@@ -3397,7 +3397,7 @@ class SharedState:
         return False
 
 
-    async def record_fill(self, symbol: str, side: str, qty: float, price: float, fee_quote: float = 0.0, tier: Optional[str] = None) -> None:
+    async def record_fill(self, symbol: str, side: str, qty: float, price: float, fee_quote: float = 0.0, fee_base: float = 0.0, tier: Optional[str] = None) -> None:
         side_u = (side or "").upper()
         qty = float(qty); price = float(price)
         if qty <= 0 or price <= 0: return
@@ -3405,11 +3405,18 @@ class SharedState:
         cur_qty = float(pos.get("quantity", 0.0))
         avg = float(pos.get("avg_price", self._avg_price_cache.get(symbol, 0.0) or 0.0))
         realized = 0.0
+        fee_base = float(fee_base or 0.0)
         
         if side_u == "BUY":
+            buy_fee_base = float(pos.get("buy_fee_base", 0.0) or 0.0) + fee_base
             new_qty = cur_qty + qty
             new_avg = ((cur_qty * avg) + (qty * price)) / max(new_qty, 1e-12)
-            pos.update({"quantity": new_qty, "avg_price": new_avg, "last_fill_ts": time.time()})
+            pos.update({
+                "quantity": new_qty,
+                "avg_price": new_avg,
+                "last_fill_ts": time.time(),
+                "buy_fee_base": buy_fee_base,
+            })
             self._avg_price_cache[symbol] = new_avg
             
             # Frequency Engineering: Track tier count
@@ -3423,6 +3430,8 @@ class SharedState:
             if close_qty > 0 and avg > 0:
                 realized = (price - avg) * close_qty - float(fee_quote or 0.0)
             new_qty = max(0.0, cur_qty - qty)
+            if new_qty == 0:
+                pos.pop("buy_fee_base", None)
             pos.update({"quantity": new_qty, "avg_price": avg if new_qty > 0 else 0.0, "last_fill_ts": time.time()})
             if new_qty == 0: self._avg_price_cache.pop(symbol, None)
             
@@ -3466,14 +3475,14 @@ class SharedState:
         self.metrics["realized_pnl"] = float(self.metrics.get("realized_pnl", 0.0)) + realized
         self.trade_history.append({
             "ts": time.time(), "symbol": symbol, "side": side_u, "qty": qty, "price": price, "fee_quote": fee_quote,
-            "realized_delta": realized, "tier": tier
+            "fee_base": fee_base, "realized_delta": realized, "tier": tier
         })
         self.trade_count += 1
         await self.emit_event("RealizedPnlUpdated", {"realized_pnl": self.metrics["realized_pnl"]})
 
-    async def record_trade(self, symbol: str, side: str, qty: float, price: float, fee_quote: float = 0.0, tier: Optional[str] = None) -> None:
+    async def record_trade(self, symbol: str, side: str, qty: float, price: float, fee_quote: float = 0.0, fee_base: float = 0.0, tier: Optional[str] = None) -> None:
         """Compatibility alias for ExecutionManager post-fill tracking."""
-        await self.record_fill(symbol, side, qty, price, fee_quote=fee_quote, tier=tier)
+        await self.record_fill(symbol, side, qty, price, fee_quote=fee_quote, fee_base=fee_base, tier=tier)
 
     def increment_idle_ticks(self) -> None:
         """Frequency Engineering: Track periods of no trading activity."""
@@ -3534,7 +3543,11 @@ class SharedState:
         return self.positions.get(symbol)
     async def get_position_quantity(self, symbol: str) -> float:
         p = await self.get_position(symbol)
-        return float(p.get("quantity", 0.0)) if p else 0.0
+        if not p:
+            return 0.0
+        qty = float(p.get("quantity", 0.0))
+        fee_base = float(p.get("buy_fee_base", 0.0) or 0.0)
+        return max(0.0, qty - fee_base)
 
     # -------- Sentiment/Signals/Regimes --------
     async def set_volatility_regime(self, symbol: str, timeframe: str, regime: str, atrp: Optional[float] = None) -> None:
@@ -4121,7 +4134,11 @@ class SharedState:
     def get_position_qty(self, symbol: str) -> float:
         """Return the quantity for a position, or 0.0 if not present."""
         p = self.positions.get(self._norm_sym(symbol))
-        return float(p.get("quantity", 0.0)) if p else 0.0
+        if not p:
+            return 0.0
+        qty = float(p.get("quantity", 0.0))
+        fee_base = float(p.get("buy_fee_base", 0.0) or 0.0)
+        return max(0.0, qty - fee_base)
 
     def record_exit_reason(self, symbol: str, reason: str, source: Optional[str] = None) -> None:
         """Record the last exit reason for a symbol (used for anti-churn gating)."""
