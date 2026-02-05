@@ -4830,6 +4830,8 @@ class MetaController:
                 if sig.get("_contributions"):
                     contributions.extend(list(sig.get("_contributions") or []))
 
+            if total_quote <= 0:
+                total_quote = float(base_sig.get("_planned_quote") or base_sig.get("planned_quote") or 0.0)
             base_sig["_planned_quote"] = total_quote
             if contributions:
                 base_sig["_contributions"] = contributions
