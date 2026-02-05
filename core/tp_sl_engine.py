@@ -42,6 +42,7 @@ class TPSLEngine:
         self._mono = time.monotonic
         self._session_start = time.monotonic()  # Track when this session started
         self._last_close_attempt: Dict[str, float] = {}
+        self._tp_floor_hit: Dict[str, bool] = {}
     async def start(self):
         """
         P9 contract: start() creates the monitoring task and emits an initial status.
@@ -375,6 +376,9 @@ class TPSLEngine:
             slippage_bps = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0)
             buffer_bps = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0)
             tp_floor = (taker_bps * 2.0 + slippage_bps + buffer_bps) / 10000.0
+
+            raw_tp_pct = (tp_dist / entry_price) if entry_price > 0 else 0.0
+            self._tp_floor_hit[symbol] = bool(raw_tp_pct > 0 and raw_tp_pct < tp_floor)
 
             tp_pct_min = max(tp_pct_min, tp_floor)  # Clamp target floor
 
