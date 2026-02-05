@@ -8882,19 +8882,23 @@ class MetaController:
                         cur_price = float(getattr(self.shared_state, "latest_prices", {}).get(symbol, 0.0) or 0.0)
                     if cur_price > 0 and hasattr(self.tp_sl_engine, "calculate_tp_sl"):
                         tp, sl = self.tp_sl_engine.calculate_tp_sl(symbol, cur_price, tier=signal.get("_tier"))
-                        min_tp_pct = float(self._cfg("TP_SL_MIN_TP_PCT", 0.002))
-                        min_sl_pct = float(self._cfg("TP_SL_MIN_SL_PCT", 0.002))
+                        taker_bps = float(self._get_fee_bps(self.shared_state, "taker") or 10.0)
+                        slippage_bps = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0)
+                        buffer_bps = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0)
+                        min_tp_pct_floor = (taker_bps * 2.0 + slippage_bps + buffer_bps) / 10000.0
+                        min_tp_pct = max(min_tp_pct_floor, float(self._cfg("TP_SL_MIN_TP_PCT", 0.002) or 0.0))
+                        min_sl_pct = float(self._cfg("TP_SL_MIN_SL_PCT", 0.002) or 0.0)
                         tp_dist = abs(float(tp or 0.0) - cur_price) / cur_price if tp else 0.0
                         sl_dist = abs(cur_price - float(sl or 0.0)) / cur_price if sl else 0.0
                         if tp_dist < min_tp_pct or sl_dist < min_sl_pct:
                             self.logger.warning(
-                                "[Meta:TPSL_GUARD] Blocking BUY %s: TP/SL too tight (tp=%.3f%% sl=%.3f%% min=%.3f%%)",
+                                "[Meta:TPSL_GUARD] Blocking BUY %s: TP/SL too tight (tp=%.3f%% sl=%.3f%% min_tp=%.3f%%)",
                                 symbol, tp_dist * 100.0, sl_dist * 100.0, min_tp_pct * 100.0
                             )
                             await self._log_execution_result(symbol, side, signal, {
                                 "status": "skipped",
                                 "reason": "tp_sl_guard",
-                                "details": {"tp_dist": tp_dist, "sl_dist": sl_dist}
+                                "details": {"tp_dist": tp_dist, "sl_dist": sl_dist, "min_tp_pct": min_tp_pct}
                             })
                             return {"ok": False, "status": "skipped", "reason": "tp_sl_guard"}
                     elif cur_price > 0:
