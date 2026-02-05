@@ -364,6 +364,13 @@ class Config:
             self.MIN_ENTRY_USDT = float(os.getenv("MIN_ENTRY_USDT", str(Config.MIN_ENTRY_USDT)))
             self.MIN_TRADE_QUOTE = float(os.getenv("MIN_TRADE_QUOTE", str(Config.MIN_TRADE_QUOTE)))
             self.MAX_TRADE_QUOTE = float(os.getenv("MAX_TRADE_QUOTE", str(Config.MAX_TRADE_QUOTE)))
+            if self.MAX_TRADE_QUOTE and self.MAX_TRADE_QUOTE < self.MIN_TRADE_QUOTE:
+                logger.warning(
+                    "MAX_TRADE_QUOTE (%.2f) < MIN_TRADE_QUOTE (%.2f). Bumping max to min.",
+                    self.MAX_TRADE_QUOTE,
+                    self.MIN_TRADE_QUOTE,
+                )
+                self.MAX_TRADE_QUOTE = float(self.MIN_TRADE_QUOTE)
             self.MAX_HOLD_TIME_SEC = float(os.getenv("MAX_HOLD_TIME_SEC", str(Config.MAX_HOLD_TIME_SEC)))
             self.EXIT_EXCURSION_TICK_MULT = float(os.getenv("EXIT_EXCURSION_TICK_MULT", str(Config.EXIT_EXCURSION_TICK_MULT)))
             self.EXIT_EXCURSION_ATR_MULT = float(os.getenv("EXIT_EXCURSION_ATR_MULT", str(Config.EXIT_EXCURSION_ATR_MULT)))
