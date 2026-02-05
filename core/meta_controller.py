@@ -4286,6 +4286,8 @@ class MetaController:
             self.logger.info("[ROTATION_DEBUG] Checking rotation escape. Focus=%s", getattr(self, "_focus_mode_active", "N/A"))
             if not bool(getattr(self, "_focus_mode_active", False)):
                 return []
+            if not bool(getattr(self.config, "FOCUS_MODE_EXIT_ENABLED", False)):
+                return []
 
             positions = self.shared_state.get_positions_snapshot() or {}
             if not positions:
@@ -4543,6 +4545,8 @@ class MetaController:
         THEN SELL 25% (User spec) to free up capital.
         """
         if not bool(getattr(self, "_focus_mode_active", False)):
+            return []
+        if not bool(getattr(self.config, "FOCUS_MODE_EXIT_ENABLED", False)):
             return []
 
         rotation_signals = []
