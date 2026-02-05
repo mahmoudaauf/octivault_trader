@@ -57,6 +57,8 @@ class Config:
         SAFE_ENTRY_USDT = 12.0
         MIN_POSITION_VALUE_USDT = 10.0
         MIN_ENTRY_USDT = 25.0
+        MIN_TRADE_QUOTE = 50.0
+        MAX_TRADE_QUOTE = 250.0
         EXEC_PROBE_QUOTE = 10.5
         MAX_HOLD_TIME_SEC = 1800.0
         LIQ_ORCH_MIN_USDT_FLOOR = 5.0
@@ -360,6 +362,8 @@ class Config:
             self.SAFE_ENTRY_USDT = float(os.getenv("SAFE_ENTRY_USDT", str(Config.SAFE_ENTRY_USDT)))
             self.MIN_POSITION_VALUE_USDT = float(os.getenv("MIN_POSITION_VALUE_USDT", str(Config.MIN_POSITION_VALUE_USDT)))
             self.MIN_ENTRY_USDT = float(os.getenv("MIN_ENTRY_USDT", str(Config.MIN_ENTRY_USDT)))
+            self.MIN_TRADE_QUOTE = float(os.getenv("MIN_TRADE_QUOTE", str(Config.MIN_TRADE_QUOTE)))
+            self.MAX_TRADE_QUOTE = float(os.getenv("MAX_TRADE_QUOTE", str(Config.MAX_TRADE_QUOTE)))
             self.MAX_HOLD_TIME_SEC = float(os.getenv("MAX_HOLD_TIME_SEC", str(Config.MAX_HOLD_TIME_SEC)))
             self.EXIT_EXCURSION_TICK_MULT = float(os.getenv("EXIT_EXCURSION_TICK_MULT", str(Config.EXIT_EXCURSION_TICK_MULT)))
             self.EXIT_EXCURSION_ATR_MULT = float(os.getenv("EXIT_EXCURSION_ATR_MULT", str(Config.EXIT_EXCURSION_ATR_MULT)))
@@ -472,6 +476,7 @@ class Config:
             self.SL_PCT_MAX = float(os.getenv("SL_PCT_MAX", "0.008"))  # 0.80%
             self.TP_TARGET_PCT = float(os.getenv("TP_TARGET_PCT", str(Config.TP_TARGET_PCT)))
             self.SL_CAP_PCT = float(os.getenv("SL_CAP_PCT", str(Config.SL_CAP_PCT)))
+            self.TP_MIN_BUFFER_BPS = float(os.getenv("TP_MIN_BUFFER_BPS", "5"))
 
             # ---------- SELL economic gates ----------
             # If False, non-liquidation SELLs must clear fee-aware net PnL gate.
