@@ -8,3 +8,5 @@ This project implements a self-compounding, multi-agent AI trading bot that gene
 - `models/` – ML/RL model storage
 - `logs/` – performance and trade logs
 
+<!-- GIT-SYNC-TEST -->
+Last sync test from VS Code: 2026-02-05 15:10
