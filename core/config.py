@@ -453,6 +453,7 @@ class Config:
             self.META_MIN_CONF = float(os.getenv("META_MIN_CONF", "0.70"))
             self.MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "10"))  # Increased for 20 USDT/h target
             self.MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", str(Config.MAX_TRADES_PER_DAY)))
+            self.FOCUS_MODE_EXIT_ENABLED = os.getenv("FOCUS_MODE_EXIT_ENABLED", "false").lower() == "true"
             self.META_DIRECTIONAL_CONSISTENCY_PCT = float(os.getenv("META_DIRECTIONAL_CONSISTENCY_PCT", "0.65"))
             # Diversification knobs (penalize recently traded symbols when ranking BUYs)
             self.DIVERSIFY_RECENT_TRADE_WINDOW_SEC = float(os.getenv("DIVERSIFY_RECENT_TRADE_WINDOW_SEC", "1800"))
