@@ -158,14 +158,32 @@ class ExecutionManager:
                 return
 
             ss = self.shared_state
+
+            fee_quote = float(order.get("fee_quote", 0.0) or order.get("fee", 0.0) or 0.0)
+            fee_base = float(order.get("fee_base", 0.0) or 0.0)
+            try:
+                base_asset, quote_asset = self._split_base_quote(sym)
+                fills = order.get("fills") or []
+                if isinstance(fills, list):
+                    fee_base = sum(
+                        float(f.get("commission", 0.0) or 0.0)
+                        for f in fills
+                        if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == base_asset
+                    ) or fee_base
+                    fee_quote = sum(
+                        float(f.get("commission", 0.0) or 0.0)
+                        for f in fills
+                        if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
+                    ) or fee_quote
+            except Exception:
+                pass
             
             trade_recorded = False
             # P9 Frequency Engineering: Record trade for tier tracking and open trades
             if hasattr(ss, "record_trade"):
                 try:
                     # Get fee if available
-                    fee = float(order.get("fee", 0.0) or 0.0)
-                    await ss.record_trade(sym, side_u, exec_qty, price, fee_quote=fee, tier=tier)
+                    await ss.record_trade(sym, side_u, exec_qty, price, fee_quote=fee_quote, fee_base=fee_base, tier=tier)
                     trade_recorded = True
                     
                     # Frequency Engineering: Trigger TP/SL setup for BUYs
