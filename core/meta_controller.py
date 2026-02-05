@@ -8870,8 +8870,9 @@ class MetaController:
                 if max_hourly > 0 and len(self._trade_timestamps) >= max_hourly:
                     self.logger.info("[Meta] Skip %s BUY: Global hourly trade limit (%d) reached.", symbol, max_hourly)
                     return {"ok": False, "status": "skipped", "reason": "global_limit", "reason_detail": "global_hourly_limit_reached"}
-                # PER-SYMBOL GATE (Safety: Max 2 trades per symbol per hour during Phase A)
-                if len(self._trade_timestamps_sym[symbol]) >= 2:
+                # PER-SYMBOL GATE
+                max_sym_hourly = int(getattr(self.config, "MAX_TRADES_PER_SYMBOL_PER_HOUR", 2) or 0)
+                if max_sym_hourly > 0 and len(self._trade_timestamps_sym[symbol]) >= max_sym_hourly:
                     self.logger.info("[Meta] Skip %s BUY: Symbol hourly trade limit reached.", symbol)
                     return {"ok": False, "status": "skipped", "reason": "symbol_limit", "reason_detail": "symbol_hourly_limit_reached"}
                 # PER-AGENT GATE (Safety: Max 75% of global limit per agent)
