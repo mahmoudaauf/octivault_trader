@@ -8965,6 +8965,22 @@ class MetaController:
                         min_sl_pct = float(self._cfg("TP_SL_MIN_SL_PCT", 0.002) or 0.0)
                         tp_dist = abs(float(tp or 0.0) - cur_price) / cur_price if tp else 0.0
                         sl_dist = abs(cur_price - float(sl or 0.0)) / cur_price if sl else 0.0
+                        floor_hit = False
+                        try:
+                            floor_hit = bool(getattr(self.tp_sl_engine, "_tp_floor_hit", {}).get(symbol))
+                        except Exception:
+                            floor_hit = False
+                        if floor_hit:
+                            self.logger.warning(
+                                "[Meta:TPSL_GUARD] Blocking BUY %s: TP below fee-aware floor (min_tp=%.3f%%)",
+                                symbol, min_tp_pct * 100.0
+                            )
+                            await self._log_execution_result(symbol, side, signal, {
+                                "status": "skipped",
+                                "reason": "tp_sl_guard",
+                                "details": {"min_tp_pct": min_tp_pct}
+                            })
+                            return {"ok": False, "status": "skipped", "reason": "tp_sl_guard"}
                         if tp_dist < min_tp_pct or sl_dist < min_sl_pct:
                             self.logger.warning(
                                 "[Meta:TPSL_GUARD] Blocking BUY %s: TP/SL too tight (tp=%.3f%% sl=%.3f%% min_tp=%.3f%%)",
