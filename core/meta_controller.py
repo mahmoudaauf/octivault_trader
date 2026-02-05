@@ -8697,6 +8697,7 @@ class MetaController:
             except Exception as e:
                 self.logger.warning("[DUST_EXIT] Failed to execute dust exit policy: %s", str(e))
 
+        decisions = self._batch_buy_decisions(decisions)
         decisions = self._batch_sell_decisions(decisions)
         decisions = self._apply_sell_arbiter(decisions)
         for idx, (sym, action, sig) in enumerate(decisions):
