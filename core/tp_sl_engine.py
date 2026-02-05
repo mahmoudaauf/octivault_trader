@@ -370,14 +370,13 @@ class TPSLEngine:
             sl_pct_min = float(getattr(self.config, "SL_PCT_MIN", 0.005) or 0.005)
             sl_pct_max = float(getattr(self.config, "SL_PCT_MAX", 0.008) or 0.008)
 
-            # Fee-aware TP floor (Rule 2: FTP)
-            # Ensure TP at least covers 3x round-trip fees to guarantee expectancy.
-            taker_bps = fee_bps(self.shared_state, "taker") or 10.0
-            rt_fee_pct = (taker_bps * 2.0) / 10000.0
-            tp_expectancy_k = float(os.getenv("FEE_TP_K", "3.0"))  # Baseline 3x fees
-            tp_floor = rt_fee_pct * tp_expectancy_k
-            
-            tp_pct_min = max(tp_pct_min, tp_floor) # Clamp target floor
+            # Fee-aware TP floor: 2*fee + slippage + buffer
+            taker_bps = float(fee_bps(self.shared_state, "taker") or 10.0)
+            slippage_bps = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0)
+            buffer_bps = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0)
+            tp_floor = (taker_bps * 2.0 + slippage_bps + buffer_bps) / 10000.0
+
+            tp_pct_min = max(tp_pct_min, tp_floor)  # Clamp target floor
 
             if entry_price > 0:
                 tp_pct = tp_dist / entry_price
