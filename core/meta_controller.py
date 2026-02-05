@@ -1022,38 +1022,19 @@ class MetaController:
             # Emergency dust liquidation (60%+ dust ratio) bypasses focus gate
             # to ensure emergency escape route is always available
             
-            if self.FOCUS_MODE_ENABLED and not emergency_liquidation:
-                await self._update_focus_symbols()
-                
-                if symbol not in self.FOCUS_SYMBOLS:
-                    # NEW: Check if focus mode timeout has been exceeded
-                    # After 30 minutes in focus mode, allow non-focus SELL as escape hatch
-                    time_in_focus = time.time() - getattr(self, '_focus_mode_start_time', time.time())
-                    if time_in_focus > 1800:  # 30 minutes
-                        self.logger.warning(
-                            "[WALLET_FOCUS_BOOTSTRAP] ⏱️ FOCUS_ESCAPE: %s not in focus, but timeout exceeded (%d sec). "
-                            "Allowing SELL (escape hatch activated).",
-                            symbol, int(time_in_focus)
-                        )
-                        # Allow SELL - escape hatch
-                    else:
-                        self.logger.warning(
-                            "[WALLET_FOCUS_BOOTSTRAP] 🚫 SELL blocked — %s not in focus symbols %s "
-                            "(frozen non-focus position)",
-                            symbol, sorted(self.FOCUS_SYMBOLS)
-                        )
-                        return False
-                else:
-                    self.logger.debug(
-                        "[WALLET_FOCUS_BOOTSTRAP] ✓ SELL allowed on %s (in focus symbols)",
+            if self.FOCUS_MODE_ENABLED:
+                if emergency_liquidation:
+                    self.logger.info(
+                        "[WALLET_FOCUS_BOOTSTRAP] ⚠️ EMERGENCY LIQUIDATION: Bypassing FOCUS_MODE gate for %s "
+                        "(PHASE_2_GUARD dust ratio exceeded)",
                         symbol
                     )
-            elif self.FOCUS_MODE_ENABLED and emergency_liquidation:
-                self.logger.info(
-                    "[WALLET_FOCUS_BOOTSTRAP] ⚠️ EMERGENCY LIQUIDATION: Bypassing FOCUS_MODE gate for %s "
-                    "(PHASE_2_GUARD dust ratio exceeded)",
-                    symbol
-                )
+                else:
+                    # Focus mode should restrict entries, not exits.
+                    self.logger.debug(
+                        "[WALLET_FOCUS_BOOTSTRAP] Focus mode active — SELL allowed for %s.",
+                        symbol
+                    )
             
             # ═══════════════════════════════════════════════════════════════════════
             # GATE 2: DUST STATE MACHINE
@@ -1330,7 +1311,8 @@ class MetaController:
 
             min_exit_quote = float(exit_info.get("min_exit_quote") or 0.0)
             base_quote = float(getattr(self.config, "DEFAULT_PLANNED_QUOTE", self._default_planned_quote) or self._default_planned_quote)
-            min_trade_quote = max(min_exit_quote, base_quote)
+            min_trade_floor = float(self._cfg("MIN_TRADE_QUOTE", 0.0) or 0.0)
+            min_trade_quote = max(min_exit_quote, base_quote, min_trade_floor)
 
             # ═══════════════════════════════════════════════════════════════════════
             # GLOBAL ECONOMIC BUY GATE (SOP): economically sellable + profit lock
