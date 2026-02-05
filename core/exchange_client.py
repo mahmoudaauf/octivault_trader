@@ -622,14 +622,14 @@ class ExchangeClient:
             self.logger.debug("emit_event passthrough failed", exc_info=True)
 
     # ------------- public helpers -------------
-    async def get_all_symbols(self) -> list[str]:
+    async def get_all_symbols(self) -> List[str]:
         """
         Return tradable spot symbols (uppercased) using cached exchangeInfo when possible.
         AppContext uses this to prune accepted symbols.
         """
         await self._sync_exchange_info()
         info = self._exchange_info or {}
-        out: list[str] = []
+        out: List[str] = []
         try:
             for s in info.get("symbols", []):
                 status = s.get("status")
@@ -1058,7 +1058,7 @@ class ExchangeClient:
         symbol: str,
         interval: str = "1h",
         limit: int = 500,
-    ) -> list[list[float]]:
+    ) -> List[List[float]]:
         """
         Return OHLCV rows from /api/v3/klines.
         Each row = [openTime, open, high, low, close, volume] as floats.
