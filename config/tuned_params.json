@@ -1,0 +1,7 @@
+{
+    "MLForecaster": {
+        "window_size": 62,
+        "n_layers": 2,
+        "n_neurons": 146
+    }
+}

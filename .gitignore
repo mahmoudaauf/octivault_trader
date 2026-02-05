@@ -1,0 +1,90 @@
+########################################
+# Virtual environments & secrets
+########################################
+venv/
+.env
+.env.*
+*.key
+*.pem
+
+########################################
+# Python cache & compiled files
+########################################
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+########################################
+# Logs & runtime outputs
+########################################
+*.log
+logs/
+app.log
+bot.log
+runtime.log
+full_error_log.txt
+nohup.out
+
+########################################
+# Databases & snapshots
+########################################
+*.db
+*.sqlite
+snapshots/
+storage/
+
+########################################
+# ML / AI artifacts (DO NOT COMMIT)
+########################################
+models/
+tuned_params/
+data/
+stream/
+*.h5
+*.keras
+*.pt
+*.ckpt
+*.onnx
+
+########################################
+# Backups & temp files
+########################################
+*.save
+*.save.*
+*.bak
+*.tmp
+*.swp
+
+########################################
+# OS / IDE files
+########################################
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+########################################
+# Docker / build artifacts
+########################################
+*.tar.gz
+*.zip
+*.tgz
+ta-lib/
+ta-lib-*/
+
+########################################
+# Generated reports & diagnostics
+########################################
+diagnose_report.json
+order_call_scan.txt
+project_structure.txt
+current_scripts_inventory.txt
+
+########################################
+# Defensive ignores (bad filenames / typos)
+########################################
+*.pyy
+*\\

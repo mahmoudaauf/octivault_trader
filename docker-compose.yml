@@ -1,0 +1,12 @@
+version: "3"
+services:
+  trader:
+    build: .
+    container_name: octivault_trader
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    ports:
+      - "8000:8000"  # For FastAPI dashboard

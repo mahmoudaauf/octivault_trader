@@ -1,0 +1,100 @@
+import logging
+import asyncio
+import os
+import time
+from datetime import datetime
+from typing import Optional
+
+logger = logging.getLogger("RecoveryEngine")
+
+class RecoveryEngine:
+    def __init__(self, shared_state, restart_callback, alert_callback, check_interval=10, max_inactive_time=60):
+        """
+        :param shared_state: SharedState object tracking timestamps.
+        :param restart_callback: Coroutine to restart the failing module.
+        :param alert_callback: Coroutine to send alert messages.
+        :param check_interval: Seconds between each health check.
+        :param max_inactive_time: Inactivity threshold in seconds before recovery is triggered.
+        """
+        self.shared_state = shared_state
+        self.restart_callback = restart_callback
+        self.alert_callback = alert_callback
+        self.check_interval = check_interval
+        self.max_inactive_time = max_inactive_time
+        self.test_mode = os.getenv("RECOVERY_TEST_MODE", "False").lower() == "true"
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.info("RecoveryEngine initialized.")
+        self.last_successful_market_data_update: Optional[float] = None # Initialize for freshness check
+
+
+    async def perform_initial_recovery(self):
+        """
+        Performs an initial check and recovery steps during startup.
+        This can be a placeholder for specific startup health checks.
+        """
+        self.logger.info("Performing initial recovery checks.")
+        current_health = self.shared_state.get_system_health_status()
+        if not current_health:
+            self.logger.info("No initial system health status found in SharedState.")
+        else:
+            self.logger.info(f"Initial system health status: {current_health}")
+        pass
+
+    async def run(self): # Renamed from monitor_health
+        """Main loop for the Recovery Engine, monitoring system health."""
+        self.logger.info(f"🩺 Starting RecoveryEngine health monitor, checking every {self.check_interval} seconds.")
+
+        while True:
+            try:
+                await self.shared_state.update_timestamp(component_name="recovery_engine")
+
+                now = time.time()
+                last_market_data_update = self.shared_state.get_market_data_last_updated_time()
+
+                if last_market_data_update is None:
+                    self.logger.warning("⚠️ Market data last updated timestamp not yet available from SharedState.")
+                else:
+                    inactivity = now - last_market_data_update
+                    self.logger.debug(f"📊 Market data last updated {inactivity:.2f}s ago.")
+
+                    if inactivity > self.max_inactive_time:
+                        self.logger.warning(f"🚨 Market data inactivity threshold exceeded: {inactivity:.2f}s > {self.max_inactive_time}s.")
+                        alert_msg = f"⚠️ No market data update for {int(inactivity)} seconds. Triggering recovery for MarketDataFeed."
+                        self.logger.warning(f"📨 Sending alert: {alert_msg}")
+                        await self.alert_callback(alert_msg)
+
+                        await self.shared_state.update_system_health(
+                            component="market_data_feed",
+                            status="recovering",
+                            message="Restart triggered by RecoveryEngine due to inactivity"
+                        )
+
+                        if self.test_mode:
+                            self.logger.info("🧪 [TEST MODE] Simulated restart. Skipping real restart.")
+                            await asyncio.sleep(1) 
+                            await self.shared_state.update_system_health(
+                                component="market_data_feed",
+                                status="healthy",
+                                message="Simulated recovery complete"
+                            )
+                        else:
+                            self.logger.info("🔄 Attempting to restart market data feed...")
+                            await self.restart_callback()
+
+                            await self.shared_state.update_system_health(
+                                component="market_data_feed",
+                                status="healthy",
+                                message="Resumed after recovery by RecoveryEngine"
+                            )
+                            self.logger.info("✅ Market data feed restart completed.")
+
+            except asyncio.CancelledError:
+                self.logger.info("🛌 RecoveryEngine: run cancelled.")
+                raise
+
+            except Exception as e:
+                self.logger.error(f"❌ Error in RecoveryEngine run: {e}", exc_info=True)
+                if self.alert_callback:
+                    await self.alert_callback(f"Critical error in RecoveryEngine: {e}")
+            
+            await asyncio.sleep(self.check_interval)
