@@ -1486,7 +1486,7 @@ class ExchangeClient:
         raise ValueError(f"Invalid order tag: {tag}")
 
     # ------------- balances -------------
-    async def get_spot_balances(self) -> dict[str, dict]:
+    async def get_spot_balances(self) -> Dict[str, Dict[str, float]]:
         """Spot balances via /api/v3/account (safe; no SAPI permission required)."""
         data = await self._request("GET", "/api/v3/account", signed=True, api="spot_api")
         out = {}
