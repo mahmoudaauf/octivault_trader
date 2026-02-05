@@ -1335,7 +1335,15 @@ class ExchangeClient:
                 or 0.0
             ),
             "cummulativeQuoteQty": float(raw.get("cummulativeQuoteQty", 0.0)),
-            "fills": [{"qty": float(f.get("qty", 0.0)), "price": float(f.get("price", 0.0))} for f in raw.get("fills", [])],
+            "fills": [
+                {
+                    "qty": float(f.get("qty", 0.0)),
+                    "price": float(f.get("price", 0.0)),
+                    "commission": float(f.get("commission", 0.0) or 0.0),
+                    "commissionAsset": f.get("commissionAsset") or f.get("commission_asset"),
+                }
+                for f in raw.get("fills", [])
+            ],
             "exchange_order_id": raw.get("orderId") or raw.get("order_id") or "",
             "error_code": error_code,
             "error_msg": error_msg,
