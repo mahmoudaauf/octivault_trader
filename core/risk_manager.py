@@ -210,19 +210,16 @@ class RiskManager:
             if tier == "B":
                 if q > self.tier_b_max_quote:
                     return False, f"tier_b_exceeds_micro_cap_{self.tier_b_max_quote}"
-                # Tier B bypasses min_trade_quote to allow micro trades
-            else:
-                # Tier A: Normal caps
-                if q < self.min_trade_quote:
-                    # FIX #4: Allow liquidation SELL to bypass min_trade_quote
-                    if not is_liquidation:
-                        self.logger.debug(f"[Risk:pre_check] {symbol} {side} ${q:.2f} below min ${self.min_trade_quote:.2f}")
-                        return False, "below_min_trade_quote"
-                    else:
-                        self.logger.info(f"[Risk:pre_check] {symbol} {side} ${q:.2f} LIQUIDATION_BYPASS min_trade_quote")
-                
-                if self.max_trade_quote > 0 and q > self.max_trade_quote:
-                    return False, "exceeds_max_trade_quote"
+
+            # Enforce minimum trade quote for all tiers (unless liquidation)
+            if q < self.min_trade_quote:
+                if not is_liquidation:
+                    self.logger.debug(f"[Risk:pre_check] {symbol} {side} ${q:.2f} below min ${self.min_trade_quote:.2f}")
+                    return False, "below_min_trade_quote"
+                self.logger.info(f"[Risk:pre_check] {symbol} {side} ${q:.2f} LIQUIDATION_BYPASS min_trade_quote")
+
+            if self.max_trade_quote > 0 and q > self.max_trade_quote:
+                return False, "exceeds_max_trade_quote"
         
         # FIX #4: Liquidation SELL bypasses min_trade_quote entirely
         if s == "SELL" and is_liquidation and planned_quote is not None:
