@@ -4782,6 +4782,80 @@ class MetaController:
         filtered.insert(0, best_sell)
         return filtered
 
+    def _batch_buy_decisions(self, decisions: List[Tuple[str, str, Dict[str, Any]]]) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """Aggregate multiple BUY intents per symbol into a single batched BUY."""
+        if not decisions:
+            return decisions
+
+        grouped: Dict[str, List[Tuple[str, str, Dict[str, Any]]]] = defaultdict(list)
+        passthrough: List[Tuple[str, str, Dict[str, Any]]] = []
+
+        for sym, action, sig in decisions:
+            if action == "BUY":
+                grouped[self._normalize_symbol(sym)].append((sym, action, sig))
+            else:
+                passthrough.append((sym, action, sig))
+
+        batched: List[Tuple[str, str, Dict[str, Any]]] = []
+        for sym_norm, buys in grouped.items():
+            if len(buys) == 1:
+                batched.append(buys[0])
+                continue
+
+            def _score(item: Tuple[str, str, Dict[str, Any]]) -> float:
+                return float((item[2] or {}).get("confidence", 0.0) or 0.0)
+
+            best = max(buys, key=_score)
+            base_sym, _, base_sig = best
+            base_sig = dict(base_sig or {})
+
+            total_quote = 0.0
+            reasons = []
+            agents = []
+            contributions = []
+            tiers = []
+
+            for _, _, sig in buys:
+                sig = sig or {}
+                q = float(sig.get("_planned_quote") or sig.get("planned_quote") or sig.get("quote_amount") or sig.get("quote") or 0.0)
+                if q > 0:
+                    total_quote += q
+                reasons.append(str(sig.get("reason") or sig.get("tag") or ""))
+                agents.append(str(sig.get("agent") or ""))
+                tiers.append(str(sig.get("_tier") or ""))
+                if sig.get("_contributions"):
+                    contributions.extend(list(sig.get("_contributions") or []))
+
+            base_sig["_planned_quote"] = total_quote
+            if contributions:
+                base_sig["_contributions"] = contributions
+            if tiers:
+                if "A" in tiers:
+                    base_sig["_tier"] = "A"
+                elif "B" in tiers:
+                    base_sig["_tier"] = "B"
+            if any(bool(s.get("_bootstrap")) for _, _, s in buys):
+                base_sig["_bootstrap"] = True
+            if any(bool(s.get("_bootstrap_override")) for _, _, s in buys):
+                base_sig["_bootstrap_override"] = True
+            if any(bool(s.get("_bootstrap_seed")) for _, _, s in buys):
+                base_sig["_bootstrap_seed"] = True
+            if any(bool(s.get("_accumulated")) for _, _, s in buys):
+                base_sig["_accumulated"] = True
+
+            base_sig["_batched"] = True
+            base_sig["_batched_count"] = len(buys)
+            base_sig["_batched_reasons"] = reasons
+            base_sig["_batched_agents"] = agents
+
+            self.logger.info(
+                "[Meta:BuyBatch] %s batched %d BUYs -> one intent (quote=%.2f)",
+                sym_norm, len(buys), total_quote,
+            )
+            batched.append((base_sym, "BUY", base_sig))
+
+        return passthrough + batched
+
     def _batch_sell_decisions(self, decisions: List[Tuple[str, str, Dict[str, Any]]]) -> List[Tuple[str, str, Dict[str, Any]]]:
         """Aggregate multiple SELL intents per symbol into a single batched SELL."""
         if not decisions:
