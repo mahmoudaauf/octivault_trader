@@ -3432,6 +3432,10 @@ class SharedState:
             new_qty = max(0.0, cur_qty - qty)
             if new_qty == 0:
                 pos.pop("buy_fee_base", None)
+            else:
+                buy_fee_base = float(pos.get("buy_fee_base", 0.0) or 0.0)
+                if cur_qty > 0 and buy_fee_base > 0:
+                    pos["buy_fee_base"] = buy_fee_base * (new_qty / cur_qty)
             pos.update({"quantity": new_qty, "avg_price": avg if new_qty > 0 else 0.0, "last_fill_ts": time.time()})
             if new_qty == 0: self._avg_price_cache.pop(symbol, None)
             
