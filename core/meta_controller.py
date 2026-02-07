@@ -73,7 +73,7 @@ class ExecutionError(Exception):
         error_type: str,
         message: str,
         symbol: str = "",
-        context: Dict[str, Any] | None = None,
+        context: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(message)
         self.error_type = error_type
