@@ -62,13 +62,6 @@ class ExecutionBlocked(Exception):
         self.available_quote = float(available_quote or 0.0)
         self.min_required = float(min_required or 0.0)
         super().__init__(f"{code}: planned={self.planned_quote:.2f} available={self.available_quote:.2f} min_required={self.min_required:.2f}")
-
-# =============================
-# Order filter shims (SymbolFilters, validate_order_request)
-# =============================
-from dataclasses import dataclass
-@dataclass
-class SymbolFilters:
 step_size: float
 min_qty: float
 max_qty: float
