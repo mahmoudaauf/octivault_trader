@@ -38,7 +38,7 @@ def round_step(value: float, step: float) -> float:
 
 # =============================
 # Exchange error shims (BinanceAPIException, ExecutionError)
-    # =============================
+# =============================
 try:
     from core.stubs import BinanceAPIException, ExecutionError
     # type: ignore
@@ -46,14 +46,14 @@ except Exception:
     class BinanceAPIException(Exception):
         def __init__(self, code: int | None = None, message: str = ""):
             self.code = code
-        super().__init__(message or f"BinanceAPIException({code})")
+            super().__init__(message or f"BinanceAPIException({code})")
 
     class ExecutionError(Exception):
         def __init__(self, error_type: str, message: str = "", symbol: str = "", meta: dict | None = None):
             self.error_type = error_type
             self.symbol = symbol
-        self.meta = meta or {}
-        super().__init__(message or error_type)
+            self.meta = meta or {}
+            super().__init__(message or error_type)
 
     class ExecutionBlocked(Exception):
         def __init__(self, code: str, planned_quote: float, available_quote: float, min_required: float):
@@ -62,12 +62,12 @@ except Exception:
             self.available_quote = float(available_quote or 0.0)
             self.min_required = float(min_required or 0.0)
             super().__init__(f"{code}: planned={self.planned_quote:.2f} available={self.available_quote:.2f} min_required={self.min_required:.2f}")
-            step_size: float
-            min_qty: float
+        step_size: float
+        min_qty: float
         max_qty: float
         tick_size: float
-    min_notional: float
-min_entry_quote: float = 0.0
+        min_notional: float
+        min_entry_quote: float = 0.0
 
 async def validate_order_request(*, side: str, qty: float, price: float,
 filters: SymbolFilters, taker_fee_bps: int = 10,
@@ -77,100 +77,102 @@ use_quote_amount: Optional[float] = None):
     if use_quote_amount is not None:
         spend = float(use_quote_amount)
         # 1. Nominal Floor Check (Spec Requirement 1.1)
-if spend < max(filters.min_notional, filters.min_entry_quote or 0.0):
-        return False, 0.0, 0.0, "QUOTE_LT_MIN_NOTIONAL"
+        if spend < max(filters.min_notional, filters.min_entry_quote or 0.0):
+            return False, 0.0, 0.0, "QUOTE_LT_MIN_NOTIONAL"
 
-# 2. Executable Quantity Check (Spec Requirement 1.2)
-    # Affordability = "The trade produces a non-zero executable quantity"
-    step = float(filters.step_size or 0.0) # BOOTSTRAP FIX: Handle 0.0 step
-    price_safe = price if price > 0 else 1.0 # Guard zero div
+        # 2. Executable Quantity Check (Spec Requirement 1.2)
+        # Affordability = "The trade produces a non-zero executable quantity"
+        from decimal import Decimal, ROUND_DOWN
+        step = float(filters.step_size or 0.0) # BOOTSTRAP FIX: Handle 0.0 step
+        price_safe = price if price > 0 else 1.0 # Guard zero div
         estimated_qty = spend / price_safe
 
-    if step > 0:
-        q = (Decimal(str(estimated_qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+        if step > 0:
+            q = (Decimal(str(estimated_qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
             qty = float(q * Decimal(str(step)))
         else:
-        qty = estimated_qty
+            qty = estimated_qty
 
-# STRICT CHECK: If rounding kills the quantity, we CANNOT execute.
-    if qty <= 0:
-        return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
+        # STRICT CHECK: If rounding kills the quantity, we CANNOT execute.
+        if qty <= 0:
+            return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
 
         if qty < float(filters.min_qty):
-        return False, 0.0, 0.0, "QTY_LT_MIN"
+            return False, 0.0, 0.0, "QTY_LT_MIN"
 
         return True, float(qty), spend, "OK"
-            else:
+    else:
+        from decimal import Decimal, ROUND_DOWN
         step = float(filters.step_size or 0.0)
         if step > 0:
-        q = (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
-        qty = float(q * Decimal(str(step)))
+            q = (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+            qty = float(q * Decimal(str(step)))
 
         if qty <= 0:
-        return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
+            return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
 
-    if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
-    # Strict Rule 2.1: amount == 0 -> ExecutionProbe = FAIL
-    return False, 0.0, 0.0, "NOTIONAL_LT_MIN"
-return True, float(qty), 0.0, "OK"
+        if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
+            # Strict Rule 2.1: amount == 0 -> ExecutionProbe = FAIL
+            return False, 0.0, 0.0, "NOTIONAL_LT_MIN"
+        return True, float(qty), 0.0, "OK"
 
 # =============================
 # ExecutionManager
 # =============================
 
 class ExecutionManager:
-"""
-P9 ExecutionManager — canonical single-order path, natively aligned with:
-- SharedState: get_spendable_balance(), get_position_quantity(), reserve_liquidity()/release_liquidity()
-- ExchangeClient: place_market_order(), get_exchange_filters(), get_current_price()
-"""
+    """
+    P9 ExecutionManager — canonical single-order path, natively aligned with:
+    - SharedState: get_spendable_balance(), get_position_quantity(), reserve_liquidity()/release_liquidity()
+    - ExchangeClient: place_market_order(), get_exchange_filters(), get_current_price()
+    """
 
-@staticmethod
-def _round_step_down(value: float, step: float) -> float:
-"""Safe step rounding (floor)."""
-if step <= 0: return value
-import math
-# Avoid float precision garbage
-steps = math.floor(value / step)
-return steps * step
+    @staticmethod
+    def _round_step_down(value: float, step: float) -> float:
+        """Safe step rounding (floor)."""
+        if step <= 0: return value
+        import math
+        # Avoid float precision garbage
+        steps = math.floor(value / step)
+        return steps * step
 
-# --- Post-fill realized PnL emitter (P9 observability contract) ---
-async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
-"""
-Best-effort: compute/record realized PnL delta when a trade fills, then emit
-a `RealizedPnlUpdated` event and persist the delta via SharedState if possible.
-This is tolerant to different SharedState contract shapes.
-"""
-emitted = False
-realized_committed = False
-delta_f = None
-try:
-sym = self._norm_symbol(symbol)
-side_u = (side or "").upper()
-exec_qty = float(order.get("executedQty") or order.get("executed_qty") or 0.0)
-price = float(order.get("avgPrice") or order.get("price") or 0.0)
-if exec_qty <= 0 or price <= 0:
-return
+    # --- Post-fill realized PnL emitter (P9 observability contract) ---
+    async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Best-effort: compute/record realized PnL delta when a trade fills, then emit
+        a `RealizedPnlUpdated` event and persist the delta via SharedState if possible.
+        This is tolerant to different SharedState contract shapes.
+        """
+        emitted = False
+        realized_committed = False
+        delta_f = None
+        try:
+            sym = self._norm_symbol(symbol)
+            side_u = (side or "").upper()
+            exec_qty = float(order.get("executedQty") or order.get("executed_qty") or 0.0)
+            price = float(order.get("avgPrice") or order.get("price") or 0.0)
+            if exec_qty <= 0 or price <= 0:
+                return
 
-ss = self.shared_state
-realized_before = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
+            ss = self.shared_state
+            realized_before = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
 
-fee_quote = float(order.get("fee_quote", 0.0) or order.get("fee", 0.0) or 0.0)
-fee_base = float(order.get("fee_base", 0.0) or 0.0)
-try:
-base_asset, quote_asset = self._split_base_quote(sym)
-fills = order.get("fills") or []
-if isinstance(fills, list):
-fee_base = sum(
-float(f.get("commission", 0.0) or 0.0)
-for f in fills
-if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == base_asset
-) or fee_base
-fee_quote = sum(
-float(f.get("commission", 0.0) or 0.0)
-for f in fills
-if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
-) or fee_quote
+            fee_quote = float(order.get("fee_quote", 0.0) or order.get("fee", 0.0) or 0.0)
+            fee_base = float(order.get("fee_base", 0.0) or 0.0)
+            try:
+                base_asset, quote_asset = self._split_base_quote(sym)
+                fills = order.get("fills") or []
+                if isinstance(fills, list):
+                    fee_base = sum(
+                        float(f.get("commission", 0.0) or 0.0)
+                        for f in fills
+                        if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == base_asset
+                    ) or fee_base
+                    fee_quote = sum(
+                        float(f.get("commission", 0.0) or 0.0)
+                        for f in fills
+                        if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
+                    ) or fee_quote
 except Exception:
 pass
 
