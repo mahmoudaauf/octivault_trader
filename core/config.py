@@ -1,12 +1,12 @@
-    from dotenv import load_dotenv, find_dotenv
-    # Force-load the .env closest to your repo (not the caller's cwd), and override any stale env
-    load_dotenv(dotenv_path=find_dotenv(usecwd=True), override=True)
+from dotenv import load_dotenv, find_dotenv
+# Force-load the .env closest to your repo (not the caller's cwd), and override any stale env
+load_dotenv(dotenv_path=find_dotenv(usecwd=True), override=True)
 
-    import os
-    import logging
-    import json
-    from types import SimpleNamespace
-    from typing import Optional
+import os
+import logging
+import json
+from types import SimpleNamespace
+from typing import Optional
 
 
     logger = logging.getLogger("Config")
