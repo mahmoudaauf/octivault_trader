@@ -504,25 +504,24 @@ class ExecutionManager:
             return await self.shared_state.compute_symbol_exit_floor(
                 symbol,
                 price=price,
-    fee_bps=self._exit_fee_bps(),
-    slippage_bps=self._exit_slippage_bps(),
-    )
-    return {"min_exit_quote": 0.0, "min_notional": 0.0}
-
+                fee_bps=self._exit_fee_bps(),
+                slippage_bps=self._exit_slippage_bps(),
+            )
+        return {"min_exit_quote": 0.0, "min_notional": 0.0}
 
     async def _get_min_entry_quote(self, symbol: str, price: Optional[float] = None, min_notional: Optional[float] = None) -> float:
-    base_quote = float(getattr(self.config, "DEFAULT_PLANNED_QUOTE", getattr(
-    self.config, "MIN_ENTRY_QUOTE_USDT", 0.0)) or 0.0)
-    exit_info = await self._get_exit_floor_info(symbol, price=price)
+        base_quote = float(getattr(self.config, "DEFAULT_PLANNED_QUOTE", getattr(
+            self.config, "MIN_ENTRY_QUOTE_USDT", 0.0)) or 0.0)
+        exit_info = await self._get_exit_floor_info(symbol, price=price)
 
-    min_position_usdt = float(
-    getattr(self.config, "MIN_POSITION_USDT", 0.0) or 0.0)
-    min_notional_mult = float(
-    getattr(self.config, "MIN_POSITION_MIN_NOTIONAL_MULT", 2.0) or 2.0)
-    min_notional_val = float(min_notional or 0.0)
-    if min_notional_val <= 0:
-    try:
-    filters = await self.exchange_client.ensure_symbol_filters_ready(symbol)
+        min_position_usdt = float(
+            getattr(self.config, "MIN_POSITION_USDT", 0.0) or 0.0)
+        min_notional_mult = float(
+            getattr(self.config, "MIN_POSITION_MIN_NOTIONAL_MULT", 2.0) or 2.0)
+        min_notional_val = float(min_notional or 0.0)
+        if min_notional_val <= 0:
+            try:
+                filters = await self.exchange_client.ensure_symbol_filters_ready(symbol)
     min_notional_val = float(self._extract_min_notional(filters) or 0.0)
     except Exception:
     min_notional_val = 0.0
