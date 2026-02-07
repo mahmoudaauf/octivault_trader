@@ -23,15 +23,15 @@ from core.shared_state import PendingPositionIntent
 # Utility shims (maybe_call, round_step, resilient_trade)
 # =============================
 try:
-    from utils import shared_state_tools, indicators, pnl_calculator
+from utils import shared_state_tools, indicators, pnl_calculator
 except Exception:
-    import asyncio as _asyncio
-    from functools import wraps as _wraps
+import asyncio as _asyncio
+from functools import wraps as _wraps
 
 def round_step(value: float, step: float) -> float:
-    if step <= 0: return float(value)
-    q = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
-    return float(q * Decimal(str(step)))
+if step <= 0: return float(value)
+q = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+return float(q * Decimal(str(step)))
 
 
 
