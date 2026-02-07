@@ -223,9 +223,9 @@ from core.rotation_authority import RotationExitAuthority
 from core.portfolio_authority import PortfolioAuthority
 from core.exit_utils import post_exit_bookkeeping
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # Type stubs for type checking only (no runtime impact)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 if TYPE_CHECKING:
     from core.shared_state import SharedState
     from core.exchange_client import ExchangeClient
