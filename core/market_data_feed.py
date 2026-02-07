@@ -578,69 +578,45 @@ class MarketDataFeed:
 
     async def run(self) -> None:
         self._logger.info("📡 MarketDataFeed run loop entered")
-        self._logger.warning(
-            f"[MDF] loop entered | accepted_symbols={list(self.shared_state.accepted_symbols.keys()) if hasattr(self.shared_state, 'accepted_symbols') else 'NONE'}"
-        )
-        sem = asyncio.Semaphore(self.max_concurrency)
-        symbols = list(self.shared_state.accepted_symbols)
-        self._logger.warning(
-            f"[MDF] symbols snapshot: {symbols} | shared_state_id={id(self.shared_state)}"
-        )
-        while not self._stop.is_set():
-            try:
-                t0 = time.perf_counter()
-                symbols = await self._get_accepted_symbols()
-                
-                if not symbols:
-                    await asyncio.sleep(1)
-                    continue
-                
-                if self._stop.is_set():
-                    break
-                tasks: List[asyncio.Task] = [
-                    asyncio.create_task(self._poll_symbol(sym, sem), name=f"mdf.poll[{sym}]") for sym in symbols
-                ]
-                if tasks:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    # classify any top-level exceptions
-                    for r in results:
-                        if isinstance(r, Exception):
-                            kind, meta = self._classify_error(r)
-                            await self._set_health(self._code_error, f"poll.batch:{kind}", metrics=meta)
 
-                latency_ms = int((time.perf_counter() - t0) * 1000)
+        while True:
+            symbols = list(self.shared_state.accepted_symbols)
 
-                # Opportunistically declare readiness once depth is satisfied
-                if not self._declared_ready and self.readiness_emit:
-                    try:
-                        depth_ok = True
-                        has_fn = getattr(self.shared_state, "has_ohlcv", None)
-                        count_fn = getattr(self.shared_state, "get_ohlcv_count", None)
-                        for s in symbols:
-                            for tf in self.timeframes:
-                                enough = False
-                                if callable(has_fn):
-                                    enough = bool(await self._maybe_await(has_fn(s, tf, self.min_bars_required)))
-                                elif callable(count_fn):
-                                    n = await self._maybe_await(count_fn(s, tf))
-                                    enough = int(n or 0) >= self.min_bars_required
-                                if not enough:
-                                    depth_ok = False
-                                    break
-                            if not depth_ok:
-                                break
-                        if depth_ok:
-                            await self._maybe_set_ready()
-                    except Exception:
-                        self._logger.debug("readiness check in run() failed", exc_info=True)
+            self._logger.debug(f"[MDF] symbols={symbols}")
 
-                await self._set_health(self._code_ok, "poll", metrics={"symbols": len(symbols), "latency_ms": latency_ms})
-            except Exception as loop_err:
-                kind, meta = self._classify_error(loop_err)
-                await self._set_health(self._code_error, f"poll.loop:{kind}", metrics=meta)
+            if not symbols:
+                await asyncio.sleep(1)
+                continue
 
-            # cadence with jitter
-            await asyncio.sleep(self.poll_interval + random.uniform(0, self.jitter_max))
+            ec = await self._get_exchange_client()
+            if ec is None:
+                await asyncio.sleep(1)
+                continue
+
+            for symbol in symbols:
+                try:
+                    price = await ec.get_current_price(symbol)
+                    await self._maybe_await(self.shared_state.update_last_price(symbol, float(price)))
+
+                    for tf in self.timeframes:
+                        ohlcv = await ec.get_ohlcv(symbol, tf, limit=3)
+                        ohlcv = self._sanitize_ohlcv(ohlcv or [])
+                        for bar_data in ohlcv:
+                            bar = {
+                                "ts": float(bar_data[0]),
+                                "o": float(bar_data[1]),
+                                "h": float(bar_data[2]),
+                                "l": float(bar_data[3]),
+                                "c": float(bar_data[4]),
+                                "v": float(bar_data[5]),
+                            }
+                            await self._maybe_await(self.shared_state.add_ohlcv(symbol, tf, bar))
+                except Exception as e:
+                    self._logger.debug(f"Failed to poll {symbol}: {e}")
+
+            await self._set_health(self._code_ok, "poll", metrics={"symbols": len(symbols)})
+
+            await asyncio.sleep(self.poll_interval)
 
     async def _poll_symbol(self, sym: str, sem: asyncio.Semaphore) -> None:
         async with sem:
