@@ -600,15 +600,10 @@ class ExecutionManager:
     # =============================
 
     def set_meta_controller(self, meta_controller):
-
-
-    self.meta_controller = meta_controller
-
+        self.meta_controller = meta_controller
 
     def set_risk_manager(self, risk_manager):
-
-
-    self.risk_manager = risk_manager
+        self.risk_manager = risk_manager
 
     # =============================
     # Utilities
