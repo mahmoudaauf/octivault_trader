@@ -1,5 +1,5 @@
 """
-MetaController (Monolithic – Transitional)
+MetaController (Monolithic - Transitional)
 
 This file currently contains multiple subsystems:
 - Orchestration
