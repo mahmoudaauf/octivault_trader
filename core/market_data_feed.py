@@ -582,6 +582,10 @@ class MarketDataFeed:
             f"[MDF] loop entered | accepted_symbols={list(self.shared_state.accepted_symbols.keys()) if hasattr(self.shared_state, 'accepted_symbols') else 'NONE'}"
         )
         sem = asyncio.Semaphore(self.max_concurrency)
+        symbols = list(self.shared_state.accepted_symbols)
+        self._logger.warning(
+            f"[MDF] symbols snapshot: {symbols} | shared_state_id={id(self.shared_state)}"
+        )
         while not self._stop.is_set():
             try:
                 t0 = time.perf_counter()
