@@ -578,6 +578,9 @@ class MarketDataFeed:
 
     async def run(self) -> None:
         self._logger.info("📡 MarketDataFeed run loop entered")
+        self._logger.warning(
+            f"[MDF] loop entered | accepted_symbols={list(self.shared_state.accepted_symbols.keys()) if hasattr(self.shared_state, 'accepted_symbols') else 'NONE'}"
+        )
         sem = asyncio.Semaphore(self.max_concurrency)
         while not self._stop.is_set():
             try:
