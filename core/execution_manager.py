@@ -121,20 +121,20 @@ use_quote_amount: Optional[float] = None):
 # =============================
 
 class ExecutionManager:
-"""
-P9 ExecutionManager — canonical single-order path, natively aligned with:
-- SharedState: get_spendable_balance(), get_position_quantity(), reserve_liquidity()/release_liquidity()
-- ExchangeClient: place_market_order(), get_exchange_filters(), get_current_price()
-"""
+    """
+    P9 ExecutionManager — canonical single-order path, natively aligned with:
+    - SharedState: get_spendable_balance(), get_position_quantity(), reserve_liquidity()/release_liquidity()
+    - ExchangeClient: place_market_order(), get_exchange_filters(), get_current_price()
+    """
 
-@staticmethod
-def _round_step_down(value: float, step: float) -> float:
-"""Safe step rounding (floor)."""
-if step <= 0: return value
-import math
-# Avoid float precision garbage
-steps = math.floor(value / step)
-return steps * step
+    @staticmethod
+    def _round_step_down(value: float, step: float) -> float:
+        """Safe step rounding (floor)."""
+        if step <= 0: return value
+        import math
+        # Avoid float precision garbage
+        steps = math.floor(value / step)
+        return steps * step
 
 # --- Post-fill realized PnL emitter (P9 observability contract) ---
 async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
