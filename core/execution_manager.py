@@ -337,17 +337,17 @@ class ExecutionManager:
         emitted = bool(post_fill or {}).get("emitted", False)
 
         if not committed:
-    try:
-    cur = float(getattr(self.shared_state, "metrics",
-            {}).get("realized_pnl", 0.0) or 0.0)
-    self.shared_state.metrics["realized_pnl"] = cur + float(realized_pnl)
-    except Exception:
-    pass
+            try:
+                cur = float(getattr(self.shared_state, "metrics",
+                        {}).get("realized_pnl", 0.0) or 0.0)
+                self.shared_state.metrics["realized_pnl"] = cur + float(realized_pnl)
+            except Exception:
+                pass
 
-    if not emitted:
-    now = time.time()
-    payload = {
-    "realized_pnl": float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0),
+        if not emitted:
+            now = time.time()
+            payload = {
+                "realized_pnl": float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0),
     "pnl_delta": float(realized_pnl),
     "symbol": sym,
     "price": exec_px,
