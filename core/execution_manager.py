@@ -708,24 +708,23 @@ class ExecutionManager:
             # State might be in flight; trigger refresh and retry
             self.logger.warning(
                 f"[PositionReady] {sym}: No qty found (attempt {attempt + 1}/{max_retries}). "
-    f"Syncing state..."
-    )
+                f"Syncing state..."
+            )
 
-    try:
-    # Force authoritative sync
-    await self.shared_state.sync_authoritative_balance(force=True)
-    except Exception as e:
-    self.logger.debug(f"[PositionReady] Sync failed: {e}")
+            try:
+                # Force authoritative sync
+                await self.shared_state.sync_authoritative_balance(force=True)
+            except Exception as e:
+                self.logger.debug(f"[PositionReady] Sync failed: {e}")
 
-    # Brief wait for state propagation (50-100ms should be sufficient)
-    # Exponential backoff: 50ms, 100ms, 150ms
-    await asyncio.sleep(0.05 * (attempt + 1))
+            # Brief wait for state propagation (50-100ms should be sufficient)
+            # Exponential backoff: 50ms, 100ms, 150ms
+            await asyncio.sleep(0.05 * (attempt + 1))
 
     # After all retries, qty is truly 0
     self.logger.info(
-    f"[PositionReady] {sym}: Confirmed no position after {max_retries} attempts")
+        f"[PositionReady] {sym}: Confirmed no position after {max_retries} attempts")
     return 0.0
-
 
     def _get_entry_price_for_sell(self, sym: str) -> float:
 
