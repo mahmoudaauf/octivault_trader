@@ -299,15 +299,15 @@ class ExecutionManager:
     async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
         return {"emitted": False, "realized_committed": False, "delta_f": None}
     def _calc_close_payload(self, sym: str, raw: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    entry_price = float(self._get_entry_price_for_sell(sym) or 0.0)
-    exec_px = float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0)
-    exec_qty = float(raw.get("executedQty", 0.0) or 0.0)
-    fee_quote = float(raw.get("fee_quote", 0.0) or raw.get("fee", 0.0) or 0.0)
-    try:
-        _, quote_asset = self._split_base_quote(sym)
-        fills = raw.get("fills") or []
-    if isinstance(fills, list):
-    fee_quote = sum(
+        entry_price = float(self._get_entry_price_for_sell(sym) or 0.0)
+        exec_px = float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0)
+        exec_qty = float(raw.get("executedQty", 0.0) or 0.0)
+        fee_quote = float(raw.get("fee_quote", 0.0) or raw.get("fee", 0.0) or 0.0)
+        try:
+            _, quote_asset = self._split_base_quote(sym)
+            fills = raw.get("fills") or []
+            if isinstance(fills, list):
+                fee_quote = sum(
     float(f.get("commission", 0.0) or 0.0)
     for f in fills
     if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
