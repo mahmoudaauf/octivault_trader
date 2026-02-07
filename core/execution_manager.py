@@ -557,22 +557,22 @@ class ExecutionManager:
     async def _emit_status(self, status: str, detail: str = ""):
         self._ensure_heartbeat()
         try:
-    # Update timestamp so Watchdog sees activity
-    if hasattr(self.shared_state, "update_timestamp"):
-    await maybe_call(self.shared_state, "update_timestamp", "ExecutionManager")
+            # Update timestamp so Watchdog sees activity
+            if hasattr(self.shared_state, "update_timestamp"):
+                await maybe_call(self.shared_state, "update_timestamp", "ExecutionManager")
 
-    upd = getattr(self.shared_state, "update_component_status", None) \
-    or getattr(self.shared_state, "set_component_status", None)
-    if callable(upd):
-    await (upd("ExecutionManager", status, detail) if asyncio.iscoroutinefunction(upd)
-       else asyncio.to_thread(upd, "ExecutionManager", status, detail))
-    except Exception:
-    self.logger.debug("EM status emit (primary) failed", exc_info=True)
-    # best-effort compatibility mirror
-    try:
-    now_ts = time.time()
-    cs = getattr(self.shared_state, "component_statuses", None)
-    if isinstance(cs, dict):
+            upd = getattr(self.shared_state, "update_component_status", None) \
+                or getattr(self.shared_state, "set_component_status", None)
+            if callable(upd):
+                await (upd("ExecutionManager", status, detail) if asyncio.iscoroutinefunction(upd)
+                   else asyncio.to_thread(upd, "ExecutionManager", status, detail))
+        except Exception:
+            self.logger.debug("EM status emit (primary) failed", exc_info=True)
+        # best-effort compatibility mirror
+        try:
+            now_ts = time.time()
+            cs = getattr(self.shared_state, "component_statuses", None)
+            if isinstance(cs, dict):
     cs["ExecutionManager"] = {"status": status,
                           "message": detail, "timestamp": now_ts, "ts": now_ts}
     except Exception:
