@@ -593,12 +593,11 @@ class ExecutionManager:
                 self._cancel_sem = asyncio.Semaphore(3)
             self._semaphores_initialized = True
         except Exception as e:
-    self.logger.debug(f"Semaphore initialization deferred: {e}")
+            self.logger.debug(f"Semaphore initialization deferred: {e}")
 
     # =============================
     # Setters
     # =============================
-
 
     def set_meta_controller(self, meta_controller):
 
