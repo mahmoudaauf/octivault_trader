@@ -496,18 +496,14 @@ class ExecutionManager:
         fee_from_pct = float(self.trade_fee_pct or 0.0) * 10000.0
         return max(cfg_val, fee_from_pct)
 
-
     def _exit_slippage_bps(self) -> float:
-
-
-    return float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 15.0)) or 0.0)
-
+        return float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 15.0)) or 0.0)
 
     async def _get_exit_floor_info(self, symbol: str, price: Optional[float] = None) -> Dict[str, float]:
-    if hasattr(self.shared_state, "compute_symbol_exit_floor"):
-    return await self.shared_state.compute_symbol_exit_floor(
-    symbol,
-    price=price,
+        if hasattr(self.shared_state, "compute_symbol_exit_floor"):
+            return await self.shared_state.compute_symbol_exit_floor(
+                symbol,
+                price=price,
     fee_bps=self._exit_fee_bps(),
     slippage_bps=self._exit_slippage_bps(),
     )
