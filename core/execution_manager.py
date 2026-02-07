@@ -522,17 +522,16 @@ class ExecutionManager:
         if min_notional_val <= 0:
             try:
                 filters = await self.exchange_client.ensure_symbol_filters_ready(symbol)
-    min_notional_val = float(self._extract_min_notional(filters) or 0.0)
-    except Exception:
-    min_notional_val = 0.0
-    min_position_floor = min_notional_val * \
-    min_notional_mult if min_notional_val > 0 else 0.0
-    return max(float(exit_info.get("min_exit_quote", 0.0)), float(base_quote), min_position_usdt, min_position_floor)
-
+                min_notional_val = float(self._extract_min_notional(filters) or 0.0)
+            except Exception:
+                min_notional_val = 0.0
+        min_position_floor = min_notional_val * \
+            min_notional_mult if min_notional_val > 0 else 0.0
+        return max(float(exit_info.get("min_exit_quote", 0.0)), float(base_quote), min_position_usdt, min_position_floor)
 
     async def _heartbeat_loop(self):
-    """Continuous heartbeat to satisfy Watchdog when no trades are occurring."""
-    while True:
+        """Continuous heartbeat to satisfy Watchdog when no trades are occurring."""
+        while True:
     try:
     await self._emit_status("Operational", "Idle / Ready")
     except Exception:
