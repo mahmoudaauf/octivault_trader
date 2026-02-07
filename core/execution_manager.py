@@ -11,6 +11,7 @@ import contextlib
 from contextlib import asynccontextmanager
 from collections import deque
 import logging
+import json
 import time
 from decimal import Decimal, ROUND_DOWN
 # uuid import removed (unused)
@@ -143,12 +144,15 @@ class ExecutionManager:
         return steps * step
 
     # --- Post-fill realized PnL emitter (P9 observability contract) ---
-    async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None):
+    async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
         """
         Best-effort: compute/record realized PnL delta when a trade fills, then emit
         a `RealizedPnlUpdated` event and persist the delta via SharedState if possible.
         This is tolerant to different SharedState contract shapes.
         """
+        emitted = False
+        realized_committed = False
+        delta_f = None
         try:
             sym = self._norm_symbol(symbol)
             side_u = (side or "").upper()
@@ -158,6 +162,7 @@ class ExecutionManager:
                 return
 
             ss = self.shared_state
+            realized_before = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
 
             fee_quote = float(order.get("fee_quote", 0.0) or order.get("fee", 0.0) or 0.0)
             fee_base = float(order.get("fee_base", 0.0) or 0.0)
@@ -214,14 +219,38 @@ class ExecutionManager:
                 if isinstance(res, dict):
                     delta = res.get("realized_pnl_delta") or res.get("pnl_delta")
 
-            # If we have a delta, persist and emit
-            if delta is not None:
-                try:
-                    delta_f = float(delta)
-                except Exception:
-                    delta_f = None
+            realized_after = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
+            realized_committed = realized_after != realized_before
+
+            # If we have a delta or no commit happened, persist and emit
+            if delta is not None or (side_u == "SELL" and not realized_committed):
+                if delta is not None:
+                    try:
+                        delta_f = float(delta)
+                    except Exception:
+                        delta_f = None
+                if delta_f is None and side_u == "SELL" and not realized_committed:
+                    try:
+                        pos = getattr(ss, "positions", {}).get(sym, {}) if hasattr(ss, "positions") else {}
+                        entry = float(pos.get("avg_price", 0.0) or 0.0)
+                        if entry <= 0:
+                            ot = getattr(ss, "open_trades", {}).get(sym, {}) if hasattr(ss, "open_trades") else {}
+                            entry = float(ot.get("entry_price", 0.0) or 0.0)
+                        side_hint = str(pos.get("side") or pos.get("position") or "long").lower()
+                        if entry > 0:
+                            if side_hint in ("short", "sell"):
+                                delta_f = (entry - price) * exec_qty - fee_quote
+                            else:
+                                delta_f = (price - entry) * exec_qty - fee_quote
+                    except Exception:
+                        delta_f = None
+
                 if delta_f is not None and delta_f != 0.0:
                     now = time.time()
+                    try:
+                        ss.metrics["realized_pnl"] = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0) + delta_f
+                    except Exception:
+                        pass
                     # Persist via public API when available
                     if hasattr(ss, "append_realized_pnl_delta"):
                         with contextlib.suppress(Exception):
@@ -247,8 +276,79 @@ class ExecutionManager:
                         payload["nav_quote"] = nav_q
                     with contextlib.suppress(Exception):
                         await maybe_call(ss, "emit_event", "RealizedPnlUpdated", payload)
+                        emitted = True
         except Exception:
             self.logger.debug("post-fill PnL handler failed (non-fatal)", exc_info=True)
+        return {
+            "delta": delta_f,
+            "realized_committed": realized_committed,
+            "emitted": emitted,
+        }
+
+    def _calc_close_payload(self, sym: str, raw: Dict[str, Any]) -> Tuple[float, float, float, float]:
+        entry_price = float(self._get_entry_price_for_sell(sym) or 0.0)
+        exec_px = float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0)
+        exec_qty = float(raw.get("executedQty", 0.0) or 0.0)
+        fee_quote = float(raw.get("fee_quote", 0.0) or raw.get("fee", 0.0) or 0.0)
+        try:
+            _, quote_asset = self._split_base_quote(sym)
+            fills = raw.get("fills") or []
+            if isinstance(fills, list):
+                fee_quote = sum(
+                    float(f.get("commission", 0.0) or 0.0)
+                    for f in fills
+                    if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
+                ) or fee_quote
+        except Exception:
+            pass
+
+        realized_pnl = 0.0
+        pos = getattr(self.shared_state, "positions", {}).get(sym, {}) if hasattr(self.shared_state, "positions") else {}
+        side_hint = str(pos.get("side") or pos.get("position") or "long").lower()
+        if entry_price > 0 and exec_px > 0 and exec_qty > 0:
+            if side_hint in ("short", "sell"):
+                realized_pnl = (entry_price - exec_px) * exec_qty - fee_quote
+            else:
+                realized_pnl = (exec_px - entry_price) * exec_qty - fee_quote
+
+        return entry_price, exec_px, exec_qty, realized_pnl
+
+    async def _emit_close_events(self, sym: str, raw: Dict[str, Any], post_fill: Optional[Dict[str, Any]] = None) -> None:
+        entry_price, exec_px, exec_qty, realized_pnl = self._calc_close_payload(sym, raw)
+        if exec_qty <= 0 or exec_px <= 0:
+            return
+
+        committed = bool(post_fill or {}).get("realized_committed", False)
+        emitted = bool(post_fill or {}).get("emitted", False)
+
+        if not committed:
+            try:
+                cur = float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
+                self.shared_state.metrics["realized_pnl"] = cur + float(realized_pnl)
+            except Exception:
+                pass
+
+        if not emitted:
+            now = time.time()
+            payload = {
+                "realized_pnl": float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0),
+                "pnl_delta": float(realized_pnl),
+                "symbol": sym,
+                "price": exec_px,
+                "qty": exec_qty,
+                "timestamp": now,
+            }
+            with contextlib.suppress(Exception):
+                await maybe_call(self.shared_state, "emit_event", "RealizedPnlUpdated", payload)
+
+        self.logger.info(json.dumps({
+            "event": "POSITION_CLOSED",
+            "symbol": sym,
+            "entry_price": entry_price,
+            "exit_price": exec_px,
+            "qty": exec_qty,
+            "realized_pnl": realized_pnl,
+        }, separators=(",", ":")))
 
     # Consider consolidating _split_symbol_quote and _split_base_quote to avoid drift.
     def _split_base_quote(self, symbol: str) -> Tuple[str, str]:
@@ -374,10 +474,21 @@ class ExecutionManager:
             )
         return {"min_exit_quote": 0.0, "min_notional": 0.0}
 
-    async def _get_min_entry_quote(self, symbol: str, price: Optional[float] = None) -> float:
+    async def _get_min_entry_quote(self, symbol: str, price: Optional[float] = None, min_notional: Optional[float] = None) -> float:
         base_quote = float(getattr(self.config, "DEFAULT_PLANNED_QUOTE", getattr(self.config, "MIN_ENTRY_QUOTE_USDT", 0.0)) or 0.0)
         exit_info = await self._get_exit_floor_info(symbol, price=price)
-        return max(float(exit_info.get("min_exit_quote", 0.0)), float(base_quote))
+
+        min_position_usdt = float(getattr(self.config, "MIN_POSITION_USDT", 0.0) or 0.0)
+        min_notional_mult = float(getattr(self.config, "MIN_POSITION_MIN_NOTIONAL_MULT", 2.0) or 2.0)
+        min_notional_val = float(min_notional or 0.0)
+        if min_notional_val <= 0:
+            try:
+                filters = await self.exchange_client.ensure_symbol_filters_ready(symbol)
+                min_notional_val = float(self._extract_min_notional(filters) or 0.0)
+            except Exception:
+                min_notional_val = 0.0
+        min_position_floor = min_notional_val * min_notional_mult if min_notional_val > 0 else 0.0
+        return max(float(exit_info.get("min_exit_quote", 0.0)), float(base_quote), min_position_usdt, min_position_floor)
 
     async def _heartbeat_loop(self):
         """Continuous heartbeat to satisfy Watchdog when no trades are occurring."""
@@ -585,6 +696,54 @@ class ExecutionManager:
         except Exception:
             return 0.0
 
+    def _entry_profitability_feasible(
+        self,
+        symbol: Optional[str] = None,
+        price: Optional[float] = None,
+        atr_pct: Optional[float] = None,
+    ) -> Tuple[bool, Dict[str, float]]:
+        """Check if TP max can clear required exit move and net-profit floor."""
+        trade_fee_pct = float(getattr(self.config, "TRADE_FEE_PCT", 0.0) or 0.0)
+        exit_fee_bps = float(getattr(self.config, "EXIT_FEE_BPS", 0.0) or 0.0)
+        fee_bps = max(exit_fee_bps, trade_fee_pct * 10000.0)
+        r_fee = fee_bps / 10000.0
+        r_slip = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", 0.0) or 0.0) / 10000.0
+        r_buf = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
+        m_entry = float(getattr(self.config, "MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
+        m_exit = float(getattr(self.config, "MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
+        m_exit = max(m_exit, m_entry)
+
+        r_req = (2.0 * r_fee * m_exit) + r_slip + r_buf
+        r_min_net = float(getattr(self.config, "MIN_NET_PROFIT_AFTER_FEES", 0.0) or 0.0)
+        min_tp_needed_for_net = r_min_net + (2.0 * r_fee) + r_slip
+        required_tp = max(r_req, min_tp_needed_for_net)
+        tp_pct_min = float(getattr(self.config, "TP_PCT_MIN", 0.0) or 0.0)
+        tp_max_cfg = float(getattr(self.config, "TP_PCT_MAX", 0.0) or 0.0)
+        tp_atr_mult = float(getattr(self.config, "TP_ATR_MULT", 0.0) or 0.0)
+        if atr_pct is None or atr_pct <= 0:
+            atr_pct = float(getattr(self.config, "TPSL_FALLBACK_ATR_PCT", 0.0) or 0.0)
+
+        tp_from_atr = (atr_pct * tp_atr_mult) if (atr_pct > 0 and tp_atr_mult > 0) else 0.0
+        tp_max = tp_max_cfg if tp_max_cfg > 0 else max(tp_from_atr, tp_pct_min)
+
+        detail = {
+            "required_exit": r_req,
+            "min_net_required": min_tp_needed_for_net,
+            "required_tp": required_tp,
+            "tp_max": tp_max,
+            "fee_bps": fee_bps,
+            "slippage_bps": float(getattr(self.config, "EXIT_SLIPPAGE_BPS", 0.0) or 0.0),
+            "buffer_bps": float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0),
+            "exit_fee_mult": m_exit,
+            "price": float(price or 0.0),
+            "atr_pct": float(atr_pct or 0.0),
+            "tp_from_atr": float(tp_from_atr),
+            "tp_min": tp_pct_min,
+        }
+        if tp_max <= 0 or tp_max < required_tp:
+            return False, detail
+        return True, detail
+
     async def _check_sell_net_pnl_gate(
         self,
         *,
@@ -650,8 +809,40 @@ class ExecutionManager:
         slippage_bps = float(self._exit_slippage_bps() or 0.0)
         fee_pct_total = (fee_bps / 10000.0) * 2.0
         slippage_pct = slippage_bps / 10000.0
+        buffer_pct = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
+        entry_fee_mult = float(getattr(self.config, "MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
+        exit_fee_mult = float(getattr(self.config, "MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
+        exit_fee_mult = max(exit_fee_mult, entry_fee_mult)
         net_after_fees_pct = expected_move_pct - fee_pct_total - slippage_pct
         min_net_pct = float(self.min_net_profit_after_fees_pct or 0.0)
+        required_move_pct = (fee_pct_total * exit_fee_mult) + slippage_pct + buffer_pct
+        if expected_move_pct < required_move_pct:
+            self.logger.info(
+                "[EM:SellNetPctGate] Blocked SELL %s: move=%.4f%% < required=%.4f%% (fee_mult=%.2f fees=%.4f%% slip=%.4f%% buffer=%.4f%%)",
+                sym,
+                expected_move_pct * 100.0,
+                required_move_pct * 100.0,
+                exit_fee_mult,
+                fee_pct_total * 100.0,
+                slippage_pct * 100.0,
+                buffer_pct * 100.0,
+            )
+            try:
+                await self.shared_state.record_rejection(sym, "SELL", "SELL_BELOW_FEES", source="ExecutionManager")
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "sell_below_fees",
+                "error_code": "SELL_BELOW_FEES",
+                "expected_move_pct": expected_move_pct,
+                "required_move_pct": required_move_pct,
+                "fee_mult": exit_fee_mult,
+                "fee_bps": fee_bps,
+                "slippage_bps": slippage_bps,
+                "buffer_bps": float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0),
+            }
         if min_net_pct > 0 and net_after_fees_pct < min_net_pct:
             self.logger.info(
                 "[EM:SellNetPctGate] Blocked SELL %s: net_after_fees=%.4f%% < min=%.4f%% (move=%.4f%% fees=%.4f%% slip=%.4f%%)",
@@ -919,6 +1110,35 @@ class ExecutionManager:
         # Use SharedState.emit_event (exists) — not append_event
         await maybe_call(self.shared_state, "emit_event", "ExecEvent", event)
 
+    async def _emit_trade_executed_event(
+        self,
+        symbol: str,
+        side: str,
+        tag: str,
+        order: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        tag_lower = str(tag or "").lower()
+        if side.lower() != "sell" or "tp_sl" not in tag_lower:
+            return
+        payload = {
+            "ts": time.time(),
+            "symbol": symbol,
+            "side": side.upper(),
+            "tag": tag,
+            "source": "ExecutionManager",
+        }
+        if isinstance(order, dict):
+            payload.update({
+                "executed_qty": float(order.get("executedQty", 0.0) or 0.0),
+                "avg_price": float(order.get("avgPrice", order.get("price", 0.0)) or 0.0),
+                "order_id": order.get("orderId") or order.get("order_id") or order.get("exchange_order_id"),
+                "status": str(order.get("status", "")).lower(),
+            })
+        try:
+            await maybe_call(self.shared_state, "emit_event", "TRADE_EXECUTED", payload)
+        except Exception:
+            pass
+
     async def _on_order_failed(self, symbol: str, side: str, reason: str, quote: Optional[float] = None):
         """
         GAP #2 FIX: Called when an order fails. Triggers pruning if capital is tight.
@@ -966,7 +1186,7 @@ class ExecutionManager:
     def _sanitize_tag(self, tag: Optional[str]) -> str:
         s = (tag or "meta/Agent")
         # ensure P9-compliant namespace
-        if not (s.startswith("meta/") or s in ("balancer", "liquidation", "tp_sl")):
+        if not (s.startswith("meta/") or s in ("balancer", "liquidation", "tp_sl", "rebalance", "meta_exit")):
             s = "meta/" + s
         out = []
         for ch in s:
@@ -1109,6 +1329,29 @@ class ExecutionManager:
                  # Failing is safer for affordability checks.
                  return (False, Decimal("0"), "PRICE_UNAVAILABLE")
 
+            atr_pct = 0.0
+            try:
+                if hasattr(self.shared_state, "calc_atr"):
+                    atr = float(await self.shared_state.calc_atr(sym, "5m", 14) or 0.0)
+                    if atr <= 0:
+                        atr = float(await self.shared_state.calc_atr(sym, "1m", 14) or 0.0)
+                    if atr and price > 0:
+                        atr_pct = float(atr) / float(price)
+            except Exception:
+                atr_pct = 0.0
+
+            feasible, feas_detail = self._entry_profitability_feasible(sym, price=price, atr_pct=atr_pct)
+            if not feasible:
+                payload = {
+                    "reason": "INFEASIBLE_PROFITABILITY",
+                    "symbol": sym,
+                    **feas_detail,
+                }
+                self.logger.warning("[EM:ProfitFeasibility] Block BUY: %s", payload)
+                with contextlib.suppress(Exception):
+                    await maybe_call(self.shared_state, "emit_event", "EntryProfitabilityBlocked", payload)
+                return (False, Decimal("0"), "INFEASIBLE_PROFITABILITY")
+
             # Micro-trade kill switch: low equity + low volatility
             if getattr(self.config, "MICRO_TRADE_KILL_SWITCH_ENABLED", False):
                 nav = await self.shared_state.get_nav()
@@ -1150,7 +1393,7 @@ class ExecutionManager:
                 return (False, Decimal("0"), f"invalid_min_notional({min_notional})")
 
             # Dynamic exit-feasibility floor (symbol-aware)
-            min_required_val = await self._get_min_entry_quote(sym, price=price)
+            min_required_val = await self._get_min_entry_quote(sym, price=price, min_notional=float(min_notional))
             min_required = Decimal(str(min_required_val))
 
             # Planned-quote fee floor (planned_quote >= fee_mult × round-trip fee on min-required quote)
@@ -1387,6 +1630,67 @@ class ExecutionManager:
     # =============================
     # Canonical execution API
     # =============================
+    async def close_position(
+        self,
+        *,
+        symbol: str,
+        reason: str = "",
+        force_finalize: bool = False,
+        tag: str = "tp_sl",
+    ) -> Dict[str, Any]:
+        """Close a position via the canonical execution path with optional forced finalization."""
+        reason_text = str(reason or "").strip() or "EXIT"
+        policy_context = {
+            "exit_reason": reason_text,
+            "reason": reason_text,
+            "liquidation_reason": reason_text,
+        }
+        res = await self.execute_trade(
+            symbol=symbol,
+            side="sell",
+            quantity=None,
+            planned_quote=None,
+            tag=tag,
+            is_liquidation=True,
+            policy_context=policy_context,
+        )
+        if force_finalize:
+            try:
+                status = str(res.get("status", "")).lower() if isinstance(res, dict) else ""
+                ok = bool(res.get("ok")) if isinstance(res, dict) else False
+                if ok or status in {"placed", "executed", "filled", "partially_filled"}:
+                    await self._force_finalize_position(symbol, reason_text)
+            except Exception:
+                self.logger.debug("[EM] force_finalize_position failed for %s", symbol, exc_info=True)
+        return res
+
+    async def _force_finalize_position(self, symbol: str, reason: str) -> None:
+        """Best-effort: mark a position as closed in SharedState after an exit."""
+        ss = self.shared_state
+        sym = self._norm_symbol(symbol)
+        try:
+            pos = None
+            if hasattr(ss, "positions") and isinstance(ss.positions, dict):
+                pos = ss.positions.get(sym)
+            if pos is None:
+                pos = await maybe_call(ss, "get_position", sym)
+            if not isinstance(pos, dict):
+                pos = {}
+            updated = dict(pos)
+            updated["quantity"] = 0.0
+            updated["status"] = "CLOSED"
+            updated["closed_reason"] = reason
+            updated["closed_at"] = time.time()
+            await maybe_call(ss, "update_position", sym, updated)
+        except Exception:
+            self.logger.debug("[EM] Failed to update position as CLOSED for %s", sym, exc_info=True)
+        try:
+            ot = getattr(ss, "open_trades", None)
+            if isinstance(ot, dict):
+                ot.pop(sym, None)
+        except Exception:
+            pass
+
     async def execute_trade(
         self,
         *,
@@ -1605,8 +1909,55 @@ class ExecutionManager:
                 except Exception as e:
                     self.logger.debug(f"[MemoryOfFailure] Failed to clear: {e}")
                 
+                post_fill = None
                 with contextlib.suppress(Exception):
-                    await self._handle_post_fill(sym, side, raw, tier=tier)
+                    post_fill = await self._handle_post_fill(sym, side, raw, tier=tier)
+
+                with contextlib.suppress(Exception):
+                    await self._emit_close_events(sym, raw, post_fill)
+
+                with contextlib.suppress(Exception):
+                    await self._emit_trade_executed_event(sym, side, tag_raw, raw)
+
+                # Close position explicitly on liquidation SELL fills
+                try:
+                    pm = getattr(self.shared_state, "position_manager", None)
+                    exec_qty = float(raw.get("executedQty", 0.0))
+                    exec_px = float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0)
+                    fee_quote = float(raw.get("fee_quote", 0.0) or raw.get("fee", 0.0) or 0.0)
+                    try:
+                        _, quote_asset = self._split_base_quote(sym)
+                        fills = raw.get("fills") or []
+                        if isinstance(fills, list):
+                            fee_quote = sum(
+                                float(f.get("commission", 0.0) or 0.0)
+                                for f in fills
+                                if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
+                            ) or fee_quote
+                    except Exception:
+                        pass
+                    if pm and hasattr(pm, "close_position"):
+                        await pm.close_position(
+                            symbol=sym,
+                            executed_qty=exec_qty,
+                            executed_price=exec_px,
+                            fee_quote=fee_quote,
+                            reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
+                        )
+                    elif pm and hasattr(pm, "finalize_position"):
+                        await pm.finalize_position(
+                            symbol=sym,
+                            executed_qty=exec_qty,
+                            executed_price=exec_px,
+                            reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
+                        )
+                    elif hasattr(self.shared_state, "close_position"):
+                        await self.shared_state.close_position(
+                            sym,
+                            reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
+                        )
+                except Exception:
+                    self.logger.debug("[EM] finalize_position failed for %s", sym, exc_info=True)
                 
                 result = {
                     "ok": True,
@@ -1892,14 +2243,15 @@ class ExecutionManager:
                                 await self.shared_state.add_to_accumulation(sym, "BUY", execute_quote)
                                 return {"ok": True, "status": "accumulating", "reason": "intent_claimed_restarting"}
 
-                        raw = await self._place_market_order_quote(
-                            sym,
-                            execute_quote,
-                            clean_tag,
-                            policy_validated=policy_validated,
-                            is_liquidation=is_liq_full,
-                            decision_id=decision_id,
-                        )
+                        order = await self.exchange_client.market_buy(sym, execute_quote, tag=clean_tag)
+                        filled_qty = float(order.get("executedQty", 0.0) or 0.0)
+                        avg_price = 0.0
+                        if filled_qty > 0:
+                            avg_price = float(order.get("cummulativeQuoteQty", 0.0) or 0.0) / filled_qty
+                        if avg_price > 0:
+                            order.setdefault("avgPrice", avg_price)
+                            order.setdefault("price", avg_price)
+                        raw = order
                     else:
                         if not quantity or quantity <= 0:
                             await self._log_execution_event("order_skip", sym, {"side": "buy", "reason": "InvalidQuantity"})
@@ -2037,10 +2389,89 @@ class ExecutionManager:
                         self._buy_block_state.pop(sym, None)
                 except Exception as e:
                     self.logger.debug(f"[MemoryOfFailure] Failed to clear rejections: {e}")
+
+                # Ensure BUY positions have an entry timestamp for time-based exits.
+                if side == "buy":
+                    try:
+                        now_ts = time.time()
+                        pos = {}
+                        if hasattr(self.shared_state, "positions") and isinstance(self.shared_state.positions, dict):
+                            pos = dict(self.shared_state.positions.get(sym, {}) or {})
+                        if pos and not pos.get("opened_at"):
+                            pos["opened_at"] = now_ts
+                            if hasattr(self.shared_state, "update_position"):
+                                await self.shared_state.update_position(sym, pos)
+                            else:
+                                self.shared_state.positions[sym] = pos
+                        ot = getattr(self.shared_state, "open_trades", None)
+                        if isinstance(ot, dict):
+                            tr = dict(ot.get(sym, {}) or {})
+                            if tr and not tr.get("opened_at"):
+                                tr["opened_at"] = now_ts
+                                ot[sym] = tr
+                    except Exception as e:
+                        self.logger.debug("[EM] Failed to set opened_at for %s: %s", sym, e)
                 
                 # Emit realized PnL delta if SharedState can compute it
+                post_fill = None
                 with contextlib.suppress(Exception):
-                    await self._handle_post_fill(sym, side, raw, tier=tier)
+                    post_fill = await self._handle_post_fill(sym, side, raw, tier=tier)
+
+                if side == "sell":
+                    with contextlib.suppress(Exception):
+                        await self._emit_close_events(sym, raw, post_fill)
+
+                with contextlib.suppress(Exception):
+                    await self._emit_trade_executed_event(sym, side, tag_raw, raw)
+
+                # Finalize position on SELL fills
+                if side == "sell":
+                    try:
+                        pm = getattr(self.shared_state, "position_manager", None)
+                        exec_qty = float(raw.get("executedQty", 0.0))
+                        exec_px = float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0)
+                        fee_quote = float(raw.get("fee_quote", 0.0) or raw.get("fee", 0.0) or 0.0)
+                        try:
+                            _, quote_asset = self._split_base_quote(sym)
+                            fills = raw.get("fills") or []
+                            if isinstance(fills, list):
+                                fee_quote = sum(
+                                    float(f.get("commission", 0.0) or 0.0)
+                                    for f in fills
+                                    if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
+                                ) or fee_quote
+                        except Exception:
+                            pass
+                        if pm and hasattr(pm, "close_position"):
+                            await pm.close_position(
+                                symbol=sym,
+                                executed_qty=exec_qty,
+                                executed_price=exec_px,
+                                fee_quote=fee_quote,
+                                reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
+                            )
+                        elif pm and hasattr(pm, "finalize_position"):
+                            await pm.finalize_position(
+                                symbol=sym,
+                                executed_qty=exec_qty,
+                                executed_price=exec_px,
+                                reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
+                            )
+                        elif hasattr(self.shared_state, "close_position"):
+                            await self.shared_state.close_position(
+                                sym,
+                                reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
+                            )
+                        if hasattr(self.shared_state, "mark_position_closed"):
+                            await self.shared_state.mark_position_closed(
+                                symbol=sym,
+                                qty=exec_qty,
+                                price=exec_px,
+                                reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
+                                tag=str(tag_raw or ""),
+                            )
+                    except Exception:
+                        self.logger.debug("[EM] finalize_position failed for %s", sym, exc_info=True)
 
                 result = {
                     "ok": True,
@@ -2450,7 +2881,7 @@ class ExecutionManager:
 
                     # Enforce both venue min_notional (with buffer) and minimal execution floor
                     # PHASE 2 NOTE: Capital floor check already done in MetaController
-                    min_entry = await self._get_min_entry_quote(symbol, price=current_price)
+                    min_entry = await self._get_min_entry_quote(symbol, price=current_price, min_notional=min_notional)
                     if spend < min_entry:
                         await self._log_execution_event("order_skip", symbol, {"side": "BUY", "reason": "NOTIONAL_LT_MIN", "min_required": min_entry})
                         return None

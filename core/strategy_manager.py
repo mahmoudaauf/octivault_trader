@@ -178,6 +178,13 @@ class StrategyManager:
     def _cooldown_left(self, symbol: str) -> float:
         """Seconds of cooldown left for a symbol (0 if none)."""
         last = float(self._last_signal_ts_per_symbol.get(symbol, 0.0))
+        try:
+            if hasattr(self.shared_state, "get_last_exit_ts"):
+                last = max(last, float(self.shared_state.get_last_exit_ts(symbol) or 0.0))
+            elif hasattr(self.shared_state, "last_exit_ts"):
+                last = max(last, float(self.shared_state.last_exit_ts.get(symbol, 0.0) or 0.0))
+        except Exception:
+            pass
         cd = float(self.order_guard_cooldown_s or 0.0)
         if cd <= 0:
             return 0.0

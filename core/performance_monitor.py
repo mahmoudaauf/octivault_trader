@@ -76,6 +76,10 @@ class PerformanceMonitor:
         km.setdefault("per_agent", {})
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self._profitability_last_ts: float = 0.0
+        self._profitability_interval_sec: float = float(
+            getattr(self.cfg, "PROFITABILITY_STATUS_INTERVAL_SEC", 3600) or 3600
+        )
 
     # ----------------------------
     # Public recording API
@@ -155,6 +159,66 @@ class PerformanceMonitor:
         except Exception:
             self.log.debug("PerformanceSnapshot emit failed", exc_info=True)
 
+    def _profitability_snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        window_sec = float(
+            getattr(self.cfg, "PROFITABILITY_STATUS_WINDOW_SEC", self._profitability_interval_sec)
+            or self._profitability_interval_sec
+        )
+        cutoff = now - max(1.0, window_sec)
+
+        trades = []
+        try:
+            for t in list(getattr(self.ss, "trade_history", []) or []):
+                ts = float(t.get("ts", 0.0) or 0.0)
+                if ts >= cutoff and str(t.get("side", "")).upper() == "SELL":
+                    trades.append(t)
+        except Exception:
+            trades = []
+
+        pnl_values = [float(t.get("realized_delta", 0.0) or 0.0) for t in trades]
+        wins = [v for v in pnl_values if v > 0]
+        losses = [v for v in pnl_values if v < 0]
+        trades_count = len(pnl_values)
+        win_rate = (len(wins) / trades_count) if trades_count else 0.0
+        avg_win = (sum(wins) / len(wins)) if wins else 0.0
+        avg_loss = (sum(losses) / len(losses)) if losses else 0.0
+
+        fee_total = 0.0
+        try:
+            fee_total = sum(float(t.get("fee_quote", 0.0) or 0.0) for t in trades)
+        except Exception:
+            fee_total = 0.0
+
+        gross_abs_pnl = sum(abs(v) for v in pnl_values)
+        fee_ratio = (fee_total / gross_abs_pnl) if gross_abs_pnl > 0 else 0.0
+        expectancy = (win_rate * avg_win) + ((1.0 - win_rate) * avg_loss) if trades_count else 0.0
+
+        return {
+            "trades": trades_count,
+            "win_rate": round(win_rate, 6),
+            "avg_win": round(avg_win, 6),
+            "avg_loss": round(avg_loss, 6),
+            "fee_ratio": round(fee_ratio, 6),
+            "expectancy": round(expectancy, 6),
+            "window_sec": int(window_sec),
+        }
+
+    async def _maybe_emit_profitability_status(self) -> None:
+        now = time.time()
+        if (now - self._profitability_last_ts) < max(1.0, self._profitability_interval_sec):
+            return
+        self._profitability_last_ts = now
+        payload = {"ts": _iso(now), **self._profitability_snapshot()}
+        try:
+            self.log.info("ProfitabilityStatus %s", payload)
+        except Exception:
+            pass
+        try:
+            await _call(self.sstools, "emit_event", "ProfitabilityStatus", payload)
+        except Exception:
+            self.log.debug("ProfitabilityStatus emit failed", exc_info=True)
+
     # ----------------------------
     # Run loop
     # ----------------------------
@@ -177,6 +241,7 @@ class PerformanceMonitor:
                     snap = self._snapshot_now()
                     await self._emit_snapshot_event(snap)
                     await self._emit_health("Running", "OK")
+                    await self._maybe_emit_profitability_status()
                 except Exception as e:
                     await self._emit_health("Error", f"monitor error: {e!r}")
                     self.log.exception("PerformanceMonitor cycle failed")

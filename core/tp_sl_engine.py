@@ -6,6 +6,7 @@ from inspect import iscoroutine
 from typing import Optional, List, Dict, Any, Tuple
 from math import fsum
 from utils.shared_state_tools import fee_bps
+from core.exit_utils import post_exit_bookkeeping
 
 class TPSLEngine:
     """
@@ -43,6 +44,18 @@ class TPSLEngine:
         self._session_start = time.monotonic()  # Track when this session started
         self._last_close_attempt: Dict[str, float] = {}
         self._tp_floor_hit: Dict[str, bool] = {}
+        self._last_tp_sl_method: Dict[str, str] = {}
+        self._last_profit_audit_ts: Dict[str, float] = {}
+        self._price_stale_sec = float(getattr(self.config, "TPSL_PRICE_STALE_SEC", 120.0) or 120.0)
+        self._ohlcv_stale_sec = float(getattr(self.config, "TPSL_OHLCV_STALE_SEC", 300.0) or 300.0)
+        self._min_notional_safety = float(getattr(self.config, "TPSL_MIN_NOTIONAL_SAFETY", 1.0) or 1.0)
+        # Default strategy contract: hybrid ATR targets + time-based exits
+        self._tp_sl_strategy = str(getattr(self.config, "TPSL_STRATEGY", "hybrid_atr_time") or "hybrid_atr_time")
+        self._tp_sl_calc_model = str(getattr(self.config, "TPSL_CALC_MODEL", "atr_pct") or "atr_pct")
+        self._status_timeout_sec = float(getattr(self.config, "TPSL_STATUS_TIMEOUT_SEC", 1.0) or 1.0)
+        self._profit_audit_enabled = bool(getattr(self.config, "TPSL_PROFIT_AUDIT", False))
+        self._profit_audit_sec = float(getattr(self.config, "TPSL_PROFIT_AUDIT_SEC", 300.0) or 300.0)
+        self._time_exit_enabled = bool(getattr(self.config, "TPSL_TIME_EXIT_ENABLED", False))
     async def start(self):
         """
         P9 contract: start() creates the monitoring task and emits an initial status.
@@ -64,20 +77,7 @@ class TPSLEngine:
             self.logger.debug("TPSL auto-arm on startup failed (non-fatal)", exc_info=True)
             
         self._task = asyncio.create_task(self.run())
-        try:
-            # Component name kept as 'TPSLEngine' to match this module's logging
-            await self.shared_state.update_component_status("TPSLEngine", "Initialized", "Ready")
-            # Legacy alias (some watchdogs still expect this key)
-            await self.shared_state.update_component_status("TP_SLEngine", "Initialized", "Ready")
-            if hasattr(self.shared_state, "update_timestamp"):
-                res = self.shared_state.update_timestamp("TPSLEngine")
-                if iscoroutine(res):
-                    await res
-                res = self.shared_state.update_timestamp("TP_SLEngine")
-                if iscoroutine(res):
-                    await res
-        except Exception:
-            self.logger.debug("TPSLEngine initial health update failed", exc_info=True)
+        await self._safe_status_update("Initialized", "Ready")
 
     async def _auto_arm_existing_trades(self) -> None:
         """Ensure TP/SL is set for existing open positions at startup."""
@@ -151,34 +151,64 @@ class TPSLEngine:
         """Continuous heartbeat to satisfy Watchdog when no trades exist or loop is gated."""
         while True:
             try:
-                if hasattr(self.shared_state, "update_timestamp"):
-                    res = self.shared_state.update_timestamp("TPSLEngine")
-                    if iscoroutine(res):
-                        await res
-                
-                # Report 'Operational' even if idle
-                uh = getattr(self.shared_state, "update_system_health", None)
-                if callable(uh):
-                    res = uh(
-                        component="TPSLEngine",
-                        status="Operational",
-                        message="Heartbeat: Active / Monitoring"
-                    )
-                    if iscoroutine(res):
-                        await res
-                # Also update component-status store for Watchdog freshness
-                cs = getattr(self.shared_state, "update_component_status", None)
-                if callable(cs):
-                    res = cs("TPSLEngine", "Operational", "Heartbeat: Active / Monitoring")
-                    if iscoroutine(res):
-                        await res
-                    res = cs("TP_SLEngine", "Operational", "Heartbeat: Active / Monitoring")
-                    if iscoroutine(res):
-                        await res
+                await self._safe_status_update("Operational", "Heartbeat: Active / Monitoring")
                 _emit_health(self.shared_state, "Operational", "Heartbeat: Active / Monitoring")
             except Exception:
                 pass
             await asyncio.sleep(60)
+
+    async def _safe_status_update(self, status: str, message: str) -> None:
+        ts = time.time()
+        try:
+            if hasattr(self.shared_state, "update_timestamp"):
+                res = self.shared_state.update_timestamp("TPSLEngine")
+                if iscoroutine(res):
+                    await res
+                res = self.shared_state.update_timestamp("TP_SLEngine")
+                if iscoroutine(res):
+                    await res
+        except Exception:
+            pass
+        try:
+            statuses = getattr(self.shared_state, "component_statuses", None)
+            if isinstance(statuses, dict):
+                statuses["TPSLEngine"] = {
+                    "status": status,
+                    "message": message,
+                    "timestamp": ts,
+                    "ts": ts,
+                }
+                statuses["TP_SLEngine"] = {
+                    "status": status,
+                    "message": message,
+                    "timestamp": ts,
+                    "ts": ts,
+                }
+            last_seen = getattr(self.shared_state, "component_last_seen", None)
+            if isinstance(last_seen, dict):
+                last_seen["TPSLEngine"] = ts
+                last_seen["TP_SLEngine"] = ts
+        except Exception:
+            pass
+        try:
+            uh = getattr(self.shared_state, "update_system_health", None)
+            if callable(uh):
+                res = uh(component="TPSLEngine", status=status, message=message)
+                if iscoroutine(res):
+                    await asyncio.wait_for(res, timeout=self._status_timeout_sec)
+        except Exception:
+            pass
+        try:
+            cs = getattr(self.shared_state, "update_component_status", None)
+            if callable(cs):
+                res = cs("TPSLEngine", status, message)
+                if iscoroutine(res):
+                    await asyncio.wait_for(res, timeout=self._status_timeout_sec)
+                res = cs("TP_SLEngine", status, message)
+                if iscoroutine(res):
+                    await asyncio.wait_for(res, timeout=self._status_timeout_sec)
+        except Exception:
+            pass
 
     # ---------- small helpers ----------
 
@@ -199,6 +229,37 @@ class TPSLEngine:
         except Exception:
             # very chatty when exc_info=True; keep quiet on TPSL hot path
             self.logger.debug("set_cot_explanation failed (non-fatal)")
+
+    def _maybe_log_profit_audit(self, symbol: str, tp_pct: float, sl_pct: float) -> None:
+        if not self._profit_audit_enabled:
+            return
+        now = time.time()
+        last = self._last_profit_audit_ts.get(symbol, 0.0)
+        if (now - last) < self._profit_audit_sec:
+            return
+        self._last_profit_audit_ts[symbol] = now
+
+        taker_bps = float(fee_bps(self.shared_state, "taker") or 10.0)
+        fee_pct = (taker_bps * 2.0) / 10000.0
+        slippage_pct = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0) / 10000.0
+        buffer_pct = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
+        net_tp_pct = tp_pct - (fee_pct + slippage_pct)
+        net_sl_pct = sl_pct + (fee_pct + slippage_pct)
+        denom = net_tp_pct + net_sl_pct
+        win_rate_be = (net_sl_pct / denom) if denom > 0 else 1.0
+
+        self.logger.info(
+            "[TPSL:profit_audit] %s tp=%.3f%% sl=%.3f%% net_tp=%.3f%% net_sl=%.3f%% fee=%.3f%% slip=%.3f%% buffer=%.3f%% breakeven=%.1f%%",
+            symbol,
+            tp_pct * 100.0,
+            sl_pct * 100.0,
+            net_tp_pct * 100.0,
+            net_sl_pct * 100.0,
+            fee_pct * 100.0,
+            slippage_pct * 100.0,
+            buffer_pct * 100.0,
+            win_rate_be * 100.0,
+        )
 
     def _pick_candles(self, symbol: str) -> List[Dict[str, Any]]:
         """
@@ -268,6 +329,98 @@ class TPSLEngine:
         except Exception:
             return None
 
+    def _get_min_notional_sync(self, symbol: str) -> float:
+        sym = (symbol or "").upper().replace("/", "")
+        try:
+            filters = getattr(self.shared_state, "symbol_filters", {}).get(sym, {}) or {}
+        except Exception:
+            filters = {}
+        min_notional = float(
+            filters.get("MIN_NOTIONAL", {}).get("minNotional")
+            or filters.get("minNotional")
+            or filters.get("_normalized", {}).get("min_notional", 0.0)
+            or 0.0
+        )
+        return min_notional
+
+    def _pre_activation_guard(self, symbol: str, entry_price: float, qty: float) -> Tuple[bool, str]:
+        if entry_price <= 0:
+            return False, "missing_entry_or_qty"
+        if qty <= 0:
+            try:
+                pos = getattr(self.shared_state, "positions", {}).get(symbol, {})
+                if isinstance(pos, dict):
+                    qty = float(pos.get("quantity", 0.0) or 0.0)
+            except Exception:
+                qty = qty
+        if qty <= 0:
+            return False, "missing_entry_or_qty"
+        notional = float(entry_price) * float(qty)
+        min_notional = self._get_min_notional_sync(symbol)
+        safety = float(self._min_notional_safety or 1.0)
+        if min_notional > 0 and notional < (min_notional * safety):
+            return False, "below_min_notional"
+        return True, "ok"
+
+    def _is_price_stale(self, symbol: str) -> bool:
+        if self._price_stale_sec <= 0:
+            return False
+        ts = None
+        for key in ("latest_price_ts", "latest_prices_ts", "price_timestamps"):
+            try:
+                mp = getattr(self.shared_state, key, None)
+                if isinstance(mp, dict) and symbol in mp:
+                    ts = mp.get(symbol)
+                    break
+            except Exception:
+                pass
+        if ts is None:
+            return False
+        try:
+            ts_val = float(ts or 0.0)
+        except Exception:
+            return False
+        if ts_val > 1e12:
+            ts_val /= 1000.0
+        return (time.time() - ts_val) > self._price_stale_sec
+
+    def _is_ohlcv_stale(self, symbol: str) -> bool:
+        if self._ohlcv_stale_sec <= 0:
+            return False
+        candles = self._pick_candles(symbol)
+        if not candles:
+            return True
+        last_ts = candles[-1].get("timestamp")
+        if not last_ts:
+            return False
+        try:
+            ts_val = float(last_ts)
+        except Exception:
+            return False
+        if ts_val > 1e12:
+            ts_val /= 1000.0
+        return (time.time() - ts_val) > self._ohlcv_stale_sec
+
+    def _plan_reason_code(self, reason: str) -> str:
+        ru = str(reason or "").upper()
+        if "TP" in ru:
+            return "TP_HIT"
+        if "SL" in ru:
+            return "SL_HIT"
+        if "MAX-HOLD" in ru or "MAX_HOLD" in ru:
+            return "MAX_HOLD"
+        if "CAPITAL RECOVERY" in ru:
+            return "CAPITAL_RECOVERY"
+        if "STAGNATION" in ru:
+            return "STAGNATION_PURGE"
+        if "BREAKEVEN" in ru:
+            return "BREAKEVEN_EXIT"
+        if "MICRO-CYCLE" in ru or "MICRO CYCLE" in ru:
+            return "MICRO_CYCLE"
+        if "TTL" in ru:
+            return "TIER_TTL"
+        return "TPSL_EXIT"
+
     # ---------- public API used by EM ----------
 
     def set_initial_tp_sl(self, symbol: str, entry_price: float, quantity: float, tier: Optional[str] = None) -> Tuple[Optional[float], Optional[float]]:
@@ -281,6 +434,10 @@ class TPSLEngine:
         
         Returns (tp, sl).
         """
+        ok, reason = self._pre_activation_guard(symbol, entry_price, quantity)
+        if not ok:
+            self.logger.info("[TPSL:PreGuard] %s skip set_initial_tp_sl: %s", symbol, reason)
+            return None, None
         tp, sl = self.calculate_tp_sl(symbol, entry_price, tier=tier)
         try:
             ot = self.shared_state.open_trades.get(symbol)
@@ -293,6 +450,7 @@ class TPSLEngine:
             ot["tp"] = tp
             ot["sl"] = sl
             ot["tier"] = tier  # Store tier for monitoring
+            ot["tp_sl_method"] = self._last_tp_sl_method.get(symbol)
             ot.setdefault("entry_price", entry_price)
             ot.setdefault("quantity", quantity)
 
@@ -324,7 +482,8 @@ class TPSLEngine:
                 with_5m = sym_md.get("5m") or {}
                 atr_cached = float(sym_md.get("atr") or with_5m.get("atr") or 0.0)
 
-            atr = self._compute_atr(symbol, lookback=14) or atr_cached
+            atr_live = self._compute_atr(symbol, lookback=14)
+            atr = atr_live or atr_cached
             sentiment = float(self.shared_state.sentiment_score.get(symbol, 0.0) or 0.0)
             regime = (self.shared_state.volatility_state.get(symbol, "sideways") or "sideways").lower()
 
@@ -362,6 +521,13 @@ class TPSLEngine:
                 atr = entry_price * self._fallback_atr_pct  # fallback ATR
                 self.logger.debug("[%s] ATR too small; fallback=%.6f", symbol, atr)
 
+            method = "atr" if atr_live else ("atr_cached" if atr_cached > 0 else "atr_fallback")
+            if tier == "B":
+                method += "+tier_b"
+            if sentiment != 0.0 or regime not in ("sideways", ""):
+                method += "+context"
+            self._last_tp_sl_method[symbol] = method
+
             tp_dist = atr * tp_mul
             sl_dist = atr * sl_mul
 
@@ -371,11 +537,32 @@ class TPSLEngine:
             sl_pct_min = float(getattr(self.config, "SL_PCT_MIN", 0.005) or 0.005)
             sl_pct_max = float(getattr(self.config, "SL_PCT_MAX", 0.008) or 0.008)
 
-            # Fee-aware TP floor: 2*fee + slippage + buffer
+            # Fee-aware TP floor: 2*fee + slippage + buffer (with fee multiplier)
             taker_bps = float(fee_bps(self.shared_state, "taker") or 10.0)
             slippage_bps = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0)
             buffer_bps = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0)
-            tp_floor = (taker_bps * 2.0 + slippage_bps + buffer_bps) / 10000.0
+            entry_fee_mult = float(getattr(self.config, "MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
+            fee_mult = float(getattr(self.config, "MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
+            fee_mult = max(fee_mult, entry_fee_mult)
+            base_floor = (taker_bps * 2.0 + slippage_bps + buffer_bps) / 10000.0
+            tp_floor = max(base_floor, (taker_bps * 2.0 * fee_mult + slippage_bps + buffer_bps) / 10000.0)
+
+            # Dynamic TP floor for micro trades: add extra bps when notional is small
+            micro_notional = float(getattr(self.config, "TP_MICRO_NOTIONAL_USDT", 25.0) or 25.0)
+            micro_extra_bps = float(getattr(self.config, "TP_MICRO_EXTRA_BPS", 0.0) or 0.0)
+            try:
+                qty = 0.0
+                ot = getattr(self.shared_state, "open_trades", {}) or {}
+                if isinstance(ot, dict):
+                    qty = float((ot.get(symbol) or {}).get("quantity", 0.0) or 0.0)
+                if qty <= 0 and hasattr(self.shared_state, "get_position_qty"):
+                    qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
+                trade_notional = float(entry_price) * float(qty)
+            except Exception:
+                trade_notional = 0.0
+            if micro_extra_bps > 0 and micro_notional > 0 and trade_notional > 0 and trade_notional < micro_notional:
+                scale = max(0.0, 1.0 - (trade_notional / micro_notional))
+                tp_floor += (micro_extra_bps * scale) / 10000.0
 
             raw_tp_pct = (tp_dist / entry_price) if entry_price > 0 else 0.0
             self._tp_floor_hit[symbol] = bool(raw_tp_pct > 0 and raw_tp_pct < tp_floor)
@@ -396,6 +583,7 @@ class TPSLEngine:
                 sl_pct = max(sl_pct_min, min(sl_pct_max, sl_pct))
                 tp_dist = entry_price * tp_pct
                 sl_dist = entry_price * sl_pct
+                self._maybe_log_profit_audit(symbol, tp_pct, sl_pct)
 
             tp_price = round(entry_price + tp_dist, 4)
             sl_price = round(entry_price - sl_dist, 4)
@@ -430,10 +618,32 @@ class TPSLEngine:
         if "SL" in reason_u or "STOP_LOSS" in reason_u:
             return True
 
+        entry_fee_mult = float(getattr(self.config, "MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
         fee_mult = float(getattr(self.config, "MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
+        fee_mult = max(fee_mult, entry_fee_mult)
         rt_fee_pct = ((fee_bps(self.shared_state, "taker") or 10.0) * 2.0) / 10000.0
-        min_profit = rt_fee_pct * fee_mult
+        slippage_pct = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0) / 10000.0
+        buffer_pct = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
+        min_net_pct = float(getattr(self.config, "MIN_NET_PROFIT_AFTER_FEES", 0.0035) or 0.0035)
+        fee_floor = (rt_fee_pct * fee_mult) + slippage_pct + buffer_pct
+        min_profit = max(min_net_pct, fee_floor)
         return pnl_pct >= min_profit
+
+    def _passes_net_exit_gate(self, pnl_pct: float) -> bool:
+        """Exit gate: realized pnl must clear exit-side costs (fee + slippage + buffer)."""
+        taker_bps = float(fee_bps(self.shared_state, "taker") or 10.0)
+        fee_pct = taker_bps / 10000.0
+        slippage_pct = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0) / 10000.0
+        buffer_pct = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
+        min_exit = fee_pct + slippage_pct + buffer_pct
+        if pnl_pct < min_exit:
+            self.logger.info(
+                "[TPSL:ExitGate] blocked pnl=%.4f%% < min_exit=%.4f%%",
+                pnl_pct * 100.0,
+                min_exit * 100.0,
+            )
+            return False
+        return True
 
     async def _passes_excursion_gate(self, symbol: str, entry_price: float, exit_price: float, atr: Optional[float], reason: str) -> bool:
         """Minimum price excursion gate for non-SL TP exits."""
@@ -499,14 +709,107 @@ class TPSLEngine:
 
         return True
 
+    async def _get_min_notional(self, symbol: str) -> float:
+        sym = (symbol or "").upper().replace("/", "")
+        filters = {}
+        try:
+            getter = getattr(self.shared_state, "get_symbol_filters_cached", None)
+            if callable(getter):
+                res = getter(sym)
+                if iscoroutine(res):
+                    res = await res
+                if isinstance(res, dict):
+                    filters = res
+        except Exception:
+            filters = {}
+        if not filters:
+            filters = getattr(self.shared_state, "symbol_filters", {}).get(sym, {}) or {}
+
+        min_notional = float(
+            filters.get("MIN_NOTIONAL", {}).get("minNotional")
+            or filters.get("minNotional")
+            or filters.get("_normalized", {}).get("min_notional", 0.0)
+            or 0.0
+        )
+        return min_notional
+
+    async def _force_close_all_open_lots(self, symbol: str, reason: str) -> None:
+        force_fn = getattr(self.shared_state, "force_close_all_open_lots", None)
+        if callable(force_fn):
+            res = force_fn(symbol, reason=reason)
+            if iscoroutine(res):
+                await res
+            return
+        try:
+            ot = getattr(self.shared_state, "open_trades", None)
+            if isinstance(ot, dict):
+                ot.pop(symbol, None)
+        except Exception:
+            pass
+
+    async def _emit_tp_sl_plan(
+        self,
+        symbol: str,
+        reason: str,
+        position: str,
+        position_qty: Optional[float],
+        entry_price: Optional[float],
+        current_price: Optional[float],
+        tp: Optional[float],
+        sl: Optional[float],
+        pnl_pct: Optional[float],
+        tier: Optional[str],
+        method: Optional[str],
+    ) -> None:
+        emitter = getattr(self.shared_state, "emit_event", None)
+        if not callable(emitter):
+            return
+        payload = {
+            "symbol": symbol,
+            "reason": reason,
+            "reason_code": self._plan_reason_code(reason),
+            "position": position,
+            "side": "SELL" if position == "long" else "BUY",
+            "position_qty": position_qty,
+            "entry_price": entry_price,
+            "current_price": current_price,
+            "tp": tp,
+            "sl": sl,
+            "pnl_pct": pnl_pct,
+            "tier": tier,
+            "method": method,
+            "strategy": self._tp_sl_strategy,
+            "calc_model": self._tp_sl_calc_model,
+            "tag": "tp_sl",
+            "ts": time.time(),
+        }
+        try:
+            res = emitter("TP_SL_PLAN", payload)
+            if iscoroutine(res):
+                await res
+        except Exception:
+            pass
+
     async def check_orders(self):
         """
         Evaluate open trades; if TP/SL is hit → close via EM (bounded concurrency).
         Debounces repeated closes per symbol.
         """
+        def _log_skip(symbol: str, qty: float, price: Optional[float], tp: Optional[float], sl: Optional[float], reason: str) -> None:
+            self.logger.info(
+                "[TPSL:skip] %s qty=%.8f price=%s tp=%s sl=%s reason=%s",
+                symbol,
+                float(qty or 0.0),
+                f"{price:.8f}" if price is not None else "None",
+                f"{tp:.8f}" if tp is not None else "None",
+                f"{sl:.8f}" if sl is not None else "None",
+                reason,
+            )
         try:
             open_trades = dict(self.shared_state.open_trades or {})  # snapshot
             prices = self.shared_state.latest_prices or {}
+            self.logger.info("[TPSL:check] open_trades=%d prices=%d", len(open_trades), len(prices))
+            self.logger.info("[TPSL:check] checking orders")
             to_close: List[Tuple[str, str]] = []
 
             for symbol, tr in open_trades.items():
@@ -517,6 +820,24 @@ class TPSLEngine:
                         "[%s] TPSL skip: missing position or entry_price (position=%s entry_price=%s)",
                         symbol, position, entry_price
                     )
+                    _log_skip(symbol, 0.0, None, None, None, "missing_position_or_entry")
+                    continue
+
+                qty = float(tr.get("quantity") or 0.0)
+                ok, pre_reason = self._pre_activation_guard(symbol, float(entry_price), qty)
+                if not ok:
+                    self.logger.info("[TPSL:PreGuard] %s skip evaluate: %s", symbol, pre_reason)
+                    _log_skip(symbol, qty, None, None, None, pre_reason)
+                    continue
+
+                if self._is_ohlcv_stale(symbol):
+                    self.logger.info("[TPSL:StaleOHLCV] %s market data stale; deferring", symbol)
+                    _log_skip(symbol, qty, None, None, None, "stale_ohlcv")
+                    continue
+
+                if self._is_price_stale(symbol):
+                    self.logger.info("[TPSL:StalePrice] %s price stale; deferring", symbol)
+                    _log_skip(symbol, qty, None, None, None, "stale_price")
                     continue
 
                 # [FIX #4] Compute ATR per symbol for trailing SL support
@@ -556,18 +877,19 @@ class TPSLEngine:
                 )
                 age_sec = time.time() - created_at if created_at > 0 else 0.0
 
-                # 1. Hard max-hold time exit (no exceptions)
-                max_hold_sec = float(getattr(self.config, "MAX_HOLD_TIME_SEC", 1800.0) or 1800.0)
-                if max_hold_sec > 0 and age_sec >= max_hold_sec:
-                    self.logger.info(
-                        "[TPSL:MAX_HOLD_EXIT] %s age=%.0fs >= max_hold=%.0fs",
-                        symbol, age_sec, max_hold_sec
-                    )
-                    to_close.append((
-                        symbol,
-                        f"Max-hold exit: age={int(age_sec)}s >= {int(max_hold_sec)}s"
-                    ))
-                    continue
+                if self._time_exit_enabled:
+                    # 1. Hard max-hold time exit (no exceptions)
+                    max_hold_sec = float(getattr(self.config, "MAX_HOLD_TIME_SEC", 1800.0) or 1800.0)
+                    if max_hold_sec > 0 and age_sec >= max_hold_sec:
+                        self.logger.info(
+                            "[TPSL:MAX_HOLD_EXIT] %s age=%.0fs >= max_hold=%.0fs",
+                            symbol, age_sec, max_hold_sec
+                        )
+                        to_close.append((
+                            symbol,
+                            f"Max-hold exit: age={int(age_sec)}s >= {int(max_hold_sec)}s"
+                        ))
+                        continue
 
                 # 2. Capital recovery mode: force small-profit or time-based exit
                 try:
@@ -584,7 +906,7 @@ class TPSLEngine:
                 except Exception:
                     pass
 
-                if cap_rec_active:
+                if self._time_exit_enabled and cap_rec_active:
                     min_pnl_rec = float(cap_rec.get("min_pnl_pct", 0.0002) or 0.0002)
                     max_age_sec_rec = float(cap_rec.get("max_age_sec", 0.0) or 0.0)
                     
@@ -604,6 +926,7 @@ class TPSLEngine:
                         "[%s] TPSL skip: missing current price (cannot evaluate TP/SL or pnl-based exits).",
                         symbol
                     )
+                    _log_skip(symbol, qty, None, None, None, "missing_current_price")
                     continue
 
                 # Prefer stored TP/SL, compute if missing
@@ -611,6 +934,7 @@ class TPSLEngine:
                 if tp is None or sl is None:
                     tp, sl = self.calculate_tp_sl(symbol, float(entry_price))
                     if tp is None or sl is None:
+                        _log_skip(symbol, qty, float(current_price) if current_price is not None else None, tp, sl, "missing_tp_sl")
                         continue
                     try:
                         tr["tp"] = tp; tr["sl"] = sl  # cache for next pass
@@ -624,13 +948,34 @@ class TPSLEngine:
                 tier = tr.get("tier")
                 pnl_pct = (cp - entry_price) / entry_price if position == "long" else (entry_price - cp) / entry_price
 
+                # Dust exit rule: if value is tiny and held too long, force exit to free capital.
+                if self._time_exit_enabled:
+                    dust_usdt_threshold = float(getattr(self.config, "TPSL_DUST_EXIT_USDT", 4.0) or 4.0)
+                    max_hold_min = float(getattr(self.config, "TPSL_DUST_MAX_HOLD_MINUTES", 15.0) or 15.0)
+                    if dust_usdt_threshold > 0 and max_hold_min > 0:
+                        position_value = float(qty) * cp
+                        if position_value > 0 and position_value < dust_usdt_threshold and age_sec >= (max_hold_min * 60.0):
+                            self.logger.warning(
+                                "[TPSL:DustExit] %s value=%.2f < %.2f and age=%.0fs >= %.0fs. Forcing exit.",
+                                symbol,
+                                position_value,
+                                dust_usdt_threshold,
+                                age_sec,
+                                max_hold_min * 60.0,
+                            )
+                            to_close.append((
+                                symbol,
+                                f"Dust exit: value={position_value:.2f} < {dust_usdt_threshold:.2f} age={int(age_sec)}s"
+                            ))
+                            continue
+
                 # --- Fee-aware Stagnation Purge (Phase A Frequency Engineering) ---
                 # Rule: If PnL < (2 * fees) AND age > 45m → Exit to recycle capital.
                 # This prevents "limbo" trades where capital is trapped in slow-moving assets.
                 stagnation_min = float(getattr(self.config, "STAGNATION_EXIT_MINUTES", 45.0))
                 rt_fee_pct = ((fee_bps(self.shared_state, "taker") or 10.0) * 2.0) / 10000.0
                 
-                if age_sec >= (stagnation_min * 60.0):
+                if self._time_exit_enabled and age_sec >= (stagnation_min * 60.0):
                     stagnation_pnl_threshold = rt_fee_pct * 2.0
                     if pnl_pct < stagnation_pnl_threshold:
                          self.logger.warning(
@@ -648,7 +993,7 @@ class TPSLEngine:
                 # If PnL <= fees AND age >= 20m -> EXIT IMMEDIATELY
                 # This prevents fee-dominated positions and capital deadlocks.
                 min_hold_breakeven = float(getattr(self.config, "BREAKEVEN_EXIT_MINUTES", 20.0))
-                if age_sec >= (min_hold_breakeven * 60.0):
+                if self._time_exit_enabled and age_sec >= (min_hold_breakeven * 60.0):
                     if pnl_pct <= rt_fee_pct:
                          self.logger.warning(
                              "[TPSL:Breakeven] %s age=%dm >= %dm, pnl=%.2f%% <= fees=%.2f%%. Breakeven exit.",
@@ -678,7 +1023,7 @@ class TPSLEngine:
                 except Exception:
                     trades_executed = 0
 
-                if trades_executed >= 1 and bool(getattr(self.config, "MICRO_PROFIT_CYCLE_ENABLED", False)):
+                if self._time_exit_enabled and trades_executed >= 1 and bool(getattr(self.config, "MICRO_PROFIT_CYCLE_ENABLED", False)):
                     min_age_h = float(getattr(self.config, "MICRO_PROFIT_CYCLE_MIN_AGE_HOURS", 2.0) or 2.0)
                     min_pnl_cycle = float(getattr(self.config, "MICRO_PROFIT_CYCLE_MIN_PNL_PCT", 0.001) or 0.001)
                     if age_sec >= (min_age_h * 3600) and pnl_pct >= min_pnl_cycle:
@@ -689,7 +1034,7 @@ class TPSLEngine:
                             self.logger.info("[%s] Profit/excursion gate blocked SELL (%s).", symbol, reason)
                         continue
 
-                if tier == "B":
+                if self._time_exit_enabled and tier == "B":
                     ttl_sec = tr.get("ttl_sec", 300)  # Default 5 minutes
                     if age_sec > ttl_sec:
                             # Grace period: only for winners (PnL > 1%)
@@ -704,6 +1049,14 @@ class TPSLEngine:
                 
                 # --- Wealth Guard: Support for Trailing SL and Ratcheting ---
                 use_trailing = tr.get("_use_trailing", False)
+
+                self.logger.info(
+                    "[TPSL:eval] %s price=%.4f tp=%.4f sl=%.4f",
+                    symbol,
+                    cp,
+                    float(tp),
+                    float(sl),
+                )
                 
                 if position == "long":
                     # Update Trailing SL if price moves up
@@ -719,7 +1072,11 @@ class TPSLEngine:
 
                     if cp >= float(tp):
                         reason = "TP Hit"
-                        if self._passes_profit_gate(pnl_pct, reason) and await self._passes_excursion_gate(symbol, entry_price, cp, atr, reason):
+                        if (
+                            self._passes_net_exit_gate(pnl_pct)
+                            and self._passes_profit_gate(pnl_pct, reason)
+                            and await self._passes_excursion_gate(symbol, entry_price, cp, atr, reason)
+                        ):
                             to_close.append((symbol, reason))
                         else:
                             self.logger.info("[%s] Profit gate blocked SELL (%s).", symbol, reason)
@@ -738,7 +1095,11 @@ class TPSLEngine:
 
                     if cp <= float(tp):
                         reason = "TP Hit (short)"
-                        if self._passes_profit_gate(pnl_pct, reason) and await self._passes_excursion_gate(symbol, entry_price, cp, atr, reason):
+                        if (
+                            self._passes_net_exit_gate(pnl_pct)
+                            and self._passes_profit_gate(pnl_pct, reason)
+                            and await self._passes_excursion_gate(symbol, entry_price, cp, atr, reason)
+                        ):
                             to_close.append((symbol, reason))
                         else:
                             self.logger.info("[%s] Profit gate blocked SELL (%s).", symbol, reason)
@@ -755,22 +1116,96 @@ class TPSLEngine:
                         # [FIX #9] CRITICAL: Mark as liquidation to bypass ALL guards
                         # TP/SL exits are liquidation (risk management), NOT trading decisions.
                         # They must execute regardless of: capital, throughput, min-notional, etc.
-                        res = await self.execution_manager.execute_trade(
-                            symbol=sym, side="sell", tag="tp_sl", is_liquidation=True
+                        reason_u = str(reason).upper()
+                        if "TP" in reason_u:
+                            close_reason = "TP_HIT"
+                        elif "SL" in reason_u:
+                            close_reason = "SL_HIT"
+                        else:
+                            close_reason = "TPSL_EXIT"
+
+                        try:
+                            total_position_qty = 0.0
+                            pos = getattr(self.shared_state, "positions", {}).get(sym, {}) if hasattr(self.shared_state, "positions") else {}
+                            if isinstance(pos, dict):
+                                total_position_qty = float(pos.get("quantity", 0.0) or 0.0)
+                            if total_position_qty <= 0 and hasattr(self.shared_state, "get_position_qty"):
+                                total_position_qty = float(self.shared_state.get_position_qty(sym) or 0.0)
+                            min_notional = await self._get_min_notional(sym)
+                            if min_notional > 0 and total_position_qty < min_notional:
+                                self.logger.warning(
+                                    "[TPSL] Proceeding with close %s even though qty=%.8f < min_notional=%.8f",
+                                    sym,
+                                    total_position_qty,
+                                    min_notional,
+                                )
+                        except Exception:
+                            pass
+                        try:
+                            ot = getattr(self.shared_state, "open_trades", {}) or {}
+                            tr = ot.get(sym, {}) if isinstance(ot, dict) else {}
+                            entry_price = float(tr.get("entry_price", 0.0) or 0.0) or None
+                            position_qty = float(tr.get("quantity", 0.0) or 0.0) or None
+                            tp = float(tr.get("tp", 0.0) or 0.0) or None
+                            sl = float(tr.get("sl", 0.0) or 0.0) or None
+                            tier = tr.get("tier")
+                            method = tr.get("tp_sl_method") or self._last_tp_sl_method.get(sym)
+                            position = tr.get("position") or "long"
+                            current_price = None
+                            try:
+                                p = self.shared_state.latest_prices.get(sym)
+                                if p:
+                                    current_price = float(p)
+                            except Exception:
+                                current_price = None
+                            if current_price is None:
+                                current_price = await self._current_price(sym)
+                            pnl_pct = None
+                            if entry_price and current_price:
+                                if position == "long":
+                                    pnl_pct = (current_price - entry_price) / entry_price
+                                else:
+                                    pnl_pct = (entry_price - current_price) / entry_price
+                            await self._emit_tp_sl_plan(
+                                sym,
+                                reason,
+                                position,
+                                position_qty,
+                                entry_price,
+                                current_price,
+                                tp,
+                                sl,
+                                pnl_pct,
+                                tier,
+                                method,
+                            )
+                        except Exception:
+                            pass
+                        res = await self.execution_manager.close_position(
+                            symbol=sym,
+                            reason=close_reason,
+                            force_finalize=True,
+                            tag="tp_sl",
                         )
                         try:
                             status = str(res.get("status", "")).lower() if isinstance(res, dict) else ""
                             ok = bool(res.get("ok")) if isinstance(res, dict) else False
                             if ok or status in {"placed", "executed", "filled", "partially_filled"}:
-                                reason_u = str(reason).upper()
-                                if "TP" in reason_u:
+                                if close_reason == "TP_HIT":
                                     code = "TP"
-                                elif "SL" in reason_u:
+                                elif close_reason == "SL_HIT":
                                     code = "SL"
                                 else:
                                     code = "TPSL_EXIT"
-                                if hasattr(self.shared_state, "record_exit_reason"):
-                                    self.shared_state.record_exit_reason(sym, code, source="tp_sl")
+                                await post_exit_bookkeeping(
+                                    self.shared_state,
+                                    self.config,
+                                    self.logger,
+                                    sym,
+                                    code,
+                                    "tp_sl",
+                                )
+                                await self._force_close_all_open_lots(sym, close_reason)
                         except Exception:
                             pass
 
@@ -818,32 +1253,37 @@ class TPSLEngine:
         Continuous, drift-free monitoring loop.
         """
         # Wait gates using events if present (non-fatal if missing)
+        async def _wait_gate(ev, name: str, timeout: float) -> None:
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=timeout)
+                self.logger.info("[TPSL] Gate open: %s", name)
+            except asyncio.TimeoutError:
+                self.logger.warning("[TPSL] Gate timeout: %s — proceeding anyway", name)
+            except Exception:
+                self.logger.debug("[TPSL] Gate error: %s", name, exc_info=True)
+
+        gate_timeout = float(getattr(self.config, "TPSL_GATE_TIMEOUT_SEC", 20.0) or 20.0)
+        self.logger.info("[TPSL] Waiting for startup gates")
         try:
             ev_acc = getattr(self.shared_state, "get_accepted_symbols_ready_event", None)
             if callable(ev_acc):
-                await ev_acc().wait()
+                await _wait_gate(ev_acc(), "AcceptedSymbolsReady", gate_timeout)
         except Exception:
             pass
         try:
             ev_md = getattr(self.shared_state, "get_market_data_ready_event", None)
             if callable(ev_md):
-                await ev_md().wait()
+                await _wait_gate(ev_md(), "MarketDataReady", gate_timeout)
         except Exception:
             pass
+        self.logger.info("[TPSL] Startup gates cleared")
+        self.logger.error("[TPSL:DIAG] reached pre-loop section")
 
-        uh = getattr(self.shared_state, "update_system_health", None)
-        if callable(uh):
-            res = uh(
-                component="TPSLEngine",
-                status="Healthy",
-                message="TPSLEngine loop initialized."
-            )
-            if iscoroutine(res):
-                await res
+        await self._safe_status_update("Healthy", "TPSLEngine loop initialized.")
         self.logger.info("🚀 TPSLEngine started TP/SL monitoring loop.")
         # Mirror to component-status mirror (optional)
         try:
-            await self.shared_state.update_component_status("TPSLEngine", "OK", "Running normally.")
+            await self._safe_status_update("OK", "Running normally.")
         except Exception:
             pass
 
@@ -852,6 +1292,10 @@ class TPSLEngine:
 
         try:
             while True:
+                self.logger.error("[TPSL:DIAG] entered monitoring loop")
+                self.logger.info("[TPSL:tick] alive")
+                self.status = "RUNNING"
+                self.last_tick = time.time()
                 try:
                     await self.shared_state.update_timestamp("TPSLEngine")
                 except Exception:
@@ -860,7 +1304,7 @@ class TPSLEngine:
                 await self.check_orders()
 
                 try:
-                    await self.shared_state.update_component_status("TPSLEngine", "OK", "Running normally.")
+                    await self._safe_status_update("OK", "Running normally.")
                     _emit_health(self.shared_state, "Running", "Monitoring active")
                 except Exception:
                     pass

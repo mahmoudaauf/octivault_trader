@@ -171,17 +171,10 @@ class PerformanceEvaluator:
             "breaches": int(getattr(self.ss, "kpi_breaches", 0) or 0),
         }
 
-        # Breach logic (soft): only if KPI target is configured and system is ready
-        # PHASE A FIX: Dynamic profit target based on NAV
+        # Breach logic (soft): dynamic profit target based on NAV
         nav = total_value
-        # Use config or default ratio 0.2% per hour
-        target_ratio = float(getattr(self.config, "TARGET_PROFIT_RATIO_PER_HOUR", 0.002))
-        dynamic_target = max(0.5, nav * target_ratio) # Min 0.5 USDT/h (Phase A)
-        
-        # Priority: Config 'PROFIT_TARGET_BASE_USD_PER_HOUR' > dynamic (Default 20.0)
-        target_usdt_h = float(getattr(self.config, "PROFIT_TARGET_BASE_USD_PER_HOUR", 20.0))
-        if target_usdt_h <= 0.0:
-            target_usdt_h = dynamic_target
+        target_ratio = float(getattr(self.config, "TARGET_PROFIT_RATIO_PER_HOUR", 0.001))
+        target_usdt_h = max(0.0, nav * target_ratio)
 
         # Calm watchdog during LOW volatility regime
         regime = ""

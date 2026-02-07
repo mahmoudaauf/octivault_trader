@@ -164,6 +164,13 @@ class StateManager:
                     self.shared_state.system_health[self.component_name] = {"status": status, "detail": detail, "ts": time.time()}
         except Exception:
             self.logger.debug("Fallback update_system_health failed.", exc_info=True)
+        try:
+            fn = getattr(self.shared_state, "update_component_status", None)
+            if callable(fn):
+                from .core_utils import _safe_await
+                await _safe_await(fn(self.component_name, status, detail))
+        except Exception:
+            self.logger.debug("update_component_status failed.", exc_info=True)
 
     async def _heartbeat(self) -> None:
         """System heartbeat functionality."""

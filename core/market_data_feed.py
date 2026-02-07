@@ -28,7 +28,7 @@ except Exception:
 
 
 API_AUTH_ERR_CODES = {-2015, -2014}        # Invalid key/permissions/signature
-API_RATELIMIT_ERR_CODES = {-1003, -1015}   # Rate limit, too many requests
+API_RATELIMIT_ERR_CODES = {-1003, -1015, -1021}   # Rate limit, too many requests, time skew
 
 
 class MarketDataFeed:
@@ -80,6 +80,7 @@ class MarketDataFeed:
         self._ec_public_ok: bool = True  # allow public-only bootstrap for unsigned endpoints
 
         cfg = config or {}
+        self.config = cfg
         
         # Helper to access config whether it's a dict or object
         def _cfg(key, default=None):
@@ -112,6 +113,7 @@ class MarketDataFeed:
         self.warmup_timeout_sec: float = float(_cfg("warmup_timeout_sec", warmup_timeout_sec))
         self.retry_after_no_symbols_sec: float = float(_cfg("retry_after_no_symbols_sec", retry_after_no_symbols_sec))
         self.max_retry_backoff_sec: float = float(_cfg("max_retry_backoff_sec", max_retry_backoff_sec))
+        self.max_retry_attempts: int = int(_cfg("max_retry_attempts", 6))
         self.min_bars_required: int = int(_cfg("min_bars_required", min_bars_required))
         self.readiness_emit: bool = bool(_cfg("readiness_emit", readiness_emit))
         self.per_symbol_readiness: bool = bool(_cfg("per_symbol_readiness", per_symbol_readiness))
@@ -128,6 +130,7 @@ class MarketDataFeed:
             self._logger.setLevel(logging.INFO)
 
         self._health_task: Optional[asyncio.Task] = None
+        self._last_error_ts: float = 0.0
 
         # Resolve component and code values (enum if present, else strings)
         self._component_key = getattr(_ComponentEnum, "MARKET_DATA_FEED", "MarketDataFeed")
@@ -209,11 +212,7 @@ class MarketDataFeed:
         """
         ec = getattr(self, "exchange_client", None)
         if ec is not None:
-            try:
-                if getattr(ec, "is_started", False) or getattr(ec, "is_ready", False):
-                    return ec
-            except Exception:
-                return ec
+            return ec
         if _ensure_ec_public is not None and getattr(self, "_ec_public_ok", False):
             try:
                 ec = await _ensure_ec_public(
@@ -294,6 +293,30 @@ class MarketDataFeed:
             meta["code"] = code
         return kind, meta
 
+    @staticmethod
+    def _parse_op_label(what: str) -> Dict[str, Any]:
+        """
+        Parse op label like "warmup.get_ohlcv[BTCUSDT,1m]" or
+        "poll.get_price[ETHUSDT]" into structured fields.
+        """
+        out: Dict[str, Any] = {"op": str(what)}
+        try:
+            label = str(what)
+            if "[" in label and "]" in label:
+                op = label.split("[", 1)[0]
+                args = label.split("[", 1)[1].rsplit("]", 1)[0]
+                parts = [p.strip() for p in args.split(",") if p.strip()]
+                out["op"] = op
+                if parts:
+                    out["symbol"] = parts[0]
+                if len(parts) > 1:
+                    out["timeframe"] = parts[1]
+            else:
+                out["op"] = label
+        except Exception:
+            return {"op": str(what)}
+        return out
+
     async def _with_retries(self, coro_fn: Callable[[], asyncio.Future], what: str):
         # exponential backoff w/ jitter; capped
         attempt = 0
@@ -302,6 +325,13 @@ class MarketDataFeed:
                 return await coro_fn()
             except Exception as e:
                 kind, meta = self._classify_error(e)
+                try:
+                    self._last_error_ts = time.time()
+                except Exception:
+                    pass
+                op_meta = self._parse_op_label(what)
+                if op_meta:
+                    meta = {**meta, **op_meta}
                 await self._set_health(self._code_error, f"{what}:{kind}", metrics=meta)
                 # If it's an auth error, back off harder and cap attempts (prevents hot-looping on -2015)
                 if kind == "AuthError":
@@ -311,6 +341,8 @@ class MarketDataFeed:
                 else:
                     base = 1.0
                 attempt += 1
+                if attempt >= max(1, int(getattr(self, "max_retry_attempts", 6) or 6)):
+                    raise
                 backoff = min(self.max_retry_backoff_sec, base * (2 ** min(attempt, 6)))
                 backoff += random.uniform(0.0, 0.5)
                 await asyncio.sleep(backoff)
@@ -339,12 +371,26 @@ class MarketDataFeed:
                 try:
                     ec = await self._get_exchange_client()
                     if ec is not None and hasattr(ec, "api_key") and not getattr(ec, "api_key", None):
-                        await self._set_health(self._code_ok, "heartbeat(public-only)", metrics={"symbols": len(syms)})
+                        recent_err = False
+                        try:
+                            recent_err = (time.time() - float(self._last_error_ts or 0.0)) <= (self.health_cadence_sec * 2.0)
+                        except Exception:
+                            recent_err = False
+                        code = self._code_warn if recent_err else self._code_ok
+                        msg = "heartbeat(public-only, recent_errors)" if recent_err else "heartbeat(public-only)"
+                        await self._set_health(code, msg, metrics={"symbols": len(syms)})
                         await asyncio.sleep(self.health_cadence_sec)
                         continue
                 except Exception:
                     pass
-                await self._set_health(self._code_ok, "heartbeat", metrics={"symbols": len(syms)})
+                recent_err = False
+                try:
+                    recent_err = (time.time() - float(self._last_error_ts or 0.0)) <= (self.health_cadence_sec * 2.0)
+                except Exception:
+                    recent_err = False
+                code = self._code_warn if recent_err else self._code_ok
+                msg = "heartbeat(recent_errors)" if recent_err else "heartbeat"
+                await self._set_health(code, msg, metrics={"symbols": len(syms)})
                 await asyncio.sleep(self.health_cadence_sec)
         except asyncio.CancelledError:
             pass
@@ -430,7 +476,11 @@ class MarketDataFeed:
 
         # Execute warmup with bounded concurrency
         t0 = time.perf_counter()
-        await asyncio.gather(*(_load_symbol(s) for s in symbols))
+        results = await asyncio.gather(*(_load_symbol(s) for s in symbols), return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                kind, meta = self._classify_error(r)
+                await self._set_health(self._code_error, f"warmup.task:{kind}", metrics=meta)
         latency_ms = int((time.perf_counter() - t0) * 1000)
 
         # Validate OHLCV depth and declare readiness if all tfs meet minimum bars
@@ -463,6 +513,14 @@ class MarketDataFeed:
             await self._maybe_set_ready()
         else:
             await self._set_health(self._code_warn, "warmup:insufficient_bars", metrics={"missing": {k: sorted(v.keys()) for k, v in missing.items()}, "min_bars": self.min_bars_required})
+            # Allow partial readiness to unblock degraded-mode trading
+            try:
+                for s in symbols:
+                    if await self._symbol_meets_depth(s):
+                        await self._maybe_set_ready()
+                        break
+            except Exception:
+                self._logger.debug("partial readiness check failed", exc_info=True)
 
         # Readiness: SharedState flips MarketDataReady internally once thresholds are met.
         await self._set_health(self._code_ok, "warmup:done", metrics={"symbols": len(symbols), "latency_ms": latency_ms})
@@ -524,7 +582,8 @@ class MarketDataFeed:
             try:
                 t0 = time.perf_counter()
                 symbols = await self._get_accepted_symbols()
-
+                if self._stop.is_set():
+                    break
                 tasks: List[asyncio.Task] = [
                     asyncio.create_task(self._poll_symbol(sym, sem), name=f"mdf.poll[{sym}]") for sym in symbols
                 ]
@@ -577,28 +636,35 @@ class MarketDataFeed:
                 # Late wiring race: skip this cycle for this symbol
                 return
             # Last price
-            async def _fetch_price():
-                return await ec.get_current_price(sym)
-            price = await self._with_retries(_fetch_price, f"poll.get_price[{sym}]")
+            price = None
+            try:
+                async def _fetch_price():
+                    return await ec.get_current_price(sym)
+                price = await self._with_retries(_fetch_price, f"poll.get_price[{sym}]")
+            except Exception:
+                price = None
             if price is not None:
                 await self._maybe_await(self.shared_state.update_last_price(sym, float(price)))
 
             # Lightweight tail refresh on each timeframe
             for tf in self.timeframes:
-                async def _fetch_tail():
-                    return await ec.get_ohlcv(sym, tf, limit=3)
-                rows = await self._with_retries(_fetch_tail, f"poll.get_ohlcv[{sym},{tf}]")
-                rows = self._sanitize_ohlcv(rows or [])
-                for r in rows:
-                    bar = {
-                        "ts": float(r[0]),
-                        "o": float(r[1]),
-                        "h": float(r[2]),
-                        "l": float(r[3]),
-                        "c": float(r[4]),
-                        "v": float(r[5]),
-                    }
-                    await self._maybe_await(self.shared_state.add_ohlcv(sym, tf, bar))
+                try:
+                    async def _fetch_tail():
+                        return await ec.get_ohlcv(sym, tf, limit=3)
+                    rows = await self._with_retries(_fetch_tail, f"poll.get_ohlcv[{sym},{tf}]")
+                    rows = self._sanitize_ohlcv(rows or [])
+                    for r in rows:
+                        bar = {
+                            "ts": float(r[0]),
+                            "o": float(r[1]),
+                            "h": float(r[2]),
+                            "l": float(r[3]),
+                            "c": float(r[4]),
+                            "v": float(r[5]),
+                        }
+                        await self._maybe_await(self.shared_state.add_ohlcv(sym, tf, bar))
+                except Exception:
+                    pass
 
             # Optional ATR keep-warm
             if self.compute_atr and "1h" in self.timeframes:

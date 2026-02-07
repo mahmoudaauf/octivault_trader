@@ -1,4 +1,6 @@
-# main_phased.py — P9-aligned minimal runner
+
+# -*- coding: utf-8 -*-
+# main_phased.py - P9-aligned minimal runner
 
 import os
 import sys
@@ -16,6 +18,7 @@ except Exception:
     pass
 
 from core.app_context import AppContext, log_structured_error
+from core.config import Config
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="octivault-main-phased", description="P9-aligned runner")
@@ -37,7 +40,7 @@ def to_bool(v: Optional[str], default: bool = False) -> bool:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
-def load_config() -> Dict[str, Any]:
+def load_config() -> Config:
     # .env اختياري
     try:
         from dotenv import load_dotenv
@@ -46,14 +49,14 @@ def load_config() -> Dict[str, Any]:
         logger = logging.getLogger("Main")
         logger.warning("dotenv load failed: %s (Tip: pip install python-dotenv and ensure .env exists)", e)
 
-    return {
-        "env": os.getenv("ENV", "prod"),
-        "recovery": {
-            "enabled": to_bool(os.getenv("RECOVERY_ENABLED"), True),
-            "snapshot_dir": os.getenv("RECOVERY_SNAPSHOT_DIR", "./snapshots"),
-        },
-        "logging": {"level": os.getenv("LOG_LEVEL", "INFO")},
+    cfg = Config()
+    cfg.env = os.getenv("ENV", "prod")
+    cfg.recovery = {
+        "enabled": to_bool(os.getenv("RECOVERY_ENABLED"), True),
+        "snapshot_dir": os.getenv("RECOVERY_SNAPSHOT_DIR", "./snapshots"),
     }
+    cfg.logging = {"level": os.getenv("LOG_LEVEL", "INFO")}
+    return cfg
 
 def _configure_logging() -> logging.Logger:
     # Configure root once; module loggers inherit handlers/level by default
@@ -83,10 +86,10 @@ async def _run():
     ns = _parse_args()
     # apply CLI overrides
     phase_max = get_up_to_phase(ns)
-    if ns.no_recovery and isinstance(cfg.get("recovery"), dict):
-        cfg["recovery"]["enabled"] = False
+    if ns.no_recovery and isinstance(getattr(cfg, "recovery", None), dict):
+        cfg.recovery["enabled"] = False
     logger.info("Startup: up_to_phase=%s, recovery_enabled=%s, env=%s",
-                phase_max, cfg.get("recovery", {}).get("enabled"), cfg.get("env"))
+                phase_max, getattr(cfg, "recovery", {}).get("enabled"), getattr(cfg, "env", ""))
 
     # Quick reflect of effective level
     logger.debug("Loaded config: %s", cfg)
@@ -109,6 +112,8 @@ async def _run():
 
     ctx: Optional[AppContext] = None
     try:
+        cfg.MODE = "LIVE"
+        cfg.PHASE = phase_max
         ctx = AppContext(config=cfg, logger=logging.getLogger("AppContext"))
         # شغّل كل المراحل داخليًا (P1→P9)
         await ctx.initialize_all(up_to_phase=phase_max)

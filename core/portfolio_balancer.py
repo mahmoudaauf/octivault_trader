@@ -299,7 +299,7 @@ class PortfolioBalancer:
                 "planned_qty": qty_rounded if side == "SELL" else None,
                 "planned_quote": trade_quote if side == "BUY" else None,
                 "agent": self.component,
-                "tag": "balancer",
+                "tag": "rebalance",
                 "ttl_sec": 300,
             }
             intents.append(intent)

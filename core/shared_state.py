@@ -13,7 +13,7 @@ from decimal import getcontext
 from collections import deque, defaultdict
 from contextlib import asynccontextmanager
 from functools import wraps
-from typing import Any, Dict, List, Set, Tuple, Optional, Callable, TypedDict
+from typing import Any, Dict, List, Set, Tuple, Optional, Callable, TypedDict, TYPE_CHECKING
 from dataclasses import dataclass
 from enum import Enum
 
@@ -22,6 +22,10 @@ try:
     import pandas as pd  # type: ignore
 except ImportError:
     pd = None
+
+# ---- Type-Only Imports (avoid circular imports) ----
+if TYPE_CHECKING:
+    from core.app_context import AppContext, log_structured_error
 
 # ---- Module Metadata ----
 __version__ = "2.0.1"
@@ -122,6 +126,7 @@ class SharedStateConfig:
     auto_positions_from_balances: bool = True  # mirror wallet (non-quote) into positions
     dust_min_quote_usdt: float = 5.0   # minimum notional to treat as non-dust
     dust_liquidation_enabled: bool = True  # allow listing dust as sellable inventory
+    DUST_POSITION_QTY: float = 0.0001
     liq_queue_maxsize: int = 1000      # maximum size for liquidation queue
 
     # --- Active symbols fallback behavior (helps agents like LiquidationAgent) ---
@@ -1677,10 +1682,10 @@ class SharedState:
         Definition: Portfolio has ZERO positions with qty > 0
         
         This is INDEPENDENT of:
-          • Capital availability
-          • Margin usage
-          • Trade history
-          
+        • Capital availability
+        • Margin usage
+        • Trade history
+        
         Returns: True if total_positions == 0, False otherwise
         """
         significant_count = await self.get_significant_position_count()
@@ -1693,10 +1698,10 @@ class SharedState:
         Definition: Free quote capital < minimum safe threshold
         
         This is INDEPENDENT of:
-          • Flatness (can be flat AND rich, or full AND starved)
-          • Position count
-          • Trade status
-          
+        • Flatness (can be flat AND rich, or full AND starved)
+        • Position count
+        • Trade status
+        
         Returns: True if free_usdt < minimum threshold, False otherwise
         """
         free_usdt = await self.free_usdt()
@@ -1710,10 +1715,10 @@ class SharedState:
         Definition: Occupied capital is approaching max exposure limit
         
         This is INDEPENDENT of:
-          • Flatness (can be flat AND full if previous positions still valued high)
-          • Capital availability
-          • Significant position count
-          
+        • Flatness (can be flat AND full if previous positions still valued high)
+        • Capital availability
+        • Significant position count
+        
         Returns: True if occupied_capital / total_capital > exposure_target, False otherwise
         """
         free_usdt = await self.free_usdt()
@@ -1735,10 +1740,10 @@ class SharedState:
         Definition: Count of non-dust positions > 0
         
         This is INDEPENDENT of:
-          • Capital state (starved, full, rich)
-          • Trade lifecycle
-          • Dust positions
-          
+        • Capital state (starved, full, rich)
+        • Trade lifecycle
+        • Dust positions
+        
         Returns: True if significant_positions > 0, False otherwise
         """
         significant_count = await self.get_significant_position_count()
@@ -1755,7 +1760,7 @@ class SharedState:
         """
         Compute whether current free quote can afford trading 'symbol'.
         Returns a dict with keys:
-          symbol, ok, amount, code, planned_quote, required_min_quote
+        symbol, ok, amount, code, planned_quote, required_min_quote
         - ok: True if planned_quote >= required_min_quote (when known)
         - amount: if ok==False, amount of quote still missing to satisfy requirement
         - code: 'QUOTE_LT_MIN_NOTIONAL' if exchange minNotional gating; else 'INSUFFICIENT_QUOTE'
@@ -1834,11 +1839,11 @@ class SharedState:
         """
         Build a snapshot used by AppContext startup readiness logs.
         Includes:
-          - MarketDataReady
-          - FreeUSDT
-          - AffordabilityProbe (for the given symbol)
-          - PlannedQuoteUsed
-          - StartupSanity (coverage, floors)
+        - MarketDataReady
+        - FreeUSDT
+        - AffordabilityProbe (for the given symbol)
+        - PlannedQuoteUsed
+        - StartupSanity (coverage, floors)
         """
         try:
             # Planned/spendable quote to use in probe
@@ -1904,16 +1909,20 @@ class SharedState:
         self, component: Component, code: HealthCode, message: str, *, metrics: Optional[Dict[str, Any]] = None
     ) -> None:
         ts = time.time()
+        component_key = component.value if hasattr(component, "value") else str(component)
+        code_val = code.value if hasattr(code, "value") else str(code)
         data = {
-            "status": code.value,
+            "status": code_val,
             "message": message,
             "timestamp": ts,
             "metrics": metrics or {},
         }
-        self.component_statuses[component.value] = data
+        self.component_statuses[component_key] = data
         self.system_health = data
         self.metrics["last_health_update"] = ts
-        await self.emit_event("HealthStatus", {"component": component.value, **data})
+        await self.emit_event("HealthStatus", {"component": component_key, **data})
+        if component_key == Component.MARKET_DATA_FEED.value and code_val in (HealthCode.ERROR.value, HealthCode.WARN.value):
+            self.set_readiness_flag("market_data_ready", False)
 
     async def emit_health(self, component: str, status: str, reason: str = "", meta: Optional[Dict[str, Any]] = None):
         """Small wrapper used by AppContext contract validation & boot logs."""
@@ -1996,7 +2005,7 @@ class SharedState:
         
         # Defensive logging for accidental shrink (if allow_shrink=False)
         if not allow_shrink and len(symbols) < len(self.accepted_symbols):
-             self.logger.warning(
+            self.logger.warning(
                 "[SS] Accepted symbols update is smaller than current set (no shrink allowed). "
                 f"Current={len(self.accepted_symbols)}, Incoming={len(symbols)}, Source={source}"
             )
@@ -2348,7 +2357,7 @@ class SharedState:
             try:
                 p = await price_fetcher(sym)
                 if p is None and asyncio.iscoroutine(p):
-                     p = await p
+                    p = await p
                 
                 if p:
                     await self.update_latest_price(sym, float(p))
@@ -2872,7 +2881,7 @@ class SharedState:
         Build a list of positions that can be sold to free quote.
         Uses symbol filters (LOT_SIZE, MIN_NOTIONAL) and current price when available.
         Returns a list of dicts with keys:
-          symbol, base_asset, quote_asset, qty, est_quote_value, price, filters, reason
+        symbol, base_asset, quote_asset, qty, est_quote_value, price, filters, reason
         """
         if min_quote_value is None:
             min_quote_value = float(getattr(self.config, "dust_min_quote_usdt", 5.0) or 0.0)
@@ -3025,11 +3034,11 @@ class SharedState:
         ===== PHASE 3: Get dust positions eligible for cleanup SELL =====
         
         Returns positions that:
-          1. Are in dust_registry (below minNotional)
-          2. Haven't exceeded max cleanup attempts
-          3. Are old enough (min_age_sec)
-          4. Are past cooldown from last attempt
-          5. Have qty > 0 (not already closed)
+        1. Are in dust_registry (below minNotional)
+        2. Haven't exceeded max cleanup attempts
+        3. Are old enough (min_age_sec)
+        4. Are past cooldown from last attempt
+        5. Have qty > 0 (not already closed)
         
         These can be sold REGARDLESS of portfolio state.
         """
@@ -3123,10 +3132,10 @@ class SharedState:
         ===== PHASE 3: Enable bypass of portfolio_flat checks for dust cleanup SELL =====
         
         When enabled:
-          • get_sellable_inventory() marks dust positions as eligible
-          • get_dust_cleanup_candidates() returns all eligible dust
-          • SELL signals for dust will not be blocked by portfolio state
-          • Only dust positions are affected (normal positions unaffected)
+        • get_sellable_inventory() marks dust positions as eligible
+        • get_dust_cleanup_candidates() returns all eligible dust
+        • SELL signals for dust will not be blocked by portfolio state
+        • Only dust positions are affected (normal positions unaffected)
         """
         self.bypass_portfolio_flat_for_dust = True
         self.logger.info("[Phase3] Dust cleanup mode ENABLED - dust SELL bypass active")
@@ -3543,6 +3552,92 @@ class SharedState:
             
             self.positions[sym] = dict(position_data)
 
+    async def force_close_all_open_lots(self, symbol: str, reason: str = "") -> None:
+        """Force-close any open lots for a symbol by clearing position and open_trades."""
+        sym = self._norm_sym(symbol)
+        try:
+            pos = dict(self.positions.get(sym, {}) or {})
+            pos["quantity"] = 0.0
+            pos["status"] = "CLOSED"
+            if reason:
+                pos["closed_reason"] = str(reason)
+            pos["closed_at"] = time.time()
+            await self.update_position(sym, pos)
+        except Exception:
+            pass
+        try:
+            if isinstance(self.open_trades, dict):
+                self.open_trades.pop(sym, None)
+        except Exception:
+            pass
+        try:
+            await self.emit_event("ForceCloseAllOpenLots", {"symbol": sym, "reason": reason})
+        except Exception:
+            pass
+
+    async def close_position(self, symbol: str, reason: str = "") -> None:
+        """Canonical close helper for position finalization."""
+        await self.force_close_all_open_lots(symbol, reason=reason)
+
+    async def mark_position_closed(
+        self,
+        symbol: str,
+        qty: float,
+        price: float,
+        reason: str = "SELL_FILLED",
+        tag: str = "",
+    ) -> None:
+        """Record a filled SELL by reducing or closing the position and cleaning open_trades."""
+        sym = self._norm_sym(symbol)
+        exec_qty = float(qty or 0.0)
+        exec_price = float(price or 0.0)
+
+        try:
+            pos = dict(self.positions.get(sym, {}) or {})
+        except Exception:
+            pos = {}
+
+        cur_qty = float(pos.get("quantity", 0.0) or 0.0)
+        new_qty = max(0.0, cur_qty - exec_qty) if cur_qty > 0 and exec_qty > 0 else cur_qty
+
+        if pos:
+            pos["quantity"] = new_qty
+            if new_qty <= 0:
+                pos["status"] = "CLOSED"
+                pos["closed_at"] = time.time()
+                pos["closed_reason"] = str(reason or "SELL_FILLED")
+                pos["closed_price"] = exec_price
+                pos["closed_qty"] = exec_qty
+                if tag:
+                    pos["closed_tag"] = str(tag)
+            await self.update_position(sym, pos)
+
+        try:
+            ot = self.open_trades if isinstance(self.open_trades, dict) else {}
+            tr = dict(ot.get(sym, {}) or {})
+            if tr:
+                tr_qty = float(tr.get("quantity", 0.0) or 0.0)
+                tr_new_qty = max(0.0, tr_qty - exec_qty) if tr_qty > 0 and exec_qty > 0 else tr_qty
+                if tr_new_qty <= 0:
+                    ot.pop(sym, None)
+                else:
+                    tr["quantity"] = tr_new_qty
+                    ot[sym] = tr
+        except Exception:
+            pass
+
+        try:
+            await self.emit_event("PositionClosed", {
+                "symbol": sym,
+                "qty": exec_qty,
+                "price": exec_price,
+                "reason": str(reason or "SELL_FILLED"),
+                "tag": str(tag or ""),
+                "timestamp": time.time(),
+            })
+        except Exception:
+            pass
+
     async def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         return self.positions.get(symbol)
     async def get_position_quantity(self, symbol: str) -> float:
@@ -3810,9 +3905,9 @@ class SharedState:
         ===== GOLDEN RULE: If total_positions > 0 → portfolio is NOT flat =====
         
         States:
-          - COLD_BOOTSTRAP: Never traded (is_cold_bootstrap() = True)
-          - ACTIVE: Has ANY positions (total_positions > 0)
-          - PORTFOLIO_FLAT: No positions (total_positions == 0)
+        - COLD_BOOTSTRAP: Never traded (is_cold_bootstrap() = True)
+        - ACTIVE: Has ANY positions (total_positions > 0)
+        - PORTFOLIO_FLAT: No positions (total_positions == 0)
         
         This replaces the minNotional-based logic with the authoritative rule:
         Any position (regardless of size) means the portfolio is ACTIVE.
@@ -3872,10 +3967,10 @@ class SharedState:
         """
         PHASE 2 ENHANCEMENT: Returns capital availability state.
         States:
-          - SUFFICIENT: Free capital >= min_viable_quote
-          - INSUFFICIENT: No free capital available
-          - FRAGMENTED: Capital locked in many small reservations
-          - RESERVED: Capital locked but should recover soon
+        - SUFFICIENT: Free capital >= min_viable_quote
+        - INSUFFICIENT: No free capital available
+        - FRAGMENTED: Capital locked in many small reservations
+        - RESERVED: Capital locked but should recover soon
         """
         try:
             spendable = await self._free_usdt() if hasattr(self, "_free_usdt") else 0.0
@@ -3913,9 +4008,9 @@ class SharedState:
         """
         PHASE 2 ENHANCEMENT: Returns market liquidity/volatility state.
         States:
-          - NORMAL: Standard bid-ask spread, moderate volatility
-          - LOW_LIQUIDITY: Wide spreads, low order book depth
-          - HIGH_VOLATILITY: High price movement, rapid changes
+        - NORMAL: Standard bid-ask spread, moderate volatility
+        - LOW_LIQUIDITY: Wide spreads, low order book depth
+        - HIGH_VOLATILITY: High price movement, rapid changes
         """
         try:
             # Simple heuristic: check bid-ask spreads and recent volatility
@@ -4124,6 +4219,21 @@ class SharedState:
         ✅ Returns BOTH significant and dust positions.
         Filter by is_dust flag in caller if needed.
         """
+        dust_qty = 0.0
+        if self.config:
+            dust_qty = float(
+                getattr(
+                    self.config,
+                    "DUST_POSITION_QTY",
+                    getattr(self.config, "dust_position_qty", 0.0),
+                )
+                or 0.0
+            )
+        is_bootstrap = False
+        try:
+            is_bootstrap = bool(self.is_bootstrap_mode())
+        except Exception:
+            is_bootstrap = False
         result = {}
         for sym, pos_data in self.positions.items():
             status = str(pos_data.get("status", "")).upper()
@@ -4131,6 +4241,8 @@ class SharedState:
             
             # Only include positions with OPEN/PARTIALLY_FILLED status and qty > 0
             if status in {"OPEN", "PARTIALLY_FILLED"} and qty > 0:
+                if is_bootstrap and dust_qty > 0.0 and qty <= dust_qty:
+                    continue
                 result[sym] = pos_data
         
         return result
@@ -4205,9 +4317,9 @@ class SharedState:
     def get_active_symbols(self, *, limit: Optional[int] = None) -> List[str]:
         """
         Return a prioritized list of symbols for agents:
-          1) accepted_symbols (wallet-forced + normal)
-          2) positions we currently hold (so liquidation/management never misses them)
-          3) any other known symbols cached in self.symbols
+        1) accepted_symbols (wallet-forced + normal)
+        2) positions we currently hold (so liquidation/management never misses them)
+        3) any other known symbols cached in self.symbols
         The list is de-duplicated while preserving the above priority order.
         If `limit` is provided or `config.active_symbols_default_limit > 0`, the result is truncated.
         """

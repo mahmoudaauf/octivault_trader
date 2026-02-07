@@ -15,7 +15,7 @@ class PortfolioAuthority:
         
         # Thresholds
         self.min_utilization = float(getattr(config, "PORTFOLIO_MIN_UTILIZATION_PCT", 0.5)) # 50%
-        self.target_velocity = float(getattr(config, "TARGET_PROFIT_PER_HR", 10.0)) # 10 USDT/hr
+        self.target_velocity_ratio = float(getattr(config, "TARGET_PROFIT_RATIO_PER_HOUR", 0.001))
         self.max_symbol_concentration = float(getattr(config, "MAX_SYMBOL_CONCENTRATION_PCT", 0.3)) # 30%
 
     def authorize_velocity_exit(self, owned_positions: Dict[str, Any], current_metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -24,7 +24,9 @@ class PortfolioAuthority:
         If profit/hr is low, we may exit low-conv positions to recycle capital.
         """
         run_rate = float(current_metrics.get("run_rate", 0.0))
-        if run_rate >= self.target_velocity:
+        nav = float(current_metrics.get("nav_quote", 0.0) or getattr(self.ss, "_total_value", 0.0) or 0.0)
+        target_velocity = max(0.0, nav * self.target_velocity_ratio)
+        if run_rate >= target_velocity:
             return None # Velocity target met
             
         # If we are underperforming velocity, find the lowest-ALPHA position to recycle
@@ -58,7 +60,7 @@ class PortfolioAuthority:
         if highest_score > 1.2: # Tuneable threshold
             self.logger.warning(
                 "[PortfolioAuth:Velocity] 🔄 RECYCLING CAPITAL: %s (score=%.2f) - Below target velocity ($%.2f/hr)",
-                worst_sym, highest_score, self.target_velocity
+                worst_sym, highest_score, target_velocity
             )
             return {
                 "symbol": worst_sym,

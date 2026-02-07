@@ -144,6 +144,134 @@ class PositionManager:
         await self._emit_audit(active=len(curr_syms), closed=len(vanished))
         await self._emit_health("Running", f"Reconciled {len(curr_syms)} active, {len(vanished)} closed")
 
+    async def finalize_position(
+        self,
+        *,
+        symbol: str,
+        executed_qty: float,
+        executed_price: float,
+        reason: str = "",
+    ) -> None:
+        """Finalize a position after a filled SELL and emit realized PnL update."""
+        try:
+            if hasattr(self.ss, "close_position"):
+                await maybe_call(self.ss, "close_position", symbol, reason)
+            elif hasattr(self.ss, "force_close_all_open_lots"):
+                await maybe_call(self.ss, "force_close_all_open_lots", symbol, reason)
+        except Exception:
+            pass
+        try:
+            realized = float(getattr(self.ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
+            await maybe_call(self.ss, "emit_event", "RealizedPnlUpdated", {
+                "realized_pnl": realized,
+                "symbol": symbol,
+                "price": float(executed_price or 0.0),
+                "qty": float(executed_qty or 0.0),
+                "reason": reason or "SELL_FILLED",
+                "timestamp": time.time(),
+            })
+        except Exception:
+            pass
+
+    async def close_position(
+        self,
+        *,
+        symbol: str,
+        executed_qty: float,
+        executed_price: float,
+        fee_quote: float = 0.0,
+        reason: str = "",
+    ) -> None:
+        """Canonical close hook for SELL fills: close + emit POSITION_CLOSED."""
+        await self.finalize_position(
+            symbol=symbol,
+            executed_qty=executed_qty,
+            executed_price=executed_price,
+            reason=reason,
+        )
+        realized_pnl = 0.0
+        entry_price = 0.0
+        try:
+            sym = str(symbol or "").upper()
+            pos = getattr(self.ss, "positions", {}).get(sym, {}) if hasattr(self.ss, "positions") else {}
+            entry_price = float(pos.get("avg_price", 0.0) or 0.0)
+            if entry_price <= 0 and hasattr(self.ss, "open_trades"):
+                ot = (self.ss.open_trades or {}).get(sym, {})
+                entry_price = float(ot.get("entry_price", 0.0) or 0.0)
+            if entry_price <= 0 and hasattr(self.ss, "_avg_price_cache"):
+                entry_price = float(self.ss._avg_price_cache.get(sym, 0.0) or 0.0)
+            side_hint = str(pos.get("side") or pos.get("position") or "long").lower()
+            if entry_price > 0:
+                if side_hint in ("short", "sell"):
+                    realized_pnl = (entry_price - float(executed_price or 0.0)) * float(executed_qty or 0.0)
+                else:
+                    realized_pnl = (float(executed_price or 0.0) - entry_price) * float(executed_qty or 0.0)
+                realized_pnl -= float(fee_quote or 0.0)
+        except Exception:
+            realized_pnl = 0.0
+
+        already_recorded = False
+        try:
+            hist = getattr(self.ss, "trade_history", None)
+            if isinstance(hist, list) and hist:
+                last = hist[-1] or {}
+                last_sym = str(last.get("symbol", "")).upper()
+                last_side = str(last.get("side", "")).upper()
+                last_ts = float(last.get("ts", 0.0) or 0.0)
+                if last_sym == str(symbol or "").upper() and last_side == "SELL":
+                    if time.time() - last_ts <= 2.0:
+                        already_recorded = True
+        except Exception:
+            already_recorded = False
+
+        if not already_recorded and realized_pnl != 0.0:
+            try:
+                cur = float(getattr(self.ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
+                self.ss.metrics["realized_pnl"] = cur + realized_pnl
+            except Exception:
+                pass
+        try:
+            await maybe_call(self.ss, "emit_event", "RealizedPnlUpdated", {
+                "realized_pnl": float(getattr(self.ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0),
+                "pnl_delta": float(realized_pnl),
+                "symbol": symbol,
+                "price": float(executed_price or 0.0),
+                "qty": float(executed_qty or 0.0),
+                "reason": reason or "SELL_FILLED",
+                "timestamp": time.time(),
+            })
+        except Exception:
+            pass
+        try:
+            if hasattr(self.ss, "record_exit_reason"):
+                self.ss.record_exit_reason(symbol, reason or "SELL_FILLED", source="PositionManager")
+        except Exception:
+            pass
+        try:
+            self.logger.info(
+                "[POSITION_CLOSED] %s pnl=%.6f entry=%.6f exit=%.6f qty=%.6f reason=%s",
+                symbol,
+                float(realized_pnl or 0.0),
+                float(entry_price or 0.0),
+                float(executed_price or 0.0),
+                float(executed_qty or 0.0),
+                reason or "SELL_FILLED",
+            )
+        except Exception:
+            pass
+        try:
+            await maybe_call(self.ss, "emit_event", "POSITION_CLOSED", {
+                "symbol": symbol,
+                "entry_price": float(entry_price or 0.0),
+                "price": float(executed_price or 0.0),
+                "qty": float(executed_qty or 0.0),
+                "realized_pnl": float(realized_pnl),
+                "reason": reason or "SELL_FILLED",
+                "timestamp": time.time(),
+            })
+        except Exception:
+            pass
+
     # ---------------------------
     # Helpers
     # ---------------------------

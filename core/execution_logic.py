@@ -8,8 +8,6 @@ import time
 import asyncio
 from collections import deque, defaultdict
 from typing import Optional
-from core.meta_controller import ExecutionError
-from core.meta_controller import classify_execution_error as _classify_execution_error
 
 class ExecutionLogic:
     def __init__(self, shared_state, execution_manager, config, logger, meta_controller):
@@ -528,13 +526,30 @@ class ExecutionLogic:
             return result
 
         except Exception as e:
+            try:
+                from core.meta_controller import ExecutionError as _ExecutionError
+                from core.meta_controller import classify_execution_error as _classify_execution_error
+            except Exception:
+                from core.stubs import ExecutionError as _ExecutionError
+
+                def _classify_execution_error(err, sym=""):
+                    return _ExecutionError(str(err))
+
             classified_error = _classify_execution_error(e, symbol)
             self.logger.error("Decision execution failed for %s: %s", symbol, classified_error, exc_info=True)
-            if classified_error.error_type in (ExecutionError.Type.INSUFFICIENT_BALANCE, ExecutionError.Type.MIN_NOTIONAL_VIOLATION):
+            error_type = getattr(classified_error, "error_type", "UNKNOWN")
+            try:
+                insuff_types = (
+                    _ExecutionError.Type.INSUFFICIENT_BALANCE,
+                    _ExecutionError.Type.MIN_NOTIONAL_VIOLATION,
+                )
+            except Exception:
+                insuff_types = ("INSUFFICIENT_BALANCE", "MIN_NOTIONAL_VIOLATION")
+            if error_type in insuff_types:
                 agent = signal.get("agent", "Meta")
                 if hasattr(self.shared_state, "report_agent_capital_failure"):
                     self.shared_state.report_agent_capital_failure(agent)
-            await self.meta_controller._update_kpi_metrics("error", classified_error.error_type)
+            await self.meta_controller._update_kpi_metrics("error", error_type)
             await self.meta_controller._health_set("Critical", f"Execution error for {symbol}: {classified_error}")
 
     async def _safe_await(self, maybe_coro):

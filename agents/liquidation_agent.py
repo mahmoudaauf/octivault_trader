@@ -85,6 +85,62 @@ class LiquidationAgent:
     def roi_threshold(self) -> float: return float(self._cfg("LIQ_ROI_THRESHOLD", -0.05))
     @property
     def min_notional_dust_factor(self) -> float: return float(self._cfg("LIQ_DUST_FACTOR", 1.2))
+    @property
+    def min_hold_sec(self) -> float: return float(self._cfg("LIQ_MIN_HOLD_SEC", 90.0))
+
+    def _parse_ts(self, val: Any) -> float:
+        if isinstance(val, datetime):
+            return float(val.timestamp())
+        try:
+            return float(val or 0.0)
+        except Exception:
+            return 0.0
+
+    def _get_position_age_sec(self, symbol: str) -> Optional[float]:
+        sym = str(symbol or "")
+        entry_ts = 0.0
+        try:
+            ot = getattr(self.shared_state, "open_trades", {}) or {}
+            if isinstance(ot, dict):
+                tr = ot.get(sym, {}) or {}
+                entry_ts = self._parse_ts(
+                    tr.get("entry_time") or tr.get("created_at") or tr.get("opened_at")
+                )
+        except Exception:
+            entry_ts = 0.0
+        if entry_ts <= 0:
+            try:
+                pos = getattr(self.shared_state, "positions", {}) or {}
+                if isinstance(pos, dict):
+                    pr = pos.get(sym, {}) or {}
+                    entry_ts = self._parse_ts(
+                        pr.get("entry_time") or pr.get("opened_at") or pr.get("created_at")
+                    )
+            except Exception:
+                entry_ts = 0.0
+
+        if entry_ts <= 0:
+            return None
+        return max(0.0, _t.time() - entry_ts)
+
+    def _passes_min_hold(self, symbol: str) -> bool:
+        min_hold = float(self.min_hold_sec or 0.0)
+        if min_hold <= 0:
+            return True
+        age_sec = self._get_position_age_sec(symbol)
+        if age_sec is None:
+            self.logger.info("[%s] Min-hold blocked %s: missing entry timestamp", self.name, symbol)
+            return False
+        if age_sec < min_hold:
+            self.logger.info(
+                "[%s] Min-hold blocked %s: age=%.1fs < min_hold=%.0fs",
+                self.name,
+                symbol,
+                age_sec,
+                min_hold,
+            )
+            return False
+        return True
 
     # -----------------------------
     # Lifecycle
@@ -185,7 +241,8 @@ class LiquidationAgent:
         if target_symbol:
             qty = await self.shared_state.get_position_quantity(target_symbol)
             if qty > 0:
-                intents.append(self._create_intent(target_symbol, qty, reason=opp_meta.get("reason", "manual"), force=force))
+                if self._passes_min_hold(target_symbol):
+                    intents.append(self._create_intent(target_symbol, qty, reason=opp_meta.get("reason", "manual"), force=force))
         
         elif needed_quote > 0:
             freed = 0.0
@@ -202,6 +259,8 @@ class LiquidationAgent:
             candidates.sort(key=lambda x: x["roi"]) # Worst ROI first
             for cand in candidates:
                 if freed >= needed_quote: break
+                if not self._passes_min_hold(cand["symbol"]):
+                    continue
                 intents.append(self._create_intent(cand["symbol"], cand["qty"], reason=f"Free capital: {opp_meta.get('reason','gap')}", force=force))
                 freed += cand["value"]
 
@@ -245,8 +304,8 @@ class LiquidationAgent:
             agent=self.name,
             qty_hint=qty,
             ttl_sec=300,
-            tag="liquidation_force" if force else "liquidation",
-            rationale=reason
+            tag="liquidation",
+            rationale=(f"{reason} (force)" if force else reason)
         )
 
     async def request_liquidation(self, symbol: str, side: str = "SELL", qty: float = 0.0, reason: str = "External request", **kwargs):
@@ -258,6 +317,8 @@ class LiquidationAgent:
         """Internal hygiene exit: emits directly."""
         try:
             self.active_liquidations.add(symbol)
+            if not self._passes_min_hold(symbol):
+                return
             qty = await self.shared_state.get_position_quantity(symbol)
             if qty <= 0: return
 
