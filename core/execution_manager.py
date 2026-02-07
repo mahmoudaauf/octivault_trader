@@ -1250,7 +1250,7 @@ class ExecutionManager:
         else:
             yield
 
-    async def _get_free_quote_and_remainder_ok(self, quote_asset: str, spend: float) -> tuple[float, bool, str]:
+    async def _get_free_quote_and_remainder_ok(self, quote_asset: str, spend: float) -> Tuple[float, bool, str]:
         """Return (free_quote, ok, reason). Enforce min_free_reserve_usdt and no_remainder_below_quote."""
         free = 0.0
         if hasattr(self.shared_state, 'get_free_balance'):
