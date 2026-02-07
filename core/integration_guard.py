@@ -69,7 +69,7 @@ def compute_notional(price: float, qty: float, mode: Literal["QUOTE","BASE"]) ->
 def validate_trade(
     symbol: str, price: float, qty: float, mode: Literal["QUOTE","BASE"],
     wallet_free_usdt: float, filters: dict
-) -> tuple[bool, str]:
+) -> Tuple[bool, str]:
     if price <= 0: return False, "price_invalid"
     notional = compute_notional(price, qty, mode)
     min_notional = float(filters.get("minNotional", 0.0))
