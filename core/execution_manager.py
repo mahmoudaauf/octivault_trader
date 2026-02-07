@@ -727,22 +727,21 @@ class ExecutionManager:
     return 0.0
 
     def _get_entry_price_for_sell(self, sym: str) -> float:
-
-    """Best-effort lookup of entry/avg price for net PnL gating."""
-    try:
-    ot = getattr(self.shared_state, "open_trades", {}) or {}
-    entry = float((ot.get(sym) or {}).get("entry_price", 0.0) or 0.0)
-    if entry > 0:
-    return entry
-    except Exception:
-    pass
-    try:
-    pos = getattr(self.shared_state, "positions", {}) or {}
-    entry = float((pos.get(sym) or {}).get("avg_price", 0.0) or 0.0)
-    if entry > 0:
-    return entry
-    except Exception:
-    pass
+        """Best-effort lookup of entry/avg price for net PnL gating."""
+        try:
+            ot = getattr(self.shared_state, "open_trades", {}) or {}
+            entry = float((ot.get(sym) or {}).get("entry_price", 0.0) or 0.0)
+            if entry > 0:
+                return entry
+        except Exception:
+            pass
+        try:
+            pos = getattr(self.shared_state, "positions", {}) or {}
+            entry = float((pos.get(sym) or {}).get("avg_price", 0.0) or 0.0)
+            if entry > 0:
+                return entry
+        except Exception:
+            pass
     try:
     return float(getattr(self.shared_state, "_avg_price_cache", {}).get(sym, 0.0) or 0.0)
     except Exception:
