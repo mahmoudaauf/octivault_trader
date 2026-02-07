@@ -578,6 +578,8 @@ class MarketDataFeed:
 
     async def run(self) -> None:
         self._logger.info("📡 MarketDataFeed run loop entered")
+        syms = await self._get_accepted_symbols()
+        self._logger.warning(f"[MDF] loop entered | accepted_symbols={syms}")
 
         while True:
             symbols = await self._get_accepted_symbols()
