@@ -2,7 +2,7 @@
 SignalManager subsystem extracted from MetaController.
 Handles signal cache, signal intake, validation, deduplication, and queue management.
 """
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import time
 
 # Import utilities needed for intent processing
