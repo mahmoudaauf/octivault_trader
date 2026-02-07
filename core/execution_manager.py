@@ -44,9 +44,9 @@ try:
 # type: ignore
 except Exception:
     class BinanceAPIException(Exception):
-    def __init__(self, code: int | None = None, message: str = ""):
-        self.code = code
-        super().__init__(message or f"BinanceAPIException({code})")
+        def __init__(self, code: int | None = None, message: str = ""):
+            self.code = code
+            super().__init__(message or f"BinanceAPIException({code})")
 
 class ExecutionError(Exception):
     def __init__(self, error_type: str, message: str = "", symbol: str = "", meta: dict | None = None):
