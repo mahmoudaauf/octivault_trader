@@ -695,19 +695,19 @@ class ExecutionManager:
     base_asset, _ = self._split_base_quote(sym)
 
     for attempt in range(max_retries):
-    # Check current balance (Exchange-first via FIX #2)
-    qty = await self._get_sellable_qty(sym)
-    if qty > 0:
-    self.logger.info(
-    f"[PositionReady] {sym}: qty={qty:.6f} available (attempt {attempt + 1}/{max_retries})"
-    )
-    return qty
+        # Check current balance (Exchange-first via FIX #2)
+        qty = await self._get_sellable_qty(sym)
+        if qty > 0:
+            self.logger.info(
+                f"[PositionReady] {sym}: qty={qty:.6f} available (attempt {attempt + 1}/{max_retries})"
+            )
+            return qty
 
-    # If we found it, return early
-    if attempt < max_retries - 1:
-    # State might be in flight; trigger refresh and retry
-    self.logger.warning(
-    f"[PositionReady] {sym}: No qty found (attempt {attempt + 1}/{max_retries}). "
+        # If we found it, return early
+        if attempt < max_retries - 1:
+            # State might be in flight; trigger refresh and retry
+            self.logger.warning(
+                f"[PositionReady] {sym}: No qty found (attempt {attempt + 1}/{max_retries}). "
     f"Syncing state..."
     )
 
