@@ -541,23 +541,22 @@ class ExecutionManager:
     def _ensure_heartbeat(self) -> None:
         """Start the heartbeat task if it isn't running yet."""
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
-    return
-    try:
-    loop = asyncio.get_running_loop()
-    except RuntimeError:
-    return
-    try:
-    self._heartbeat_task = loop.create_task(
-    self._heartbeat_loop(), name="ExecutionManager:heartbeat")
-    except Exception:
-    pass
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            self._heartbeat_task = loop.create_task(
+                self._heartbeat_loop(), name="ExecutionManager:heartbeat")
+        except Exception:
+            pass
 
     # small helper to emit status consistently
 
-
     async def _emit_status(self, status: str, detail: str = ""):
-    self._ensure_heartbeat()
-    try:
+        self._ensure_heartbeat()
+        try:
     # Update timestamp so Watchdog sees activity
     if hasattr(self.shared_state, "update_timestamp"):
     await maybe_call(self.shared_state, "update_timestamp", "ExecutionManager")
