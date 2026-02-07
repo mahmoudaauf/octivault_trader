@@ -633,21 +633,21 @@ class ExecutionManager:
                 with contextlib.suppress(Exception):
                     bal = await get_bal(base_asset)
                     free = float((bal or {}).get("free", 0.0))
-    locked = float((bal or {}).get("locked", 0.0))
-    qty = float(free + locked)
-    if qty > 0:
-    self.logger.debug(
-    f"[GetSellable] {sym}: qty={qty:.6f} from Exchange (AUTHORITATIVE)")
-    return qty
+                    locked = float((bal or {}).get("locked", 0.0))
+                    qty = float(free + locked)
+                    if qty > 0:
+                        self.logger.debug(
+                            f"[GetSellable] {sym}: qty={qty:.6f} from Exchange (AUTHORITATIVE)")
+                        return qty
 
-    # ✅ FIX #2: FALLBACK to SharedState only if Exchange unavailable
-    if hasattr(self.shared_state, "get_position_quantity"):
-    with contextlib.suppress(Exception):
-    q = await self.shared_state.get_position_quantity(sym)
-    qty = float(q or 0.0)
-    if qty > 0:
-    self.logger.debug(
-    f"[GetSellable] {sym}: qty={qty:.6f} from SharedState (cache)")
+            # ✅ FIX #2: FALLBACK to SharedState only if Exchange unavailable
+            if hasattr(self.shared_state, "get_position_quantity"):
+                with contextlib.suppress(Exception):
+                    q = await self.shared_state.get_position_quantity(sym)
+                    qty = float(q or 0.0)
+                    if qty > 0:
+                        self.logger.debug(
+                            f"[GetSellable] {sym}: qty={qty:.6f} from SharedState (cache)")
     return qty
 
     # ✅ FIX #2: PositionManager fallback (if present under SharedState)
