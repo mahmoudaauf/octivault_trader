@@ -136,18 +136,18 @@ class ExecutionManager:
         steps = math.floor(value / step)
         return steps * step
 
-# --- Post-fill realized PnL emitter (P9 observability contract) ---
-async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
-"""
-Best-effort: compute/record realized PnL delta when a trade fills, then emit
-a `RealizedPnlUpdated` event and persist the delta via SharedState if possible.
-This is tolerant to different SharedState contract shapes.
-"""
-emitted = False
-realized_committed = False
-delta_f = None
-try:
-sym = self._norm_symbol(symbol)
+    # --- Post-fill realized PnL emitter (P9 observability contract) ---
+    async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Best-effort: compute/record realized PnL delta when a trade fills, then emit
+        a `RealizedPnlUpdated` event and persist the delta via SharedState if possible.
+        This is tolerant to different SharedState contract shapes.
+        """
+        emitted = False
+        realized_committed = False
+        delta_f = None
+        try:
+            sym = self._norm_symbol(symbol)
 side_u = (side or "").upper()
 exec_qty = float(order.get("executedQty") or order.get("executed_qty") or 0.0)
 price = float(order.get("avgPrice") or order.get("price") or 0.0)
