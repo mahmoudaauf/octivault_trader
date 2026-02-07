@@ -1,3 +1,6 @@
+"""
+Octivault Trader - Risk Manager Module
+"""
 # core/risk_manager.py
 import logging
 import contextlib
