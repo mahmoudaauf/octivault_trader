@@ -117,6 +117,12 @@ async def _run():
         ctx = AppContext(config=cfg, logger=logging.getLogger("AppContext"))
         # شغّل كل المراحل داخليًا (P1→P9)
         await ctx.initialize_all(up_to_phase=phase_max)
+        
+        # Ensure MarketDataFeed is running (canonical startup)
+        if hasattr(ctx, 'market_data_feed') and ctx.market_data_feed and hasattr(ctx.market_data_feed, 'run'):
+            asyncio.create_task(ctx.market_data_feed.run(), name="MarketDataFeed")
+            logger.info("✅ MarketDataFeed started")
+        
         logger.info("✅ Runtime plane is live (P9). Press Ctrl+C to stop.")
 
         # Wait here until a signal arrives
