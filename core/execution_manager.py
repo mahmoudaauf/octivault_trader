@@ -348,23 +348,23 @@ class ExecutionManager:
             now = time.time()
             payload = {
                 "realized_pnl": float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0),
-    "pnl_delta": float(realized_pnl),
-    "symbol": sym,
-    "price": exec_px,
-    "qty": exec_qty,
-    "timestamp": now,
-    }
-    with contextlib.suppress(Exception):
-    await maybe_call(self.shared_state, "emit_event", "RealizedPnlUpdated", payload)
+                "pnl_delta": float(realized_pnl),
+                "symbol": sym,
+                "price": exec_px,
+                "qty": exec_qty,
+                "timestamp": now,
+            }
+            with contextlib.suppress(Exception):
+                await maybe_call(self.shared_state, "emit_event", "RealizedPnlUpdated", payload)
 
-    self.logger.info(json.dumps({
-    "event": "POSITION_CLOSED",
-    "symbol": sym,
-    "entry_price": entry_price,
-    "exit_price": exec_px,
-    "qty": exec_qty,
-    "realized_pnl": realized_pnl,
-    }, separators=(",", ":")))
+            self.logger.info(json.dumps({
+                "event": "POSITION_CLOSED",
+                "symbol": sym,
+                "entry_price": entry_price,
+                "exit_price": exec_px,
+                "qty": exec_qty,
+                "realized_pnl": realized_pnl,
+            }, separators=(",", ":")))
 
     # Consider consolidating _split_symbol_quote and _split_base_quote to avoid drift.
 
