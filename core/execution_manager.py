@@ -1,13 +1,13 @@
-    """
-    Octivault Trader — P9 Canonical ExecutionManager (native to your SharedState & ExchangeClient)
-    """
+"""
+Octivault Trader — P9 Canonical ExecutionManager (native to your SharedState & ExchangeClient)
+"""
 
-    from __future__ import annotations
+from __future__ import annotations
 
-    __all__ = ["ExecutionManager"]
+__all__ = ["ExecutionManager"]
 
-    import asyncio
-    import contextlib
+import asyncio
+import contextlib
     from contextlib import asynccontextmanager
     from collections import deque
     import logging
