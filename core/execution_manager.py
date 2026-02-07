@@ -485,8 +485,8 @@ class ExecutionManager:
                 if isinstance(cs, dict):
                     cs["ExecutionManager"] = {"status": "Initialized",
                                               "message": "Ready", "timestamp": now_ts, "ts": now_ts}
-            except Exception:
-                pass
+                except Exception:
+                    pass
         except Exception:
             self.logger.debug("EM init health update failed", exc_info=True)
 
