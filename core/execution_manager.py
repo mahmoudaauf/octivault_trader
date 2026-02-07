@@ -483,21 +483,18 @@ class ExecutionManager:
                 now_ts = time.time()
                 cs = getattr(self.shared_state, "component_statuses", None)
                 if isinstance(cs, dict):
-    cs["ExecutionManager"] = {"status": "Initialized",
-                          "message": "Ready", "timestamp": now_ts, "ts": now_ts}
-    except Exception:
-    pass
-    except Exception:
-    self.logger.debug("EM init health update failed", exc_info=True)
-
+                    cs["ExecutionManager"] = {"status": "Initialized",
+                                              "message": "Ready", "timestamp": now_ts, "ts": now_ts}
+            except Exception:
+                pass
+        except Exception:
+            self.logger.debug("EM init health update failed", exc_info=True)
 
     def _exit_fee_bps(self) -> float:
-
-
-    cfg_val = float(getattr(self.config, "EXIT_FEE_BPS",
-                getattr(self.config, "CR_FEE_BPS", 0.0)) or 0.0)
-    fee_from_pct = float(self.trade_fee_pct or 0.0) * 10000.0
-    return max(cfg_val, fee_from_pct)
+        cfg_val = float(getattr(self.config, "EXIT_FEE_BPS",
+                    getattr(self.config, "CR_FEE_BPS", 0.0)) or 0.0)
+        fee_from_pct = float(self.trade_fee_pct or 0.0) * 10000.0
+        return max(cfg_val, fee_from_pct)
 
 
     def _exit_slippage_bps(self) -> float:
