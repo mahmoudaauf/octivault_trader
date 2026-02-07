@@ -2,7 +2,7 @@
 import time, uuid, logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Literal, Any
+from typing import Dict, Optional, Literal, Any, Tuple
 
 logger = logging.getLogger("IntegrationGuard")
 
@@ -30,7 +30,7 @@ class SchemaRegistry:
 schema_registry = SchemaRegistry()
 
 # ---------- Freshness helpers ----------
-def too_old(ts_sec: float, budget_sec: float) -> tuple[bool, float]:
+def too_old(ts_sec: float, budget_sec: float) -> Tuple[bool, float]:
     if not ts_sec: return (True, float("inf"))
     age = time.time() - float(ts_sec)
     return (age > budget_sec, age)

@@ -582,7 +582,7 @@ class RiskManager:
                     if hasattr(order, "quote_quantity"):
                         setattr(order, "quote_quantity", float(adj_quote))
 
-    async def approve(self, order=None, **kwargs) -> tuple[bool, str]:
+    async def approve(self, order=None, **kwargs) -> Tuple[bool, str]:
         params = self._order_to_kwargs(order)
         params.update({k: v for k, v in kwargs.items() if v is not None})
         ok, reason, adj_qty, adj_quote = await self.validate_order(
@@ -601,7 +601,7 @@ class RiskManager:
         ok, _ = await self.approve(order)
         return bool(ok)
 
-    async def should_allow(self, order) -> tuple[bool, str]:
+    async def should_allow(self, order) -> Tuple[bool, str]:
         # EM prefers this if present
         return await self.approve(order)
 
