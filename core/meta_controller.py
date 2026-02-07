@@ -2106,6 +2106,13 @@ class MetaController:
         nudge = float(self.active_policy_nudges.get("confidence_nudge", 0.0))
         effective = base + nudge
         
+        # BOOTSTRAP CONFIDENCE FLOOR: Enforce minimum confidence for bootstrap mode
+        # to avoid garbage signals while still allowing liquidity seeding
+        if self._is_bootstrap_mode():
+            bootstrap_min_conf = float(self._cfg("BOOTSTRAP_MIN_CONFIDENCE", 0.55))
+            effective = max(effective, bootstrap_min_conf)
+            self.logger.debug("[Meta:Bootstrap] Confidence floor enforced: %.3f (min=%.3f)", effective, bootstrap_min_conf)
+        
         # SAFETY CLAMP: Policies can INCREASE confidence floor (making entries harder/safer),
         # but they cannot LOWER the floor for safety-critical modes (PROTECTIVE, SAFE, RECOVERY).
         if mode in ("PROTECTIVE", "SAFE", "RECOVERY"):
