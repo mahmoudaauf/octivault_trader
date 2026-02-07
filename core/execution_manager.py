@@ -532,17 +532,15 @@ class ExecutionManager:
     async def _heartbeat_loop(self):
         """Continuous heartbeat to satisfy Watchdog when no trades are occurring."""
         while True:
-    try:
-    await self._emit_status("Operational", "Idle / Ready")
-    except Exception:
-    pass
-    await asyncio.sleep(60)
-
+            try:
+                await self._emit_status("Operational", "Idle / Ready")
+            except Exception:
+                pass
+            await asyncio.sleep(60)
 
     def _ensure_heartbeat(self) -> None:
-
-    """Start the heartbeat task if it isn't running yet."""
-    if self._heartbeat_task is not None and not self._heartbeat_task.done():
+        """Start the heartbeat task if it isn't running yet."""
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
     return
     try:
     loop = asyncio.get_running_loop()
