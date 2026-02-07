@@ -573,16 +573,14 @@ class ExecutionManager:
             now_ts = time.time()
             cs = getattr(self.shared_state, "component_statuses", None)
             if isinstance(cs, dict):
-    cs["ExecutionManager"] = {"status": status,
-                          "message": detail, "timestamp": now_ts, "ts": now_ts}
-    except Exception:
-    pass
-
+                cs["ExecutionManager"] = {"status": status,
+                                          "message": detail, "timestamp": now_ts, "ts": now_ts}
+        except Exception:
+            pass
 
     def _ensure_semaphores_ready(self):
-
-    """Lazy-initialize semaphores when needed (requires running event loop)."""
-    if self._semaphores_initialized:
+        """Lazy-initialize semaphores when needed (requires running event loop)."""
+        if self._semaphores_initialized:
     return
     try:
     if self._concurrent_orders_sem is None:
