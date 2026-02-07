@@ -72,13 +72,13 @@ except Exception:
 async def validate_order_request(*, side: str, qty: float, price: float,
 filters: SymbolFilters, taker_fee_bps: int = 10,
 use_quote_amount: Optional[float] = None):
-if price <= 0:
-return False, 0.0, 0.0, "invalid_price"
-if use_quote_amount is not None:
-spend = float(use_quote_amount)
-# 1. Nominal Floor Check (Spec Requirement 1.1)
-if spend < max(filters.min_notional, filters.min_entry_quote or 0.0):
-return False, 0.0, 0.0, "QUOTE_LT_MIN_NOTIONAL"
+    if price <= 0:
+        return False, 0.0, 0.0, "invalid_price"
+    if use_quote_amount is not None:
+        spend = float(use_quote_amount)
+        # 1. Nominal Floor Check (Spec Requirement 1.1)
+        if spend < max(filters.min_notional, filters.min_entry_quote or 0.0):
+            return False, 0.0, 0.0, "QUOTE_LT_MIN_NOTIONAL"
 
 # 2. Executable Quantity Check (Spec Requirement 1.2)
 # Affordability = "The trade produces a non-zero executable quantity"
