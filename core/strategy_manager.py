@@ -192,7 +192,7 @@ class StrategyManager:
         left = (last + cd) - now
         return left if left > 0 else 0.0
 
-    async def _can_forward(self, symbol: str) -> tuple[bool, str, dict]:
+    async def _can_forward(self, symbol: str) -> Tuple[bool, str, dict]:
         """Check hard guards before forwarding to ExecutionManager."""
         meta = {"inflight": int(self._inflight_exec), "max_conc": int(self.exec_max_concurrency)}
         # Concurrency gate (non-blocking)
