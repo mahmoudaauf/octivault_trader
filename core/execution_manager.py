@@ -469,20 +469,20 @@ class ExecutionManager:
 
     self.logger.info("ExecutionManager initialized with P9 configuration")
 
-    # --- Health: mark as Initialized right away (so Watchdog stops "no-report") ---
-    try:
-    # primary API
-    upd = getattr(self.shared_state, "update_component_status", None) \
-    or getattr(self.shared_state, "set_component_status", None)
-    if callable(upd):
-    res = upd("ExecutionManager", "Initialized", "Ready")
-    if asyncio.iscoroutine(res):
-    asyncio.create_task(res)
-    # compatibility mirror for Watchdog (_safe_status fallback)
-    try:
-    now_ts = time.time()
-    cs = getattr(self.shared_state, "component_statuses", None)
-    if isinstance(cs, dict):
+        # --- Health: mark as Initialized right away (so Watchdog stops "no-report") ---
+        try:
+            # primary API
+            upd = getattr(self.shared_state, "update_component_status", None) \
+                or getattr(self.shared_state, "set_component_status", None)
+            if callable(upd):
+                res = upd("ExecutionManager", "Initialized", "Ready")
+                if asyncio.iscoroutine(res):
+                    asyncio.create_task(res)
+            # compatibility mirror for Watchdog (_safe_status fallback)
+            try:
+                now_ts = time.time()
+                cs = getattr(self.shared_state, "component_statuses", None)
+                if isinstance(cs, dict):
     cs["ExecutionManager"] = {"status": "Initialized",
                           "message": "Ready", "timestamp": now_ts, "ts": now_ts}
     except Exception:
