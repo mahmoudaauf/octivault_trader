@@ -577,11 +577,17 @@ class MarketDataFeed:
     # -------------------- steady loop --------------------
 
     async def run(self) -> None:
+        self._logger.info("📡 MarketDataFeed run loop entered")
         sem = asyncio.Semaphore(self.max_concurrency)
         while not self._stop.is_set():
             try:
                 t0 = time.perf_counter()
                 symbols = await self._get_accepted_symbols()
+                
+                if not symbols:
+                    await asyncio.sleep(1)
+                    continue
+                
                 if self._stop.is_set():
                     break
                 tasks: List[asyncio.Task] = [
