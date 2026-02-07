@@ -101,20 +101,20 @@ use_quote_amount: Optional[float] = None):
             return False, 0.0, 0.0, "QTY_LT_MIN"
 
         return True, float(qty), spend, "OK"
-else:
-from decimal import Decimal, ROUND_DOWN
-step = float(filters.step_size or 0.0)
-if step > 0:
-q = (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
-qty = float(q * Decimal(str(step)))
+    else:
+        from decimal import Decimal, ROUND_DOWN
+        step = float(filters.step_size or 0.0)
+        if step > 0:
+            q = (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+            qty = float(q * Decimal(str(step)))
 
-if qty <= 0:
-return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
+        if qty <= 0:
+            return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
 
-if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
-# Strict Rule 2.1: amount == 0 -> ExecutionProbe = FAIL
-return False, 0.0, 0.0, "NOTIONAL_LT_MIN"
-return True, float(qty), 0.0, "OK"
+        if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
+            # Strict Rule 2.1: amount == 0 -> ExecutionProbe = FAIL
+            return False, 0.0, 0.0, "NOTIONAL_LT_MIN"
+        return True, float(qty), 0.0, "OK"
 
 # =============================
 # ExecutionManager
