@@ -118,6 +118,9 @@ async def _run():
         # شغّل كل المراحل داخليًا (P1→P9)
         await ctx.initialize_all(up_to_phase=phase_max)
         
+        # Wait for symbols to be ready before starting MDF (architecturally clean)
+        await ctx.shared_state.wait_for_event("AcceptedSymbolsReady")
+        
         # Ensure MarketDataFeed is running (canonical startup)
         if hasattr(ctx, 'market_data_feed') and ctx.market_data_feed and hasattr(ctx.market_data_feed, 'run'):
             asyncio.create_task(ctx.market_data_feed.run(), name="MarketDataFeed")
