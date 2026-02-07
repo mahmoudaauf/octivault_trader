@@ -308,21 +308,21 @@ class ExecutionManager:
             fills = raw.get("fills") or []
             if isinstance(fills, list):
                 fee_quote = sum(
-    float(f.get("commission", 0.0) or 0.0)
-    for f in fills
-    if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
-    ) or fee_quote
-    except Exception:
-    pass
+                    float(f.get("commission", 0.0) or 0.0)
+                    for f in fills
+                    if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
+                ) or fee_quote
+        except Exception:
+            pass
 
-    realized_pnl = 0.0
-    pos = getattr(self.shared_state, "positions", {}).get(
-    sym, {}) if hasattr(self.shared_state, "positions") else {}
-    side_hint = str(pos.get("side") or pos.get("position") or "long").lower()
-    if entry_price > 0 and exec_px > 0 and exec_qty > 0:
-    if side_hint in ("short", "sell"):
-    realized_pnl = (entry_price - exec_px) * exec_qty - fee_quote
-    else:
+        realized_pnl = 0.0
+        pos = getattr(self.shared_state, "positions", {}).get(
+            sym, {}) if hasattr(self.shared_state, "positions") else {}
+        side_hint = str(pos.get("side") or pos.get("position") or "long").lower()
+        if entry_price > 0 and exec_px > 0 and exec_qty > 0:
+            if side_hint in ("short", "sell"):
+                realized_pnl = (entry_price - exec_px) * exec_qty - fee_quote
+            else:
     realized_pnl = (exec_px - entry_price) * exec_qty - fee_quote
 
     return entry_price, exec_px, exec_qty, realized_pnl
