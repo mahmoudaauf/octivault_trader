@@ -580,7 +580,7 @@ class MarketDataFeed:
         self._logger.info("📡 MarketDataFeed run loop entered")
 
         while True:
-            symbols = list(self.shared_state.accepted_symbols)
+            symbols = await self._get_accepted_symbols()
 
             self._logger.debug(f"[MDF] symbols={symbols}")
 
