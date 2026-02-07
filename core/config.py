@@ -1,9 +1,6 @@
-try:
-    from dotenv import load_dotenv, find_dotenv
-    # Force-load the .env closest to your repo (not the caller's cwd), and override any stale env
-    load_dotenv(dotenv_path=find_dotenv(usecwd=True), override=True)
-except ImportError:
-    pass
+from dotenv import load_dotenv, find_dotenv
+# Force-load the .env closest to your repo (not the caller's cwd), and override any stale env
+load_dotenv(dotenv_path=find_dotenv(usecwd=True), override=True)
 
 import os
 import logging
