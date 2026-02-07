@@ -9415,6 +9415,16 @@ class MetaController:
                             self.shared_state.replan_request_event.set()
                         # Brief wait for reconciliation
                         await _asyncio.sleep(float(self._cfg("ESCALATION_RETRY_DELAY_SEC", default=2.0)))
+                        
+                        # CRITICAL FIX: Refresh balance from exchange after escalation liquidation
+                        # Problem: Cached balance may not reflect liquidation results
+                        # Solution: Force sync before retry to ensure accurate affordability check
+                        try:
+                            await self.shared_state.sync_authoritative_balance(force=True)
+                            self.logger.debug("Balance refreshed after escalation liquidation for %s", symbol)
+                        except Exception as e:
+                            self.logger.warning("Failed to refresh balance after escalation: %s", e)
+                        
                         # Authoritative Retry
                         self.logger.info("🔄 [Escalation] Retrying BUY for %s after liquidation.", symbol)
                         retry_policy_ctx = self._build_policy_context(
