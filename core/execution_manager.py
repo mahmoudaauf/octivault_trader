@@ -611,28 +611,28 @@ class ExecutionManager:
 
 
     async def _get_sellable_qty(self, sym: str) -> float:
-    """Best-effort lookup for how much we can sell right now.
+        """Best-effort lookup for how much we can sell right now.
 
-    ✅ FIX #2: REORDERED PRECEDENCE - Exchange is authoritative!
-    Order of precedence (REVISED for eventual consistency):
-    1) ExchangeClient.get_account_balance(base_asset) ← AUTHORITATIVE SOURCE
-    2) SharedState.get_position_quantity(sym) ← Cache (fallback)
-    3) SharedState.position_manager.get_position(sym).quantity ← Last resort
+        ✅ FIX #2: REORDERED PRECEDENCE - Exchange is authoritative!
+        Order of precedence (REVISED for eventual consistency):
+        1) ExchangeClient.get_account_balance(base_asset) ← AUTHORITATIVE SOURCE
+        2) SharedState.get_position_quantity(sym) ← Cache (fallback)
+        3) SharedState.position_manager.get_position(sym).quantity ← Last resort
 
-    Rationale: Exchange has the actual fill immediately. SharedState might be 
-    delayed by 100-500ms. Checking SharedState first causes stale-state rejections.
-    Returns 0.0 if unknown.
-    """
-    try:
-    qty = 0.0
-    base_asset, _ = self._split_base_quote(sym)
+        Rationale: Exchange has the actual fill immediately. SharedState might be 
+        delayed by 100-500ms. Checking SharedState first causes stale-state rejections.
+        Returns 0.0 if unknown.
+        """
+        try:
+            qty = 0.0
+            base_asset, _ = self._split_base_quote(sym)
 
-    # ✅ FIX #2: CHECK EXCHANGE FIRST (authoritative source, < 50ms)
-    get_bal = getattr(self.exchange_client, "get_account_balance", None)
-    if callable(get_bal):
-    with contextlib.suppress(Exception):
-    bal = await get_bal(base_asset)
-    free = float((bal or {}).get("free", 0.0))
+            # ✅ FIX #2: CHECK EXCHANGE FIRST (authoritative source, < 50ms)
+            get_bal = getattr(self.exchange_client, "get_account_balance", None)
+            if callable(get_bal):
+                with contextlib.suppress(Exception):
+                    bal = await get_bal(base_asset)
+                    free = float((bal or {}).get("free", 0.0))
     locked = float((bal or {}).get("locked", 0.0))
     qty = float(free + locked)
     if qty > 0:
