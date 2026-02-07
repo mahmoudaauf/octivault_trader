@@ -13,11 +13,11 @@ from collections import deque
 import logging
 import json
 import time
-    from decimal import Decimal, ROUND_DOWN
-    # uuid import removed (unused)
-    from typing import Any, Dict, Optional, Tuple, Union, Literal
-    from core.stubs import resilient_trade, maybe_call
-    from core.shared_state import PendingPositionIntent
+from decimal import Decimal, ROUND_DOWN
+# uuid import removed (unused)
+from typing import Any, Dict, Optional, Tuple, Union, Literal
+from core.stubs import resilient_trade, maybe_call
+from core.shared_state import PendingPositionIntent
 
     # =============================
     # Utility shims (maybe_call, round_step, resilient_trade)
