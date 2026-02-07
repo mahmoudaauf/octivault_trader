@@ -648,26 +648,26 @@ class ExecutionManager:
                     if qty > 0:
                         self.logger.debug(
                             f"[GetSellable] {sym}: qty={qty:.6f} from SharedState (cache)")
-    return qty
+                        return qty
 
-    # ✅ FIX #2: PositionManager fallback (if present under SharedState)
-    pm = getattr(self.shared_state, "position_manager", None)
-    if pm is not None:
-    getp = getattr(pm, "get_position", None)
-    if callable(getp):
-    with contextlib.suppress(Exception):
-    p = await getp(sym) if asyncio.iscoroutinefunction(getp) else getp(sym)
-    if p:
-    q = getattr(p, "quantity", None)
-    if q is None:
-    q = getattr(p, "qty", 0.0)
-    qty = float(q or 0.0)
-    if qty > 0:
-    self.logger.debug(f"[GetSellable] {sym}: qty={qty:.6f} from PositionManager")
-    return qty
+            # ✅ FIX #2: PositionManager fallback (if present under SharedState)
+            pm = getattr(self.shared_state, "position_manager", None)
+            if pm is not None:
+                getp = getattr(pm, "get_position", None)
+                if callable(getp):
+                    with contextlib.suppress(Exception):
+                        p = await getp(sym) if asyncio.iscoroutinefunction(getp) else getp(sym)
+                        if p:
+                            q = getattr(p, "quantity", None)
+                            if q is None:
+                                q = getattr(p, "qty", 0.0)
+                            qty = float(q or 0.0)
+                            if qty > 0:
+                                self.logger.debug(f"[GetSellable] {sym}: qty={qty:.6f} from PositionManager")
+                                return qty
 
-    # If we reached here, both Exchange and SharedState think we have 0
-    if getattr(self.shared_state, "positions", {}).get(sym):
+            # If we reached here, both Exchange and SharedState think we have 0
+            if getattr(self.shared_state, "positions", {}).get(sym):
     self.logger.warning(
     f"[GetSellable] {sym}: Zero quantity returned despite position record existence.")
 
