@@ -80,27 +80,27 @@ use_quote_amount: Optional[float] = None):
         if spend < max(filters.min_notional, filters.min_entry_quote or 0.0):
             return False, 0.0, 0.0, "QUOTE_LT_MIN_NOTIONAL"
 
-# 2. Executable Quantity Check (Spec Requirement 1.2)
-# Affordability = "The trade produces a non-zero executable quantity"
-from decimal import Decimal, ROUND_DOWN
-step = float(filters.step_size or 0.0) # BOOTSTRAP FIX: Handle 0.0 step
-price_safe = price if price > 0 else 1.0 # Guard zero div
-estimated_qty = spend / price_safe
+        # 2. Executable Quantity Check (Spec Requirement 1.2)
+        # Affordability = "The trade produces a non-zero executable quantity"
+        from decimal import Decimal, ROUND_DOWN
+        step = float(filters.step_size or 0.0) # BOOTSTRAP FIX: Handle 0.0 step
+        price_safe = price if price > 0 else 1.0 # Guard zero div
+        estimated_qty = spend / price_safe
 
-if step > 0:
-q = (Decimal(str(estimated_qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
-qty = float(q * Decimal(str(step)))
-else:
-qty = estimated_qty
+        if step > 0:
+            q = (Decimal(str(estimated_qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+            qty = float(q * Decimal(str(step)))
+        else:
+            qty = estimated_qty
 
-# STRICT CHECK: If rounding kills the quantity, we CANNOT execute.
-if qty <= 0:
-return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
+        # STRICT CHECK: If rounding kills the quantity, we CANNOT execute.
+        if qty <= 0:
+            return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
 
-if qty < float(filters.min_qty):
-return False, 0.0, 0.0, "QTY_LT_MIN"
+        if qty < float(filters.min_qty):
+            return False, 0.0, 0.0, "QTY_LT_MIN"
 
-return True, float(qty), spend, "OK"
+        return True, float(qty), spend, "OK"
 else:
 from decimal import Decimal, ROUND_DOWN
 step = float(filters.step_size or 0.0)
