@@ -248,7 +248,7 @@ class SignalManager:
         """Normalize symbol to uppercase."""
         return symbol.upper().strip() if symbol else ""
 
-    def _split_base_quote(self, symbol: str) -> tuple[str, str]:
+    def _split_base_quote(self, symbol: str) -> Tuple[str, str]:
         """Split symbol into base and quote currencies."""
         # Simple split - assumes format like BTCUSDT
         if len(symbol) < 6:
