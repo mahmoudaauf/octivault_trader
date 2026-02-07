@@ -370,17 +370,15 @@ class ExecutionManager:
 
 
     def _split_base_quote(self, symbol: str) -> Tuple[str, str]:
-
-
-    s = (symbol or "").upper()
-    for q in ("USDT", "FDUSD", "USDC", "BUSD", "TUSD", "BTC", "ETH"):
-    if s.endswith(q):
-    return s[:-len(q)], q
-    # fallback: treat configured base_ccy as quote
-    if s.endswith(self.base_ccy):
-    return s[:-len(self.base_ccy)], self.base_ccy
-    # last resort: naive 3–4 letter quote split
-    return s[:-4], s[-4:]
+        s = (symbol or "").upper()
+        for q in ("USDT", "FDUSD", "USDC", "BUSD", "TUSD", "BTC", "ETH"):
+            if s.endswith(q):
+                return s[:-len(q)], q
+        # fallback: treat configured base_ccy as quote
+        if s.endswith(self.base_ccy):
+            return s[:-len(self.base_ccy)], self.base_ccy
+        # last resort: naive 3–4 letter quote split
+        return s[:-4], s[-4:]
 
 
     def __init__(self, config: Any, shared_state: Any, exchange_client: Any, alert_callback=None):
