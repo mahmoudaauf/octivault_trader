@@ -584,39 +584,24 @@ class MarketDataFeed:
         while True:
             symbols = await self._get_accepted_symbols()
 
-            self._logger.debug(f"[MDF] symbols={symbols}")
-
             if not symbols:
-                await asyncio.sleep(1)
+                await asyncio.sleep(self.retry_after_no_symbols_sec)
                 continue
 
-            ec = await self._get_exchange_client()
-            if ec is None:
-                await asyncio.sleep(1)
-                continue
+            sem = asyncio.Semaphore(self.max_concurrency)
 
-            for symbol in symbols:
-                try:
-                    price = await ec.get_current_price(symbol)
-                    await self._maybe_await(self.shared_state.update_last_price(symbol, float(price)))
+            tasks = [
+                asyncio.create_task(self._poll_symbol(sym, sem), name=f"mdf.poll[{sym}]")
+                for sym in symbols
+            ]
 
-                    for tf in self.timeframes:
-                        ohlcv = await ec.get_ohlcv(symbol, tf, limit=3)
-                        ohlcv = self._sanitize_ohlcv(ohlcv or [])
-                        for bar_data in ohlcv:
-                            bar = {
-                                "ts": float(bar_data[0]),
-                                "o": float(bar_data[1]),
-                                "h": float(bar_data[2]),
-                                "l": float(bar_data[3]),
-                                "c": float(bar_data[4]),
-                                "v": float(bar_data[5]),
-                            }
-                            await self._maybe_await(self.shared_state.add_ohlcv(symbol, tf, bar))
-                except Exception as e:
-                    self._logger.debug(f"Failed to poll {symbol}: {e}")
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-            await self._set_health(self._code_ok, "poll", metrics={"symbols": len(symbols)})
+            await self._set_health(
+                self._code_ok,
+                "poll",
+                metrics={"symbols": len(symbols)}
+            )
 
             await asyncio.sleep(self.poll_interval)
 
