@@ -48,12 +48,12 @@ except Exception:
             self.code = code
             super().__init__(message or f"BinanceAPIException({code})")
 
-class ExecutionError(Exception):
-def __init__(self, error_type: str, message: str = "", symbol: str = "", meta: dict | None = None):
-self.error_type = error_type
-self.symbol = symbol
-self.meta = meta or {}
-super().__init__(message or error_type)
+    class ExecutionError(Exception):
+        def __init__(self, error_type: str, message: str = "", symbol: str = "", meta: dict | None = None):
+            self.error_type = error_type
+            self.symbol = symbol
+            self.meta = meta or {}
+            super().__init__(message or error_type)
 
 class ExecutionBlocked(Exception):
 def __init__(self, code: str, planned_quote: float, available_quote: float, min_required: float):
