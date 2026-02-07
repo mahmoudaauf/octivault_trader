@@ -3848,6 +3848,21 @@ class SharedState:
         
         # P9 Fix: Ensure subscribers are NOTIFIED
         await self.publish_event(event_name, event_data)
+
+    async def wait_for_event(self, event_name: str) -> None:
+        """Wait for a named event to be set."""
+        event_map = {
+            "AcceptedSymbolsReady": self.accepted_symbols_ready_event,
+            "BalancesReady": self.balances_ready_event,
+            "MarketDataReady": self.market_data_ready_event,
+            "NavReady": self.nav_ready_event,
+            "OpsPlaneReady": self.ops_plane_ready_event,
+        }
+        event = event_map.get(event_name)
+        if event:
+            await event.wait()
+        else:
+            self.logger.warning(f"Unknown event name for wait_for_event: {event_name}")
     async def get_recent_events(self, limit: int = 100) -> List[Dict[str, Any]]:
         return list(self._event_log)[-limit:]
     async def publish_event(self, name: str, data: Dict[str, Any]) -> None:
