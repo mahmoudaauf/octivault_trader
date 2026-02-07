@@ -581,18 +581,18 @@ class ExecutionManager:
     def _ensure_semaphores_ready(self):
         """Lazy-initialize semaphores when needed (requires running event loop)."""
         if self._semaphores_initialized:
-    return
-    try:
-    if self._concurrent_orders_sem is None:
-    self._concurrent_orders_sem = asyncio.Semaphore(self.max_concurrent_orders)
-    cfg_max_conc = int(
-    getattr(self.config, 'execution.max_concurrency', self.max_concurrent_orders))
-    if cfg_max_conc and cfg_max_conc < self.max_concurrent_orders:
-    self._concurrent_orders_sem = asyncio.Semaphore(cfg_max_conc)
-    if self._cancel_sem is None:
-    self._cancel_sem = asyncio.Semaphore(3)
-    self._semaphores_initialized = True
-    except Exception as e:
+            return
+        try:
+            if self._concurrent_orders_sem is None:
+                self._concurrent_orders_sem = asyncio.Semaphore(self.max_concurrent_orders)
+            cfg_max_conc = int(
+                getattr(self.config, 'execution.max_concurrency', self.max_concurrent_orders))
+            if cfg_max_conc and cfg_max_conc < self.max_concurrent_orders:
+                self._concurrent_orders_sem = asyncio.Semaphore(cfg_max_conc)
+            if self._cancel_sem is None:
+                self._cancel_sem = asyncio.Semaphore(3)
+            self._semaphores_initialized = True
+        except Exception as e:
     self.logger.debug(f"Semaphore initialization deferred: {e}")
 
     # =============================
