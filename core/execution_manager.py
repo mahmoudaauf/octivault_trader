@@ -414,21 +414,21 @@ class ExecutionManager:
     getattr(config, "ENABLE_COT_VALIDATION_AT_EXECUTION", False))
     # SELL economic gate (fee-aware)
     self.allow_sell_below_fee = bool(
-    getattr(config, "ALLOW_SELL_BELOW_FEE", False))
+        getattr(config, "ALLOW_SELL_BELOW_FEE", False))
     self.sell_min_net_pnl_usdt = float(
-    getattr(config, "SELL_MIN_NET_PNL_USDT", 0.0))
-        self.min_net_profit_after_fees_pct = float(
-            getattr(config, "MIN_NET_PROFIT_AFTER_FEES", 0.0035))
-        # --- Hard-guard & sizing configuration (P9) ---
-        def _cfg(path: str, default):
-            cur = self.config
-            for part in path.split('.'):
-                if isinstance(cur, dict):
-                    cur = cur.get(part, default)
-                else:
-                    cur = getattr(cur, part, default)
-                default = cur if cur is not None else default
-            return cur if cur is not None else default
+        getattr(config, "SELL_MIN_NET_PNL_USDT", 0.0))
+    self.min_net_profit_after_fees_pct = float(
+        getattr(config, "MIN_NET_PROFIT_AFTER_FEES", 0.0035))
+    # --- Hard-guard & sizing configuration (P9) ---
+    def _cfg(path: str, default):
+        cur = self.config
+        for part in path.split('.'):
+            if isinstance(cur, dict):
+                cur = cur.get(part, default)
+            else:
+                cur = getattr(cur, part, default)
+            default = cur if cur is not None else default
+        return cur if cur is not None else default
 
     # PHASE 2 NOTE: min_notional_floor removed (capital floor check moved to MetaController)
     # ExecutionManager no longer enforces capital policy
