@@ -154,25 +154,25 @@ class ExecutionManager:
             if exec_qty <= 0 or price <= 0:
                 return
 
-ss = self.shared_state
-realized_before = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
+            ss = self.shared_state
+            realized_before = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
 
-fee_quote = float(order.get("fee_quote", 0.0) or order.get("fee", 0.0) or 0.0)
-fee_base = float(order.get("fee_base", 0.0) or 0.0)
-try:
-base_asset, quote_asset = self._split_base_quote(sym)
-fills = order.get("fills") or []
-if isinstance(fills, list):
-fee_base = sum(
-float(f.get("commission", 0.0) or 0.0)
-for f in fills
-if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == base_asset
-) or fee_base
-fee_quote = sum(
-float(f.get("commission", 0.0) or 0.0)
-for f in fills
-if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
-) or fee_quote
+            fee_quote = float(order.get("fee_quote", 0.0) or order.get("fee", 0.0) or 0.0)
+            fee_base = float(order.get("fee_base", 0.0) or 0.0)
+            try:
+                base_asset, quote_asset = self._split_base_quote(sym)
+                fills = order.get("fills") or []
+                if isinstance(fills, list):
+                    fee_base = sum(
+                        float(f.get("commission", 0.0) or 0.0)
+                        for f in fills
+                        if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == base_asset
+                    ) or fee_base
+                    fee_quote = sum(
+                        float(f.get("commission", 0.0) or 0.0)
+                        for f in fills
+                        if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
+                    ) or fee_quote
 except Exception:
 pass
 
