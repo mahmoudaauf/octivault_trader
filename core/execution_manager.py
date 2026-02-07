@@ -668,20 +668,21 @@ class ExecutionManager:
 
             # If we reached here, both Exchange and SharedState think we have 0
             if getattr(self.shared_state, "positions", {}).get(sym):
-    self.logger.warning(
-    f"[GetSellable] {sym}: Zero quantity returned despite position record existence.")
+                self.logger.warning(
+                    f"[GetSellable] {sym}: Zero quantity returned despite position record existence.")
 
-    except Exception:
-    self.logger.debug("_get_sellable_qty failed (non-fatal)", exc_info=True)
-    return 0.0
+        except Exception:
+            self.logger.debug("_get_sellable_qty failed (non-fatal)", exc_info=True)
+            return 0.0
+
     async def _ensure_position_ready(self, sym: str, max_retries: int = 3) -> float:
-    """
-    ✅ FIX #4: Wait for position to be available, with state reconciliation retries.
+        """
+        ✅ FIX #4: Wait for position to be available, with state reconciliation retries.
 
-    Purpose: Handle the temporal gap where:
-    - Exchange has the position (just filled)
-    - SharedState doesn't yet (refresh in flight)
-    - ExecutionManager needs to SELL immediately after
+        Purpose: Handle the temporal gap where:
+        - Exchange has the position (just filled)
+        - SharedState doesn't yet (refresh in flight)
+        - ExecutionManager needs to SELL immediately after
 
     Strategy:
     1. Check position via _get_sellable_qty()
