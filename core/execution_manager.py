@@ -1497,7 +1497,11 @@
                     )
 
                 gross_needed = qa * (Decimal("1") + taker_fee) * headroom
-                if spendable_dec < gross_needed - eps:
+                # CRITICAL FIX: Use EPSILON tolerance to avoid float/timing false negatives
+                # Problem: spendable_dec < gross_needed can fail due to tiny float differences
+                # Solution: Allow small tolerance (EPSILON = 1e-6) for capital availability
+                EPSILON = Decimal("1e-6")
+                if spendable_dec < gross_needed - EPSILON:
                     # Point 3: Dynamic Resizing (Downscaling)
                     # If we have less than planned, but enough for minNotional, we downscale.
                     max_qa = spendable_dec / ((Decimal("1") + taker_fee) * headroom)
