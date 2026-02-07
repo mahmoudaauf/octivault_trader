@@ -2879,7 +2879,7 @@ spend = float(planned_quote)
 # Enforce both venue min_notional (with buffer) and minimal execution floor
 # PHASE 2 NOTE: Capital floor check already done in MetaController
 min_entry = await self._get_min_entry_quote(symbol, price=current_price, min_notional=min_notional)
-if spend < min_entry:
+try:
 await self._log_execution_event("order_skip", symbol, {"side": "BUY", "reason": "NOTIONAL_LT_MIN", "min_required": min_entry})
 return None
 
