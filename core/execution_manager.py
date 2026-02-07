@@ -323,21 +323,20 @@ class ExecutionManager:
             if side_hint in ("short", "sell"):
                 realized_pnl = (entry_price - exec_px) * exec_qty - fee_quote
             else:
-    realized_pnl = (exec_px - entry_price) * exec_qty - fee_quote
+                realized_pnl = (exec_px - entry_price) * exec_qty - fee_quote
 
-    return entry_price, exec_px, exec_qty, realized_pnl
-
+        return entry_price, exec_px, exec_qty, realized_pnl
 
     async def _emit_close_events(self, sym: str, raw: Dict[str, Any], post_fill: Optional[Dict[str, Any]] = None) -> None:
-    entry_price, exec_px, exec_qty, realized_pnl = self._calc_close_payload(
-    sym, raw)
-    if exec_qty <= 0 or exec_px <= 0:
-    return
+        entry_price, exec_px, exec_qty, realized_pnl = self._calc_close_payload(
+            sym, raw)
+        if exec_qty <= 0 or exec_px <= 0:
+            return
 
-    committed = bool(post_fill or {}).get("realized_committed", False)
-    emitted = bool(post_fill or {}).get("emitted", False)
+        committed = bool(post_fill or {}).get("realized_committed", False)
+        emitted = bool(post_fill or {}).get("emitted", False)
 
-    if not committed:
+        if not committed:
     try:
     cur = float(getattr(self.shared_state, "metrics",
             {}).get("realized_pnl", 0.0) or 0.0)
