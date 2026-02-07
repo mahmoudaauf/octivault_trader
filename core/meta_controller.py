@@ -10760,6 +10760,15 @@ class MetaController:
                     self.logger.warning("Liquidity execution failed for %s (attempt %d)", symbol, attempt + 1)
                     continue
 
+                # CRITICAL FIX: Refresh balance from exchange after liquidation execution
+                # Problem: Cached balance in SharedState may not reflect recent liquidations
+                # Solution: Force sync authoritative balance before affordability verification
+                try:
+                    await self.shared_state.sync_authoritative_balance(force=True)
+                    self.logger.debug("Balance refreshed after liquidity execution for %s", symbol)
+                except Exception as e:
+                    self.logger.warning("Failed to refresh balance after liquidity execution: %s", e)
+
                 # Verify liquidity was freed
                 # BOOTSTRAP FIX: Use bootstrap_bypass context if needed
                 bootstrap_policy_ctx = None
