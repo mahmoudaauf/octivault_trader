@@ -382,22 +382,20 @@ class ExecutionManager:
 
 
     def __init__(self, config: Any, shared_state: Any, exchange_client: Any, alert_callback=None):
+        self.config = config
+        self.shared_state = shared_state
+        self.exchange_client = exchange_client
+        self.alert_callback = alert_callback
+        self.logger = logging.getLogger(self.__class__.__name__)
 
+        # Contract check: must expose place_market_order()
+        if not hasattr(self.exchange_client, "place_market_order") or not callable(getattr(self.exchange_client, "place_market_order", None)):
+            raise RuntimeError(
+                "ExchangeClient must expose place_market_order() for canonical path")
 
-    self.config = config
-    self.shared_state = shared_state
-    self.exchange_client = exchange_client
-    self.alert_callback = alert_callback
-    self.logger = logging.getLogger(self.__class__.__name__)
-
-    # Contract check: must expose place_market_order()
-    if not hasattr(self.exchange_client, "place_market_order") or not callable(getattr(self.exchange_client, "place_market_order", None)):
-    raise RuntimeError(
-    "ExchangeClient must expose place_market_order() for canonical path")
-
-    # Dependencies (injected later)
-    self.meta_controller = None
-    self.risk_manager = None
+        # Dependencies (injected later)
+        self.meta_controller = None
+        self.risk_manager = None
 
     # Config
     self.base_ccy = str(getattr(config, "BASE_CURRENCY", "USDT")).upper()
