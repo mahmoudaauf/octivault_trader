@@ -467,10 +467,10 @@ class ExecutionManager:
     # Heartbeat task (will be created on first async operation)
     self._heartbeat_task = None
 
-        self.logger.info("ExecutionManager initialized with P9 configuration")
+    self.logger.info("ExecutionManager initialized with P9 configuration")
 
-        # --- Health: mark as Initialized right away (so Watchdog stops "no-report") ---
-        try:
+    # --- Health: mark as Initialized right away (so Watchdog stops "no-report") ---
+    try:
             # primary API
             upd = getattr(self.shared_state, "update_component_status", None) \
                 or getattr(self.shared_state, "set_component_status", None)
