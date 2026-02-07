@@ -6359,7 +6359,9 @@ class MetaController:
 
                 # SELL PATH BYPASS: SELLs must NOT be subject to rejection_threshold blocking
                 # because SELL is risk-reducing and must be executable even during capital shortage
-                if action != "SELL":
+                # BOOTSTRAP BYPASS: Bootstrap mode must NOT be subject to rejection_threshold blocking
+                # because the goal is liquidity seeding and confidence gating is counterproductive
+                if action != "SELL" and not self._is_bootstrap_mode():
                     try:
                         if hasattr(self.shared_state, "is_symbol_blocked") and self.shared_state.is_symbol_blocked(sym, action):
                             self.logger.info("[Meta:Block] Skipping %s %s: blocked by rejection threshold", sym, action)
