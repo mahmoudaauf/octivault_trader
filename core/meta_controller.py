@@ -46,9 +46,9 @@ except Exception:
         class BinanceAPIException(Exception):
             pass
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # INLINE DEFINITIONS: Essential classes from meta_libs (avoiding external dependency)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # These were refactored into core/meta_libs/ locally, but meta_libs doesn't exist
 # on EC2. To ensure EC2 deployment works, we inline the essential definitions here.
 
