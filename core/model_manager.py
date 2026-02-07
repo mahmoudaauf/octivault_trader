@@ -37,7 +37,7 @@ def _with_ext(path: Path, ext: str) -> Path:
     """Changes the suffix of a given Path object to the specified extension."""
     return path.with_suffix(ext)
 
-def _paired_paths(path: Path) -> tuple[Path, Path]:
+def _paired_paths(path: Path) -> Tuple[Path, Path]:
     """
     Returns a tuple of (keras_path, h5_path) for a given base path,
     ignoring its original extension.
