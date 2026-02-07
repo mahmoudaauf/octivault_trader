@@ -19,7 +19,10 @@ from datetime import datetime
 
 from core.component_status_logger import ComponentStatusLogger
 # HealthStatus import removed - not used after P9 refactor
-from core.model_manager import ModelManager
+try:
+    from core.model_manager import ModelManager
+except ImportError:
+    ModelManager = None
 
 # --- Canonical TradeIntent import (P9 invariant) with backward-compat shim ---
 try:
@@ -94,7 +97,7 @@ class AgentManager:
         self.symbols = symbols if symbols is not None else []
         self.tp_sl_engine = tp_sl_engine
         self.market_data_feed = market_data_feed
-        self.model_manager = model_manager if model_manager is not None else ModelManager(self.config)
+        self.model_manager = model_manager if model_manager is not None else (ModelManager(self.config) if ModelManager else None)
         self.meta_controller = meta_controller
         self.symbol_manager = symbol_manager
         self.exchange_client = exchange_client
