@@ -485,10 +485,10 @@ class ExecutionManager:
                 if isinstance(cs, dict):
                     cs["ExecutionManager"] = {"status": "Initialized",
                                               "message": "Ready", "timestamp": now_ts, "ts": now_ts}
-                except Exception:
-                    pass
             except Exception:
-                self.logger.debug("EM init health update failed", exc_info=True)
+                pass
+        except Exception:
+            self.logger.debug("EM init health update failed", exc_info=True)
 
     def _exit_fee_bps(self) -> float:
         cfg_val = float(getattr(self.config, "EXIT_FEE_BPS",
