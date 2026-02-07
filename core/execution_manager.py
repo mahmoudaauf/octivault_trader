@@ -72,49 +72,49 @@ min_entry_quote: float = 0.0
 async def validate_order_request(*, side: str, qty: float, price: float,
                                 filters: SymbolFilters, taker_fee_bps: int = 10,
                                 use_quote_amount: Optional[float] = None):
-if price <= 0:
-    return False, 0.0, 0.0, "invalid_price"
-if use_quote_amount is not None:
-    spend = float(use_quote_amount)
-    # 1. Nominal Floor Check (Spec Requirement 1.1)
-    if spend < max(filters.min_notional, filters.min_entry_quote or 0.0):
-        return False, 0.0, 0.0, "QUOTE_LT_MIN_NOTIONAL"
+    if price <= 0:
+        return False, 0.0, 0.0, "invalid_price"
+    if use_quote_amount is not None:
+        spend = float(use_quote_amount)
+        # 1. Nominal Floor Check (Spec Requirement 1.1)
+        if spend < max(filters.min_notional, filters.min_entry_quote or 0.0):
+            return False, 0.0, 0.0, "QUOTE_LT_MIN_NOTIONAL"
 
-    # 2. Executable Quantity Check (Spec Requirement 1.2)
-    # Affordability = "The trade produces a non-zero executable quantity"
-    from decimal import Decimal, ROUND_DOWN
-    step = float(filters.step_size or 0.0) # BOOTSTRAP FIX: Handle 0.0 step
-    price_safe = price if price > 0 else 1.0 # Guard zero div
-    estimated_qty = spend / price_safe
+        # 2. Executable Quantity Check (Spec Requirement 1.2)
+        # Affordability = "The trade produces a non-zero executable quantity"
+        from decimal import Decimal, ROUND_DOWN
+        step = float(filters.step_size or 0.0) # BOOTSTRAP FIX: Handle 0.0 step
+        price_safe = price if price > 0 else 1.0 # Guard zero div
+        estimated_qty = spend / price_safe
 
-    if step > 0:
-        q = (Decimal(str(estimated_qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
-        qty = float(q * Decimal(str(step)))
+        if step > 0:
+            q = (Decimal(str(estimated_qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+            qty = float(q * Decimal(str(step)))
+        else:
+            qty = estimated_qty
+
+        # STRICT CHECK: If rounding kills the quantity, we CANNOT execute.
+        if qty <= 0:
+            return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
+
+        if qty < float(filters.min_qty):
+            return False, 0.0, 0.0, "QTY_LT_MIN"
+
+        return True, float(qty), spend, "OK"
     else:
-        qty = estimated_qty
+        from decimal import Decimal, ROUND_DOWN
+        step = float(filters.step_size or 0.0)
+        if step > 0:
+            q = (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+            qty = float(q * Decimal(str(step)))
 
-    # STRICT CHECK: If rounding kills the quantity, we CANNOT execute.
-    if qty <= 0:
-        return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
+        if qty <= 0:
+            return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
 
-    if qty < float(filters.min_qty):
-        return False, 0.0, 0.0, "QTY_LT_MIN"
-
-    return True, float(qty), spend, "OK"
-else:
-    from decimal import Decimal, ROUND_DOWN
-    step = float(filters.step_size or 0.0)
-    if step > 0:
-        q = (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
-        qty = float(q * Decimal(str(step)))
-
-    if qty <= 0:
-        return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
-
-    if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
-        # Strict Rule 2.1: amount == 0 -> ExecutionProbe = FAIL
-        return False, 0.0, 0.0, "NOTIONAL_LT_MIN"
-    return True, float(qty), 0.0, "OK"
+        if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
+            # Strict Rule 2.1: amount == 0 -> ExecutionProbe = FAIL
+            return False, 0.0, 0.0, "NOTIONAL_LT_MIN"
+        return True, float(qty), 0.0, "OK"
 
 # =============================
 # ExecutionManager
