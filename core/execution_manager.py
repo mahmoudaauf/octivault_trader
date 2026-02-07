@@ -56,12 +56,12 @@ class ExecutionError(Exception):
         super().__init__(message or error_type)
 
 class ExecutionBlocked(Exception):
-def __init__(self, code: str, planned_quote: float, available_quote: float, min_required: float):
-    self.code = code
-    self.planned_quote = float(planned_quote or 0.0)
-    self.available_quote = float(available_quote or 0.0)
-    self.min_required = float(min_required or 0.0)
-    super().__init__(f"{code}: planned={self.planned_quote:.2f} available={self.available_quote:.2f} min_required={self.min_required:.2f}")
+    def __init__(self, code: str, planned_quote: float, available_quote: float, min_required: float):
+        self.code = code
+        self.planned_quote = float(planned_quote or 0.0)
+        self.available_quote = float(available_quote or 0.0)
+        self.min_required = float(min_required or 0.0)
+        super().__init__(f"{code}: planned={self.planned_quote:.2f} available={self.available_quote:.2f} min_required={self.min_required:.2f}")
 
 # =============================
 # Order filter shims (SymbolFilters, validate_order_request)
