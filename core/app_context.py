@@ -3351,13 +3351,8 @@ class AppContext:
                 if up_to_phase >= 4 and self.market_data_feed and any(hasattr(self.market_data_feed, nm) for nm in ("start","start_async","run","run_async")):
                     # Start MDF (supports start/start_async/run/run_async) and apply timeout handling
                     await self._start_with_timeout("P4_market_data", self.market_data_feed)
-                    # Explicitly ensure MDF run loop is started (fallback for special logic issues)
-                    if self.market_data_feed and hasattr(self.market_data_feed, 'run'):
-                        try:
-                            asyncio.create_task(self.market_data_feed.run(), name="mdf.run")
-                            self.logger.info("[P4] MDF run loop explicitly started")
-                        except Exception as e:
-                            self.logger.error(f"[P4] Failed to start MDF run loop: {e}")
+                    # NOTE: _start_with_timeout already spawns mdf.run() as a background task.
+                    # DO NOT call mdf.run() again here — it causes duplicate polling + race conditions.
                     try:
                         await self._emit_summary("P4_MARKET_DATA_STARTED")
                     except Exception:

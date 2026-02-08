@@ -125,6 +125,7 @@ class MarketDataFeed:
             self._exch_ready_evt.set()
 
         self._stop = asyncio.Event()
+        self._run_loop_entered = False  # guard against multiple concurrent run() entries
         self._logger = logger or logging.getLogger("MarketDataFeed")
         if self._logger.level == logging.NOTSET:
             self._logger.setLevel(logging.INFO)
@@ -577,9 +578,19 @@ class MarketDataFeed:
     # -------------------- steady loop --------------------
 
     async def run(self) -> None:
-        self._logger.info("📡 MarketDataFeed run loop entered")
+        # GUARD: Prevent multiple concurrent run loop instances.
+        # Multiple callers (AppContext._start_with_timeout, main_phased, main_live)
+        # may invoke run() — only the first one should proceed.
+        if self._run_loop_entered:
+            self._logger.warning(
+                "[MDF] run() called but loop already running — ignoring duplicate entry"
+            )
+            return
+        self._run_loop_entered = True
+
+        self._logger.info("MarketDataFeed run loop entered")
         syms = await self._get_accepted_symbols()
-        self._logger.warning(f"[MDF] loop entered | accepted_symbols={syms}")
+        self._logger.info(f"[MDF] loop started | accepted_symbols={syms}")
 
         while True:
             symbols = await self._get_accepted_symbols()
@@ -648,6 +659,12 @@ class MarketDataFeed:
                     _ = await self._maybe_await(self.shared_state.calc_atr(sym, "1h", 14))
                 except Exception:
                     pass
+
+            # TEMPORARY DEBUG — remove after confirming data flow is healthy
+            self._logger.debug(
+                "[MDF:POLL] %s price=%s tfs=%s",
+                sym, price, self.timeframes,
+            )
 
     # -------------------- control --------------------
 

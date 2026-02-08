@@ -754,7 +754,6 @@ class ExecutionManager:
     price: Optional[float] = None,
     atr_pct: Optional[float] = None,
     ) -> Tuple[bool, Dict[str, float]]:
-
     """Check if TP max can clear required exit move and net-profit floor."""
     trade_fee_pct = float(getattr(self.config, "TRADE_FEE_PCT", 0.0) or 0.0)
     exit_fee_bps = float(getattr(self.config, "EXIT_FEE_BPS", 0.0) or 0.0)
@@ -767,55 +766,54 @@ class ExecutionManager:
     m_exit = max(m_exit, m_entry)
 
     r_req = (2.0 * r_fee * m_exit) + r_slip + r_buf
-    r_min_net = float(
-    getattr(self.config, "MIN_NET_PROFIT_AFTER_FEES", 0.0) or 0.0)
-    min_tp_needed_for_net = r_min_net + (2.0 * r_fee) + r_slip
-    required_tp = max(r_req, min_tp_needed_for_net)
-    tp_pct_min = float(getattr(self.config, "TP_PCT_MIN", 0.0) or 0.0)
-    tp_max_cfg = float(getattr(self.config, "TP_PCT_MAX", 0.0) or 0.0)
-    tp_atr_mult = float(getattr(self.config, "TP_ATR_MULT", 0.0) or 0.0)
-    if atr_pct is None or atr_pct <= 0:
-    atr_pct = float(getattr(self.config, "TPSL_FALLBACK_ATR_PCT", 0.0) or 0.0)
+        self,
+        symbol: Optional[str] = None,
+        price: Optional[float] = None,
+        atr_pct: Optional[float] = None,
+    ) -> Tuple[bool, Dict[str, float]]:
 
-    tp_from_atr = (atr_pct * tp_atr_mult) if (atr_pct >
-                                          0 and tp_atr_mult > 0) else 0.0
-    tp_max = tp_max_cfg if tp_max_cfg > 0 else max(tp_from_atr, tp_pct_min)
+        """Check if TP max can clear required exit move and net-profit floor."""
+        trade_fee_pct = float(getattr(self.config, "TRADE_FEE_PCT", 0.0) or 0.0)
+        exit_fee_bps = float(getattr(self.config, "EXIT_FEE_BPS", 0.0) or 0.0)
+        fee_bps = max(exit_fee_bps, trade_fee_pct * 10000.0)
+        r_fee = fee_bps / 10000.0
+        r_slip = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", 0.0) or 0.0) / 10000.0
+        r_buf = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
+        m_entry = float(getattr(self.config, "MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
+        m_exit = float(getattr(self.config, "MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
+        m_exit = max(m_exit, m_entry)
 
-    detail = {
-    "required_exit": r_req,
-    "min_net_required": min_tp_needed_for_net,
-    "required_tp": required_tp,
-    "tp_max": tp_max,
-    "fee_bps": fee_bps,
-    "slippage_bps": float(getattr(self.config, "EXIT_SLIPPAGE_BPS", 0.0) or 0.0),
-    "buffer_bps": float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0),
-    "exit_fee_mult": m_exit,
-    "price": float(price or 0.0),
-    "atr_pct": float(atr_pct or 0.0),
-    "tp_from_atr": float(tp_from_atr),
-    "tp_min": tp_pct_min,
-    }
-    if tp_max <= 0 or tp_max < required_tp:
-    return False, detail
-    return True, detail
+        r_req = (2.0 * r_fee * m_exit) + r_slip + r_buf
+        r_min_net = float(
+            getattr(self.config, "MIN_NET_PROFIT_AFTER_FEES", 0.0) or 0.0)
+        min_tp_needed_for_net = r_min_net + (2.0 * r_fee) + r_slip
+        required_tp = max(r_req, min_tp_needed_for_net)
+        tp_pct_min = float(getattr(self.config, "TP_PCT_MIN", 0.0) or 0.0)
+        tp_max_cfg = float(getattr(self.config, "TP_PCT_MAX", 0.0) or 0.0)
+        tp_atr_mult = float(getattr(self.config, "TP_ATR_MULT", 0.0) or 0.0)
+        if atr_pct is None or atr_pct <= 0:
+            atr_pct = float(getattr(self.config, "TPSL_FALLBACK_ATR_PCT", 0.0) or 0.0)
 
+        tp_from_atr = (atr_pct * tp_atr_mult) if (atr_pct > 0 and tp_atr_mult > 0) else 0.0
+        tp_max = tp_max_cfg if tp_max_cfg > 0 else max(tp_from_atr, tp_pct_min)
 
-    async def _check_sell_net_pnl_gate(
-    self,
-    *,
-    sym: str,
-    quantity: Optional[float],
-    policy_ctx: Dict[str, Any],
-    tag: str,
-    is_liq_full: bool,
-    special_liq_bypass: bool,
-    ) -> Optional[Dict[str, Any]]:
-    """Block non-liquidation SELLs that don't clear fee-aware net PnL gate."""
-    if is_liq_full or special_liq_bypass:
-    return None
-
-    reason_text = " ".join([
-    str(policy_ctx.get("reason") or ""),
+        detail = {
+            "required_exit": r_req,
+            "min_net_required": min_tp_needed_for_net,
+            "required_tp": required_tp,
+            "tp_max": tp_max,
+            "fee_bps": fee_bps,
+            "slippage_bps": float(getattr(self.config, "EXIT_SLIPPAGE_BPS", 0.0) or 0.0),
+            "buffer_bps": float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0),
+            "exit_fee_mult": m_exit,
+            "price": float(price or 0.0),
+            "atr_pct": float(atr_pct or 0.0),
+            "tp_from_atr": float(tp_from_atr),
+            "tp_min": tp_pct_min,
+        }
+        if tp_max <= 0 or tp_max < required_tp:
+            return False, detail
+        return True, detail
     str(policy_ctx.get("exit_reason") or ""),
     str(policy_ctx.get("signal_reason") or ""),
     str(policy_ctx.get("liquidation_reason") or ""),
