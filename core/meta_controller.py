@@ -6756,15 +6756,34 @@ class MetaController:
                 allocated_budget = float(self.shared_state.get_authoritative_reservation(agent_name)) if agent_name else 0.0
                 
                 # If CapitalAllocator allocated < 10.0, use that as the floor instead of hardcoded default
-                min_notional_floor = float(self._cfg("MIN_NOTIONAL_FLOOR", 10.0))
-                min_executable_quote = float(self._cfg("MIN_EXECUTABLE_QUOTE", 10.0))
-                
+                # ALIGNMENT FIX: Use the SAME economic floor as ExecutionManager
+                # to avoid Meta proposing quotes that EM will reject.
+                min_econ_trade = float(getattr(self.config, "MIN_ECONOMIC_TRADE_USDT", 40.0) or 40.0)
+                min_notional_floor = max(
+                    float(self._cfg("MIN_NOTIONAL_FLOOR", 10.0)),
+                    min_econ_trade,
+                )
+                min_executable_quote = max(
+                    float(self._cfg("MIN_EXECUTABLE_QUOTE", 10.0)),
+                    min_econ_trade,
+                )
+                dust_floor = float(getattr(self.config, "DUST_MIN_QUOTE_USDT", 5.0) or 5.0)
+
                 # PRIORITY 3 FIX: Respect CapitalAllocator's allocation for small accounts
-                if 0 < allocated_budget < 10.0:
-                    # Account is small: use allocated budget as the minimum notional
-                    min_notional_floor = allocated_budget * 0.80  # 80% of allocated to leave margin for fees
-                    self.logger.debug(f"[Meta:LAYER9] Using CapitalAllocator budget: agent={agent_name} allocated={allocated_budget:.2f} -> floor={min_notional_floor:.2f}")
-                
+                # but NEVER go below the EM economic floor (unless bootstrap escape hatch)
+                if 0 < allocated_budget < min_econ_trade and not bootstrap_bypass_active:
+                    min_notional_floor = max(allocated_budget * 0.80, min_econ_trade)
+                    self.logger.debug(
+                        f"[Meta:LAYER9] Small account: agent={agent_name} "
+                        f"allocated={allocated_budget:.2f} -> floor={min_notional_floor:.2f} "
+                        f"(clamped to MIN_ECONOMIC={min_econ_trade})")
+                elif 0 < allocated_budget < min_econ_trade and bootstrap_bypass_active:
+                    # Bootstrap: allow lower floor for first trade
+                    min_notional_floor = max(allocated_budget * 0.80, dust_floor)
+                    self.logger.debug(
+                        f"[Meta:LAYER9:BOOTSTRAP] Using bootstrap budget floor: "
+                        f"agent={agent_name} allocated={allocated_budget:.2f} -> floor={min_notional_floor:.2f}")
+
                 base_floor = max(min_notional_floor, min_executable_quote)
                 current_price = None
                 
@@ -6852,9 +6871,21 @@ class MetaController:
                     float(plan_q or 0.0),
                 )
                 
-                # CRITICAL FIX #24: Initialize bootstrap bypass flag before use
+                # CRITICAL FIX #24: Initialize bootstrap bypass flag
+                # BOOTSTRAP ESCAPE HATCH: Activate when portfolio is FLAT (cold bootstrap)
+                # so the first trade can bypass MICRO_TRADE_KILL_SWITCH + MIN_ECONOMIC gates
                 bootstrap_bypass_active = False
-                
+                try:
+                    if (hasattr(self.shared_state, "is_bootstrap_mode")
+                            and self.shared_state.is_bootstrap_mode()
+                            and getattr(self.config, "BOOTSTRAP_ESCAPE_HATCH_ENABLED", False)):
+                        bootstrap_bypass_active = True
+                        self.logger.info(
+                            "[Meta:BOOTSTRAP_ESCAPE] Escape hatch active for %s — "
+                            "portfolio is FLAT, first trade allowed", sym)
+                except Exception:
+                    pass
+
                 # Probe: Can we afford this?
                 # Pass bootstrap state through policy context if in bootstrap mode
                 if bootstrap_bypass_active:
@@ -6925,7 +6956,7 @@ class MetaController:
                         else:
                             # TIER 1B/2/3: Try ultra-aggressive degradation
                             executed = False
-                            for trial_q in [fallback_q, min_notional_floor, 5.0, 3.0, 2.0, 1.5, 1.0]:
+                            for trial_q in [fallback_q, min_notional_floor, min_notional_floor * 0.9, min_notional_floor * 0.75]:
                                 if trial_q <= 0: continue
                                 plan_q = trial_q
                                 # Pass bootstrap context for consistency

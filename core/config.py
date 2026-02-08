@@ -99,6 +99,9 @@ class Config:
     MICRO_TRADE_KILL_EQUITY_MAX = 150.0
     MICRO_TRADE_KILL_ATR_FEE_MULT = 1.0
     MICRO_TRADE_KILL_FALLBACK_ATR_PCT = 0.0
+    # Bootstrap escape hatch: allow ONE trade to bypass kill-switch + min-economic
+    # when portfolio is FLAT (cold bootstrap). Auto-disables after first trade.
+    BOOTSTRAP_ESCAPE_HATCH_ENABLED = True
     BUY_COOLDOWN_SEC = 120
     ENTRY_COOLDOWN_SEC = 120
     MAX_OPEN_POSITIONS_PER_SYMBOL = 1
@@ -119,6 +122,12 @@ class Config:
     TARGET_PROFIT_CHECK_SEC = 60
     UPTIME_GRACE_PERIOD_MIN = 30 # Ignore noise during startup
     TARGET_PROFIT_RATIO_PER_HOUR = 0.0008 # 0.08% per hour of NAV (baseline 0.08%–0.12%)
+    # ProfitTargetEngine knobs
+    PROFIT_TARGET_DAILY_PCT = 0.02          # 2% daily NAV target
+    PROFIT_TARGET_MAX_RISK_PER_CYCLE = 0.005 # 0.5% max risk per evaluation cycle
+    PROFIT_TARGET_COMPOUND_THROTTLE = 0.5   # 50% of excess profit reinvested (rest banked)
+    PROFIT_TARGET_BASE_USD_PER_HOUR = 0.0   # 0 = use ratio-based target; >0 overrides
+    PROFIT_TARGET_GRACE_MINUTES = 30        # Ignore target enforcement during startup
     TPSL_PROFIT_AUDIT = True
     TPSL_PROFIT_AUDIT_SEC = 300
     MAX_TRADES_PER_DAY = 0
@@ -430,6 +439,17 @@ class Config:
         self.MICRO_TRADE_KILL_EQUITY_MAX = float(os.getenv("MICRO_TRADE_KILL_EQUITY_MAX", str(Config.MICRO_TRADE_KILL_EQUITY_MAX)))
         self.MICRO_TRADE_KILL_ATR_FEE_MULT = float(os.getenv("MICRO_TRADE_KILL_ATR_FEE_MULT", str(Config.MICRO_TRADE_KILL_ATR_FEE_MULT)))
         self.MICRO_TRADE_KILL_FALLBACK_ATR_PCT = float(os.getenv("MICRO_TRADE_KILL_FALLBACK_ATR_PCT", str(Config.MICRO_TRADE_KILL_FALLBACK_ATR_PCT)))
+        self.BOOTSTRAP_ESCAPE_HATCH_ENABLED = os.getenv(
+            "BOOTSTRAP_ESCAPE_HATCH_ENABLED",
+            str(Config.BOOTSTRAP_ESCAPE_HATCH_ENABLED)
+        ).lower() == "true"
+
+        # ProfitTargetEngine knobs
+        self.PROFIT_TARGET_DAILY_PCT = float(os.getenv("PROFIT_TARGET_DAILY_PCT", str(Config.PROFIT_TARGET_DAILY_PCT)))
+        self.PROFIT_TARGET_MAX_RISK_PER_CYCLE = float(os.getenv("PROFIT_TARGET_MAX_RISK_PER_CYCLE", str(Config.PROFIT_TARGET_MAX_RISK_PER_CYCLE)))
+        self.PROFIT_TARGET_COMPOUND_THROTTLE = float(os.getenv("PROFIT_TARGET_COMPOUND_THROTTLE", str(Config.PROFIT_TARGET_COMPOUND_THROTTLE)))
+        self.PROFIT_TARGET_BASE_USD_PER_HOUR = float(os.getenv("PROFIT_TARGET_BASE_USD_PER_HOUR", str(Config.PROFIT_TARGET_BASE_USD_PER_HOUR)))
+        self.PROFIT_TARGET_GRACE_MINUTES = float(os.getenv("PROFIT_TARGET_GRACE_MINUTES", str(Config.PROFIT_TARGET_GRACE_MINUTES)))
 
         # Stagnation micro-loss exit (Phase-1.5)
         self.STAGNATION_EXIT_ENABLED = os.getenv(

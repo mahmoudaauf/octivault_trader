@@ -1409,6 +1409,25 @@ class ExecutionManager:
     # Zero-sized trades MUST be treated as failure (Behavior Change 1.1)
     return (False, Decimal("0"), "ZERO_SIZE_TRADE")
 
+    # BOOTSTRAP ESCAPE HATCH: Extract bootstrap_bypass EARLY so it can
+    # gate QUOTE_LT_MIN_ECONOMIC and MICRO_TRADE_KILL_SWITCH.
+    # Only active when portfolio is FLAT (cold bootstrap) and config allows it.
+    _early_bootstrap_bypass = False
+    if policy_context and bool(policy_context.get("bootstrap_bypass", False)):
+    escape_enabled = getattr(self.config, "BOOTSTRAP_ESCAPE_HATCH_ENABLED", False)
+    is_cold = False
+    try:
+    is_cold = bool(self.shared_state.is_bootstrap_mode())
+    except Exception:
+    pass
+    if escape_enabled and is_cold:
+    _early_bootstrap_bypass = True
+    self.logger.warning(
+    "[EM:BOOTSTRAP_ESCAPE] Escape hatch ACTIVE for %s — "
+    "bypassing MIN_ECONOMIC and KILL_SWITCH gates (one-time)",
+    symbol,
+    )
+
     min_econ_trade_cfg = Decimal(
     str(getattr(self.config, "MIN_ECONOMIC_TRADE_USDT", 0.0) or 0.0))
     dynamic_min_econ = Decimal("0")
@@ -1423,6 +1442,13 @@ class ExecutionManager:
     dynamic_min_econ = Decimal("0")
     min_econ_trade = max(min_econ_trade_cfg, dynamic_min_econ)
     if min_econ_trade > 0 and qa < min_econ_trade:
+    if _early_bootstrap_bypass:
+    self.logger.warning(
+    "[EM:BOOTSTRAP_ESCAPE] Bypassing QUOTE_LT_MIN_ECONOMIC "
+    "(qa=%.2f < min_econ=%.2f) for bootstrap first trade",
+    float(qa), float(min_econ_trade),
+    )
+    else:
     gap = (min_econ_trade - qa).max(Decimal("0"))
     return (False, gap, "QUOTE_LT_MIN_ECONOMIC")
 
@@ -1451,6 +1477,10 @@ class ExecutionManager:
     feasible, feas_detail = self._entry_profitability_feasible(
     sym, price=price, atr_pct=atr_pct)
     if not feasible:
+    if _early_bootstrap_bypass:
+    self.logger.warning(
+    "[EM:BOOTSTRAP_ESCAPE] Bypassing INFEASIBLE_PROFITABILITY for bootstrap first trade: %s", sym)
+    else:
     payload = {
     "reason": "INFEASIBLE_PROFITABILITY",
     "symbol": sym,
@@ -1462,7 +1492,7 @@ class ExecutionManager:
     return (False, Decimal("0"), "INFEASIBLE_PROFITABILITY")
 
     # Micro-trade kill switch: low equity + low volatility
-    if getattr(self.config, "MICRO_TRADE_KILL_SWITCH_ENABLED", False):
+    if getattr(self.config, "MICRO_TRADE_KILL_SWITCH_ENABLED", False) and not _early_bootstrap_bypass:
     nav = await self.shared_state.get_nav()
     nav_max = float(
     getattr(self.config, "MICRO_TRADE_KILL_EQUITY_MAX", 0.0) or 0.0)
@@ -1486,6 +1516,9 @@ class ExecutionManager:
     fee_threshold = round_trip_fee_rate * fee_mult
     if fee_threshold > 0 and atr_pct < fee_threshold:
     return (False, Decimal("0"), "MICRO_TRADE_KILL_SWITCH")
+    elif _early_bootstrap_bypass and getattr(self.config, "MICRO_TRADE_KILL_SWITCH_ENABLED", False):
+    self.logger.warning(
+    "[EM:BOOTSTRAP_ESCAPE] Bypassing MICRO_TRADE_KILL_SWITCH for bootstrap first trade: %s", sym)
 
     # --- P9 Phase 4: Accumulation Synergy ---
     # 1. Fetch existing intent to check for frozen constraints (Point 2)
