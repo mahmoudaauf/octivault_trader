@@ -742,10 +742,10 @@ class ExecutionManager:
                 return entry
         except Exception:
             pass
-    try:
-    return float(getattr(self.shared_state, "_avg_price_cache", {}).get(sym, 0.0) or 0.0)
-    except Exception:
-    return 0.0
+        try:
+            return float(getattr(self.shared_state, "_avg_price_cache", {}).get(sym, 0.0) or 0.0)
+        except Exception:
+            return 0.0
 
 
     def _entry_profitability_feasible(
@@ -2351,7 +2351,7 @@ class ExecutionManager:
     await self.shared_state.record_rejection(sym, "BUY", reason, source="ExecutionManager")
     rej_count = self.shared_state.get_rejection_count(sym, "BUY")
     self.logger.info(
-    f"[EXEC_REJECT] symbol={sym} side=BUY reason=AFFORDABILITY_CHECK_FAILED count={rej_count} action=RETRY")
+    f"[EXEC_REJECT] symbol={sym} side=BUY reason={reason} count={rej_count} action=RETRY")
     await self._log_execution_event("order_skip", sym, {"side": "buy", "reason": reason})
     return {"ok": False, "status": "skipped", "reason": reason, "error_code": reason}
     else:
@@ -3142,7 +3142,8 @@ class ExecutionManager:
 
     filters_obj = SymbolFilters(
     step_size=step_size, min_qty=min_qty, max_qty=max_qty,
-    tick_size=tick_size, min_notional=min_notional, min_entry_quote=min_entry
+    tick_size=tick_size, min_notional=min_notional, min_entry_quote=float(
+        exit_floor or 0.0)
     )
 
     # BOOTSTRAP FIX: Check if this is a bootstrap bypass scenario
