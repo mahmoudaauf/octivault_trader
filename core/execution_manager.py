@@ -32,8 +32,7 @@ except Exception:
 def round_step(value: float, step: float) -> float:
     if step <= 0:
         return float(value)
-    q = (Decimal(str(value)) / Decimal(str(step))
-         ).to_integral_value(rounding=ROUND_DOWN)
+    q = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
     return float(q * Decimal(str(step)))
 
 
@@ -92,8 +91,7 @@ async def validate_order_request(*, side: str, qty: float, price: float,
         estimated_qty = spend / price_safe
 
         if step > 0:
-            q = (Decimal(str(estimated_qty)) / Decimal(str(step))
-                 ).to_integral_value(rounding=ROUND_DOWN)
+            q = (Decimal(str(estimated_qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
             qty = float(q * Decimal(str(step)))
         else:
             qty = estimated_qty
@@ -110,8 +108,7 @@ async def validate_order_request(*, side: str, qty: float, price: float,
         from decimal import Decimal, ROUND_DOWN
         step = float(filters.step_size or 0.0)
         if step > 0:
-            q = (Decimal(str(qty)) / Decimal(str(step))
-                 ).to_integral_value(rounding=ROUND_DOWN)
+            q = (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
             qty = float(q * Decimal(str(step)))
 
         if qty <= 0:
@@ -1535,6 +1532,9 @@ class ExecutionManager:
     if min_notional <= 0:
     return (False, Decimal("0"), f"invalid_min_notional({min_notional})")
 
+    # Dynamic exit-feasibility floor (symbol-aware)
+    min_required_val = await self._get_min_entry_quote(sym, price=price, min_notional=float(min_notional))
+    min_required
     # Dynamic exit-feasibility floor (symbol-aware)
     min_required_val = await self._get_min_entry_quote(sym, price=price, min_notional=float(min_notional))
     min_required = Decimal(str(min_required_val))
