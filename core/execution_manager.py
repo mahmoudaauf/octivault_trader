@@ -2005,7 +2005,7 @@ class ExecutionManager:
     self.logger.info(
     f"[EM:UnifiedSell] {sym} SELL has UNIFIED_SELL_AUTHORITY: bypassing operational veto points")
 
-    # 🚫 TERMINAL_DUST BLOCK: If position < minNotional, block all liquidation attempts
+    # 🚫 TERMINAL_DUST BLOCK: If position < minNotional (terminal dust).
     # MODIFIED [FIX #4]: Allow terminal dust block to be overridden by unified sell authority
     # This prevents endless liquidation loops UNLESS MetaController explicitly overrides
     if side == "sell" and (is_liq_full or special_liq_bypass):
