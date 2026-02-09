@@ -142,159 +142,9 @@ class ExecutionManager:
         return steps * step
 
     # --- Post-fill realized PnL emitter (P9 observability contract) ---
-#     async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
-#         """
-#         Best-effort: compute/record realized PnL delta when a trade fills, then emit
-#         a `RealizedPnlUpdated` event and persist the delta via SharedState if possible.
-#         This is tolerant to different SharedState contract shapes.
-#         """
-#         emitted = False
-#         realized_committed = False
-#         delta_f = None
-#         try:
-#             sym = self._norm_symbol(symbol)
-#             side_u = (side or "").upper()
-#             exec_qty = float(order.get("executedQty")
-#                              or order.get("executed_qty") or 0.0)
-#             price = float(order.get("avgPrice") or order.get("price") or 0.0)
-#             if exec_qty <= 0 or price <= 0:
-#                 return
-# 
-#             ss = self.shared_state
-#             realized_before = float(
-#                 getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
-# 
-#             fee_quote = float(order.get("fee_quote", 0.0)
-#                               or order.get("fee", 0.0) or 0.0)
-#             fee_base = float(order.get("fee_base", 0.0) or 0.0)
-#             try:
-#                 base_asset, quote_asset = self._split_base_quote(sym)
-#                 fills = order.get("fills") or []
-#                 if isinstance(fills, list):
-#                     fee_base = sum(
-#                         float(f.get("commission", 0.0) or 0.0)
-#                         for f in fills
-#                         if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == base_asset
-#                     ) or fee_base
-#                     fee_quote = sum(
-#                         float(f.get("commission", 0.0) or 0.0)
-#                         for f in fills
-#                         if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
-#                     ) or fee_quote
-# 
-# 
-# except Exception:
-# pass
-# 
-# trade_recorded = False
-# # P9 Frequency Engineering: Record trade for tier tracking and open trades
-# if hasattr(ss, "record_trade"):
-# try:
-#     # Get fee if available
-# await ss.record_trade(sym, side_u, exec_qty, price, fee_quote=fee_quote, fee_base=fee_base, tier=tier)
-# trade_recorded = True
-# 
-# # Frequency Engineering: Trigger TP/SL setup for BUYs
-# if side_u == "BUY" and hasattr(self, "tp_sl_engine") and self.tp_sl_engine:
-# if hasattr(self.tp_sl_engine, "set_initial_tp_sl"):
-# try:
-# self.tp_sl_engine.set_initial_tp_sl(sym, price, exec_qty, tier=tier)
-# except Exception as e:
-# self.logger.warning(f"Failed to set initial TP/SL: {e}")
-# except Exception as e:
-# self.logger.warning(f"Failed to record trade in SharedState: {e}")
-# 
-# delta = None
-# 
-# # Try canonical API first
-# delta = await maybe_call(ss, "compute_realized_pnl_delta", sym, side_u, exec_qty, price)
-# 
-# # Try fill-recording APIs that return a dict containing the delta
-# # FIX: Don't call record_fill again if record_trade already did the job
-# if delta is None and not trade_recorded:
-# res = await maybe_call(ss, "record_fill", sym, side_u, exec_qty, price)
-# if isinstance(res, dict):
-# delta = res.get("realized_pnl_delta") or res.get("pnl_delta")
-# 
-# # Try position manager-style API
-# if delta is None:
-# res = await maybe_call(ss, "apply_fill_to_positions", sym, side_u, exec_qty, price)
-# if isinstance(res, dict):
-# delta = res.get("realized_pnl_delta") or res.get("pnl_delta")
-# 
-# realized_after = float(
-#     getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
-# realized_committed = realized_after != realized_before
-# 
-# # If we have a delta or no commit happened, persist and emit
-# if delta is not None or (side_u == "SELL" and not realized_committed):
-# if delta is not None:
-# try:
-# delta_f = float(delta)
-# except Exception:
-# delta_f = None
-# if delta_f is None and side_u == "SELL" and not realized_committed:
-# try:
-# pos = getattr(ss, "positions", {}).get(
-#     sym, {}) if hasattr(ss, "positions") else {}
-# entry = float(pos.get("avg_price", 0.0) or 0.0)
-# if entry <= 0:
-# ot = getattr(ss, "open_trades", {}).get(
-#     sym, {}) if hasattr(ss, "open_trades") else {}
-# entry = float(ot.get("entry_price", 0.0) or 0.0)
-# side_hint = str(pos.get("side") or pos.get("position") or "long").lower()
-# if entry > 0:
-# if side_hint in ("short", "sell"):
-# delta_f = (entry - price) * exec_qty - fee_quote
-# else:
-# delta_f = (price - entry) * exec_qty - fee_quote
-# except Exception:
-# delta_f = None
-# 
-# if delta_f is not None and delta_f != 0.0:
-# now = time.time()
-# try:
-# ss.metrics["realized_pnl"] = float(
-#     getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0) + delta_f
-# except Exception:
-# pass
-# # Persist via public API when available
-# if hasattr(ss, "append_realized_pnl_delta"):
-# with contextlib.suppress(Exception):
-# await maybe_call(ss, "append_realized_pnl_delta", now, delta_f)
-# else:
-#     # Fallback to internal store (bounded deque)
-# try:
-# ss._realized_pnl.append((now, delta_f))
-# except Exception:
-# ss._realized_pnl = deque(maxlen=4096)
-# ss._realized_pnl.append((now, delta_f))
-# 
-# # Emit the event with optional nav_quote
-# nav_q = None
-# try:
-# if hasattr(ss, "get_nav_quote"):
-# nav_q = float(await maybe_call(ss, "get_nav_quote", sym))
-# except Exception:
-# nav_q = None
-# 
-# payload = {"pnl_delta": delta_f, "symbol": sym, "timestamp": now}
-# if nav_q is not None:
-# payload["nav_quote"] = nav_q
-# with contextlib.suppress(Exception):
-# await maybe_call(ss, "emit_event", "RealizedPnlUpdated", payload)
-# emitted = True
-# except Exception:
-# self.logger.debug("post-fill PnL handler failed (non-fatal)", exc_info=True)
-# return {
-#     "delta": delta_f,
-#     "realized_committed": realized_committed,
-#     "emitted": emitted,
-# }
-# 
-# 
     async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
         return {"emitted": False, "realized_committed": False, "delta_f": None}
+
     def _calc_close_payload(self, sym: str, raw: Dict[str, Any]) -> Tuple[float, float, float, float]:
         entry_price = float(self._get_entry_price_for_sell(sym) or 0.0)
         exec_px = float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0)
@@ -335,8 +185,7 @@ class ExecutionManager:
 
         if not committed:
             try:
-                cur = float(getattr(self.shared_state, "metrics",
-                        {}).get("realized_pnl", 0.0) or 0.0)
+                cur = float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
                 self.shared_state.metrics["realized_pnl"] = cur + float(realized_pnl)
             except Exception:
                 pass
@@ -1587,6 +1436,157 @@ class ExecutionManager:
     # CRITICAL: bootstrap_bypass allows first trade on flat portfolio to execute
     bypass_min_notional = bootstrap_bypass
 
+    if not bypass_min_notional:
+    # 3) If planned quote + accumulation is below the floor, decide between MIN_NOTIONAL vs NAV shortfall
+    if effective_qa < min_required - eps:
+    # If the user is effectively trying to spend all they have (including accumulation)
+    # and that amount is still below the venue/config floor, classify as NAV shortfall.
+    if spendable_dec > 0 and (qa <= spendable_dec + eps) and (spendable_dec + acc_val < min_required - eps):
+    gap = (min_required - (spendable_dec + acc_val)).max(Decimal("0"))
+    return (False, gap, "INSUFFICIENT_QUOTE")
+    # Otherwise, the caller asked below the floor while having enough NAV.
+    gap = (min_required - effective_qa).max(Decimal("0"))
+    return (False, gap, "QUOTE_LT_MIN_NOTIONAL")
+    else:
+    # BOOTSTRAP: Bypass min_notional for first trade execution
+    if effective_qa < min_required - eps:
+    self.logger.warning(
+    f"[EM:BOOTSTRAP] {sym} BUY: Bypassing min_entry={float(min_required):.2f} "
+    f"for quote={float(effective_qa):.2f} USDT"
+    )
+    # Continue to affordability check even if below min_entry
+
+
+    # 4) Affordability with fees/headroom
+    # We don't just check gross_needed; we check if the rounded quantity is affordable.
+
+    # Extract step_size from filters for quantity rounding
+    step_size, min_qty, max_qty, tick_size, _ = self._extract_filter_vals(filters)
+
+    # Apply fee buffer to find "net" spendable for the asset (including accumulation)
+    price_f = float(price) if price > 0 else 1.0
+    est_units_raw = float(effective_qa) / price_f
+
+    # P9 Corrective: Use the extracted step_size (robust) instead of direct dict access
+    step = step_size
+    if step > 0:
+    est_units = self._round_step_down(est_units_raw, step)
+    else:
+    est_units = est_units_raw
+
+    if est_units <= 0:
+    return (False, Decimal("0"), "ZERO_QTY_AFTER_ROUNDING")
+
+    est_notional = est_units * price_f
+
+    # Check if this executable chunk meets minNotional (SKIP in bootstrap/accumulate modes)
+    if not bypass_min_notional and est_notional < float(min_required):
+    gap = Decimal(str(min_required)) - Decimal(str(est_notional))
+    return (False, gap.max(Decimal("0")), "QUOTE_LT_MIN_NOTIONAL")
+    elif bypass_min_notional and est_notional < float(min_required):
+    # Log bypass for accumulate execution
+    self.logger.warning(
+    f"[EM:ACCUMULATE] {sym} BUY: Bypassing second min_entry check - "
+    f"est_notional={est_notional:.2f} < min_required={float(min_required):.2f}"
+    )
+
+    gross_needed = qa * (Decimal("1") + taker_fee) * headroom
+    # CRITICAL FIX: Use EPSILON tolerance to avoid float/timing false negatives
+    # Problem: spendable_dec < gross_needed can fail due to tiny float differences
+    # Solution: Allow small tolerance (EPSILON = 1e-6) for capital availability
+    EPSILON = Decimal("1e-6")
+    if spendable_dec < gross_needed - EPSILON:
+    # Point 3: Dynamic Resizing (Downscaling)
+    # If we have less than planned, but enough for minNotional, we downscale.
+    max_qa = spendable_dec / ((Decimal("1") + taker_fee) * headroom)
+    if no_downscale_planned_quote:
+    gap = (qa - max_qa).max(Decimal("0"))
+    return (False, gap, "INSUFFICIENT_QUOTE")
+    if max_qa >= Decimal(str(min_required)) or bypass_min_notional:
+    self.logger.info(
+    f"[EM] Dynamic Resizing: Downscaling {qa} -> {max_qa:.2f} to fit spendable {spendable_dec:.2f}")
+    return (True, max_qa, "OK_DOWNSCALED")
+    else:
+    # Point 2: Accumulation Pivot
+    # No enough for minNotional even with all cash.
+    gap = Decimal(str(min_required)) - max_qa
+    return (False, gap.max(Decimal("0")), "INSUFFICIENT_QUOTE_FOR_ACCUMULATION")
+
+    if price <= 0:
+    self.logger.warning(
+    "[EM] ExecutionProbe = FAIL (Reason: Market Price 0). Readiness = FALSE.")
+    return (False, Decimal("0"), "ZERO_MARKET_PRICE")
+
+    if price > 0:
+    filters_obj = SymbolFilters(
+    step_size=float(min_notional/10),  # dummy or real if we had it
+    min_qty=0.0,
+    max_qty=float("inf"),
+    tick_size=1e-8,
+    min_notional=float(min_notional),
+    min_entry_quote=float(min_required)
+    )
+    # Re-fetch real filters for accuracy
+    f_data = await self.exchange_client.ensure_symbol_filters_ready(sym)
+    step_size, min_qty, _, _, _ = self._extract_filter_vals(f_data)
+    filters_obj.step_size = step_size
+    filters_obj.min_qty = min_qty
+
+    v_ok, v_qty, _, v_reason = await validate_order_request(
+    side="BUY", qty=0, price=price, filters=filters_obj, use_quote_amount=float(effective_qa)
+    )
+
+    # BOOTSTRAP FIX: Force minimum quantity if we have capital but qty rounded to zero
+    if not v_ok and v_reason in ("QTY_LT_MIN", "NOTIONAL_LT_MIN_OR_ZERO_QTY"):
+    # Check if we're in bootstrap mode (either via policy context or shared state)
+    is_bootstrap = bootstrap_bypass
+    if not is_bootstrap:
+    try:
+    if hasattr(self.shared_state, "is_bootstrap_mode"):
+    is_bootstrap = self.shared_state.is_bootstrap_mode()
+    except Exception:
+    pass
+
+    # If bootstrap AND we have enough capital for minNotional, force minimum quantity
+    if is_bootstrap and spendable_dec >= Decimal(str(filters_obj.min_notional)):
+    step = Decimal(str(filters_obj.step_size or 0.1))
+    min_qty_dec = Decimal(str(filters_obj.min_qty or 0.0))
+    forced_qty = max(min_qty_dec, step)
+
+    # Verify the forced quantity is actually executable
+    forced_notional = forced_qty * Decimal(str(price))
+    if forced_notional <= spendable_dec:
+    self.logger.info(
+    f"[EM] BOOTSTRAP: Forcing minimum quantity for {sym}: "
+    f"qty={float(forced_qty):.8f}, notional={float(forced_notional):.2f} USDT"
+    )
+    # Override: treat as OK with the forced quantity
+    return (True, forced_qty, "OK_BOOTSTRAP_FORCED")
+
+    if not v_ok:
+    # BOOTSTRAP FIX 2.0: If we have enough capital for minNotional, logic should PASS not fail on rounding.
+    # This is critical for readiness probes on high-priced or weird-step-size symbols.
+    spendable_dec = Decimal(str(spendable))
+    min_req_dec = Decimal(str(filters_obj.min_notional))
+
+    if spendable_dec >= min_req_dec:
+    # Use at least one step_size/min_qty
+    forced_qty = max(Decimal(str(filters_obj.min_qty)),
+                 Decimal(str(filters_obj.step_size or 0.1)))
+    self.logger.info(
+    f"[EM] Readiness Check: Ignoring rounding error because spendable {spendable_dec:.2f} >= minNotional {min_req_dec:.2f}. Forcing qty={forced_qty}")
+    return (True, forced_qty, "OK_BOOTSTRAP_FORCED")
+
+    gap = Decimal("0")
+    if v_reason == "QTY_LT_MIN" or v_reason == "NOTIONAL_LT_MIN_OR_ZERO_QTY":
+    # Rule 2/5 Enhancement: Calculate exactly what we need to reach 1 unit
+    step = Decimal(str(filters_obj.step_size or 0.1))
+    target_qty = max(Decimal(str(filters_obj.min_qty)), step)
+    target_notional = max(Decimal(str(filters_obj.min_notional)),
+                      target_qty * Decimal(str(price)))
+    gap = (target_notional - qa).max(Decimal("0"))
+
+    self.logger.warning
     if not bypass_min_notional:
     # 3) If planned quote + accumulation is below the floor, decide between MIN_NOTIONAL vs NAV shortfall
     if effective_qa < min_required - eps:
