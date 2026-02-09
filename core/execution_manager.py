@@ -1411,7 +1411,7 @@ class ExecutionManager:
     # gate QUOTE_LT_MIN_ECONOMIC and MICRO_TRADE_KILL_SWITCH.
     # Only active when portfolio is FLAT (cold bootstrap) and config allows it.
     _early_bootstrap_bypass = False
-    if policy_context and bool(policy_context.get("bootstrap_bypass", False)):
+    if policy_context and bool(policy_ctx.get("bootstrap_bypass", False)):
     escape_enabled = getattr(self.config, "BOOTSTRAP_ESCAPE_HATCH_ENABLED", False)
     is_cold = False
     try:
