@@ -1100,16 +1100,16 @@ class ExecutionManager:
         )
         try:
             await self.shared_state.record_rejection(sym, "SELL", "SELL_NET_PNL_MIN", source="ExecutionManager")
-    except Exception:
-    pass
-    return {
-    "ok": False,
-    "status": "blocked",
-    "reason": "sell_net_pnl_below_min",
-    "error_code": "SELL_NET_PNL_MIN",
-    "net_pnl": net_pnl,
-    "min_net_pnl": min_net,
-    "fee_estimate": fee_est,
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": "sell_net_pnl_below_min",
+            "error_code": "SELL_NET_PNL_MIN",
+            "net_pnl": net_pnl,
+            "min_net_pnl": min_net,
+            "fee_estimate": fee_est,
     }
 >>>>>>> e5b242f (auto-commit)
 
