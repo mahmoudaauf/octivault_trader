@@ -305,6 +305,13 @@ class MetaController:
             if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
                 self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
                 self._bootstrap_attempts = 0
+class MetaController:
+    # ...existing code...
+    LIFECYCLE_DUST_HEALING = "DUST_HEALING"
+    LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
+    LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
+    LIFECYCLE_LIQUIDATION = "LIQUIDATION"
+
     def _compute_min_notional_aware_qty(
         self,
         *,
@@ -330,14 +337,6 @@ class MetaController:
         from decimal import Decimal, ROUND_DOWN
         qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
         return qty
-
-    # Symbol lifecycle states
-LIFECYCLE_DUST_HEALING = "DUST_HEALING"
-LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
-LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
-LIFECYCLE_LIQUIDATION = "LIQUIDATION"
-
-class MetaController:
     # ...existing code...
     def _init_symbol_lifecycle(self):
         # Call this in __init__
