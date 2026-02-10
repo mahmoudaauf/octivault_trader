@@ -9197,6 +9197,21 @@ class MetaController:
             self.logger.debug("symbol readiness check failed for %s", symbol, exc_info=True)
         try:
             if side == "BUY":
+                # Step 1: Fetch symbol economics from exchange
+                filters = await self.exchange_client.ensure_symbol_filters_ready(symbol)
+                min_notional = float(getattr(filters, "min_notional", 0.0) or filters.get("min_notional", 0.0) or 0.0)
+                min_entry_quote = max(min_notional, float(self._cfg("MIN_ENTRY_QUOTE", 0.0)))
+                step_size = float(getattr(filters, "step_size", 0.0) or filters.get("step_size", 0.0) or 0.0)
+                min_qty = float(getattr(filters, "min_qty", 0.0) or filters.get("min_qty", 0.0) or 0.0)
+                dust_threshold = min_notional * 0.9
+                # Attach to policy_context
+                policy_context = {
+                    "min_notional": min_notional,
+                    "min_entry_quote": min_entry_quote,
+                    "step_size": step_size,
+                    "min_qty": min_qty,
+                    "dust_threshold": dust_threshold,
+                }
                 # Strict Rule 5: Zero-amount execution must NEVER be OK
                 planned_quote = float(signal.get("_planned_quote", 0.0))
                 if planned_quote <= 0:
@@ -9332,16 +9347,13 @@ class MetaController:
                 policy_flags["ECONOMIC_PROFITABILITY_INVARIANT"] = True
                 # Double check affordability for executable qty (Rule 2/5)
                 # BOOTSTRAP FIX: If this signal is marked with _bootstrap flag, pass bootstrap context
-                bootstrap_policy_ctx = None
+                bootstrap_policy_ctx = policy_context.copy() if policy_context else None
                 if signal.get("_bootstrap") or signal.get("_bootstrap_override"):
-                    bootstrap_policy_ctx = self._build_policy_context(
-                        symbol,
-                        side,
-                        extra={"bootstrap_bypass": True}
-                    )
+                    if not bootstrap_policy_ctx:
+                        bootstrap_policy_ctx = {}
+                    bootstrap_policy_ctx["bootstrap_bypass"] = True
                     self.logger.info("[Meta:BOOTSTRAP] Using bootstrap_bypass context for affordability check: %s", symbol)
 
-                
                 can_ex, _, reason = await self.execution_manager.can_afford_market_buy(symbol, planned_quote, policy_context=bootstrap_policy_ctx)
                 if not can_ex:
                     self.logger.warning("⚡ [Escalation] Signal %s for %s has zero executable qty (%s). Triggering Rule 5 Escalation.", symbol, side, reason)
