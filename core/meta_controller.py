@@ -328,6 +328,8 @@ LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
 LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
 LIFECYCLE_LIQUIDATION = "LIQUIDATION"
 
+class MetaController:
+    # ...existing code...
     def _init_symbol_lifecycle(self):
         # Call this in __init__
         self.symbol_lifecycle = {}  # symbol -> state
