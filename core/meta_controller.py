@@ -310,17 +310,17 @@ class MetaController:
         Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
         """
         from math import ceil
-        if price <= 0 or min_notional <= 0 or step_size <= 0:
-            return 0.0
-        effective_min_notional = min_notional * fee_buffer * slippage_buffer
-        min_qty_for_notional = effective_min_notional / price
-        min_exec_qty = max(min_qty, min_qty_for_notional)
-        steps = ceil(min_exec_qty / step_size)
-        qty = steps * step_size
-        # Final check: ensure qty * price >= min_notional
-        if qty * price < min_notional:
-            qty = ((ceil((min_notional / price) / step_size)) * step_size)
-        return qty
+            if price <= 0 or min_notional <= 0 or step_size <= 0:
+                return 0.0
+            # Apply fee and slippage buffer
+            min_quote = min_notional * fee_buffer * slippage_buffer
+            qty = min_quote / price
+            # Enforce min_qty and step_size
+            qty = max(qty, min_qty)
+            # Round down to step_size
+            from decimal import Decimal, ROUND_DOWN
+            qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
+            return qty
 
     # Symbol lifecycle states
     LIFECYCLE_DUST_HEALING = "DUST_HEALING"
