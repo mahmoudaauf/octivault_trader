@@ -50,11 +50,6 @@ def load_config() -> Config:
         logger = logging.getLogger("Main")
         logger.warning("dotenv load failed: %s (Tip: pip install python-dotenv and ensure .env exists)", e)
 
-    # Debug print for API secret
-    api_secret = os.getenv("BINANCE_API_SECRET")
-    print(f"[DEBUG] BINANCE_API_SECRET loaded: {api_secret}")
-    logger = logging.getLogger("Main")
-    logger.info(f"[DEBUG] BINANCE_API_SECRET loaded: {api_secret}")
 
     cfg = Config()
     cfg.env = os.getenv("ENV", "prod")
