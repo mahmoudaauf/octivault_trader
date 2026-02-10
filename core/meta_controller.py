@@ -1,3 +1,19 @@
+    def _compute_min_notional_aware_qty(self, *, price: float, min_notional: float, min_qty: float, step_size: float, fee_buffer: float = 1.01, slippage_buffer: float = 1.0) -> float:
+        """
+        Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
+        """
+        from math import ceil
+        if price <= 0 or min_notional <= 0 or step_size <= 0:
+            return 0.0
+        effective_min_notional = min_notional * fee_buffer * slippage_buffer
+        min_qty_for_notional = effective_min_notional / price
+        min_exec_qty = max(min_qty, min_qty_for_notional)
+        steps = ceil(min_exec_qty / step_size)
+        qty = steps * step_size
+        # Final check: ensure qty * price >= min_notional
+        if qty * price < min_notional:
+            qty = ((ceil((min_notional / price) / step_size)) * step_size)
+        return qty
 # -*- coding: utf-8 -*-
 """
 MetaController (Monolithic - Transitional)
@@ -6793,8 +6809,8 @@ class MetaController:
                     symbol_info = await self._get_symbol_info(sym)
                     if symbol_info:
                         symbol_min_notional = float(symbol_info.get('min_notional', base_floor))
-                        min_qty = float(symbol_info.get('step_size', 0.0001))  # lot step size
-                        
+                        min_qty = float(symbol_info.get('min_qty', 0.0))
+                        step_size = float(symbol_info.get('step_size', 0.0001))
                         # Get current price for quantity calculation
                         current_price = None
                         if self.exchange_client:
@@ -6806,33 +6822,30 @@ class MetaController:
                                         current_price = float(current_price)
                                 except Exception as e:
                                     self.logger.debug(f"[Meta:FlatBootstrap] Failed to get price for {sym}: {e}")
-                        
                         if current_price and current_price > 0:
-                            # Bootstrap-aware calculation: ensure both qty >= lot_step AND quote >= minNotional
-                            min_quote_for_qty = min_qty * current_price  # Minimum quote to get minimum quantity
-                            trading_fee_buffer = max(symbol_min_notional * 0.05, min_quote_for_qty * 0.05)  # 5% fee buffer
-                            
-                            # Final planned quote: max of both constraints + fee buffer
-                            plan_q = max(
-                                symbol_min_notional + trading_fee_buffer,   # minNotional constraint
-                                min_quote_for_qty + trading_fee_buffer,     # lot step constraint
-                                float(self._cfg("BOOTSTRAP_MIN_QUOTE", 10.0))  # config minimum
+                            # Use production-grade min-notional-aware quantity calculation
+                            fee_buffer = 1.01  # 1% fee buffer
+                            slippage_buffer = 1.0  # Optionally configurable
+                            qty = self._compute_min_notional_aware_qty(
+                                price=current_price,
+                                min_notional=symbol_min_notional,
+                                min_qty=min_qty,
+                                step_size=step_size,
+                                fee_buffer=fee_buffer,
+                                slippage_buffer=slippage_buffer
                             )
-                            
+                            plan_q = qty * current_price
                             self.logger.info(
-                                "[Meta:FlatBootstrap] Symbol %s: bootstrap-aware planned_quote=%.2f "
-                                "(min_notional=%.2f, min_qty=%.6f, price=%.2f, min_quote_for_qty=%.2f, fee_buffer=%.2f)",
-                                sym, plan_q, symbol_min_notional, min_qty, current_price, min_quote_for_qty, trading_fee_buffer
+                                "[Meta:FlatBootstrap] Symbol %s: min-notional-aware qty=%.8f planned_quote=%.2f (min_notional=%.2f, min_qty=%.6f, step_size=%.6f, price=%.2f, fee_buffer=%.3f)",
+                                sym, qty, plan_q, symbol_min_notional, min_qty, step_size, current_price, fee_buffer
                             )
                         else:
                             # Fallback without price: use enhanced min_notional approach
-                            fee_buffer = symbol_min_notional * 0.10  # 10% buffer without price info
+                            fee_buffer = 1.10  # 10% buffer without price info
                             bootstrap_min_quote = float(self._cfg("BOOTSTRAP_MIN_QUOTE", 10.0))
-                            plan_q = max(symbol_min_notional + fee_buffer, bootstrap_min_quote)
-                            
+                            plan_q = max(symbol_min_notional * fee_buffer, bootstrap_min_quote)
                             self.logger.info(
-                                "[Meta:FlatBootstrap] Symbol %s: fallback planned_quote=%.2f "
-                                "(symbol_min_notional=%.2f, fee_buffer=%.2f, bootstrap_min=%.2f, reason=no_price)",
+                                "[Meta:FlatBootstrap] Symbol %s: fallback planned_quote=%.2f (symbol_min_notional=%.2f, fee_buffer=%.2f, bootstrap_min=%.2f, reason=no_price)",
                                 sym, plan_q, symbol_min_notional, fee_buffer, bootstrap_min_quote
                             )
                     else:
@@ -6843,7 +6856,7 @@ class MetaController:
                         plan_q = base_floor * escalation_factor
                         self.logger.warning(f"[Meta:FlatBootstrap] Symbol {sym}: using fallback planned_quote=%.2f (no symbol_info)", plan_q)
                 except Exception as e:
-                    self.logger.warning(f"[Meta:FlatBootstrap] Failed to calculate bootstrap-aware quote for {sym}: {e}, using fallback")
+                    self.logger.warning(f"[Meta:FlatBootstrap] Failed to calculate min-notional-aware quote for {sym}: {e}, using fallback")
                     trade_fee_pct = 0.001 * float(getattr(self.config, "TAKER_FEE_BPS", 10))
                     safety_factor = 1.15
                     escalation_factor = (1.0 + trade_fee_pct) * safety_factor
