@@ -878,24 +878,6 @@ class ExecutionManager:
         slippage_pct = slippage_bps / 10000.0
         buffer_pct = float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
 
-    if net_pnl < min_net and not self.allow_sell_below_fee:
-        self.logger.info(
-            "[EM:SellNetGate] Blocked SELL %s: net_pnl=%.4f < min_net=%.4f (fee=%.4f entry=%.4f price=%.4f qty=%.6f)",
-            sym, net_pnl, min_net, fee_est, entry, price, qty
-        )
-        try:
-            await self.shared_state.record_rejection(sym, "SELL", "SELL_NET_PNL_MIN", source="ExecutionManager")
-        except Exception:
-            pass
-        return {
-                "ok": False,
-                "status": "blocked",
-                "reason": "sell_net_pnl_below_min",
-                "error_code": "SELL_NET_PNL_MIN",
-                "net_pnl": net_pnl,
-                "min_net_pnl": min_net,
-                "fee_estimate": fee_est,
-            }
     if min_net_pct > 0 and net_after_fees_pct < min_net_pct:
         self.logger.info(
             "[EM:SellNetPctGate] Blocked SELL %s: net_after_fees=%.4f%% < min=%.4f%% (move=%.4f%% fees=%.4f%% slip=%.4f%%)",
