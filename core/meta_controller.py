@@ -1555,12 +1555,13 @@ class MetaController:
                     self.logger.info("[WHY_NO_TRADE] reason=MIN_TRADE_QUOTE_BLOCK symbol=%s details=quote_below_mvt", symbol)
                     return False  # ❌ BLOCK: Would create new dust or below MVT
             
+
             # ═══════════════════════════════════════════════════════════════════════
-            # STEP 4.5: ENTRY LOCK & MAX POSITION CAP (USER REQUESTED)
+            # STEP 4.5: DUST-AWARE POSITION LOCK (Professional-grade fix)
             # ═══════════════════════════════════════════════════════════════════════
             now = time.time()
             last_buy = self._last_buy_ts.get(symbol, 0.0)
-            
+
             # 1. Entry Cooldown (prevent buy storms)
             cooldown_sec = float(getattr(self.config, "ENTRY_COOLDOWN_SEC", 30.0))
             if now - last_buy < cooldown_sec:
@@ -1572,23 +1573,26 @@ class MetaController:
             if existing_position_notional >= max_pos:
                 self.logger.info("[WHY_NO_TRADE] symbol=%s reason=MAX_POSITION_REACHED details=current_%.2f_max_%.2f", symbol, existing_position_notional, max_pos)
                 return False
-            
+
             if (existing_position_notional + planned_quote) > max_pos:
                 self.logger.info("[WHY_NO_TRADE] symbol=%s reason=MAX_POSITION_REACHED details=resulting_%.2f_max_%.2f", symbol, existing_position_notional + planned_quote, max_pos)
                 return False
 
-            # 3. Position Lock (One Lifecycle Rule)
-            # If position exists (and is not dust), REJECT unless explicit scale-in
-            # This enforces "Buy Once, Hold, Sell" behavior for v1 stability
-            if existing_position_notional > 0 and not is_existing_dust:
-                allow_scale_in = False
-                # Future: Check for "scale_in" or "dca" tags in signal
-                if "scale_in" in reason.lower() or "dca" in reason.lower():
-                    allow_scale_in = True
-                
-                if not allow_scale_in:
-                    self.logger.info("[WHY_NO_TRADE] reason=POSITION_ALREADY_OPEN symbol=%s details=single_entry_rule_active", symbol)
-                    return False
+            # 3. DUST-AWARE POSITION LOCK
+            # Treat dust as no position: if position value < DUST_POSITION_VALUE_USDT, allow BUY as bootstrap merge
+            DUST_POSITION_VALUE_USDT = float(getattr(self.config, "DUST_POSITION_VALUE_USDT", 10.0))
+            if existing_position_notional > 0:
+                if existing_position_notional < DUST_POSITION_VALUE_USDT:
+                    # Allow buy as bootstrap merge (treat as no position)
+                    self.logger.info(f"[Meta:BuyGate] DUST-AWARE POSITION: {symbol} position=${existing_position_notional:.2f} < DUST_POSITION_VALUE_USDT=${DUST_POSITION_VALUE_USDT:.2f} → BUY ALLOWED (bootstrap merge)")
+                else:
+                    # Real position exists, block unless explicit scale-in
+                    allow_scale_in = False
+                    if "scale_in" in reason.lower() or "dca" in reason.lower():
+                        allow_scale_in = True
+                    if not allow_scale_in:
+                        self.logger.info("[WHY_NO_TRADE] reason=POSITION_ALREADY_OPEN symbol=%s details=single_entry_rule_active", symbol)
+                        return False
 
             # ═══════════════════════════════════════════════════════════════════════
             # STEP 5: Check balance availability
