@@ -1,3 +1,6 @@
+import os
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(dotenv_path=find_dotenv(usecwd=True), override=True)
 import asyncio
 import logging
 
