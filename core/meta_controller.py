@@ -274,6 +274,37 @@ except ImportError:
 
 
 class MetaController:
+        def _reset_bootstrap_override_if_deadlocked(self, symbol: str, signal: dict, last_result: dict = None):
+            """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
+            # Check if position is flat
+            is_flat = False
+            try:
+                qty = 0.0
+                if hasattr(self.shared_state, "get_position_qty"):
+                    qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
+                elif hasattr(self.shared_state, "get_position"):
+                    pos = self.shared_state.get_position(symbol)
+                    if _asyncio.iscoroutine(pos):
+                        pos = _asyncio.get_event_loop().run_until_complete(pos)
+                    qty = float(pos.get("qty", 0.0) or pos.get("quantity", 0.0) or 0.0)
+                is_flat = qty == 0.0
+            except Exception:
+                pass
+            # Check if no realized trades yet
+            realized_trades = 0
+            try:
+                metrics = getattr(self.shared_state, "metrics", {}) or {}
+                realized_trades = int(metrics.get("total_trades_executed", 0) or 0)
+            except Exception:
+                pass
+            # Check if last override did NOT produce execution
+            last_override_failed = False
+            if last_result is not None:
+                last_override_failed = not (str(last_result.get("status", "")).lower() in {"placed", "executed", "filled"})
+            # If all conditions met, reset bootstrap attempts
+            if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
+                self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
+                self._bootstrap_attempts = 0
     def _compute_min_notional_aware_qty(self, *, price: float, min_notional: float, min_qty: float, step_size: float, fee_buffer: float = 1.01, slippage_buffer: float = 1.0) -> float:
         """
         Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
@@ -9029,6 +9060,7 @@ class MetaController:
         """Standardized execution path with P9-aligned readiness and trade frequency gating."""
         # NOTE: Execution attempts are counted only when we actually call ExecutionManager.
         # This prevents policy rejections from inflating liveness counters.
+        last_result = None
         if side == "BUY":
             now = time.time()
             agent_name = signal.get("agent", "Meta")
@@ -9454,6 +9486,10 @@ class MetaController:
                     tier=tier,
                     policy_context=policy_ctx,
                 )
+                last_result = result
+                # Option A: Reset bootstrap override counter if deadlocked
+                if signal.get("_bootstrap_override", False):
+                    self._reset_bootstrap_override_if_deadlocked(symbol, signal, last_result)
                 # Escalation Loop: BUY -> fail (InsufficientBalance) -> liquidate -> retry (Behavior Change 5)
                 ec = result.get("error_code") or result.get("reason")
                 if not result.get("ok") and ec in ("InsufficientBalance", "INSUFFICIENT_QUOTE", "RESERVE_FLOOR", "QUOTE_LT_MIN_NOTIONAL", "MIN_NOTIONAL_VIOLATION"):
