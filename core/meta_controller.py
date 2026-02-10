@@ -6714,6 +6714,8 @@ class MetaController:
             candidates.sort(key=lambda x: float(x[1].get("confidence", 0.0)), reverse=True)
             
             for sym, s in candidates:
+                # Ensure bootstrap_bypass_active is always defined before use
+                bootstrap_bypass_active = False
                 conf = float(s.get("confidence", 0.0))
                 
                 # ===== CRITICAL FIX #1: PRE-FLIGHT GATE CHECK (BOOTSTRAP DEADLOCK FIX) =====
