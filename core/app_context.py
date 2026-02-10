@@ -2789,6 +2789,10 @@ class AppContext:
             return getattr(mod, name, None) if mod else None
 
         # ExchangeClient (before others that depend on it)
+        # Load API keys from environment
+        BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
+        BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET')
+
         if self.exchange_client is None:
             ExchangeClient = _get_cls(_exchange_mod, "ExchangeClient")
             self.exchange_client = _try_construct(
@@ -2797,6 +2801,8 @@ class AppContext:
                 logger=self.logger,
                 app=self,
                 shared_state=self.shared_state,
+                api_key=BINANCE_API_KEY,
+                api_secret=BINANCE_API_SECRET
             )
         # Fallback: use module-level factory if direct construction failed
         if self.exchange_client is None and _exchange_mod is not None:
@@ -3352,12 +3358,6 @@ class AppContext:
                     # Start MDF (supports start/start_async/run/run_async) and apply timeout handling
                     await self._start_with_timeout("P4_market_data", self.market_data_feed)
                     # NOTE: _start_with_timeout already spawns mdf.run() as a background task.
-                    # DO NOT call mdf.run() again here — it causes duplicate polling + race conditions.
-                    try:
-                        await self._emit_summary("P4_MARKET_DATA_STARTED")
-                    except Exception:
-                        pass
-                    # Gate on exchange + universe + market_data readiness
                     try:
                         md_timeout = int(self._cfg("P4_MARKET_DATA_READY_TIMEOUT_SEC", 180))
                     except Exception:
