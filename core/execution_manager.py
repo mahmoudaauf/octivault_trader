@@ -5,9 +5,10 @@
     # - ExecutionError
     # - ExecutionBlocked
     # =============================
-    """
-    Octivault Trader — P9 Canonical ExecutionManager (native to your SharedState & ExchangeClient)
-    """
+
+"""
+Octivault Trader — P9 Canonical ExecutionManager (native to your SharedState & ExchangeClient)
+"""
     
     from __future__ import annotations
 
