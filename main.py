@@ -1,6 +1,7 @@
 import os
-from dotenv import load_dotenv, find_dotenv
-load_dotenv(dotenv_path=find_dotenv(usecwd=True), override=True)
+from dotenv import load_dotenv
+env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
+load_dotenv(dotenv_path=env_path, override=True)
 import asyncio
 import logging
 
