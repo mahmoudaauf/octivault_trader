@@ -895,89 +895,88 @@ class ExecutionManager:
     if price <= 0 or entry <= 0:
         return None
 
-<<<<<<< HEAD
-        proceeds = qty * price
-        fee_est = proceeds * float(self.trade_fee_pct or 0.0) * 2.0
-        entry_cost = qty * entry
-        net_pnl = proceeds - fee_est - entry_cost
-        min_net = float(self.sell_min_net_pnl_usdt or 0.0)
-        if bootstrap_override:
-            min_net = bootstrap_min_net
+    proceeds = qty * price
+    fee_est = proceeds * float(self.trade_fee_pct or 0.0) * 2.0
+    entry_cost = qty * entry
+    net_pnl = proceeds - fee_est - entry_cost
+    min_net = float(self.sell_min_net_pnl_usdt or 0.0)
+    if bootstrap_override:
+        min_net = bootstrap_min_net
 
-        expected_move_pct = (price - entry) / max(entry, 1e-9)
-        fee_bps = float(self._exit_fee_bps() or 0.0)
-        slippage_bps = float(self._exit_slippage_bps() or 0.0)
-        fee_pct_total = (fee_bps / 10000.0) * 2.0
-        slippage_pct = slippage_bps / 10000.0
-        buffer_pct = float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
-        entry_fee_mult = float(self._cfg("MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
-        exit_fee_mult = float(self._cfg("MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
-        exit_fee_mult = max(exit_fee_mult, entry_fee_mult)
-        net_after_fees_pct = expected_move_pct - fee_pct_total - slippage_pct
-        min_net_pct = float(self.min_net_profit_after_fees_pct or 0.0)
-        required_move_pct = (fee_pct_total * exit_fee_mult) + slippage_pct + buffer_pct
-        if expected_move_pct < required_move_pct:
-            self.logger.info(
-                "[EM:SellNetPctGate] Blocked SELL %s: move=%.4f%% < required=%.4f%% (fee_mult=%.2f fees=%.4f%% slip=%.4f%% buffer=%.4f%%)",
-                sym,
-                expected_move_pct * 100.0,
-                required_move_pct * 100.0,
-                exit_fee_mult,
-                fee_pct_total * 100.0,
-                slippage_pct * 100.0,
-                buffer_pct * 100.0,
-            )
-            try:
-                await self.shared_state.record_rejection(sym, "SELL", "SELL_BELOW_FEES", source="ExecutionManager")
-            except Exception:
-                pass
-            return {
-                "ok": False,
-                "status": "blocked",
-                "reason": "sell_below_fees",
-                "error_code": "SELL_BELOW_FEES",
-                "expected_move_pct": expected_move_pct,
-                "required_move_pct": required_move_pct,
-                "fee_mult": exit_fee_mult,
-                "fee_bps": fee_bps,
-                "slippage_bps": slippage_bps,
-                "buffer_bps": float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0),
-            }
-        if min_net_pct > 0 and net_after_fees_pct < min_net_pct:
-            self.logger.info(
-                "[EM:SellNetPctGate] Blocked SELL %s: net_after_fees=%.4f%% < min=%.4f%% (move=%.4f%% fees=%.4f%% slip=%.4f%%)",
-                sym,
-                net_after_fees_pct * 100.0,
-                min_net_pct * 100.0,
-                expected_move_pct * 100.0,
-                fee_pct_total * 100.0,
-                slippage_pct * 100.0,
-            )
-            try:
-                await self.shared_state.record_rejection(sym, "SELL", "SELL_NET_PCT_MIN", source="ExecutionManager")
-            except Exception:
-                pass
-            return {
-                "ok": False,
-                "status": "blocked",
-                "reason": "sell_net_pct_below_min",
-                "error_code": "SELL_NET_PCT_MIN",
-                "net_after_fees_pct": net_after_fees_pct,
-                "min_net_profit_pct": min_net_pct,
-                "fee_bps": fee_bps,
-                "slippage_bps": slippage_bps,
-            }
+    expected_move_pct = (price - entry) / max(entry, 1e-9)
+    fee_bps = float(self._exit_fee_bps() or 0.0)
+    slippage_bps = float(self._exit_slippage_bps() or 0.0)
+    fee_pct_total = (fee_bps / 10000.0) * 2.0
+    slippage_pct = slippage_bps / 10000.0
+    buffer_pct = float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
+    entry_fee_mult = float(self._cfg("MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
+    exit_fee_mult = float(self._cfg("MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
+    exit_fee_mult = max(exit_fee_mult, entry_fee_mult)
+    net_after_fees_pct = expected_move_pct - fee_pct_total - slippage_pct
+    min_net_pct = float(self.min_net_profit_after_fees_pct or 0.0)
+    required_move_pct = (fee_pct_total * exit_fee_mult) + slippage_pct + buffer_pct
+    if expected_move_pct < required_move_pct:
+        self.logger.info(
+            "[EM:SellNetPctGate] Blocked SELL %s: move=%.4f%% < required=%.4f%% (fee_mult=%.2f fees=%.4f%% slip=%.4f%% buffer=%.4f%%)",
+            sym,
+            expected_move_pct * 100.0,
+            required_move_pct * 100.0,
+            exit_fee_mult,
+            fee_pct_total * 100.0,
+            slippage_pct * 100.0,
+            buffer_pct * 100.0,
+        )
+        try:
+            await self.shared_state.record_rejection(sym, "SELL", "SELL_BELOW_FEES", source="ExecutionManager")
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": "sell_below_fees",
+            "error_code": "SELL_BELOW_FEES",
+            "expected_move_pct": expected_move_pct,
+            "required_move_pct": required_move_pct,
+            "fee_mult": exit_fee_mult,
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
+            "buffer_bps": float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0),
+        }
+    if min_net_pct > 0 and net_after_fees_pct < min_net_pct:
+        self.logger.info(
+            "[EM:SellNetPctGate] Blocked SELL %s: net_after_fees=%.4f%% < min=%.4f%% (move=%.4f%% fees=%.4f%% slip=%.4f%%)",
+            sym,
+            net_after_fees_pct * 100.0,
+            min_net_pct * 100.0,
+            expected_move_pct * 100.0,
+            fee_pct_total * 100.0,
+            slippage_pct * 100.0,
+        )
+        try:
+            await self.shared_state.record_rejection(sym, "SELL", "SELL_NET_PCT_MIN", source="ExecutionManager")
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": "sell_net_pct_below_min",
+            "error_code": "SELL_NET_PCT_MIN",
+            "net_after_fees_pct": net_after_fees_pct,
+            "min_net_profit_pct": min_net_pct,
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
+        }
 
-        if net_pnl < min_net and not self.allow_sell_below_fee:
-            self.logger.info(
-                "[EM:SellNetGate] Blocked SELL %s: net_pnl=%.4f < min_net=%.4f (fee=%.4f entry=%.4f price=%.4f qty=%.6f)",
-                sym, net_pnl, min_net, fee_est, entry, price, qty
-            )
-            try:
-                await self.shared_state.record_rejection(sym, "SELL", "SELL_NET_PNL_MIN", source="ExecutionManager")
-            except Exception:
-                pass
-            return {
+    if net_pnl < min_net and not self.allow_sell_below_fee:
+        self.logger.info(
+            "[EM:SellNetGate] Blocked SELL %s: net_pnl=%.4f < min_net=%.4f (fee=%.4f entry=%.4f price=%.4f qty=%.6f)",
+            sym, net_pnl, min_net, fee_est, entry, price, qty
+        )
+        try:
+            await self.shared_state.record_rejection(sym, "SELL", "SELL_NET_PNL_MIN", source="ExecutionManager")
+        except Exception:
+            pass
+        return {
                 "ok": False,
                 "status": "blocked",
                 "reason": "sell_net_pnl_below_min",
