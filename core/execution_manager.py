@@ -875,7 +875,6 @@ class ExecutionManager:
             price = float(await get_px(sym)) if get_px else 0.0
         except Exception:
             price = 0.0
-                qty = float(quantity or 0.0)
 
         qty = float(quantity or 0.0)
         if qty <= 0:
