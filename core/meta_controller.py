@@ -318,9 +318,9 @@ class MetaController:
         # Enforce min_qty and step_size
         qty = max(qty, min_qty)
         # Round down to step_size
-            from decimal import Decimal, ROUND_DOWN
-            qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
-            return qty
+        from decimal import Decimal, ROUND_DOWN
+        qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
+        return qty
 
     # Symbol lifecycle states
     LIFECYCLE_DUST_HEALING = "DUST_HEALING"
