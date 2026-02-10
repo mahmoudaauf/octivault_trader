@@ -271,30 +271,30 @@ except ImportError:
 # - MetaControllerOrchestrator
 ############################################################
 
+
 class MetaController:
-        def _compute_min_notional_aware_qty(self, *, price: float, min_notional: float, min_qty: float, step_size: float, fee_buffer: float = 1.01, slippage_buffer: float = 1.0) -> float:
-            """
-            Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
-            """
-            from math import ceil
-            if price <= 0 or min_notional <= 0 or step_size <= 0:
-                return 0.0
-            effective_min_notional = min_notional * fee_buffer * slippage_buffer
-            min_qty_for_notional = effective_min_notional / price
-            min_exec_qty = max(min_qty, min_qty_for_notional)
-            steps = ceil(min_exec_qty / step_size)
-            qty = steps * step_size
-            # Final check: ensure qty * price >= min_notional
-            if qty * price < min_notional:
-                qty = ((ceil((min_notional / price) / step_size)) * step_size)
+    def _compute_min_notional_aware_qty(self, *, price: float, min_notional: float, min_qty: float, step_size: float, fee_buffer: float = 1.01, slippage_buffer: float = 1.0) -> float:
+        """
+        Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
+        """
+        from math import ceil
+        if price <= 0 or min_notional <= 0 or step_size <= 0:
+            return 0.0
+        effective_min_notional = min_notional * fee_buffer * slippage_buffer
+        min_qty_for_notional = effective_min_notional / price
+        min_exec_qty = max(min_qty, min_qty_for_notional)
+        steps = ceil(min_exec_qty / step_size)
+        qty = steps * step_size
+        # Final check: ensure qty * price >= min_notional
+        if qty * price < min_notional:
+            qty = ((ceil((min_notional / price) / step_size)) * step_size)
+        return qty
 
-                return qty
-
-            # Symbol lifecycle states
-            LIFECYCLE_DUST_HEALING = "DUST_HEALING"
-            LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
-            LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
-            LIFECYCLE_LIQUIDATION = "LIQUIDATION"
+    # Symbol lifecycle states
+    LIFECYCLE_DUST_HEALING = "DUST_HEALING"
+    LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
+    LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
+    LIFECYCLE_LIQUIDATION = "LIQUIDATION"
 
     def _init_symbol_lifecycle(self):
         # Call this in __init__
