@@ -38,7 +38,6 @@ class ExecutionBlocked(Exception):
         self.available_quote = float(available_quote or 0.0)
         self.min_required = float(min_required or 0.0)
         super().__init__(f"{code}: planned={self.planned_quote:.2f} available={self.available_quote:.2f} min_required={self.min_required:.2f}")
-
  # =============================
  # 2. Order Filter Shims
  # Imports and/or defines data classes and validation helpers for order filtering and symbol constraints, such as:
@@ -1024,8 +1023,7 @@ class ExecutionManager:
             "min_net_pnl": min_net,
             "fee_estimate": fee_est,
     }
->>>>>>> e5b242f (auto-commit)
-
+    
         # Portfolio-level improvement guard (monotonic realized PnL)
         try:
             metrics = getattr(self.shared_state, "metrics", {}) or {}
