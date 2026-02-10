@@ -274,38 +274,45 @@ except ImportError:
 
 
 class MetaController:
-        def _reset_bootstrap_override_if_deadlocked(self, symbol: str, signal: dict, last_result: dict = None):
-            """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
-            # Check if position is flat
-            is_flat = False
-            try:
-                qty = 0.0
-                if hasattr(self.shared_state, "get_position_qty"):
-                    qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
-                elif hasattr(self.shared_state, "get_position"):
-                    pos = self.shared_state.get_position(symbol)
-                    if _asyncio.iscoroutine(pos):
-                        pos = _asyncio.get_event_loop().run_until_complete(pos)
-                    qty = float(pos.get("qty", 0.0) or pos.get("quantity", 0.0) or 0.0)
-                is_flat = qty == 0.0
-            except Exception:
-                pass
-            # Check if no realized trades yet
-            realized_trades = 0
-            try:
-                metrics = getattr(self.shared_state, "metrics", {}) or {}
-                realized_trades = int(metrics.get("total_trades_executed", 0) or 0)
-            except Exception:
-                pass
-            # Check if last override did NOT produce execution
-            last_override_failed = False
-            if last_result is not None:
-                last_override_failed = not (str(last_result.get("status", "")).lower() in {"placed", "executed", "filled"})
-            # If all conditions met, reset bootstrap attempts
-            if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
-                self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
-                self._bootstrap_attempts = 0
 class MetaController:
+    # ...existing code...
+    LIFECYCLE_DUST_HEALING = "DUST_HEALING"
+    LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
+    LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
+    LIFECYCLE_LIQUIDATION = "LIQUIDATION"
+
+    def _reset_bootstrap_override_if_deadlocked(self, symbol: str, signal: dict, last_result: dict = None):
+        """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
+        # Check if position is flat
+        is_flat = False
+        try:
+            qty = 0.0
+            if hasattr(self.shared_state, "get_position_qty"):
+                qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
+            elif hasattr(self.shared_state, "get_position"):
+                pos = self.shared_state.get_position(symbol)
+                if _asyncio.iscoroutine(pos):
+                    pos = _asyncio.get_event_loop().run_until_complete(pos)
+                qty = float(pos.get("qty", 0.0) or pos.get("quantity", 0.0) or 0.0)
+            is_flat = qty == 0.0
+        except Exception:
+            pass
+        # Check if no realized trades yet
+        realized_trades = 0
+        try:
+            metrics = getattr(self.shared_state, "metrics", {}) or {}
+            realized_trades = int(metrics.get("total_trades_executed", 0) or 0)
+        except Exception:
+            pass
+        # Check if last override did NOT produce execution
+        last_override_failed = False
+        if last_result is not None:
+            last_override_failed = not (str(last_result.get("status", "")).lower() in {"placed", "executed", "filled"})
+        # If all conditions met, reset bootstrap attempts
+        if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
+            self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
+            self._bootstrap_attempts = 0
+    # ...existing code...
     # ...existing code...
     LIFECYCLE_DUST_HEALING = "DUST_HEALING"
     LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
