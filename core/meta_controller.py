@@ -305,7 +305,16 @@ class MetaController:
             if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
                 self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
                 self._bootstrap_attempts = 0
-    def _compute_min_notional_aware_qty(self, *, price: float, min_notional: float, min_qty: float, step_size: float, fee_buffer: float = 1.01, slippage_buffer: float = 1.0) -> float:
+    def _compute_min_notional_aware_qty(
+        self,
+        *,
+        price: float,
+        min_notional: float,
+        min_qty: float,
+        step_size: float,
+        fee_buffer: float = 1.01,
+        slippage_buffer: float = 1.0,
+    ) -> float:
         """
         Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
         """
