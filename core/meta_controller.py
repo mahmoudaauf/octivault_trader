@@ -6109,6 +6109,7 @@ class MetaController:
         suppress_buys = bool(isinstance(rec_state, dict) and rec_state.get("active"))
         for sym in symbols_to_consider:
             sigs = signals_by_sym.get(sym, [])
+            orig_sigs = list(sigs)  # For logging rejected signals
             
             # MEMORY INJECTION (HOLD context only, not intended for execution)
             if not sigs and sym in owned_positions:
@@ -6155,6 +6156,10 @@ class MetaController:
                         )
                     else:
                         buy_suppressed = True
+                        self.logger.info(
+                            "[WHY_NO_TRADE] symbol=%s reason=CAPITAL_RECOVERY_BUY_SUPPRESSED details=capital_recovery_mode_active",
+                            sym
+                        )
                         continue
                 conf = float(sig.get("confidence", 0.0))
 
@@ -6203,8 +6208,10 @@ class MetaController:
                         final_exec_floor = max(exec_floor, mode_conf_floor)
                     
                     if conf < final_exec_floor and not sig.get("bypass_conf"):
-                        self.logger.debug("[Meta:Envelope] %s BUY rejected: conf %.2f < final_floor %.2f (bootstrap=%s)", 
-                                        sym, conf, final_exec_floor, bootstrap_execution_override)
+                        self.logger.info(
+                            "[WHY_NO_TRADE] symbol=%s reason=CONFIDENCE_TOO_LOW details=conf=%.3f final_floor=%.3f bootstrap=%s",
+                            sym, conf, final_exec_floor, bootstrap_execution_override
+                        )
                         continue
 
                     # 4. Mode-based Cooldown Gate
@@ -6218,7 +6225,7 @@ class MetaController:
                         elif not sig.get("_bootstrap_override") and not sig.get("_bootstrap"):
                             remaining = int(mode_cooldown - (now_ts - last_buy_ts))
                             self.logger.info(
-                                "[Meta:Envelope] Skipping %s BUY: mode cooldown (%ds remaining)",
+                                "[WHY_NO_TRADE] symbol=%s reason=MODE_COOLDOWN details=remaining=%ds",
                                 sym, max(0, remaining)
                             )
                             continue
@@ -6237,7 +6244,7 @@ class MetaController:
                         elif not sig.get("_bootstrap_override") and not sig.get("_bootstrap"):
                             remaining = int(self._buy_cooldown_sec - (now_ts - last_buy_ts))
                             self.logger.info(
-                                "[Meta:BUY_COOLDOWN] Skipping %s BUY: cooldown active (%ds remaining)",
+                                "[WHY_NO_TRADE] symbol=%s reason=BUY_COOLDOWN details=remaining=%ds",
                                 sym, max(0, remaining)
                             )
                             continue
@@ -6263,7 +6270,7 @@ class MetaController:
                             delta_pct = abs(cur_price - last_price) / max(last_price, 1e-9)
                             if delta_pct < self._buy_reentry_delta_pct:
                                 self.logger.info(
-                                    "[Meta:BUY_REENTRY] Skipping %s BUY: price delta %.3f%% < %.3f%%",
+                                    "[WHY_NO_TRADE] symbol=%s reason=PRICE_DELTA_TOO_SMALL details=delta=%.3f%% required=%.3f%%",
                                     sym, delta_pct * 100.0, self._buy_reentry_delta_pct * 100.0
                                 )
                                 continue
@@ -6371,10 +6378,9 @@ class MetaController:
                             )
                     if has_significant_position and not allow_reentry:
                         self.logger.info(
-                            "[Meta:REENTRY_LOCK] Skipping %s BUY: existing position qty=%.6f",
+                            "[WHY_NO_TRADE] symbol=%s reason=POSITION_ALREADY_OPEN details=qty=%.6f",
                             sym, existing_qty
                         )
-                        self.logger.info("[WHY_NO_TRADE] symbol=%s reason=POSITION_ALREADY_OPEN details=qty=%.6f", sym, existing_qty)
                         continue
 
                     # Re-entry guard after non-TP/SL exits unless signal changed
@@ -6395,14 +6401,14 @@ class MetaController:
                     if self._reentry_require_tp_sl_exit and (last_exit_ts or exit_reason_norm) and exit_reason_norm not in ("TP", "SL"):
                         if self._reentry_require_signal_change and not signal_changed:
                             self.logger.info(
-                                "[Meta:REENTRY_LOCK] Skipping %s BUY: last_exit=%s and signal unchanged",
+                                "[WHY_NO_TRADE] symbol=%s reason=REENTRY_LOCK_SIGNAL_UNCHANGED details=last_exit=%s",
                                 sym, last_exit_reason or "UNKNOWN"
                             )
                             continue
                         if self._reentry_lock_sec > 0 and (now_ts - float(last_exit_ts or 0.0)) < self._reentry_lock_sec and not signal_changed:
                             remaining = int(self._reentry_lock_sec - (now_ts - float(last_exit_ts or 0.0)))
                             self.logger.info(
-                                "[Meta:REENTRY_LOCK] Skipping %s BUY: exit cooldown active (%ds remaining)",
+                                "[WHY_NO_TRADE] symbol=%s reason=REENTRY_LOCK_EXIT_COOLDOWN details=remaining=%ds",
                                 sym, max(0, remaining)
                             )
                             continue
@@ -6454,7 +6460,7 @@ class MetaController:
                 if action != "SELL" and not self._is_bootstrap_mode():
                     try:
                         if hasattr(self.shared_state, "is_symbol_blocked") and self.shared_state.is_symbol_blocked(sym, action):
-                            self.logger.info("[Meta:Block] Skipping %s %s: blocked by rejection threshold", sym, action)
+                            self.logger.info("[WHY_NO_TRADE] symbol=%s reason=REJECTION_THRESHOLD_BLOCKED details=action=%s", sym, action)
                             continue
                     except Exception:
                         pass
