@@ -44,7 +44,8 @@ def load_config() -> Config:
     # .env اختياري
     try:
         from dotenv import load_dotenv
-        load_dotenv()
+        import os
+        load_dotenv(os.path.abspath(os.path.join(os.getcwd(), '.env')), override=True)
     except Exception as e:
         logger = logging.getLogger("Main")
         logger.warning("dotenv load failed: %s (Tip: pip install python-dotenv and ensure .env exists)", e)
