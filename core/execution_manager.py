@@ -897,30 +897,30 @@
                     except Exception:
                         pass
                     return {
-                        "ok": False,
-                        "status": "blocked",
-                        "reason": "portfolio_pnl_improvement",
-                        "error_code": "PORTFOLIO_PNL_IMPROVEMENT",
-                        "projected_realized_pnl": projected,
-                        "realized_pnl": realized,
-                        "min_required": min_required,
-                    }
-            except Exception:
-                pass
-
-            return None
-
-        async def _check_dust_retirement_before_rejection(self, symbol: str, side: str) -> bool:
-            """
-            🔒 DUST RETIREMENT RULE: Check if position should be retired to PERMANENT_DUST.
-            
-            Returns True if position was retired (rejection should be skipped).
-            Returns False if safe to record rejection.
-            
-            Prevents dust positions from entering infinite rejection loops.
-            """
-            sym = symbol.upper()
-            side_upper = side.upper()
+                    if min_net_pct > 0 and net_after_fees_pct < min_net_pct:
+                        self.logger.info(
+                            "[EM:SellNetPctGate] Blocked SELL %s: net_after_fees=%.4f%% < min=%.4f%% (move=%.4f%% fees=%.4f%% slip=%.4f%%)",
+                            sym,
+                            net_after_fees_pct * 100.0,
+                            min_net_pct * 100.0,
+                            expected_move_pct * 100.0,
+                            fee_pct_total * 100.0,
+                            slippage_pct * 100.0,
+                        )
+                        try:
+                            await self.shared_state.record_rejection(sym, "SELL", "SELL_NET_PCT_MIN", source="ExecutionManager")
+                        except Exception:
+                            pass
+                        return {
+                            "ok": False,
+                            "status": "blocked",
+                            "reason": "sell_net_pct_below_min",
+                            "error_code": "SELL_NET_PCT_MIN",
+                            "net_after_fees_pct": net_after_fees_pct,
+                            "min_net_profit_pct": min_net_pct,
+                            "fee_bps": fee_bps,
+                            "slippage_bps": slippage_bps,
+                        }
             
             # If already permanent dust, skip rejection recording entirely
             if self.shared_state and hasattr(self.shared_state, "is_permanent_dust"):
