@@ -11,7 +11,7 @@ This file currently contains multiple subsystems:
 - Capital safety
 
 It is intentionally monolithic during stabilization.
-Sections are annotated for future extraction once behavior is stable.
+Sections arex annotated for future extraction once behavior is stable.
 """
 
 ############################################################
