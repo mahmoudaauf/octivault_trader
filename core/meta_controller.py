@@ -310,14 +310,14 @@ class MetaController:
         Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
         """
         from math import ceil
-            if price <= 0 or min_notional <= 0 or step_size <= 0:
-                return 0.0
-            # Apply fee and slippage buffer
-            min_quote = min_notional * fee_buffer * slippage_buffer
-            qty = min_quote / price
-            # Enforce min_qty and step_size
-            qty = max(qty, min_qty)
-            # Round down to step_size
+        if price <= 0 or min_notional <= 0 or step_size <= 0:
+            return 0.0
+        # Apply fee and slippage buffer
+        min_quote = min_notional * fee_buffer * slippage_buffer
+        qty = min_quote / price
+        # Enforce min_qty and step_size
+        qty = max(qty, min_qty)
+        # Round down to step_size
             from decimal import Decimal, ROUND_DOWN
             qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
             return qty
