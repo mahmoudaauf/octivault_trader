@@ -1,23 +1,24 @@
-    # =============================
-    # 1. Exchange Error Shims
-    # Handles import of exchange-related exception classes. If unavailable, provides local fallback definitions for:
-    # - BinanceAPIException
-    # - ExecutionError
-    # - ExecutionBlocked
-    # =============================
+
+# =============================
+# 1. Exchange Error Shims
+# Handles import of exchange-related exception classes. If unavailable, provides local fallback definitions for:
+# - BinanceAPIException
+# - ExecutionError
+# - ExecutionBlocked
+# =============================
 
 """
 Octivault Trader — P9 Canonical ExecutionManager (native to your SharedState & ExchangeClient)
 """
     
-    from __future__ import annotations
+from __future__ import annotations
 
-    __all__ = ["ExecutionManager"]
+__all__ = ["ExecutionManager"]
 
-    import asyncio
-    import contextlib
-    from contextlib import asynccontextmanager
-    from collections import deque
+import asyncio
+import contextlib
+from contextlib import asynccontextmanager
+from collections import deque
     import logging
 
     class BinanceAPIException(Exception):
