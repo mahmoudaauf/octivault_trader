@@ -876,48 +876,30 @@ class ExecutionManager:
         except Exception:
             price = 0.0
                 qty = float(quantity or 0.0)
-                if qty <= 0:
-                    qty = await self._get_sellable_qty(sym)
-                    if qty <= 0:
-                        return None
-                get_px = getattr(self.exchange_client, "get_current_price", None) or getattr(self.exchange_client, "get_price")
-                price = 0.0
-                try:
-                    price = float(await get_px(sym)) if get_px else 0.0
-                except Exception:
-                    price = 0.0
-                if price <= 0:
-                    price = float(getattr(self.shared_state, "latest_prices", {}).get(sym, 0.0) or 0.0)
-                entry = self._get_entry_price_for_sell(sym)
-                if price <= 0 or entry <= 0:
-                    return None
-                proceeds = qty * price
-                fee_est = proceeds * float(self.trade_fee_pct or 0.0) * 2.0
-                entry_cost = qty * entry
-                net_pnl = proceeds - fee_est - entry_cost
-                min_net = float(self.sell_min_net_pnl_usdt or 0.0)
-                if bootstrap_override:
-                    min_net = bootstrap_min_net
-    except Exception:
-        price = 0.0
-    if price <= 0:
-        price = float(getattr(self.shared_state,
-                            "latest_prices", {}).get(sym, 0.0) or 0.0)
 
+        qty = float(quantity or 0.0)
+        if qty <= 0:
+            qty = await self._get_sellable_qty(sym)
+            if qty <= 0:
+                return None
+        get_px = getattr(self.exchange_client, "get_current_price", None) or getattr(self.exchange_client, "get_price")
+        price = 0.0
+        try:
+            price = float(await get_px(sym)) if get_px else 0.0
+        except Exception:
+            price = 0.0
+        if price <= 0:
+            price = float(getattr(self.shared_state, "latest_prices", {}).get(sym, 0.0) or 0.0)
         entry = self._get_entry_price_for_sell(sym)
         if price <= 0 or entry <= 0:
             return None
-    entry = self._get_entry_price_for_sell(sym)
-    if price <= 0 or entry <= 0:
-        return None
-
-    proceeds = qty * price
-    fee_est = proceeds * float(self.trade_fee_pct or 0.0) * 2.0
-    entry_cost = qty * entry
-    net_pnl = proceeds - fee_est - entry_cost
-    min_net = float(self.sell_min_net_pnl_usdt or 0.0)
-    if bootstrap_override:
-        min_net = bootstrap_min_net
+        proceeds = qty * price
+        fee_est = proceeds * float(self.trade_fee_pct or 0.0) * 2.0
+        entry_cost = qty * entry
+        net_pnl = proceeds - fee_est - entry_cost
+        min_net = float(self.sell_min_net_pnl_usdt or 0.0)
+        if bootstrap_override:
+            min_net = bootstrap_min_net
 
     expected_move_pct = (price - entry) / max(entry, 1e-9)
     fee_bps = float(self._exit_fee_bps() or 0.0)
