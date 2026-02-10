@@ -5889,6 +5889,20 @@ class MetaController:
         
         # AUTHORITATIVE FLAT CHECK: bootstrap-aware (dust-only portfolios treated as flat in BOOTSTRAP)
         is_flat = await self._check_portfolio_flat()
+        # --- FIX #2: Override flatness if any real trades or TPSL monitoring exist ---
+        try:
+            open_positions = self.shared_state.get_open_positions()
+            open_trades = getattr(self.execution_manager, 'open_trades', {})
+            tpsl_active = False
+            if hasattr(self.tp_sl_engine, 'has_active_trades'):
+                tpsl_active = self.tp_sl_engine.has_active_trades()
+            if (open_positions and len(open_positions) > 0) or (open_trades and len(open_trades) > 0) or tpsl_active:
+                self.logger.info("[Meta:FIX#2] Overriding FLAT_PORTFOLIO: open positions/trades detected.")
+                is_flat = False
+                # --- FIX #3: Auto-exit bootstrap if real trades or TPSL monitoring ---
+                await self._disable_bootstrap_if_positions()
+        except Exception as e:
+            self.logger.warning(f"[Meta:FIX#2/3] Flat override check failed: {e}")
         
         # ═══════════════════════════════════════════════════════════════════════════════
         # BOOTSTRAP FIRST TRADE POLICY (Critical Fix for Clean Wallet Deadlock)
