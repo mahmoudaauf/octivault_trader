@@ -1523,10 +1523,16 @@ class ExecutionManager:
         intent_override: Optional[PendingPositionIntent] = None,
         policy_context: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Decimal, str]:
+
         try:
             if qa is None or float(qa) <= 0:
                 # Zero-sized trades MUST be treated as failure (Behavior Change 1.1)
                 return (False, Decimal("0"), "ZERO_SIZE_TRADE")
+
+            # --- BOOTSTRAP BYPASS: If bootstrap_bypass is True, skip MICRO_TRADE_KILL_SWITCH logic entirely ---
+            bootstrap_bypass = False
+            if policy_context and bool(policy_context.get("bootstrap_bypass", False)):
+                bootstrap_bypass = True
 
             min_econ_trade_cfg = Decimal(str(self._cfg("MIN_ECONOMIC_TRADE_USDT", 0.0) or 0.0))
             dynamic_min_econ = Decimal("0")
@@ -1566,6 +1572,54 @@ class ExecutionManager:
                  # Fallback logic or hard fail? Let's assume 1.0 but log warning, or fail.
                  # Failing is safer for affordability checks.
                  return (False, Decimal("0"), "PRICE_UNAVAILABLE")
+
+            # --- SKIP MICRO_TRADE_KILL_SWITCH if bootstrap_bypass is True ---
+            if not bootstrap_bypass:
+                atr_pct = 0.0
+                try:
+                    if hasattr(self.shared_state, "calc_atr"):
+                        atr = float(await self.shared_state.calc_atr(sym, "5m", 14) or 0.0)
+                        if atr <= 0:
+                            atr = float(await self.shared_state.calc_atr(sym, "1m", 14) or 0.0)
+                        if atr and price > 0:
+                            atr_pct = float(atr) / float(price)
+                except Exception:
+                    atr_pct = 0.0
+
+                feasible, feas_detail = self._entry_profitability_feasible(sym, price=price, atr_pct=atr_pct)
+                if not feasible:
+                    payload = {
+                        "reason": "INFEASIBLE_PROFITABILITY",
+                        "symbol": sym,
+                        **feas_detail,
+                    }
+                    self.logger.warning("[EM:ProfitFeasibility] Block BUY: %s", payload)
+                    with contextlib.suppress(Exception):
+                        await maybe_call(self.shared_state, "emit_event", "EntryProfitabilityBlocked", payload)
+                    return (False, Decimal("0"), "INFEASIBLE_PROFITABILITY")
+
+                # Micro-trade kill switch: low equity + low volatility
+                if self._cfg("MICRO_TRADE_KILL_SWITCH_ENABLED", False):
+                    nav = await self.shared_state.get_nav()
+                    nav_max = float(self._cfg("MICRO_TRADE_KILL_EQUITY_MAX", 0.0) or 0.0)
+                    if nav_max > 0 and nav > 0 and nav < nav_max:
+                        atr_pct = 0.0
+                        try:
+                            if hasattr(self.shared_state, "calc_atr"):
+                                atr = float(await self.shared_state.calc_atr(sym, "5m", 14) or 0.0)
+                                if atr <= 0:
+                                    atr = float(await self.shared_state.calc_atr(sym, "1m", 14) or 0.0)
+                                if atr and price > 0:
+                                    atr_pct = float(atr) / float(price)
+                        except Exception:
+                            atr_pct = 0.0
+                        if atr_pct <= 0:
+                            atr_pct = float(self._cfg("MICRO_TRADE_KILL_FALLBACK_ATR_PCT", 0.0) or 0.0)
+                        round_trip_fee_rate = float(self.trade_fee_pct) * 2.0
+                        fee_mult = float(self._cfg("MICRO_TRADE_KILL_ATR_FEE_MULT", 1.0) or 1.0)
+                        fee_threshold = round_trip_fee_rate * fee_mult
+                        if fee_threshold > 0 and atr_pct < fee_threshold:
+                            return (False, Decimal("0"), "MICRO_TRADE_KILL_SWITCH")
 
             atr_pct = 0.0
             try:
