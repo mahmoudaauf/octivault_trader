@@ -858,7 +858,6 @@ class ExecutionManager:
         if self.allow_sell_below_fee and float(self.sell_min_net_pnl_usdt or 0.0) <= 0.0:
             return None
 
-        qty = float(quantity or 0.0)
         if qty <= 0:
             qty = await self._get_sellable_qty(sym)
         if qty <= 0:
