@@ -117,12 +117,6 @@ async def validate_order_request(*, side: str, qty: float, price: float,
             return False, 0.0, 0.0, "QTY_LT_MIN"
             
         return True, float(qty), spend, "OK"
-    else:
-        from decimal import Decimal, ROUND_DOWN
-        step = float(filters.step_size or 0.0)
-        if step > 0:
-            q = (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
-            qty = float(q * Decimal(str(step)))
         
         if qty <= 0:
              return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
@@ -853,27 +847,6 @@ class ExecutionManager:
         if not bootstrap_override:
             if self.allow_sell_below_fee and float(self.sell_min_net_pnl_usdt or 0.0) <= 0.0:
                 return None
-    if not bootstrap_override:
-        if self.allow_sell_below_fee and float(self.sell_min_net_pnl_usdt or 0.0) <= 0.0:
-            return None
-
-        if qty <= 0:
-            qty = await self._get_sellable_qty(sym)
-        if qty <= 0:
-            return None
-    qty = float(quantity or 0.0)
-    if qty <= 0:
-        qty = await self._get_sellable_qty(sym)
-        if qty <= 0:
-            return None
-
-        get_px = getattr(self.exchange_client, "get_current_price", None) or getattr(self.exchange_client, "get_price")
-        price = 0.0
-        try:
-            price = float(await get_px(sym)) if get_px else 0.0
-        except Exception:
-            price = 0.0
-
         qty = float(quantity or 0.0)
         if qty <= 0:
             qty = await self._get_sellable_qty(sym)
@@ -898,12 +871,12 @@ class ExecutionManager:
         if bootstrap_override:
             min_net = bootstrap_min_net
 
-    expected_move_pct = (price - entry) / max(entry, 1e-9)
-    fee_bps = float(self._exit_fee_bps() or 0.0)
-    slippage_bps = float(self._exit_slippage_bps() or 0.0)
-    fee_pct_total = (fee_bps / 10000.0) * 2.0
-    slippage_pct = slippage_bps / 10000.0
-    buffer_pct = float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
+        expected_move_pct = (price - entry) / max(entry, 1e-9)
+        fee_bps = float(self._exit_fee_bps() or 0.0)
+        slippage_bps = float(self._exit_slippage_bps() or 0.0)
+        fee_pct_total = (fee_bps / 10000.0) * 2.0
+        slippage_pct = slippage_bps / 10000.0
+        buffer_pct = float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
     entry_fee_mult = float(self._cfg("MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
     exit_fee_mult = float(self._cfg("MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
     exit_fee_mult = max(exit_fee_mult, entry_fee_mult)
