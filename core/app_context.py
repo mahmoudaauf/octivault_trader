@@ -1219,7 +1219,7 @@ class AppContext:
         try:
             line = {"component": "AppContext", "event": event, **kvs}
             self.logger.info("SUMMARY %s", line)
-            if hasattr(self.shared_state, "emit_event"):
+            if hasattr(self.shared_state, "emit
                 v = self.shared_state.emit_event("events.summary", line)
                 if asyncio.iscoroutine(v):
                     await v
