@@ -463,8 +463,6 @@ class MetaController:
         """Delegated daily throughput tracking."""
         return self.execution_logic._trade_timestamps_day
 
-
-
     # Belongs to: MetaController Lifecycle & Entry Points
     # Extraction Candidate: Yes
     # Depends on: State & Internal Counters, Mode Management
