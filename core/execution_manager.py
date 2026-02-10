@@ -407,11 +407,13 @@ class ExecutionManager:
         # Heartbeat task (must be set before any other logic to avoid AttributeError)
         self._heartbeat_task = None
         self._decision_id_seq = 0
-        self.config = config
-        self.shared_state = shared_state
-        self.exchange_client = exchange_client
-        self.alert_callback = alert_callback
-        self.logger = logging.getLogger(self.__class__.__name__)
+    self.config = config
+    self.shared_state = shared_state
+    self.exchange_client = exchange_client
+    self.alert_callback = alert_callback
+    self.logger = logging.getLogger(self.__class__.__name__)
+    # Add min_free_reserve_usdt attribute
+    self.min_free_reserve_usdt = float(getattr(config, 'EXECUTION_MIN_FREE_RESERVE_USDT', 0.50))
 
         # Execution-block cooldowns (finite no-trade states)
         self._buy_block_state: Dict[str, Dict[str, float]] = {}
