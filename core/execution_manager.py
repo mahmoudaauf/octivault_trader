@@ -18,17 +18,6 @@ import contextlib
 from contextlib import asynccontextmanager
 from collections import deque
 import logging
-        if expected_move_pct < required_move_pct:
-            self.logger.info(
-                "[EM:SellNetPctGate] Blocked SELL %s: move=%.4f%% < required=%.4f%% (fee_mult=%.2f fees=%.4f%% slip=%.4f%% buffer=%.4f%%)",
-                sym,
-                expected_move_pct * 100.0,
-                required_move_pct * 100.0,
-                exit_fee_mult,
-                fee_pct_total * 100.0,
-                slippage_pct * 100.0,
-                buffer_pct * 100.0,
-            )
         def __init__(self, code: int | None = None, message: str = ""):
             self.code = code
             super().__init__(message or f"BinanceAPIException({code})")
