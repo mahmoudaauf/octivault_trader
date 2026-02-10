@@ -404,6 +404,8 @@ class ExecutionManager:
         return s[:-4], s[-4:]
 
     def __init__(self, config: Any, shared_state: Any, exchange_client: Any, alert_callback=None):
+        # Heartbeat task (must be set before any other logic to avoid AttributeError)
+        self._heartbeat_task = None
         self.config = config
         self.shared_state = shared_state
         self.exchange_client = exchange_client
