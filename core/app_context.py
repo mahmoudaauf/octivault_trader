@@ -649,6 +649,8 @@ class AppContext:
 
     # === SECTION: Constructor & Initialization ===
     def __init__(
+        # Safety fix: ensure no_remainder_below_quote is always initialized
+        self.no_remainder_below_quote = 0.0
         self,
         config: Any,  # Config instance or dict-like
         logger: Optional[logging.Logger] = None,
