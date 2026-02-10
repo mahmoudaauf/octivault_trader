@@ -3484,4 +3484,4 @@ class ExecutionManager:
             await self._emit_status("Initialized", "start() no-op warmup complete")
             self.logger.info("ExecutionManager.start: symbol filters warmed (if supported)")
         except Exception:
-            self.logger.debug("ExecutionManager.start warmup failed (non-fatal)", exc_info=True) 
+            self.logger.debug("ExecutionManager.start warmup failed (non-fatal)", exc_info=True) //
