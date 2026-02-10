@@ -1407,6 +1407,11 @@ class ExecutionManager:
         intent_override: Optional[PendingPositionIntent] = None,
         policy_context: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Decimal, str]:
+        # --- BOOTSTRAP OVERRIDE ---
+        skip_micro_trade_kill_switch = False
+        policy_ctx = policy_context or {}
+        if policy_ctx.get("bootstrap_bypass", False):
+            skip_micro_trade_kill_switch = True
         try:
             if qa is None or float(qa) <= 0:
                 # Zero-sized trades MUST be treated as failure (Behavior Change 1.1)
@@ -1475,27 +1480,28 @@ class ExecutionManager:
                 return (False, Decimal("0"), "INFEASIBLE_PROFITABILITY")
 
             # Micro-trade kill switch: low equity + low volatility
-            if self._cfg("MICRO_TRADE_KILL_SWITCH_ENABLED", False):
-                nav = await self.shared_state.get_nav()
-                nav_max = float(self._cfg("MICRO_TRADE_KILL_EQUITY_MAX", 0.0) or 0.0)
-                if nav_max > 0 and nav > 0 and nav < nav_max:
-                    atr_pct = 0.0
-                    try:
-                        if hasattr(self.shared_state, "calc_atr"):
-                            atr = float(await self.shared_state.calc_atr(sym, "5m", 14) or 0.0)
-                            if atr <= 0:
-                                atr = float(await self.shared_state.calc_atr(sym, "1m", 14) or 0.0)
-                            if atr and price > 0:
-                                atr_pct = float(atr) / float(price)
-                    except Exception:
+            if not skip_micro_trade_kill_switch:
+                if self._cfg("MICRO_TRADE_KILL_SWITCH_ENABLED", False):
+                    nav = await self.shared_state.get_nav()
+                    nav_max = float(self._cfg("MICRO_TRADE_KILL_EQUITY_MAX", 0.0) or 0.0)
+                    if nav_max > 0 and nav > 0 and nav < nav_max:
                         atr_pct = 0.0
-                    if atr_pct <= 0:
-                        atr_pct = float(self._cfg("MICRO_TRADE_KILL_FALLBACK_ATR_PCT", 0.0) or 0.0)
-                    round_trip_fee_rate = float(self.trade_fee_pct) * 2.0
-                    fee_mult = float(self._cfg("MICRO_TRADE_KILL_ATR_FEE_MULT", 1.0) or 1.0)
-                    fee_threshold = round_trip_fee_rate * fee_mult
-                    if fee_threshold > 0 and atr_pct < fee_threshold:
-                        return (False, Decimal("0"), "MICRO_TRADE_KILL_SWITCH")
+                        try:
+                            if hasattr(self.shared_state, "calc_atr"):
+                                atr = float(await self.shared_state.calc_atr(sym, "5m", 14) or 0.0)
+                                if atr <= 0:
+                                    atr = float(await self.shared_state.calc_atr(sym, "1m", 14) or 0.0)
+                                if atr and price > 0:
+                                    atr_pct = float(atr) / float(price)
+                        except Exception:
+                            atr_pct = 0.0
+                        if atr_pct <= 0:
+                            atr_pct = float(self._cfg("MICRO_TRADE_KILL_FALLBACK_ATR_PCT", 0.0) or 0.0)
+                        round_trip_fee_rate = float(self.trade_fee_pct) * 2.0
+                        fee_mult = float(self._cfg("MICRO_TRADE_KILL_ATR_FEE_MULT", 1.0) or 1.0)
+                        fee_threshold = round_trip_fee_rate * fee_mult
+                        if fee_threshold > 0 and atr_pct < fee_threshold:
+                            return (False, Decimal("0"), "MICRO_TRADE_KILL_SWITCH")
 
             # --- P9 Phase 4: Accumulation Synergy ---
             # 1. Fetch existing intent to check for frozen constraints (Point 2)
