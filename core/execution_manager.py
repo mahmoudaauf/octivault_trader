@@ -1413,6 +1413,10 @@ class ExecutionManager:
         # --- BOOTSTRAP OVERRIDE ---
         skip_micro_trade_kill_switch = False
         policy_ctx = policy_context or {}
+        # --- EXPLICIT BOOTSTRAP ESCAPE HATCH ---
+        if policy_ctx.get("is_flat", False) and policy_ctx.get("bootstrap_mode", False):
+            # Allow exactly one BUY regardless of economic/micro trade guards
+            return (True, qa, "BOOTSTRAP_ESCAPE_HATCH")
         if policy_ctx.get("bootstrap_bypass", False):
             skip_micro_trade_kill_switch = True
         try:
