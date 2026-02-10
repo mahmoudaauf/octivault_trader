@@ -287,12 +287,14 @@ class MetaController:
             # Final check: ensure qty * price >= min_notional
             if qty * price < min_notional:
                 qty = ((ceil((min_notional / price) / step_size)) * step_size)
-            return qty
-    # Symbol lifecycle states
-    LIFECYCLE_DUST_HEALING = "DUST_HEALING"
-    LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
-    LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
-    LIFECYCLE_LIQUIDATION = "LIQUIDATION"
+
+                return qty
+
+            # Symbol lifecycle states
+            LIFECYCLE_DUST_HEALING = "DUST_HEALING"
+            LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
+            LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
+            LIFECYCLE_LIQUIDATION = "LIQUIDATION"
 
     def _init_symbol_lifecycle(self):
         # Call this in __init__
