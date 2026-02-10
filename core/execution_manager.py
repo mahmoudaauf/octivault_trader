@@ -981,20 +981,6 @@ class ExecutionManager:
                 "min_net_pnl": min_net,
                 "fee_estimate": fee_est,
             }
-        except Exception:
-            pass
-        return {
-            "ok": False,
-            "status": "blocked",
-            "reason": "sell_below_fees",
-            "error_code": "SELL_BELOW_FEES",
-            "expected_move_pct": expected_move_pct,
-            "required_move_pct": required_move_pct,
-            "fee_mult": exit_fee_mult,
-            "fee_bps": fee_bps,
-            "slippage_bps": slippage_bps,
-            "buffer_bps": float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0),
-        }
     if min_net_pct > 0 and net_after_fees_pct < min_net_pct:
         self.logger.info(
             "[EM:SellNetPctGate] Blocked SELL %s: net_after_fees=%.4f%% < min=%.4f%% (move=%.4f%% fees=%.4f%% slip=%.4f%%)",
