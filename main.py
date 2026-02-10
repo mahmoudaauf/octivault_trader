@@ -123,7 +123,16 @@ class AppContext:
         self.notification_manager = NoOpNotificationManager()
         alert_callback = self.notification_manager.send_alert
 
-        self.exchange_client = ExchangeClient(config=self.config, shared_state=self.shared_state)
+        # Load API keys from environment
+        BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
+        BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET')
+
+        self.exchange_client = ExchangeClient(
+            config=self.config,
+            shared_state=self.shared_state,
+            api_key=BINANCE_API_KEY,
+            api_secret=BINANCE_API_SECRET
+        )
         await self.exchange_client.start()
         self.shared_state.exchange_client = self.exchange_client
         
