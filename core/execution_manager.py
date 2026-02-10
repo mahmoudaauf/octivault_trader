@@ -413,6 +413,9 @@ class ExecutionManager:
         self.alert_callback = alert_callback
         self.logger = logging.getLogger(self.__class__.__name__)
 
+        # Execution-block cooldowns (finite no-trade states)
+        self._buy_block_state: Dict[str, Dict[str, float]] = {}
+
         # Contract check: must expose place_market_order()
         if not hasattr(self.exchange_client, "place_market_order") or not callable(getattr(self.exchange_client, "place_market_order", None)):
             raise RuntimeError("ExchangeClient must expose place_market_order() for canonical path")
@@ -464,7 +467,6 @@ class ExecutionManager:
         # Execution-block cooldowns (finite no-trade states)
         self.exec_block_max_retries = int(getattr(config, "EXEC_BLOCK_MAX_RETRIES", 3))
         self.exec_block_cooldown_sec = int(getattr(config, "EXEC_BLOCK_COOLDOWN_SEC", 600))
-        self._buy_block_state: Dict[str, Dict[str, float]] = {}
 
         # Concurrency (defer semaphore creation to first use, need running loop)
         self._concurrent_orders_sem = None
