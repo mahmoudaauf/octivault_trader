@@ -610,146 +610,146 @@ from core.meta_utils import (
         # ...existing code...
 
         async def _has_open_position(self, sym: str) -> tuple:
-        """
-        Check if a symbol has an open position (including dust logic).
-        Returns (has_open: bool, qty: float)
-        """
-        try:
-            pos_map = getattr(self.shared_state, "positions", {}) or {}
-            open_statuses = {"OPEN", "PARTIALLY_FILLED"}
-            is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
-            dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
-            if isinstance(pos_map, dict) and sym in pos_map:
-                pos = pos_map.get(sym) or {}
-                qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
-                status = str(pos.get("status") or "").upper()
-                if qty > 0 or status in open_statuses:
-                    if is_bootstrap and 0 < qty < dust_qty:
-                        return False, 0.0
-                    return True, max(qty, 0.0)
-        except Exception:
-            pass
-
-        try:
-            open_trades = getattr(self.shared_state, "open_trades", {}) or {}
-            is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
-            dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
-            if isinstance(open_trades, dict) and sym in open_trades:
-                tr = open_trades.get(sym) or {}
-                qty = float(tr.get("quantity") or tr.get("qty") or 0.0)
-                if qty > 0:
-                    if is_bootstrap and 0 < qty < dust_qty:
-                        return False, 0.0
-                    return True, max(qty, 0.0)
-        except Exception:
-            pass
-
-        try:
-            fn = getattr(self.shared_state, "get_position_qty", None) or getattr(self.shared_state, "get_position_quantity", None)
-            if callable(fn):
-                qty = float(await _safe_await(fn(sym)) or 0.0)
+            """
+            Check if a symbol has an open position (including dust logic).
+            Returns (has_open: bool, qty: float)
+            """
+            try:
+                pos_map = getattr(self.shared_state, "positions", {}) or {}
+                open_statuses = {"OPEN", "PARTIALLY_FILLED"}
                 is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
                 dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
-                if qty > 0:
-                    if is_bootstrap and 0 < qty < dust_qty:
-                        return False, 0.0
-                    return True, qty
-        except Exception:
-            pass
+                if isinstance(pos_map, dict) and sym in pos_map:
+                    pos = pos_map.get(sym) or {}
+                    qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
+                    status = str(pos.get("status") or "").upper()
+                    if qty > 0 or status in open_statuses:
+                        if is_bootstrap and 0 < qty < dust_qty:
+                            return False, 0.0
+                        return True, max(qty, 0.0)
+            except Exception:
+                pass
 
-        return False, 0.0
+            try:
+                open_trades = getattr(self.shared_state, "open_trades", {}) or {}
+                is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
+                dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
+                if isinstance(open_trades, dict) and sym in open_trades:
+                    tr = open_trades.get(sym) or {}
+                    qty = float(tr.get("quantity") or tr.get("qty") or 0.0)
+                    if qty > 0:
+                        if is_bootstrap and 0 < qty < dust_qty:
+                            return False, 0.0
+                        return True, max(qty, 0.0)
+            except Exception:
+                pass
 
-    @property
-    def FOCUS_SYMBOLS(self):
-        """Delegate to FocusModeManager."""
-        return self.focus_mode_manager.FOCUS_SYMBOLS
+            try:
+                fn = getattr(self.shared_state, "get_position_qty", None) or getattr(self.shared_state, "get_position_quantity", None)
+                if callable(fn):
+                    qty = float(await _safe_await(fn(sym)) or 0.0)
+                    is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
+                    dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
+                    if qty > 0:
+                        if is_bootstrap and 0 < qty < dust_qty:
+                            return False, 0.0
+                        return True, qty
+            except Exception:
+                pass
 
-    @FOCUS_SYMBOLS.setter
-    def FOCUS_SYMBOLS(self, value):
-        """Delegate to FocusModeManager."""
-        self.focus_mode_manager.FOCUS_SYMBOLS = value
+            return False, 0.0
 
-    @property
-    def FOCUS_SYMBOLS_PINNED(self):
-        """Delegate to FocusModeManager."""
-        return self.focus_mode_manager.FOCUS_SYMBOLS_PINNED
+        @property
+        def FOCUS_SYMBOLS(self):
+            """Delegate to FocusModeManager."""
+            return self.focus_mode_manager.FOCUS_SYMBOLS
 
-    @FOCUS_SYMBOLS_PINNED.setter
-    def FOCUS_SYMBOLS_PINNED(self, value):
-        """Delegate to FocusModeManager."""
-        self.focus_mode_manager.FOCUS_SYMBOLS_PINNED = value
+        @FOCUS_SYMBOLS.setter
+        def FOCUS_SYMBOLS(self, value):
+            """Delegate to FocusModeManager."""
+            self.focus_mode_manager.FOCUS_SYMBOLS = value
 
-    @property
-    def FOCUS_SYMBOLS_LAST_UPDATE(self):
-        """Delegate to FocusModeManager."""
-        return self.focus_mode_manager.FOCUS_SYMBOLS_LAST_UPDATE
+        @property
+        def FOCUS_SYMBOLS_PINNED(self):
+            """Delegate to FocusModeManager."""
+            return self.focus_mode_manager.FOCUS_SYMBOLS_PINNED
 
-    @FOCUS_SYMBOLS_LAST_UPDATE.setter
-    def FOCUS_SYMBOLS_LAST_UPDATE(self, value):
-        """Delegate to FocusModeManager."""
-        self.focus_mode_manager.FOCUS_SYMBOLS_LAST_UPDATE = value
+        @FOCUS_SYMBOLS_PINNED.setter
+        def FOCUS_SYMBOLS_PINNED(self, value):
+            """Delegate to FocusModeManager."""
+            self.focus_mode_manager.FOCUS_SYMBOLS_PINNED = value
 
-    @property
-    def _bootstrap_focus_symbols_pending(self):
-        """Delegate to FocusModeManager."""
-        return self.focus_mode_manager._bootstrap_focus_symbols_pending
+        @property
+        def FOCUS_SYMBOLS_LAST_UPDATE(self):
+            """Delegate to FocusModeManager."""
+            return self.focus_mode_manager.FOCUS_SYMBOLS_LAST_UPDATE
 
-    @_bootstrap_focus_symbols_pending.setter
-    def _bootstrap_focus_symbols_pending(self, value):
-        """Delegate to FocusModeManager."""
-        self.focus_mode_manager._bootstrap_focus_symbols_pending = value
+        @FOCUS_SYMBOLS_LAST_UPDATE.setter
+        def FOCUS_SYMBOLS_LAST_UPDATE(self, value):
+            """Delegate to FocusModeManager."""
+            self.focus_mode_manager.FOCUS_SYMBOLS_LAST_UPDATE = value
 
-    @property
-    def _focus_mode_active(self):
-        """Delegate to FocusModeManager."""
-        return self.focus_mode_manager._focus_mode_active
+        @property
+        def _bootstrap_focus_symbols_pending(self):
+            """Delegate to FocusModeManager."""
+            return self.focus_mode_manager._bootstrap_focus_symbols_pending
 
-    @_focus_mode_active.setter
-    def _focus_mode_active(self, value):
-        """Delegate to FocusModeManager."""
-        self.focus_mode_manager._focus_mode_active = value
+        @_bootstrap_focus_symbols_pending.setter
+        def _bootstrap_focus_symbols_pending(self, value):
+            """Delegate to FocusModeManager."""
+            self.focus_mode_manager._bootstrap_focus_symbols_pending = value
 
-    @property
-    def _focus_mode_trade_executed(self):
-        """Delegate to FocusModeManager."""
-        return self.focus_mode_manager._focus_mode_trade_executed
+        @property
+        def _focus_mode_active(self):
+            """Delegate to FocusModeManager."""
+            return self.focus_mode_manager._focus_mode_active
 
-    @_focus_mode_trade_executed.setter
-    def _focus_mode_trade_executed(self, value):
-        """Delegate to FocusModeManager."""
-        self.focus_mode_manager._focus_mode_trade_executed = value
+        @_focus_mode_active.setter
+        def _focus_mode_active(self, value):
+            """Delegate to FocusModeManager."""
+            self.focus_mode_manager._focus_mode_active = value
 
-    def _activate_focus_mode(self, reason: str):
-        """Delegate focus mode activation to FocusModeManager."""
-        if not self.FOCUS_MODE_ENABLED:
-            self.logger.info("[Meta:FOCUS_MODE] Skipped activation: FOCUS_MODE is disabled by config.")
-            return
-        self.focus_mode_manager.activate_focus_mode(reason)
+        @property
+        def _focus_mode_trade_executed(self):
+            """Delegate to FocusModeManager."""
+            return self.focus_mode_manager._focus_mode_trade_executed
 
-    def _deactivate_focus_mode(self):
-        """Delegate focus mode deactivation to FocusModeManager."""
-        self.focus_mode_manager.deactivate_focus_mode()
-        self._focus_mode_healthy_cycles = 0
+        @_focus_mode_trade_executed.setter
+        def _focus_mode_trade_executed(self, value):
+            """Delegate to FocusModeManager."""
+            self.focus_mode_manager._focus_mode_trade_executed = value
 
-    @property
-    def _mandatory_sell_mode_active(self):
-        """Delegate to ModeManager."""
-        return self.mode_manager.is_mandatory_sell_mode_active()
+        def _activate_focus_mode(self, reason: str):
+            """Delegate focus mode activation to FocusModeManager."""
+            if not self.FOCUS_MODE_ENABLED:
+                self.logger.info("[Meta:FOCUS_MODE] Skipped activation: FOCUS_MODE is disabled by config.")
+                return
+            self.focus_mode_manager.activate_focus_mode(reason)
 
-    @_mandatory_sell_mode_active.setter
-    def _mandatory_sell_mode_active(self, value):
-        """Delegate to ModeManager."""
-        self.mode_manager.set_mandatory_sell_mode(value)
+        def _deactivate_focus_mode(self):
+            """Delegate focus mode deactivation to FocusModeManager."""
+            self.focus_mode_manager.deactivate_focus_mode()
+            self._focus_mode_healthy_cycles = 0
 
-    @property
-    def _kpi_metrics(self):
-        """Delegate to StateManager."""
-        return self.state_manager._kpi_metrics
+        @property
+        def _mandatory_sell_mode_active(self):
+            """Delegate to ModeManager."""
+            return self.mode_manager.is_mandatory_sell_mode_active()
 
-    @_kpi_metrics.setter
-    def _kpi_metrics(self, value):
-        """Delegate to StateManager."""
-        self.state_manager._kpi_metrics = value
+        @_mandatory_sell_mode_active.setter
+        def _mandatory_sell_mode_active(self, value):
+            """Delegate to ModeManager."""
+            self.mode_manager.set_mandatory_sell_mode(value)
+
+        @property
+        def _kpi_metrics(self):
+            """Delegate to StateManager."""
+            return self.state_manager._kpi_metrics
+
+        @_kpi_metrics.setter
+        def _kpi_metrics(self, value):
+            """Delegate to StateManager."""
+            self.state_manager._kpi_metrics = value
 
     async def _count_significant_positions(self) -> Tuple[int, int, int]:
         """
