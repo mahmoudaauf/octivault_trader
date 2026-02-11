@@ -89,6 +89,21 @@ except ImportError:
 
 class MetaController:
 
+    async def _handle_rejection_and_log(self, symbol: str, side: str, signal: dict, reason: str, reason_detail: str = "", status: str = "skipped", log_level: str = "INFO", extra: dict = None):
+        """
+        Centralized error handling, logging, and rejection reporting for trade rejections/blocks.
+        """
+        self._log_reason(log_level, symbol, f"{reason}:{reason_detail}" if reason_detail else reason)
+        if hasattr(self.shared_state, "record_rejection"):
+            await self.shared_state.record_rejection(symbol, side, reason, source="MetaController")
+        result = {"status": status, "reason": reason}
+        if reason_detail:
+            result["reason_detail"] = reason_detail
+        if extra:
+            result.update(extra)
+        await self._log_execution_result(symbol, side, signal, result)
+        return {"ok": False, "status": status, "reason": reason}
+
     async def _run_risk_precheck(self, symbol: str, side: str, signal: dict) -> dict:
         """
         Centralized risk pre-check for capital floor, risk manager, and exposure/risk limits.
@@ -9024,18 +9039,9 @@ from core.meta_utils import (
                 policy_flags = {"POLICY_SINGLE_AUTHORITY": True}
                 econ_ok, econ_reason, econ_metrics = self._check_economic_profitability(symbol, signal)
                 if not econ_ok:
-                    self._log_reason("INFO", symbol, f"economic_guard:{econ_reason}")
-                    if hasattr(self.shared_state, "record_rejection"):
-                        await self.shared_state.record_rejection(
-                            symbol, "BUY", "ECONOMIC_PROFITABILITY_BLOCK", source="MetaController"
-                        )
-                    await self._log_execution_result(
-                        symbol,
-                        side,
-                        signal,
-                        {"status": "skipped", "reason": "economic_guard", "details": econ_metrics},
+                    return await self._handle_rejection_and_log(
+                        symbol, side, signal, "economic_guard", econ_reason, status="skipped", log_level="INFO", extra={"details": econ_metrics}
                     )
-                    return {"ok": False, "status": "skipped", "reason": "economic_guard"}
                 policy_flags["ECONOMIC_PROFITABILITY_INVARIANT"] = True
                 # Double check affordability for executable qty (Rule 2/5)
                 # BOOTSTRAP FIX: If this signal is marked with _bootstrap flag, pass bootstrap context
