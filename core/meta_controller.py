@@ -9709,10 +9709,11 @@ class MetaController:
                     except Exception:
                         pass
 
-            await self._log_execution_result(symbol, side, signal, result)
-            await self._update_kpi_metrics("execution")
-            return result
-        except Exception as e:
+            try:
+                await self._log_execution_result(symbol, side, signal, result)
+                await self._update_kpi_metrics("execution")
+                return result
+            except Exception as e:
             classified_error = classify_execution_error(e, symbol)
             self.logger.error("Decision execution failed for %s: %s", symbol, classified_error.error_type, exc_info=True)
             # P9 Requirement 3/4: Report Capital Failure for Hysteresis
