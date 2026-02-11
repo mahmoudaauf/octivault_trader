@@ -8718,8 +8718,6 @@ from core.meta_utils import (
                         decisions.append((sym, action, sig))
                     else:
                         self.logger.info("[Meta] Skipping %s - unaffordable (%s); budget returned.", sym, reason)
-                else:
-                    decisions.append((sym, action, sig))
                 except Exception as e:
                     self.logger.debug("Affordability check failed for %s: %s", sym, e)
             else:
