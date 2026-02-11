@@ -9710,6 +9710,7 @@ class MetaController:
                         pass
 
             try:
+                # Main execution logic (move try here)
                 await self._log_execution_result(symbol, side, signal, result)
                 await self._update_kpi_metrics("execution")
                 return result
