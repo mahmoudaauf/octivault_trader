@@ -1,4 +1,70 @@
 
+    async def _check_position_and_dust(self, symbol: str, signal: dict) -> dict:
+        """
+        Centralized check for position lock, dust status, dust healing, and bootstrap/dust bypass.
+        Returns a dict with keys: ok (bool), reason, reason_detail, and may update signal in place.
+        """
+        is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
+        is_bootstrap_override = signal.get("_bootstrap_override", False)
+        is_flat_init = signal.get("_flat_init_buy", False)
+        is_dust_merge = signal.get("_dust_reentry_override", False)
+        focus_active = bool(getattr(self, "_focus_mode_active", False))
+        is_bootstrap_seed = bool(signal.get("_bootstrap_seed") or signal.get("bootstrap_seed") or str(signal.get("reason", "")).upper() == "BOOTSTRAP_SEED")
+        is_dust_healing = signal.get("_dust_healing", False)
+
+        curr_qty = self.shared_state.get_position_qty(symbol) if hasattr(self.shared_state, "get_position_qty") else 0.0
+        pos_data = None
+        if hasattr(self.shared_state, "get_position"):
+            try:
+                pos_data = await _safe_await(self.shared_state.get_position(symbol))
+            except Exception:
+                pos_data = None
+        is_dust_position = False
+        if pos_data and isinstance(pos_data, dict):
+            is_dust_position = pos_data.get("is_dust", False) or pos_data.get("_is_dust", False) or pos_data.get("state", "") == "DUST_LOCKED"
+        is_bootstrap_dust_bypass = False
+
+        # Dust healing trade count check
+        if is_dust_healing:
+            metrics = getattr(self.shared_state, "metrics", {}) or {}
+            trade_count = int(
+                metrics.get("total_trades_executed", 0)
+                or getattr(self.shared_state, "trade_count", 0)
+                or 0
+            )
+            if trade_count < 1:
+                return {"ok": False, "reason": "dust_healing_not_ready", "reason_detail": "no_realized_trades"}
+
+        # Position lock logic
+        if curr_qty > 0 and not is_dust_merge:
+            is_bootstrap_dust_bypass = self._bootstrap_dust_bypass_allowed(
+                symbol,
+                bool(is_bootstrap_override),
+                bool(is_dust_position),
+            )
+            if not (is_bootstrap_seed or is_bootstrap_dust_bypass or (is_dust_healing and (is_dust_position or is_bootstrap or is_bootstrap_override or is_flat_init))):
+                return {"ok": False, "reason": "position_lock", "reason_detail": "position_already_exists"}
+            else:
+                if is_bootstrap_seed:
+                    signal["_bootstrap_seed_bypass"] = True
+                elif is_bootstrap_dust_bypass:
+                    signal["execution_tag"] = "meta/bootstrap_dust"
+                    signal["_bootstrap_dust_bypass"] = True
+                else:
+                    signal["execution_tag"] = "meta/dust_healing"
+
+        # Dust healing overrides
+        if is_dust_healing:
+            pre_value = float(signal.get("pre_value", 0.0))
+            post_value = float(signal.get("post_value", 0.0))
+            signal["tier"] = "DUST_RECOVERY"
+            signal["execution_tag"] = "meta/dust_healing"
+            signal["agent"] = "Meta"
+            return {"ok": True, "reason": "dust_healing", "reason_detail": f"pre_value={pre_value},post_value={post_value}"}
+
+        # If all checks pass
+        return {"ok": True}
+
     def _check_trade_limits(self, symbol: str, agent_name: str, side: str = "BUY") -> dict:
         """
         Centralized trade gating and limit checks for BUY/SELL.
@@ -8875,96 +8941,11 @@ from core.meta_utils import (
             focus_active = bool(getattr(self, "_focus_mode_active", False))
             is_bootstrap_seed = bool(signal.get("_bootstrap_seed") or signal.get("bootstrap_seed") or str(signal.get("reason", "")).upper() == "BOOTSTRAP_SEED")
 
-            # FIX: Position Lock Invariant (User Rule 7)
-            # If position exists, REJECT BUY unless scaling is explicitly planned/allowed.
-            curr_qty = self.shared_state.get_position_qty(symbol) if hasattr(self.shared_state, "get_position_qty") else 0.0
-            is_dust_healing = signal.get("_dust_healing", False)
-            if is_dust_healing:
-                metrics = getattr(self.shared_state, "metrics", {}) or {}
-                trade_count = int(
-                    metrics.get("total_trades_executed", 0)
-                    or getattr(self.shared_state, "trade_count", 0)
-                    or 0
-                )
-                if trade_count < 1:
-                    self.logger.warning(
-                        "[DUST_HEALING] BLOCKED at execution: trade_count=%d < 1 (no realized trades yet)",
-                        trade_count,
-                    )
-                    return {"ok": False, "status": "skipped", "reason": "dust_healing_not_ready"}
-            # Check if position is marked as dust
-            pos_data = None
-            if hasattr(self.shared_state, "get_position"):
-                try:
-                    pos_data = await _safe_await(self.shared_state.get_position(symbol))
-                except Exception:
-                    pos_data = None
-            is_dust_position = False
-            if pos_data and isinstance(pos_data, dict):
-                is_dust_position = pos_data.get("is_dust", False) or pos_data.get("_is_dust", False) or pos_data.get("state", "") == "DUST_LOCKED"
-            is_bootstrap_dust_bypass = False
-            # Diagnostic logging for dust healing execution
-            self.logger.info(
-                "[DIAG:DUST_HEALING] _execute_decision: symbol=%s, curr_qty=%.8f, is_dust_healing=%s, is_dust_position=%s, is_bootstrap=%s, is_bootstrap_override=%s, is_flat_init=%s, focus_active=%s, reason=%s",
-                symbol, curr_qty, is_dust_healing, is_dust_position, is_bootstrap, is_bootstrap_override, is_flat_init, focus_active, str(signal.get("reason", ""))
-            )
-            # SOP-REC-004: Dust Healing Execution Authority
-            if curr_qty > 0 and not is_dust_merge:
-                is_bootstrap_dust_bypass = self._bootstrap_dust_bypass_allowed(
-                    symbol,
-                    bool(is_bootstrap_override),
-                    bool(is_dust_position),
-                )
-                # Allow dust healing scaling if position is marked as dust, regardless of mode
-                if not (is_bootstrap_seed or is_bootstrap_dust_bypass or (is_dust_healing and (is_dust_position or is_bootstrap or is_bootstrap_override or is_flat_init))):
-                    self.logger.warning(
-                        "[Meta:PositionLock] REJECTING BUY %s: Position already exists (%.8f). Scaling not enabled.", 
-                        symbol, curr_qty
-                    )
-                    return {"ok": False, "status": "skipped", "reason": "position_lock", "reason_detail": "position_already_exists"}
-                else:
-                    if is_bootstrap_seed:
-                        self.logger.info(
-                            "[BOOTSTRAP] Seed BUY authorized: bypassing PositionLock once for %s",
-                            symbol,
-                        )
-                    elif is_bootstrap_dust_bypass:
-                        self.logger.info(
-                            "[BOOTSTRAP] Dust scaling authorized: bypassing PositionLock once for %s",
-                            symbol,
-                        )
-                        signal["execution_tag"] = "meta/bootstrap_dust"
-                        signal["_bootstrap_dust_bypass"] = True
-                    else:
-                        # Emit SOP-REC-004 log for dust healing authority
-                        self.logger.info(
-                            "[SOP-REC-004] Dust healing execution authorized | reason=dust_only_portfolio | mode=%s | symbol=%s | quote_amount=%.2f",
-                            "DUST_HEALING" if is_dust_position else ("BOOTSTRAP" if is_bootstrap or is_bootstrap_override or is_flat_init else "RECOVERY"),
-                            symbol,
-                            float(signal.get("quote_amount", 0.0))
-                        )
-                        # Tag execution for dust healing
-                        signal["execution_tag"] = "meta/dust_healing"
-
-            is_dust_healing = signal.get("_dust_healing", False)
-            # SOP-REC-004: Dust healing overrides PositionLock, hourly trade limit, confidence threshold, agent ownership
-            if is_dust_healing:
-                # Log dust recovery event (required by SOP)
-                pre_value = float(signal.get("pre_value", 0.0))
-                post_value = float(signal.get("post_value", 0.0))
-                self.logger.info(
-                    f"[SOP-REC-004] symbol={symbol} action=BUY reason=dust_recovery pre_value=${pre_value:.2f} post_value=${post_value:.2f} mode=NORMAL override=[PositionLock, HourlyLimit]"
-                )
-                # Tag for stats exclusion and authority
-                signal["tier"] = "DUST_RECOVERY"
-                signal["execution_tag"] = "meta/dust_healing"
-                # Override agent ownership
-                signal["agent"] = "Meta"
-                # Bypass PositionLock, hourly trade limit, confidence threshold
-                # (PositionLock and confidence threshold checks must be bypassed elsewhere if present)
-                # Do not count toward hourly trade limit or stats (skip timestamp append below)
-                # Still enforce capital floor, risk hard stops, exchange min/max rules
-                # ...existing code...
+            # Deduplicated position and dust checks
+            pos_result = await self._check_position_and_dust(symbol, signal)
+            if not pos_result["ok"]:
+                self.logger.warning(f"[Meta:PositionCheck] REJECTING BUY {symbol}: {pos_result['reason_detail']}")
+                return {"ok": False, "status": "skipped", "reason": pos_result["reason"], "reason_detail": pos_result.get("reason_detail", "")}
             elif not (is_bootstrap or is_bootstrap_override or is_flat_init or is_dust_merge or focus_active):
                 # Deduplicated trade gating and limit checks
                 limit_result = self._check_trade_limits(symbol, agent_name, side="BUY")
