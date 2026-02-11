@@ -1,33 +1,4 @@
 
-    def _check_trade_limits(self, symbol: str, agent_name: str, side: str = "BUY") -> dict:
-        """
-        Centralized trade gating and limit checks for BUY/SELL.
-        Returns a dict with keys: ok (bool), reason, reason_detail (if blocked), or None if passed.
-        """
-        # Clean up old timestamps
-        now = time.time()
-        for dq in [self._trade_timestamps, self._trade_timestamps_sym[symbol], self._trade_timestamps_agent[agent_name]]:
-            while dq and (now - dq[0] > 3600):
-                dq.popleft()
-        while self._trade_timestamps_day and (now - self._trade_timestamps_day[0] > 86400):
-            self._trade_timestamps_day.popleft()
-
-        # Bootstrap/flat init bypass
-        # (Caller should check for bootstrap/flat_init/dust_merge/focus_active and skip this if needed)
-        max_hourly = int(getattr(self.config, "MAX_TRADES_PER_HOUR", self._max_trades_per_hour) or 0)
-        max_daily = int(getattr(self.config, "MAX_TRADES_PER_DAY", self._max_trades_per_day) or 0)
-        max_sym_hourly = int(getattr(self.config, "MAX_TRADES_PER_SYMBOL_PER_HOUR", 2) or 0)
-        agent_limit = max(1, int(max_hourly * 0.75))
-
-        if max_daily > 0 and len(self._trade_timestamps_day) >= max_daily:
-            return {"ok": False, "reason": "global_daily_limit", "reason_detail": "global_daily_limit_reached"}
-        if max_hourly > 0 and len(self._trade_timestamps) >= max_hourly:
-            return {"ok": False, "reason": "global_limit", "reason_detail": "global_hourly_limit_reached"}
-        if max_sym_hourly > 0 and len(self._trade_timestamps_sym[symbol]) >= max_sym_hourly:
-            return {"ok": False, "reason": "symbol_limit", "reason_detail": "symbol_hourly_limit_reached"}
-        if len(self._trade_timestamps_agent[agent_name]) >= agent_limit:
-            return {"ok": False, "reason": "agent_limit", "reason_detail": f"agent_limit_{agent_name}_reached"}
-        return {"ok": True}
 
 # -*- coding: utf-8 -*-
 from typing import Any, Optional, List, Dict, Set, Tuple, TYPE_CHECKING
