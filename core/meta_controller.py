@@ -89,6 +89,56 @@ except ImportError:
 
 class MetaController:
 
+    async def _has_open_position(self, sym: str) -> tuple:
+        """
+        Check if a symbol has an open position (including dust logic).
+        Returns (has_open: bool, qty: float)
+        """
+        try:
+            pos_map = getattr(self.shared_state, "positions", {}) or {}
+            open_statuses = {"OPEN", "PARTIALLY_FILLED"}
+            is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
+            dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
+            if isinstance(pos_map, dict) and sym in pos_map:
+                pos = pos_map.get(sym) or {}
+                qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
+                status = str(pos.get("status") or "").upper()
+                if qty > 0 or status in open_statuses:
+                    if is_bootstrap and 0 < qty < dust_qty:
+                        return False, 0.0
+                    return True, max(qty, 0.0)
+        except Exception:
+            pass
+
+        try:
+            open_trades = getattr(self.shared_state, "open_trades", {}) or {}
+            is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
+            dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
+            if isinstance(open_trades, dict) and sym in open_trades:
+                tr = open_trades.get(sym) or {}
+                qty = float(tr.get("quantity") or tr.get("qty") or 0.0)
+                if qty > 0:
+                    if is_bootstrap and 0 < qty < dust_qty:
+                        return False, 0.0
+                    return True, max(qty, 0.0)
+        except Exception:
+            pass
+
+        try:
+            fn = getattr(self.shared_state, "get_position_qty", None) or getattr(self.shared_state, "get_position_quantity", None)
+            if callable(fn):
+                qty = float(await _safe_await(fn(sym)) or 0.0)
+                is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
+                dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
+                if qty > 0:
+                    if is_bootstrap and 0 < qty < dust_qty:
+                        return False, 0.0
+                    return True, qty
+        except Exception:
+            pass
+
+        return False, 0.0
+
     async def _handle_rejection_and_log(self, symbol: str, side: str, signal: dict, reason: str, reason_detail: str = "", status: str = "skipped", log_level: str = "INFO", extra: dict = None):
         """
         Centralized error handling, logging, and rejection reporting for trade rejections/blocks.
