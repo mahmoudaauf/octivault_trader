@@ -2754,22 +2754,34 @@ from core.meta_utils import (
             self.logger.warning(f"[Meta:SignalCache] Cleanup failed: {e}")
         return loop_id
         
+
         # ===== AUTOMATIC MODE SWITCHING & POLICY EVALUATION =====
-        # Evaluate if we should switch operating modes at the start of each evaluation cycle
+        await self._evaluate_modes_and_policies(loop_id)
+
+        # ===== FOCUS MODE & SYMBOL MANAGEMENT =====
+        await self._manage_focus_mode()
+
+        # ...existing code...
+
+    async def _evaluate_modes_and_policies(self, loop_id):
+        """
+        Handles automatic mode switching and policy evaluation.
+        """
         try:
             await self._evaluate_mode_switch()
             await self.policy_manager.evaluate_policies(self, loop_id)
         except Exception as e:
             self.logger.error(f"[Meta:ModeSwitch] Failed to evaluate modes/policies: {e}", exc_info=True)
 
-        # ═════════════════════════════════════════════════════════════════════════
+    async def _manage_focus_mode(self):
+        """
+        Handles focus mode bootstrap and symbol updates.
+        """
         # CRITICAL FIX #1: WALLET_FOCUS_BOOTSTRAP - Startup Bootstrap Sequence
-        # ═════════════════════════════════════════════════════════════════════════
         # On first cycle, initialize focus symbols from wallet balances
         if self.FOCUS_MODE_ENABLED and self._bootstrap_focus_symbols_pending:
             self.logger.info("[WALLET_FOCUS_BOOTSTRAP] Triggering startup bootstrap on first cycle...")
             await self._bootstrap_focus_symbols()
-        
         # Update focus symbols (now returns pinned set from bootstrap)
         if self.FOCUS_MODE_ENABLED:
             await self._update_focus_symbols()
