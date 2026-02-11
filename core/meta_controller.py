@@ -1,4 +1,34 @@
 
+    def _check_trade_limits(self, symbol: str, agent_name: str, side: str = "BUY") -> dict:
+        """
+        Centralized trade gating and limit checks for BUY/SELL.
+        Returns a dict with keys: ok (bool), reason, reason_detail (if blocked), or None if passed.
+        """
+        # Clean up old timestamps
+        now = time.time()
+        for dq in [self._trade_timestamps, self._trade_timestamps_sym[symbol], self._trade_timestamps_agent[agent_name]]:
+            while dq and (now - dq[0] > 3600):
+                dq.popleft()
+        while self._trade_timestamps_day and (now - self._trade_timestamps_day[0] > 86400):
+            self._trade_timestamps_day.popleft()
+
+        # Bootstrap/flat init bypass
+        # (Caller should check for bootstrap/flat_init/dust_merge/focus_active and skip this if needed)
+        max_hourly = int(getattr(self.config, "MAX_TRADES_PER_HOUR", self._max_trades_per_hour) or 0)
+        max_daily = int(getattr(self.config, "MAX_TRADES_PER_DAY", self._max_trades_per_day) or 0)
+        max_sym_hourly = int(getattr(self.config, "MAX_TRADES_PER_SYMBOL_PER_HOUR", 2) or 0)
+        agent_limit = max(1, int(max_hourly * 0.75))
+
+        if max_daily > 0 and len(self._trade_timestamps_day) >= max_daily:
+            return {"ok": False, "reason": "global_daily_limit", "reason_detail": "global_daily_limit_reached"}
+        if max_hourly > 0 and len(self._trade_timestamps) >= max_hourly:
+            return {"ok": False, "reason": "global_limit", "reason_detail": "global_hourly_limit_reached"}
+        if max_sym_hourly > 0 and len(self._trade_timestamps_sym[symbol]) >= max_sym_hourly:
+            return {"ok": False, "reason": "symbol_limit", "reason_detail": "symbol_hourly_limit_reached"}
+        if len(self._trade_timestamps_agent[agent_name]) >= agent_limit:
+            return {"ok": False, "reason": "agent_limit", "reason_detail": f"agent_limit_{agent_name}_reached"}
+        return {"ok": True}
+
 # -*- coding: utf-8 -*-
 from typing import Any, Optional, List, Dict, Set, Tuple, TYPE_CHECKING
 from collections import defaultdict
@@ -8812,9 +8842,9 @@ from core.meta_utils import (
             self._last_reason_log = BoundedCache(max_size=100, default_ttl=60)
             
         cached_reason = self._last_reason_log.get(sym)
+
         if cached_reason == reason:
             return
-
         self._last_reason_log.set(sym, reason)
         log_msg = f"[DecisionReject] {sym} :: {reason}"
         if level == "INFO":
@@ -8837,15 +8867,7 @@ from core.meta_utils import (
         # This prevents policy rejections from inflating liveness counters.
         last_result = None
         if side == "BUY":
-            now = time.time()
             agent_name = signal.get("agent", "Meta")
-            # 1. Clean old timestamps (Hourly window)
-            for dq in [self._trade_timestamps, self._trade_timestamps_sym[symbol], self._trade_timestamps_agent[agent_name]]:
-                while dq and (now - dq[0] > 3600):
-                    dq.popleft()
-            while self._trade_timestamps_day and (now - self._trade_timestamps_day[0] > 86400):
-                self._trade_timestamps_day.popleft()
-            # ===== CRITICAL FIX #2A: Bootstrap BUY can bypass hourly limits =====
             is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
             is_bootstrap_override = signal.get("_bootstrap_override", False)
             is_flat_init = signal.get("_flat_init_buy", False)
@@ -8944,26 +8966,11 @@ from core.meta_utils import (
                 # Still enforce capital floor, risk hard stops, exchange min/max rules
                 # ...existing code...
             elif not (is_bootstrap or is_bootstrap_override or is_flat_init or is_dust_merge or focus_active):
-                # 2. Gating logic (Phase A Enhancements) — Only for NORMAL BUYs
-                # GLOBAL GATE
-                max_hourly = int(getattr(self.config, "MAX_TRADES_PER_HOUR", self._max_trades_per_hour) or 0)
-                max_daily = int(getattr(self.config, "MAX_TRADES_PER_DAY", self._max_trades_per_day) or 0)
-                if max_daily > 0 and len(self._trade_timestamps_day) >= max_daily:
-                    self.logger.info("[Meta] Skip %s BUY: Global daily trade limit (%d) reached.", symbol, max_daily)
-                    return {"ok": False, "status": "skipped", "reason": "global_daily_limit", "reason_detail": "global_daily_limit_reached"}
-                if max_hourly > 0 and len(self._trade_timestamps) >= max_hourly:
-                    self.logger.info("[Meta] Skip %s BUY: Global hourly trade limit (%d) reached.", symbol, max_hourly)
-                    return {"ok": False, "status": "skipped", "reason": "global_limit", "reason_detail": "global_hourly_limit_reached"}
-                # PER-SYMBOL GATE
-                max_sym_hourly = int(getattr(self.config, "MAX_TRADES_PER_SYMBOL_PER_HOUR", 2) or 0)
-                if max_sym_hourly > 0 and len(self._trade_timestamps_sym[symbol]) >= max_sym_hourly:
-                    self.logger.info("[Meta] Skip %s BUY: Symbol hourly trade limit reached.", symbol)
-                    return {"ok": False, "status": "skipped", "reason": "symbol_limit", "reason_detail": "symbol_hourly_limit_reached"}
-                # PER-AGENT GATE (Safety: Max 75% of global limit per agent)
-                agent_limit = max(1, int(max_hourly * 0.75))
-                if len(self._trade_timestamps_agent[agent_name]) >= agent_limit:
-                    self.logger.info("[Meta] Skip %s BUY: Agent %s hourly limit reached.", symbol, agent_name)
-                    return {"ok": False, "status": "skipped", "reason": "agent_limit", "reason_detail": f"agent_limit_{agent_name}_reached"}
+                # Deduplicated trade gating and limit checks
+                limit_result = self._check_trade_limits(symbol, agent_name, side="BUY")
+                if not limit_result["ok"]:
+                    self.logger.info(f"[Meta] Skip {symbol} BUY: {limit_result['reason_detail']}")
+                    return {"ok": False, "status": "skipped", "reason": limit_result["reason"], "reason_detail": limit_result["reason_detail"]}
             else:
                 # BOOTSTRAP BYPASS: Log that we're bypassing limits
                 self.logger.info(
