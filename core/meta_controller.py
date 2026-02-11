@@ -19,53 +19,7 @@ from core.meta_utils import (
     parse_timestamp,
     classify_execution_error,
 )
-        """Add intent to sink."""
-        self._intents.append(intent)
-        if len(self._intents) > self._max_size:
-            self._intents.pop(0)
 
-    def get_all(self) -> List[Any]:
-        """Get all intents and clear."""
-        result = list(self._intents)
-        self._intents.clear()
-        return result
-
-
-def parse_timestamp(val: Any, default_ts: float = 0.0) -> float:
-    """Coerce timestamps into epoch seconds."""
-    if val is None:
-        return default_ts
-    if isinstance(val, (int, float)):
-        return float(val)
-    if isinstance(val, str):
-        try:
-            if val.endswith('Z'):
-                val = val[:-1] + '+00:00'
-            from datetime import datetime
-            dt = datetime.fromisoformat(val.replace('Z', '+00:00'))
-            return dt.timestamp()
-        except Exception:
-            return default_ts
-    return default_ts
-
-
-def classify_execution_error(err: Any, symbol: str = "") -> ExecutionError:
-    """Classify execution error type and return ExecutionError object."""
-    if isinstance(err, ExecutionError):
-        # Ensure symbol is set if provided
-        if symbol and not err.symbol:
-            err.symbol = symbol
-        return err
-    if hasattr(err, 'error_type'):
-        return ExecutionError(err.error_type, str(err), symbol)
-    err_str = str(err).lower()
-    if 'notional' in err_str:
-        return ExecutionError(ExecutionError.Type.MIN_NOTIONAL_VIOLATION, str(err), symbol)
-    if 'balance' in err_str or 'insufficient' in err_str:
-        return ExecutionError(ExecutionError.Type.INSUFFICIENT_BALANCE, str(err), symbol)
-    if 'fee' in err_str:
-        return ExecutionError(ExecutionError.Type.FEE_SAFETY_VIOLATION, str(err), symbol)
-    return ExecutionError("UNKNOWN", str(err), symbol)
 
 # Core system imports
 from core.focus_mode import FocusModeManager
@@ -131,53 +85,53 @@ except ImportError:
 
 
 class MetaController:
-        def _reset_bootstrap_override_if_deadlocked(self, symbol: str, signal: dict, last_result: dict = None):
-            """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
-            # Check if position is flat
-            is_flat = False
-            try:
-                qty = 0.0
-                if hasattr(self.shared_state, "get_position_qty"):
-                    qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
-                elif hasattr(self.shared_state, "get_position"):
-                    pos = self.shared_state.get_position(symbol)
-                    if _asyncio.iscoroutine(pos):
-                        pos = _asyncio.get_event_loop().run_until_complete(pos)
-                    qty = float(pos.get("qty", 0.0) or pos.get("quantity", 0.0) or 0.0)
-                is_flat = qty == 0.0
-            except Exception:
-                pass
-            # Check if no realized trades yet
-            realized_trades = 0
-            try:
-                metrics = getattr(self.shared_state, "metrics", {}) or {}
-                realized_trades = int(metrics.get("total_trades_executed", 0) or 0)
-            except Exception:
-                pass
-            # Check if last override did NOT produce execution
-            last_override_failed = False
-            if last_result is not None:
-                last_override_failed = not (str(last_result.get("status", "")).lower() in {"placed", "executed", "filled"})
-            # If all conditions met, reset bootstrap attempts
-            if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
-                self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
-                self._bootstrap_attempts = 0
+    def _reset_bootstrap_override_if_deadlocked(self, symbol: str, signal: dict, last_result: dict = None):
+        """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
+        # Check if position is flat
+        is_flat = False
+        try:
+            qty = 0.0
+            if hasattr(self.shared_state, "get_position_qty"):
+                qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
+            elif hasattr(self.shared_state, "get_position"):
+                pos = self.shared_state.get_position(symbol)
+                if _asyncio.iscoroutine(pos):
+                    pos = _asyncio.get_event_loop().run_until_complete(pos)
+                qty = float(pos.get("qty", 0.0) or pos.get("quantity", 0.0) or 0.0)
+            is_flat = qty == 0.0
+        except Exception:
+            pass
+        # Check if no realized trades yet
+        realized_trades = 0
+        try:
+            metrics = getattr(self.shared_state, "metrics", {}) or {}
+            realized_trades = int(metrics.get("total_trades_executed", 0) or 0)
+        except Exception:
+            pass
+        # Check if last override did NOT produce execution
+        last_override_failed = False
+        if last_result is not None:
+            last_override_failed = not (str(last_result.get("status", "")).lower() in {"placed", "executed", "filled"})
+        # If all conditions met, reset bootstrap attempts
+        if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
+            self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
+            self._bootstrap_attempts = 0
+
     def _compute_min_notional_aware_qty(self, *, price: float, min_notional: float, min_qty: float, step_size: float, fee_buffer: float = 1.01, slippage_buffer: float = 1.0) -> float:
         """
         Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
         """
-        from math import ceil
-            if price <= 0 or min_notional <= 0 or step_size <= 0:
-                return 0.0
-            # Apply fee and slippage buffer
-            min_quote = min_notional * fee_buffer * slippage_buffer
-            qty = min_quote / price
-            # Enforce min_qty and step_size
-            qty = max(qty, min_qty)
-            # Round down to step_size
-            from decimal import Decimal, ROUND_DOWN
-            qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
-            return qty
+        if price <= 0 or min_notional <= 0 or step_size <= 0:
+            return 0.0
+        # Apply fee and slippage buffer
+        min_quote = min_notional * fee_buffer * slippage_buffer
+        qty = min_quote / price
+        # Enforce min_qty and step_size
+        qty = max(qty, min_qty)
+        # Round down to step_size
+        from decimal import Decimal, ROUND_DOWN
+        qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
+        return qty
 
     # Symbol lifecycle states
     LIFECYCLE_DUST_HEALING = "DUST_HEALING"
