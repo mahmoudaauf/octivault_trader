@@ -2894,6 +2894,14 @@ from core.meta_utils import (
 
         return accepted_symbols_set, decisions
 
+
+        # --- Execution Logic and Post-Execution Summary ---
+        await self._execute_and_summarize(accepted_symbols_set, decisions)
+
+    async def _execute_and_summarize(self, accepted_symbols_set, decisions):
+        """
+        Handles readiness gating, execution logic (gated/normal), and post-execution summary.
+        """
         # 4. Readiness Gating (Market Data, Balances, OpsPlane)
         gated_reasons = []
         try:
@@ -2909,13 +2917,13 @@ from core.meta_utils import (
             hasattr(self.shared_state, "is_cold_bootstrap") and 
             await _safe_await(self.shared_state.is_cold_bootstrap())
         )
-        
+
         # CRITICAL: Use authoritative check, not cached SharedState value
         is_flat = await self._check_portfolio_flat()
         portfolio_state = "PORTFOLIO_FLAT" if is_flat else "ACTIVE"
-        
+
         bootstrap_buy = None
-        
+
         if is_flat or is_cold_bootstrap:
             # In flat/cold bootstrap state, promote the best Throughput BUY to "safe"
             for d in decisions:
@@ -2937,7 +2945,7 @@ from core.meta_utils import (
             if gated_reasons:
                 # Gated Mode: Process actions that DON'T require budget (SELL/HOLD)
                 safe_decisions = [d for d in decisions if not self._is_budget_required(d[1])]
-                
+
                 if bootstrap_buy:
                     self.logger.info("[Meta:Bootstrap] 🚀 Gating bypass: Promoting %s BUY to safe_decisions.", bootstrap_buy[0])
                     safe_decisions.append(bootstrap_buy)
@@ -2953,18 +2961,18 @@ from core.meta_utils import (
                                     "reason": f"GATED:{sig.get('reason')}", "ts": time.time()
                                 }))
                             except Exception: pass
-                            
+
                         res = await self._execute_decision(sym, side, sig, accepted_symbols_set)
                         status = "FAILED"
                         if isinstance(res, dict): status = str(res.get("status", "FAILED")).upper()
                         elif res is True: status = "FILLED"
-                        
+
                         if status in ("FILLED", "PARTIALLY_FILLED", "PLACED", "EXECUTED"):
                             if side == "BUY": opened_trades += 1
                             elif side == "SELL":
                                 closed_trades += 1
                                 capital_released += float((res if isinstance(res, dict) else {}).get("cummulativeQuoteQty", 0.0))
-                        
+
                         # Only one bootstrap BUY at a time
                         if side == "BUY": break
                 else:
@@ -2990,11 +2998,11 @@ from core.meta_utils import (
                         except Exception: pass
 
                     res = await self._execute_decision(sym, side, sig, accepted_symbols_set)
-                    
+
                     status = "FAILED"
                     if isinstance(res, dict): status = str(res.get("status", "FAILED")).upper()
                     elif res is True: status = "FILLED"
-                    
+
                     tick_fills[sym] = status
                     if status in ("FILLED", "PARTIALLY_FILLED", "PLACED", "EXECUTED"):
                         if side == "BUY": opened_trades += 1
@@ -3008,14 +3016,14 @@ from core.meta_utils import (
                 self.cycles_no_trade = 0
             else:
                 self.cycles_no_trade += 1
-            
+
             # Post-execution refresh
             if opened_trades > 0 or closed_trades > 0:
                 try:
                     if hasattr(self.shared_state, "recalculate_portfolio_state"):
                         await _safe_await(self.shared_state.recalculate_portfolio_state())
                 except Exception: pass
-            
+
             if opened_trades > 0 and not self._first_trade_executed:
                 self._first_trade_executed = True
                 self._bootstrap_lock_engaged = True
@@ -3024,7 +3032,7 @@ from core.meta_utils import (
             end_snap = await _safe_await(self.shared_state.get_portfolio_snapshot())
             end_pnl = float(end_snap.get("realized_pnl", 0.0))
             realized_pnl_delta = end_pnl - start_pnl
-            
+
             # Layer 1: Update LOOP_SUMMARY
             self._loop_summary_state.update({
                 "execution_attempted": len(decisions) > 0,
@@ -3033,13 +3041,13 @@ from core.meta_utils import (
                 "trade_closed": closed_trades > 0,
                 "realized_pnl": realized_pnl_delta,
             })
-            
+
             # Capital free info
             quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
             if quote_asset in self.shared_state.balances:
                 actual_spendable = float(await _safe_await(self.shared_state.get_spendable_balance(quote_asset)) or 0.0)
                 self._loop_summary_state["capital_free"] = actual_spendable
-            
+
             # EMIT SUMMARY
             self._emit_loop_summary()
 
