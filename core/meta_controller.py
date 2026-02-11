@@ -605,11 +605,11 @@ from core.meta_utils import (
     LiquidityPlan,
     parse_timestamp,
     classify_execution_error,
-)
+    )
 
-    # ...existing code...
+        # ...existing code...
 
-    async def _has_open_position(self, sym: str) -> tuple:
+        async def _has_open_position(self, sym: str) -> tuple:
         """
         Check if a symbol has an open position (including dust logic).
         Returns (has_open: bool, qty: float)
