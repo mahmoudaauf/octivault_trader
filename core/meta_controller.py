@@ -2710,6 +2710,7 @@ from core.meta_utils import (
     # Candidate split into:
     # - orchestrate_evaluation_cycle()
     # - execute_policy_pipeline()
+
     async def evaluate_and_act(self):
         """
         P9: Mandatory Lifecycle Evaluation cycle.
@@ -2720,6 +2721,15 @@ from core.meta_utils import (
         - Emits [DEADLOCK_DETECTED] if rejection threshold exceeded
         - Emits [EXEC_REJECT] for each execution failure with reason
         - Emits [ECON_EVENT] ONLY for trades opened/closed, capital moves
+        """
+        loop_id = await self._pre_cycle_setup_and_refresh()
+
+        # ...existing code...
+
+    async def _pre_cycle_setup_and_refresh(self):
+        """
+        Handles pre-cycle setup: execution attempts, tick counters, refreshes, and signal cache cleanup.
+        Returns the loop_id for this cycle.
         """
         self._last_cycle_execution_attempts = self.get_execution_attempts_this_cycle()
         self.reset_execution_attempts()  # Structural Correction: Reset at cycle boundary
@@ -2742,6 +2752,7 @@ from core.meta_utils import (
                 self.logger.debug(f"[Meta:SignalCache] Cleaned up {cleaned_count} expired signals")
         except Exception as e:
             self.logger.warning(f"[Meta:SignalCache] Cleanup failed: {e}")
+        return loop_id
         
         # ===== AUTOMATIC MODE SWITCHING & POLICY EVALUATION =====
         # Evaluate if we should switch operating modes at the start of each evaluation cycle
