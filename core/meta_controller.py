@@ -1,17 +1,26 @@
 
 # -*- coding: utf-8 -*-
 """
-MetaController (Monolithic - Transitional)
+MetaController - Central Trading Orchestrator
 
-This file currently contains multiple subsystems:
-- Orchestration
-- Policy evaluation
-- Mode management
-- Liveness detection
-- Capital safety
+Subsystems:
+- Orchestration & lifecycle (start/stop/run/evaluate_and_act)
+- Policy evaluation & governance decisions
+- Mode management (bootstrap/normal/paused)
+- Liveness detection & health monitoring
+- Capital safety & position lifecycle
+- Dust healing, consolidation & sacrifice logic
+- Signal ingestion & decision building
+- Execution dispatch to ExecutionManager
 
-It is intentionally monolithic during stabilization.
-Sections are annotated for future extraction once behavior is stable.
+Data models (ExecutionError, DustState, LiquidityPlan, BoundedCache,
+ThreadSafeIntentSink, parse_timestamp, classify_execution_error) have been
+extracted to core/meta_models.py and are re-exported here for compatibility.
+
+Remaining extraction candidates (annotated with SECTION comments):
+- DustManager: dust healing/sacrifice/consolidation (~800 lines)
+- ExecutionCoordinator: _execute_decision dispatch (~1200 lines)
+- MetricsCollector: _log_execution_result, KPI tracking (~300 lines)
 """
 
 ############################################################
@@ -49,166 +58,20 @@ except Exception:
             pass
 
 # ==============================================================================
-# INLINE DEFINITIONS: Essential classes from meta_libs (avoiding external dependency)
+# Data models & utilities (extracted to core/meta_models.py)
+# Re-exported here for backward compatibility with existing imports.
 # ==============================================================================
-# These were refactored into core/meta_libs/ locally, but meta_libs doesn't exist
-# on EC2. To ensure EC2 deployment works, we inline the essential definitions here.
-
+from core.meta_models import (
+    ExecutionError,
+    DustState,
+    LiquidityPlan,
+    BoundedCache,
+    ThreadSafeIntentSink,
+    parse_timestamp,
+    classify_execution_error,
+)
 from enum import Enum
 from dataclasses import dataclass
-
-class ExecutionError(Exception):
-    """Canonical P9 execution error with proper classification."""
-
-    class Type:
-        """Error type constants for backward compatibility (string-based comparison)."""
-        EXTERNAL_API_ERROR = "EXTERNAL_API_ERROR"
-        MIN_NOTIONAL_VIOLATION = "MIN_NOTIONAL_VIOLATION"
-        FEE_SAFETY_VIOLATION = "FEE_SAFETY_VIOLATION"
-        RISK_CAP_EXCEEDED = "RISK_CAP_EXCEEDED"
-        INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
-        INTEGRITY_ERROR = "INTEGRITY_ERROR"
-
-    def __init__(
-        self,
-        error_type: str,
-        message: str,
-        symbol: str = "",
-        context: Optional[Dict[str, Any]] = None,
-    ):
-        super().__init__(message)
-        self.error_type = error_type
-        self.message = message
-        self.symbol = symbol
-        self.context = context or {}
-
-
-class DustState(Enum):
-    """Dust Accumulation State Machine."""
-    EMPTY = "empty"
-    DUST_ACCUMULATING = "dust_accumulating"
-    DUST_MATURED = "dust_matured"
-    TRADABLE = "tradable"
-
-
-@dataclass
-class LiquidityPlan:
-    """Enhanced liquidation plan with P9 compliance."""
-    status: str
-    exits: List[Dict[str, Any]]
-    freed_quote: float
-    trace_id: str
-    risk_assessment: Optional[Dict[str, Any]] = None
-
-
-class BoundedCache:
-    """Thread-safe bounded cache with TTL support."""
-
-    def __init__(self, max_size: int = 1000, default_ttl: float = 300.0):
-        self._cache: Dict[str, tuple] = {}
-        self._max_size = max_size
-        self._default_ttl = default_ttl
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """Get value from cache if not expired."""
-        if key not in self._cache:
-            return default
-        value, expires_at = self._cache[key]
-        now = time.time()
-        if now > expires_at:
-            del self._cache[key]
-            return default
-        return value
-
-    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
-        """Set value in cache with TTL."""
-        now = time.time()
-        expires_at = now + (ttl or self._default_ttl)
-        self._cache[key] = (value, expires_at)
-
-    def put(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
-        """Alias for set() for compatibility."""
-        self.set(key, value, ttl)
-
-    def list_all(self) -> List[Any]:
-        """Return all non-expired values."""
-        now = time.time()
-        results = []
-        expired_keys = []
-        for k, (val, exp) in list(self._cache.items()):
-            if now <= exp:
-                results.append(val)
-            else:
-                expired_keys.append(k)
-        for k in expired_keys:
-            self._cache.pop(k, None)
-        return results
-
-    def cleanup_expired(self) -> int:
-        """Remove expired entries from cache. Returns count of removed items."""
-        now = time.time()
-        expired_keys = [k for k, (_, exp) in self._cache.items() if now > exp]
-        for k in expired_keys:
-            del self._cache[k]
-        return len(expired_keys)
-
-
-
-class ThreadSafeIntentSink:
-    """Thread-safe collection for trade intents."""
-
-    def __init__(self, max_size: int = 1000):
-        self._intents = []
-        self._max_size = max_size
-
-    def add(self, intent: Any) -> None:
-        """Add intent to sink."""
-        self._intents.append(intent)
-        if len(self._intents) > self._max_size:
-            self._intents.pop(0)
-
-    def get_all(self) -> List[Any]:
-        """Get all intents and clear."""
-        result = list(self._intents)
-        self._intents.clear()
-        return result
-
-
-def parse_timestamp(val: Any, default_ts: float = 0.0) -> float:
-    """Coerce timestamps into epoch seconds."""
-    if val is None:
-        return default_ts
-    if isinstance(val, (int, float)):
-        return float(val)
-    if isinstance(val, str):
-        try:
-            if val.endswith('Z'):
-                val = val[:-1] + '+00:00'
-            from datetime import datetime
-            dt = datetime.fromisoformat(val.replace('Z', '+00:00'))
-            return dt.timestamp()
-        except Exception:
-            return default_ts
-    return default_ts
-
-
-def classify_execution_error(err: Any, symbol: str = "") -> ExecutionError:
-    """Classify execution error type and return ExecutionError object."""
-    if isinstance(err, ExecutionError):
-        # Ensure symbol is set if provided
-        if symbol and not err.symbol:
-            err.symbol = symbol
-        return err
-    if hasattr(err, 'error_type'):
-        return ExecutionError(err.error_type, str(err), symbol)
-    err_str = str(err).lower()
-    if 'notional' in err_str:
-        return ExecutionError(ExecutionError.Type.MIN_NOTIONAL_VIOLATION, str(err), symbol)
-    if 'balance' in err_str or 'insufficient' in err_str:
-        return ExecutionError(ExecutionError.Type.INSUFFICIENT_BALANCE, str(err), symbol)
-    if 'fee' in err_str:
-        return ExecutionError(ExecutionError.Type.FEE_SAFETY_VIOLATION, str(err), symbol)
-    return ExecutionError("UNKNOWN", str(err), symbol)
 
 # Core system imports
 from core.focus_mode import FocusModeManager
@@ -274,8 +137,6 @@ except ImportError:
 
 
 class MetaController:
-class MetaController:
-    # ...existing code...
     LIFECYCLE_DUST_HEALING = "DUST_HEALING"
     LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
     LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
@@ -312,12 +173,6 @@ class MetaController:
         if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
             self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
             self._bootstrap_attempts = 0
-    # ...existing code...
-    # ...existing code...
-    LIFECYCLE_DUST_HEALING = "DUST_HEALING"
-    LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
-    LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
-    LIFECYCLE_LIQUIDATION = "LIQUIDATION"
 
     def _compute_min_notional_aware_qty(
         self,
@@ -344,7 +199,7 @@ class MetaController:
         from decimal import Decimal, ROUND_DOWN
         qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
         return qty
-    # ...existing code...
+
     def _init_symbol_lifecycle(self):
         # Call this in __init__
         self.symbol_lifecycle = {}  # symbol -> state
@@ -574,12 +429,7 @@ class MetaController:
         self._min_notional_cache = BoundedCache(max_size=500, default_ttl=3600)
         self.logger.debug("[Meta:Init] Min notional cache initialized: max_size=500, ttl=3600s")
         
-        # Initialize reason log cache for duplicate message filtering
-        self._last_reason_log = BoundedCache(max_size=200, default_ttl=1800)
-        self.logger.debug("[Meta:Init] Reason log cache initialized: max_size=200, ttl=1800s")
-
         # Initialize additional controller attributes
-        self._reason_cooldown = float(getattr(config, 'REASON_LOG_COOLDOWN_SEC', 30.0))
         self._performance_lock = _asyncio.Lock()
         
         # Initialize ops plane readiness flag
@@ -605,34 +455,23 @@ class MetaController:
         self._tick_counter = 0
         
         # --- Execution confidence floors ---
-        self._min_exec_conf = getattr(config, "MIN_EXEC_CONF", 0.60)
-        self._tier_a_conf = getattr(config, "TIER_A_CONF", 0.70)
         self._tier_b_conf = getattr(config, "TIER_B_CONF", 0.55)
         self._meta_min_agents = int(getattr(config, "META_MIN_AGENTS", 1))
         self._directional_consistency_pct = float(getattr(config, "META_DIRECTIONAL_CONSISTENCY_PCT", 0.60))
-        self._adaptive_aggression = 1.0 # P9: Start with neutral aggression
+        self._adaptive_aggression = 1.0  # P9: Start with neutral aggression
 
         # --- Planned-quote defaults (avoid 0.00 sizing) ---
         min_entry_quote = float(getattr(config, "MIN_ENTRY_QUOTE_USDT", 12.0))
         min_econ_trade = float(getattr(config, "MIN_ECONOMIC_TRADE_USDT", 0.0) or 0.0)
         if min_econ_trade > 0:
             min_entry_quote = max(min_entry_quote, min_econ_trade)
-        default_quote = float(
-            getattr(
-                config,
-                "DEFAULT_PLANNED_QUOTE",
-                getattr(config, "TRADE_AMOUNT_USDT", 10.0)
-            )
-        )
         self._min_entry_quote_usdt = max(10.0, min_entry_quote)
-        self._default_planned_quote = max(default_quote, self._min_entry_quote_usdt)
-        self._max_spend = float(getattr(config, "MAX_SPEND_PER_TRADE_USDT", 50.0))
         # Conditional size bump latches (activated when edge proves itself)
         self._exit_coalescing_enabled = True
         self._min_hold_enabled = True
         metrics = getattr(self.shared_state, "metrics", {}) or {}
         self._planned_quote_bump_applied = bool(metrics.get("planned_quote_bump_applied"))
-        
+
         # --- Post-bootstrap controls ---
         self._symbol_concentration_limit = getattr(
             config,
@@ -645,15 +484,13 @@ class MetaController:
 
         self._micro_size_quote = float(getattr(config, "MICRO_SIZE_QUOTE", 5.0))
         self._scout_min_notional = float(getattr(config, "SCOUT_MIN_NOTIONAL", 5.0))
-        
-        # EXECUTION FLOORS
-        self._min_exec_confidence = float(self._cfg("MIN_EXECUTION_CONFIDENCE", default=0.60))
-        self._tier_a_conf = float(self._cfg("TIER_A_CONFIDENCE_THRESHOLD", default=0.70))
-        
-        # Config snapshot
+
+        # Config snapshot (canonical source for execution floors & sizing)
         self._min_conf_ingest = float(self._cfg("MIN_SIGNAL_CONF", default=0.50))
         self._max_age_sec = float(self._cfg("MAX_SIGNAL_AGE_SECONDS", default=60))
+        self._min_exec_confidence = float(self._cfg("MIN_EXECUTION_CONFIDENCE", default=0.60))
         self._min_exec_conf = float(self._cfg("MIN_EXECUTION_CONFIDENCE", default=0.55))
+        self._tier_a_conf = float(self._cfg("TIER_A_CONFIDENCE_THRESHOLD", default=0.70))
         # Ensure execution floor is not below ingest floor
         if self._min_exec_conf < self._min_conf_ingest:
             self.logger.warning(
@@ -753,11 +590,6 @@ class MetaController:
         self._time_exit_enabled = bool(getattr(config, "TIME_EXIT_ENABLED", True))
         self._time_exit_min_hours = float(getattr(config, "TIME_EXIT_MIN_HOURS", 24.0))
         self._time_exit_slice_pct = float(getattr(config, "TIME_EXIT_SLICE_PCT", 0.50))
-
-        # Gating settings
-        self._reentry_lock_sec = float(getattr(config, "REENTRY_LOCK_SEC", 900.0))
-        self._reentry_require_tp_sl_exit = bool(getattr(config, "REENTRY_REQUIRE_TPSL_EXIT", True))
-        self._reentry_require_signal_change = bool(getattr(config, "REENTRY_REQUIRE_SIGNAL_CHANGE", True))
 
         # Initialize focus mode state tracking attributes (moved after manager initialization)
         self.FOCUS_SYMBOLS = set()  # Top N symbols by wallet value (PINNED at startup)
@@ -5146,7 +4978,7 @@ class MetaController:
 
     async def _build_decisions(self, accepted_symbols_set: set) -> List[Tuple[str, str, Dict[str, Any]]]:
         # CRITICAL DEBUG: Log that _build_decisions is being called
-        self.logger.warning("[Meta:DEBUG] _build_decisions called with %d accepted symbols", len(accepted_symbols_set))
+        self.logger.debug("[Meta] _build_decisions called with %d accepted symbols", len(accepted_symbols_set))
 
         # Conditional size bump (one-time) after realized PnL clears fee threshold
         try:
@@ -9085,16 +8917,12 @@ class MetaController:
             self.logger.debug(log_msg)
 
     async def _execute_decision(self, symbol: str, side: str, signal: Dict[str, Any], accepted_symbols_set: set):
+        """Standardized execution path with P9-aligned readiness and trade frequency gating."""
         # Enforce lifecycle lock for SELL and ROTATION
         if side.upper() == "SELL":
             if not self._can_act(symbol, "SELL"):
                 self.logger.info(f"[LIFECYCLE] {symbol}: SELL execution blocked by lifecycle lock")
                 return
-        # ...existing code...
-        # On successful SELL, update lifecycle
-        if side.upper() == "SELL":
-            self._on_sell_executed(symbol)
-        """Standardized execution path with P9-aligned readiness and trade frequency gating."""
         # NOTE: Execution attempts are counted only when we actually call ExecutionManager.
         # This prevents policy rejections from inflating liveness counters.
         last_result = None
@@ -10206,6 +10034,8 @@ class MetaController:
 
                     except Exception:
                         self.logger.debug("Failed to apply post-exit cleanup for %s", symbol)
+                    # Update lifecycle state after successful SELL
+                    self._on_sell_executed(symbol)
                     try:
                         await self._health_set("Healthy", f"Executed SELL {symbol}")
                     except Exception:
@@ -10223,594 +10053,23 @@ class MetaController:
                     self.shared_state.report_agent_capital_failure(agent)
             await self._update_kpi_metrics("error", classified_error.error_type)
             await self._health_set("Critical", f"Execution error for {symbol}: {classified_error}")
-            now = time.time()
-            agent_name = signal.get("agent", "Meta")
-            
-            # 1. Clean old timestamps (Hourly window)
-            for dq in [self._trade_timestamps, self._trade_timestamps_sym[symbol], self._trade_timestamps_agent[agent_name]]:
-                while dq and (now - dq[0] > 3600):
-                    dq.popleft()
-            
-            # ===== CRITICAL FIX #2A: Bootstrap BUY can bypass hourly limits =====
-            is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
-            is_flat_init = signal.get("_flat_init_buy", False)
-            
-            if not (is_bootstrap or is_flat_init):
-                # 2. Gating logic (Phase A Enhancements) — Only for NORMAL BUYs
-                # GLOBAL GATE
-                if len(self._trade_timestamps) >= self._max_trades_per_hour:
-                    self.logger.info("[Meta] Skip %s BUY: Global hourly trade limit (%d) reached.", symbol, self._max_trades_per_hour)
-                    return {"ok": False, "status": "skipped", "reason": "global_limit", "reason_detail": "global_hourly_limit_reached"}
-                
-                # PER-SYMBOL GATE (Safety: Max 2 trades per symbol per hour during Phase A)
-                if len(self._trade_timestamps_sym[symbol]) >= 2:
-                    self.logger.info("[Meta] Skip %s BUY: Symbol hourly trade limit reached.", symbol)
-                    return {"ok": False, "status": "skipped", "reason": "symbol_limit", "reason_detail": "symbol_hourly_limit_reached"}
+            return {"ok": False, "status": "error", "reason": classified_error.error_type, "error": str(e)}
 
-                # PER-AGENT GATE (Safety: Max 75% of global limit per agent)
-                agent_limit = max(1, int(self._max_trades_per_hour * 0.75))
-                if len(self._trade_timestamps_agent[agent_name]) >= agent_limit:
-                    self.logger.info("[Meta] Skip %s BUY: Agent %s hourly limit reached.", symbol, agent_name)
-                    return {"ok": False, "status": "skipped", "reason": "agent_limit", "reason_detail": f"agent_limit_{agent_name}_reached"}
-            else:
-                # BOOTSTRAP BYPASS: Log that we're bypassing limits
-                self.logger.info(
-                    "[Meta:FIX#2] Bootstrap BUY %s bypassing hourly limits (is_bootstrap=%s, is_flat_init=%s)",
-                    symbol, is_bootstrap, is_flat_init
-                )
+        # NOTE: The code below is unreachable - the try block returns on success,
+        # and the except block now returns on error. Kept as dead code guard.
+        return {"ok": False, "status": "skipped", "reason": "unreachable_fallthrough"}
 
-        if symbol not in accepted_symbols_set:
-            # P9 FIX: SELL always bypasses accepted_symbols check
-            # REASON: SELL is for exiting existing positions, even if symbol is not in analysis universe
-            # SELL must never be blocked by universe filters - positions must always be exitiable
-            if side == "SELL":
-                self.logger.info(
-                    "[Meta:P9] SELL bypass: %s not in accepted set but SELL must execute (P9 Rule: Exits always allowed). Proceeding.",
-                    symbol
-                )
-            else:
-                # For BUY: Allow bootstrap BUY to bypass accepted_symbols check
-                is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
-                if side == "BUY" and is_bootstrap:
-                    self.logger.info("[Meta:Bootstrap] Gating bypass: %s is not in accepted set but is a bootstrap BUY. Proceeding.", symbol)
-                else:
-                    self.logger.warning("Skipping unaccepted symbol: %s", symbol)
-                    await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": "symbol_not_accepted"})
-                    return {"ok": False, "status": "skipped", "reason": "symbol_not_accepted"}
-
-        # Ensure per-symbol market data is ready if SharedState provides a hook
-        try:
-            fn = getattr(self.shared_state, "is_symbol_data_ready", None)
-            if callable(fn):
-                ok = fn(symbol)
-                if _asyncio.iscoroutine(ok):
-                    ok = await ok
-                if not ok:
-                    await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": "symbol_data_not_ready"})
-                    return {"ok": False, "status": "skipped", "reason": "symbol_data_not_ready"}
-        except Exception:
-            self.logger.debug("symbol readiness check failed for %s", symbol, exc_info=True)
-
-        try:
-            if side == "BUY":
-                # Strict Rule 5: Zero-amount execution must NEVER be OK
-                planned_quote = float(signal.get("_planned_quote", 0.0))
-                if planned_quote <= 0:
-                    planned_quote = await self._planned_quote_for(symbol, signal)
-
-                # TIER 1: ACCUMULATING State Protection
-                # Skip SELL on fresh accumulating positions (unless risk/liquidation/tp_sl)
-                intent_owner = signal.get("_intent_owner", "")
-                if side == "SELL" and hasattr(self.shared_state, "get_pending_intent"):
-                    intent = self.shared_state.get_pending_intent(symbol, "BUY")
-                    if intent and intent.state == "ACCUMULATING":
-                        is_protected_sell = any(tag in str(intent_owner).lower() or tag in str(signal.get("agent", "")).lower() 
-                                            for tag in ["risk", "liquidation", "tp_sl", "emergency", "rotation", "authority"])
-                        if not is_protected_sell:
-                            self.logger.info(
-                                "[Meta:AccumGuard] Blocking SELL on %s: position is ACCUMULATING (intent_owner=%s). "
-                                "Only risk/liquidation/tp_sl/rotation/authority can override.",
-                                symbol, intent_owner
-                            )
-                            await self.shared_state.record_rejection(
-                                symbol, "SELL", "ACCUMULATING_PROTECTION", source="MetaController"
-                            )
-                            # TIER 2: Track conflict (economic gate vs accumulation protection)
-                            if hasattr(self.shared_state, "record_policy_conflict"):
-                                self.shared_state.record_policy_conflict("accumulating_protection_blocks")
-                            return {"ok": False, "status": "skipped", "reason": "accumulating_protection"}
-
-                # TIER 1: Capital Preservation Floor ($50 minimum)
-                min_capital_floor = float(self._cfg("CAPITAL_PRESERVATION_FLOOR", 50.0))
-                free_quote = 0.0
-                try:
-                    if hasattr(self.shared_state, "get_free_quote"):
-                        maybe = self.shared_state.get_free_quote()
-                        if _asyncio.iscoroutine(maybe):
-                            free_quote = await maybe
-                        else:
-                            free_quote = float(maybe or 0.0)
-                except Exception:
-                    free_quote = 0.0
-
-                # PHASE 2 NOTE: Capital floor check removed (now checked at start of _build_decisions)
-                # If we reached this point, capital has already been validated
-                # No redundant check needed here
-
-                policy_flags = {"POLICY_SINGLE_AUTHORITY": True}
-                econ_ok, econ_reason, econ_metrics = self._check_economic_profitability(symbol, signal)
-                if not econ_ok:
-                    self._log_reason("INFO", symbol, f"economic_guard:{econ_reason}")
-                    if hasattr(self.shared_state, "record_rejection"):
-                        await self.shared_state.record_rejection(
-                            symbol, "BUY", "ECONOMIC_PROFITABILITY_BLOCK", source="MetaController"
-                        )
-                    await self._log_execution_result(
-                        symbol,
-                        side,
-                        signal,
-                        {"status": "skipped", "reason": "economic_guard", "details": econ_metrics},
-                    )
-                    return {"ok": False, "status": "skipped", "reason": "economic_guard"}
-                policy_flags["ECONOMIC_PROFITABILITY_INVARIANT"] = True
-                
-                # Double check affordability for executable qty (Rule 2/5)
-                # BOOTSTRAP FIX: If this signal is marked with _bootstrap flag, pass bootstrap context
-                bootstrap_policy_ctx = None
-                if signal.get("_bootstrap") or signal.get("_bootstrap_override"):
-                    bootstrap_policy_ctx = self._build_policy_context(
-                        symbol,
-                        side,
-                        extra={"bootstrap_bypass": True}
-                    )
-                    self.logger.info("[Meta:BOOTSTRAP] Using bootstrap_bypass context for affordability check: %s", symbol)
-
-                can_ex, _, reason = await self.execution_manager.can_afford_market_buy(symbol, planned_quote, policy_context=bootstrap_policy_ctx)
-
-                if not can_ex:
-                    self.logger.warning("⚡ [Escalation] Signal %s for %s has zero executable qty (%s). Triggering Rule 5 Escalation.", symbol, side, reason)
-                    
-                    # P9: Report capital failure immediately
-                    agent = signal.get("agent", "Meta")
-                    if hasattr(self.shared_state, "report_agent_capital_failure"):
-                        self.shared_state.report_agent_capital_failure(agent)
-
-                    # Rule 6: Liquidation must be able to invalidate readiness
-                    if hasattr(self.shared_state, "ops_plane_ready_event"):
-                        self.shared_state.ops_plane_ready_event.clear()
-                        self.logger.info("[Meta] Readiness = FALSE (Escalation Triggered)")
-                        
-                    if self.liquidation_agent and hasattr(self.liquidation_agent, "_free_usdt_now"):
-                        await self.liquidation_agent._free_usdt_now(
-                            target=float(self._cfg("MIN_NOTIONAL_FLOOR", 15.0)),
-                            reason=f"rule5_escalation_{symbol}"
-                        )
-                    elif self.liquidation_agent:
-                        # If liquidation_agent doesn't have _free_usdt_now method, try propose_liquidations instead
-                        self.logger.warning(f"[Meta] LiquidationAgent doesn't have _free_usdt_now method. Using propose_liquidations instead.")
-                        try:
-                            target_usdt = float(self._cfg("MIN_NOTIONAL_FLOOR", 15.0))
-                            proposals = await self.liquidation_agent.propose_liquidations(
-                                gap_usdt=target_usdt,
-                                reason=f"rule5_escalation_{symbol}",
-                                force=True
-                            )
-                            if proposals:
-                                self.logger.info(f"[Meta] Generated {len(proposals)} liquidation proposals for escalation")
-                        except Exception as e:
-                            self.logger.warning(f"[Meta] Failed to generate liquidation proposals: {e}")
-                    else:
-                        self.logger.warning(f"[Meta] No liquidation agent available for escalation")
-                    # P9: Trigger immediate re-plan
-                    if hasattr(self.shared_state, "replan_request_event"):
-                        self.shared_state.replan_request_event.set()
-                    await self._log_execution_result(symbol, side, signal, {"status": "failed", "reason": f"rule5_escalation_{reason}"})
-                    return {"ok": False, "status": "failed", "reason": f"rule5_escalation_{reason}"}
-
-                # Handle liquidity healing if needed
-                if signal.get("_need_liquidity"):
-                    success = await self._attempt_liquidity_healing(symbol, signal)
-                    if not success:
-                        await self._log_execution_result(
-                            symbol, side, signal, {"status": "skipped", "reason": "liquidity_healing_failed"}
-                        )
-                        return {"ok": False, "status": "skipped", "reason": "liquidity_healing"}
-
-                # Hard per-symbol guard to prevent stacked BUYs without explicit scale-in
-                max_per_symbol = int(self._cfg(
-                    "MAX_OPEN_POSITIONS_PER_SYMBOL",
-                    default=self._max_open_positions_per_symbol,
-                ))
-                if max_per_symbol <= 1:
-                    has_open, existing_qty = await self._has_open_position(symbol)
-                    allow_scale_in = bool(
-                        signal.get("_scale_in")
-                        or signal.get("_accumulate_mode")
-                        or signal.get("_allow_reentry")
-                    )
-                    if has_open and not allow_scale_in:
-                        await self._log_execution_result(
-                            symbol,
-                            side,
-                            signal,
-                            {
-                                "status": "skipped",
-                                "reason": "position_already_open",
-                                "reason_detail": f"max_open_positions_per_symbol qty={existing_qty:.6f}",
-                            },
-                        )
-                        return {"ok": False, "status": "skipped", "reason": "position_already_open"}
-
-                # Risk pre-check (BUY) - Tier-aware with FIX #4: liquidation bypass support
-                if self.risk_manager and hasattr(self.risk_manager, "pre_check"):
-                    tier = signal.get("_tier", "A")  # Default to Tier A if not specified
-                    # FIX #4: Detect if this is a liquidation signal for bypass
-                    is_liq = signal.get("_is_starvation_sell") or signal.get("_quote_based") or signal.get("_batch_sell")
-                    tag = signal.get("_tag") or signal.get("tag") or ""
-                    is_liq = is_liq or ("liquidation" in str(tag))
-                    
-                    ok, r_reason = await _safe_await(self.risk_manager.pre_check(
-                        symbol=symbol, side="BUY", planned_quote=planned_quote, tier=tier, is_liquidation=is_liq
-                    ))
-                    if not ok:
-                        self._log_reason("INFO", symbol, f"risk_precheck:{r_reason}")
-                        await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": f"risk:{r_reason}"})
-                        return {"ok": False, "status": "skipped", "reason": f"risk:{r_reason}"}
-
-                # P9: Revalidate signal + risk context at firing time
-                if hasattr(self.shared_state, "is_intent_valid"):
-                    is_bootstrap_seed = bool(
-                        signal.get("_bootstrap_seed")
-                        or signal.get("bootstrap_seed")
-                        or str(signal.get("reason", "")).upper() == "BOOTSTRAP_SEED"
-                        or str(signal.get("execution_tag", "")) == "meta/bootstrap_seed"
-                    )
-                    if not is_bootstrap_seed and not self.shared_state.is_intent_valid(symbol, "BUY"):
-                        self.logger.warning("[Meta] Signal no longer valid at firing time for %s. Skipping.", symbol)
-                        await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": "signal_invalid_at_firing"})
-                        return {"ok": False, "status": "skipped", "reason": "signal_invalid"}
-
-                # Execute through ExecutionManager (canonical single order path)
-                tier = signal.get("_tier", "A")
-                extra_ctx = {"economic_guard": econ_metrics}
-                
-                # ACCUMULATE_MODE: If signal is marked with _accumulate_mode, pass it through policy context
-                if signal.get("_accumulate_mode"):
-                    extra_ctx["_accumulate_mode"] = True
-                    self.logger.info("[Meta:P0] Passing ACCUMULATE_MODE flag to ExecutionManager for %s", symbol)
-                
-                policy_ctx = self._build_policy_context(
-                    symbol,
-                    "BUY",
-                    policies=[p for p, enabled in policy_flags.items() if enabled],
-                    extra=extra_ctx,
-                )
-                self.increment_execution_attempts()
-                result = await self.execution_manager.execute_trade(
-                    symbol=symbol,
-                    side="buy",
-                    quantity=None,
-                    planned_quote=planned_quote,
-                    tag=f"meta-{signal.get('agent', 'Meta')}",
-                    tier=tier,
-                    policy_context=policy_ctx,
-                )
-
-                # Escalation Loop: BUY -> fail (InsufficientBalance) -> liquidate -> retry (Behavior Change 5)
-                ec = result.get("error_code") or result.get("reason")
-                if not result.get("ok") and ec in ("InsufficientBalance", "INSUFFICIENT_QUOTE", "RESERVE_FLOOR", "QUOTE_LT_MIN_NOTIONAL", "MIN_NOTIONAL_VIOLATION"):
-                    # P9: Report capital failure so allocator knows
-                    agent = signal.get("agent", "Meta")
-                    if hasattr(self.shared_state, "report_agent_capital_failure"):
-                        self.shared_state.report_agent_capital_failure(agent)
-
-                    if self.liquidation_agent and hasattr(self.liquidation_agent, "_free_usdt_now"):
-                        self.logger.info("⚡ [Escalation] Insufficient funds for %s. Triggering forced liquidation.", symbol)
-                        # Mandatory liquidation trigger (Behavior Change 2)
-                        await self.liquidation_agent._free_usdt_now(
-                            target=float(planned_quote),
-                            reason=f"escalation_{symbol}"
-                        )
-                    elif self.liquidation_agent:
-                        self.logger.info("⚡ [Escalation] Insufficient funds for %s. Using propose_liquidations fallback.", symbol)
-                        try:
-                            proposals = await self.liquidation_agent.propose_liquidations(
-                                gap_usdt=float(planned_quote),
-                                reason=f"escalation_{symbol}",
-                                force=True
-                            )
-                            if proposals:
-                                self.logger.info(f"[Meta] Generated {len(proposals)} liquidation proposals for insufficient funds")
-                        except Exception as e:
-                            self.logger.warning(f"[Meta] Failed to generate liquidation proposals: {e}")
-                    else:
-                        self.logger.warning(f"[Meta] No liquidation agent available for insufficient funds escalation")
-                        # P9: Trigger immediate re-plan (system rebalance)
-                        if hasattr(self.shared_state, "replan_request_event"):
-                            self.shared_state.replan_request_event.set()
-                        # Brief wait for reconciliation
-                        await _asyncio.sleep(float(self._cfg("ESCALATION_RETRY_DELAY_SEC", default=2.0)))
-                        
-                        # Authoritative Retry
-                        self.logger.info("🔄 [Escalation] Retrying BUY for %s after liquidation.", symbol)
-                        retry_policy_ctx = self._build_policy_context(
-                            symbol,
-                            "BUY",
-                            policies=[p for p, enabled in policy_flags.items() if enabled],
-                            extra={
-                                "economic_guard": econ_metrics,
-                                "retry": "post_liquidation",
-                            },
-                        )
-                        self.increment_execution_attempts()
-                        result = await self.execution_manager.execute_trade(
-                            symbol=symbol,
-                            side="buy",
-                            quantity=None,
-                            planned_quote=planned_quote,
-                            tag=f"meta-{signal.get('agent', 'Meta')}",
-                            policy_context=retry_policy_ctx,
-                        )
-
-                # Post-success cooldown & health bump
-                if str(result.get("status", "")).lower() in {"placed", "executed", "filled"}:
-                    ts = time.time()
-                    self._trade_timestamps.append(ts)
-                    self._trade_timestamps_day.append(ts)
-                    self._trade_timestamps_sym[symbol].append(ts)
-                    self._trade_timestamps_agent[agent_name].append(ts)
-                    self._last_buy_ts[symbol] = ts
-                    try:
-                        if hasattr(self.shared_state, "set_cooldown"):
-                            cooldown_sec = float(self._cfg("META_DECISION_COOLDOWN_SEC", default=15))
-                            await self.shared_state.set_cooldown(symbol, cooldown_sec)
-                    except Exception:
-                        self.logger.debug("Failed to set SharedState cooldown for %s", symbol)
-                    try:
-                        await self._health_set("Healthy", f"Executed BUY {symbol}")
-                    except Exception:
-                        pass
-
-            else:  # SELL
-                policy_flags = {"POLICY_SINGLE_AUTHORITY": True}
-                qty = signal.get("quantity")
-
-                tag = signal.get("_tag") or signal.get("tag") or ""
-                sell_tag = self._resolve_sell_tag(signal)
-                signal["tag"] = sell_tag
-                is_starvation_sell = bool(signal.get("_is_starvation_sell"))
-                is_quote_based_signal = bool(signal.get("_quote_based"))
-                is_batch_sell = bool(signal.get("_batch_sell"))
-                is_liq_signal = bool(
-                    is_starvation_sell
-                    or is_quote_based_signal
-                    or is_batch_sell
-                    or signal.get("_force_dust_liquidation")
-                    or (sell_tag == "liquidation")
-                )
-                sell_policy_extra = {
-                    "liquidation_signal": is_liq_signal,
-                    "dust_value": signal.get("_dust_value"),
-                    "sell_source": sell_tag,
-                }
-                if signal.get("_phase2_guard"):
-                    policy_flags["PHASE_2_GRACE_PERIOD"] = True
-                    sell_policy_extra["phase2_guard"] = signal["_phase2_guard"]
-
-                # [FIX #4] UNIFIED SELL AUTHORITY: Liquidation SELLs have supreme authority
-                # This ensures MetaController's decision to liquidate cannot be blocked by lower layers
-                if is_liq_signal:
-                    policy_flags["UNIFIED_SELL_AUTHORITY"] = True
-                    self.logger.info(f"[Meta:UnifiedSell] {symbol} liquidation SELL will assert UNIFIED_SELL_AUTHORITY")
-
-                if not is_liq_signal:
-                    is_cold = False
-                    try:
-                        cold_attr = getattr(self.shared_state, "is_cold_bootstrap", None)
-                        if callable(cold_attr):
-                            cold_state = cold_attr()
-                            if _asyncio.iscoroutine(cold_state):
-                                cold_state = await cold_state
-                            is_cold = bool(cold_state)
-                        elif cold_attr is not None:
-                            is_cold = bool(cold_attr)
-                    except Exception:
-                        is_cold = False
-
-                    if is_cold:
-                        self._log_reason("INFO", symbol, "sell_blocked_cold_bootstrap")
-                        if hasattr(self.shared_state, "record_rejection"):
-                            await self.shared_state.record_rejection(
-                                symbol, "SELL", "COLD_BOOTSTRAP_BLOCK", source="MetaController"
-                            )
-                        await self._log_execution_result(
-                            symbol,
-                            side,
-                            signal,
-                            {"status": "blocked", "reason": "cold_bootstrap_no_sell"},
-                        )
-                        return {"ok": False, "status": "blocked", "reason": "cold_bootstrap_no_sell"}
-
-                # LiquidationAgent-specific min hold (blocks fresh positions).
-                if is_liq_signal and str(signal.get("agent") or "") == "LiquidationAgent":
-                    min_hold_sec = float(self._cfg("LIQ_MIN_HOLD_SEC", default=90.0) or 0.0)
-                    if min_hold_sec > 0:
-                        entry_ts = 0.0
-                        try:
-                            sym_norm = self._normalize_symbol(symbol)
-                            open_trades = getattr(self.shared_state, "open_trades", {}) or {}
-                            if isinstance(open_trades, dict):
-                                ot = open_trades.get(symbol) or open_trades.get(sym_norm) or {}
-                                entry_ts = parse_timestamp(
-                                    ot.get("entry_time")
-                                    or ot.get("created_at")
-                                    or ot.get("opened_at")
-                                )
-                            if not entry_ts:
-                                positions = getattr(self.shared_state, "positions", {}) or {}
-                                if isinstance(positions, dict):
-                                    pos = positions.get(symbol) or positions.get(sym_norm) or {}
-                                    entry_ts = parse_timestamp(
-                                        pos.get("entry_time")
-                                        or pos.get("opened_at")
-                                        or pos.get("created_at")
-                                    )
-                        except Exception:
-                            entry_ts = 0.0
-
-                        if entry_ts > 0:
-                            age_sec = max(0.0, time.time() - entry_ts)
-                            if age_sec < min_hold_sec:
-                                self._log_reason("INFO", symbol, f"liq_min_hold:{age_sec:.1f}s<{min_hold_sec:.0f}s")
-                                self.logger.info(
-                                    "[Meta:MinHold:Liq] SELL blocked for %s: age=%.1fs < min_hold=%.0fs",
-                                    symbol,
-                                    age_sec,
-                                    min_hold_sec,
-                                )
-                                if hasattr(self.shared_state, "record_rejection"):
-                                    await self.shared_state.record_rejection(
-                                        symbol, "SELL", "LIQ_MIN_HOLD_SEC", source="MetaController"
-                                    )
-                                await self._log_execution_result(
-                                    symbol,
-                                    side,
-                                    signal,
-                                    {"status": "blocked", "reason": "liq_min_hold", "min_hold_sec": min_hold_sec, "age_sec": age_sec},
-                                )
-                                return {"ok": False, "status": "blocked", "reason": "liq_min_hold"}
-                        else:
-                            self._log_reason("INFO", symbol, "liq_min_hold_missing_entry")
-                            await self._log_execution_result(
-                                symbol,
-                                side,
-                                signal,
-                                {"status": "blocked", "reason": "liq_min_hold_missing_entry"},
-                            )
-                            return {"ok": False, "status": "blocked", "reason": "liq_min_hold_missing_entry"}
-
-                # Get position from SharedState (Canonical)
-                qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
-
-                if not qty or qty <= 0:
-                    self._log_reason("INFO", symbol, "sell_no_position_qty")
-                    await self._log_execution_result(
-                        symbol, side, signal, {"status": "skipped", "reason": "no_position_quantity"}
-                    )
-                    return
-
-                # Risk pre-check (SELL) with FIX #4: liquidation bypass support
-                if self.risk_manager and hasattr(self.risk_manager, "pre_check"):
-                    # FIX #4: Detect if this is a liquidation signal for bypass
-                    ok, r_reason = await _safe_await(self.risk_manager.pre_check(
-                        symbol=symbol, side="SELL", is_liquidation=is_liq_signal
-                    ))
-                    if not ok:
-                        self._log_reason("INFO", symbol, f"risk_precheck:{r_reason}")
-                        await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": f"risk:{r_reason}"})
-                        return
-
-                # ===== FIX 3: Quote-Based SELL for Liquidation =====
-                # If this is a liquidation SELL with quote-based flag, use quoteOrderQty instead of quantity
-                if is_quote_based_signal and is_starvation_sell:
-                    quote_value = signal.get("_target_usdt", 0.0)
-                    if quote_value > 0:
-                        self.logger.warning(
-                            "[Meta:QuoteLiq:Execute] Executing QUOTE-BASED liquidation SELL. "
-                            "Symbol: %s, TargetUSDT: %.2f, PositionQty: %.8f. Using quoteOrderQty (bypasses min-notional).",
-                            symbol, quote_value, qty
-                        )
-                        # Execute with quoteOrderQty (USDT value, not quantity)
-                        policy_ctx = self._build_policy_context(
-                            symbol,
-                            "SELL",
-                            policies=[p for p, enabled in policy_flags.items() if enabled],
-                            extra={**sell_policy_extra, "mode": "quote_based"},
-                        )
-                        result = await self.execution_manager.execute_trade(
-                            symbol=symbol,
-                            side="sell",
-                            quantity=None,  # Use quoteOrderQty instead
-                            planned_quote=quote_value,  # Pass as USDT value
-                            tag=sell_tag,
-                            policy_context=policy_ctx,
-                        )
-                    else:
-                        self.logger.warning("[Meta:QuoteLiq:Execute] Quote-based liquidation flag set but _target_usdt is invalid. Falling back to quantity-based sell.")
-                        policy_ctx = self._build_policy_context(
-                            symbol,
-                            "SELL",
-                            policies=[p for p, enabled in policy_flags.items() if enabled],
-                            extra=sell_policy_extra,
-                        )
-                        result = await self.execution_manager.execute_trade(
-                            symbol=symbol,
-                            side="sell",
-                            quantity=qty,
-                            tag=sell_tag,
-                            policy_context=policy_ctx,
-                        )
-                else:
-                    # ===== FIX 2: Liquidation SELLs BYPASS starvation gates =====
-                    # Even if system is starved, liquidation SELLs execute to free capital
-                    if is_starvation_sell:
-                        self.logger.warning(
-                            "[Meta:LiquidationHardPath:Execute] Executing LIQUIDATION SELL (batch or fallback). "
-                            "Symbol: %s, Qty: %.8f. Bypassing starvation/affordability gates.",
-                            symbol, qty
-                        )
-                    
-                    # Standard quantity-based SELL (batch liquidation or normal sell)
-                    policy_ctx = self._build_policy_context(
-                        symbol,
-                        "SELL",
-                        policies=[p for p, enabled in policy_flags.items() if enabled],
-                        extra={**sell_policy_extra, "mode": "quantity"},
-                    )
-                    self.increment_execution_attempts()
-                    result = await self.execution_manager.execute_trade(
-                        symbol=symbol,
-                        side="sell",
-                        quantity=qty,
-                        tag=sell_tag,
-                        policy_context=policy_ctx,
-                    )
-
-                # Post-success cooldown & health bump
-                if str(result.get("status", "")).lower() in {"placed", "executed", "filled"}:
-                    # Track trade execution for focus mode exit condition
-                    if self._focus_mode_active:
-                        self._focus_mode_trade_executed = True
-                        self._focus_mode_trade_executed_count += 1
-                        self.logger.info(f"[FOCUS_MODE] Trade executed: {symbol} {side} (count={self._focus_mode_trade_executed_count})")
-                    
-                    try:
-                        if hasattr(self.shared_state, "set_cooldown"):
-                            cooldown_sec = float(self._cfg("META_DECISION_COOLDOWN_SEC", default=15))
-                            await self.shared_state.set_cooldown(symbol, cooldown_sec)
-                    except Exception:
-                        self.logger.debug("Failed to set SharedState cooldown for %s", symbol)
-                    try:
-                        await self._health_set("Healthy", f"Executed SELL {symbol}")
-                    except Exception:
-                        pass
-
-            await self._log_execution_result(symbol, side, signal, result)
-            await self._update_kpi_metrics("execution")
-            return result
-
-        except Exception as e:
-            classified_error = classify_execution_error(e, symbol)
-            self.logger.error("Decision execution failed for %s: %s", symbol, classified_error.error_type, exc_info=True)
-            
-            # P9 Requirement 3/4: Report Capital Failure for Hysteresis
-            if classified_error.error_type in (ExecutionError.Type.INSUFFICIENT_BALANCE, ExecutionError.Type.MIN_NOTIONAL_VIOLATION):
-                agent = signal.get("agent", "Meta")
-                if hasattr(self.shared_state, "report_agent_capital_failure"):
-                    self.shared_state.report_agent_capital_failure(agent)
-                    
-            await self._update_kpi_metrics("error", classified_error.error_type)
-            await self._health_set("Critical", f"Execution error for {symbol}: {classified_error}")
+    # =========================================================================
+    # DEAD CODE REMOVED: Duplicate execution path (~550 lines) that was
+    # introduced by a merge artifact. The canonical execution path is above
+    # in the try block. The duplicate included identical copies of:
+    # - Symbol acceptance checks
+    # - Market data readiness checks
+    # - BUY frequency gating
+    # - Position lock invariant checks
+    # - Execution dispatch to ExecutionManager
+    # - Post-execution bookkeeping
+    # =========================================================================
 
     def score_position(self, position: Dict[str, Any]) -> float:
         """

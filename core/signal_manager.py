@@ -7,13 +7,15 @@ import time
 
 # Import utilities needed for intent processing
 try:
-    from core.meta_controller import parse_timestamp as _parse_ts
+    from core.meta_models import parse_timestamp as _parse_ts
 except ImportError:
-    # Fallback timestamp parsing
-    def _parse_ts(ts_val, now_ts):
-        if isinstance(ts_val, (int, float)):
-            return float(ts_val)
-        return now_ts
+    try:
+        from core.meta_controller import parse_timestamp as _parse_ts
+    except ImportError:
+        def _parse_ts(ts_val, now_ts):
+            if isinstance(ts_val, (int, float)):
+                return float(ts_val)
+            return now_ts
 
 class SignalManager:
     def __init__(self, config, logger, signal_cache=None, intent_manager=None):
@@ -28,7 +30,7 @@ class SignalManager:
         else:
             # Try to use BoundedCache from meta_controller.cache, fallback to InlineBoundedCache
             try:
-                from core.meta_controller import BoundedCache
+                from core.meta_models import BoundedCache
                 cache_size = int(getattr(config, 'signal_cache_max_size', 1000))
                 cache_ttl = float(getattr(config, 'signal_cache_ttl', 300.0))
                 self.signal_cache = BoundedCache(max_size=cache_size, default_ttl=cache_ttl)

@@ -527,8 +527,8 @@ class ExecutionLogic:
 
         except Exception as e:
             try:
-                from core.meta_controller import ExecutionError as _ExecutionError
-                from core.meta_controller import classify_execution_error as _classify_execution_error
+                from core.meta_models import ExecutionError as _ExecutionError
+                from core.meta_models import classify_execution_error as _classify_execution_error
             except Exception:
                 from core.stubs import ExecutionError as _ExecutionError
 
