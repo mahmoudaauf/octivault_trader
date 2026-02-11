@@ -89,6 +89,45 @@ except ImportError:
 
 class MetaController:
 
+    async def _attempt_liquidity_healing_and_escalation(self, sym, planned_quote, sig, agent_budgets, action, bootstrap_policy_ctx=None):
+        """
+        Attempt to heal liquidity gap by adjusting planned quote, retrying, and escalating if needed.
+        Returns (can_afford: bool, planned_quote: float, reason: str)
+        """
+        can_afford, gap, reason = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=bootstrap_policy_ctx)
+        if not can_afford and gap > 0:
+            agent_name = sig.get("agent", "Meta")
+            avail = agent_budgets.get(agent_name, 0.0)
+            gap_f = float(gap)
+            if avail >= gap_f:
+                self.logger.info("[Meta] Healing trade for %s: Scaling quote %.2f -> %.2f (+%.2f) to reach valid quantity.", sym, planned_quote, planned_quote + gap_f, gap_f)
+                self.shared_state.request_reservation_adjustment(agent=agent_name, delta=-gap_f, reason="meta_healing")
+                planned_quote += gap_f
+                agent_budgets[agent_name] -= gap_f
+                sig["_planned_quote"] = planned_quote
+                res_heal, _, _ = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=bootstrap_policy_ctx)
+                if res_heal:
+                    self.logger.info("[Meta] Healing successful for %s.", sym)
+                    return True, planned_quote, "healed"
+        # If still not affordable, escalate and report
+        if not can_afford:
+            agent_name = sig.get("agent", "Meta")
+            if hasattr(self.shared_state, "record_agent_rejection"):
+                try:
+                    await self.shared_state.record_agent_rejection(
+                        agent=agent_name,
+                        symbol=sym,
+                        side=action,
+                        reason=str(reason),
+                        rejected_quote=planned_quote,
+                        gap=gap,
+                        timestamp=time.time()
+                    )
+                    self.logger.info("[Meta:Feedback] Agent %s notified: affordability failure (quote=%.2f gap=%.2f reason=%s)", agent_name, planned_quote, gap, reason)
+                except Exception as e:
+                    self.logger.warning("[Meta:Feedback] Failed to record rejection for %s: %s", agent_name, e)
+        return can_afford, planned_quote, reason
+
     async def _has_open_position(self, sym: str) -> tuple:
         """
         Check if a symbol has an open position (including dust logic).
@@ -8789,54 +8828,9 @@ from core.meta_utils import (
                             "BUY",
                             extra={"bootstrap_bypass": True}
                         )
-
-                    can_afford, gap, reason = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=bootstrap_policy_ctx)
-
-                    if not can_afford and gap > 0:
-                        # Point 3 enhancement: Quantity Healing
-                        agent_name = sig.get("agent", "Meta")
-                        avail = agent_budgets.get(agent_name, 0.0)
-                        gap_f = float(gap)
-                        
-                        if avail >= gap_f:
-                            self.logger.info("[Meta] Healing trade for %s: Scaling quote %.2f -> %.2f (+%.2f) to reach valid quantity.", 
-                                            sym, planned_quote, planned_quote + gap_f, gap_f)
-                            # ISSUE #3 FIX: P9-compliant adjustment request
-                            self.shared_state.request_reservation_adjustment(
-                                agent=agent_name, delta=-gap_f, reason="meta_healing"
-                            )
-                            
-                            # 2. Update local tracking
-                            planned_quote += gap_f
-                            agent_budgets[agent_name] -= gap_f
-                            sig["_planned_quote"] = planned_quote
-                            
-                            # 3. Final sanity check
-                            res_heal, _, _ = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=bootstrap_policy_ctx)
-                            if res_heal:
-                                can_afford = True
-                                self.logger.info("[Meta] Healing successful for %s.", sym)
-
-                    if not can_afford:
-                        # Rule 5: Give back the budget to the pool if it won't be used
-                        agent_name = sig.get("agent", "Meta")
-                        
-                        # GAP FIX D: Send rejection feedback to agent
-                        if hasattr(self.shared_state, "record_agent_rejection"):
-                            try:
-                                await self.shared_state.record_agent_rejection(
-                                    agent=agent_name,
-                                    symbol=sym,
-                                    side=action,
-                                    reason=str(reason),
-                                    rejected_quote=planned_quote,
-                                    gap=gap,
-                                    timestamp=time.time()
-                                )
-                                self.logger.info("[Meta:Feedback] Agent %s notified: affordability failure (quote=%.2f gap=%.2f reason=%s)", 
-                                            agent_name, planned_quote, gap, reason)
-                            except Exception as e:
-                                self.logger.warning("[Meta:Feedback] Failed to record rejection for %s: %s", agent_name, e)
+                    can_afford, planned_quote, reason = await self._attempt_liquidity_healing_and_escalation(
+                        sym, planned_quote, sig, agent_budgets, action, bootstrap_policy_ctx=bootstrap_policy_ctx
+                    )
                         
                         # ISSUE #3 FIX: P9-compliant adjustment request
                         self.shared_state.request_reservation_adjustment(
