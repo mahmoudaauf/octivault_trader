@@ -86,8 +86,6 @@ except ImportError:
 # - MetaControllerOrchestrator
 ############################################################
 
-
-class MetaController:
 class MetaController:
     # ...existing code...
     LIFECYCLE_DUST_HEALING = "DUST_HEALING"
