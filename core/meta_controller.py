@@ -577,63 +577,16 @@ class MetaController:
         self._bootstrap_seed_active = False
         self._bootstrap_seed_cycle = None
         self._bootstrap_dust_bypass_used = set()  # Track one-shot bootstrap dust scale bypass per symbol
-        self._consolidated_dust_symbols = set()  # Track symbols that have completed dust consolidation
-        self._dust_merge_attempts = {}  # symbol -> {price, ts, bootstrap_epoch}
-        self._dust_merge_bootstrap_epoch = 0
-        self._dust_merge_last_bootstrap = None
-        self._dust_merges = set()  # legacy compatibility (deprecated)
-        self._info_cache = {}
-
-        # Initialize symbol lifecycle state tracking (required by _can_act / dust healing)
-        self._init_symbol_lifecycle()
-
-    def _info_once(self, key: str, msg: str, *args):
-        """Helper to log important events only once to avoid spamming."""
-        if key not in self._info_cache:
-            self.logger.info(msg, *args)
-            self._info_cache[key] = time.time()
-
-    async def _has_open_position(self, symbol: str) -> Tuple[bool, float]:
-        """Return (has_open_position, qty) using the most reliable sources."""
-        sym = str(symbol or "")
-        if not sym:
-            return False, 0.0
-
-        dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", 0.0) or 0.0)
-        is_bootstrap = self._is_bootstrap_mode() if dust_qty > 0 else False
-        qty = 0.0
-        open_statuses = {"OPEN", "PARTIALLY_FILLED", "ACTIVE", "IN_POSITION", "RUNNING"}
-
-        try:
-            if hasattr(self.shared_state, "get_open_positions"):
-                pos_map = await _safe_await(self.shared_state.get_open_positions())
-                if isinstance(pos_map, dict) and sym in pos_map:
-                    pos = pos_map.get(sym) or {}
-                    qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
-                    status = str(pos.get("status") or "").upper()
-                    if qty > 0 or status in open_statuses:
-                        if is_bootstrap and 0 < qty < dust_qty:
-                            return False, 0.0
-                        return True, max(qty, 0.0)
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self.shared_state, "get_positions_snapshot"):
-                snap = await _safe_await(self.shared_state.get_positions_snapshot())
-                if isinstance(snap, dict) and sym in snap:
-                    pos = snap.get(sym) or {}
-                    qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
-                    status = str(pos.get("status") or "").upper()
-                    if qty > 0 or status in open_statuses:
-                        if is_bootstrap and 0 < qty < dust_qty:
-                            return False, 0.0
-                        return True, max(qty, 0.0)
-        except Exception:
-            pass
-
-        try:
-            pos_map = getattr(self.shared_state, "positions", {}) or {}
+# Utility classes and functions moved to core/meta_utils.py
+from core.meta_utils import (
+    BoundedCache,
+    ThreadSafeIntentSink,
+    ExecutionError,
+    DustState,
+    LiquidityPlan,
+    parse_timestamp,
+    classify_execution_error,
+)
             if isinstance(pos_map, dict) and sym in pos_map:
                 pos = pos_map.get(sym) or {}
                 qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
