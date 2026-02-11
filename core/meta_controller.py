@@ -8831,36 +8831,32 @@ from core.meta_utils import (
                     can_afford, planned_quote, reason = await self._attempt_liquidity_healing_and_escalation(
                         sym, planned_quote, sig, agent_budgets, action, bootstrap_policy_ctx=bootstrap_policy_ctx
                     )
-                        
-                        # ISSUE #3 FIX: P9-compliant adjustment request
-                        self.shared_state.request_reservation_adjustment(
-                            agent=agent_name, delta=planned_quote, reason="trade_validation_failed"
-                        )
-                        
-                        # P9 DEADLOCK PREVENTION: Record rejection
-                        if hasattr(self.shared_state, "record_rejection"):
-                            await self.shared_state.record_rejection(sym, action, str(reason))
-                        
-                        # Check for deadlock condition
-                        deadlock_threshold = int(self._cfg("DEADLOCK_REJECTION_THRESHOLD", 3))
-                        rej_count = self.shared_state.get_rejection_count(sym, "BUY") if hasattr(self.shared_state, "get_rejection_count") else 0
-                        if rej_count >= deadlock_threshold:
-                            self.logger.error("[Meta:DEADLOCK] Symbol %s has been rejected %d times. Emitting DEADLOCK event.", sym, rej_count)
-                            if hasattr(self.shared_state, "emit_event"):
-                                await _safe_await(self.shared_state.emit_event("DEADLOCK_DETECTED", {
-                                    "symbol": sym, "side": action, "reason": str(reason), 
-                                    "rejection_count": rej_count, "ts": time.time()
-                                }))
-                        
-                        if reason in ("INSUFFICIENT_QUOTE", "QUOTE_LT_MIN_NOTIONAL") or "NOT_EXECUTABLE" in str(reason):
-                            sig["_need_liquidity"] = True
-                            sig["_liq_gap"] = gap
-                            sig["_liq_reason"] = reason
-                            decisions.append((sym, action, sig))
-                        else:
-                            self.logger.info("[Meta] Skipping %s - unaffordable (%s); budget returned.", sym, reason)
-                    else:
+                    # ISSUE #3 FIX: P9-compliant adjustment request
+                    self.shared_state.request_reservation_adjustment(
+                        agent=agent_name, delta=planned_quote, reason="trade_validation_failed"
+                    )
+                    # P9 DEADLOCK PREVENTION: Record rejection
+                    if hasattr(self.shared_state, "record_rejection"):
+                        await self.shared_state.record_rejection(sym, action, str(reason))
+                    # Check for deadlock condition
+                    deadlock_threshold = int(self._cfg("DEADLOCK_REJECTION_THRESHOLD", 3))
+                    rej_count = self.shared_state.get_rejection_count(sym, "BUY") if hasattr(self.shared_state, "get_rejection_count") else 0
+                    if rej_count >= deadlock_threshold:
+                        self.logger.error("[Meta:DEADLOCK] Symbol %s has been rejected %d times. Emitting DEADLOCK event.", sym, rej_count)
+                        if hasattr(self.shared_state, "emit_event"):
+                            await _safe_await(self.shared_state.emit_event("DEADLOCK_DETECTED", {
+                                "symbol": sym, "side": action, "reason": str(reason), 
+                                "rejection_count": rej_count, "ts": time.time()
+                            }))
+                    if reason in ("INSUFFICIENT_QUOTE", "QUOTE_LT_MIN_NOTIONAL") or "NOT_EXECUTABLE" in str(reason):
+                        sig["_need_liquidity"] = True
+                        sig["_liq_gap"] = gap
+                        sig["_liq_reason"] = reason
                         decisions.append((sym, action, sig))
+                    else:
+                        self.logger.info("[Meta] Skipping %s - unaffordable (%s); budget returned.", sym, reason)
+                else:
+                    decisions.append((sym, action, sig))
                 except Exception as e:
                     self.logger.debug("Affordability check failed for %s: %s", sym, e)
             else:
