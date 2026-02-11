@@ -595,6 +595,7 @@ class MetaController:
         self._bootstrap_seed_active = False
         self._bootstrap_seed_cycle = None
         self._bootstrap_dust_bypass_used = set()  # Track one-shot bootstrap dust scale bypass per symbol
+
 # Utility classes and functions moved to core/meta_utils.py
 from core.meta_utils import (
     BoundedCache,
@@ -605,6 +606,8 @@ from core.meta_utils import (
     parse_timestamp,
     classify_execution_error,
 )
+
+    # ...existing code...
 
     async def _has_open_position(self, sym: str) -> tuple:
         """
