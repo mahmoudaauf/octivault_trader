@@ -721,8 +721,6 @@ from core.meta_utils import (
     classify_execution_error,
 )
 
-    # ...existing code...
-
     async def _has_open_position(self, sym: str) -> tuple:
         """
         Check if a symbol has an open position (including dust logic).
