@@ -1,15 +1,6 @@
 
 # -*- coding: utf-8 -*-
-"""
-MetaController (Monolithic - Transitional)
 
-This file currently contains multiple subsystems:
-- Orchestration
-- Policy evaluation
-- Mode management
-- Liveness detection
-
-# Utility classes and functions moved to core/meta_utils.py
 from core.meta_utils import (
     BoundedCache,
     ThreadSafeIntentSink,
