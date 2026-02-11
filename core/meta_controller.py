@@ -88,225 +88,13 @@ except ImportError:
 
 
 class MetaController:
+class MetaController:
+    # ...existing code...
+    LIFECYCLE_DUST_HEALING = "DUST_HEALING"
+    LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
+    LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
+    LIFECYCLE_LIQUIDATION = "LIQUIDATION"
 
-    async def _attempt_liquidity_healing_and_escalation(self, sym, planned_quote, sig, agent_budgets, action, bootstrap_policy_ctx=None):
-        """
-        Attempt to heal liquidity gap by adjusting planned quote, retrying, and escalating if needed.
-        Returns (can_afford: bool, planned_quote: float, reason: str)
-        """
-        can_afford, gap, reason = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=bootstrap_policy_ctx)
-        if not can_afford and gap > 0:
-            agent_name = sig.get("agent", "Meta")
-            avail = agent_budgets.get(agent_name, 0.0)
-            gap_f = float(gap)
-            if avail >= gap_f:
-                self.logger.info("[Meta] Healing trade for %s: Scaling quote %.2f -> %.2f (+%.2f) to reach valid quantity.", sym, planned_quote, planned_quote + gap_f, gap_f)
-                self.shared_state.request_reservation_adjustment(agent=agent_name, delta=-gap_f, reason="meta_healing")
-                planned_quote += gap_f
-                agent_budgets[agent_name] -= gap_f
-                sig["_planned_quote"] = planned_quote
-                res_heal, _, _ = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=bootstrap_policy_ctx)
-                if res_heal:
-                    self.logger.info("[Meta] Healing successful for %s.", sym)
-                    return True, planned_quote, "healed"
-        # If still not affordable, escalate and report
-        if not can_afford:
-            agent_name = sig.get("agent", "Meta")
-            if hasattr(self.shared_state, "record_agent_rejection"):
-                try:
-                    await self.shared_state.record_agent_rejection(
-                        agent=agent_name,
-                        symbol=sym,
-                        side=action,
-                        reason=str(reason),
-                        rejected_quote=planned_quote,
-                        gap=gap,
-                        timestamp=time.time()
-                    )
-                    self.logger.info("[Meta:Feedback] Agent %s notified: affordability failure (quote=%.2f gap=%.2f reason=%s)", agent_name, planned_quote, gap, reason)
-                except Exception as e:
-                    self.logger.warning("[Meta:Feedback] Failed to record rejection for %s: %s", agent_name, e)
-        return can_afford, planned_quote, reason
-
-    async def _has_open_position(self, sym: str) -> tuple:
-        """
-        Check if a symbol has an open position (including dust logic).
-        Returns (has_open: bool, qty: float)
-        """
-        try:
-            pos_map = getattr(self.shared_state, "positions", {}) or {}
-            open_statuses = {"OPEN", "PARTIALLY_FILLED"}
-            is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
-            dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
-            if isinstance(pos_map, dict) and sym in pos_map:
-                pos = pos_map.get(sym) or {}
-                qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
-                status = str(pos.get("status") or "").upper()
-                if qty > 0 or status in open_statuses:
-                    if is_bootstrap and 0 < qty < dust_qty:
-                        return False, 0.0
-                    return True, max(qty, 0.0)
-        except Exception:
-            pass
-
-        try:
-            open_trades = getattr(self.shared_state, "open_trades", {}) or {}
-            is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
-            dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
-            if isinstance(open_trades, dict) and sym in open_trades:
-                tr = open_trades.get(sym) or {}
-                qty = float(tr.get("quantity") or tr.get("qty") or 0.0)
-                if qty > 0:
-                    if is_bootstrap and 0 < qty < dust_qty:
-                        return False, 0.0
-                    return True, max(qty, 0.0)
-        except Exception:
-            pass
-
-        try:
-            fn = getattr(self.shared_state, "get_position_qty", None) or getattr(self.shared_state, "get_position_quantity", None)
-            if callable(fn):
-                qty = float(await _safe_await(fn(sym)) or 0.0)
-                is_bootstrap = getattr(self, "_focus_mode_active", False) or getattr(self, "_bootstrap_seed_active", False)
-                dust_qty = float(getattr(self.config, "DUST_POSITION_QTY", getattr(self.config, "dust_position_qty", 0.0)) or 0.0)
-                if qty > 0:
-                    if is_bootstrap and 0 < qty < dust_qty:
-                        return False, 0.0
-                    return True, qty
-        except Exception:
-            pass
-
-        return False, 0.0
-
-    async def _handle_rejection_and_log(self, symbol: str, side: str, signal: dict, reason: str, reason_detail: str = "", status: str = "skipped", log_level: str = "INFO", extra: dict = None):
-        """
-        Centralized error handling, logging, and rejection reporting for trade rejections/blocks.
-        """
-        self._log_reason(log_level, symbol, f"{reason}:{reason_detail}" if reason_detail else reason)
-        if hasattr(self.shared_state, "record_rejection"):
-            await self.shared_state.record_rejection(symbol, side, reason, source="MetaController")
-        result = {"status": status, "reason": reason}
-        if reason_detail:
-            result["reason_detail"] = reason_detail
-        if extra:
-            result.update(extra)
-        await self._log_execution_result(symbol, side, signal, result)
-        return {"ok": False, "status": status, "reason": reason}
-
-    async def _run_risk_precheck(self, symbol: str, side: str, signal: dict) -> dict:
-        """
-        Centralized risk pre-check for capital floor, risk manager, and exposure/risk limits.
-        Returns a dict with keys: ok (bool), reason (if blocked), or None if passed.
-        """
-        min_capital_floor = float(self._cfg("CAPITAL_PRESERVATION_FLOOR", 50.0))
-        free_quote = 0.0
-        try:
-            if hasattr(self.shared_state, "get_free_quote"):
-                maybe = self.shared_state.get_free_quote()
-                if _asyncio.iscoroutine(maybe):
-                    free_quote = await maybe
-                else:
-                    free_quote = float(maybe or 0.0)
-        except Exception:
-            free_quote = 0.0
-        if side.upper() == "BUY" and free_quote < min_capital_floor:
-            return {"ok": False, "reason": "capital_floor"}
-
-        if self.risk_manager and hasattr(self.risk_manager, "pre_check"):
-            planned_quote = signal.get("planned_quote") or signal.get("quote_amount") or signal.get("_planned_quote")
-            tier = signal.get("_tier", "A")
-            is_liq = signal.get("_is_starvation_sell") or signal.get("_quote_based") or signal.get("_batch_sell")
-            tag = signal.get("_tag") or signal.get("tag") or ""
-            is_liq = is_liq or ("liquidation" in str(tag))
-            ok, r_reason = await _safe_await(self.risk_manager.pre_check(
-                symbol=symbol, side=side, planned_quote=planned_quote, tier=tier, is_liquidation=is_liq
-            ))
-            if not ok:
-                return {"ok": False, "reason": f"risk:{r_reason}"}
-
-        return {"ok": True}
-
-    async def _apply_cooldown_and_health(self, symbol: str, action: str = "", cooldown_cfg_key: str = "META_DECISION_COOLDOWN_SEC", default_cooldown: float = 15.0, health_status: str = "Healthy", health_detail: str = None):
-        """
-        Helper to apply cooldown and health update after successful trade or healing.
-        """
-        try:
-            if hasattr(self.shared_state, "set_cooldown"):
-                cooldown_sec = float(self._cfg(cooldown_cfg_key, default=default_cooldown))
-                await self.shared_state.set_cooldown(symbol, cooldown_sec)
-        except Exception:
-            self.logger.debug(f"Failed to set SharedState cooldown for {symbol}")
-        try:
-            detail = health_detail or (f"Executed {action} {symbol}" if action else f"Executed {symbol}")
-            await self._health_set(health_status, detail)
-        except Exception:
-            pass
-
-    async def _check_position_and_dust(self, symbol: str, signal: dict) -> dict:
-        """
-        Centralized check for position lock, dust status, dust healing, and bootstrap/dust bypass.
-        Returns a dict with keys: ok (bool), reason, reason_detail, and may update signal in place.
-        """
-        is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
-        is_bootstrap_override = signal.get("_bootstrap_override", False)
-        is_flat_init = signal.get("_flat_init_buy", False)
-        is_dust_merge = signal.get("_dust_reentry_override", False)
-        focus_active = bool(getattr(self, "_focus_mode_active", False))
-        is_bootstrap_seed = bool(signal.get("_bootstrap_seed") or signal.get("bootstrap_seed") or str(signal.get("reason", "")).upper() == "BOOTSTRAP_SEED")
-        is_dust_healing = signal.get("_dust_healing", False)
-
-        curr_qty = self.shared_state.get_position_qty(symbol) if hasattr(self.shared_state, "get_position_qty") else 0.0
-        pos_data = None
-        if hasattr(self.shared_state, "get_position"):
-            try:
-                pos_data = await _safe_await(self.shared_state.get_position(symbol))
-            except Exception:
-                pos_data = None
-        is_dust_position = False
-        if pos_data and isinstance(pos_data, dict):
-            is_dust_position = pos_data.get("is_dust", False) or pos_data.get("_is_dust", False) or pos_data.get("state", "") == "DUST_LOCKED"
-        is_bootstrap_dust_bypass = False
-
-        # Dust healing trade count check
-        if is_dust_healing:
-            metrics = getattr(self.shared_state, "metrics", {}) or {}
-            trade_count = int(
-                metrics.get("total_trades_executed", 0)
-                or getattr(self.shared_state, "trade_count", 0)
-                or 0
-            )
-            if trade_count < 1:
-                return {"ok": False, "reason": "dust_healing_not_ready", "reason_detail": "no_realized_trades"}
-
-        # Position lock logic
-        if curr_qty > 0 and not is_dust_merge:
-            is_bootstrap_dust_bypass = self._bootstrap_dust_bypass_allowed(
-                symbol,
-                bool(is_bootstrap_override),
-                bool(is_dust_position),
-            )
-            if not (is_bootstrap_seed or is_bootstrap_dust_bypass or (is_dust_healing and (is_dust_position or is_bootstrap or is_bootstrap_override or is_flat_init))):
-                return {"ok": False, "reason": "position_lock", "reason_detail": "position_already_exists"}
-            else:
-                if is_bootstrap_seed:
-                    signal["_bootstrap_seed_bypass"] = True
-                elif is_bootstrap_dust_bypass:
-                    signal["execution_tag"] = "meta/bootstrap_dust"
-                    signal["_bootstrap_dust_bypass"] = True
-                else:
-                    signal["execution_tag"] = "meta/dust_healing"
-
-        # Dust healing overrides
-        if is_dust_healing:
-            pre_value = float(signal.get("pre_value", 0.0))
-            post_value = float(signal.get("post_value", 0.0))
-            signal["tier"] = "DUST_RECOVERY"
-            signal["execution_tag"] = "meta/dust_healing"
-            signal["agent"] = "Meta"
-            return {"ok": True, "reason": "dust_healing", "reason_detail": f"pre_value={pre_value},post_value={post_value}"}
-
-        # If all checks pass
-        return {"ok": True}
     def _reset_bootstrap_override_if_deadlocked(self, symbol: str, signal: dict, last_result: dict = None):
         """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
         # Check if position is flat
@@ -338,11 +126,27 @@ class MetaController:
         if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
             self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
             self._bootstrap_attempts = 0
+    # ...existing code...
+    # ...existing code...
+    LIFECYCLE_DUST_HEALING = "DUST_HEALING"
+    LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
+    LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
+    LIFECYCLE_LIQUIDATION = "LIQUIDATION"
 
-    def _compute_min_notional_aware_qty(self, *, price: float, min_notional: float, min_qty: float, step_size: float, fee_buffer: float = 1.01, slippage_buffer: float = 1.0) -> float:
+    def _compute_min_notional_aware_qty(
+        self,
+        *,
+        price: float,
+        min_notional: float,
+        min_qty: float,
+        step_size: float,
+        fee_buffer: float = 1.01,
+        slippage_buffer: float = 1.0,
+    ) -> float:
         """
         Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
         """
+        from math import ceil
         if price <= 0 or min_notional <= 0 or step_size <= 0:
             return 0.0
         # Apply fee and slippage buffer
@@ -354,13 +158,7 @@ class MetaController:
         from decimal import Decimal, ROUND_DOWN
         qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
         return qty
-
-    # Symbol lifecycle states
-    LIFECYCLE_DUST_HEALING = "DUST_HEALING"
-    LIFECYCLE_STRATEGY_OWNED = "STRATEGY_OWNED"
-    LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
-    LIFECYCLE_LIQUIDATION = "LIQUIDATION"
-
+    # ...existing code...
     def _init_symbol_lifecycle(self):
         # Call this in __init__
         self.symbol_lifecycle = {}  # symbol -> state
@@ -5880,6 +5678,20 @@ from core.meta_utils import (
         
         # AUTHORITATIVE FLAT CHECK: bootstrap-aware (dust-only portfolios treated as flat in BOOTSTRAP)
         is_flat = await self._check_portfolio_flat()
+        # --- FIX #2: Override flatness if any real trades or TPSL monitoring exist ---
+        try:
+            open_positions = self.shared_state.get_open_positions()
+            open_trades = getattr(self.execution_manager, 'open_trades', {})
+            tpsl_active = False
+            if hasattr(self.tp_sl_engine, 'has_active_trades'):
+                tpsl_active = self.tp_sl_engine.has_active_trades()
+            if (open_positions and len(open_positions) > 0) or (open_trades and len(open_trades) > 0) or tpsl_active:
+                self.logger.info("[Meta:FIX#2] Overriding FLAT_PORTFOLIO: open positions/trades detected.")
+                is_flat = False
+                # --- FIX #3: Auto-exit bootstrap if real trades or TPSL monitoring ---
+                await self._disable_bootstrap_if_positions()
+        except Exception as e:
+            self.logger.warning(f"[Meta:FIX#2/3] Flat override check failed: {e}")
         
         # ═══════════════════════════════════════════════════════════════════════════════
         # BOOTSTRAP FIRST TRADE POLICY (Critical Fix for Clean Wallet Deadlock)
@@ -6079,6 +5891,7 @@ from core.meta_utils import (
         suppress_buys = bool(isinstance(rec_state, dict) and rec_state.get("active"))
         for sym in symbols_to_consider:
             sigs = signals_by_sym.get(sym, [])
+            orig_sigs = list(sigs)  # For logging rejected signals
             
             # MEMORY INJECTION (HOLD context only, not intended for execution)
             if not sigs and sym in owned_positions:
@@ -6125,6 +5938,10 @@ from core.meta_utils import (
                         )
                     else:
                         buy_suppressed = True
+                        self.logger.info(
+                            "[WHY_NO_TRADE] symbol=%s reason=CAPITAL_RECOVERY_BUY_SUPPRESSED details=capital_recovery_mode_active",
+                            sym
+                        )
                         continue
                 conf = float(sig.get("confidence", 0.0))
 
@@ -6173,8 +5990,10 @@ from core.meta_utils import (
                         final_exec_floor = max(exec_floor, mode_conf_floor)
                     
                     if conf < final_exec_floor and not sig.get("bypass_conf"):
-                        self.logger.debug("[Meta:Envelope] %s BUY rejected: conf %.2f < final_floor %.2f (bootstrap=%s)", 
-                                        sym, conf, final_exec_floor, bootstrap_execution_override)
+                        self.logger.info(
+                            "[WHY_NO_TRADE] symbol=%s reason=CONFIDENCE_TOO_LOW details=conf=%.3f final_floor=%.3f bootstrap=%s",
+                            sym, conf, final_exec_floor, bootstrap_execution_override
+                        )
                         continue
 
                     # 4. Mode-based Cooldown Gate
@@ -6188,7 +6007,7 @@ from core.meta_utils import (
                         elif not sig.get("_bootstrap_override") and not sig.get("_bootstrap"):
                             remaining = int(mode_cooldown - (now_ts - last_buy_ts))
                             self.logger.info(
-                                "[Meta:Envelope] Skipping %s BUY: mode cooldown (%ds remaining)",
+                                "[WHY_NO_TRADE] symbol=%s reason=MODE_COOLDOWN details=remaining=%ds",
                                 sym, max(0, remaining)
                             )
                             continue
@@ -6207,7 +6026,7 @@ from core.meta_utils import (
                         elif not sig.get("_bootstrap_override") and not sig.get("_bootstrap"):
                             remaining = int(self._buy_cooldown_sec - (now_ts - last_buy_ts))
                             self.logger.info(
-                                "[Meta:BUY_COOLDOWN] Skipping %s BUY: cooldown active (%ds remaining)",
+                                "[WHY_NO_TRADE] symbol=%s reason=BUY_COOLDOWN details=remaining=%ds",
                                 sym, max(0, remaining)
                             )
                             continue
@@ -6233,7 +6052,7 @@ from core.meta_utils import (
                             delta_pct = abs(cur_price - last_price) / max(last_price, 1e-9)
                             if delta_pct < self._buy_reentry_delta_pct:
                                 self.logger.info(
-                                    "[Meta:BUY_REENTRY] Skipping %s BUY: price delta %.3f%% < %.3f%%",
+                                    "[WHY_NO_TRADE] symbol=%s reason=PRICE_DELTA_TOO_SMALL details=delta=%.3f%% required=%.3f%%",
                                     sym, delta_pct * 100.0, self._buy_reentry_delta_pct * 100.0
                                 )
                                 continue
@@ -6341,10 +6160,9 @@ from core.meta_utils import (
                             )
                     if has_significant_position and not allow_reentry:
                         self.logger.info(
-                            "[Meta:REENTRY_LOCK] Skipping %s BUY: existing position qty=%.6f",
+                            "[WHY_NO_TRADE] symbol=%s reason=POSITION_ALREADY_OPEN details=qty=%.6f",
                             sym, existing_qty
                         )
-                        self.logger.info("[WHY_NO_TRADE] symbol=%s reason=POSITION_ALREADY_OPEN details=qty=%.6f", sym, existing_qty)
                         continue
 
                     # Re-entry guard after non-TP/SL exits unless signal changed
@@ -6365,14 +6183,14 @@ from core.meta_utils import (
                     if self._reentry_require_tp_sl_exit and (last_exit_ts or exit_reason_norm) and exit_reason_norm not in ("TP", "SL"):
                         if self._reentry_require_signal_change and not signal_changed:
                             self.logger.info(
-                                "[Meta:REENTRY_LOCK] Skipping %s BUY: last_exit=%s and signal unchanged",
+                                "[WHY_NO_TRADE] symbol=%s reason=REENTRY_LOCK_SIGNAL_UNCHANGED details=last_exit=%s",
                                 sym, last_exit_reason or "UNKNOWN"
                             )
                             continue
                         if self._reentry_lock_sec > 0 and (now_ts - float(last_exit_ts or 0.0)) < self._reentry_lock_sec and not signal_changed:
                             remaining = int(self._reentry_lock_sec - (now_ts - float(last_exit_ts or 0.0)))
                             self.logger.info(
-                                "[Meta:REENTRY_LOCK] Skipping %s BUY: exit cooldown active (%ds remaining)",
+                                "[WHY_NO_TRADE] symbol=%s reason=REENTRY_LOCK_EXIT_COOLDOWN details=remaining=%ds",
                                 sym, max(0, remaining)
                             )
                             continue
@@ -6424,7 +6242,7 @@ from core.meta_utils import (
                 if action != "SELL" and not self._is_bootstrap_mode():
                     try:
                         if hasattr(self.shared_state, "is_symbol_blocked") and self.shared_state.is_symbol_blocked(sym, action):
-                            self.logger.info("[Meta:Block] Skipping %s %s: blocked by rejection threshold", sym, action)
+                            self.logger.info("[WHY_NO_TRADE] symbol=%s reason=REJECTION_THRESHOLD_BLOCKED details=action=%s", sym, action)
                             continue
                     except Exception:
                         pass
