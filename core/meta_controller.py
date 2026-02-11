@@ -9723,23 +9723,23 @@ class MetaController:
             await self._health_set("Critical", f"Execution error for {symbol}: {classified_error}")
             now = time.time()
             agent_name = signal.get("agent", "Meta")
-            
+
             # 1. Clean old timestamps (Hourly window)
             for dq in [self._trade_timestamps, self._trade_timestamps_sym[symbol], self._trade_timestamps_agent[agent_name]]:
                 while dq and (now - dq[0] > 3600):
                     dq.popleft()
-            
+
             # ===== CRITICAL FIX #2A: Bootstrap BUY can bypass hourly limits =====
             is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
             is_flat_init = signal.get("_flat_init_buy", False)
-            
+
             if not (is_bootstrap or is_flat_init):
                 # 2. Gating logic (Phase A Enhancements) — Only for NORMAL BUYs
                 # GLOBAL GATE
                 if len(self._trade_timestamps) >= self._max_trades_per_hour:
                     self.logger.info("[Meta] Skip %s BUY: Global hourly trade limit (%d) reached.", symbol, self._max_trades_per_hour)
                     return {"ok": False, "status": "skipped", "reason": "global_limit", "reason_detail": "global_hourly_limit_reached"}
-                
+
                 # PER-SYMBOL GATE (Safety: Max 2 trades per symbol per hour during Phase A)
                 if len(self._trade_timestamps_sym[symbol]) >= 2:
                     self.logger.info("[Meta] Skip %s BUY: Symbol hourly trade limit reached.", symbol)
@@ -9757,9 +9757,9 @@ class MetaController:
                     symbol, is_bootstrap, is_flat_init
                 )
 
-        if symbol not in accepted_symbols_set:
-            # P9 FIX: SELL always bypasses accepted_symbols check
-            # REASON: SELL is for exiting existing positions, even if symbol is not in analysis universe
+            if symbol not in accepted_symbols_set:
+                # P9 FIX: SELL always bypasses accepted_symbols check
+                # REASON: SELL is for exiting existing positions, even if symbol is not in analysis universe
             # SELL must never be blocked by universe filters - positions must always be exitiable
             if side == "SELL":
                 self.logger.info(
