@@ -2786,9 +2786,20 @@ from core.meta_utils import (
         if self.FOCUS_MODE_ENABLED:
             await self._update_focus_symbols()
         
+
+        # --- Signal Ingestion, Symbol Sync, and Decision Building ---
+        accepted_symbols_set, decisions = await self._ingest_signals_and_build_decisions()
+        if accepted_symbols_set is None and decisions is None:
+            return
+
+    async def _ingest_signals_and_build_decisions(self):
+        """
+        Handles signal ingestion, symbol universe sync, and decision building.
+        Returns (accepted_symbols_set, decisions). If a critical error occurs, emits loop summary and returns (None, None).
+        """
         # Initialize LOOP_SUMMARY state for this tick
         self._loop_summary_state = {
-            "loop_id": loop_id,
+            "loop_id": getattr(self, '_tick_counter', 0),
             "symbols_considered": 0,
             "top_candidate": None,
             "decision": "NONE",
@@ -2807,11 +2818,11 @@ from core.meta_utils import (
             "deadlock": False,
             "system_health": "HEALTHY",
         }
-        
+
         # --- Capital Integrity: Recompute balance every tick ---
         if hasattr(self.shared_state, "sync_authoritative_balance"):
             await self.shared_state.sync_authoritative_balance()
-            
+
         # --- Circuit Breaker Invariant: Freeze on CB_OPEN ---
         if hasattr(self.shared_state, "is_circuit_breaker_open") and await self.shared_state.is_circuit_breaker_open():
             self.logger.warning("[Meta:Freeze] 🛑 Circuit Breaker is OPEN. Freezing all trade intents.")
@@ -2830,7 +2841,7 @@ from core.meta_utils import (
                         self._deactivate_focus_mode()
                 else:
                     self._focus_mode_healthy_cycles = 0
-            return
+            return None, None
 
         # 1. Consolidate Signal Ingestion (sink + bus + liquidation)
         now_epoch = self._epoch()
@@ -2841,7 +2852,7 @@ from core.meta_utils import (
         except Exception as e:
             self.logger.error("[Meta] Signal ingestion failure: %s", e)
             self._emit_loop_summary()
-            return
+            return None, None
 
         # 2. Synchronize Symbol Universe from Source of Truth
         accepted_symbols_set = set()
@@ -2855,13 +2866,13 @@ from core.meta_utils import (
         except Exception as e:
             self.logger.warning("[Meta] Symbol sync failure: %s", e)
             self._emit_loop_summary()
-            return
-        
+            return None, None
+
         self._loop_summary_state["symbols_considered"] = len(accepted_symbols_set)
 
         # 3. Build Decision Context (Portfolio Arbitration)
         decisions = await self._build_decisions(accepted_symbols_set)
-        
+
         # Frequency Engineering: Always update utilization and check for idle ticks
         if hasattr(self.shared_state, "update_utilization_metric"):
             await _safe_await(self.shared_state.update_utilization_metric())
@@ -2879,7 +2890,9 @@ from core.meta_utils import (
             except Exception:
                 pass
             self._emit_loop_summary()
-            return
+            return None, None
+
+        return accepted_symbols_set, decisions
 
         # 4. Readiness Gating (Market Data, Balances, OpsPlane)
         gated_reasons = []
