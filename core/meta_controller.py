@@ -89,6 +89,22 @@ except ImportError:
 
 class MetaController:
 
+    async def _apply_cooldown_and_health(self, symbol: str, action: str = "", cooldown_cfg_key: str = "META_DECISION_COOLDOWN_SEC", default_cooldown: float = 15.0, health_status: str = "Healthy", health_detail: str = None):
+        """
+        Helper to apply cooldown and health update after successful trade or healing.
+        """
+        try:
+            if hasattr(self.shared_state, "set_cooldown"):
+                cooldown_sec = float(self._cfg(cooldown_cfg_key, default=default_cooldown))
+                await self.shared_state.set_cooldown(symbol, cooldown_sec)
+        except Exception:
+            self.logger.debug(f"Failed to set SharedState cooldown for {symbol}")
+        try:
+            detail = health_detail or (f"Executed {action} {symbol}" if action else f"Executed {symbol}")
+            await self._health_set(health_status, detail)
+        except Exception:
+            pass
+
     async def _check_position_and_dust(self, symbol: str, signal: dict) -> dict:
         """
         Centralized check for position lock, dust status, dust healing, and bootstrap/dust bypass.
@@ -9361,17 +9377,7 @@ from core.meta_utils import (
                         self._focus_mode_trade_executed = True
                         self._focus_mode_trade_executed_count += 1
                         self.logger.info(f"[FOCUS_MODE] Trade executed: {symbol} {side} (count={self._focus_mode_trade_executed_count})")
-                    
-                    try:
-                        if hasattr(self.shared_state, "set_cooldown"):
-                            cooldown_sec = float(self._cfg("META_DECISION_COOLDOWN_SEC", default=15))
-                            await self.shared_state.set_cooldown(symbol, cooldown_sec)
-                    except Exception:
-                        self.logger.debug("Failed to set SharedState cooldown for %s", symbol)
-                    try:
-                        await self._health_set("Healthy", f"Executed BUY {symbol}")
-                    except Exception:
-                        pass
+                    await self._apply_cooldown_and_health(symbol, action=side)
             else:  # SELL
                 policy_flags = {"POLICY_SINGLE_AUTHORITY": True}
                 qty = signal.get("quantity")
