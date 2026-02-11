@@ -8963,13 +8963,12 @@ from core.meta_utils import (
         if side.upper() == "SELL":
             if not self._can_act(symbol, "SELL"):
                 self.logger.info(f"[LIFECYCLE] {symbol}: SELL execution blocked by lifecycle lock")
-
                 # Deduplicated risk pre-checks
                 risk_result = await self._run_risk_precheck(symbol, side, signal)
                 if not risk_result["ok"]:
-                    self._log_reason("INFO", symbol, f"risk_precheck:{risk_result['reason']}")
-                    await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": risk_result["reason"]})
-                    return {"ok": False, "status": "skipped", "reason": risk_result["reason"]}
+                    return await self._handle_rejection_and_log(
+                        symbol, side, signal, reason="risk_precheck", reason_detail=risk_result["reason"], status="skipped", log_level="INFO"
+                    )
                         sl_dist = abs(cur_price - float(sl or 0.0)) / cur_price if sl else 0.0
                         floor_hit = False
                         try:
@@ -8977,27 +8976,13 @@ from core.meta_utils import (
                         except Exception:
                             floor_hit = False
                         if floor_hit:
-                            self.logger.warning(
-                                "[Meta:TPSL_GUARD] Blocking BUY %s: TP below fee-aware floor (min_tp=%.3f%%)",
-                                symbol, min_tp_pct * 100.0
+                            return await self._handle_rejection_and_log(
+                                symbol, side, signal, reason="tp_sl_guard", reason_detail=f"min_tp={min_tp_pct}", status="skipped", log_level="WARNING", extra={"details": {"min_tp_pct": min_tp_pct}}
                             )
-                            await self._log_execution_result(symbol, side, signal, {
-                                "status": "skipped",
-                                "reason": "tp_sl_guard",
-                                "details": {"min_tp_pct": min_tp_pct}
-                            })
-                            return {"ok": False, "status": "skipped", "reason": "tp_sl_guard"}
                         if tp_dist < min_tp_pct or sl_dist < min_sl_pct:
-                            self.logger.warning(
-                                "[Meta:TPSL_GUARD] Blocking BUY %s: TP/SL too tight (tp=%.3f%% sl=%.3f%% min_tp=%.3f%%)",
-                                symbol, tp_dist * 100.0, sl_dist * 100.0, min_tp_pct * 100.0
+                            return await self._handle_rejection_and_log(
+                                symbol, side, signal, reason="tp_sl_guard", reason_detail=f"tp={tp_dist},sl={sl_dist},min_tp={min_tp_pct}", status="skipped", log_level="WARNING", extra={"details": {"tp_dist": tp_dist, "sl_dist": sl_dist, "min_tp_pct": min_tp_pct}}
                             )
-                            await self._log_execution_result(symbol, side, signal, {
-                                "status": "skipped",
-                                "reason": "tp_sl_guard",
-                                "details": {"tp_dist": tp_dist, "sl_dist": sl_dist, "min_tp_pct": min_tp_pct}
-                            })
-                            return {"ok": False, "status": "skipped", "reason": "tp_sl_guard"}
                     elif cur_price > 0:
                         self.logger.warning("[Meta:TPSL_GUARD] TP/SL engine missing calculate_tp_sl; skipping guard.")
                 # TIER 1: ACCUMULATING State Protection
@@ -9009,18 +8994,11 @@ from core.meta_utils import (
                         is_protected_sell = any(tag in str(intent_owner).lower() or tag in str(signal.get("agent", "")).lower() 
                                             for tag in ["risk", "liquidation", "tp_sl", "emergency", "rotation", "authority"])
                         if not is_protected_sell:
-                            self.logger.info(
-                                "[Meta:AccumGuard] Blocking SELL on %s: position is ACCUMULATING (intent_owner=%s). "
-                                "Only risk/liquidation/tp_sl/rotation/authority can override.",
-                                symbol, intent_owner
-                            )
-                            await self.shared_state.record_rejection(
-                                symbol, "SELL", "ACCUMULATING_PROTECTION", source="MetaController"
-                            )
-                            # TIER 2: Track conflict (economic gate vs accumulation protection)
                             if hasattr(self.shared_state, "record_policy_conflict"):
                                 self.shared_state.record_policy_conflict("accumulating_protection_blocks")
-                            return {"ok": False, "status": "skipped", "reason": "accumulating_protection"}
+                            return await self._handle_rejection_and_log(
+                                symbol, side, signal, reason="accumulating_protection", status="skipped", log_level="INFO"
+                            )
                 # TIER 1: Capital Preservation Floor ($50 minimum)
                 min_capital_floor = float(self._cfg("CAPITAL_PRESERVATION_FLOOR", 50.0))
                 free_quote = 0.0
@@ -9040,7 +9018,7 @@ from core.meta_utils import (
                 econ_ok, econ_reason, econ_metrics = self._check_economic_profitability(symbol, signal)
                 if not econ_ok:
                     return await self._handle_rejection_and_log(
-                        symbol, side, signal, "economic_guard", econ_reason, status="skipped", log_level="INFO", extra={"details": econ_metrics}
+                        symbol, side, signal, reason="economic_guard", reason_detail=econ_reason, status="skipped", log_level="INFO", extra={"details": econ_metrics}
                     )
                 policy_flags["ECONOMIC_PROFITABILITY_INVARIANT"] = True
                 # Double check affordability for executable qty (Rule 2/5)
@@ -9054,12 +9032,11 @@ from core.meta_utils import (
 
                 can_ex, _, reason = await self.execution_manager.can_afford_market_buy(symbol, planned_quote, policy_context=bootstrap_policy_ctx)
                 if not can_ex:
+                    # All escalation logic remains, but final reporting is deduplicated
                     self.logger.warning("⚡ [Escalation] Signal %s for %s has zero executable qty (%s). Triggering Rule 5 Escalation.", symbol, side, reason)
-                    # P9: Report capital failure immediately
                     agent = signal.get("agent", "Meta")
                     if hasattr(self.shared_state, "report_agent_capital_failure"):
                         self.shared_state.report_agent_capital_failure(agent)
-                    # Rule 6: Liquidation must be able to invalidate readiness
                     if hasattr(self.shared_state, "ops_plane_ready_event"):
                         self.shared_state.ops_plane_ready_event.clear()
                         self.logger.info("[Meta] Readiness = FALSE (Escalation Triggered)")
@@ -9069,7 +9046,6 @@ from core.meta_utils import (
                             reason=f"rule5_escalation_{symbol}"
                         )
                     elif self.liquidation_agent:
-                        # If liquidation_agent doesn't have _free_usdt_now method, try propose_liquidations instead
                         self.logger.warning(f"[Meta] LiquidationAgent doesn't have _free_usdt_now method. Using propose_liquidations instead.")
                         try:
                             target_usdt = float(self._cfg("MIN_NOTIONAL_FLOOR", 15.0))
@@ -9084,23 +9060,21 @@ from core.meta_utils import (
                             self.logger.warning(f"[Meta] Failed to generate liquidation proposals: {e}")
                     else:
                         self.logger.warning(f"[Meta] No liquidation agent available for escalation")
-                    # P9: Trigger immediate re-plan
-                    if hasattr(self.shared_state, "replan_request_event"):
-                        self.shared_state.replan_request_event.set()
-                    await self._log_execution_result(symbol, side, signal, {"status": "failed", "reason": f"rule5_escalation_{reason}"})
-                    return {"ok": False, "status": "failed", "reason": f"rule5_escalation_{reason}"}
+                        if hasattr(self.shared_state, "replan_request_event"):
+                            self.shared_state.replan_request_event.set()
+                    return await self._handle_rejection_and_log(
+                        symbol, side, signal, reason="rule5_escalation", reason_detail=reason, status="failed", log_level="WARNING"
+                    )
                 # Handle liquidity healing if needed
                 if signal.get("_need_liquidity"):
                     success = await self._attempt_liquidity_healing(symbol, signal)
                     if not success:
-                        await self._log_execution_result(
-                            symbol, side, signal, {"status": "skipped", "reason": "liquidity_healing_failed"}
+                        return await self._handle_rejection_and_log(
+                            symbol, side, signal, reason="liquidity_healing_failed", status="skipped", log_level="WARNING"
                         )
-                        return {"ok": False, "status": "skipped", "reason": "liquidity_healing"}
                 # Risk pre-check (BUY) - Tier-aware with FIX #4: liquidation bypass support
                 if self.risk_manager and hasattr(self.risk_manager, "pre_check"):
                     tier = signal.get("_tier", "A")  # Default to Tier A if not specified
-                    # FIX #4: Detect if this is a liquidation signal for bypass
                     is_liq = signal.get("_is_starvation_sell") or signal.get("_quote_based") or signal.get("_batch_sell")
                     tag = signal.get("_tag") or signal.get("tag") or ""
                     is_liq = is_liq or ("liquidation" in str(tag))
@@ -9108,9 +9082,9 @@ from core.meta_utils import (
                         symbol=symbol, side="BUY", planned_quote=planned_quote, tier=tier, is_liquidation=is_liq
                     ))
                     if not ok:
-                        self._log_reason("INFO", symbol, f"risk_precheck:{r_reason}")
-                        await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": f"risk:{r_reason}"})
-                        return {"ok": False, "status": "skipped", "reason": f"risk:{r_reason}"}
+                        return await self._handle_rejection_and_log(
+                            symbol, side, signal, reason="risk_precheck", reason_detail=r_reason, status="skipped", log_level="INFO"
+                        )
                 # P9: Revalidate signal + risk context at firing time
                 if hasattr(self.shared_state, "is_intent_valid"):
                     is_bootstrap_seed = bool(
@@ -9120,9 +9094,9 @@ from core.meta_utils import (
                         or str(signal.get("execution_tag", "")) == "meta/bootstrap_seed"
                     )
                     if not is_bootstrap_seed and not self.shared_state.is_intent_valid(symbol, "BUY"):
-                        self.logger.warning("[Meta] Signal no longer valid at firing time for %s. Skipping.", symbol)
-                        await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": "signal_invalid_at_firing"})
-                        return {"ok": False, "status": "skipped", "reason": "signal_invalid"}
+                        return await self._handle_rejection_and_log(
+                            symbol, side, signal, reason="signal_invalid_at_firing", status="skipped", log_level="WARNING"
+                        )
                 # Execute through ExecutionManager (canonical single order path)
                 tier = signal.get("_tier", "A")
                 extra_ctx = {"economic_guard": econ_metrics}
