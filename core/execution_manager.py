@@ -412,6 +412,8 @@ class ExecutionManager:
         self.exchange_client = exchange_client
         self.alert_callback = alert_callback
         self.logger = logging.getLogger(self.__class__.__name__)
+        # Add min_free_reserve_usdt attribute
+        self.min_free_reserve_usdt = float(getattr(config, 'EXECUTION_MIN_FREE_RESERVE_USDT', 0.50))
 
         # Execution-block cooldowns (finite no-trade states)
         self._buy_block_state: Dict[str, Dict[str, float]] = {}

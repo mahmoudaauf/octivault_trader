@@ -44,10 +44,12 @@ def load_config() -> Config:
     # .env اختياري
     try:
         from dotenv import load_dotenv
-        load_dotenv()
+        import os
+        load_dotenv(os.path.abspath(os.path.join(os.getcwd(), '.env')), override=True)
     except Exception as e:
         logger = logging.getLogger("Main")
         logger.warning("dotenv load failed: %s (Tip: pip install python-dotenv and ensure .env exists)", e)
+
 
     cfg = Config()
     cfg.env = os.getenv("ENV", "prod")
@@ -63,19 +65,32 @@ def _configure_logging() -> logging.Logger:
     root_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     root_level = getattr(logging, root_level_name, logging.INFO)
     if root_level_name not in logging._nameToLevel:
-        # Early warn to stderr if invalid
         sys.stderr.write(f"[main] Unknown LOG_LEVEL={root_level_name}, defaulting to INFO\n")
 
-    # Idempotent basicConfig (only applies if no handlers on root)
+    log_format = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    log_file_path = os.getenv("LOG_FILE_PATH", "logs/app.log")
+
+    # Ensure logs directory exists
+    log_dir = os.path.dirname(log_file_path)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+
+    handlers = [logging.StreamHandler(sys.stdout)]
+    try:
+        file_handler = logging.FileHandler(log_file_path, mode="a")
+        file_handler.setFormatter(logging.Formatter(log_format))
+        handlers.append(file_handler)
+    except Exception as e:
+        sys.stderr.write(f"[main] Failed to add file handler: {e}\n")
+
     logging.basicConfig(
         level=root_level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        stream=sys.stdout,
+        format=log_format,
+        handlers=handlers
     )
 
     logger = logging.getLogger("Main")
-    # Ensure “Main” doesn’t double-log if others attach root handlers later
-    logger.propagate = True  # rely on root handler
+    logger.propagate = True
     logger.debug("Logging configured at root level: %s", logging.getLevelName(logging.getLogger().level))
     return logger
 
