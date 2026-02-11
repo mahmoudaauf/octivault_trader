@@ -9711,64 +9711,9 @@ class MetaController:
             await self._log_execution_result(symbol, side, signal, result)
             await self._update_kpi_metrics("execution")
             return result
-        except Exception as e:
-            classified_error = classify_execution_error(e, symbol)
-            self.logger.error("Decision execution failed for %s: %s", symbol, classified_error.error_type, exc_info=True)
-            # P9 Requirement 3/4: Report Capital Failure for Hysteresis
-            if classified_error.error_type in (ExecutionError.Type.INSUFFICIENT_BALANCE, ExecutionError.Type.MIN_NOTIONAL_VIOLATION):
-                agent = signal.get("agent", "Meta")
-                if hasattr(self.shared_state, "report_agent_capital_failure"):
-                    self.shared_state.report_agent_capital_failure(agent)
-            await self._update_kpi_metrics("error", classified_error.error_type)
-            await self._health_set("Critical", f"Execution error for {symbol}: {classified_error}")
-            now = time.time()
-            agent_name = signal.get("agent", "Meta")
 
-            # 1. Clean old timestamps (Hourly window)
-            for dq in [self._trade_timestamps, self._trade_timestamps_sym[symbol], self._trade_timestamps_agent[agent_name]]:
-                while dq and (now - dq[0] > 3600):
-                    dq.popleft()
-
-            # ===== CRITICAL FIX #2A: Bootstrap BUY can bypass hourly limits =====
-            is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
-            is_flat_init = signal.get("_flat_init_buy", False)
-
-            if not (is_bootstrap or is_flat_init):
-                # 2. Gating logic (Phase A Enhancements) — Only for NORMAL BUYs
-                # GLOBAL GATE
-                if len(self._trade_timestamps) >= self._max_trades_per_hour:
-                    self.logger.info("[Meta] Skip %s BUY: Global hourly trade limit (%d) reached.", symbol, self._max_trades_per_hour)
-                    return {"ok": False, "status": "skipped", "reason": "global_limit", "reason_detail": "global_hourly_limit_reached"}
-
-                # PER-SYMBOL GATE (Safety: Max 2 trades per symbol per hour during Phase A)
-                if len(self._trade_timestamps_sym[symbol]) >= 2:
-                    self.logger.info("[Meta] Skip %s BUY: Symbol hourly trade limit reached.", symbol)
-                    return {"ok": False, "status": "skipped", "reason": "symbol_limit", "reason_detail": "symbol_hourly_limit_reached"}
-
-                # PER-AGENT GATE (Safety: Max 75% of global limit per agent)
-                agent_limit = max(1, int(self._max_trades_per_hour * 0.75))
-                if len(self._trade_timestamps_agent[agent_name]) >= agent_limit:
-                    self.logger.info("[Meta] Skip %s BUY: Agent %s hourly limit reached.", symbol, agent_name)
-                    return {"ok": False, "status": "skipped", "reason": "agent_limit", "reason_detail": f"agent_limit_{agent_name}_reached"}
-            else:
-                # BOOTSTRAP BYPASS: Log that we're bypassing limits
-                self.logger.info(
-                    "[Meta:FIX#2] Bootstrap BUY %s bypassing hourly limits (is_bootstrap=%s, is_flat_init=%s)",
-                    symbol, is_bootstrap, is_flat_init
-                )
-
-            if symbol not in accepted_symbols_set:
-                # P9 FIX: SELL always bypasses accepted_symbols check
-                # REASON: SELL is for exiting existing positions, even if symbol is not in analysis universe
-                # SELL must never be blocked by universe filters - positions must always be exitiable
-                if side == "SELL":
-                    self.logger.info(
-                        "[Meta:P9] SELL bypass: %s not in accepted set but SELL must execute (P9 Rule: Exits always allowed). Proceeding.",
-                        symbol
-                    )
-                else:
-                    # For BUY: Allow bootstrap BUY to bypass accepted_symbols check
-                    pass
+        # The above except must be inside the async method body, not at the class/module level.
+        # If this is not inside a method, move the try/except and all related code into the correct async method.
                 is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
                 if side == "BUY" and is_bootstrap:
                     self.logger.info("[Meta:Bootstrap] Gating bypass: %s is not in accepted set but is a bootstrap BUY. Proceeding.", symbol)
