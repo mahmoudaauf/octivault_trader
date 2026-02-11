@@ -113,71 +113,71 @@ except ImportError:
 
 class MetaController:
 
-        async def _check_position_and_dust(self, symbol: str, signal: dict) -> dict:
-            """
-            Centralized check for position lock, dust status, dust healing, and bootstrap/dust bypass.
-            Returns a dict with keys: ok (bool), reason, reason_detail, and may update signal in place.
-            """
-            is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
-            is_bootstrap_override = signal.get("_bootstrap_override", False)
-            is_flat_init = signal.get("_flat_init_buy", False)
-            is_dust_merge = signal.get("_dust_reentry_override", False)
-            focus_active = bool(getattr(self, "_focus_mode_active", False))
-            is_bootstrap_seed = bool(signal.get("_bootstrap_seed") or signal.get("bootstrap_seed") or str(signal.get("reason", "")).upper() == "BOOTSTRAP_SEED")
-            is_dust_healing = signal.get("_dust_healing", False)
+    async def _check_position_and_dust(self, symbol: str, signal: dict) -> dict:
+        """
+        Centralized check for position lock, dust status, dust healing, and bootstrap/dust bypass.
+        Returns a dict with keys: ok (bool), reason, reason_detail, and may update signal in place.
+        """
+        is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
+        is_bootstrap_override = signal.get("_bootstrap_override", False)
+        is_flat_init = signal.get("_flat_init_buy", False)
+        is_dust_merge = signal.get("_dust_reentry_override", False)
+        focus_active = bool(getattr(self, "_focus_mode_active", False))
+        is_bootstrap_seed = bool(signal.get("_bootstrap_seed") or signal.get("bootstrap_seed") or str(signal.get("reason", "")).upper() == "BOOTSTRAP_SEED")
+        is_dust_healing = signal.get("_dust_healing", False)
 
-            curr_qty = self.shared_state.get_position_qty(symbol) if hasattr(self.shared_state, "get_position_qty") else 0.0
-            pos_data = None
-            if hasattr(self.shared_state, "get_position"):
-                try:
-                    pos_data = await _safe_await(self.shared_state.get_position(symbol))
-                except Exception:
-                    pos_data = None
-            is_dust_position = False
-            if pos_data and isinstance(pos_data, dict):
-                is_dust_position = pos_data.get("is_dust", False) or pos_data.get("_is_dust", False) or pos_data.get("state", "") == "DUST_LOCKED"
-            is_bootstrap_dust_bypass = False
+        curr_qty = self.shared_state.get_position_qty(symbol) if hasattr(self.shared_state, "get_position_qty") else 0.0
+        pos_data = None
+        if hasattr(self.shared_state, "get_position"):
+            try:
+                pos_data = await _safe_await(self.shared_state.get_position(symbol))
+            except Exception:
+                pos_data = None
+        is_dust_position = False
+        if pos_data and isinstance(pos_data, dict):
+            is_dust_position = pos_data.get("is_dust", False) or pos_data.get("_is_dust", False) or pos_data.get("state", "") == "DUST_LOCKED"
+        is_bootstrap_dust_bypass = False
 
-            # Dust healing trade count check
-            if is_dust_healing:
-                metrics = getattr(self.shared_state, "metrics", {}) or {}
-                trade_count = int(
-                    metrics.get("total_trades_executed", 0)
-                    or getattr(self.shared_state, "trade_count", 0)
-                    or 0
-                )
-                if trade_count < 1:
-                    return {"ok": False, "reason": "dust_healing_not_ready", "reason_detail": "no_realized_trades"}
+        # Dust healing trade count check
+        if is_dust_healing:
+            metrics = getattr(self.shared_state, "metrics", {}) or {}
+            trade_count = int(
+                metrics.get("total_trades_executed", 0)
+                or getattr(self.shared_state, "trade_count", 0)
+                or 0
+            )
+            if trade_count < 1:
+                return {"ok": False, "reason": "dust_healing_not_ready", "reason_detail": "no_realized_trades"}
 
-            # Position lock logic
-            if curr_qty > 0 and not is_dust_merge:
-                is_bootstrap_dust_bypass = self._bootstrap_dust_bypass_allowed(
-                    symbol,
-                    bool(is_bootstrap_override),
-                    bool(is_dust_position),
-                )
-                if not (is_bootstrap_seed or is_bootstrap_dust_bypass or (is_dust_healing and (is_dust_position or is_bootstrap or is_bootstrap_override or is_flat_init))):
-                    return {"ok": False, "reason": "position_lock", "reason_detail": "position_already_exists"}
+        # Position lock logic
+        if curr_qty > 0 and not is_dust_merge:
+            is_bootstrap_dust_bypass = self._bootstrap_dust_bypass_allowed(
+                symbol,
+                bool(is_bootstrap_override),
+                bool(is_dust_position),
+            )
+            if not (is_bootstrap_seed or is_bootstrap_dust_bypass or (is_dust_healing and (is_dust_position or is_bootstrap or is_bootstrap_override or is_flat_init))):
+                return {"ok": False, "reason": "position_lock", "reason_detail": "position_already_exists"}
+            else:
+                if is_bootstrap_seed:
+                    signal["_bootstrap_seed_bypass"] = True
+                elif is_bootstrap_dust_bypass:
+                    signal["execution_tag"] = "meta/bootstrap_dust"
+                    signal["_bootstrap_dust_bypass"] = True
                 else:
-                    if is_bootstrap_seed:
-                        signal["_bootstrap_seed_bypass"] = True
-                    elif is_bootstrap_dust_bypass:
-                        signal["execution_tag"] = "meta/bootstrap_dust"
-                        signal["_bootstrap_dust_bypass"] = True
-                    else:
-                        signal["execution_tag"] = "meta/dust_healing"
+                    signal["execution_tag"] = "meta/dust_healing"
 
-            # Dust healing overrides
-            if is_dust_healing:
-                pre_value = float(signal.get("pre_value", 0.0))
-                post_value = float(signal.get("post_value", 0.0))
-                signal["tier"] = "DUST_RECOVERY"
-                signal["execution_tag"] = "meta/dust_healing"
-                signal["agent"] = "Meta"
-                return {"ok": True, "reason": "dust_healing", "reason_detail": f"pre_value={pre_value},post_value={post_value}"}
+        # Dust healing overrides
+        if is_dust_healing:
+            pre_value = float(signal.get("pre_value", 0.0))
+            post_value = float(signal.get("post_value", 0.0))
+            signal["tier"] = "DUST_RECOVERY"
+            signal["execution_tag"] = "meta/dust_healing"
+            signal["agent"] = "Meta"
+            return {"ok": True, "reason": "dust_healing", "reason_detail": f"pre_value={pre_value},post_value={post_value}"}
 
-            # If all checks pass
-            return {"ok": True}
+        # If all checks pass
+        return {"ok": True}
     def _reset_bootstrap_override_if_deadlocked(self, symbol: str, signal: dict, last_result: dict = None):
         """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
         # Check if position is flat
