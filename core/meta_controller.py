@@ -8970,20 +8970,22 @@ from core.meta_utils import (
                     return await self._handle_rejection_and_log(
                         symbol, side, signal, reason="risk_precheck", reason_detail=risk_result["reason"], status="skipped", log_level="INFO"
                     )
-                    sl_dist = abs(cur_price - float(sl or 0.0)) / cur_price if sl else 0.0
+
+                # TP/SL guard logic (should not be nested in risk_result block)
+                sl_dist = abs(cur_price - float(sl or 0.0)) / cur_price if sl else 0.0
+                floor_hit = False
+                try:
+                    floor_hit = bool(getattr(self.tp_sl_engine, "_tp_floor_hit", {}).get(symbol))
+                except Exception:
                     floor_hit = False
-                    try:
-                        floor_hit = bool(getattr(self.tp_sl_engine, "_tp_floor_hit", {}).get(symbol))
-                    except Exception:
-                        floor_hit = False
-                    if floor_hit:
-                        return await self._handle_rejection_and_log(
-                            symbol, side, signal, reason="tp_sl_guard", reason_detail=f"min_tp={min_tp_pct}", status="skipped", log_level="WARNING", extra={"details": {"min_tp_pct": min_tp_pct}}
-                        )
-                    if tp_dist < min_tp_pct or sl_dist < min_sl_pct:
-                        return await self._handle_rejection_and_log(
-                            symbol, side, signal, reason="tp_sl_guard", reason_detail=f"tp={tp_dist},sl={sl_dist},min_tp={min_tp_pct}", status="skipped", log_level="WARNING", extra={"details": {"tp_dist": tp_dist, "sl_dist": sl_dist, "min_tp_pct": min_tp_pct}}
-                        )
+                if floor_hit:
+                    return await self._handle_rejection_and_log(
+                        symbol, side, signal, reason="tp_sl_guard", reason_detail=f"min_tp={min_tp_pct}", status="skipped", log_level="WARNING", extra={"details": {"min_tp_pct": min_tp_pct}}
+                    )
+                if tp_dist < min_tp_pct or sl_dist < min_sl_pct:
+                    return await self._handle_rejection_and_log(
+                        symbol, side, signal, reason="tp_sl_guard", reason_detail=f"tp={tp_dist},sl={sl_dist},min_tp={min_tp_pct}", status="skipped", log_level="WARNING", extra={"details": {"tp_dist": tp_dist, "sl_dist": sl_dist, "min_tp_pct": min_tp_pct}}
+                    )
                 elif cur_price > 0:
                     self.logger.warning("[Meta:TPSL_GUARD] TP/SL engine missing calculate_tp_sl; skipping guard.")
                 # TIER 1: ACCUMULATING State Protection
