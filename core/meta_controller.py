@@ -89,6 +89,39 @@ except ImportError:
 
 class MetaController:
 
+    async def _run_risk_precheck(self, symbol: str, side: str, signal: dict) -> dict:
+        """
+        Centralized risk pre-check for capital floor, risk manager, and exposure/risk limits.
+        Returns a dict with keys: ok (bool), reason (if blocked), or None if passed.
+        """
+        min_capital_floor = float(self._cfg("CAPITAL_PRESERVATION_FLOOR", 50.0))
+        free_quote = 0.0
+        try:
+            if hasattr(self.shared_state, "get_free_quote"):
+                maybe = self.shared_state.get_free_quote()
+                if _asyncio.iscoroutine(maybe):
+                    free_quote = await maybe
+                else:
+                    free_quote = float(maybe or 0.0)
+        except Exception:
+            free_quote = 0.0
+        if side.upper() == "BUY" and free_quote < min_capital_floor:
+            return {"ok": False, "reason": "capital_floor"}
+
+        if self.risk_manager and hasattr(self.risk_manager, "pre_check"):
+            planned_quote = signal.get("planned_quote") or signal.get("quote_amount") or signal.get("_planned_quote")
+            tier = signal.get("_tier", "A")
+            is_liq = signal.get("_is_starvation_sell") or signal.get("_quote_based") or signal.get("_batch_sell")
+            tag = signal.get("_tag") or signal.get("tag") or ""
+            is_liq = is_liq or ("liquidation" in str(tag))
+            ok, r_reason = await _safe_await(self.risk_manager.pre_check(
+                symbol=symbol, side=side, planned_quote=planned_quote, tier=tier, is_liquidation=is_liq
+            ))
+            if not ok:
+                return {"ok": False, "reason": f"risk:{r_reason}"}
+
+        return {"ok": True}
+
     async def _apply_cooldown_and_health(self, symbol: str, action: str = "", cooldown_cfg_key: str = "META_DECISION_COOLDOWN_SEC", default_cooldown: float = 15.0, health_status: str = "Healthy", health_detail: str = None):
         """
         Helper to apply cooldown and health update after successful trade or healing.
@@ -8915,141 +8948,13 @@ from core.meta_utils import (
         if side.upper() == "SELL":
             if not self._can_act(symbol, "SELL"):
                 self.logger.info(f"[LIFECYCLE] {symbol}: SELL execution blocked by lifecycle lock")
-                return
-        # ...existing code...
-        # On successful SELL, update lifecycle
-        if side.upper() == "SELL":
-            self._on_sell_executed(symbol)
-        """Standardized execution path with P9-aligned readiness and trade frequency gating."""
-        # NOTE: Execution attempts are counted only when we actually call ExecutionManager.
-        # This prevents policy rejections from inflating liveness counters.
-        last_result = None
-        if side == "BUY":
-            agent_name = signal.get("agent", "Meta")
-            is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
-            is_bootstrap_override = signal.get("_bootstrap_override", False)
-            is_flat_init = signal.get("_flat_init_buy", False)
-            is_dust_merge = signal.get("_dust_reentry_override", False)
-            focus_active = bool(getattr(self, "_focus_mode_active", False))
-            is_bootstrap_seed = bool(signal.get("_bootstrap_seed") or signal.get("bootstrap_seed") or str(signal.get("reason", "")).upper() == "BOOTSTRAP_SEED")
 
-            # Deduplicated position and dust checks
-            pos_result = await self._check_position_and_dust(symbol, signal)
-            if not pos_result["ok"]:
-                self.logger.warning(f"[Meta:PositionCheck] REJECTING BUY {symbol}: {pos_result['reason_detail']}")
-                return {"ok": False, "status": "skipped", "reason": pos_result["reason"], "reason_detail": pos_result.get("reason_detail", "")}
-            elif not (is_bootstrap or is_bootstrap_override or is_flat_init or is_dust_merge or focus_active):
-                # Deduplicated trade gating and limit checks
-                limit_result = self._check_trade_limits(symbol, agent_name, side="BUY")
-                if not limit_result["ok"]:
-                    self.logger.info(f"[Meta] Skip {symbol} BUY: {limit_result['reason_detail']}")
-                    return {"ok": False, "status": "skipped", "reason": limit_result["reason"], "reason_detail": limit_result["reason_detail"]}
-            else:
-                # BOOTSTRAP BYPASS: Log that we're bypassing limits
-                self.logger.info(
-                    "[Meta:FIX#2] Bootstrap BUY %s bypassing hourly limits (is_bootstrap=%s, is_flat_init=%s)",
-                    symbol, is_bootstrap, is_flat_init
-                )
-                if focus_active:
-                    self.logger.info("[Meta:FocusMode] BUY limits relaxed for %s (focus mode active).", symbol)
-        if symbol not in accepted_symbols_set:
-            # P9 FIX: SELL always bypasses accepted_symbols check
-            # REASON: SELL is for exiting existing positions, even if symbol is not in analysis universe
-            # SELL must never be blocked by universe filters - positions must always be exitiable
-            if side == "SELL":
-                self.logger.info(
-                    "[Meta:P9] SELL bypass: %s not in accepted set but SELL must execute (P9 Rule: Exits always allowed). Proceeding.",
-                    symbol
-                )
-            else:
-                # For BUY: Allow bootstrap BUY to bypass accepted_symbols check
-                is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
-                if side == "BUY" and is_bootstrap:
-                    self.logger.info("[Meta:Bootstrap] Gating bypass: %s is not in accepted set but is a bootstrap BUY. Proceeding.", symbol)
-                else:
-                    self.logger.warning("Skipping unaccepted symbol: %s", symbol)
-                    await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": "symbol_not_accepted"})
-                    return {"ok": False, "status": "skipped", "reason": "symbol_not_accepted"}
-        # Ensure per-symbol market data is ready if SharedState provides a hook
-        try:
-            fn = getattr(self.shared_state, "is_symbol_data_ready", None)
-            if callable(fn):
-                ok = fn(symbol)
-                if _asyncio.iscoroutine(ok):
-                    ok = await ok
-                if not ok:
-                    await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": "symbol_data_not_ready"})
-                    return {"ok": False, "status": "skipped", "reason": "symbol_data_not_ready"}
-        except Exception:
-            self.logger.debug("symbol readiness check failed for %s", symbol, exc_info=True)
-        try:
-            if side == "BUY":
-                # Step 1: Fetch symbol economics from exchange
-                filters = await self.exchange_client.ensure_symbol_filters_ready(symbol)
-                min_notional = float(getattr(filters, "min_notional", 0.0) or filters.get("min_notional", 0.0) or 0.0)
-                min_entry_quote = max(min_notional, float(self._cfg("MIN_ENTRY_QUOTE", 0.0)))
-                step_size = float(getattr(filters, "step_size", 0.0) or filters.get("step_size", 0.0) or 0.0)
-                min_qty = float(getattr(filters, "min_qty", 0.0) or filters.get("min_qty", 0.0) or 0.0)
-                dust_threshold = min_notional * 0.9
-                # Attach to policy_context
-                policy_context = {
-                    "min_notional": min_notional,
-                    "min_entry_quote": min_entry_quote,
-                    "step_size": step_size,
-                    "min_qty": min_qty,
-                    "dust_threshold": dust_threshold,
-                }
-                # Strict Rule 5: Zero-amount execution must NEVER be OK
-                planned_quote = float(signal.get("_planned_quote", 0.0))
-                if planned_quote <= 0:
-                    planned_quote = await self._planned_quote_for(symbol, signal)
-                # Reservation fallback: remap agent to a funded reservation key if needed
-                agent_name = signal.get("agent", "Meta")
-                try:
-                    if hasattr(self.shared_state, "get_authoritative_reservation"):
-                        auth_res = float(self.shared_state.get_authoritative_reservation(agent_name) or 0.0)
-                        if auth_res < planned_quote:
-                            fallback_agent = None
-                            if hasattr(self.shared_state, "get_authoritative_reservations"):
-                                reservations = self.shared_state.get_authoritative_reservations() or {}
-                                if isinstance(reservations, dict):
-                                    if float(reservations.get("Meta", 0.0) or 0.0) >= planned_quote:
-                                        fallback_agent = "Meta"
-                                    else:
-                                        for cand, val in reservations.items():
-                                            if float(val or 0.0) >= planned_quote:
-                                                fallback_agent = cand
-                                                break
-                            if fallback_agent and fallback_agent != agent_name:
-                                self.logger.warning(
-                                    "[Meta:ReservationFallback] Remapping agent %s -> %s for %s (planned=%.2f)",
-                                    agent_name, fallback_agent, symbol, planned_quote
-                                )
-                                signal["_reservation_original_agent"] = agent_name
-                                signal["agent"] = fallback_agent
-                                signal["_reservation_fallback"] = True
-                                agent_name = fallback_agent
-                except Exception:
-                    self.logger.debug("[Meta:ReservationFallback] Failed to evaluate reservation fallback", exc_info=True)
-                # Early TP/SL sanity check to avoid entries with unrealistic exits
-                if getattr(self, "tp_sl_engine", None) is not None and bool(self._cfg("TP_SL_GUARD_ENABLED", True)):
-                    cur_price = 0.0
-                    try:
-                        if hasattr(self.shared_state, "safe_price"):
-                            cur_price = float(await _safe_await(self.shared_state.safe_price(symbol)) or 0.0)
-                    except Exception:
-                        cur_price = 0.0
-                    if not cur_price:
-                        cur_price = float(getattr(self.shared_state, "latest_prices", {}).get(symbol, 0.0) or 0.0)
-                    if cur_price > 0 and hasattr(self.tp_sl_engine, "calculate_tp_sl"):
-                        tp, sl = self.tp_sl_engine.calculate_tp_sl(symbol, cur_price, tier=signal.get("_tier"))
-                        taker_bps = float(self._get_fee_bps(self.shared_state, "taker") or 10.0)
-                        slippage_bps = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0)
-                        buffer_bps = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0)
-                        min_tp_pct_floor = (taker_bps * 2.0 + slippage_bps + buffer_bps) / 10000.0
-                        min_tp_pct = max(min_tp_pct_floor, float(self._cfg("TP_SL_MIN_TP_PCT", 0.002) or 0.0))
-                        min_sl_pct = float(self._cfg("TP_SL_MIN_SL_PCT", 0.002) or 0.0)
-                        tp_dist = abs(float(tp or 0.0) - cur_price) / cur_price if tp else 0.0
+                # Deduplicated risk pre-checks
+                risk_result = await self._run_risk_precheck(symbol, side, signal)
+                if not risk_result["ok"]:
+                    self._log_reason("INFO", symbol, f"risk_precheck:{risk_result['reason']}")
+                    await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": risk_result["reason"]})
+                    return {"ok": False, "status": "skipped", "reason": risk_result["reason"]}
                         sl_dist = abs(cur_price - float(sl or 0.0)) / cur_price if sl else 0.0
                         floor_hit = False
                         try:
