@@ -596,16 +596,17 @@ class MetaController:
         self._bootstrap_seed_cycle = None
         self._bootstrap_dust_bypass_used = set()  # Track one-shot bootstrap dust scale bypass per symbol
 
- # Utility classes and functions moved to core/meta_utils.py
-from core.meta_utils import (
-    BoundedCache,
-    ThreadSafeIntentSink,
-    ExecutionError,
-    DustState,
-    LiquidityPlan,
-    parse_timestamp,
-    classify_execution_error,
-)
+
+    # Utility classes and functions moved to core/meta_utils.py
+    from core.meta_utils import (
+        BoundedCache,
+        ThreadSafeIntentSink,
+        ExecutionError,
+        DustState,
+        LiquidityPlan,
+        parse_timestamp,
+        classify_execution_error,
+    )
 
     # ...existing code...
 
