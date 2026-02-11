@@ -9760,14 +9760,15 @@ class MetaController:
             if symbol not in accepted_symbols_set:
                 # P9 FIX: SELL always bypasses accepted_symbols check
                 # REASON: SELL is for exiting existing positions, even if symbol is not in analysis universe
-            # SELL must never be blocked by universe filters - positions must always be exitiable
-            if side == "SELL":
-                self.logger.info(
-                    "[Meta:P9] SELL bypass: %s not in accepted set but SELL must execute (P9 Rule: Exits always allowed). Proceeding.",
-                    symbol
-                )
-            else:
-                # For BUY: Allow bootstrap BUY to bypass accepted_symbols check
+                # SELL must never be blocked by universe filters - positions must always be exitiable
+                if side == "SELL":
+                    self.logger.info(
+                        "[Meta:P9] SELL bypass: %s not in accepted set but SELL must execute (P9 Rule: Exits always allowed). Proceeding.",
+                        symbol
+                    )
+                else:
+                    # For BUY: Allow bootstrap BUY to bypass accepted_symbols check
+                    pass
                 is_bootstrap = "bootstrap" in str(signal.get("reason", "")).lower()
                 if side == "BUY" and is_bootstrap:
                     self.logger.info("[Meta:Bootstrap] Gating bypass: %s is not in accepted set but is a bootstrap BUY. Proceeding.", symbol)
