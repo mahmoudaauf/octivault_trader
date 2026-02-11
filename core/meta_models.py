@@ -49,6 +49,48 @@ class DustState(Enum):
     TRADABLE = "tradable"
 
 
+class ControllerPhase(Enum):
+    """MetaController lifecycle phase (replaces scattered boolean flags).
+
+    State transitions:
+        INIT -> BOOTSTRAP -> SEEDING -> NORMAL -> PAUSED
+                                     -> FOCUS
+        Any state -> PAUSED (via operator command)
+    """
+    INIT = "init"                  # Before first evaluate_and_act
+    BOOTSTRAP = "bootstrap"        # Cold start, no positions
+    SEEDING = "seeding"            # Bootstrap seed trade in progress
+    NORMAL = "normal"              # Steady-state operation
+    FOCUS = "focus"                # Focus mode (reduced symbol set)
+    PAUSED = "paused"              # Trading halted
+
+
+@dataclass
+class DecisionContext:
+    """Per-tick context passed through the decision pipeline.
+
+    Replaces scattered dicts and local variables in _build_decisions,
+    making the decision data flow explicit and testable.
+    """
+    tick_id: int = 0
+    is_flat: bool = True
+    is_bootstrap: bool = False
+    total_positions: int = 0
+    significant_positions: int = 0
+    dust_positions: int = 0
+    max_positions: int = 5
+    portfolio_full: bool = False
+    capital_floor_ok: bool = True
+    mandatory_sell_mode: bool = False
+    nav: float = 0.0
+    free_capital: float = 0.0
+    # Context flags (replaces context_flags dict)
+    p0_gate_open: bool = False
+    dust_healing_available: bool = False
+    dust_sacrifice_necessary: bool = False
+    capital_starved: bool = False
+
+
 @dataclass
 class LiquidityPlan:
     """Enhanced liquidation plan with P9 compliance."""

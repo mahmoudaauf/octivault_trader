@@ -41,7 +41,7 @@ import datetime
 import time
 import inspect as _inspect
 import asyncio as _asyncio
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from datetime import timezone
 import logging
 import json
@@ -67,6 +67,8 @@ from core.meta_models import (
     LiquidityPlan,
     BoundedCache,
     ThreadSafeIntentSink,
+    ControllerPhase,
+    DecisionContext,
     parse_timestamp,
     classify_execution_error,
 )
@@ -125,6 +127,17 @@ except ImportError:
 # ==============================================================================
 
 
+# Sentinel for config cache miss detection (None is a valid cached value)
+_CFG_SENTINEL = object()
+
+# Config keys called 5+ times per tick — cached in _cfg_cache for performance
+_CFG_HOT_KEYS = frozenset({
+    "QUOTE_ASSET", "MIN_NOTIONAL_FLOOR", "MIN_SIGNIFICANT_USD",
+    "MIN_NOTIONAL_USDT", "MIN_SIGNIFICANT_POSITION_USDT",
+    "DEFAULT_PLANNED_QUOTE", "CAPITAL_PRESERVATION_FLOOR",
+    "MIN_ENTRY_QUOTE_USDT", "MIN_EXECUTION_CONFIDENCE",
+})
+
 ############################################################
 # SECTION: MetaController Lifecycle & Entry Points
 # Responsibility:
@@ -142,6 +155,35 @@ class MetaController:
     LIFECYCLE_ROTATION_PENDING = "ROTATION_PENDING"
     LIFECYCLE_LIQUIDATION = "LIQUIDATION"
 
+    # Valid phase transitions (from -> {allowed targets})
+    _PHASE_TRANSITIONS: Dict[ControllerPhase, Set] = {
+        ControllerPhase.INIT: {ControllerPhase.BOOTSTRAP, ControllerPhase.NORMAL, ControllerPhase.PAUSED},
+        ControllerPhase.BOOTSTRAP: {ControllerPhase.SEEDING, ControllerPhase.NORMAL, ControllerPhase.PAUSED},
+        ControllerPhase.SEEDING: {ControllerPhase.NORMAL, ControllerPhase.BOOTSTRAP, ControllerPhase.PAUSED},
+        ControllerPhase.NORMAL: {ControllerPhase.FOCUS, ControllerPhase.PAUSED},
+        ControllerPhase.FOCUS: {ControllerPhase.NORMAL, ControllerPhase.PAUSED},
+        ControllerPhase.PAUSED: {ControllerPhase.NORMAL, ControllerPhase.BOOTSTRAP},
+    }
+
+    @property
+    def phase(self) -> ControllerPhase:
+        """Current controller lifecycle phase."""
+        return self._phase
+
+    def _transition_phase(self, target: ControllerPhase, reason: str = "") -> bool:
+        """Attempt a phase transition. Returns True if transition was valid."""
+        allowed = self._PHASE_TRANSITIONS.get(self._phase, set())
+        if target not in allowed:
+            self.logger.warning(
+                "[Phase] Invalid transition %s -> %s (reason=%s). Allowed: %s",
+                self._phase.value, target.value, reason, [p.value for p in allowed],
+            )
+            return False
+        prev = self._phase
+        self._phase = target
+        self.logger.info("[Phase] %s -> %s (reason=%s)", prev.value, target.value, reason)
+        return True
+
     def _reset_bootstrap_override_if_deadlocked(self, symbol: str, signal: dict, last_result: dict = None):
         """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
         # Check if position is flat
@@ -153,7 +195,10 @@ class MetaController:
             elif hasattr(self.shared_state, "get_position"):
                 pos = self.shared_state.get_position(symbol)
                 if _asyncio.iscoroutine(pos):
-                    pos = _asyncio.get_event_loop().run_until_complete(pos)
+                    # Cannot use run_until_complete in async context (deadlock).
+                    # Use cached snapshot instead.
+                    snap = getattr(self, "_tick_positions_snapshot", None) or {}
+                    pos = snap.get(symbol, {})
                 qty = float(pos.get("qty", 0.0) or pos.get("quantity", 0.0) or 0.0)
             is_flat = qty == 0.0
         except Exception:
@@ -187,7 +232,6 @@ class MetaController:
         """
         Compute the minimum executable quantity that satisfies min_notional, min_qty, and step_size, with buffers.
         """
-        from math import ceil
         if price <= 0 or min_notional <= 0 or step_size <= 0:
             return 0.0
         # Apply fee and slippage buffer
@@ -196,7 +240,6 @@ class MetaController:
         # Enforce min_qty and step_size
         qty = max(qty, min_qty)
         # Round down to step_size
-        from decimal import Decimal, ROUND_DOWN
         qty = float((Decimal(str(qty)) / Decimal(str(step_size))).to_integral_value(rounding=ROUND_DOWN) * Decimal(str(step_size)))
         return qty
 
@@ -333,13 +376,13 @@ class MetaController:
     def _on_sell_executed(self, symbol):
         self._set_lifecycle(symbol, self.LIFECYCLE_ROTATION_PENDING)
         # Freeze dust healing for cooldown (e.g., 10 min)
-        import time
         self.dust_healing_cooldown[symbol] = time.time() + 600
         self.logger.info(f"[LIFECYCLE] {symbol}: Dust healing frozen for 600s after SELL")
         if getattr(self, "_bootstrap_seed_active", False):
             self._bootstrap_seed_active = False
             self._bootstrap_seed_used = True
             self._bootstrap_seed_enabled = False
+            self._transition_phase(ControllerPhase.NORMAL, "seed_trade_completed")
             self.logger.warning("[BOOTSTRAP] Seed trade completed. System unlocked.")
             try:
                 if hasattr(self, "mode_manager") and self.mode_manager.get_mode().upper() == "BOOTSTRAP":
@@ -389,6 +432,7 @@ class MetaController:
         self.exchange_client = exchange_client
         self.execution_manager = execution_manager
         self.config = config
+        self._cfg_cache: Dict[str, Any] = {}  # Hot-path config cache (see _CFG_HOT_KEYS)
         self.cot_assistant = cot_assistant
         self.alert_callback = alert_callback
         self.liquidation_agent = liquidation_agent
@@ -435,7 +479,12 @@ class MetaController:
         # Initialize ops plane readiness flag
         self._has_emitted_ops_ready = False
         
-        # Initialize lifecycle and mode tracking flags
+        # Controller phase FSM (canonical source of truth for lifecycle state).
+        # Individual boolean flags below are kept for backward compatibility
+        # and will be deprecated once all callers migrate to self.phase.
+        self._phase = ControllerPhase.INIT
+
+        # Initialize lifecycle and mode tracking flags (legacy - see _phase above)
         self._perf_eval_ready = False
         self._first_trade_executed = False
         self._bootstrap_lock_engaged = False
@@ -625,6 +674,28 @@ class MetaController:
         # Initialize symbol lifecycle state tracking (required by _can_act / dust healing)
         self._init_symbol_lifecycle()
 
+    def _get_positions_snapshot(self) -> Dict[str, Any]:
+        """Return cached per-tick positions snapshot or fetch fresh.
+
+        Avoids redundant calls to shared_state.get_positions_snapshot() within
+        the same evaluation tick.  Callers that need post-execution fresh data
+        should call self._invalidate_tick_cache() first.
+        """
+        snap = getattr(self, "_tick_positions_snapshot", None)
+        if snap is not None:
+            return snap
+        try:
+            snap = self._get_positions_snapshot()
+        except Exception:
+            snap = {}
+        self._tick_positions_snapshot = snap
+        return snap
+
+    def _invalidate_tick_cache(self) -> None:
+        """Invalidate per-tick caches after trade execution so subsequent
+        reads get fresh data."""
+        self._tick_positions_snapshot = None
+
     def _info_once(self, key: str, msg: str, *args):
         """Helper to log important events only once to avoid spamming."""
         if key not in self._info_cache:
@@ -658,7 +729,7 @@ class MetaController:
 
         try:
             if hasattr(self.shared_state, "get_positions_snapshot"):
-                snap = await _safe_await(self.shared_state.get_positions_snapshot())
+                snap = self._get_positions_snapshot()
                 if isinstance(snap, dict) and sym in snap:
                     pos = snap.get(sym) or {}
                     qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
@@ -774,11 +845,14 @@ class MetaController:
             self.logger.info("[Meta:FOCUS_MODE] Skipped activation: FOCUS_MODE is disabled by config.")
             return
         self.focus_mode_manager.activate_focus_mode(reason)
+        self._transition_phase(ControllerPhase.FOCUS, reason)
 
     def _deactivate_focus_mode(self):
         """Delegate focus mode deactivation to FocusModeManager."""
         self.focus_mode_manager.deactivate_focus_mode()
         self._focus_mode_healthy_cycles = 0
+        if self._phase == ControllerPhase.FOCUS:
+            self._transition_phase(ControllerPhase.NORMAL, "focus_mode_exit")
 
     @property
     def _mandatory_sell_mode_active(self):
@@ -867,7 +941,6 @@ class MetaController:
     # Depends on: None (utility function)
     def _epoch(self) -> float:
         """Return current epoch timestamp in seconds."""
-        import time
         return time.time()
 
     def _signal_fingerprint(self, sig: Dict[str, Any]) -> str:
@@ -1284,7 +1357,7 @@ class MetaController:
                 # Check if symbol is in focus
                 if symbol not in self.FOCUS_SYMBOLS:
                     # Check if it's an existing position (accumulation allowed on existing)
-                    snap = self.shared_state.get_positions_snapshot() or {}
+                    snap = self._get_positions_snapshot()
                     existing_qty = 0.0
                     for sym_raw, pos_data in snap.items():
                         if self._normalize_symbol(sym_raw) == symbol:
@@ -1897,16 +1970,30 @@ class MetaController:
             pass
         return snap
     def _cfg(self, section_or_key: str, key: typing.Optional[str] = None, default=None):
-        """Helper to get config values with optional section/key pattern."""
+        """Helper to get config values with optional section/key pattern.
+
+        Hot-path keys (called 5+ times per tick) are cached in _cfg_cache
+        to avoid repeated getattr lookups.
+        """
         # Robust Overload: If 2nd arg (key) is passed but not a string, treat it as default
         if key is not None and not isinstance(key, str) and default is None:
             default = key
             key = None
 
+        # Fast path: simple key (no section) and cached
+        if key is None:
+            cache = self._cfg_cache
+            cached = cache.get(section_or_key, _CFG_SENTINEL)
+            if cached is not _CFG_SENTINEL:
+                return cached
+
         try:
             val = getattr(self.config, section_or_key, default)
             if key and hasattr(val, "get"):
                 return val.get(key, default)
+            # Cache simple key lookups for hot-path performance
+            if key is None and section_or_key in _CFG_HOT_KEYS:
+                self._cfg_cache[section_or_key] = val
             return val
         except Exception:
             return default
@@ -2313,7 +2400,7 @@ class MetaController:
         # ===== SECONDARY CHECK: Portfolio Snapshot (from policy manager) =====
         # This provides a second authoritative opinion.
         try:
-            snap = self.shared_state.get_positions_snapshot()
+            snap = self._get_positions_snapshot()
             if snap and len(snap) > 0:
                 for sym, p in snap.items():
                     qty = float(p.get("qty", 0.0) or p.get("quantity", 0.0))
@@ -2382,10 +2469,10 @@ class MetaController:
         except Exception as e:
             self.logger.debug("[Meta:SellGate:Fallback] get_positions() failed for %s: %s", symbol, e)
         
-        # Fallback: Try get_positions_snapshot()
+        # Fallback: Try cached positions snapshot
         try:
             if hasattr(self.shared_state, "get_positions_snapshot"):
-                snap = self.shared_state.get_positions_snapshot()
+                snap = self._get_positions_snapshot()
                 if snap and isinstance(snap, dict):
                     p = snap.get(symbol)
                     if p and isinstance(p, dict):
@@ -2493,6 +2580,12 @@ class MetaController:
         await self._disable_bootstrap_if_positions()
         self._running = True
         self.interval = interval_sec
+        # Transition from INIT to appropriate phase
+        if self._phase == ControllerPhase.INIT:
+            if self._is_bootstrap_mode():
+                self._transition_phase(ControllerPhase.BOOTSTRAP, "start")
+            else:
+                self._transition_phase(ControllerPhase.NORMAL, "start")
 
         self._eval_task = _asyncio.create_task(self.run(), name="meta.run")
         self._health_task = _asyncio.create_task(self.report_health_loop(), name="meta.health")
@@ -2514,7 +2607,7 @@ class MetaController:
     async def _disable_bootstrap_if_positions(self) -> None:
         """Hard rule: disable bootstrap when any exchange-backed positions exist."""
         try:
-            snap = self.shared_state.get_positions_snapshot() or {}
+            snap = self._get_positions_snapshot()
             has_positions = False
             for pos in snap.values():
                 qty = float(pos.get("quantity", 0.0) or pos.get("qty", 0.0))
@@ -2530,6 +2623,7 @@ class MetaController:
             self._bootstrap_focus_symbols_pending = False
             self._current_mode = "NORMAL"
             self._last_mode = "BOOTSTRAP"
+            self._transition_phase(ControllerPhase.NORMAL, "positions_detected")
 
             if self._post_bootstrap_symbol_limit is not None:
                 self._active_symbol_limit = self._post_bootstrap_symbol_limit
@@ -2699,7 +2793,7 @@ class MetaController:
                         
                         # Active Lifecycle check (Rule 3)
                         if not has_executable_capital:
-                            snap = self.shared_state.get_positions_snapshot()
+                            snap = self._get_positions_snapshot()
                             for p in snap.values():
                                 if float(p.get("quantity", 0.0)) > 0:
                                     has_executable_capital = True
@@ -2776,6 +2870,14 @@ class MetaController:
         self.tick_id += 1
         self._tick_counter += 1
         loop_id = self._tick_counter
+
+        # Per-tick position snapshot cache: avoids 15+ redundant get_positions_snapshot() calls per cycle.
+        # Methods should use self._tick_positions_snapshot instead of calling get_positions_snapshot() directly.
+        # Invalidated after execution (set to None) so post-execution logic gets fresh data.
+        try:
+            self._tick_positions_snapshot = self.shared_state.get_positions_snapshot() or {}
+        except Exception:
+            self._tick_positions_snapshot = {}
 
         # Refresh temporary BUY re-entry delta (auto-restore based on equity/trade count)
         self._refresh_buy_reentry_delta()
@@ -2974,6 +3076,7 @@ class MetaController:
                         elif res is True: status = "FILLED"
                         
                         if status in ("FILLED", "PARTIALLY_FILLED", "PLACED", "EXECUTED"):
+                            self._invalidate_tick_cache()  # Fresh data for subsequent decisions
                             if side == "BUY": opened_trades += 1
                             elif side == "SELL":
                                 closed_trades += 1
@@ -3011,6 +3114,7 @@ class MetaController:
                     
                     tick_fills[sym] = status
                     if status in ("FILLED", "PARTIALLY_FILLED", "PLACED", "EXECUTED"):
+                        self._invalidate_tick_cache()  # Fresh data for subsequent decisions
                         if side == "BUY": opened_trades += 1
                         elif side == "SELL":
                             closed_trades += 1
@@ -3297,7 +3401,7 @@ class MetaController:
         """
         try:
             # Get all positions and identify dust
-            snap = self.shared_state.get_positions_snapshot() or {}
+            snap = self._get_positions_snapshot()
             dust_positions = []  # [(sym, qty, value)]
             
             quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
@@ -3451,7 +3555,7 @@ class MetaController:
                 )
                 return None
             
-            snap = self.shared_state.get_positions_snapshot() or {}
+            snap = self._get_positions_snapshot()
             quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
             free_usdt = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
             min_notional = float(self._cfg("MIN_NOTIONAL", 10.0))
@@ -3541,7 +3645,6 @@ class MetaController:
                 if not self._can_act(sym_to_heal, "DUST_HEALING"):
                     continue
                 # Check cooldown
-                import time
                 if sym_to_heal in self.dust_healing_cooldown and self.dust_healing_cooldown[sym_to_heal] > time.time():
                     self.logger.info(f"[LIFECYCLE] {sym_to_heal}: DUST_HEALING blocked by cooldown")
                     continue
@@ -3632,7 +3735,7 @@ class MetaController:
             None if healing possible or portfolio not deadlocked
         """
         try:
-            snap = self.shared_state.get_positions_snapshot() or {}
+            snap = self._get_positions_snapshot()
             quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
             free_usdt = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
             min_notional = float(self._cfg("MIN_NOTIONAL", 10.0))
@@ -3773,7 +3876,7 @@ class MetaController:
             Number of positions that graduated from dust state
         """
         try:
-            snap = self.shared_state.get_positions_snapshot() or {}
+            snap = self._get_positions_snapshot()
             min_notional = float(self._cfg("MIN_NOTIONAL", 10.0))
             significant_threshold = float(
                 self._cfg(
@@ -3903,7 +4006,7 @@ class MetaController:
         
         try:
             # Get all positions
-            snap = self.shared_state.get_positions_snapshot() or {}
+            snap = self._get_positions_snapshot()
             owned_positions = {}
             dust_positions = {}
             
@@ -4025,7 +4128,7 @@ class MetaController:
         """
         try:
             # Get all positions
-            snap = self.shared_state.get_positions_snapshot() or {}
+            snap = self._get_positions_snapshot()
             owned_positions = {}
             
             for sym_raw, p in snap.items():
@@ -4109,7 +4212,7 @@ class MetaController:
         """
         try:
             # Get all positions
-            snap = self.shared_state.get_positions_snapshot() or {}
+            snap = self._get_positions_snapshot()
             owned_positions = {}
             
             for sym_raw, p in snap.items():
@@ -4311,7 +4414,7 @@ class MetaController:
             if not bool(getattr(self.config, "FOCUS_MODE_EXIT_ENABLED", False)):
                 return []
 
-            positions = self.shared_state.get_positions_snapshot() or {}
+            positions = self._get_positions_snapshot()
             if not positions:
                 return []
 
@@ -4977,7 +5080,6 @@ class MetaController:
 
 
     async def _build_decisions(self, accepted_symbols_set: set) -> List[Tuple[str, str, Dict[str, Any]]]:
-        # CRITICAL DEBUG: Log that _build_decisions is being called
         self.logger.debug("[Meta] _build_decisions called with %d accepted symbols", len(accepted_symbols_set))
 
         # Conditional size bump (one-time) after realized PnL clears fee threshold
@@ -4985,9 +5087,26 @@ class MetaController:
             self._maybe_apply_conditional_size_bump()
         except Exception:
             self.logger.debug("[Meta:SizeBump] Evaluation failed (non-fatal)", exc_info=True)
-        
+
         # 1. Authoritative Flat Check (Authoritative Source for Governance)
         is_flat = await self._check_portfolio_flat()
+
+        # Build structured decision context (replaces scattered local vars)
+        try:
+            total_pos, sig_pos, dust_pos = await self._count_significant_positions()
+        except Exception:
+            total_pos, sig_pos, dust_pos = 0, 0, 0
+        max_pos = self._get_max_positions()
+        self._decision_ctx = DecisionContext(
+            tick_id=self.tick_id,
+            is_flat=is_flat,
+            is_bootstrap=self._is_bootstrap_mode(),
+            total_positions=total_pos,
+            significant_positions=sig_pos,
+            dust_positions=dust_pos,
+            max_positions=max_pos,
+            mandatory_sell_mode=self._mandatory_sell_mode_active,
+        )
         
         # 2. Get Structured Governance Decision (PROACTIVE)
         # We don't have bootstrap_override yet, but we'll calculate it later if needed for emission
@@ -5477,7 +5596,7 @@ class MetaController:
 
                     if not nominated_sym:
                         try:
-                            positions = self.shared_state.get_positions_snapshot() or {}
+                            positions = self._get_positions_snapshot()
                             open_trades = getattr(self.shared_state, "open_trades", {}) or {}
                             candidates = []
                             fallback_candidates = []
@@ -5525,7 +5644,7 @@ class MetaController:
 
                     # Reset latches when candidate is closed
                     try:
-                        positions = self.shared_state.get_positions_snapshot() or {}
+                        positions = self._get_positions_snapshot()
                         cand_pos = positions.get(nominated_sym) if nominated_sym else None
                         cand_qty = float(cand_pos.get("quantity", 0.0) or cand_pos.get("qty", 0.0)) if cand_pos else 0.0
                         if nominated_sym and cand_qty <= 0:
@@ -5862,7 +5981,7 @@ class MetaController:
         # ═══════════════════════════════════════════════════════════════════════════════
 
         try:
-            snap = self.shared_state.get_positions_snapshot() or {}
+            snap = self._get_positions_snapshot()
             for sym_raw, p in snap.items():
                 sym = self._normalize_symbol(sym_raw)
                 q_val = p.get("quantity")
@@ -8148,7 +8267,7 @@ class MetaController:
         # ===== AUTHORITATIVE CHECK: Do we have ANY positions with qty > 0? (including dust) =====
         # This is the TRUE source of truth for SELL gating - not open_positions_count()
         # Reason: SELL must be allowed if inventory exists, regardless of dust classification
-        snap_for_inventory = self.shared_state.get_positions_snapshot() or {}
+        snap_for_inventory = self._get_positions_snapshot()
         has_positions = any(
             float(p.get("quantity", 0.0)) > 0 
             for p in snap_for_inventory.values()
@@ -9435,6 +9554,7 @@ class MetaController:
                     if signal.get("_bootstrap_seed") or signal.get("bootstrap_seed"):
                         self._bootstrap_seed_active = True
                         self._bootstrap_seed_used = True
+                        self._transition_phase(ControllerPhase.SEEDING, "seed_buy_executed")
                         self.logger.warning(
                             "[BOOTSTRAP] Seed BUY executed: %s | quote=%.2f",
                             symbol,
