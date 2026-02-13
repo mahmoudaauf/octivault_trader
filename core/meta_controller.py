@@ -9044,6 +9044,17 @@ class MetaController:
             # FIX: Position Lock Invariant (User Rule 7)
             # If position exists, REJECT BUY unless scaling is explicitly planned/allowed.
             curr_qty = self.shared_state.get_position_qty(symbol) if hasattr(self.shared_state, "get_position_qty") else 0.0
+            # FIX 2: PositionLock must use position_value, not qty
+            price = 0.0
+            try:
+                if hasattr(self.shared_state, "safe_price"):
+                    price = float(await _safe_await(self.shared_state.safe_price(symbol)) or 0.0)
+            except Exception:
+                price = 0.0
+            if not price:
+                price = float(getattr(self.shared_state, "latest_prices", {}).get(symbol, 0.0) or 0.0)
+            position_value = curr_qty * price
+            economic_floor = self._cfg("MIN_ECONOMIC_TRADE_USDT", 40.0)
             is_dust_healing = signal.get("_dust_healing", False)
             if is_dust_healing:
                 metrics = getattr(self.shared_state, "metrics", {}) or {}
@@ -9075,7 +9086,7 @@ class MetaController:
                 symbol, curr_qty, is_dust_healing, is_dust_position, is_bootstrap, is_bootstrap_override, is_flat_init, focus_active, str(signal.get("reason", ""))
             )
             # SOP-REC-004: Dust Healing Execution Authority
-            if curr_qty > 0 and not is_dust_merge:
+            if position_value >= economic_floor and not is_dust_merge:
                 is_bootstrap_dust_bypass = self._bootstrap_dust_bypass_allowed(
                     symbol,
                     bool(is_bootstrap_override),
@@ -9084,8 +9095,8 @@ class MetaController:
                 # Allow dust healing scaling if position is marked as dust, regardless of mode
                 if not (is_bootstrap_seed or is_bootstrap_dust_bypass or (is_dust_healing and (is_dust_position or is_bootstrap or is_bootstrap_override or is_flat_init))):
                     self.logger.warning(
-                        "[Meta:PositionLock] REJECTING BUY %s: Position already exists (%.8f). Scaling not enabled.", 
-                        symbol, curr_qty
+                        "[Meta:PositionLock] REJECTING BUY %s: Position value (%.2f) >= economic floor (%.2f). Scaling not enabled.", 
+                        symbol, position_value, economic_floor
                     )
                     return {"ok": False, "status": "skipped", "reason": "position_lock", "reason_detail": "position_already_exists"}
                 else:
