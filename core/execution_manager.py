@@ -1479,9 +1479,11 @@ class ExecutionManager:
                 try:
                     # Get symbol economics
                     filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
+                    # Extract filter values properly
+                    lot = filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE") or {}
+                    step_size = float(lot.get("stepSize", 0.1) or 0.1)
+                    min_qty = float(lot.get("minQty", 0.001) or 0.001)
                     min_notional = self._extract_min_notional(filters)
-                    step_size = float(filters.get("step_size", 0.1) or 0.1)
-                    min_qty = float(filters.get("min_qty", 0.001) or 0.001)
                     
                     # Use min_entry_quote from policy_context or config
                     min_entry_quote = float(policy_ctx.get("min_entry_quote", 
