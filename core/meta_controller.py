@@ -2427,43 +2427,63 @@ class MetaController:
 
     async def _check_portfolio_flat(self) -> bool:
         """
-        Returns: True ONLY if ALL positions have qty <= 0
-        
-        ===== DEADLOCK SAFETY: Multi-Method Verification =====
-        We verify flatness using multiple independent paths to prevent single-point failure.
-        If ANY path shows inventory exists, we return False.
+        Returns: True ONLY if total position value < economic floor (dust-aware flat detection)
+
+        ===== DUST-AWARE FLAT DETECTION =====
+        Flat = total_position_value < economic_floor
+        Not: position_count == 0
+
+        This prevents bootstrap deadlock where dust positions block meaningful position establishment.
         """
-        # ===== PRIMARY CHECK: Get all positions, check for any qty > 0 =====
+        economic_floor = float(self._cfg("MIN_ECONOMIC_TRADE_USDT", 40.0) or 40.0)
+
+        # ===== PRIMARY CHECK: Calculate total position value =====
+        try:
+            positions = self.shared_state.get_open_positions()
+            if isinstance(positions, dict):
+                total_value = 0.0
+                for sym, pos in positions.items():
+                    qty = float(pos.get("qty", 0.0) or 0.0)
+                    if qty > 0:
+                        # Get current price
+                        price = 0.0
+                        try:
+                            price_data = self.shared_state.get_price(sym)
+                            price = float(price_data or 0.0)
+                        except Exception:
+                            price = 0.0
+
+                        if price > 0:
+                            value = qty * price
+                            total_value += value
+                            self.logger.debug(f"[Meta:CheckFlat] {sym} qty={qty:.8f} price={price:.2f} value={value:.2f}")
+
+                self.logger.info(f"[Meta:CheckFlat] Total position value: {total_value:.2f} USDT, Economic floor: {economic_floor:.2f} USDT")
+
+                if total_value < economic_floor:
+                    self.logger.info("[Meta:CheckFlat] Portfolio DUST-AWARE FLAT: total_value < economic_floor")
+                    return True
+                else:
+                    self.logger.debug(f"[Meta:CheckFlat] Portfolio NOT FLAT: total_value >= economic_floor")
+                    return False
+        except Exception as e:
+            self.logger.warning("[Meta:CheckFlat] Primary check failed: %s", e)
+
+        # ===== FALLBACK: Legacy position count check =====
         try:
             positions = self.shared_state.get_open_positions()
             if isinstance(positions, dict):
                 if len(positions) == 0:
-                    self.logger.debug("[Meta:CheckFlat] Portfolio FLAT: open_positions=0")
+                    self.logger.debug("[Meta:CheckFlat] Portfolio FLAT (fallback): open_positions=0")
                     return True
-                self.logger.debug("[Meta:CheckFlat] Portfolio NOT FLAT: open_positions=%d", len(positions))
+                self.logger.debug("[Meta:CheckFlat] Portfolio NOT FLAT (fallback): open_positions=%d", len(positions))
                 return False
         except Exception as e:
-            self.logger.warning("[Meta:CheckFlat] Primary check failed: %s", e)
+            self.logger.warning("[Meta:CheckFlat] Fallback check failed: %s", e)
 
-        # ===== SECONDARY CHECK: Portfolio Snapshot (from policy manager) =====
-        # This provides a second authoritative opinion.
-        try:
-            snap = self.shared_state.get_positions_snapshot()
-            if snap and len(snap) > 0:
-                for sym, p in snap.items():
-                    qty = float(p.get("qty", 0.0) or p.get("quantity", 0.0))
-                    if qty > 0:
-                        self.logger.debug(
-                            "[Meta:CheckFlat] Snapshot shows %s qty=%.8f > 0. NOT FLAT.",
-                            sym, qty
-                        )
-                        return False
-        except Exception as e:
-            self.logger.warning("[Meta:CheckFlat] Secondary check failed: %s", e)
-
-        # If both checks pass, it's flat.
-        self.logger.info("[Meta:CheckFlat] Portfolio is FLAT. Ready for fresh capital allocation.")
-        return True
+        # If all checks fail, assume not flat (safer)
+        self.logger.warning("[Meta:CheckFlat] All checks failed, assuming NOT FLAT")
+        return False
 
     def _is_budget_required(self, action: str) -> bool:
         """Determine if an action requires capital allocation (USDT budget)."""
