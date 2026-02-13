@@ -6826,44 +6826,37 @@ class MetaController:
                         if current_price and current_price > 0:
                             # Bootstrap-aware calculation: ensure both qty >= lot_step AND quote >= minNotional
                             min_quote_for_qty = min_qty * current_price  # Minimum quote to get minimum quantity
-                            trading_fee_buffer = max(symbol_min_notional * 0.05, min_quote_for_qty * 0.05)  # 5% fee buffer
-                            
-                            # Final planned quote: max of both constraints + fee buffer
-                            plan_q = max(
-                                symbol_min_notional + trading_fee_buffer,   # minNotional constraint
-                                min_quote_for_qty + trading_fee_buffer,     # lot step constraint
-                                float(self._cfg("BOOTSTRAP_MIN_QUOTE", 10.0))  # config minimum
-                            )
+                            planned_quote = max(min_quote_for_qty * 1.05, symbol_min_notional)
                             
                             self.logger.info(
                                 "[Meta:FlatBootstrap] Symbol %s: bootstrap-aware planned_quote=%.2f "
-                                "(min_notional=%.2f, min_qty=%.6f, price=%.2f, min_quote_for_qty=%.2f, fee_buffer=%.2f)",
-                                sym, plan_q, symbol_min_notional, min_qty, current_price, min_quote_for_qty, trading_fee_buffer
+                                "(min_notional=%.2f, min_qty=%.6f, price=%.2f, min_quote_for_qty=%.2f)",
+                                sym, planned_quote, symbol_min_notional, min_qty, current_price, min_quote_for_qty
                             )
                         else:
                             # Fallback without price: use enhanced min_notional approach
                             fee_buffer = symbol_min_notional * 0.10  # 10% buffer without price info
                             bootstrap_min_quote = float(self._cfg("BOOTSTRAP_MIN_QUOTE", 10.0))
-                            plan_q = max(symbol_min_notional + fee_buffer, bootstrap_min_quote)
+                            planned_quote = max(symbol_min_notional + fee_buffer, bootstrap_min_quote)
                             
                             self.logger.info(
                                 "[Meta:FlatBootstrap] Symbol %s: fallback planned_quote=%.2f "
                                 "(symbol_min_notional=%.2f, fee_buffer=%.2f, bootstrap_min=%.2f, reason=no_price)",
-                                sym, plan_q, symbol_min_notional, fee_buffer, bootstrap_min_quote
+                                sym, planned_quote, symbol_min_notional, fee_buffer, bootstrap_min_quote
                             )
                     else:
                         # Fallback if symbol_info unavailable
                         trade_fee_pct = 0.001 * float(getattr(self.config, "TAKER_FEE_BPS", 10))
                         safety_factor = 1.15  # Increased safety factor for bootstrap
                         escalation_factor = (1.0 + trade_fee_pct) * safety_factor
-                        plan_q = base_floor * escalation_factor
-                        self.logger.warning(f"[Meta:FlatBootstrap] Symbol {sym}: using fallback planned_quote=%.2f (no symbol_info)", plan_q)
+                        planned_quote = base_floor * escalation_factor
+                        self.logger.warning(f"[Meta:FlatBootstrap] Symbol {sym}: using fallback planned_quote=%.2f (no symbol_info)", planned_quote)
                 except Exception as e:
                     self.logger.warning(f"[Meta:FlatBootstrap] Failed to calculate bootstrap-aware quote for {sym}: {e}, using fallback")
                     trade_fee_pct = 0.001 * float(getattr(self.config, "TAKER_FEE_BPS", 10))
                     safety_factor = 1.15
                     escalation_factor = (1.0 + trade_fee_pct) * safety_factor
-                    plan_q = base_floor * escalation_factor
+                    planned_quote = base_floor * escalation_factor
 
                 # Enforce unified entry floor (exit-feasibility-first when available)
                 min_entry_floor = None
@@ -6871,7 +6864,7 @@ class MetaController:
                     if self.shared_state and hasattr(self.shared_state, "compute_min_entry_quote"):
                         min_entry_floor = await self.shared_state.compute_min_entry_quote(
                             sym,
-                            default_quote=float(plan_q or 0.0),
+                            default_quote=float(planned_quote or 0.0),
                             price=float(current_price or 0.0),
                         )
                 except Exception:
@@ -6881,11 +6874,11 @@ class MetaController:
                         min_entry_floor = float(self._cfg("MIN_ENTRY_USDT", self._min_entry_quote_usdt))
                     except Exception:
                         min_entry_floor = float(self._min_entry_quote_usdt)
-                plan_q = max(float(plan_q or 0.0), float(min_entry_floor or 0.0))
-                plan_q = max(
+                planned_quote = max(float(planned_quote or 0.0), float(min_entry_floor or 0.0))
+                planned_quote = max(
                     float(getattr(self.config, "DEFAULT_PLANNED_QUOTE", 0.0) or 0.0),
                     float(getattr(self.config, "MIN_TRADE_QUOTE", 0.0) or 0.0),
-                    float(plan_q or 0.0),
+                    float(planned_quote or 0.0),
                 )
                 
                 # CRITICAL FIX #24: Initialize bootstrap bypass flag before use
@@ -6895,15 +6888,15 @@ class MetaController:
                 # Pass bootstrap state through policy context if in bootstrap mode
                 if bootstrap_bypass_active:
                     policy_ctx = self._build_policy_context(sym, "BUY", extra={"bootstrap_bypass": True})
-                    can_exec, gap, reason = await self.execution_manager.can_afford_market_buy(sym, plan_q, policy_context=policy_ctx)
+                    can_exec, gap, reason = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=policy_ctx)
                 else:
-                    can_exec, gap, reason = await self.execution_manager.can_afford_market_buy(sym, plan_q)
+                    can_exec, gap, reason = await self.execution_manager.can_afford_market_buy(sym, planned_quote)
                 
                 # DEBUG: Log the affordability check details for capital starvation diagnosis
                 quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
                 actual_spendable = float(await _safe_await(self.shared_state.get_spendable_balance(quote_asset)) or 0.0)
                 self.logger.warning(
-                    f"[Meta:CAPITAL_DEBUG] Symbol {sym}: can_afford_check(planned_quote={plan_q:.2f}) "
+                    f"[Meta:CAPITAL_DEBUG] Symbol {sym}: can_afford_check(planned_quote={planned_quote:.2f}) "
                     f"-> can_exec={can_exec}, gap={gap:.2f}, reason='{reason}' | "
                     f"actual_spendable={actual_spendable:.2f}"
                 )
@@ -6917,10 +6910,10 @@ class MetaController:
                     
                     # BOOTSTRAP CAPITAL FIX: If we have significant actual capital but ExecutionManager says no,
                     # bypass the check for small bootstrap amounts during clean wallet recovery
-                    if actual_spendable > 50.0 and plan_q <= 15.0:
+                    if actual_spendable > 50.0 and planned_quote <= 15.0:
                         self.logger.warning(
                             f"[Meta:BOOTSTRAP_BYPASS] ExecutionManager affordability check failed for {sym} "
-                            f"but actual_spendable=${actual_spendable:.2f} >> required=${plan_q:.2f}. "
+                            f"but actual_spendable=${actual_spendable:.2f} >> required=${planned_quote:.2f}. "
                             f"Bypassing check for bootstrap execution."
                         )
                         # Force execution by marking as affordable
@@ -6941,35 +6934,35 @@ class MetaController:
                     # Attempt fallback: reduce by gap + buffer
                     # CRITICAL FIX: When capital is severely constrained (gap > allocated),
                     # allow graceful degradation to near-minimum notional.
-                    fallback_q = plan_q - (gap + 0.5)  # 0.5 safety margin
+                    fallback_q = planned_quote - (gap + 0.5)  # 0.5 safety margin
                     
                     # TIER 1: Try original fallback if it's reasonable
                     if fallback_q >= min_notional_floor * 0.75:  # Allow 75% of floor
-                        plan_q = fallback_q
+                        planned_quote = fallback_q
                         # Pass bootstrap context for consistency
                         if bootstrap_bypass_active:
                             policy_ctx = self._build_policy_context(sym, "BUY", extra={"bootstrap_bypass": True})
-                            can_exec_fb, gap_fb, reason_fb = await self.execution_manager.can_afford_market_buy(sym, plan_q, policy_context=policy_ctx)
+                            can_exec_fb, gap_fb, reason_fb = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=policy_ctx)
                         else:
-                            can_exec_fb, gap_fb, reason_fb = await self.execution_manager.can_afford_market_buy(sym, plan_q)
+                            can_exec_fb, gap_fb, reason_fb = await self.execution_manager.can_afford_market_buy(sym, planned_quote)
                         
                         if can_exec_fb:
                             self.logger.info(
                                 "[Meta:FlatBootstrap] Symbol %s: tier-1 fallback to %.2f (gap was %.2f → %.2f)",
-                                sym, plan_q, gap, gap_fb
+                                sym, planned_quote, gap, gap_fb
                             )
                         else:
                             # TIER 1B/2/3: Try ultra-aggressive degradation
                             executed = False
                             for trial_q in [fallback_q, min_notional_floor, 5.0, 3.0, 2.0, 1.5, 1.0]:
                                 if trial_q <= 0: continue
-                                plan_q = trial_q
+                                planned_quote = trial_q
                                 # Pass bootstrap context for consistency
                                 if bootstrap_bypass_active:
                                     policy_ctx = self._build_policy_context(sym, "BUY", extra={"bootstrap_bypass": True})
-                                    can_exec_trial, gap_trial, reason_trial = await self.execution_manager.can_afford_market_buy(sym, plan_q, policy_context=policy_ctx)
+                                    can_exec_trial, gap_trial, reason_trial = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=policy_ctx)
                                 else:
-                                    can_exec_trial, gap_trial, reason_trial = await self.execution_manager.can_afford_market_buy(sym, plan_q)
+                                    can_exec_trial, gap_trial, reason_trial = await self.execution_manager.can_afford_market_buy(sym, planned_quote)
                                 
                                 # DEBUG: Log each fallback attempt
                                 self.logger.warning(
@@ -6980,7 +6973,7 @@ class MetaController:
                                 if can_exec_trial:
                                     self.logger.info(
                                         "[Meta:FlatBootstrap] Symbol %s: fallback to %.2f (gap=%.2f → %.2f)",
-                                        sym, plan_q, gap, gap_trial
+                                        sym, planned_quote, gap, gap_trial
                                     )
                                     executed = True
                                     break
@@ -6992,20 +6985,20 @@ class MetaController:
                                 )
                                 await self.shared_state.record_rejection(sym, "BUY", "CAPITAL_INSUFFICIENT", source="MetaController")
                                 # SCENARIO 1: FLAT + INSUFFICIENT + BUY → Emit CAPITAL_STARVED
-                                await self._handle_capital_starved(sym, plan_q, gap)
+                                await self._handle_capital_starved(sym, planned_quote, gap)
                                 continue
                     else:
                         # Fallback is small but > 0: try ultra-aggressive tiers
                         executed = False
                         for trial_q in [fallback_q, min_notional_floor, 5.0, 3.0, 2.0, 1.5, 1.0]:
                             if trial_q <= 0: continue
-                            plan_q = trial_q
+                            planned_quote = trial_q
                             # Pass bootstrap context for consistency
                             if bootstrap_bypass_active:
                                 policy_ctx = self._build_policy_context(sym, "BUY", extra={"bootstrap_bypass": True})
-                                can_exec_trial, gap_trial, reason_trial = await self.execution_manager.can_afford_market_buy(sym, plan_q, policy_context=policy_ctx)
+                                can_exec_trial, gap_trial, reason_trial = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=policy_ctx)
                             else:
-                                can_exec_trial, gap_trial, reason_trial = await self.execution_manager.can_afford_market_buy(sym, plan_q)
+                                can_exec_trial, gap_trial, reason_trial = await self.execution_manager.can_afford_market_buy(sym, planned_quote)
                             
                             # DEBUG: Log each aggressive fallback attempt
                             self.logger.warning(
@@ -7016,7 +7009,7 @@ class MetaController:
                             if can_exec_trial:
                                 self.logger.info(
                                     "[Meta:FlatBootstrap] Symbol %s: aggressive fallback to %.2f (gap=%.2f → %.2f)",
-                                    sym, plan_q, gap, gap_trial
+                                    sym, planned_quote, gap, gap_trial
                                 )
                                 executed = True
                                 break
@@ -7028,32 +7021,32 @@ class MetaController:
                             )
                             await self.shared_state.record_rejection(sym, "BUY", "CAPITAL_INSUFFICIENT", source="MetaController")
                             # SCENARIO 1: FLAT + INSUFFICIENT + BUY → Emit CAPITAL_STARVED
-                            await self._handle_capital_starved(sym, plan_q, gap)
+                            await self._handle_capital_starved(sym, planned_quote, gap)
                             continue
 
                 # CRITICAL FIX #24: After bootstrap bypass, skip to execution
                 if bootstrap_bypass_active:
                     self.logger.warning(
                         f"[Meta:BOOTSTRAP_BYPASS] Proceeding to execution with bypass active: "
-                        f"{sym} planned_quote={plan_q:.2f}, can_exec={can_exec}, reason={reason}"
+                        f"{sym} planned_quote={planned_quote:.2f}, can_exec={can_exec}, reason={reason}"
                     )
                 else:
                     self.logger.info(
                         "[Meta:FlatBootstrap] Symbol %s: executeableat escalated quote %.2f (gap=%.2f)",
-                        sym, plan_q, gap
+                        sym, planned_quote, gap
                     )
 
                 # Found valid candidate at escalated/fallback quote
                 self.logger.info(
                     "[Meta] FLAT_PORTFOLIO -> BUY_FORCED symbol=%s conf=%.2f escalated_quote=%.2f",
-                    sym, conf, plan_q
+                    sym, conf, planned_quote
                 )
                 
                 # Enforce attributes for execution
                 s["_tier"] = "B"
                 s["_bootstrap"] = True
                 s["_force_min_notional"] = True
-                s["_planned_quote"] = plan_q
+                s["_planned_quote"] = planned_quote
                 s["reason"] = f"FLAT_FORCED_BOOTSTRAP:{conf:.2f}:escalated"
                 return [(sym, "BUY", s)]
             
