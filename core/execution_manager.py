@@ -1680,7 +1680,7 @@ class ExecutionManager:
                 f"qty_raw={qty_raw:.8f} "
                 f"step_size={step_size:.8f} "
                 f"qty_exec={est_units:.8f} "
-                f"notional={est_notional:.2f}"
+                f"notional={est_units * price_f:.2f}"
             )
             
             est_notional = est_units * price_f
