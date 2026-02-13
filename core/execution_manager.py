@@ -1479,11 +1479,7 @@ class ExecutionManager:
                 try:
                     # Get symbol economics
                     filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
-                    # Extract filter values properly
-                    lot = filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE") or {}
-                    step_size = float(lot.get("stepSize", 0.1) or 0.1)
-                    min_qty = float(lot.get("minQty", 0.001) or 0.001)
-                    min_notional = self._extract_min_notional(filters)
+                    step_size, min_qty, min_notional = self.extract_symbol_economics(sym, filters)
                     
                     # Use min_entry_quote from policy_context or config
                     min_entry_quote = float(policy_ctx.get("min_entry_quote", 
@@ -3556,6 +3552,62 @@ class ExecutionManager:
         tick_size = float(price.get("tickSize", 0))
         min_notional = float(notional.get("minNotional", 0))
         return step_size, min_qty, max_qty, tick_size, min_notional
+
+    def extract_symbol_economics(self, symbol: str, filters: Dict[str, Any]) -> Tuple[float, float, float]:
+        """
+        Canonical extraction of symbol economics for quantity calculations.
+        Raises RuntimeError if filters are invalid or missing critical values.
+        """
+        if not filters:
+            raise RuntimeError(f"Symbol filters missing for {symbol}")
+
+        # Extract LOT_SIZE
+        lot = filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE")
+        if not lot:
+            raise RuntimeError(f"LOT_SIZE filter missing for {symbol}")
+
+        # Extract step_size
+        step_size_str = lot.get("stepSize")
+        if not step_size_str:
+            raise RuntimeError(f"stepSize missing in LOT_SIZE for {symbol}")
+        try:
+            step_size = float(step_size_str)
+            if step_size <= 0:
+                raise ValueError("step_size must be positive")
+        except (ValueError, TypeError):
+            raise RuntimeError(f"Invalid stepSize '{step_size_str}' for {symbol}")
+
+        # Extract min_qty
+        min_qty_str = lot.get("minQty")
+        if not min_qty_str:
+            raise RuntimeError(f"minQty missing in LOT_SIZE for {symbol}")
+        try:
+            min_qty = float(min_qty_str)
+            if min_qty < 0:
+                raise ValueError("min_qty cannot be negative")
+        except (ValueError, TypeError):
+            raise RuntimeError(f"Invalid minQty '{min_qty_str}' for {symbol}")
+
+        # Extract min_notional
+        notional = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL")
+        if not notional:
+            raise RuntimeError(f"NOTIONAL filter missing for {symbol}")
+        min_notional_str = notional.get("minNotional")
+        if not min_notional_str:
+            raise RuntimeError(f"minNotional missing in NOTIONAL for {symbol}")
+        try:
+            min_notional = float(min_notional_str)
+            if min_notional < 0:
+                raise ValueError("min_notional cannot be negative")
+        except (ValueError, TypeError):
+            raise RuntimeError(f"Invalid minNotional '{min_notional_str}' for {symbol}")
+
+        # Log extracted values
+        self.logger.info(
+            f"[FILTERS] {symbol} step_size={step_size} min_qty={min_qty} min_notional={min_notional}"
+        )
+
+        return step_size, min_qty, min_notional
     async def start(self):
         """
         Minimal start hook so AppContext can warm this component during P5.
