@@ -392,6 +392,42 @@ class MetaController:
         self._bootstrap_dust_bypass_used.add(symbol)
         return True
 
+    def _reset_bootstrap_override_if_deadlocked(self, symbol: str, signal: dict, last_result: dict = None):
+        """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
+        # Check if position is flat
+        is_flat = False
+        try:
+            qty = 0.0
+            if hasattr(self.shared_state, "get_position_qty"):
+                qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
+                is_flat = qty == 0.0
+            elif hasattr(self.shared_state, "get_position"):
+                pos = self.shared_state.get_position(symbol)
+                if _asyncio.iscoroutine(pos):
+                    pos = _asyncio.get_event_loop().run_until_complete(pos)
+                qty = float(pos.get("qty", 0.0) or pos.get("quantity", 0.0) or 0.0)
+                is_flat = qty == 0.0
+        except Exception:
+            pass
+        
+        # Check if no realized trades yet
+        realized_trades = 0
+        try:
+            metrics = getattr(self.shared_state, "metrics", {}) or {}
+            realized_trades = int(metrics.get("total_trades_executed", 0) or 0)
+        except Exception:
+            pass
+        
+        # Check if last override did NOT produce execution
+        last_override_failed = False
+        if last_result is not None:
+            last_override_failed = not (str(last_result.get("status", "")).lower() in {"placed", "executed", "filled"})
+        
+        # If all conditions met, reset bootstrap attempts
+        if is_flat and realized_trades == 0 and last_override_failed and getattr(self, "_bootstrap_attempts", 0) > 0:
+            self.logger.warning(f"[Meta:BOOTSTRAP_DEADLOCK] Resetting bootstrap override counter for {symbol} (flat, no realized trades, last override failed)")
+            self._bootstrap_attempts = 0
+
     def _set_lifecycle(self, symbol, state):
         prev = self.symbol_lifecycle.get(symbol)
         self.symbol_lifecycle[symbol] = state
@@ -548,7 +584,7 @@ class MetaController:
         self._adaptive_aggression = 1.0 # P9: Start with neutral aggression
 
         # --- Planned-quote defaults (avoid 0.00 sizing) ---
-        min_entry_quote = float(getattr(config, "MIN_ENTRY_QUOTE_USDT", 12.0))
+        min_entry_quote = float(getattr(config, "MIN_ENTRY_QUOTE_USDT", 80.0))
         min_econ_trade = float(getattr(config, "MIN_ECONOMIC_TRADE_USDT", 0.0) or 0.0)
         if min_econ_trade > 0:
             min_entry_quote = max(min_entry_quote, min_econ_trade)
@@ -583,7 +619,7 @@ class MetaController:
         
         # EXECUTION FLOORS
         self._min_exec_confidence = float(self._cfg("MIN_EXECUTION_CONFIDENCE", default=0.60))
-        self._tier_a_conf = float(self._cfg("TIER_A_CONFIDENCE_THRESHOLD", default=0.70))
+        self._tier_a_conf = float(self._cfg("TIER_A_CONFIDENCE_THRESHOLD", 0.70))
         
         # Config snapshot
         self._min_conf_ingest = float(self._cfg("MIN_SIGNAL_CONF", default=0.50))
@@ -599,7 +635,7 @@ class MetaController:
         self._enable_cot = bool(self._cfg("ENABLE_COT_VALIDATION", default=False))
         self._known_quotes = {"USDT", "FDUSD", "USDC", "BUSD", "TUSD", "DAI"}
         self._default_planned_quote = float(self._cfg("DEFAULT_PLANNED_QUOTE", default=10.0))
-        self._min_entry_quote = float(self._cfg("MIN_ENTRY_QUOTE_USDT", default=10.0))
+        self._min_entry_quote = float(self._cfg("MIN_ENTRY_QUOTE_USDT", 80.0))
         self._max_spend = float(self._cfg("MAX_SPEND_PER_TRADE_USDT", default=50.0))
 
         # Initialize Focus Mode configuration and state
@@ -2351,7 +2387,7 @@ class MetaController:
             self.logger.warning("[DUST_EXIT] Failed to select candidate: %s", str(e))
             return None
 
-    def _build_policy_context(self, symbol: str, side: str, policies: Optional[List[str]] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _build_policy_context(self, symbol: str, side: str, policies: Optional[List[str]] = None, extra: Optional[Dict[str, Any]] = None, price: Optional[float] = None) -> Dict[str, Any]:
         """Delegate policy context building to PolicyManager."""
         return self.policy_manager._build_policy_context(symbol, side, policies, extra)
 
@@ -7156,7 +7192,7 @@ class MetaController:
 
         # 2) Ranking & Scoring BUYs (with Rejection Penalty for Deadlock Prevention)
         symbol_scores = []
-        deadlock_threshold = int(self._cfg("DEADLOCK_REJECTION_THRESHOLD", 3))
+        deadlock_threshold = int(self._cfg("DEADLOCK_REJECTION_THRESHOLD", 10))
         for sym, signals in valid_signals_by_symbol.items():
             max_conf = max(float(s.get("confidence", 0.0)) for s in signals)
             rank_weight = 1.3 if sym in owned_positions else 1.0
@@ -8805,7 +8841,7 @@ class MetaController:
                             await self.shared_state.record_rejection(sym, action, str(reason))
                         
                         # Check for deadlock condition
-                        deadlock_threshold = int(self._cfg("DEADLOCK_REJECTION_THRESHOLD", 3))
+                        deadlock_threshold = int(self._cfg("DEADLOCK_REJECTION_THRESHOLD", 10))
                         rej_count = self.shared_state.get_rejection_count(sym, "BUY") if hasattr(self.shared_state, "get_rejection_count") else 0
                         if rej_count >= deadlock_threshold:
                             self.logger.error("[Meta:DEADLOCK] Symbol %s has been rejected %d times. Emitting DEADLOCK event.", sym, rej_count)
@@ -9392,6 +9428,9 @@ class MetaController:
                     tier=tier,
                     policy_context=policy_ctx,
                 )
+                # Option A: Reset bootstrap override counter if deadlocked
+                if signal.get("_bootstrap_override", False):
+                    self._reset_bootstrap_override_if_deadlocked(symbol, signal, result)
                 # Escalation Loop: BUY -> fail (InsufficientBalance) -> liquidate -> retry (Behavior Change 5)
                 ec = result.get("error_code") or result.get("reason")
                 if not result.get("ok") and ec in ("InsufficientBalance", "INSUFFICIENT_QUOTE", "RESERVE_FLOOR", "QUOTE_LT_MIN_NOTIONAL", "MIN_NOTIONAL_VIOLATION"):

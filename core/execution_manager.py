@@ -148,6 +148,10 @@ async def validate_order_request(*, side: str, qty: float, price: float,
         if qty < float(filters.min_qty):
             return False, 0.0, 0.0, "QTY_LT_MIN"
             
+        # STRICT CHECK: Final notional must still meet min_notional after rounding
+        if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
+            return False, 0.0, 0.0, "NOTIONAL_LT_MIN_AFTER_ROUNDING"
+            
         return True, float(qty), spend, "OK"
     else:
         from decimal import Decimal, ROUND_DOWN
@@ -529,8 +533,9 @@ class ExecutionManager:
             )
         return {"min_exit_quote": 0.0, "min_notional": 0.0}
 
-    async def _get_min_entry_quote(self, symbol: str, price: Optional[float] = None, min_notional: Optional[float] = None) -> float:
-        base_quote = float(self._cfg("DEFAULT_PLANNED_QUOTE", self._cfg("MIN_ENTRY_QUOTE_USDT", 0.0)) or 0.0)
+    async def _get_min_entry_quote(self, symbol: str, price: Optional[float] = None, min_notional: Optional[float] = None, policy_context: Optional[Dict[str, Any]] = None) -> float:
+        policy_ctx = policy_context or {}
+        base_quote = float(policy_ctx.get("min_entry_quote", self._cfg("DEFAULT_PLANNED_QUOTE", self._cfg("MIN_ENTRY_QUOTE_USDT", 0.0)) or 0.0))
         exit_info = await self._get_exit_floor_info(symbol, price=price)
 
         min_position_usdt = float(self._cfg("MIN_POSITION_USDT", 0.0) or 0.0)
@@ -1416,7 +1421,7 @@ class ExecutionManager:
     ) -> Tuple[bool, Decimal, str]:
         # --- BOOTSTRAP OVERRIDE ---
         skip_micro_trade_kill_switch = False
-        policy_ctx = policy_context or {}
+        policy_ctx = policy_context or {}  # Ensure it's never None
         # --- EXPLICIT BOOTSTRAP ESCAPE HATCH ---
         if policy_ctx.get("is_flat", False) and policy_ctx.get("bootstrap_mode", False):
             # Allow exactly one BUY regardless of economic/micro trade guards
@@ -1428,7 +1433,7 @@ class ExecutionManager:
                 # Zero-sized trades MUST be treated as failure (Behavior Change 1.1)
                 return (False, Decimal("0"), "ZERO_SIZE_TRADE")
 
-            min_econ_trade_cfg = Decimal(str(self._cfg("MIN_ECONOMIC_TRADE_USDT", 0.0) or 0.0))
+            min_econ_trade_cfg = Decimal(str(policy_ctx.get("min_economic_trade", self._cfg("MIN_ECONOMIC_TRADE_USDT", 0.0)) or 0.0))
             dynamic_min_econ = Decimal("0")
             if hasattr(self.shared_state, "compute_min_entry_quote"):
                 try:
@@ -1466,6 +1471,44 @@ class ExecutionManager:
                  # Fallback logic or hard fail? Let's assume 1.0 but log warning, or fail.
                  # Failing is safer for affordability checks.
                  return (False, Decimal("0"), "PRICE_UNAVAILABLE")
+
+            # COMPUTE QUANTITY USING QUOTE-DRIVEN APPROACH
+            # If policy_context doesn't have planned_qty, compute it now
+            planned_qty = policy_ctx.get("planned_qty")
+            if planned_qty is None and price > 0:
+                try:
+                    # Get symbol economics
+                    filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
+                    min_notional = self._extract_min_notional(filters)
+                    step_size = float(filters.get("step_size", 0.1) or 0.1)
+                    min_qty = float(filters.get("min_qty", 0.001) or 0.001)
+                    
+                    # Use min_entry_quote from policy_context or config
+                    min_entry_quote = float(policy_ctx.get("min_entry_quote", 
+                                                          self._cfg("MIN_ENTRY_QUOTE_USDT", 80.0)) or 80.0)
+                    
+                    # Guarantee non-dust: min_entry_quote >= min_notional
+                    min_entry_quote = max(min_entry_quote, float(min_notional or 10.0))
+                    
+                    # Derive qty from min_entry_quote (quote-driven)
+                    raw_qty = float(min_entry_quote) / float(price)
+                    computed_qty = self._round_step_down(raw_qty, step_size)
+                    
+                    # Validate constraints
+                    if (computed_qty >= min_qty and 
+                        computed_qty * price >= float(min_notional or 10.0)):
+                        planned_qty = computed_qty
+                        # Update policy_context for consistency
+                        policy_ctx["planned_qty"] = planned_qty
+                        policy_ctx["step_size"] = step_size
+                        policy_ctx["min_qty"] = min_qty
+                        policy_ctx["computed_min_entry_quote"] = min_entry_quote
+                        policy_ctx["computed_min_notional"] = float(min_notional or 10.0)
+                    else:
+                        return (False, Decimal("0"), f"QTY_VALIDATION_FAILED: qty={computed_qty:.8f} < min_qty={min_qty} or notional={computed_qty*price:.2f} < min_notional={min_notional}")
+                        
+                except Exception as e:
+                    return (False, Decimal("0"), f"QTY_COMPUTATION_FAILED: {e}")
 
             atr_pct = 0.0
             try:
@@ -1526,13 +1569,14 @@ class ExecutionManager:
                 min_notional = intent.min_notional
                 self.logger.debug(f"[EM] Using frozen min_notional {min_notional} for {sym}")
             else:
-                min_notional = self._extract_min_notional(filters)
+                # Check policy_context first, then fall back to exchange filters
+                min_notional = policy_ctx.get("min_notional", self._extract_min_notional(filters))
 
             if min_notional <= 0:
                 return (False, Decimal("0"), f"invalid_min_notional({min_notional})")
 
             # Dynamic exit-feasibility floor (symbol-aware)
-            min_required_val = await self._get_min_entry_quote(sym, price=price, min_notional=float(min_notional))
+            min_required_val = await self._get_min_entry_quote(sym, price=price, min_notional=float(min_notional), policy_context=policy_ctx)
             min_required = Decimal(str(min_required_val))
 
             # Planned-quote fee floor (planned_quote >= fee_mult × round-trip fee on min-required quote)
@@ -1561,19 +1605,19 @@ class ExecutionManager:
             effective_qa = qa + acc_val
 
             # Store policy context for later access in bootstrap execution
-            self._current_policy_context = policy_context
+            self._current_policy_context = policy_ctx
             
             # 3) ACCUMULATE_MODE/BOOTSTRAP_BYPASS CHECK: Skip min_notional validation for special modes
             # This allows P0 dust promotion and bootstrap execution to work without being blocked by min_notional guards
             accumulate_mode = False
             bootstrap_bypass = False
             no_downscale_planned_quote = False
-            if policy_context:
-                accumulate_mode = bool(policy_context.get("_accumulate_mode", False))
-                bootstrap_bypass = bool(policy_context.get("bootstrap_bypass", False))
+            if policy_ctx:
+                accumulate_mode = bool(policy_ctx.get("_accumulate_mode", False))
+                bootstrap_bypass = bool(policy_ctx.get("bootstrap_bypass", False))
                 no_downscale_planned_quote = bool(
-                    policy_context.get("_no_downscale_planned_quote", False)
-                    or policy_context.get("no_downscale_planned_quote", False)
+                    policy_ctx.get("_no_downscale_planned_quote", False)
+                    or policy_ctx.get("no_downscale_planned_quote", False)
                 )
             
             
@@ -1610,14 +1654,20 @@ class ExecutionManager:
             
             # Apply fee buffer to find "net" spendable for the asset (including accumulation)
             price_f = float(price) if price > 0 else 1.0
-            est_units_raw = float(effective_qa) / price_f
             
-            # P9 Corrective: Use the extracted step_size (robust) instead of direct dict access
-            step = step_size
-            if step > 0:
-                est_units = self._round_step_down(est_units_raw, step)
+            # PREFER PLANNED_QTY from policy_context (MetaController computed)
+            # Fall back to computing from quote amount
+            if planned_qty is not None:
+                est_units = planned_qty
+                self.logger.debug(f"[EM] Using planned_qty {planned_qty} for {sym}")
             else:
-                est_units = est_units_raw
+                est_units_raw = float(effective_qa) / price_f
+                # P9 Corrective: Use the extracted step_size (robust) instead of direct dict access
+                step = step_size
+                if step > 0:
+                    est_units = self._round_step_down(est_units_raw, step)
+                else:
+                    est_units = est_units_raw
                 
             if est_units <= 0:
                 return (False, Decimal("0"), "ZERO_QTY_AFTER_ROUNDING")
@@ -2278,7 +2328,7 @@ class ExecutionManager:
                         if not can:
                             # Mandatory explicit failure for authoritative planned quotes
                             # BOOTSTRAP FIX: Skip this block during bootstrap as we've already verified spendable balance
-                            min_required_quote = await self._get_min_entry_quote(sym)
+                            min_required_quote = await self._get_min_entry_quote(sym, policy_context=policy_context)
                             if policy_ctx.get("_no_downscale_planned_quote") and planned_quote >= min_required_quote and not bootstrap_bypass:
                                 available = await self._get_available_quote(sym)
                                 self.logger.error(
@@ -2386,6 +2436,25 @@ class ExecutionManager:
                         avg_price = 0.0
                         if filled_qty > 0:
                             avg_price = float(order.get("cummulativeQuoteQty", 0.0) or 0.0) / filled_qty
+                        
+                        # [ECON_INVARIANT] Debug invariant: Log once per BUY to verify notional >= min_notional
+                        if filled_qty > 0:
+                            # Get min_notional for this symbol
+                            filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
+                            min_notional = self._extract_min_notional(filters)
+                            notional = filled_qty * avg_price
+                            self.logger.info(
+                                "[ECON_INVARIANT] %s qty=%.6f price=%.4f notional=%.4f min_notional=%.4f",
+                                sym, filled_qty, avg_price, notional, min_notional
+                            )
+                            # If this ever logs notional < min_notional → STOP IMMEDIATELY
+                            if notional < min_notional:
+                                self.logger.critical(
+                                    "[ECON_INVARIANT:VIOLATION] %s notional %.4f < min_notional %.4f - STOPPING",
+                                    sym, notional, min_notional
+                                )
+                                # This should never happen - if it does, we have a critical bug
+                        
                         if avg_price > 0:
                             order.setdefault("avgPrice", avg_price)
                             order.setdefault("price", avg_price)
@@ -2401,6 +2470,34 @@ class ExecutionManager:
                             clean_tag,
                             decision_id=decision_id,
                         )
+                        
+                        # [ECON_INVARIANT] Debug invariant: Log once per BUY to verify notional >= min_notional
+                        if raw and isinstance(raw, dict):
+                            filled_qty = float(raw.get("executedQty", 0.0) or 0.0)
+                            if filled_qty > 0:
+                                avg_price = float(raw.get("avgPrice", 0.0) or raw.get("price", 0.0) or 0.0)
+                                if avg_price <= 0:
+                                    # Calculate avg price from cummulativeQuoteQty if not provided
+                                    cummulative_quote = float(raw.get("cummulativeQuoteQty", 0.0) or 0.0)
+                                    if cummulative_quote > 0:
+                                        avg_price = cummulative_quote / filled_qty
+                                
+                                if avg_price > 0:
+                                    # Get min_notional for this symbol
+                                    filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
+                                    min_notional = self._extract_min_notional(filters)
+                                    notional = filled_qty * avg_price
+                                    self.logger.info(
+                                        "[ECON_INVARIANT] %s qty=%.6f price=%.4f notional=%.4f min_notional=%.4f",
+                                        sym, filled_qty, avg_price, notional, min_notional
+                                    )
+                                    # If this ever logs notional < min_notional → STOP IMMEDIATELY
+                                    if notional < min_notional:
+                                        self.logger.critical(
+                                            "[ECON_INVARIANT:VIOLATION] %s notional %.4f < min_notional %.4f - STOPPING",
+                                            sym, notional, min_notional
+                                        )
+                                        # This should never happen - if it does, we have a critical bug
 
                 elif side == "sell":
                     # GAP #4 FIX: SELL should only be blocked on true cold bootstrap, not on any bootstrap state
