@@ -683,7 +683,11 @@ if True:
             """
             await self._sync_exchange_info()
             if symbol:
-                return self.symbol_filters.get(self._norm_symbol(symbol), {})
+                norm_sym = self._norm_symbol(symbol)
+                filters = self.symbol_filters.get(norm_sym, {})
+                if not filters:
+                    raise RuntimeError(f"Symbol filters could not be loaded for {symbol} (normalized: {norm_sym})")
+                return filters
             return {}
         async def get_symbol_filters_raw(self, symbol: str) -> Dict[str, Any]:
             """Raw Binance filters map for a symbol (e.g., NOTIONAL/MIN_NOTIONAL, MARKET_LOT_SIZE/LOT_SIZE, PRICE_FILTER)."""
