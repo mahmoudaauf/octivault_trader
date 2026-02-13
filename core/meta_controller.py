@@ -6902,6 +6902,7 @@ class MetaController:
                 
                 # Probe: Can we afford this?
                 # Pass bootstrap state through policy context if in bootstrap mode
+                self.logger.warning(f"[BOOT_TRACE] calling exec.can_afford_market_buy(bootstrap_bypass_active={bootstrap_bypass_active})")
                 if bootstrap_bypass_active:
                     policy_ctx = self._build_policy_context(sym, "BUY", extra={"bootstrap_bypass": True})
                     can_exec, gap, reason = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=policy_ctx)

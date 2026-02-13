@@ -1428,6 +1428,7 @@ class ExecutionManager:
             return (True, qa, "BOOTSTRAP_ESCAPE_HATCH")
         if policy_ctx.get("bootstrap_bypass", False):
             skip_micro_trade_kill_switch = True
+        self.logger.warning(f"[EXEC_TRACE] received bootstrap_bypass={policy_ctx.get('bootstrap_bypass', False)}")
         try:
             if qa is None or float(qa) <= 0:
                 # Zero-sized trades MUST be treated as failure (Behavior Change 1.1)
