@@ -6873,6 +6873,9 @@ class MetaController:
                 # CRITICAL FIX #24: Initialize bootstrap bypass flag before use
                 bootstrap_bypass_active = False
                 
+                # Ensure symbol filters are loaded before affordability check
+                await self.execution_manager.exchange_client.ensure_symbol_filters_ready(sym)
+                
                 # Probe: Can we afford this?
                 # Pass bootstrap state through policy context if in bootstrap mode
                 if bootstrap_bypass_active:
