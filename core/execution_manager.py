@@ -1671,6 +1671,18 @@ class ExecutionManager:
             if est_units <= 0:
                 return (False, Decimal("0"), "ZERO_QTY_AFTER_ROUNDING")
             
+            # DIAGNOSTIC: Log affordability calculation details
+            qty_raw = est_units_raw if 'est_units_raw' in locals() else (float(effective_qa) / price_f)
+            self.logger.warning(
+                f"[AFFORD_DIAG] symbol={sym} "
+                f"planned_quote={float(qa):.2f} "
+                f"price={price_f:.2f} "
+                f"qty_raw={qty_raw:.8f} "
+                f"step_size={step_size:.8f} "
+                f"qty_exec={est_units:.8f} "
+                f"notional={est_notional:.2f}"
+            )
+            
             est_notional = est_units * price_f
             
             # Check if this executable chunk meets minNotional (SKIP in bootstrap/accumulate modes)
