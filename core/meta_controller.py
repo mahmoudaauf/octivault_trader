@@ -6893,6 +6893,10 @@ class MetaController:
                 # CRITICAL FIX #24: Initialize bootstrap bypass flag before use
                 bootstrap_bypass_active = False
                 
+                # BOOTSTRAP FIX: In bootstrap mode, always bypass micro trade kill switch
+                if self.mode_manager.get_mode() == "BOOTSTRAP":
+                    bootstrap_bypass_active = True
+                
                 # Ensure symbol filters are loaded before affordability check
                 await self.execution_manager.exchange_client.ensure_symbol_filters_ready(sym)
                 
