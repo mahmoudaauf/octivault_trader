@@ -1673,6 +1673,7 @@ class ExecutionManager:
             
             # DIAGNOSTIC: Log affordability calculation details
             qty_raw = est_units_raw if 'est_units_raw' in locals() else (float(effective_qa) / price_f)
+            notional_f = float(est_units or 0.0) * float(price_f or 0.0)
             self.logger.warning(
                 f"[AFFORD_DIAG] symbol={sym} "
                 f"planned_quote={float(qa):.2f} "
@@ -1680,7 +1681,7 @@ class ExecutionManager:
                 f"qty_raw={qty_raw:.8f} "
                 f"step_size={step_size:.8f} "
                 f"qty_exec={est_units:.8f} "
-                f"notional={est_units * price_f:.2f}"
+                f"notional={notional_f:.2f}"
             )
             
             est_notional = est_units * price_f
