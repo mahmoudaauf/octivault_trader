@@ -1691,14 +1691,15 @@ class ExecutionManager:
             est_notional = est_units * price_f
             
             # Check if this executable chunk meets minNotional (SKIP in bootstrap/accumulate modes)
-            if not bypass_min_notional and est_notional < float(min_required):
-                gap = Decimal(str(min_required)) - Decimal(str(est_notional))
+            exchange_floor = float(min_notional)  # NOT min_required
+            if not bypass_min_notional and est_notional < exchange_floor:
+                gap = Decimal(str(exchange_floor)) - Decimal(str(est_notional))
                 return (False, gap.max(Decimal("0")), "QUOTE_LT_MIN_NOTIONAL")
-            elif bypass_min_notional and est_notional < float(min_required):
+            elif bypass_min_notional and est_notional < exchange_floor:
                 # Log bypass for accumulate execution
                 self.logger.warning(
                     f"[EM:ACCUMULATE] {sym} BUY: Bypassing second min_entry check - "
-                    f"est_notional={est_notional:.2f} < min_required={float(min_required):.2f}"
+                    f"est_notional={est_notional:.2f} < exchange_floor={exchange_floor:.2f}"
                 )
 
             gross_needed = qa * (Decimal("1") + taker_fee) * headroom
@@ -1709,13 +1710,13 @@ class ExecutionManager:
                 if no_downscale_planned_quote:
                     gap = (qa - max_qa).max(Decimal("0"))
                     return (False, gap, "INSUFFICIENT_QUOTE")
-                if max_qa >= Decimal(str(min_required)) or bypass_min_notional:
+                if max_qa >= Decimal(str(exchange_floor)) or bypass_min_notional:
                     self.logger.info(f"[EM] Dynamic Resizing: Downscaling {qa} -> {max_qa:.2f} to fit spendable {spendable_dec:.2f}")
                     return (True, max_qa, "OK_DOWNSCALED")
                 else:
                     # Point 2: Accumulation Pivot
                     # No enough for minNotional even with all cash.
-                    gap = Decimal(str(min_required)) - max_qa
+                    gap = Decimal(str(exchange_floor)) - max_qa
                     return (False, gap.max(Decimal("0")), "INSUFFICIENT_QUOTE_FOR_ACCUMULATION")
 
             if price <= 0:
