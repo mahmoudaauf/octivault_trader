@@ -1619,9 +1619,9 @@ class ExecutionManager:
                 )
             
             
-            # Skip min_notional check only for bootstrap_bypass mode
-            # CRITICAL: bootstrap_bypass allows first trade on flat portfolio to execute
-            bypass_min_notional = bootstrap_bypass
+            # Skip min_notional check only for accumulate mode (adding to existing positions)
+            # CRITICAL: accumulate_mode allows dust promotion without min_notional guards
+            bypass_min_notional = accumulate_mode
             
             if not bypass_min_notional:
                 # 3) If planned quote + accumulation is below the floor, decide between MIN_NOTIONAL vs NAV shortfall
