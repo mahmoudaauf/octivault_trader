@@ -1672,7 +1672,11 @@ class ExecutionManager:
                 return (False, Decimal("0"), "ZERO_QTY_AFTER_ROUNDING")
             
             # DIAGNOSTIC: Log affordability calculation details
-            qty_raw = est_units_raw if 'est_units_raw' in locals() else (float(effective_qa) / price_f)
+            qty_raw = 0.0
+            if 'est_units_raw' in locals() and est_units_raw is not None:
+                qty_raw = est_units_raw
+            elif price_f > 0:
+                qty_raw = float(effective_qa) / price_f
             notional_f = float(est_units or 0.0) * float(price_f or 0.0)
             self.logger.warning(
                 f"[AFFORD_DIAG] symbol={sym} "
