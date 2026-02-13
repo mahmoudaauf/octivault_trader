@@ -6824,39 +6824,28 @@ class MetaController:
                                     self.logger.debug(f"[Meta:FlatBootstrap] Failed to get price for {sym}: {e}")
                         
                         if current_price and current_price > 0:
-                            # Bootstrap-aware calculation: ensure both qty >= lot_step AND quote >= minNotional
-                            min_quote_for_qty = min_qty * current_price  # Minimum quote to get minimum quantity
-                            planned_quote = max(min_quote_for_qty * 1.05, symbol_min_notional)
+                            # TEMP: Hardcoded bootstrap quote for testing execution
+                            planned_quote = 80.0
                             
                             self.logger.info(
-                                "[Meta:FlatBootstrap] Symbol %s: bootstrap-aware planned_quote=%.2f "
-                                "(min_notional=%.2f, min_qty=%.6f, price=%.2f, min_quote_for_qty=%.2f)",
-                                sym, planned_quote, symbol_min_notional, min_qty, current_price, min_quote_for_qty
+                                "[Meta:FlatBootstrap] Symbol %s: hardcoded planned_quote=%.2f for bootstrap test",
+                                sym, planned_quote
                             )
                         else:
-                            # Fallback without price: use enhanced min_notional approach
-                            fee_buffer = symbol_min_notional * 0.10  # 10% buffer without price info
-                            bootstrap_min_quote = float(self._cfg("BOOTSTRAP_MIN_QUOTE", 10.0))
-                            planned_quote = max(symbol_min_notional + fee_buffer, bootstrap_min_quote)
+                            # TEMP: Hardcoded bootstrap quote for testing execution (fallback case)
+                            planned_quote = 80.0
                             
                             self.logger.info(
-                                "[Meta:FlatBootstrap] Symbol %s: fallback planned_quote=%.2f "
-                                "(symbol_min_notional=%.2f, fee_buffer=%.2f, bootstrap_min=%.2f, reason=no_price)",
-                                sym, planned_quote, symbol_min_notional, fee_buffer, bootstrap_min_quote
+                                "[Meta:FlatBootstrap] Symbol %s: hardcoded planned_quote=%.2f for bootstrap test (no_price)",
+                                sym, planned_quote
                             )
                     else:
-                        # Fallback if symbol_info unavailable
-                        trade_fee_pct = 0.001 * float(getattr(self.config, "TAKER_FEE_BPS", 10))
-                        safety_factor = 1.15  # Increased safety factor for bootstrap
-                        escalation_factor = (1.0 + trade_fee_pct) * safety_factor
-                        planned_quote = base_floor * escalation_factor
-                        self.logger.warning(f"[Meta:FlatBootstrap] Symbol {sym}: using fallback planned_quote=%.2f (no symbol_info)", planned_quote)
+                        # TEMP: Hardcoded bootstrap quote for testing execution (no symbol_info)
+                        planned_quote = 80.0
+                        self.logger.warning(f"[Meta:FlatBootstrap] Symbol {sym}: hardcoded planned_quote=%.2f for bootstrap test (no symbol_info)", planned_quote)
                 except Exception as e:
-                    self.logger.warning(f"[Meta:FlatBootstrap] Failed to calculate bootstrap-aware quote for {sym}: {e}, using fallback")
-                    trade_fee_pct = 0.001 * float(getattr(self.config, "TAKER_FEE_BPS", 10))
-                    safety_factor = 1.15
-                    escalation_factor = (1.0 + trade_fee_pct) * safety_factor
-                    planned_quote = base_floor * escalation_factor
+                    self.logger.warning(f"[Meta:FlatBootstrap] Failed to calculate bootstrap-aware quote for {sym}: {e}, using hardcoded fallback")
+                    planned_quote = 80.0
 
                 # Enforce unified entry floor (exit-feasibility-first when available)
                 min_entry_floor = None
