@@ -1,6 +1,12 @@
 # =============================
 # core/shared_state.py — Octivault P9 SharedState
 # =============================
+"""
+ARCHITECTURE MAINTENANCE NOTE:
+When making changes to data structures, event contracts, or state management,
+please update the ARCHITECTURE.md file in the project root to reflect these changes.
+Key areas to review: data architecture, event bus, and component interfaces.
+"""
 from __future__ import annotations
 
 # ---- Standard Library Imports ----
@@ -480,6 +486,7 @@ class SharedState:
         self.exposure_target = 0.25  # Increased to 25% NAV for profit activation
         self.cooldowns = {}
         self.active_liquidations = set()
+        self.exit_in_progress: Dict[str, bool] = {}  # Symbol-level exit lock
         self.rebalance_targets: Set[str] = set()
 
         # Agent state
@@ -1371,13 +1378,23 @@ class SharedState:
                 price = 0.0
 
             avg_price = price if price > 0 else 0.0
-            invested_capital += qty * avg_price
+            position_value = qty * avg_price if avg_price > 0 else 0.0
+            significant_floor = float(await self.get_significant_position_floor(sym) or 0.0)
+            is_significant = bool(position_value >= significant_floor and position_value > 0.0)
+            if is_significant:
+                invested_capital += position_value
             rebuilt_positions[sym] = {
                 "quantity": qty,
                 "avg_price": avg_price,
                 "mark_price": price,
-                "status": "OPEN",
-                "state": PositionState.ACTIVE.value,
+                "value_usdt": float(position_value),
+                "significant_floor_usdt": float(significant_floor),
+                "status": "SIGNIFICANT" if is_significant else "DUST",
+                "state": PositionState.ACTIVE.value if is_significant else PositionState.DUST_LOCKED.value,
+                "is_significant": bool(is_significant),
+                "is_dust": not bool(is_significant),
+                "_is_dust": not bool(is_significant),
+                "open_position": bool(is_significant),
                 "_mirrored": True,
             }
             if price > 0:
@@ -1386,6 +1403,20 @@ class SharedState:
         # Apply rebuilt positions
         for sym, pos in rebuilt_positions.items():
             await self.update_position(sym, pos)
+            if not bool(pos.get("is_significant", False)):
+                self.record_dust(
+                    sym,
+                    float(pos.get("quantity", 0.0) or 0.0),
+                    origin="wallet_balance_sync",
+                    context={
+                        "source": "hard_reset_authoritative_sync",
+                        "value_usdt": float(pos.get("value_usdt", 0.0) or 0.0),
+                        "significant_floor_usdt": float(pos.get("significant_floor_usdt", 0.0) or 0.0),
+                    },
+                )
+                self.open_trades.pop(sym, None)
+            else:
+                self.dust_registry.pop(sym, None)
 
         # Recompute free capital from quote balance
         quote_bal = balances_snapshot.get(quote_asset, {})
@@ -1452,65 +1483,35 @@ class SharedState:
         
         for symbol, position in self.positions.items():
             try:
-                qty = float(position.get("quantity", 0.0))
+                qty = float(position.get("quantity", 0.0) or position.get("qty", 0.0) or 0.0)
                 if qty <= 0:
                     continue
-                
-                # Get minNotional for this symbol
-                _, min_notional = await self.compute_symbol_trade_rules(symbol)
-                if min_notional <= 0:
-                    min_notional = 10.0  # Default fallback
 
-                # Position significance threshold (independent of exchange)
-                min_position_value = float(getattr(self.config, "MIN_POSITION_VALUE_USDT", 10.0) or 10.0)
-                strategy_floor = float(getattr(self.config, "MIN_SIGNIFICANT_USD", 0.0) or 0.0)
-                significant_floor = max(float(min_notional), min_position_value, strategy_floor)
-                
-                # Get current price - PRIMARY source
-                price = await self.get_latest_price(symbol)
-                
-                # ✅ FIX #1: If no market price, use position's own price data
-                # This prevents false DUST classification when market data lags
-                if not price or price <= 0:
-                    # Try to get price from position's own cost basis
-                    avg_price = float(position.get("avg_price", 0.0))
-                    mark_price = float(position.get("mark_price", 0.0))
-                    entry_price = float(position.get("entry_price", 0.0))
-                    
-                    # Use best available position price
-                    if mark_price > 0:
-                        price = mark_price
-                    elif avg_price > 0:
-                        price = avg_price
-                    elif entry_price > 0:
-                        price = entry_price
-                    else:
-                        # Still no price available - mark as dust but log it
-                        self.logger.warning(
-                            f"[SS:Dust] {symbol}: No price found (market=None, "
-                            f"mark={mark_price}, avg={avg_price}, entry={entry_price}). "
-                            f"Marking as dust (qty={qty:.6f})"
-                        )
-                        dust.append(symbol)
-                        self.mark_as_dust(symbol)
-                        continue
-                
-                position_value = qty * float(price)
-                
-                # CRITICAL: If below significance floor, it's DUST
-                if position_value < significant_floor:
+                significant_floor = float(await self.get_significant_position_floor(symbol) or 0.0)
+                position_value = float(self._estimate_position_value_usdt(symbol, position) or 0.0)
+                position["value_usdt"] = float(position_value)
+                position["significant_floor_usdt"] = float(significant_floor)
+
+                if position_value >= significant_floor and position_value > 0:
+                    significant.append(symbol)
+                    position["status"] = "SIGNIFICANT"
+                    position["state"] = PositionState.ACTIVE.value
+                    position["capital_occupied"] = float(position_value)
+                    position["is_significant"] = True
+                    position["is_dust"] = False
+                    position["_is_dust"] = False
+                    position["open_position"] = True
+                    self.positions[symbol] = position
+                    self.dust_registry.pop(self._norm_sym(symbol), None)
+                else:
                     dust.append(symbol)
                     self.mark_as_dust(symbol)
                     self.logger.debug(
-                        f"[SS:Dust] {symbol}: value=${position_value:.2f} < "
-                        f"significant_floor=${significant_floor:.2f} (minNotional={min_notional:.2f}, "
-                        f"min_position_value={min_position_value:.2f}, strategy_floor={strategy_floor:.2f}) → DUST"
+                        "[SS:Dust] %s value=%.4f < floor=%.4f -> DUST_LOCKED",
+                        symbol,
+                        position_value,
+                        significant_floor,
                     )
-                else:
-                    significant.append(symbol)
-                    position["status"] = "SIGNIFICANT"
-                    position["capital_occupied"] = position_value
-                    
             except Exception as e:
                 self.logger.warning(f"[SS:Dust] Error classifying {symbol}: {e}")
                 dust.append(symbol)
@@ -1527,23 +1528,34 @@ class SharedState:
         - Do NOT count toward portfolio "occupied" capital
         - CAN be liquidated opportunistically
         """
-        if symbol in self.positions:
-            self.positions[symbol]["status"] = "DUST"
-            self.positions[symbol]["capital_occupied"] = 0.0
-            self.positions[symbol]["state"] = PositionState.DUST_LOCKED.value
-            
-            # Record in dust registry
-            sym_norm = self._norm_sym(symbol)
-            accepted = sym_norm in self.accepted_symbols or sym_norm in self.symbols
-            origin = "strategy_portfolio" if accepted else "external_untracked"
-            self.record_dust(
-                symbol,
-                self.positions[symbol].get("quantity", 0.0),
-                origin=origin,
-                context={"source": "mark_as_dust", "accepted_symbol": accepted},
-            )
-            
-            self.logger.debug(f"[SS:Dust] Marked {symbol} as DUST - does not block capital")
+        sym = self._norm_sym(symbol)
+        if sym in self.positions:
+            pos = self.positions[sym]
+            pos["status"] = "DUST"
+            pos["capital_occupied"] = 0.0
+            pos["state"] = PositionState.DUST_LOCKED.value
+            pos["is_significant"] = False
+            pos["is_dust"] = True
+            pos["_is_dust"] = True
+            pos["open_position"] = False
+            pos["accumulation_locked"] = False
+            self.positions[sym] = pos
+
+        # Hard invariant: dust never lives in open_trades.
+        self.open_trades.pop(sym, None)
+
+        # Record in dust registry
+        accepted = sym in self.accepted_symbols or sym in self.symbols
+        origin = "strategy_portfolio" if accepted else "external_untracked"
+        qty = float((self.positions.get(sym, {}) or {}).get("quantity", 0.0) or 0.0)
+        self.record_dust(
+            sym,
+            qty,
+            origin=origin,
+            context={"source": "mark_as_dust", "accepted_symbol": accepted},
+        )
+
+        self.logger.debug("[SS:Dust] Marked %s as DUST - does not block capital", sym)
 
     def mark_as_permanent_dust(self, symbol: str) -> None:
         """
@@ -1594,25 +1606,18 @@ class SharedState:
 
     async def is_portfolio_flat(self) -> bool:
         """
-        ===== GOLDEN RULE: If total_positions > 0 → portfolio is NOT flat =====
-
-        Returns True only if portfolio has ZERO positions.
-        Any position (including dust) means portfolio is NOT flat.
-
-        This is the authoritative flatness check.
+        Returns True only if portfolio has ZERO SIGNIFICANT positions.
         """
-        # FIX: Count ALL positions (including dust) — not just significant ones.
-        # The previous call to get_significant_position_count() excluded dust,
-        # which contradicted the docstring and caused BOOTSTRAP mode deadlock
-        # when only dust positions existed.
-        all_positions = self.get_open_positions()  # Returns both significant AND dust
+        all_positions = self.get_open_positions()
         total_positions = len(all_positions)
 
         if total_positions == 0:
             self.logger.debug("[SS:Portfolio] Portfolio is FLAT - no positions")
             return True
         else:
-            self.logger.debug(f"[SS:Portfolio] Portfolio NOT flat - {total_positions} positions exist (including dust)")
+            self.logger.debug(
+                f"[SS:Portfolio] Portfolio NOT flat - {total_positions} significant positions exist"
+            )
             return False
 
     async def get_occupied_capital(self) -> float:
@@ -2052,6 +2057,87 @@ class SharedState:
 
     def _norm_sym(self, s: str) -> str:
         return (s or "").upper().replace("/", "")
+
+    def _significant_position_floor_from_min_notional(self, min_notional: float = 0.0) -> float:
+        """Canonical significant-position floor used across Meta/SharedState/TPSL."""
+        strategy_floor = float(
+            self._cfg(
+                "SIGNIFICANT_POSITION_FLOOR",
+                self._cfg(
+                    "MIN_SIGNIFICANT_POSITION_USDT",
+                    self._cfg("MIN_SIGNIFICANT_USD", 25.0),
+                ),
+            )
+            or 25.0
+        )
+        min_position_value = float(self._cfg("MIN_POSITION_VALUE_USDT", 10.0) or 10.0)
+        return max(float(min_notional or 0.0), min_position_value, strategy_floor)
+
+    def _cached_min_notional(self, symbol: str) -> float:
+        try:
+            filters = dict(self.symbol_filters.get(self._norm_sym(symbol), {}) or {})
+            _step, _min_qty, _tick, min_notional = self._extract_symbol_filter_values(filters)
+            return float(min_notional or 0.0)
+        except Exception:
+            return 0.0
+
+    async def get_significant_position_floor(self, symbol: str) -> float:
+        """Async floor resolver that prefers live exchange trade rules."""
+        min_notional = 0.0
+        try:
+            _lot_step, min_notional = await self.compute_symbol_trade_rules(symbol)
+        except Exception:
+            min_notional = 0.0
+        if min_notional <= 0:
+            min_notional = self._cached_min_notional(symbol)
+        return float(self._significant_position_floor_from_min_notional(min_notional))
+
+    def _estimate_position_value_usdt(
+        self,
+        symbol: str,
+        position_data: Dict[str, Any],
+        price_hint: float = 0.0,
+    ) -> float:
+        """Best-effort mark-to-market position value."""
+        pos = position_data if isinstance(position_data, dict) else {}
+        qty = float(pos.get("quantity", 0.0) or pos.get("qty", 0.0) or 0.0)
+        if qty <= 0:
+            return 0.0
+        sym = self._norm_sym(symbol)
+        price = float(price_hint or 0.0)
+        if price <= 0:
+            price = float(self.latest_prices.get(sym, 0.0) or 0.0)
+        if price <= 0:
+            price = float(
+                pos.get("mark_price", 0.0)
+                or pos.get("avg_price", 0.0)
+                or pos.get("entry_price", 0.0)
+                or pos.get("price", 0.0)
+                or 0.0
+            )
+        if price > 0:
+            return float(qty * price)
+        return float(pos.get("value_usdt", 0.0) or 0.0)
+
+    def classify_position_snapshot(
+        self,
+        symbol: str,
+        position_data: Dict[str, Any],
+        *,
+        floor_hint: float = 0.0,
+        price_hint: float = 0.0,
+    ) -> Tuple[bool, float, float]:
+        """
+        Sync significance check for runtime paths that cannot await.
+        Returns: (is_open_significant, value_usdt, significant_floor)
+        """
+        pos = position_data if isinstance(position_data, dict) else {}
+        value_usdt = self._estimate_position_value_usdt(symbol, pos, price_hint=price_hint)
+        floor = float(floor_hint or pos.get("significant_floor_usdt", 0.0) or 0.0)
+        if floor <= 0:
+            floor = self._significant_position_floor_from_min_notional(self._cached_min_notional(symbol))
+        is_open = bool(value_usdt >= max(floor, 0.0) and value_usdt > 0.0)
+        return is_open, float(value_usdt), float(floor)
 
     def get_ohlcv_count(self, symbol: str, timeframe: str) -> int:
         return len(self.market_data.get((symbol, timeframe), []))
@@ -3182,6 +3268,7 @@ class SharedState:
                         "_mirrored": True,
                         "status": "CLOSED"  # CRITICAL: Mark as CLOSED so open_positions_count() doesn't count it
                     })
+                    self.open_trades.pop(sym, None)
                     changed.append(sym)
                 continue
             sym = f"{a}{quote}"
@@ -3191,13 +3278,48 @@ class SharedState:
             prev = self.positions.get(sym, {})
             if float(prev.get("quantity", 0.0)) != free_qty or not prev.get("_mirrored"):
                 pos = dict(prev)
+                price = float(self.latest_prices.get(sym, 0.0) or 0.0)
+                if price <= 0 and self._exchange_client:
+                    try:
+                        getter = getattr(self._exchange_client, "get_current_price", None) or getattr(
+                            self._exchange_client, "get_symbol_price", None
+                        )
+                        if callable(getter):
+                            price = float(await getter(sym) or 0.0)
+                    except Exception:
+                        price = 0.0
+                position_value = float(free_qty * price) if price > 0 else float(prev.get("value_usdt", 0.0) or 0.0)
+                significant_floor = float(await self.get_significant_position_floor(sym) or 0.0)
+                is_significant = bool(position_value >= significant_floor and position_value > 0.0)
                 pos.update({
                     "quantity": free_qty,
-                    "avg_price": float(pos.get("avg_price", 0.0)),
+                    "avg_price": float(pos.get("avg_price", 0.0) or prev.get("entry_price", 0.0) or price or 0.0),
+                    "mark_price": float(price or pos.get("mark_price", 0.0) or 0.0),
+                    "value_usdt": float(position_value),
+                    "significant_floor_usdt": float(significant_floor),
+                    "is_significant": bool(is_significant),
+                    "is_dust": not bool(is_significant),
+                    "_is_dust": not bool(is_significant),
+                    "open_position": bool(is_significant),
+                    "state": PositionState.ACTIVE.value if is_significant else PositionState.DUST_LOCKED.value,
                     "_mirrored": True,
-                    "status": "OPEN"  # CRITICAL: Set status so open_positions_count() recognizes it
+                    "status": "SIGNIFICANT" if is_significant else "DUST",
                 })
                 await self.update_position(sym, pos)
+                if not is_significant:
+                    self.record_dust(
+                        sym,
+                        free_qty,
+                        origin="wallet_balance_sync",
+                        context={
+                            "source": "hydrate_positions_from_balances",
+                            "value_usdt": float(position_value),
+                            "significant_floor_usdt": float(significant_floor),
+                        },
+                    )
+                    self.open_trades.pop(sym, None)
+                else:
+                    self.dust_registry.pop(sym, None)
                 changed.append(sym)
         if changed:
             await self.emit_event("PositionsMirroredFromBalances", {"symbols": changed, "count": len(changed)})
@@ -3425,6 +3547,7 @@ class SharedState:
                 "avg_price": new_avg,
                 "last_fill_ts": time.time(),
                 "buy_fee_base": buy_fee_base,
+                "value_usdt": new_qty * price,  # Update position value
             })
             self._avg_price_cache[symbol] = new_avg
             
@@ -3446,7 +3569,8 @@ class SharedState:
                 if cur_qty > 0 and buy_fee_base > 0:
                     pos["buy_fee_base"] = buy_fee_base * (new_qty / cur_qty)
             pos.update({"quantity": new_qty, "avg_price": avg if new_qty > 0 else 0.0, "last_fill_ts": time.time()})
-            if new_qty == 0: self._avg_price_cache.pop(symbol, None)
+            if new_qty > 0:
+                pos["value_usdt"] = new_qty * price  # Update position value for remaining quantity
             
             # Frequency Engineering: Track holding time
             ot = self.open_trades.get(symbol)
@@ -3456,34 +3580,67 @@ class SharedState:
                 self.metrics["completed_trades_count"] += 1
         else:
             return
-            
+
+        current_qty = float(pos.get("quantity", 0.0) or 0.0)
+        significant_floor = float(await self.get_significant_position_floor(symbol) or 0.0)
+        position_value = float(current_qty * price) if current_qty > 0 and price > 0 else 0.0
+        if position_value <= 0:
+            position_value = float(self._estimate_position_value_usdt(symbol, pos, price_hint=price) or 0.0)
+        is_significant = bool(position_value >= significant_floor and position_value > 0.0)
+        pos["value_usdt"] = float(position_value)
+        pos["significant_floor_usdt"] = float(significant_floor)
+        pos["is_significant"] = bool(is_significant)
+        pos["is_dust"] = not bool(is_significant)
+        pos["_is_dust"] = not bool(is_significant)
+        pos["open_position"] = bool(is_significant)
+        pos["capital_occupied"] = float(position_value) if is_significant else 0.0
+        if current_qty > 0:
+            pos["state"] = PositionState.ACTIVE.value if is_significant else PositionState.DUST_LOCKED.value
+            pos["status"] = "SIGNIFICANT" if is_significant else "DUST"
+        else:
+            pos["state"] = PositionState.DUST_LOCKED.value
+            pos["status"] = "CLOSED"
+
         await self.update_position(symbol, pos)
-        
-        # P9 Integrity: Ensure open_trades exists for TP/SL tracking
-        if side_u == "BUY" and symbol not in self.open_trades:
+
+        # Hard invariant: only significant positions are represented in open_trades.
+        if side_u == "BUY" and current_qty > 0 and is_significant:
             now_ts = time.time()
-            self.open_trades[symbol] = {
-                "symbol": symbol,
-                "position": "long",
-                "entry_price": price,
-                "quantity": qty,
-                "opened_at": now_ts,
-                "created_at": now_ts,
-                "tier": tier
-            }
-        elif side_u == "BUY" and symbol in self.open_trades:
-            # Ensure timestamps exist for time-based exits
-            try:
-                now_ts = time.time()
-                ot = self.open_trades.get(symbol) or {}
-                if isinstance(ot, dict):
-                    ot.setdefault("opened_at", now_ts)
-                    ot.setdefault("created_at", now_ts)
-                    self.open_trades[symbol] = ot
-            except Exception:
-                pass
-        elif side_u == "SELL" and new_qty <= 0:
+            ot = self.open_trades.get(symbol) if isinstance(self.open_trades, dict) else None
+            if not isinstance(ot, dict):
+                ot = {
+                    "symbol": symbol,
+                    "position": "long",
+                    "entry_price": price,
+                    "quantity": current_qty,
+                    "opened_at": now_ts,
+                    "created_at": now_ts,
+                    "tier": tier,
+                }
+            else:
+                ot.setdefault("opened_at", now_ts)
+                ot.setdefault("created_at", now_ts)
+                ot["quantity"] = float(current_qty)
+                ot.setdefault("entry_price", price)
+                if tier is not None:
+                    ot["tier"] = tier
+            self.open_trades[symbol] = ot
+        else:
             self.open_trades.pop(symbol, None)
+
+        if current_qty > 0 and not is_significant:
+            self.record_dust(
+                symbol,
+                current_qty,
+                origin="execution_fill",
+                context={
+                    "source": "record_fill",
+                    "value_usdt": float(position_value),
+                    "significant_floor_usdt": float(significant_floor),
+                },
+            )
+        elif current_qty > 0 and is_significant:
+            self.dust_registry.pop(self._norm_sym(symbol), None)
             
         self.metrics["realized_pnl"] = float(self.metrics.get("realized_pnl", 0.0)) + realized
         self.trade_history.append({
@@ -3917,37 +4074,26 @@ class SharedState:
 
     async def get_portfolio_state(self) -> str:
         """
-        ===== GOLDEN RULE: If total_positions > 0 → portfolio is NOT flat =====
+        ===== CANONICAL OPEN RULE =====
         
         States:
         - COLD_BOOTSTRAP: Never traded (is_cold_bootstrap() = True)
-        - ACTIVE: Has ANY positions (total_positions > 0)
+        - ACTIVE: Has significant open positions (value >= floor)
         - PORTFOLIO_FLAT: No positions (total_positions == 0)
-        
-        This replaces the minNotional-based logic with the authoritative rule:
-        Any position (regardless of size) means the portfolio is ACTIVE.
         """
         if self.is_cold_bootstrap():
             return "COLD_BOOTSTRAP"
-        
-        # ===== CRITICAL FIX: Golden Rule Implementation =====
-        # Count ALL positions with qty > 0 (including dust)
+
         try:
-            total_positions = 0
-            for sym, pos in self.positions.items():
-                qty = float(pos.get("quantity", 0.0))
-                if qty > 0:
-                    total_positions += 1
+            total_positions = len(self.get_open_positions())
             
             if total_positions > 0:
-                # ANY position means portfolio is ACTIVE
                 self.logger.info(
-                    "[SS:PortState] Portfolio is ACTIVE: total_positions=%d",
+                    "[SS:PortState] Portfolio is ACTIVE: significant_open_positions=%d",
                     total_positions
                 )
                 return "ACTIVE"
             else:
-                # No positions means portfolio is FLAT
                 self.logger.info("[SS:PortState] Portfolio is PORTFOLIO_FLAT: no positions")
                 return "PORTFOLIO_FLAT"
         except Exception as e:
@@ -3956,14 +4102,8 @@ class SharedState:
 
     async def is_portfolio_flat(self) -> bool:
         """
-        ===== GOLDEN RULE: If total_positions > 0 → portfolio is NOT flat =====
-
-        Returns True only if portfolio has ZERO positions.
-        Any position (including dust) means portfolio is NOT flat.
+        Returns True only when there are no significant open positions.
         """
-        # FIX: Directly count ALL positions (including dust) instead of
-        # delegating to get_portfolio_state() which treats COLD_BOOTSTRAP
-        # as flat even when dust positions exist from wallet sync.
         all_positions = self.get_open_positions()
         total_positions = len(all_positions)
 
@@ -3972,7 +4112,7 @@ class SharedState:
             return True
         else:
             self.logger.debug(
-                "[SS:IsFlat] Portfolio NOT flat - %d positions exist (including dust)",
+                "[SS:IsFlat] Portfolio NOT flat - %d significant positions exist",
                 total_positions,
             )
             return False
@@ -4229,37 +4369,46 @@ class SharedState:
 
     def get_open_positions(self) -> Dict[str, Dict[str, Any]]:
         """
-        Return all OPEN positions (status in {OPEN, PARTIALLY_FILLED}).
-        
-        ✅ Returns BOTH significant and dust positions.
-        Filter by is_dust flag in caller if needed.
+        Return only OPEN SIGNIFICANT positions.
+
+        Canonical invariant:
+        position is OPEN iff position_value_usdt >= significant_position_floor.
         """
-        dust_qty = 0.0
-        if self.config:
-            dust_qty = float(
-                getattr(
-                    self.config,
-                    "DUST_POSITION_QTY",
-                    getattr(self.config, "dust_position_qty", 0.0),
-                )
-                or 0.0
-            )
-        is_bootstrap = False
-        try:
-            is_bootstrap = bool(self.is_bootstrap_mode())
-        except Exception:
-            is_bootstrap = False
         result = {}
-        for sym, pos_data in self.positions.items():
-            status = str(pos_data.get("status", "")).upper()
-            qty = float(pos_data.get("quantity", 0.0))
-            
-            # Only include positions with OPEN/PARTIALLY_FILLED status and qty > 0
-            if status in {"OPEN", "PARTIALLY_FILLED"} and qty > 0:
-                if is_bootstrap and dust_qty > 0.0 and qty <= dust_qty:
-                    continue
-                result[sym] = pos_data
-        
+        for sym, pos_data in list(self.positions.items()):
+            if not isinstance(pos_data, dict):
+                continue
+            qty = float(pos_data.get("quantity", 0.0) or pos_data.get("qty", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+            is_open, value_usdt, floor = self.classify_position_snapshot(sym, pos_data)
+            if not is_open:
+                # Self-heal stale state so dust never blocks routing/capacity.
+                pos_data["status"] = "DUST"
+                pos_data["state"] = PositionState.DUST_LOCKED.value
+                pos_data["is_significant"] = False
+                pos_data["is_dust"] = True
+                pos_data["_is_dust"] = True
+                pos_data["open_position"] = False
+                pos_data["capital_occupied"] = 0.0
+                pos_data["value_usdt"] = float(value_usdt)
+                pos_data["significant_floor_usdt"] = float(floor)
+                self.positions[sym] = pos_data
+                self.open_trades.pop(sym, None)
+                continue
+
+            pos_data["status"] = "SIGNIFICANT"
+            pos_data["state"] = PositionState.ACTIVE.value
+            pos_data["is_significant"] = True
+            pos_data["is_dust"] = False
+            pos_data["_is_dust"] = False
+            pos_data["open_position"] = True
+            pos_data["capital_occupied"] = float(value_usdt)
+            pos_data["value_usdt"] = float(value_usdt)
+            pos_data["significant_floor_usdt"] = float(floor)
+            self.positions[sym] = pos_data
+            result[sym] = pos_data
+
         return result
 
     def get_position_qty(self, symbol: str) -> float:
@@ -4300,26 +4449,15 @@ class SharedState:
     def open_positions_count(self) -> int:
         """
         Return count of OPEN positions.
-        
+
         ✅ FIX: EXCLUDE DUST positions from count.
         Dust positions do NOT count toward portfolio occupancy.
         Only SIGNIFICANT positions count.
-        
-        AUTHORITATIVE FLAT CHECK: position.status in {"OPEN", "PARTIALLY_FILLED"}
+
+        AUTHORITATIVE FLAT CHECK: position.status in {"OPEN", "PARTIALLY_FILLED", "SIGNIFICANT"}
         and NOT marked as dust
         """
-        count = 0
-        for sym, pos_data in self.positions.items():
-            status = str(pos_data.get("status", "")).upper()
-            qty = float(pos_data.get("quantity", 0.0))
-            is_dust = pos_data.get("is_dust", False) or pos_data.get("_is_dust", False)
-            
-            # Only count positions with OPEN or PARTIALLY_FILLED status 
-            # AND qty > 0 AND NOT dust
-            if status in {"OPEN", "PARTIALLY_FILLED"} and qty > 0 and not is_dust:
-                count += 1
-        
-        return count
+        return int(len(self.get_open_positions()))
 
 
     # ---- Optional helpers ----

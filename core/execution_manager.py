@@ -7,6 +7,11 @@
 # =============================
 """
 Octivault Trader — P9 Canonical ExecutionManager (native to your SharedState & ExchangeClient)
+
+ARCHITECTURE MAINTENANCE NOTE:
+When making changes to execution logic, order placement, or component interfaces,
+please update the ARCHITECTURE.md file in the project root to reflect these changes.
+Key areas to review: execution flows, safety mechanisms, and component relationships.
 """
 
 from __future__ import annotations
@@ -48,7 +53,7 @@ def round_step(value: float, step: float) -> float:
 # =============================
 try:
     from core.stubs import BinanceAPIException, ExecutionError
-  # type: ignore
+# type: ignore
 except Exception:
     class BinanceAPIException(Exception):
         def __init__(self, code: int | None = None, message: str = ""):
@@ -70,12 +75,12 @@ class ExecutionBlocked(Exception):
         self.min_required = float(min_required or 0.0)
         super().__init__(f"{code}: planned={self.planned_quote:.2f} available={self.available_quote:.2f} min_required={self.min_required:.2f}")
 
- # =============================
- # 2. Order Filter Shims
- # Imports and/or defines data classes and validation helpers for order filtering and symbol constraints, such as:
- # - Symbol filters (e.g., min/max quantity, tick size)
- # - Order request validation
- # =============================
+# =============================
+# 2. Order Filter Shims
+# Imports and/or defines data classes and validation helpers for order filtering and symbol constraints, such as:
+# - Symbol filters (e.g., min/max quantity, tick size)
+# - Order request validation
+# =============================
 # =============================
 # 3. Execution Manager Core
 # Contains the main ExecutionManager class and its methods, responsible for:
@@ -143,7 +148,7 @@ async def validate_order_request(*, side: str, qty: float, price: float,
             
         # STRICT CHECK: If rounding kills the quantity, we CANNOT execute.
         if qty <= 0:
-             return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
+            return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
 
         if qty < float(filters.min_qty):
             return False, 0.0, 0.0, "QTY_LT_MIN"
@@ -161,8 +166,8 @@ async def validate_order_request(*, side: str, qty: float, price: float,
             qty = float(q * Decimal(str(step)))
         
         if qty <= 0:
-             return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
-             
+            return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
+            
         if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
             # Strict Rule 2.1: amount == 0 -> ExecutionProbe = FAIL
             return False, 0.0, 0.0, "NOTIONAL_LT_MIN"
@@ -175,8 +180,8 @@ async def validate_order_request(*, side: str, qty: float, price: float,
 class ExecutionManager:
     """
     P9 ExecutionManager — canonical single-order path, natively aligned with:
-      - SharedState: get_spendable_balance(), get_position_quantity(), reserve_liquidity()/release_liquidity()
-      - ExchangeClient: place_market_order(), get_exchange_filters(), get_current_price()
+    - SharedState: get_spendable_balance(), get_position_quantity(), reserve_liquidity()/release_liquidity()
+    - ExchangeClient: place_market_order(), get_exchange_filters(), get_current_price()
     """
     
     @staticmethod
@@ -187,6 +192,17 @@ class ExecutionManager:
         # Avoid float precision garbage
         steps = math.floor(value / step)
         return steps * step
+
+    def _normalize_quote_precision(self, symbol: str, quote: float) -> float:
+        """Normalize quote amount to exchange precision requirements."""
+        precision = 8
+        try:
+            precision = int(self.exchange_client.get_quote_precision(symbol))
+        except Exception:
+            precision = 8
+        scale = Decimal("1").scaleb(-max(0, precision))
+        q = Decimal(str(float(quote or 0.0))).quantize(scale, rounding=ROUND_DOWN)
+        return float(q)
 
     # --- Post-fill realized PnL emitter (P9 observability contract) ---
     async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
@@ -447,24 +463,16 @@ class ExecutionManager:
         self.sell_min_net_pnl_usdt = float(getattr(config, "SELL_MIN_NET_PNL_USDT", 0.0))
         self.min_net_profit_after_fees_pct = float(getattr(config, "MIN_NET_PROFIT_AFTER_FEES", 0.0035))
 
-    def _cfg(self, path: str, default):
-        cur = self.config
-        for part in path.split('.'):
-            if isinstance(cur, dict):
-                cur = cur.get(part, default)
-            else:
-                cur = getattr(cur, part, default)
-            default = cur if cur is not None else default
-        return cur if cur is not None else default
-
         # PHASE 2 NOTE: min_notional_floor removed (capital floor check moved to MetaController)
         # ExecutionManager no longer enforces capital policy
-        self.maker_grace_s = float(_cfg('execution.maker_grace_s', 0.0))
-        self.allow_taker_if_within_bps = float(_cfg('execution.allow_taker_if_within_bps', 0.0))
-        self.min_free_reserve_usdt = float(_cfg('execution.min_free_reserve_usdt', 0.0))
-        self.no_remainder_below_quote = float(_cfg('execution.no_remainder_below_quote', 0.0))
+        self.maker_grace_s = float(self._cfg('execution.maker_grace_s', 0.0))
+        self.allow_taker_if_within_bps = float(self._cfg('execution.allow_taker_if_within_bps', 0.0))
+        self.min_free_reserve_usdt = float(self._cfg('execution.min_free_reserve_usdt', 0.0))
+        self.no_remainder_below_quote = float(
+            self._cfg('execution.no_remainder_below_quote', getattr(config, "NO_REMAINDER_BELOW_QUOTE", 0.0)) or 0.0
+        )
         # When NAV is tiny, serialize placement globally
-        self.small_nav_threshold = float(_cfg('capital.small_nav_threshold_usdt', 50.0))
+        self.small_nav_threshold = float(self._cfg('capital.small_nav_threshold_usdt', 50.0))
 
         # Liquidity healing
         self.max_liquidity_retries = int(getattr(config, "MAX_LIQUIDITY_RETRIES", 1))
@@ -499,7 +507,7 @@ class ExecutionManager:
         try:
             # primary API
             upd = getattr(self.shared_state, "update_component_status", None) \
-                  or getattr(self.shared_state, "set_component_status", None)
+                or getattr(self.shared_state, "set_component_status", None)
             if callable(upd):
                 res = upd("ExecutionManager", "Initialized", "Ready")
                 if asyncio.iscoroutine(res):
@@ -514,6 +522,16 @@ class ExecutionManager:
                 pass
         except Exception:
             self.logger.debug("EM init health update failed", exc_info=True)
+
+    def _cfg(self, path: str, default):
+        cur = self.config
+        for part in path.split('.'):
+            if isinstance(cur, dict):
+                cur = cur.get(part, default)
+            else:
+                cur = getattr(cur, part, default)
+            default = cur if cur is not None else default
+        return cur if cur is not None else default
 
     def _exit_fee_bps(self) -> float:
         cfg_val = float(self._cfg("EXIT_FEE_BPS", self._cfg("CR_FEE_BPS", 0.0)) or 0.0)
@@ -550,6 +568,43 @@ class ExecutionManager:
         min_position_floor = min_notional_val * min_notional_mult if min_notional_val > 0 else 0.0
         return max(float(exit_info.get("min_exit_quote", 0.0)), float(base_quote), min_position_usdt, min_position_floor)
 
+    def _is_dust_operation_context(
+        self,
+        policy_ctx: Optional[Dict[str, Any]] = None,
+        tier: Optional[str] = None,
+        tag: Optional[str] = None,
+        symbol: Optional[str] = None,
+    ) -> bool:
+        """Detect dust-healing/dust-recovery intent consistently across callers."""
+        ctx = policy_ctx or {}
+        reason = str(ctx.get("reason") or "").upper()
+        ctx_tier = str(ctx.get("tier") or "").upper()
+        arg_tier = str(tier or "").upper()
+        tag_u = str(tag or "").upper()
+        sym = self._norm_symbol(symbol or ctx.get("symbol") or "")
+        has_dust_deficit = False
+        has_dust_symbol_marker = False
+        try:
+            deficit_map = getattr(self.shared_state, "dust_healing_deficit", {}) or {}
+            has_dust_deficit = float(deficit_map.get(sym, 0.0) or 0.0) > 0.0 if sym else False
+        except Exception:
+            has_dust_deficit = False
+        try:
+            mark_map = getattr(self.shared_state, "dust_operation_symbols", {}) or {}
+            has_dust_symbol_marker = bool(mark_map.get(sym)) if sym else False
+        except Exception:
+            has_dust_symbol_marker = False
+        return bool(
+            ctx.get("is_dust_healing")
+            or ctx.get("_dust_healing")
+            or reason == "DUST_HEALING_BUY"
+            or ctx_tier == "DUST_RECOVERY"
+            or arg_tier == "DUST_RECOVERY"
+            or "DUST_HEAL" in tag_u
+            or has_dust_deficit
+            or has_dust_symbol_marker
+        )
+
     async def _heartbeat_loop(self):
         """Continuous heartbeat to satisfy Watchdog when no trades are occurring."""
         while True:
@@ -581,10 +636,10 @@ class ExecutionManager:
                 await maybe_call(self.shared_state, "update_timestamp", "ExecutionManager")
 
             upd = getattr(self.shared_state, "update_component_status", None) \
-                  or getattr(self.shared_state, "set_component_status", None)
+                or getattr(self.shared_state, "set_component_status", None)
             if callable(upd):
                 await (upd("ExecutionManager", status, detail) if asyncio.iscoroutinefunction(upd)
-                       else asyncio.to_thread(upd, "ExecutionManager", status, detail))
+                    else asyncio.to_thread(upd, "ExecutionManager", status, detail))
         except Exception:
             self.logger.debug("EM status emit (primary) failed", exc_info=True)
         # best-effort compatibility mirror
@@ -742,8 +797,8 @@ class ExecutionManager:
             
             # If we reached here, both Exchange and SharedState think we have 0
             if getattr(self.shared_state, "positions", {}).get(sym):
-                 self.logger.warning(f"[GetSellable] {sym}: Zero quantity returned despite position record existence.")
-                 
+                self.logger.warning(f"[GetSellable] {sym}: Zero quantity returned despite position record existence.")
+                
         except Exception:
             self.logger.debug("_get_sellable_qty failed (non-fatal)", exc_info=True)
         return 0.0
@@ -950,14 +1005,14 @@ class ExecutionManager:
                 buffer_pct * 100.0,
             )
             try:
-                await self.shared_state.record_rejection(sym, "SELL", "SELL_BELOW_FEES", source="ExecutionManager")
+                await self.shared_state.record_rejection(sym, "SELL", "SELL_BELOW_FEE", source="ExecutionManager")
             except Exception:
                 pass
             return {
                 "ok": False,
                 "status": "blocked",
                 "reason": "sell_below_fees",
-                "error_code": "SELL_BELOW_FEES",
+                "error_code": "SELL_BELOW_FEE",
                 "expected_move_pct": expected_move_pct,
                 "required_move_pct": required_move_pct,
                 "fee_mult": exit_fee_mult,
@@ -1388,9 +1443,11 @@ class ExecutionManager:
                 bal = await self.exchange_client.get_account_balance(quote_asset)
                 free = float((bal or {}).get('free', 0.0))
         remainder = max(0.0, free - float(spend))
-        if self.min_free_reserve_usdt > 0 and remainder < self.min_free_reserve_usdt:
+        min_free_reserve_usdt = float(getattr(self, "min_free_reserve_usdt", 0.0) or 0.0)
+        no_remainder_below_quote = float(getattr(self, "no_remainder_below_quote", 0.0) or 0.0)
+        if min_free_reserve_usdt > 0 and remainder < min_free_reserve_usdt:
             return free, False, 'RESERVE_FLOOR'
-        if self.no_remainder_below_quote > 0 and 0 < remainder < self.no_remainder_below_quote:
+        if no_remainder_below_quote > 0 and 0 < remainder < no_remainder_below_quote:
             return free, False, 'TINY_REMAINDER'
         return free, True, 'OK'
 
@@ -1428,6 +1485,13 @@ class ExecutionManager:
             return (True, qa, "BOOTSTRAP_ESCAPE_HATCH")
         if policy_ctx.get("bootstrap_bypass", False):
             skip_micro_trade_kill_switch = True
+        # --- DUST HEALING BYPASS ---
+        is_dust_healing_buy = str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+        is_dust_operation = self._is_dust_operation_context(policy_ctx, symbol=symbol)
+        if is_dust_operation:
+            # For dust healing/recovery, only validate step_size, min_notional, available balance
+            # Skip all other guards: min_econ_trade, profitability, micro_trade_kill_switch, fee_floor
+            skip_micro_trade_kill_switch = True
         self.logger.warning(f"[EXEC_TRACE] received bootstrap_bypass={policy_ctx.get('bootstrap_bypass', False)}")
         try:
             if qa is None or float(qa) <= 0:
@@ -1436,7 +1500,7 @@ class ExecutionManager:
 
             min_econ_trade_cfg = Decimal(str(policy_ctx.get("min_economic_trade", self._cfg("MIN_ECONOMIC_TRADE_USDT", 0.0)) or 0.0))
             dynamic_min_econ = Decimal("0")
-            if hasattr(self.shared_state, "compute_min_entry_quote"):
+            if hasattr(self.shared_state, "compute_min_entry_quote") and not is_dust_healing_buy:
                 try:
                     dyn_floor = await self.shared_state.compute_min_entry_quote(
                         symbol,
@@ -1446,7 +1510,7 @@ class ExecutionManager:
                 except Exception:
                     dynamic_min_econ = Decimal("0")
             min_econ_trade = max(min_econ_trade_cfg, dynamic_min_econ)
-            if min_econ_trade > 0 and qa < min_econ_trade:
+            if min_econ_trade > 0 and qa < min_econ_trade and not is_dust_operation:
                 gap = (min_econ_trade - qa).max(Decimal("0"))
                 return (False, gap, "QUOTE_LT_MIN_ECONOMIC")
 
@@ -1463,51 +1527,19 @@ class ExecutionManager:
                 price = 0.0
             if price <= 0:
                 get_px = getattr(self.exchange_client, "get_ticker_price", None) \
-                         or getattr(self.exchange_client, "get_current_price", None) \
-                         or getattr(self.exchange_client, "get_price", None)
+                        or getattr(self.exchange_client, "get_current_price", None) \
+                        or getattr(self.exchange_client, "get_price", None)
                 if callable(get_px):
                     price = float(await get_px(sym) or 0.0)
             if price <= 0:
-                 # If we can't get price, we can't estimate quantity effectively
-                 # Fallback logic or hard fail? Let's assume 1.0 but log warning, or fail.
-                 # Failing is safer for affordability checks.
-                 return (False, Decimal("0"), "PRICE_UNAVAILABLE")
+                # If we can't get price, we can't estimate quantity effectively
+                # Fallback logic or hard fail? Let's assume 1.0 but log warning, or fail.
+                # Failing is safer for affordability checks.
+                return (False, Decimal("0"), "PRICE_UNAVAILABLE")
 
-            # COMPUTE QUANTITY USING QUOTE-DRIVEN APPROACH
-            # If policy_context doesn't have planned_qty, compute it now
+            # Use planned_qty only when caller provided it explicitly.
+            # Never synthesize qty from min-entry here because affordability must reflect qa.
             planned_qty = policy_ctx.get("planned_qty")
-            if planned_qty is None and price > 0:
-                try:
-                    # Get symbol economics
-                    filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
-                    step_size, min_qty, min_notional = self.extract_symbol_economics(sym, filters)
-                    
-                    # Use min_entry_quote from policy_context or config
-                    min_entry_quote = float(policy_ctx.get("min_entry_quote", 
-                                                          self._cfg("MIN_ENTRY_QUOTE_USDT", 80.0)) or 80.0)
-                    
-                    # Guarantee non-dust: min_entry_quote >= min_notional
-                    min_entry_quote = max(min_entry_quote, float(min_notional or 10.0))
-                    
-                    # Derive qty from min_entry_quote (quote-driven)
-                    raw_qty = float(min_entry_quote) / float(price)
-                    computed_qty = self._round_step_down(raw_qty, step_size)
-                    
-                    # Validate constraints
-                    if (computed_qty >= min_qty and 
-                        computed_qty * price >= float(min_notional or 10.0)):
-                        planned_qty = computed_qty
-                        # Update policy_context for consistency
-                        policy_ctx["planned_qty"] = planned_qty
-                        policy_ctx["step_size"] = step_size
-                        policy_ctx["min_qty"] = min_qty
-                        policy_ctx["computed_min_entry_quote"] = min_entry_quote
-                        policy_ctx["computed_min_notional"] = float(min_notional or 10.0)
-                    else:
-                        return (False, Decimal("0"), f"QTY_VALIDATION_FAILED: qty={computed_qty:.8f} < min_qty={min_qty} or notional={computed_qty*price:.2f} < min_notional={min_notional}")
-                        
-                except Exception as e:
-                    return (False, Decimal("0"), f"QTY_COMPUTATION_FAILED: {e}")
 
             atr_pct = 0.0
             try:
@@ -1521,13 +1553,13 @@ class ExecutionManager:
                 atr_pct = 0.0
 
             feasible, feas_detail = self._entry_profitability_feasible(sym, price=price, atr_pct=atr_pct)
-            if not feasible:
+            if not feasible and not is_dust_operation:
                 payload = {
                     "reason": "INFEASIBLE_PROFITABILITY",
                     "symbol": sym,
                     **feas_detail,
                 }
-                self.logger.warning("[EM:ProfitFeasibility] Block BUY: %s", payload)
+                self.logger.warning("[EM:ProfitFeasibility] Blocked BUY: %s", payload)
                 with contextlib.suppress(Exception):
                     await maybe_call(self.shared_state, "emit_event", "EntryProfitabilityBlocked", payload)
                 return (False, Decimal("0"), "INFEASIBLE_PROFITABILITY")
@@ -1575,13 +1607,17 @@ class ExecutionManager:
                 return (False, Decimal("0"), f"invalid_min_notional({min_notional})")
 
             # Dynamic exit-feasibility floor (symbol-aware)
-            min_required_val = await self._get_min_entry_quote(sym, price=price, min_notional=float(min_notional), policy_context=policy_ctx)
+            if is_dust_operation:
+                # Dust healing should not inherit normal strategy floor (e.g., MIN_ENTRY_QUOTE_USDT).
+                min_required_val = float(min_notional)
+            else:
+                min_required_val = await self._get_min_entry_quote(sym, price=price, min_notional=float(min_notional), policy_context=policy_ctx)
             min_required = Decimal(str(min_required_val))
 
             # Planned-quote fee floor (planned_quote >= fee_mult × round-trip fee on min-required quote)
             fee_mult = Decimal(str(self._cfg("MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5))
             round_trip_fee_rate = Decimal(str(self.trade_fee_pct)) * Decimal("2")
-            if round_trip_fee_rate > 0 and fee_mult > 0:
+            if round_trip_fee_rate > 0 and fee_mult > 0 and not is_dust_operation:
                 planned_fee_floor = min_required * round_trip_fee_rate * fee_mult
                 if qa < planned_fee_floor - eps:
                     gap = (planned_fee_floor - qa).max(Decimal("0"))
@@ -1624,7 +1660,10 @@ class ExecutionManager:
             # CRITICAL: accumulate_mode allows dust promotion without min_notional guards
             bypass_min_notional = accumulate_mode
             
-            if not bypass_min_notional:
+            # For dust healing, bypass internal economic floor but enforce exchange min_notional
+            bypass_internal_economic_floor = bypass_min_notional or is_dust_operation
+            
+            if not bypass_internal_economic_floor:
                 # 3) If planned quote + accumulation is below the floor, decide between MIN_NOTIONAL vs NAV shortfall
                 if effective_qa < min_required - eps:
                     # If the user is effectively trying to spend all they have (including accumulation)
@@ -1656,9 +1695,25 @@ class ExecutionManager:
             
             # PREFER PLANNED_QTY from policy_context (MetaController computed)
             # Fall back to computing from quote amount
-            if planned_qty is not None:
-                est_units = planned_qty
-                self.logger.debug(f"[EM] Using planned_qty {planned_qty} for {sym}")
+            # EXCEPTION: For dust healing, ALWAYS recalculate from current quote amount to avoid variable leakage
+            qty_source = "quote"
+            if planned_qty is not None and not is_dust_operation:
+                est_units = float(planned_qty)
+                est_units_raw = float(effective_qa) / price_f  # Still calculate for diagnostics
+                implied_quote = est_units * price_f
+                # Guard against stale/mismatched upstream qty that makes diagnostics and gates inconsistent.
+                if abs(implied_quote - float(effective_qa)) > max(0.01, float(effective_qa) * 0.05):
+                    self.logger.warning(
+                        "[AFFORD_DIAG] %s planned_qty mismatch (implied_quote=%.2f effective_quote=%.2f). "
+                        "Recomputing from quote.",
+                        sym, implied_quote, float(effective_qa),
+                    )
+                    step = step_size
+                    est_units = self._round_step_down(est_units_raw, step) if step > 0 else est_units_raw
+                    qty_source = "quote_recomputed"
+                else:
+                    qty_source = "policy_planned_qty"
+                    self.logger.debug(f"[EM] Using planned_qty {planned_qty} for {sym}")
             else:
                 est_units_raw = float(effective_qa) / price_f
                 # P9 Corrective: Use the extracted step_size (robust) instead of direct dict access
@@ -1681,26 +1736,33 @@ class ExecutionManager:
             self.logger.warning(
                 f"[AFFORD_DIAG] symbol={sym} "
                 f"planned_quote={float(qa):.2f} "
+                f"effective_quote={float(effective_qa):.2f} "
                 f"price={price_f:.2f} "
                 f"qty_raw={qty_raw:.8f} "
                 f"step_size={step_size:.8f} "
                 f"qty_exec={est_units:.8f} "
-                f"notional={notional_f:.2f}"
+                f"notional={notional_f:.2f} "
+                f"spendable={float(spendable_dec):.2f} "
+                f"source={qty_source}"
             )
             
             est_notional = est_units * price_f
             
-            # Check if this executable chunk meets minNotional (SKIP in bootstrap/accumulate modes)
+            # Check if this executable chunk meets minNotional (SKIP in bootstrap/accumulate modes, but NEVER for dust healing)
             exchange_floor = float(min_notional)  # NOT min_required
             if not bypass_min_notional and est_notional < exchange_floor:
                 gap = Decimal(str(exchange_floor)) - Decimal(str(est_notional))
                 return (False, gap.max(Decimal("0")), "QUOTE_LT_MIN_NOTIONAL")
-            elif bypass_min_notional and est_notional < exchange_floor:
-                # Log bypass for accumulate execution
+            elif bypass_min_notional and est_notional < exchange_floor and not is_dust_operation:
+                # Log bypass for accumulate execution, but not for dust healing
                 self.logger.warning(
                     f"[EM:ACCUMULATE] {sym} BUY: Bypassing second min_entry check - "
                     f"est_notional={est_notional:.2f} < exchange_floor={exchange_floor:.2f}"
                 )
+            elif is_dust_operation and est_notional < exchange_floor:
+                # Dust healing/recovery must respect exchange min_notional
+                gap = Decimal(str(exchange_floor)) - Decimal(str(est_notional))
+                return (False, gap.max(Decimal("0")), "DUST_OPERATION_LT_MIN_NOTIONAL")
 
             gross_needed = qa * (Decimal("1") + taker_fee) * headroom
             if spendable_dec < gross_needed - eps:
@@ -1730,7 +1792,7 @@ class ExecutionManager:
                     max_qty=float("inf"),
                     tick_size=1e-8,
                     min_notional=float(min_notional),
-                    min_entry_quote=float(min_required)
+                    min_entry_quote=(0.0 if is_dust_operation else float(min_required))
                 )
                 # Re-fetch real filters for accuracy
                 f_data = await self.exchange_client.ensure_symbol_filters_ready(sym)
@@ -1776,19 +1838,19 @@ class ExecutionManager:
                     min_req_dec = Decimal(str(filters_obj.min_notional))
                     
                     if spendable_dec >= min_req_dec:
-                         # Use at least one step_size/min_qty
-                         forced_qty = max(Decimal(str(filters_obj.min_qty)), Decimal(str(filters_obj.step_size or 0.1)))
-                         self.logger.info(f"[EM] Readiness Check: Ignoring rounding error because spendable {spendable_dec:.2f} >= minNotional {min_req_dec:.2f}. Forcing qty={forced_qty}")
-                         return (True, forced_qty, "OK_BOOTSTRAP_FORCED")
+                        # Use at least one step_size/min_qty
+                        forced_qty = max(Decimal(str(filters_obj.min_qty)), Decimal(str(filters_obj.step_size or 0.1)))
+                        self.logger.info(f"[EM] Readiness Check: Ignoring rounding error because spendable {spendable_dec:.2f} >= minNotional {min_req_dec:.2f}. Forcing qty={forced_qty}")
+                        return (True, forced_qty, "OK_BOOTSTRAP_FORCED")
                     
                     gap = Decimal("0")
                     if v_reason == "QTY_LT_MIN" or v_reason == "NOTIONAL_LT_MIN_OR_ZERO_QTY":
-                         # Rule 2/5 Enhancement: Calculate exactly what we need to reach 1 unit
-                         step = Decimal(str(filters_obj.step_size or 0.1))
-                         target_qty = max(Decimal(str(filters_obj.min_qty)), step)
-                         target_notional = max(Decimal(str(filters_obj.min_notional)), target_qty * Decimal(str(price)))
-                         gap = (target_notional - qa).max(Decimal("0"))
-                         
+                        # Rule 2/5 Enhancement: Calculate exactly what we need to reach 1 unit
+                        step = Decimal(str(filters_obj.step_size or 0.1))
+                        target_qty = max(Decimal(str(filters_obj.min_qty)), step)
+                        target_notional = max(Decimal(str(filters_obj.min_notional)), target_qty * Decimal(str(price)))
+                        gap = (target_notional - qa).max(Decimal("0"))
+                        
                     self.logger.warning("[EM] ExecutionProbe = FAIL (Reason: %s, Gap: %.2f). Readiness = FALSE.", v_reason, gap)
                     return (False, gap, f"NOT_EXECUTABLE:{v_reason}")
 
@@ -1846,6 +1908,19 @@ class ExecutionManager:
     ) -> Dict[str, Any]:
         """Close a position via the canonical execution path with optional forced finalization."""
         reason_text = str(reason or "").strip() or "EXIT"
+        sym = self._norm_symbol(symbol)
+        pos_qty = 0.0
+        try:
+            if hasattr(self.shared_state, "get_position_qty"):
+                pos_qty = float(self.shared_state.get_position_qty(sym) or 0.0)
+            elif isinstance(getattr(self.shared_state, "positions", None), dict):
+                pos_qty = float((self.shared_state.positions.get(sym, {}) or {}).get("quantity", 0.0) or 0.0)
+        except Exception:
+            pos_qty = 0.0
+        self.logger.info(
+            "[EM:CLOSE_ATTEMPT] symbol=%s qty=%.8f reason=%s tag=%s force_finalize=%s",
+            sym, pos_qty, reason_text, tag, bool(force_finalize)
+        )
         policy_context = {
             "exit_reason": reason_text,
             "reason": reason_text,
@@ -1860,12 +1935,35 @@ class ExecutionManager:
             is_liquidation=True,
             policy_context=policy_context,
         )
+        try:
+            if isinstance(res, dict):
+                self.logger.info(
+                    "[EM:CLOSE_RESULT] symbol=%s ok=%s status=%s reason=%s error_code=%s order_id=%s executed_qty=%s cumm_quote=%s",
+                    sym,
+                    bool(res.get("ok")),
+                    str(res.get("status", "")),
+                    str(res.get("reason", "")),
+                    str(res.get("error_code", "")),
+                    str(res.get("orderId", res.get("order_id", ""))),
+                    str(res.get("executedQty", res.get("executed_qty", ""))),
+                    str(res.get("cummulativeQuoteQty", res.get("cummulative_quote", ""))),
+                )
+            else:
+                self.logger.warning("[EM:CLOSE_RESULT] symbol=%s non-dict response=%r", sym, res)
+        except Exception:
+            self.logger.debug("[EM] close result logging failed for %s", sym, exc_info=True)
         if force_finalize:
             try:
                 status = str(res.get("status", "")).lower() if isinstance(res, dict) else ""
                 ok = bool(res.get("ok")) if isinstance(res, dict) else False
                 if ok or status in {"placed", "executed", "filled", "partially_filled"}:
                     await self._force_finalize_position(symbol, reason_text)
+                    self.logger.info("[EM:CLOSE_FINALIZE] symbol=%s applied=True reason=%s", sym, reason_text)
+                else:
+                    self.logger.warning(
+                        "[EM:CLOSE_FINALIZE] symbol=%s applied=False status=%s ok=%s reason=%s",
+                        sym, status, ok, reason_text
+                    )
             except Exception:
                 self.logger.debug("[EM] force_finalize_position failed for %s", symbol, exc_info=True)
         return res
@@ -1928,7 +2026,7 @@ class ExecutionManager:
         Final size = minimum of all constraints (except when liquidation bypasses)
 
         Returns normalized contract:
-          { ok, status, executedQty, avgPrice, cummulativeQuoteQty, orderId, reason, error_code?, tier? }
+        { ok, status, executedQty, avgPrice, cummulativeQuoteQty, orderId, reason, error_code?, tier? }
         """
         self._ensure_heartbeat()
         side = (side or "").lower()
@@ -1936,6 +2034,39 @@ class ExecutionManager:
         policy_ctx = dict(policy_context or {})
         decision_id = self._resolve_decision_id(policy_ctx)
         policy_ctx.setdefault("decision_id", decision_id)
+        if tier is not None and "tier" not in policy_ctx:
+            policy_ctx["tier"] = tier
+
+        # Contract guard: if tradeability metadata is present, Meta must have evaluated
+        # _passes_tradeability_gate before any quote reservation in this method.
+        if side == "buy":
+            has_tradeability_payload = any(
+                policy_ctx.get(k) is not None
+                for k in (
+                    "required_conf",
+                    "break_even_prob",
+                    "tradeability_expected_move_pct",
+                )
+            ) or bool(
+                str(policy_ctx.get("tradeability_hint", "") or "").strip()
+            ) or bool(
+                str(policy_ctx.get("tradeability_regime", "") or "").strip()
+            )
+            if has_tradeability_payload and not bool(policy_ctx.get("tradeability_gate_checked")):
+                self.logger.warning(
+                    "[EXEC:Tradeability] Blocked BUY %s: missing Meta tradeability gate before reservation.",
+                    sym,
+                )
+                return {
+                    "ok": False,
+                    "status": "blocked",
+                    "reason": "tradeability_gate_missing",
+                    "error_code": "TRADEABILITY_GATE_MISSING",
+                }
+
+        # Define dust operation flags for bypass logic
+        is_dust_healing_buy = str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+        is_dust_operation = self._is_dust_operation_context(policy_ctx, tier=tier, tag=tag, symbol=sym)
 
         # 🛡️ P9 SOP GOVERNANCE: Last line of defense (unless full liquidation bypass)
         # Exits/Liquidation are usually allowed even in safety modes to protect capital.
@@ -1969,12 +2100,12 @@ class ExecutionManager:
         if not is_liq_full:
             mode = str(self.shared_state.metrics.get("current_mode", "NORMAL")).upper()
             if mode == "PAUSED":
-                 self.logger.warning(f"[EM:GovBlock] Blocked {side.upper()} {sym}: System is PAUSED.")
-                 return {"ok": False, "status": "blocked", "reason": "System PAUSED", "error_code": "PAUSED_MODE"}
+                self.logger.warning(f"[EM:GovBlock] Blocked {side.upper()} {sym}: System is PAUSED.")
+                return {"ok": False, "status": "blocked", "reason": "System PAUSED", "error_code": "PAUSED_MODE"}
             
             if side == "buy" and mode == "PROTECTIVE":
-                 self.logger.warning(f"[EM:GovBlock] Blocked BUY {sym}: System is in PROTECTIVE mode.")
-                 return {"ok": False, "status": "blocked", "reason": "BUY Disabled in PROTECTIVE Mode", "error_code": "PROTECTIVE_MODE"}
+                self.logger.warning(f"[EM:GovBlock] Blocked BUY {sym}: System is in PROTECTIVE mode.")
+                return {"ok": False, "status": "blocked", "reason": "BUY Disabled in PROTECTIVE Mode", "error_code": "PROTECTIVE_MODE"}
         tag_raw = tag or ""
         tag_lower = tag_raw.lower()
         clean_tag = self._sanitize_tag(tag)
@@ -2012,6 +2143,58 @@ class ExecutionManager:
         if special_liq_bypass:
             liq_marker = " [LIQUIDATION:SAFE_BYPASS]"
         self.logger.info(f"[EXEC] Request: {sym} {side.upper()} q={quantity} p_quote={planned_quote} tag={clean_tag}{tier_label}{liq_marker}")
+
+        # FIX: For DUST_RECOVERY, set risk_based_quote before scaling to bypass ATR sizing
+        if tier == "DUST_RECOVERY":
+            deficit = getattr(self.shared_state, "dust_healing_deficit", {}).get(sym, 0.0)
+            small_buffer = float(getattr(self.config, "DUST_HEALING_BUFFER_USDT", 0.5))
+            planned_quote = deficit + small_buffer
+            self.shared_state.risk_based_quote = getattr(self.shared_state, "risk_based_quote", {})
+            self.shared_state.risk_based_quote[sym] = planned_quote
+            self.logger.info(f"[EM:DUST_RECOVERY] Set risk_based_quote for {sym} to {planned_quote:.2f}")
+
+        # HARD-SEPARATE DUST HEALING: Bypass all risk sizing for DUST_HEALING_BUY
+        is_dust_healing_buy = str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+        if is_dust_operation and side == "buy":
+            deficit = getattr(self.shared_state, "dust_healing_deficit", {}).get(sym, 0.0)
+            if deficit <= 0:
+                deficit = float(planned_quote or 0.0)
+            # Check if healing would create oversized position
+            current_value = 0.0
+            try:
+                positions = self.shared_state.get_open_positions()
+                if positions and sym in positions:
+                    pos = positions[sym]
+                    qty = float(pos.get("quantity", 0.0) or pos.get("qty", 0.0))
+                    if qty > 0:
+                        price = float(self.shared_state.latest_prices.get(sym, 0.0))
+                        if price > 0:
+                            current_value = qty * price
+            except Exception:
+                current_value = 0.0
+            
+            new_position_value = current_value + deficit
+            economic_floor = float(self._cfg("MIN_ECONOMIC_TRADE_USD", 75.0))
+            if new_position_value >= economic_floor:
+                self.logger.warning(f"[EM:DUST_HEALING] Blocking {sym} healing: new_position_value={new_position_value:.2f} >= economic_floor={economic_floor:.2f} (already healed)")
+                return {"ok": False, "status": "blocked", "reason": "dust_already_healed", "error_code": "DUST_ALREADY_HEALED"}
+            
+            planned_quote = deficit  # Exact deficit, no buffer for dust healing
+            self.shared_state.risk_based_quote = getattr(self.shared_state, "risk_based_quote", {})
+            self.shared_state.risk_based_quote[sym] = planned_quote
+            # Mark this symbol as an active dust operation for components that need symbol-scoped handling.
+            is_dust_operation = True
+            if not hasattr(self.shared_state, "dust_operation_symbols") or not isinstance(getattr(self.shared_state, "dust_operation_symbols", None), dict):
+                self.shared_state.dust_operation_symbols = {}
+            self.shared_state.dust_operation_symbols[sym] = time.time()
+            self.logger.info(f"[EM:DUST_HEALING] Hard-separated sizing for {sym}: exact_deficit={planned_quote:.2f}, new_pos_value={new_position_value:.2f}, bypassing risk engine")
+            
+            # Forward bypass flags to ensure no module modifies planned_quote
+            policy_ctx['bypass_risk'] = True
+            policy_ctx['bypass_scaling'] = True
+            policy_ctx['bypass_economic_floor'] = True
+            policy_ctx['bypass_micro_trade'] = True
+            policy_ctx['is_dust_healing'] = True
 
         # Fee-aware net PnL gate for non-liquidation SELLs (no stop-loss bypass)
         if side == "sell":
@@ -2076,6 +2259,19 @@ class ExecutionManager:
                             "error_code": "TerminalDust",
                             "executedQty": 0.0
                         }
+        
+        # Symbol-level exit lock to prevent duplicate SELL orders
+        if side == "sell":
+            if self.shared_state.exit_in_progress.get(sym, False):
+                self.logger.warning(f"[EXEC:EXIT_LOCK] {sym} SELL blocked: exit already in progress")
+                return {
+                    "ok": False,
+                    "status": "blocked",
+                    "reason": "exit_in_progress",
+                    "error_code": "EXIT_LOCK",
+                }
+            self.shared_state.exit_in_progress[sym] = True
+            self.logger.info(f"[EXEC:EXIT_LOCK] {sym} SELL exit lock acquired")
         
         # [FIX #9] LIQUIDATION BYPASS: If this is liquidation, skip ALL guards and go straight to execution
         if is_liq_full and side == "sell":
@@ -2174,10 +2370,14 @@ class ExecutionManager:
                     "reason": "[LIQUIDATION]",
                 }
                 self.logger.info(f"[EXEC:LIQ] ✅ Liquidation SELL executed: {sym} qty={result['executedQty']:.6f}")
+                # Release exit lock
+                self.shared_state.exit_in_progress[sym] = False
                 return result
             else:
                 self.logger.warning(f"[EXEC:LIQ] ⚠️ Liquidation SELL failed: status={status}, qty={exec_qty}")
                 await self._log_execution_event("liquidation_fail", sym, {"reason": "not_filled"})
+                # Release exit lock
+                self.shared_state.exit_in_progress[sym] = False
                 return {
                     "ok": False,
                     "status": status.lower(),
@@ -2186,11 +2386,11 @@ class ExecutionManager:
                     "error_code": "LiquidationFailed"
                 }
 
-        # ---- Risk gate (ALLOW / DENY / ADJUST) ---- [SKIPPED FOR LIQUIDATION]
+        # ---- Risk gate (ALLOW / DENY / ADJUST) ---- [SKIPPED FOR LIQUIDATION AND DUST HEALING]
         # [FIX #4] UNIFIED SELL AUTHORITY: RiskManager is advisory, not veto, for SELL
         strict_risk = bool(self._cfg("STRICT_RISK_AT_EXEC", False))
         adjusted = None
-        if self.risk_manager and hasattr(self.risk_manager, "check"):
+        if self.risk_manager and hasattr(self.risk_manager, "check") and not is_dust_operation:
             try:
                 decision = await self.risk_manager.check({
                     "symbol": sym, "side": side.upper(),
@@ -2248,8 +2448,8 @@ class ExecutionManager:
         try:
             guard_fn = getattr(self.shared_state, "profit_target_ok", None)
             if callable(guard_fn):
-                # Do not let the profit guard block SELLs or liquidity/TP-SL ops
-                if side == "buy" and not any(x in (tag or "") for x in ("liquidation", "tp_sl", "balancer")):
+                # Do not let the profit guard block SELLs or liquidity/TP-SL ops or dust healing
+                if side == "buy" and not any(x in (tag or "") for x in ("liquidation", "tp_sl", "balancer")) and not is_dust_operation:
                     # P9: Use dynamic profit target from shared_state/config
                     min_target = float(self._cfg("PROFIT_TARGET_BASE_USD_PER_HOUR", 20.0))
                     guard_ok = bool(await guard_fn(min_usdt_per_hour=min_target))
@@ -2269,8 +2469,8 @@ class ExecutionManager:
         try:
             # ---- Safety Check: Circuit Breaker & Health (Invariant 2) ----
             if hasattr(self.shared_state, "is_circuit_breaker_open") and await self.shared_state.is_circuit_breaker_open():
-                 self.logger.warning(f"[EXEC] 🛑 Circuit Breaker OPEN. Blocking trade for {sym}.")
-                 return {"ok": False, "status": "blocked", "reason": "CB_OPEN", "error_code": "CB_OPEN"}
+                self.logger.warning(f"[EXEC] 🛑 Circuit Breaker OPEN. Blocking trade for {sym}.")
+                return {"ok": False, "status": "blocked", "reason": "CB_OPEN", "error_code": "CB_OPEN"}
 
             # Health: we’re about to execute
             await self._emit_status("Running", f"execute_trade {sym} {side}")
@@ -2310,7 +2510,7 @@ class ExecutionManager:
                         # BOOTSTRAP FIX: Skip reservation check during bootstrap mode
                         bootstrap_bypass = policy_ctx.get("bootstrap_bypass", False) if policy_ctx else False
                         
-                        if clean_tag.startswith("meta/") and not bootstrap_bypass:
+                        if clean_tag.startswith("meta/") and not bootstrap_bypass and not is_dust_operation:
                             agent_id = clean_tag.split("/")[-1]
                             reservations = getattr(self.shared_state, "_authoritative_reservations", {})
                             agent_budget = reservations.get(agent_id, 0.0)
@@ -2322,27 +2522,30 @@ class ExecutionManager:
                                 
                                 # Check if authorization exists at all
                                 if agent_id in reservations:
-                                     # 🔒 DUST RETIREMENT CHECK: Don't record rejection for permanent dust
-                                     if await self._check_dust_retirement_before_rejection(sym, "BUY"):
-                                         self.logger.warning(f"[EM] {sym} is PERMANENT_DUST, skipping rejection recording")
-                                         return {"ok": False, "status": "skipped", "reason": "permanent_dust_retired", "error_code": "DustRetired"}
-                                     
-                                     self.logger.warning(f"[EM] Reservation Veto: {agent_id} budget {agent_budget:.2f} < planned {planned_quote:.2f}")
-                                     # P9 MANDATORY: Record rejection (I1 Invariant - Failure Memory)
-                                     await self.shared_state.record_rejection(sym, "BUY", "AGENT_RESERVATION_EXCEEDED", source="ExecutionManager")
-                                     rej_count = self.shared_state.get_rejection_count(sym, "BUY")
-                                     self.logger.info(f"[EXEC_REJECT] symbol={sym} side=BUY reason=AFFORDABILITY_CHECK_FAILED count={rej_count} action=RETRY")
-                                     return {"ok": False, "status": "skipped", "reason": "AGENT_RESERVATION_EXCEEDED", "error_code": "RESERVATION_LT_QUOTE"}
+                                    # 🔒 DUST RETIREMENT CHECK: Don't record rejection for permanent dust
+                                    if await self._check_dust_retirement_before_rejection(sym, "BUY"):
+                                        self.logger.warning(f"[EM] {sym} is PERMANENT_DUST, skipping rejection recording")
+                                        return {"ok": False, "status": "skipped", "reason": "permanent_dust_retired", "error_code": "DustRetired"}
+                                    
+                                    self.logger.warning(f"[EM] Reservation Veto: {agent_id} budget {agent_budget:.2f} < planned {planned_quote:.2f}")
+                                    # P9 MANDATORY: Record rejection (I1 Invariant - Failure Memory)
+                                    await self.shared_state.record_rejection(sym, "BUY", "AGENT_RESERVATION_EXCEEDED", source="ExecutionManager")
+                                    rej_count = self.shared_state.get_rejection_count(sym, "BUY")
+                                    self.logger.info(f"[EXEC_REJECT] symbol={sym} side=BUY reason=AFFORDABILITY_CHECK_FAILED count={rej_count} action=RETRY")
+                                    return {"ok": False, "status": "skipped", "reason": "AGENT_RESERVATION_EXCEEDED", "error_code": "RESERVATION_LT_QUOTE"}
                                 else:
-                                     # If agent not in reservation map, it might be new or Allocator hasn't run.
-                                     # We proceed to affordability check (can_afford_market_buy) which uses REAL balance.
-                                     self.logger.debug(f"[EM] No reservation record for {agent_id}, proceeding to balance check.")
+                                    # If agent not in reservation map, it might be new or Allocator hasn't run.
+                                    # We proceed to affordability check (can_afford_market_buy) which uses REAL balance.
+                                    self.logger.debug(f"[EM] No reservation record for {agent_id}, proceeding to balance check.")
                         elif bootstrap_bypass:
                             self.logger.info(f"[EM:BOOTSTRAP] Bypassing agent reservation check for bootstrap execution")
 
                         can, gap, reason = await self.can_afford_market_buy(sym, planned_quote, intent_override=intent, policy_context=policy_ctx)
                         
                         if not can:
+                            if is_dust_operation:
+                                await self._log_execution_event("order_skip", sym, {"side": "buy", "reason": reason, "dust_operation": True})
+                                return {"ok": False, "status": "skipped", "reason": reason, "error_code": reason}
                             # Mandatory explicit failure for authoritative planned quotes
                             # BOOTSTRAP FIX: Skip this block during bootstrap as we've already verified spendable balance
                             min_required_quote = await self._get_min_entry_quote(sym, policy_context=policy_context)
@@ -2448,6 +2651,9 @@ class ExecutionManager:
                                 await self.shared_state.add_to_accumulation(sym, "BUY", execute_quote)
                                 return {"ok": True, "status": "accumulating", "reason": "intent_claimed_restarting"}
 
+                        # Normalize execute_quote to exchange precision requirements
+                        execute_quote = self._normalize_quote_precision(sym, execute_quote)
+
                         order = await self.exchange_client.market_buy(sym, execute_quote, tag=clean_tag)
                         filled_qty = float(order.get("executedQty", 0.0) or 0.0)
                         avg_price = 0.0
@@ -2524,7 +2730,7 @@ class ExecutionManager:
                     # 3. We have a valid position
                     if not policy_validated:
                         is_cold = self.shared_state and hasattr(self.shared_state, "is_cold_bootstrap") and \
-                                  self.shared_state.is_cold_bootstrap()
+                                self.shared_state.is_cold_bootstrap()
                         is_liquidation = any(x in (tag or "") for x in ("liquidation", "tp_sl", "balancer"))
 
                         if is_cold and not is_liquidation:
@@ -2576,7 +2782,7 @@ class ExecutionManager:
                                 self.logger.info(f"[EXEC_REJECT] symbol={sym} side=SELL reason=NO_POSITION_QUANTITY count={rej_count} action=SKIP")
                                 await self._log_execution_event("sell_block_no_qty", sym, {"reason": "no_position_quantity"})
                                 return {"ok": False, "status": "skipped", "reason": "no_position_quantity", "error_code": "NoPosition"}
-                            quantity = qty
+                        quantity = qty
                         raw = await self._place_market_order_qty(
                             sym,
                             float(quantity),
@@ -2636,7 +2842,7 @@ class ExecutionManager:
                 try:
                     if hasattr(self.shared_state, "clear_rejections"):
                         await self.shared_state.clear_rejections(sym, side.upper())
-                        self.logger.info(f"[MemoryOfFailure] ✅ Cleared rejections for {sym} {side} (successful execution)")
+                        self.logger.info(f"[MemoryOfFailure] ✅ Cleared rejections for {sym} {side} (liquidation success)")
                     if side == "buy":
                         self._buy_block_state.pop(sym, None)
                 except Exception as e:
@@ -2743,7 +2949,7 @@ class ExecutionManager:
                     if planned_quote and final_quote < planned_quote:
                         reduction = f" (reduced from {planned_quote:.2f})"
                     self.logger.info(f"[EXEC] ✅ Tier-{tier} filled: {sym} {side.upper()} | "
-                                   f"quote={final_quote:.2f}{reduction} | qty={result['executedQty']:.6f}")
+                                f"quote={final_quote:.2f}{reduction} | qty={result['executedQty']:.6f}")
                 
                 return result
             else:
@@ -3512,7 +3718,7 @@ class ExecutionManager:
                 return None
             elif code == -1111:
                 # Precision error (step size)
-                self.logger.warning(
+                self.logger.error(
                     f"[EM:Classify] {symbol} {side}: PRECISION_ERROR (code={code}) - {msg}"
                 )
                 return None
@@ -3651,4 +3857,4 @@ class ExecutionManager:
             await self._emit_status("Initialized", "start() no-op warmup complete")
             self.logger.info("ExecutionManager.start: symbol filters warmed (if supported)")
         except Exception:
-            self.logger.debug("ExecutionManager.start warmup failed (non-fatal)", exc_info=True) 
+            self.logger.debug("ExecutionManager.start warmup failed (non-fatal)", exc_info=True)
