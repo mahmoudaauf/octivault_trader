@@ -792,7 +792,18 @@ class MetaController:
         self.policy_manager = PolicyManager(self.logger, self.config)
         self.active_policy_nudges = {}  # Store active policy nudges
         self.logger.info(f"[Meta:Init] Policy manager initialized")
-        self.rotation_authority = RotationExitAuthority(self.logger, self.config, self.shared_state)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE C: Pass Capital Governor to RotationExitAuthority
+        # Enables bracket-based rotation restrictions
+        # ═══════════════════════════════════════════════════════════════════
+        self.rotation_authority = RotationExitAuthority(
+            self.logger, 
+            self.config, 
+            self.shared_state,
+            capital_governor=self.capital_governor  # Already initialized in Phase B
+        )
+        self.logger.info("[Meta:Init] RotationExitAuthority initialized with Capital Governor (PHASE C)")
 
         # Profit-locked re-entry (compounding guard)
         try:
