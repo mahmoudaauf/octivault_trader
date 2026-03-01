@@ -9,6 +9,9 @@ import asyncio
 import signal
 import argparse
 from typing import Any, Dict, Optional
+from pathlib import Path
+import traceback
+from utils.pid_manager import PIDManager
 
 # Optional: uvloop for better perf on Linux; safe no-op elsewhere
 try:
@@ -17,8 +20,50 @@ try:
 except Exception:
     pass
 
-from core.app_context import AppContext, log_structured_error
-from core.config import Config
+# Load .env early - before any config or logging
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).resolve().parent / "core" / ".env"
+    load_dotenv(env_path, override=True)
+except Exception as e:
+    # Defer logging until after logging is configured
+    pass
+
+_APP_IMPORT_ERROR: Optional[Exception] = None
+_CFG_IMPORT_ERROR: Optional[Exception] = None
+
+try:
+    from core.app_context import AppContext, log_structured_error
+except Exception as _e:
+    AppContext = None  # type: ignore
+    _APP_IMPORT_ERROR = _e
+
+    def log_structured_error(  # type: ignore
+        e: Exception,
+        context: Optional[Dict[str, Any]] = None,
+        logger: Optional[logging.Logger] = None,
+        component: str = "Bootstrap",
+        phase: str = "INIT",
+        module: str = "main_phased",
+        event: str = "bootstrap_import_fail",
+    ):
+        target = logger or logging.getLogger("Main")
+        target.error(
+            "[%s] %s | component=%s phase=%s module=%s context=%s",
+            event,
+            e,
+            component,
+            phase,
+            module,
+            context or {},
+            exc_info=True,
+        )
+
+try:
+    from core.config import Config
+except Exception as _e:
+    Config = None  # type: ignore
+    _CFG_IMPORT_ERROR = _e
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="octivault-main-phased", description="P9-aligned runner")
@@ -40,17 +85,12 @@ def to_bool(v: Optional[str], default: bool = False) -> bool:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
-def load_config() -> Config:
-    # .env اختياري
-    try:
-        from dotenv import load_dotenv
-        import os
-        load_dotenv(os.path.abspath(os.path.join(os.getcwd(), '.env')), override=True)
-    except Exception as e:
-        logger = logging.getLogger("Main")
-        logger.warning("dotenv load failed: %s (Tip: pip install python-dotenv and ensure .env exists)", e)
-
-
+def load_config() -> "Config":
+    # .env is already loaded at module level
+    if Config is None:
+        raise RuntimeError(
+            f"Failed to import core.config.Config at bootstrap: {_CFG_IMPORT_ERROR!r}"
+        )
     cfg = Config()
     cfg.env = os.getenv("ENV", "prod")
     cfg.recovery = {
@@ -96,8 +136,17 @@ def _configure_logging() -> logging.Logger:
 
 async def _run():
     logger = _configure_logging()
+    if _APP_IMPORT_ERROR is not None:
+        logger.error(
+            "[bootstrap] Failed to import core.app_context before runtime start: %r",
+            _APP_IMPORT_ERROR,
+        )
+        logger.error("".join(traceback.format_exception(None, _APP_IMPORT_ERROR, _APP_IMPORT_ERROR.__traceback__)))
+        raise RuntimeError(
+            f"Bootstrap import failure for core.app_context: {_APP_IMPORT_ERROR!r}"
+        )
     cfg = load_config()
-
+    
     ns = _parse_args()
     # apply CLI overrides
     phase_max = get_up_to_phase(ns)
@@ -108,6 +157,11 @@ async def _run():
 
     # Quick reflect of effective level
     logger.debug("Loaded config: %s", cfg)
+
+    # Single-process guard: prevent duplicate live runtime processes.
+    pid_manager = PIDManager("logs/octivault_trader.pid")
+    if not pid_manager.acquire_lock():
+        raise RuntimeError("Another Octivault runtime instance is already running.")
 
     stop_event = asyncio.Event()
 
@@ -132,15 +186,22 @@ async def _run():
         ctx = AppContext(config=cfg, logger=logging.getLogger("AppContext"))
         # شغّل كل المراحل داخليًا (P1→P9)
         await ctx.initialize_all(up_to_phase=phase_max)
-        
-        # Wait for symbols to be ready before starting MDF (architecturally clean)
-        await ctx.shared_state.wait_for_event("AcceptedSymbolsReady")
-        
-        # Ensure MarketDataFeed is running (canonical startup)
-        if hasattr(ctx, 'market_data_feed') and ctx.market_data_feed and hasattr(ctx.market_data_feed, 'run'):
-            asyncio.create_task(ctx.market_data_feed.run(), name="MarketDataFeed")
-            logger.info("✅ MarketDataFeed started")
-        
+
+        # P4 in phased bootstrap is the canonical MarketDataFeed startup path.
+        # Do not start MDF again here; duplicate run loops can desynchronize execution/logging.
+        if phase_max >= 4:
+            mdf = getattr(ctx, "market_data_feed", None)
+            if mdf is None:
+                raise RuntimeError("MarketDataFeed not initialized in phased bootstrap")
+            mdf_running = bool(getattr(mdf, "_run_loop_entered", False))
+            if not mdf_running:
+                logger.warning(
+                    "MarketDataFeed loop state not confirmed yet after phased bootstrap "
+                    "(continuing without duplicate start)"
+                )
+            else:
+                logger.info("MarketDataFeed already active from phased bootstrap")
+
         logger.info("✅ Runtime plane is live (P9). Press Ctrl+C to stop.")
 
         # Wait here until a signal arrives
@@ -176,6 +237,19 @@ async def _run():
                     module="main_phased",
                     event="shutdown_fail",
                 )
+        try:
+            if pid_manager.is_locked():
+                pid_manager.remove_pid_file()
+        except Exception as e:
+            log_structured_error(
+                e,
+                context={"where": "main_phased:pid_cleanup"},
+                logger=logger,
+                component="PhasedStartup",
+                phase="SHUTDOWN",
+                module="main_phased",
+                event="pid_cleanup_fail",
+            )
 
 def main():
     try:

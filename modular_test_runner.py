@@ -11,7 +11,6 @@ from core.tp_sl_engine import TPSLEngine
 from core.meta_controller import MetaController
 
 from agents.ml_forecaster import MLForecaster
-from agents.rl_strategist import RLStrategist
 from agents.dip_sniper import DipSniper
 from agents.ipo_chaser import IPOChaser
 from agents.trend_hunter import TrendHunter
@@ -76,7 +75,6 @@ async def test_phase_6_agents_init(shared_state, market_data_feed, execution_man
     logger.info("🔧 Phase 6: Initialize Agents")
     agents = {
         "MLForecaster": MLForecaster(shared_state, market_data_feed, config, tp_sl_engine),
-        "RLStrategist": RLStrategist(shared_state, market_data_feed, execution_manager, config),
         "DipSniper": DipSniper(shared_state, market_data_feed, execution_manager, config),
         "IPOChaser": IPOChaser(shared_state, market_data_feed, execution_manager, config),
         "TrendHunter": TrendHunter(shared_state, market_data_feed, execution_manager, config),

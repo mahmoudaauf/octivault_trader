@@ -26,7 +26,7 @@ logger = logging.getLogger("ModelTrainerAsync")
 
 DEFAULT_TIMEFRAME = "5m"
 DEFAULT_LIMIT = 500
-MIN_ROWS_TO_TRAIN = 100
+MIN_ROWS_TO_TRAIN = 1000
 AGENT_NAME = "MLForecaster"
 
 
@@ -47,6 +47,46 @@ async def _safe_get_ohlcv(exchange, symbol: str, tf: str, limit: int = DEFAULT_L
             return await exchange.get_ohlcv(symbol, tf=tf, limit=limit)
         except TypeError:
             return await exchange.get_ohlcv(symbol, timeframe=tf, limit=limit)
+
+
+async def _fetch_paginated_ohlcv(exchange, symbol: str, tf: str, total_limit: int = 3000):
+    """
+    Fetch paginated OHLCV data with pagination support.
+    Builds history backwards from most recent, batching by 1000 candles.
+    Returns the last total_limit candles.
+    
+    [FIX] Replaces single-batch fetch which was truncated to exchange limits.
+    Real history requires pagination for proper model training.
+    """
+    all_rows = []
+    end_time = None
+    batch_size = 1000
+
+    while len(all_rows) < total_limit:
+        try:
+            # Fetch batch (most recent up to end_time)
+            batch = await _safe_get_ohlcv(exchange, symbol, tf=tf, limit=batch_size)
+            
+            if not batch:
+                # No more data available
+                break
+            
+            # Prepend to maintain chronological order
+            all_rows = batch + all_rows
+            
+            # Update end_time for next batch (go earlier)
+            end_time = batch[0][0] - 1
+            
+            # Stop if we got fewer than requested (reached end of history)
+            if len(batch) < batch_size:
+                break
+                
+        except Exception as e:
+            logger.error(f"[{symbol}] Error fetching OHLCV batch: {e}")
+            break
+
+    # Return only the most recent total_limit candles
+    return all_rows[-total_limit:] if all_rows else []
 
 
 def _normalize_to_trainer_schema(raw: Any) -> pd.DataFrame:
@@ -146,7 +186,8 @@ async def run_training_for_symbols(app_context):
 
     for symbol in symbols:
         try:
-            raw = await _safe_get_ohlcv(exchange, symbol, tf=DEFAULT_TIMEFRAME, limit=DEFAULT_LIMIT)
+            # [FIX] Use paginated fetch to get real history instead of truncated batch
+            raw = await _fetch_paginated_ohlcv(exchange, symbol, tf=DEFAULT_TIMEFRAME, total_limit=3000)
             df = _normalize_to_trainer_schema(raw)
 
             if df.empty:

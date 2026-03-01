@@ -12,6 +12,7 @@ import logging
 import os
 import inspect
 import time
+import importlib
 import asyncio as _asyncio  # single asyncio import (aliased)
 from typing import Dict, List, Any, Optional, TYPE_CHECKING
 import json
@@ -24,51 +25,70 @@ try:
 except ImportError:
     ModelManager = None
 
-# --- Canonical TradeIntent import (P9 invariant) with backward-compat shim ---
+# --- Canonical TradeIntent import (P9 invariant) with stub shim ---
 try:
-    # ✅ Current canonical location or stubs
     from core.stubs import TradeIntent
-except Exception:
-    try:
-        # 🕰️ Legacy fallback used by some older agents
-        from core.stubs import TradeIntent  # type: ignore
-    except Exception as _e:
-        # Bind a stub to avoid NameError during module import; any runtime use will raise clearly.
-        class _MissingTradeIntent:  # type: ignore
-            def __getattr__(self, name):  # pragma: no cover
-                raise ImportError(
-                    "TradeIntent is missing. Expected in core.baseline_trading_kernel "
-                    "or (legacy) core.contracts. Please ensure the canonical module is present."
-                )
-        TradeIntent = _MissingTradeIntent()  # type: ignore
+except Exception as _e:
+    # Bind a stub to avoid NameError during module import; any runtime use will raise clearly.
+    class _MissingTradeIntent:  # type: ignore
+        def __getattr__(self, name):  # pragma: no cover
+            raise ImportError(
+                "TradeIntent is missing. Expected in core.stubs "
+                "or core.baseline_trading_kernel. Please ensure the canonical module is present."
+            )
+    TradeIntent = _MissingTradeIntent()  # type: ignore
 
-from core.agent_registry import AGENT_CLASS_MAP
+try:
+    from core.agent_registry import AGENT_CLASS_MAP, AGENT_IMPORT_ERRORS
+except Exception:
+    from core.agent_registry import AGENT_CLASS_MAP
+    AGENT_IMPORT_ERRORS = {}
 
 logger = logging.getLogger("AgentManager")
-log_path = "logs/core/agent_manager.log"
-os.makedirs(os.path.dirname(log_path), exist_ok=True)
-file_handler = logging.FileHandler(log_path)
-formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-file_handler.setFormatter(formatter)
-# avoid duplicate file handlers on reload
+# Guard creation (not just adding) to avoid leaking FileHandler objects on reload.
 if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
-    logger.addHandler(file_handler)
+    _log_path = "logs/core/agent_manager.log"
+    os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+    _fh = logging.FileHandler(_log_path)
+    _fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(_fh)
 logger.setLevel(logging.INFO)
 logger.propagate = False  # avoid duplicate logs in root logger
 
 
 class AgentManager:
+    @staticmethod
+    def _task_cancel_requested() -> bool:
+        """
+        True only when the *current* task has an active cancellation request.
+        Helps distinguish framework shutdown from stray CancelledError in child calls.
+        """
+        task = _asyncio.current_task()
+        if task is None:
+            return False
+        cancelling = getattr(task, "cancelling", None)
+        if callable(cancelling):
+            try:
+                return bool(cancelling())
+            except Exception:
+                return False
+        return task.cancelled()
+
     async def start(self):
         if self._started:
             return
-        self._started = True
 
-        # Ensure agents are registered
+        # Ensure agents are registered before marking started.
         if not self.agents:
             try:
                 await self.auto_register_agents()
             except Exception as e:
-                self.logger.error(f"AgentManager: failed to auto-register agents: {e}", exc_info=True)
+                self.logger.error("AgentManager: failed to auto-register agents: %s", e, exc_info=True)
+                # Do NOT set _started — allow the caller to retry start().
+                return
+
+        # Only mark started after registration has succeeded so retry is possible.
+        self._started = True
 
         if hasattr(self, "run_loop"):
             _asyncio.create_task(self.run_loop(), name="AgentManager:run_loop")
@@ -119,9 +139,66 @@ class AgentManager:
         self._restart_backoff_min = float(getattr(self.config, "AGENTMGR_RESTART_BACKOFF_MIN", 2.0))
         self._restart_backoff_max = float(getattr(self.config, "AGENTMGR_RESTART_BACKOFF_MAX", 60.0))
         self._market_data_ready_timeout_s = float(getattr(self.config, "AGENTMGR_MARKETDATA_READY_TIMEOUT_S", 180.0))
+        raw_retrain_interval = float(
+            getattr(
+                self.config,
+                "AGENTMGR_STRATEGY_RETRAIN_INTERVAL_S",
+                os.getenv("AGENTMGR_STRATEGY_RETRAIN_INTERVAL_S", 1800.0),
+            )
+            or 1800.0
+        )
+        self._strategy_retrain_min_interval_s = float(
+            getattr(
+                self.config,
+                "AGENTMGR_STRATEGY_RETRAIN_MIN_INTERVAL_S",
+                os.getenv("AGENTMGR_STRATEGY_RETRAIN_MIN_INTERVAL_S", 300.0),
+            )
+            or 300.0
+        )
+        allow_fast_retrain = str(
+            getattr(
+                self.config,
+                "AGENTMGR_STRATEGY_RETRAIN_ALLOW_FAST",
+                os.getenv("AGENTMGR_STRATEGY_RETRAIN_ALLOW_FAST", "false"),
+            )
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if (
+            not allow_fast_retrain
+            and raw_retrain_interval > 0
+            and raw_retrain_interval < self._strategy_retrain_min_interval_s
+        ):
+            self.logger.warning(
+                "[Phase9:Retrain] Interval %.1fs is below architectural floor %.1fs; clamping.",
+                raw_retrain_interval,
+                self._strategy_retrain_min_interval_s,
+            )
+            raw_retrain_interval = self._strategy_retrain_min_interval_s
+        self._strategy_retrain_interval_s = raw_retrain_interval
+        self._strategy_retrain_timeout_s = float(
+            getattr(
+                self.config,
+                "AGENTMGR_STRATEGY_RETRAIN_TIMEOUT_S",
+                os.getenv("AGENTMGR_STRATEGY_RETRAIN_TIMEOUT_S", 3600.0),
+            )
+            or 3600.0
+        )
         self._last_symbols_refresh_t = 0.0
         self._accepted_symbols_cache: List[str] = []
         self._last_agent_log_t: Dict[str, float] = {}  # Per-agent logging throttle (Issue 2)
+        self._last_empty_intent_log_t = 0.0
+        self._empty_intent_log_interval_s = float(
+            getattr(self.config, "AGENTMGR_EMPTY_INTENT_LOG_INTERVAL_S", 60.0)
+        )
+        self._strategy_autoregister_retry_interval_s = float(
+            getattr(self.config, "AGENTMGR_STRATEGY_AUTOREG_RETRY_S", 60.0)
+        )
+        self._last_strategy_autoregister_retry_t = 0.0
+        self._optional_import_log_interval_s = float(
+            getattr(self.config, "AGENTMGR_OPTIONAL_IMPORT_LOG_INTERVAL_S", 300.0)
+        )
+        self._last_optional_import_log_ts: Dict[str, float] = {}
+        # Cached _MetaAdapter — stateless wrapper, safe to create once per meta_controller.
+        self._meta_adapter: Optional[Any] = None
 
     # --- Meta signal adapter so all agents have a consistent API ---
     class _MetaAdapter:
@@ -164,28 +241,73 @@ class AgentManager:
         if quantity is not None: payload["quantity"] = float(quantity)
         if horizon_hours is not None: payload["horizon_hours"] = float(horizon_hours)
         try:
-            adapter = self._MetaAdapter(self.meta_controller)
+            if self._meta_adapter is None:
+                self._meta_adapter = self._MetaAdapter(self.meta_controller)
+            adapter = self._meta_adapter
             await adapter.submit_signal(agent_name, sym, payload, payload.get("confidence"))
             self.logger.info("[AgentEmit] %s %s conf=%.2f%s%s",
                              sym, payload["action"], payload["confidence"],
                              f" quote={payload.get('quote'):.2f}" if "quote" in payload else "",
-                             f" qty={payload.get('quantity'):.6f}" if "qty" in payload else "")
+                             f" qty={payload.get('quantity'):.6f}" if "quantity" in payload else "")
         except Exception as e:
             self.logger.warning("[AgentManager] emit_to_meta failed for %s: %s", sym, e, exc_info=True)
 
     async def submit_trade_intents(self, intents: List[Dict[str, Any]]):
         """
-        Bind Agent→Meta pipe: push a batch of TradeIntents to Meta.
-        Each dict should include: symbol, action, confidence, agent, (optional) reason, quote, horizon_hours, etc.
+        Bind Agent→Meta pipe through the event bus.
+        Strategists publish canonical TradeIntent payloads on:
+          events.trade.intent
         """
-        mc = getattr(self, "meta_controller", None)
-        if not mc:
-            self.logger.warning("submit_trade_intents called but meta_controller is not set.")
+        if not intents:
             return
+
+        event_bus = getattr(self.shared_state, "event_bus", None)
+        publish = getattr(event_bus, "publish", None)
+        if not callable(publish):
+            self.logger.warning("submit_trade_intents called but shared_state.event_bus.publish is unavailable.")
+            return
+
+        published = 0
+        for raw in intents:
+            ti = self._coerce_trade_intent(raw)
+            if ti is None:
+                continue
+            try:
+                await publish("events.trade.intent", ti)
+                published += 1
+            except Exception as e:
+                self.logger.warning("Failed to publish trade intent event for %s: %s", getattr(ti, "symbol", "?"), e)
+
+        if published > 0:
+            self.logger.info("[AgentManager] Published %d trade intent events", published)
+
+    def _coerce_trade_intent(self, raw: Any) -> Optional[TradeIntent]:
+        """Best-effort conversion into canonical TradeIntent."""
         try:
-            await mc.receive_intents(intents)
-        except Exception as e:
-            self.logger.error("Failed to submit intents to Meta: %s", e, exc_info=True)
+            if isinstance(TradeIntent, type) and isinstance(raw, TradeIntent):
+                return raw
+            if not isinstance(raw, dict):
+                return None
+            symbol = str(raw.get("symbol") or "").replace("/", "").upper()
+            side = str(raw.get("side") or raw.get("action") or "").upper()
+            if not symbol or side not in {"BUY", "SELL"}:
+                return None
+            qty_hint = raw.get("qty_hint", raw.get("quantity", raw.get("planned_qty")))
+            quote_hint = raw.get("quote_hint", raw.get("quote", raw.get("planned_quote")))
+            return TradeIntent(
+                symbol=symbol,
+                side=side,
+                qty_hint=float(qty_hint) if qty_hint is not None else None,
+                quote_hint=float(quote_hint) if quote_hint is not None else None,
+                agent=str(raw.get("agent") or "AgentManager"),
+                confidence=float(raw.get("confidence", 0.0) or 0.0),
+                rationale=str(raw.get("rationale") or raw.get("reason") or ""),
+                ttl_sec=int(raw.get("ttl_sec", 30) or 30),
+                tag=str(raw.get("tag") or f"strategy/{raw.get('agent', 'AgentManager')}"),
+                timeframe=(str(raw.get("timeframe")) if raw.get("timeframe") else None),
+            )
+        except Exception:
+            return None
 
     # NEW: normalize any agent-returned signals into TradeIntents
     def _normalize_to_intents(self, agent_name: str, raw: Any) -> list:
@@ -194,11 +316,39 @@ class AgentManager:
             return intents
         if isinstance(raw, dict):
             raw = [raw]
+        elif not isinstance(raw, (list, tuple, set)):
+            raw = [raw]
         for s in raw:
-            # Accept both {"symbol","action","confidence",...} and canonical TradeIntent
+            # Handle canonical TradeIntent objects directly (previously dropped silently).
+            if isinstance(TradeIntent, type) and isinstance(s, TradeIntent):
+                side = (getattr(s, "side", "") or "").upper()
+                if side not in ("BUY", "SELL"):
+                    continue
+                intents.append({
+                    "symbol": (getattr(s, "symbol", "") or "").replace("/", "").upper(),
+                    "action": side,
+                    "side": side,
+                    "qty_hint": getattr(s, "qty_hint", None),
+                    "quote_hint": getattr(s, "quote_hint", None),
+                    "agent": agent_name,
+                    "confidence": max(0.0, min(1.0, float(getattr(s, "confidence", 0.0) or 0.0))),
+                    "rationale": getattr(s, "rationale", None),
+                    "ts": float(getattr(s, "ts", None) or time.time()),
+                    "ttl_sec": int(getattr(s, "ttl_sec", 30) or 30),
+                    "tag": f"strategy/{agent_name}",
+                    "budget_required": (side == "BUY"),
+                })
+                continue
+            # Accept dict signals {"symbol","action","confidence",...}
+            if not isinstance(s, dict):
+                self.logger.debug(
+                    "[_normalize_to_intents] Agent '%s' yielded non-dict, non-TradeIntent item (%s); skipping.",
+                    agent_name, type(s).__name__,
+                )
+                continue
             sym = (s.get("symbol") or s.get("sym") or "").replace("/", "").upper()
             act = (s.get("action") or s.get("side") or "").lower()
-            if not sym or act not in ("buy","sell"):
+            if not sym or act not in ("buy", "sell"):
                 continue
             intents.append({
                 "symbol": sym,
@@ -212,29 +362,50 @@ class AgentManager:
                 "ts": float(s.get("ts") or s.get("timestamp") or time.time()),  # CRITICAL: Intent freshness
                 "ttl_sec": int(s.get("ttl_sec") or 30),
                 "tag": f"strategy/{agent_name}",
-                "budget_required": (act == "buy")
+                "budget_required": (act == "buy"),
             })
         if raw and not intents:
-            self.logger.warning(f"[_normalize_to_intents] Agent '{agent_name}' provided {len(raw)} raw signals, but NONE passed normalization. First item: {raw[0] if len(raw)>0 else 'N/A'}")
+            self.logger.warning(
+                "[_normalize_to_intents] Agent '%s' provided %d raw signals but NONE passed normalization. First item: %s",
+                agent_name, len(raw), raw[0] if raw else "N/A",
+            )
         return intents
 
     async def collect_and_forward_signals(self):
         """Single signal collection point - calls generate_signals() once per tick."""
-        self.logger.info(f"[AgentManager] Signal Collection Tick. SharedState ID: {id(self.shared_state)}, Meta ID: {id(self.meta_controller)}")
+        self.logger.debug("[AgentManager] Signal Collection Tick. SharedState ID: %d, Meta ID: %d", id(self.shared_state), id(self.meta_controller))
         batch = []
-        for name, agent in self.agents.items():
-            agent_type = getattr(agent, "agent_type", None)
-            if agent_type == "discovery":
-                continue  # Discovery agents don't generate trade signals
+        strategy_agents = [
+            (name, agent)
+            for name, agent in list(self.agents.items())
+            if getattr(agent, "agent_type", None) != "discovery" and hasattr(agent, "generate_signals")
+        ]
+        if not strategy_agents:
+            now_ts = time.time()
+            retry_interval = max(5.0, float(self._strategy_autoregister_retry_interval_s or 60.0))
+            if (now_ts - float(self._last_strategy_autoregister_retry_t or 0.0)) >= retry_interval:
+                self._last_strategy_autoregister_retry_t = now_ts
+                self.logger.warning(
+                    "[AgentManager] No signal-capable strategy agents registered. Retrying strategy auto-registration."
+                )
+                try:
+                    await self.auto_register_agents(filter_types={"strategy"})
+                except Exception as e:
+                    self.logger.warning(
+                        "[AgentManager] Strategy auto-registration retry failed: %s",
+                        e,
+                        exc_info=True,
+                    )
+                strategy_agents = [
+                    (name, agent)
+                    for name, agent in list(self.agents.items())
+                    if getattr(agent, "agent_type", None) != "discovery" and hasattr(agent, "generate_signals")
+                ]
 
+        for name, agent in strategy_agents:
             # ARCHITECTURAL FIX: Budget gating moved to MetaController.
-            # We must allow agents to generate signals even with 0 budget 
+            # We must allow agents to generate signals even with 0 budget
             # so they can propose EXITS (SELL signals) for open positions.
-
-            # ISSUE 3: Enforce contract - strategy agents MUST have generate_signals()
-            if not hasattr(agent, "generate_signals"):
-                self.logger.debug(f"[{name}] Skipped: Missing generate_signals() method")
-                continue
 
             # Call generate_signals() exactly once per tick
             try:
@@ -242,23 +413,47 @@ class AgentManager:
                 res = fn()
                 if inspect.isawaitable(res):
                     res = await res
-                if res:
-                    self.logger.info(f"[{name}] generate_signals() returned {len(res)} raw signals.")
+                if res is None:
+                    raw_count = 0
+                elif isinstance(res, dict):
+                    raw_count = 1
+                elif isinstance(res, (list, tuple, set)):
+                    raw_count = len(res)
+                else:
+                    raw_count = 1
+                self.logger.debug("[%s] generate_signals() returned %d raw signals.", name, raw_count)
                 intents = self._normalize_to_intents(name, res)
                 if intents:
                     batch.extend(intents)
                     symbol_count = len(getattr(agent, "symbols", []))
-                    self.logger.info(f"[{name}] Successfully normalized to {len(intents)} intents (scanned {symbol_count} symbols)")
+                    self.logger.info("[%s] Normalized %d intents (scanned %d symbols)", name, len(intents), symbol_count)
                 elif res:
-                    self.logger.warning(f"[{name}] FAILED to normalize any of the {len(res)} signals.")
+                    self.logger.warning("[%s] FAILED to normalize any of the %d signals.", name, len(res))
+            except _asyncio.CancelledError:
+                if self._task_cancel_requested():
+                    raise
+                self.logger.warning(
+                    "[%s] Signal generation raised unexpected CancelledError; continuing tick.",
+                    name,
+                )
             except Exception as e:
-                self.logger.warning(f"[{name}] Signal generation failed: {e}", exc_info=True)
+                self.logger.warning("[%s] Signal generation failed: %s", name, e, exc_info=True)
 
         if batch:
             await self.submit_trade_intents(batch)
-            self.logger.info("➡️ Submitted %d TradeIntents to Meta", len(batch))
+            self.logger.info("Submitted %d TradeIntents to Meta", len(batch))
         else:
-            self.logger.debug("No TradeIntents collected this tick.")
+            now_ts = time.time()
+            interval = max(5.0, float(self._empty_intent_log_interval_s or 60.0))
+            if (now_ts - float(self._last_empty_intent_log_t or 0.0)) >= interval:
+                self._last_empty_intent_log_t = now_ts
+                strategy_names = [n for n, _a in strategy_agents]
+                self.logger.info(
+                    "[AgentManager] No TradeIntents collected this tick (strategy_agents=%d names=%s registered_agents=%d).",
+                    len(strategy_agents),
+                    strategy_names,
+                    len(self.agents),
+                )
 
 
     def register_agent(self, agent):
@@ -270,6 +465,24 @@ class AgentManager:
         self.agents[agent.name] = agent
 
     async def auto_register_agents(self, filter_types: Optional[set] = None):
+        self._ensure_optional_agent_classes()
+        ml_err = (AGENT_IMPORT_ERRORS or {}).get("MLForecaster")
+        if ml_err:
+            self._log_optional_import_issue(
+                "MLForecaster",
+                f"agent_registry import failure: {ml_err.get('error')}",
+                include_trace=False,
+            )
+        try:
+            keys = sorted(list(AGENT_CLASS_MAP.keys()))
+            self.logger.info(
+                "[AgentManager] Registry snapshot: total=%d has_MLForecaster=%s keys=%s",
+                len(keys),
+                ("MLForecaster" in AGENT_CLASS_MAP),
+                keys,
+            )
+        except Exception:
+            pass
         self.logger.info("F501 Auto-registering agents...")
         # Snapshot & deterministic order to avoid non-deterministic boot
         agent_class_items = sorted(list(AGENT_CLASS_MAP.items()), key=lambda kv: kv[0].lower())
@@ -362,6 +575,63 @@ class AgentManager:
             raise RuntimeError("AgentManager: No strategy agents registered")
         
         self._strategies_prepared = True  # Set flag after successful registration
+
+    def _ensure_optional_agent_classes(self) -> None:
+        """
+        Recover optional agents that may have been skipped during module import time.
+        This prevents a transient import issue from permanently removing a strategy
+        from AGENT_CLASS_MAP for the lifetime of the process.
+        """
+        self._try_lazy_register_agent(
+            key="MLForecaster",
+            module_path="agents.ml_forecaster",
+            class_name="MLForecaster",
+        )
+
+    def _try_lazy_register_agent(self, *, key: str, module_path: str, class_name: str) -> None:
+        if key in AGENT_CLASS_MAP:
+            return
+        try:
+            module = importlib.import_module(module_path)
+            cls = getattr(module, class_name, None)
+            if cls is None:
+                self._log_optional_import_issue(
+                    key,
+                    f"class '{class_name}' missing after importing {module_path}",
+                    include_trace=False,
+                )
+                return
+            AGENT_CLASS_MAP[key] = cls
+            self.logger.info(
+                "[AgentManager] Optional agent recovered via lazy import: %s (%s.%s)",
+                key,
+                module_path,
+                class_name,
+            )
+        except Exception as e:
+            self._log_optional_import_issue(
+                key,
+                f"lazy import failed for {module_path}.{class_name}: {e}",
+                include_trace=True,
+            )
+
+    def _log_optional_import_issue(self, key: str, message: str, include_trace: bool = False) -> None:
+        now_ts = time.time()
+        interval = max(10.0, float(self._optional_import_log_interval_s or 300.0))
+        last_ts = float(self._last_optional_import_log_ts.get(key, 0.0) or 0.0)
+        if (now_ts - last_ts) < interval:
+            return
+        self._last_optional_import_log_ts[key] = now_ts
+        if str(key) == "MLForecaster":
+            prefix = "MLForecaster import failed"
+        else:
+            prefix = f"Optional agent unavailable: {key}"
+        self.logger.warning(
+            "[AgentManager] %s (%s)",
+            prefix,
+            message,
+            exc_info=bool(include_trace),
+        )
 
     async def warmup_all(self, concurrency: int = 6):
         """
@@ -473,8 +743,8 @@ class AgentManager:
         ops_ready = getattr(self.shared_state, "ops_plane_ready_event", None)
         if ops_ready:
             try:
-                # Give it a reasonable timeout (e.g. 30s) to see if capital is assigned
-                await _asyncio.wait_for(ops_ready.wait(), timeout=30.0)
+                ops_timeout = float(getattr(self.config, "AGENTMGR_OPS_READY_TIMEOUT_S", 30.0))
+                await _asyncio.wait_for(ops_ready.wait(), timeout=ops_timeout)
                 self.logger.info("✅ Capital assigned; proceeding with agent activation.")
             except _asyncio.TimeoutError:
                 self.logger.warning("⚠️ OpsPlaneReady timed out; checking if we have any budget anyway.")
@@ -529,7 +799,7 @@ class AgentManager:
                         elif hasattr(agent_obj, "symbols"):
                             agent_obj.symbols = self._accepted_symbols_cache
                             # ISSUE 2: Log symbol visibility per agent
-                            self.logger.debug(f"[{agent_obj.__class__.__name__}] Injected {len(self._accepted_symbols_cache)} symbols")
+                            self.logger.debug("[%s] Injected %d symbols", agent_obj.__class__.__name__, len(self._accepted_symbols_cache))
         except Exception as e:
             self.logger.debug("Symbol refresh check failed: %s", e)
 
@@ -556,15 +826,15 @@ class AgentManager:
                 
                 if (now_t - last_log) > 60.0:
                     status = "Active" if budget > 0 else "Active (Exit-Only/ZeroBudget)"
-                    self.logger.info(f"📊 [Agent:{name}] {status} with {symbol_count} symbols")
+                    self.logger.info("[Agent:%s] %s with %d symbols", name, status, symbol_count)
                     self._last_agent_log_t[name] = now_t
 
                 # ISSUE 3: Enforce strategy agent contract
                 if not hasattr(agent_obj, "generate_signals"):
-                    self.logger.warning(f"[{name}] Missing generate_signals() - strategy agents MUST implement this")
+                    self.logger.warning("[%s] Missing generate_signals() - strategy agents MUST implement this", name)
                 
             except Exception as e:
-                self.logger.warning(f"⚠️ [{name}] Tick preparation failed: {e}")
+                self.logger.warning("[%s] Tick preparation failed: %s", name, e)
 
     async def run(self):
         """
@@ -585,7 +855,7 @@ class AgentManager:
             origin = inspect.getfile(agent.__class__)
         except Exception:
             origin = "<unknown>"
-        self.logger.info(f"▶️ Launching agent: {name} ({agent.__class__.__name__} from {origin})")
+        self.logger.info("Launching agent: %s (%s from %s)", name, agent.__class__.__name__, origin)
 
         # Point 2: Continuous Budget Gating
         # If an agent has no budget, it should not churn ML / generate signals.
@@ -607,15 +877,15 @@ class AgentManager:
             agent_type = getattr(agent, "agent_type", None)
             if agent_type == "discovery":
                 if hasattr(agent, "run_loop") and _asyncio.iscoroutinefunction(agent.run_loop):
-                    return await _asyncio.wait_for(agent.run_loop(), timeout=None)  # long-running
+                    return await agent.run_loop()  # long-running; no timeout
                 if hasattr(agent, "run") and _asyncio.iscoroutinefunction(agent.run):
-                    return await _asyncio.wait_for(agent.run(), timeout=None)
+                    return await agent.run()
                 if hasattr(agent, "run_once") and _asyncio.iscoroutinefunction(agent.run_once):
                     return await _asyncio.wait_for(agent.run_once(), timeout=self._agent_timeout_s)
             
             # If we are here, it's either a strategy agent (which shouldn't have reached here)
             # or a discovery agent with no supported entry point.
-            self.logger.debug(f"[AgentManager:_agent_entry] Agent {name} type={agent_type} has no background loop; exiting task.")
+            self.logger.debug("[AgentManager:_agent_entry] Agent %s type=%s has no background loop; exiting task.", name, agent_type)
             return None
 
         if not self._restart_on_crash:
@@ -658,39 +928,134 @@ class AgentManager:
         Periodically runs discovery agents to populate the symbol universe.
         This unblocks SymbolManager which waits for these proposals.
         """
-        self.logger.info("📡 Starting Discovery Agent loop...")
+        self.logger.info("Starting Discovery Agent loop...")
+        # Launch persistent discovery agent coroutines once (outside the retry loop).
         try:
-            # First launch any continuous discovery loops
             await self.run_discovery_agents()
-            
-            while True:
+        except Exception as e:
+            self.logger.error("run_discovery_agents failed on startup: %s", e, exc_info=True)
+
+        # Outer retry loop: a crash in run_discovery_agents_once must NOT exit this method.
+        while True:
+            try:
                 await self.run_discovery_agents_once()
                 # Run every 10 minutes or as configured
                 discovery_interval = float(getattr(self.config, "AGENTMGR_DISCOVERY_INTERVAL", 600.0))
                 await _asyncio.sleep(discovery_interval)
-        except _asyncio.CancelledError:
-            self.logger.info("Discovery loop cancelled.")
-            raise
-        except Exception as e:
-            self.logger.error(f"Discovery loop crashed: {e}", exc_info=True)
-            # Short backoff before retry if not cancelled
-            await _asyncio.sleep(30)
+            except _asyncio.CancelledError:
+                self.logger.info("Discovery loop cancelled.")
+                raise
+            except Exception as e:
+                self.logger.error("Discovery loop crashed: %s — retrying in 30s", e, exc_info=True)
+                # Short backoff before retry; stay in the loop.
+                await _asyncio.sleep(30)
 
     async def _tick_loop(self):  # New method for continuous ticking
         self._strategies_started = True  # Set flag when the loop starts
         try:
             while True:
-                await self.tick_all_once()                 # agents do their work
-                await self.collect_and_forward_signals()   # NEW: forward to Meta
+                try:
+                    await self.tick_all_once()                 # agents do their work
+                    await self.collect_and_forward_signals()   # NEW: forward to Meta
+                except _asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.logger.error("AgentManager.tick loop iteration failed: %s", e, exc_info=True)
                 await _asyncio.sleep(getattr(self.config, "AGENT_TICK_SEC", 5))  # Use AGENT_TICK_SEC from config
         except _asyncio.CancelledError:
             self.logger.info("AgentManager.tick loop cancelled.")
+            raise
+
+    async def run_strategy_retrain_loop(self):
+        """
+        Phase 9 async retrain loop for tick-driven strategy agents.
+        Agents opt-in by implementing async `retrain()` (or sync callable).
+        """
+        interval = float(self._strategy_retrain_interval_s or 0.0)
+        if interval <= 0:
+            self.logger.info("[Phase9:Retrain] Strategy retrain loop disabled (interval <= 0).")
+            return
+
+        timeout_s = max(60.0, float(self._strategy_retrain_timeout_s or 3600.0))
+        strategy_total = sum(1 for _n, _a in self.agents.items() if getattr(_a, "agent_type", None) == "strategy")
+        retrain_capable = [
+            _n for _n, _a in self.agents.items()
+            if getattr(_a, "agent_type", None) == "strategy" and callable(getattr(_a, "retrain", None))
+        ]
+        self.logger.info(
+            "[Phase9:Retrain] Strategy retrain loop started (interval=%.1fs timeout=%.1fs strategies=%d retrain_capable=%d names=%s).",
+            interval,
+            timeout_s,
+            strategy_total,
+            len(retrain_capable),
+            retrain_capable,
+        )
+        if strategy_total > 0 and not retrain_capable:
+            self.logger.warning(
+                "[Phase9:Retrain] No strategy agents expose retrain(); loop will stay idle."
+            )
+
+        try:
+            while True:
+                loop_start = time.time()
+                for name, agent in sorted(self.agents.items(), key=lambda kv: kv[0].lower()):
+                    if getattr(agent, "agent_type", None) != "strategy":
+                        continue
+                    retrain_fn = getattr(agent, "retrain", None)
+                    if not callable(retrain_fn):
+                        continue
+
+                    self.logger.info("[Phase9:Retrain] Retrain start agent=%s", name)
+                    try:
+                        res = retrain_fn()
+                        if inspect.isawaitable(res):
+                            res = await _asyncio.wait_for(res, timeout=timeout_s)
+                        self.logger.info(
+                            "[Phase9:Retrain] Retrain finish agent=%s status=ok result=%s",
+                            name,
+                            str(res)[:500],
+                        )
+                    except _asyncio.TimeoutError:
+                        self.logger.warning(
+                            "[Phase9:Retrain] Retrain finish agent=%s status=timeout timeout=%.1fs",
+                            name,
+                            timeout_s,
+                        )
+                    except _asyncio.CancelledError:
+                        self.logger.warning(
+                            "[Phase9:Retrain] Retrain finish agent=%s status=cancelled",
+                            name,
+                        )
+                        raise
+                    except Exception as e:
+                        self.logger.warning(
+                            "[Phase9:Retrain] Retrain finish agent=%s status=error err=%s",
+                            name,
+                            e,
+                            exc_info=True,
+                        )
+
+                elapsed = max(0.0, time.time() - loop_start)
+                # Sleep the remainder of the configured interval; minimum 1s guard.
+                sleep_for = max(1.0, interval - elapsed)
+                if elapsed > interval:
+                    self.logger.warning(
+                        "[Phase9:Retrain] Cycle overran interval: elapsed=%.1fs interval=%.1fs",
+                        elapsed,
+                        interval,
+                    )
+                await _asyncio.sleep(sleep_for)
+        except _asyncio.CancelledError:
+            self.logger.info("AgentManager.strategy_retrain loop cancelled.")
             raise
 
     async def run_loop(self, stop_event: Optional['_asyncio.Event'] = None):
         """
         Phase 9 compatibility: unblocked orchestration of manager tasks.
         """
+        if any(not t.done() for t in self._manager_tasks.values()):
+            self.logger.warning("AgentManager run_loop already active; skipping duplicate start.")
+            return
         self.logger.info("🚀 AgentManager run_loop started (Unblocked Mode).")
         
         # schedule manager tasks so stop() can cancel them
@@ -698,6 +1063,39 @@ class AgentManager:
         self._manager_tasks["run_all_agents"] = _asyncio.create_task(self.run_all_agents(), name="AgentManager:run_all_agents")
         self._manager_tasks["health"] = _asyncio.create_task(self.report_health_loop(), name="AgentManager:health")
         self._manager_tasks["tick"] = _asyncio.create_task(self._tick_loop(), name="AgentManager:tick")
+        if float(self._strategy_retrain_interval_s or 0.0) > 0:
+            self._manager_tasks["strategy_retrain"] = _asyncio.create_task(
+                self.run_strategy_retrain_loop(),
+                name="AgentManager:strategy_retrain",
+            )
+        # Diagnostic hooks: make unexpected task exits visible in logs.
+        for task_name, task in self._manager_tasks.items():
+            def _mk_cb(_name: str):
+                def _done_cb(t: _asyncio.Task):
+                    try:
+                        exc = t.exception()
+                    except _asyncio.CancelledError:
+                        self.logger.warning("AgentManager manager task cancelled: %s", _name)
+                        return
+                    except Exception as cb_err:
+                        self.logger.warning(
+                            "AgentManager manager task callback failed for %s: %s",
+                            _name,
+                            cb_err,
+                            exc_info=True,
+                        )
+                        return
+                    if exc is not None:
+                        self.logger.error(
+                            "AgentManager manager task failed: %s err=%s",
+                            _name,
+                            exc,
+                            exc_info=True,
+                        )
+                    elif _name != "run_all_agents":
+                        self.logger.warning("AgentManager manager task exited unexpectedly: %s", _name)
+                return _done_cb
+            task.add_done_callback(_mk_cb(task_name))
 
         ComponentStatusLogger.log_status(
             component="AgentManager",
@@ -712,7 +1110,7 @@ class AgentManager:
             self.logger.info("AgentManager run_loop cancelled.")
             raise
         except Exception as e:
-            self.logger.error(f"AgentManager critical manager task failure: {e}", exc_info=True)
+            self.logger.error("AgentManager critical manager task failure: %s", e, exc_info=True)
         finally:
             await self.stop()
 
@@ -776,7 +1174,7 @@ class AgentManager:
                 "running_manager_tasks": running_mgr_tasks,
             }
         except Exception as e:
-            self.logger.error(f"Error getting AgentManager health: {e}", exc_info=True)
+            self.logger.error("Error getting AgentManager health: %s", e, exc_info=True)
             return {"status": "Error", "detail": f"health-exception: {e}"}
 
     async def stop(self):
@@ -813,45 +1211,4 @@ class AgentManager:
 def _iso_now() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def _emit_health(ss, component: str, status: str, message: str):
-    try:
-        if ss and hasattr(ss, "emit_event"):
-            ss.emit_event("HealthStatus", {
-                "component": component,
-                "status": status,
-                "message": message,
-                "timestamp": _iso_now()
-            })
-    except Exception:
-        pass
-
-async def _wait_phase_gates(shared_state, poll_s: float = 0.5):
-    """Block until AcceptedSymbolsReady & MarketDataReady are true-ish.
-    We use best-effort checks to avoid hard coupling to the event impl."""
-    if not shared_state:
-        return
-    # Try common readiness flags or methods
-    while True:
-        try:
-            ok1 = True
-            ok2 = True
-            if hasattr(shared_state, "are_accepted_symbols_ready"):
-                ok1 = bool(shared_state.are_accepted_symbols_ready())
-            if hasattr(shared_state, "are_market_data_ready"):
-                ok2 = bool(shared_state.are_market_data_ready())
-            # Fallbacks: check counts and price ticks
-            if hasattr(shared_state, "get_accepted_symbols") and callable(getattr(shared_state, "get_accepted_symbols")):
-                ok1 = ok1 and len(list(shared_state.get_accepted_symbols() or [])) > 0
-            if ok1 and ok2:
-                break
-        except Exception:
-            pass
-        await _asyncio.sleep(poll_s)
-
-# CLEANUP: _normalize_intent() removed - unused helper
-# Normalization is handled by AgentManager._normalize_to_intents()
-
-def _is_fresh_intent(n: Dict[str, Any]) -> bool:
-    ttl = float(n.get("ttl_sec", 30.0) or 30.0)
-    ts = float(n.get("ts") or time.time())
-    return (time.time() - ts) <= ttl
+# CLEANUP: _emit_health, _wait_phase_gates, _is_fresh_intent removed — dead code, never called.

@@ -5,7 +5,7 @@ CapitalAllocator (P9-compliant)
 
 Purpose
 -------
-Allocate per-agent capital budgets based on recent performance & risk posture without ever
+Allocate executable capital budgets based on recent performance & risk posture without ever
 placing orders. Emits an AllocationPlan event and applies weights/budgets to StrategyManager.
 
 Conformance (Spec 2025-08-20)
@@ -90,6 +90,14 @@ class CapitalAllocator:
              
         self.enabled: bool = bool(ca_cfg.get("ENABLED", True))
         self.interval_min: float = float(ca_cfg.get("INTERVAL_MIN", 15))
+        shared_wallet_raw = ca_cfg.get(
+            "SHARED_WALLET_MODE",
+            ca_cfg.get("UNIFIED_WALLET_MODE", getattr(self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True)),
+        )
+        if isinstance(shared_wallet_raw, str):
+            self.shared_wallet_mode = shared_wallet_raw.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            self.shared_wallet_mode = bool(shared_wallet_raw)
         
         # Critical Logic Gap: Define targets for NAV-based and Cash-based allocation
         self.target_exposure_pct = float(ca_cfg.get("TARGET_EXPOSURE_PCT", 0.20))
@@ -394,6 +402,17 @@ class CapitalAllocator:
                 v = ca_cfg.get("MAX_EXPOSURE_RATIO") or ca_cfg.get("max_exposure_ratio")
                 if v is not None: return float(v)
 
+                # Portfolio-wide aliases (shared-wallet semantics)
+                for k in (
+                    "MAX_PORTFOLIO_EXPOSURE",
+                    "MAX_TOTAL_EXPOSURE_PCT",
+                    "MAX_TOTAL_EXPOSURE_PERCENTAGE",
+                ):
+                    v = getattr(self.config, k, None)
+                    if v is not None:
+                        vf = float(v)
+                        return vf / 100.0 if vf > 1.0 else vf
+
             # 2) Fallback to instance attribute or SharedState
             return float(getattr(self.ss, "exposure_target", self.target_exposure_pct))
         except Exception:
@@ -613,6 +632,12 @@ class CapitalAllocator:
         # 1. Get Capacities
         spendable_free = await self._free_usdt()
         headroom = await self._exposure_headroom_quote()
+        keep_free = max(
+            float(self._target_free_usdt() or 0.0),
+            float(self._min_free_reserve_usdt() or 0.0),
+            float(self._cfg("MIN_LIQUIDITY_BUFFER", 0.0) or 0.0),
+        )
+        allocatable_free = max(0.0, float(spendable_free) - float(keep_free))
         
         is_bootstrap = True
         try:
@@ -641,12 +666,13 @@ class CapitalAllocator:
             pass  # Use default
         
         bootstrap_reserve_usdt = float(self._cfg("BOOTSTRAP_RESERVE_USDT", default_bootstrap_reserve))
+        effective_bootstrap_reserve = max(float(bootstrap_reserve_usdt), float(keep_free))
         
         # CRITICAL FIX: If spendable is dangerously low, clear stale quote reservations
         # This prevents deadlock when reservations from failed orders lock capital
-        if is_bootstrap and spendable_free < bootstrap_reserve_usdt * 0.5:
+        if is_bootstrap and allocatable_free < effective_bootstrap_reserve * 0.5:
             self.logger.warning(
-                f"[Allocator:Bootstrap] ⚠️  Spendable critically low: {spendable_free:.2f} < {bootstrap_reserve_usdt * 0.5:.2f}. "
+                f"[Allocator:Bootstrap] ⚠️  Spendable critically low: allocatable={allocatable_free:.2f} < {effective_bootstrap_reserve * 0.5:.2f}. "
                 f"Clearing stale reservations to recover capital..."
             )
             try:
@@ -654,48 +680,57 @@ class CapitalAllocator:
                 await self.ss.prune_reservations()
                 # Recalculate after cleanup
                 spendable_free = await self._free_usdt()
+                allocatable_free = max(0.0, float(spendable_free) - float(keep_free))
                 self.logger.info(
-                    f"[Allocator:Bootstrap] After pruning: spendable_free={spendable_free:.2f}"
+                    f"[Allocator:Bootstrap] After pruning: spendable_free={spendable_free:.2f} allocatable={allocatable_free:.2f}"
                 )
             except Exception as e:
                 self.logger.warning(f"[Allocator:Bootstrap] Prune failed: {e}")
         
-        if is_bootstrap and spendable_free < bootstrap_reserve_usdt:
+        if is_bootstrap and allocatable_free < effective_bootstrap_reserve:
             # DEADLOCK PREVENTION: Not enough capital for bootstrap minimum
             self.logger.warning(
-                f"[Allocator:Bootstrap] ⛔ Reserve insufficient: spendable={spendable_free:.2f} < reserve={bootstrap_reserve_usdt:.2f}. "
+                f"[Allocator:Bootstrap] ⛔ Reserve insufficient: allocatable={allocatable_free:.2f} < reserve={effective_bootstrap_reserve:.2f}. "
                 f"Blocking all allocations to prevent fragmentation."
             )
             # Structured capital block log
-            self.logger.info(f"[CAPITAL_BLOCK] reason=BOOTSTRAP_RESERVE_INSUFFICIENT spendable={spendable_free:.2f} required={bootstrap_reserve_usdt:.2f} action=WAIT_FOR_INFLOW")
+            self.logger.info(f"[CAPITAL_BLOCK] reason=BOOTSTRAP_RESERVE_INSUFFICIENT allocatable={allocatable_free:.2f} required={effective_bootstrap_reserve:.2f} action=WAIT_FOR_INFLOW")
             
             # Emit event for observability
             try:
                 await self.ss.emit_event("AllocationBlocked", {
                     "reason": "BOOTSTRAP_RESERVE_INSUFFICIENT",
                     "spendable_free": float(spendable_free),
-                    "bootstrap_reserve": float(bootstrap_reserve_usdt),
-                    "shortfall": float(bootstrap_reserve_usdt - spendable_free),
+                    "bootstrap_reserve": float(effective_bootstrap_reserve),
+                    "liquidity_buffer": float(keep_free),
+                    "shortfall": float(effective_bootstrap_reserve - allocatable_free),
                     "ts": time.time(),
                     "component": "CapitalAllocator"
                 })
             except Exception:
                 pass
             
-            return {"agent_budgets": {}, "per_agent_usdt": {}, "reason": "bootstrap_reserve_insufficient", "pool_quote": 0.0}
+            return {
+                "agent_budgets": {},
+                "per_agent_usdt": {},
+                "reason": "bootstrap_reserve_insufficient",
+                "pool_quote": 0.0,
+                "keep_free": round(float(keep_free), 6),
+                "headroom_quote": round(float(headroom), 6),
+            }
 
         if is_bootstrap:
             # Bootstrap: Reserve floor, then allocate 90% of remainder
-            post_reserve_free = spendable_free - bootstrap_reserve_usdt
+            post_reserve_free = allocatable_free - effective_bootstrap_reserve
             usable_pool = max(0.0, post_reserve_free * 0.90)
             self.logger.info(
-                f"[Allocator:Bootstrap] Reserve applied: spendable={spendable_free:.2f} - reserve={bootstrap_reserve_usdt:.2f} "
+                f"[Allocator:Bootstrap] Reserve applied: allocatable={allocatable_free:.2f} - reserve={effective_bootstrap_reserve:.2f} "
                 f"= post_reserve={post_reserve_free:.2f} → usable_pool={usable_pool:.2f}"
             )
         else:
             # Normal: Cap is Headroom (Risk Limit)
             # Logic Gap Fix: Ensure we also respect the TARGET_QUOTE_POOL_RATIO (e.g. 25% of available)
-            target_quote_pool = spendable_free * getattr(self, "target_quote_pool_ratio", 0.25)
+            target_quote_pool = allocatable_free * getattr(self, "target_quote_pool_ratio", 0.25)
             
             # usable_pool is the headroom, but we allow it to be at least target_quote_pool 
             # if we have the cash and are not severely over-exposed.
@@ -708,10 +743,21 @@ class CapitalAllocator:
                     usable_pool = target_quote_pool
                     self.logger.info(f"[Allocator] 🛡️ Forcing usable_pool to target_quote_pool ({usable_pool:.2f}) to enable trading.")
 
+        if allocatable_free > 0:
+            usable_pool = min(float(usable_pool), float(allocatable_free))
+
         if usable_pool <= 0:
              # G007: UsablePoolZero gate - ELEVATED to INFO
              self.logger.info(f"[EXEC_BLOCK] gate=USABLE_POOL_ZERO reason=INSUFFICIENT_LIQUIDITY_HEADROOM component=CapitalAllocator action=DENY_ALLOCATION")
-             return {"agent_budgets": {}, "per_agent_usdt": {}, "reason": "usable_pool_zero", "pool_quote": 0.0}
+             self.logger.warning(f"[CAPITAL_REGIME] Capital regime: NO_ALLOC (usable_pool={usable_pool:.2f})")
+             return {
+                 "agent_budgets": {},
+                 "per_agent_usdt": {},
+                 "reason": "usable_pool_zero",
+                 "pool_quote": 0.0,
+                 "keep_free": round(float(keep_free), 6),
+                 "headroom_quote": round(float(headroom), 6),
+             }
 
         # 2. Agent Weighting (with Rejection-Aware Filtering - I2 Invariant)
         agent_tiers = self._identify_agent_tiers(perf_map)
@@ -783,18 +829,24 @@ class CapitalAllocator:
         if not candidates:
             return {"agent_budgets": {}, "per_agent_usdt": {}, "reason": "no_candidates"}
 
-        # 3. Allocation Split
+        # 3. Allocation model
         total_w = sum(c[1] for c in candidates)
-        agent_budgets = {}
-        if total_w > 0:
-            for agent, w in candidates:
-                # Distribute usable_pool among candidates proportionally
-                agent_budgets[agent] = round((w / total_w) * usable_pool, 6)
-        
-        # 4. Filter by Risk & Min Budget
-        agent_budgets = await self._validate_budgets(agent_budgets)
-        # 4.1 Apply per-agent allocation ranges (e.g., MLForecaster 40-60%)
-        agent_budgets = self._apply_agent_alloc_ranges(agent_budgets, usable_pool)
+        agent_budgets: Dict[str, float] = {}
+        if self.shared_wallet_mode:
+            # Shared-wallet mode: agents are signal brains, not isolated sub-funds.
+            shared_budget = round(max(0.0, usable_pool), 6)
+            agent_budgets = {agent: shared_budget for agent, _ in candidates}
+            agent_budgets = await self._validate_budgets(agent_budgets)
+        else:
+            if total_w > 0:
+                for agent, w in candidates:
+                    # Legacy mode: distribute usable_pool among candidates proportionally
+                    agent_budgets[agent] = round((w / total_w) * usable_pool, 6)
+
+            # 4. Filter by Risk & Min Budget
+            agent_budgets = await self._validate_budgets(agent_budgets)
+            # 4.1 Apply per-agent allocation ranges (e.g., MLForecaster 40-60%)
+            agent_budgets = self._apply_agent_alloc_ranges(agent_budgets, usable_pool)
         
         # 5. Handle Opportunity Gaps (Abstracted)
         # If usable_pool is significantly below Nav-based target, emit general liquidity needed
@@ -806,11 +858,15 @@ class CapitalAllocator:
                 "reason": "risk_capacity_underfill"
             })
 
-        total_final = sum(agent_budgets.values())
+        total_final = (
+            max(agent_budgets.values(), default=0.0)
+            if self.shared_wallet_mode
+            else sum(agent_budgets.values())
+        )
         
         # 6. Accumulation Plan (Issue #4 FIX: Event-driven)
-        if spendable_free > total_final:
-            accum_pool = min(spendable_free - total_final, usable_pool * 0.1) 
+        if allocatable_free > total_final:
+            accum_pool = min(allocatable_free - total_final, usable_pool * 0.1) 
             if accum_pool > self.min_accumulation_unit:
                 await self.ss.emit_event("ACCUMULATION_PLAN", {
                     "pool_quote": accum_pool,
@@ -822,10 +878,13 @@ class CapitalAllocator:
             "agent_budgets": agent_budgets,
             "per_agent_usdt": agent_budgets, # Legacy compatibility
             "effective_ts": self._now_iso(),
-            "reason": "agent_focused_plan",
+            "reason": "shared_wallet_plan" if self.shared_wallet_mode else "agent_focused_plan",
             "pool_quote": round(total_final, 2),
             "free_usdt": round(float(spendable_free), 6),
+            "keep_free": round(float(keep_free), 6),
+            "headroom_quote": round(float(headroom), 6),
             "is_bootstrap": is_bootstrap,
+            "shared_wallet_mode": bool(self.shared_wallet_mode),
             "accumulate_count": 0, # Logic moved to event consumer
         }
 
@@ -851,6 +910,22 @@ class CapitalAllocator:
     def _validate_with_risk(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         """Ask RiskManager whether the implied increases are permissible; if not, reduce budgets."""
         if not plan or not plan.get("per_agent_usdt"):
+            return plan
+        if self.shared_wallet_mode:
+            pool_quote = float(plan.get("pool_quote", 0.0) or 0.0)
+            try:
+                if hasattr(self.risk, "can_increase_exposure") and callable(self.risk.can_increase_exposure):
+                    try:
+                        ok = bool(self.risk.can_increase_exposure(symbol=None, trade_quote=pool_quote))
+                    except TypeError:
+                        ok = bool(self.risk.can_increase_exposure(pool_quote))
+                    if not ok:
+                        zeroed = {agent: 0.0 for agent in plan.get("per_agent_usdt", {}).keys()}
+                        plan["per_agent_usdt"] = zeroed
+                        plan["agent_budgets"] = dict(zeroed)
+                        plan["pool_quote"] = 0.0
+            except Exception:
+                self.logger.warning("Risk validation failed; using unadjusted shared-wallet plan", exc_info=True)
             return plan
         pac = plan.get("per_agent_usdt", {}).copy()
         try:
@@ -922,6 +997,29 @@ class CapitalAllocator:
         if hasattr(self.ss, "metrics"):
             current_mode = str(self.ss.metrics.get("current_mode", "NORMAL")).upper()
             
+        # GLOBAL SYSTEMIC DEGRADATION CHECK - INSTITUTIONAL FEATURE
+        # Check for system-wide performance degradation requiring global risk reduction
+        systemic_degradation_active = False
+        if hasattr(self.ss, "metrics") and isinstance(self.ss.metrics, dict):
+            systemic_degradation_active = bool(self.ss.metrics.get("global_systemic_degradation", False))
+            
+        if systemic_degradation_active:
+            degradation_reason = str(self.ss.metrics.get("global_degradation_reason", "unknown"))
+            self.logger.warning(f"[Allocator] 🌋 Global Systemic Degradation detected: {degradation_reason}")
+            
+            # Apply global risk reduction: reduce total allocation pool by configurable factor
+            global_risk_reduction = float(getattr(self.config, "GLOBAL_DEGRADATION_RISK_REDUCTION", 0.5) or 0.5)
+            self.logger.info(f"[Allocator] 🌋 Applying global risk reduction factor: {global_risk_reduction}")
+            
+            # Modify the usable_pool calculation to apply reduction
+            if usable_pool > 0:
+                original_pool = usable_pool
+                usable_pool *= global_risk_reduction
+                self.logger.warning(f"[Allocator] 🌋 Reduced usable pool from {original_pool:.2f} to {usable_pool:.2f}")
+                
+            # Emit health status for monitoring
+            await self.emit_health("DEGRADED", f"Global systemic degradation: {degradation_reason}")
+            
         if current_mode in ("PAUSED", "PROTECTIVE"):
             self.logger.info(f"[Allocator] 🛡️ Governance Mode {current_mode}: Zeroing all agent budgets.")
             # Zero out all authoritative reservations
@@ -936,6 +1034,24 @@ class CapitalAllocator:
                 zero_reservations = {agent: 0.0 for agent in agents}
                 self.ss.set_authoritative_reservations(zero_reservations)
                 self.logger.info(f"[Allocator] 🛡️ Cleared {len(zero_reservations)} agent budgets due to {current_mode} mode.")
+                self.logger.warning(f"[CAPITAL_REGIME] Capital regime: NO_ALLOC (governance_mode={current_mode})")
+                
+            await self.emit_health("DEGRADED", f"Budgets zeroed due to {current_mode} mode")
+            return {"per_agent_usdt": {}, "effective_ts": self._now_iso(), "reason": f"mode_{current_mode.lower()}"}
+            self.logger.info(f"[Allocator] 🛡️ Governance Mode {current_mode}: Zeroing all agent budgets.")
+            # Zero out all authoritative reservations
+            if hasattr(self.ss, "set_authoritative_reservations"):
+                # Get existing agents to zero them out
+                agents = {}
+                if self.agent_manager:
+                    agents = self.agent_manager.get_agents() or {}
+                elif self.strategy_manager:
+                    agents = self.strategy_manager.agents or {}
+                
+                zero_reservations = {agent: 0.0 for agent in agents}
+                self.ss.set_authoritative_reservations(zero_reservations)
+                self.logger.info(f"[Allocator] 🛡️ Cleared {len(zero_reservations)} agent budgets due to {current_mode} mode.")
+                self.logger.warning(f"[CAPITAL_REGIME] Capital regime: NO_ALLOC (governance_mode={current_mode})")
                 
             await self.emit_health("DEGRADED", f"Budgets zeroed due to {current_mode} mode")
             return {"per_agent_usdt": {}, "effective_ts": self._now_iso(), "reason": f"mode_{current_mode.lower()}"}

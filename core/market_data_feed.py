@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import random
 import time
+import math
 from typing import Any, Dict, List, Optional, Iterable, Tuple, Callable
 import logging
 
@@ -61,8 +62,8 @@ class MarketDataFeed:
         *,
         config: Optional[Dict[str, Any]] = None,
         ohlcv_timeframes: Optional[List[str]] = None,
-        ohlcv_limit: int = 300,
-        poll_interval: float = 3.0,
+        ohlcv_limit: int = 100,
+        poll_interval: float = 15.0,
         max_concurrency: int = 8,
         logger: Optional[logging.Logger] = None,
         compute_atr: bool = True,
@@ -70,7 +71,7 @@ class MarketDataFeed:
         warmup_timeout_sec: float = 45.0,
         retry_after_no_symbols_sec: float = 2.0,
         max_retry_backoff_sec: float = 20.0,
-        min_bars_required: int = 300,
+        min_bars_required: int = 50,
         readiness_emit: bool = True,
         per_symbol_readiness: bool = True,
         **_,
@@ -97,11 +98,12 @@ class MarketDataFeed:
         if isinstance(tfs, str):
             tfs = [t.strip() for t in tfs.split(",") if t.strip()]
         self.timeframes: List[str] = [str(t).strip() for t in tfs]
-        raw_limit = _cfg("ohlcv_limit", ohlcv_limit)
+        # MDF_OHLCV_LIMIT supports higher candle fetches for better training data
+        raw_limit = _cfg("MDF_OHLCV_LIMIT") or _cfg("ohlcv_limit", ohlcv_limit)
         try:
             limit = int(raw_limit)
         except Exception:
-            limit = 250
+            limit = 5000
         if limit < 50:
             limit = 50
         self.ohlcv_limit: int = limit
@@ -132,6 +134,11 @@ class MarketDataFeed:
 
         self._health_task: Optional[asyncio.Task] = None
         self._last_error_ts: float = 0.0
+        self._empty_symbol_cycles: int = 0
+        self._missing_exchange_cycles: int = 0
+        self._poll_cycle: int = 0
+        self._known_symbols: set[str] = set()
+        self._backfill_tasks: Dict[str, asyncio.Task] = {}
 
         # Resolve component and code values (enum if present, else strings)
         self._component_key = getattr(_ComponentEnum, "MARKET_DATA_FEED", "MarketDataFeed")
@@ -166,6 +173,105 @@ class MarketDataFeed:
             return await val
         return val
 
+    @staticmethod
+    def _normalize_symbol_payload(payload: Any) -> List[str]:
+        if isinstance(payload, dict):
+            raw = list(payload.keys())
+        elif isinstance(payload, (list, tuple, set)):
+            raw = list(payload)
+        else:
+            raw = []
+        out: List[str] = []
+        for item in raw:
+            sym = str(item or "").strip().upper()
+            if sym:
+                out.append(sym)
+        return out
+
+    @staticmethod
+    def _coerce_positive_price(raw_price: Any) -> float:
+        """Best-effort coercion of exchange price payloads to a positive finite float."""
+        candidate = raw_price
+        if isinstance(raw_price, dict):
+            for key in ("price", "lastPrice", "last_price", "close", "c"):
+                if key in raw_price:
+                    candidate = raw_price.get(key)
+                    break
+        try:
+            val = float(candidate)
+        except Exception:
+            return 0.0
+        if not math.isfinite(val) or val <= 0:
+            return 0.0
+        return val
+
+    async def _inject_latest_price(self, sym: str, price: float) -> bool:
+        """
+        Inject latest price into SharedState using resilient fallback chain:
+        1) update_latest_price
+        2) update_last_price
+        3) direct map write (guarded by prices lock when available)
+        """
+        ss = self.shared_state
+        write_methods = ("update_latest_price", "update_last_price")
+        for name in write_methods:
+            fn = getattr(ss, name, None)
+            if not callable(fn):
+                continue
+            try:
+                await self._maybe_await(fn(sym, price))
+                return True
+            except Exception:
+                self._logger.warning(
+                    "[MDF] %s failed for %s price=%.10f",
+                    name,
+                    sym,
+                    price,
+                    exc_info=True,
+                )
+
+        # Last-resort fallback to keep price cache live even if wrappers fail.
+        try:
+            norm_fn = getattr(ss, "_norm_sym", None)
+            norm_sym = norm_fn(sym) if callable(norm_fn) else str(sym or "").upper()
+            now = time.time()
+            lock = None
+            try:
+                lock = getattr(ss, "_locks", {}).get("prices")
+            except Exception:
+                lock = None
+
+            if isinstance(lock, asyncio.Lock):
+                async with lock:
+                    if isinstance(getattr(ss, "latest_prices", None), dict):
+                        ss.latest_prices[norm_sym] = float(price)
+                    if isinstance(getattr(ss, "_last_tick_timestamps", None), dict):
+                        ss._last_tick_timestamps[norm_sym] = now
+                    if isinstance(getattr(ss, "_price_cache", None), dict):
+                        ss._price_cache[norm_sym] = (float(price), now)
+            else:
+                if isinstance(getattr(ss, "latest_prices", None), dict):
+                    ss.latest_prices[norm_sym] = float(price)
+                if isinstance(getattr(ss, "_last_tick_timestamps", None), dict):
+                    ss._last_tick_timestamps[norm_sym] = now
+                if isinstance(getattr(ss, "_price_cache", None), dict):
+                    ss._price_cache[norm_sym] = (float(price), now)
+
+            self._logger.warning(
+                "[MDF] injected latest price via direct fallback for %s price=%.10f",
+                norm_sym,
+                price,
+            )
+            return True
+        except Exception:
+            self._logger.error(
+                "[MDF] failed to inject latest price for %s price=%.10f",
+                sym,
+                price,
+                exc_info=True,
+            )
+            return False
+
     async def _set_health(self, code, msg: str, metrics: Optional[Dict[str, Any]] = None):
         """
         Send health via SharedState.set_component_health if available.
@@ -180,15 +286,29 @@ class MarketDataFeed:
             self._logger.debug("set_component_health failed", exc_info=True)
 
     async def _get_accepted_symbols(self) -> List[str]:
+        getters = ("get_accepted_symbols", "get_accepted_symbols_snapshot")
+        for name in getters:
+            try:
+                fn = getattr(self.shared_state, name, None)
+                if not callable(fn):
+                    continue
+                payload = await self._maybe_await(fn())
+                syms = self._normalize_symbol_payload(payload)
+                if syms:
+                    return syms
+            except Exception:
+                self._logger.debug("%s failed", name, exc_info=True)
         try:
-            syms = await self._maybe_await(self.shared_state.get_accepted_symbols())
-            return list(syms or [])
+            syms = self._normalize_symbol_payload(getattr(self.shared_state, "accepted_symbols", {}))
+            if syms:
+                return syms
         except Exception:
-            self._logger.debug("get_accepted_symbols failed", exc_info=True)
-            return []
+            self._logger.debug("accepted_symbols fallback failed", exc_info=True)
+        return []
 
     async def _maybe_set_ready(self):
         """Best-effort signal to SharedState that market data is ready."""
+        self._logger.warning(f"[MDF DEBUG] SharedState ID: {id(self.shared_state)}")
         if self._declared_ready or not self.readiness_emit:
             return
         try:
@@ -264,6 +384,52 @@ class MarketDataFeed:
         except Exception:
             self._logger.debug("mark_symbol_ready failed for %s", sym, exc_info=True)
 
+    async def _schedule_symbol_backfill(self, symbols: List[str]) -> None:
+        """
+        Schedule full-window backfill for newly accepted symbols.
+        Keeps symbol ATR/indicator paths warm instead of waiting on tail polling.
+        """
+        for raw_sym in symbols:
+            sym = str(raw_sym or "").strip().upper()
+            if not sym:
+                continue
+            existing = self._backfill_tasks.get(sym)
+            if existing and not existing.done():
+                continue
+            try:
+                if await self._symbol_meets_depth(sym):
+                    continue
+            except Exception:
+                pass
+
+            self._logger.info("[MDF] scheduling accepted-symbol backfill for %s", sym)
+            task = asyncio.create_task(self.on_symbol_accepted(sym), name=f"mdf.backfill[{sym}]")
+            self._backfill_tasks[sym] = task
+
+            def _done(t: asyncio.Task, symbol: str = sym) -> None:
+                self._backfill_tasks.pop(symbol, None)
+                try:
+                    exc = t.exception()
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    return
+                if exc is not None:
+                    self._logger.warning("[MDF] accepted-symbol backfill failed for %s: %s", symbol, exc)
+
+            task.add_done_callback(_done)
+
+    async def _cancel_backfill_tasks(self) -> None:
+        if not self._backfill_tasks:
+            return
+        tasks = list(self._backfill_tasks.values())
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._backfill_tasks.clear()
+
     # -------------------- error handling --------------------
 
     @staticmethod
@@ -287,6 +453,15 @@ class MarketDataFeed:
             kind = "AuthError"
         elif code in API_RATELIMIT_ERR_CODES:
             kind = "RateLimit"
+            # 🎛️ Notify governor of rate limit
+            try:
+                if (hasattr(self, 'shared_state') and self.shared_state and 
+                    hasattr(self.shared_state, '_app_context') and self.shared_state._app_context):
+                    app = self.shared_state._app_context
+                    if hasattr(app, 'capital_symbol_governor') and app.capital_symbol_governor:
+                        app.capital_symbol_governor.mark_api_rate_limited()
+            except Exception:
+                pass  # Silently fail if governor unavailable
         elif isinstance(err, asyncio.TimeoutError):
             kind = "Timeout"
         meta = {"error": str(err)}
@@ -359,6 +534,7 @@ class MarketDataFeed:
             await self.run()
         finally:
             await self._set_health(self._code_warn, "stopped")
+            await self._cancel_backfill_tasks()
             if self._health_task:
                 self._health_task.cancel()
                 with contextlib.suppress(Exception):
@@ -457,8 +633,11 @@ class MarketDataFeed:
                 async def _fetch_price():
                     return await ec.get_current_price(sym)
                 price = await self._with_retries(_fetch_price, f"warmup.get_price[{sym}]")
-                if price is not None:
-                    await self._maybe_await(self.shared_state.update_last_price(sym, float(price)))
+                price_f = self._coerce_positive_price(price)
+                if price_f > 0:
+                    await self._inject_latest_price(sym, price_f)
+                else:
+                    self._logger.warning("[MDF] warmup price invalid for %s: %r", sym, price)
 
                 # Optional ATR on 1h
                 if self.compute_atr and "1h" in self.timeframes:
@@ -525,6 +704,7 @@ class MarketDataFeed:
 
         # Readiness: SharedState flips MarketDataReady internally once thresholds are met.
         await self._set_health(self._code_ok, "warmup:done", metrics={"symbols": len(symbols), "latency_ms": latency_ms})
+        self._known_symbols = {str(s or "").strip().upper() for s in symbols if str(s or "").strip()}
 
     async def on_symbol_accepted(self, sym: str) -> None:
         """Blocking backfill for a single symbol; can be wired to an AcceptedSymbol event."""
@@ -548,8 +728,11 @@ class MarketDataFeed:
             async def _fetch_price():
                 return await ec.get_current_price(sym)
             price = await self._with_retries(_fetch_price, f"accept.get_price[{sym}]")
-            if price is not None:
-                await self._maybe_await(self.shared_state.update_last_price(sym, float(price)))
+            price_f = self._coerce_positive_price(price)
+            if price_f > 0:
+                await self._inject_latest_price(sym, price_f)
+            else:
+                self._logger.warning("[MDF] accept price invalid for %s: %r", sym, price)
 
             # ATR keep-warm if configured
             if self.compute_atr and "1h" in self.timeframes:
@@ -592,12 +775,34 @@ class MarketDataFeed:
         syms = await self._get_accepted_symbols()
         self._logger.info(f"[MDF] loop started | accepted_symbols={syms}")
 
-        while True:
+        while not self._stop.is_set():
+            self._poll_cycle += 1
             symbols = await self._get_accepted_symbols()
+            current_symbols = {str(s or "").strip().upper() for s in symbols if str(s or "").strip()}
+            new_symbols = sorted(current_symbols - self._known_symbols)
+            if new_symbols:
+                self._logger.info("[MDF] accepted-symbol delta detected; backfill=%s", new_symbols)
+                await self._schedule_symbol_backfill(new_symbols)
+            self._known_symbols = current_symbols
+
+            # 🔎 1) Log symbols at every cycle
+            self._logger.warning("[DEBUG_MDF] symbols=%s", symbols)
 
             if not symbols:
+                self._empty_symbol_cycles += 1
+                if self._empty_symbol_cycles == 1 or self._empty_symbol_cycles % 10 == 0:
+                    self._logger.warning(
+                        "[MDF] poll cycle has no accepted symbols (streak=%d)",
+                        self._empty_symbol_cycles,
+                    )
+                    await self._set_health(
+                        self._code_warn,
+                        "poll:no_symbols",
+                        metrics={"streak": self._empty_symbol_cycles},
+                    )
                 await asyncio.sleep(self.retry_after_no_symbols_sec)
                 continue
+            self._empty_symbol_cycles = 0
 
             sem = asyncio.Semaphore(self.max_concurrency)
 
@@ -606,34 +811,117 @@ class MarketDataFeed:
                 for sym in symbols
             ]
 
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            await self._set_health(
-                self._code_ok,
-                "poll",
-                metrics={"symbols": len(symbols)}
-            )
+            poll_errors = 0
+            no_client = 0
+            no_price = 0
+            price_updates = 0
+            bars_added = 0
+
+            for result in results:
+                if isinstance(result, Exception):
+                    poll_errors += 1
+                    self._logger.warning("[MDF] poll task exception: %s", result)
+                    continue
+                if not isinstance(result, dict):
+                    continue
+                reason = str(result.get("reason") or "")
+                if reason == "no_exchange_client":
+                    no_client += 1
+                elif reason == "price_unavailable":
+                    no_price += 1
+                if bool(result.get("price_updated")):
+                    price_updates += 1
+                bars_added += int(result.get("bars_added", 0) or 0)
+
+            if no_client > 0:
+                self._missing_exchange_cycles += 1
+            else:
+                self._missing_exchange_cycles = 0
+
+            if poll_errors > 0:
+                await self._set_health(
+                    self._code_warn,
+                    "poll:task_errors",
+                    metrics={
+                        "symbols": len(symbols),
+                        "errors": poll_errors,
+                        "price_updates": price_updates,
+                        "bars_added": bars_added,
+                    },
+                )
+            elif no_client == len(symbols):
+                await self._set_health(
+                    self._code_warn,
+                    "poll:no_exchange_client",
+                    metrics={"symbols": len(symbols), "missing_exchange_cycles": self._missing_exchange_cycles},
+                )
+                if self._missing_exchange_cycles == 1 or self._missing_exchange_cycles % 5 == 0:
+                    self._logger.warning(
+                        "[MDF] exchange client unavailable across all symbols (streak=%d)",
+                        self._missing_exchange_cycles,
+                    )
+            elif price_updates == 0 and bars_added == 0:
+                await self._set_health(
+                    self._code_warn,
+                    "poll:no_data",
+                    metrics={
+                        "symbols": len(symbols),
+                        "no_price_symbols": no_price,
+                    },
+                )
+                self._logger.warning(
+                    "[MDF] poll cycle produced no market-data writes (symbols=%d, no_price=%d)",
+                    len(symbols),
+                    no_price,
+                )
+            else:
+                await self._set_health(
+                    self._code_ok,
+                    "poll",
+                    metrics={
+                        "symbols": len(symbols),
+                        "price_updates": price_updates,
+                        "bars_added": bars_added,
+                    },
+                )
 
             await asyncio.sleep(self.poll_interval)
 
-    async def _poll_symbol(self, sym: str, sem: asyncio.Semaphore) -> None:
+    async def _poll_symbol(self, sym: str, sem: asyncio.Semaphore) -> Dict[str, Any]:
         async with sem:
             ec = await self._get_exchange_client()
             if ec is None:
                 # Late wiring race: skip this cycle for this symbol
-                return
+                return {
+                    "symbol": sym,
+                    "price_updated": False,
+                    "bars_added": 0,
+                    "reason": "no_exchange_client",
+                }
             # Last price
             price = None
+            price_updated = False
+            bars_added = 0
             try:
                 async def _fetch_price():
                     return await ec.get_current_price(sym)
                 price = await self._with_retries(_fetch_price, f"poll.get_price[{sym}]")
             except Exception:
                 price = None
-            if price is not None:
-                await self._maybe_await(self.shared_state.update_last_price(sym, float(price)))
+            price_f = self._coerce_positive_price(price)
+            if price_f > 0:
+                try:
+                    price_updated = bool(await self._inject_latest_price(sym, price_f))
+                    # 🔎 3) Log price write
+                    self._logger.warning("[DEBUG_MDF] price update %s = %s", sym, price_f)
+                except Exception:
+                    self._logger.debug("update_last_price failed for %s", sym, exc_info=True)
 
             # Lightweight tail refresh on each timeframe
+            # 🔎 2) Log before fetching OHLCV
+            self._logger.warning("[DEBUG_MDF] fetching OHLCV for %s", sym)
             for tf in self.timeframes:
                 try:
                     async def _fetch_tail():
@@ -650,8 +938,9 @@ class MarketDataFeed:
                             "v": float(r[5]),
                         }
                         await self._maybe_await(self.shared_state.add_ohlcv(sym, tf, bar))
+                        bars_added += 1
                 except Exception:
-                    pass
+                    self._logger.debug("poll.get_ohlcv failed for %s %s", sym, tf, exc_info=True)
 
             # Optional ATR keep-warm
             if self.compute_atr and "1h" in self.timeframes:
@@ -665,8 +954,15 @@ class MarketDataFeed:
                 "[MDF:POLL] %s price=%s tfs=%s",
                 sym, price, self.timeframes,
             )
+            return {
+                "symbol": sym,
+                "price_updated": price_updated,
+                "bars_added": bars_added,
+                "reason": "" if (price_updated or bars_added > 0) else "price_unavailable",
+            }
 
     # -------------------- control --------------------
 
     async def stop(self):
         self._stop.set()
+        await self._cancel_backfill_tasks()

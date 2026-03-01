@@ -1,0 +1,78 @@
+{
+  "BTCUSDT": {
+    "status": "SUCCESS",
+    "sequences": 866,
+    "train_samples": 519,
+    "val_samples": 173,
+    "test_samples": 174,
+    "class_dist_train": {
+      "negative": 354,
+      "positive": 165
+    },
+    "class_dist_test": {
+      "negative": 126,
+      "positive": 48
+    },
+    "training": {
+      "final_train_acc": 0.7456647157669067,
+      "final_val_acc": 0.4797687828540802
+    },
+    "evaluation": {
+      "accuracy": 0.5632183908045977,
+      "precision": 0.25,
+      "recall": 0.2916666666666667,
+      "f1": 0.2692307692307692,
+      "auc": 0.4710648148148148,
+      "expectancy": 0.689655172413793,
+      "status": "PASS",
+      "confusion_matrix": {
+        "tn": 84,
+        "fp": 42,
+        "fn": 34,
+        "tp": 14
+      },
+      "class_distribution": {
+        "negative": 126,
+        "positive": 48
+      }
+    }
+  },
+  "ETHUSDT": {
+    "status": "SUCCESS",
+    "sequences": 861,
+    "train_samples": 516,
+    "val_samples": 172,
+    "test_samples": 173,
+    "class_dist_train": {
+      "negative": 338,
+      "positive": 178
+    },
+    "class_dist_test": {
+      "negative": 132,
+      "positive": 41
+    },
+    "training": {
+      "final_train_acc": 0.7635658979415894,
+      "final_val_acc": 0.7732558250427246
+    },
+    "evaluation": {
+      "accuracy": 0.6820809248554913,
+      "precision": 0.18181818181818182,
+      "recall": 0.0975609756097561,
+      "f1": 0.12698412698412698,
+      "auc": 0.49815225424981524,
+      "expectancy": 1.046242774566474,
+      "status": "PASS",
+      "confusion_matrix": {
+        "tn": 114,
+        "fp": 18,
+        "fn": 37,
+        "tp": 4
+      },
+      "class_distribution": {
+        "negative": 132,
+        "positive": 41
+      }
+    }
+  }
+}

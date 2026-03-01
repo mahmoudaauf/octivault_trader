@@ -487,7 +487,7 @@ class TrendHunter:
         act = action.upper()
         # Use local helper (global function)
         if act in ("BUY", "SELL"):
-            # P9 FIX: Use _submit_signal which has SELL guard and centralized emission logic
+            # Route actionable signals to AgentManager collection path.
             await self._submit_signal(symbol, act, float(confidence), reason)
         else:
             logger.debug("[%s] Not emitting for %s: action=%s, conf=%.2f (<%.2f)",
@@ -499,113 +499,6 @@ class TrendHunter:
             status="Operational",
             detail=f"Last signal: {action} ({confidence:.2f}), regime={regime or ''}",
         )
-
-    async def _maybe_execute(self, symbol: str, action: str, confidence: float, reason: str) -> None:
-        # P9: disabled by default unless explicitly allowed
-        if not bool(self._cfg("ALLOW_DIRECT_EXECUTION", False)):
-            logger.debug("[%s] Direct execution disabled by config; skipping.", self.name)
-            return
-        # fetch price via shared_state helper with exchange fallback
-        get_price_cb = getattr(self.execution_manager, "get_current_price", None)
-        if self.execution_manager and hasattr(self.execution_manager, "exchange_client"):
-            get_price_cb = getattr(self.execution_manager.exchange_client, "get_price", get_price_cb)
-
-        price = await self.shared_state.get_latest_price(symbol)
-        if (not price or price <= 0) and callable(get_price_cb):
-            try:
-                fetched = await asyncio.to_thread(get_price_cb, symbol)
-                if fetched and fetched > 0:
-                    await self.shared_state.update_latest_price(symbol, float(fetched))
-                    price = float(fetched)
-            except Exception:
-                price = price or 0.0
-        if not price or price <= 0:
-            logger.info("[%s] %s – price_unavailable; skip execution.", self.name, symbol)
-            return
-
-        # normalize side to canonical lowercase ("buy" | "sell")
-        side = "buy" if action.strip().upper() == "BUY" else ("sell" if action.strip().upper() == "SELL" else "")
-        if side not in ("buy", "sell"):
-            logger.debug("[%s] Non-actionable side for %s: %s", self.name, symbol, action)
-            return
-        
-        if side == "buy":
-            # spendable budget
-            spendable = await self.shared_state.get_spendable_balance(self.base_ccy)
-            if not spendable or spendable <= 0:
-                logger.info("[%s] %s – no spendable %s; skip buy.", self.name, symbol, self.base_ccy)
-                return
-
-            # fractional budget, clamped to [0..1]
-            fraction = float(self._cfg("BUY_FRACTION_OF_SPENDABLE", 0.10))
-            desired_quote = float(spendable) * max(0.0, min(1.0, fraction))
-
-            # pull filters to learn min entry constraint
-            nf_res = self.execution_manager.ensure_symbol_filters_ready(symbol)
-            nf = await _await_maybe(nf_res)
-            step, min_qty, max_qty, tick, min_notional = self.execution_manager._extract_filter_vals(nf)
-            cfg_min_entry = (
-                float(getattr(getattr(self.config, "GLOBAL", object()), "MIN_ENTRY_QUOTE_USDT", 10.0))
-                if not isinstance(self.config, dict)
-                else float(self.config.get("GLOBAL", {}).get("MIN_ENTRY_QUOTE_USDT", 10.0))
-            )
-            min_entry = max(float(min_notional or 0.0), cfg_min_entry)
-
-            # ensure we try at least the minimum
-            quote_to_spend = max(desired_quote, min_entry)
-
-            # ask EM to confirm affordability (fees + headroom)
-            ok, reason = await self.execution_manager.explain_afford_market_buy(symbol, quote_to_spend)
-            if not ok:
-                ok_min, reason_min = await self.execution_manager.explain_afford_market_buy(symbol, min_entry)
-                if not ok_min:
-                    logger.info("[%s] %s – cannot afford min entry (%s); skip buy.", self.name, symbol, reason_min)
-                    return
-                quote_to_spend = float(min_entry)
-
-            order = ExecOrder(
-                symbol=symbol,
-                side="buy",
-                planned_quote=float(quote_to_spend),
-                tag=f"meta-{AGENT_NAME}",
-            )
-        else:
-            pos_qty = float(await self.shared_state.get_position_quantity(symbol) or 0.0)
-            if pos_qty <= 0:
-                logger.info("[%s] Skip SELL for %s — no position.", self.name, symbol)
-                return
-
-            nf_res = self.execution_manager.ensure_symbol_filters_ready(symbol)
-            nf = await _await_maybe(nf_res)
-            step, min_qty, max_qty, tick, min_notional = self.execution_manager._extract_filter_vals(nf)
-
-            q_qty = self.execution_manager.exchange_client.quantize_qty(symbol, float(pos_qty))
-            if max_qty > 0 and q_qty > max_qty:
-                q_qty = self.execution_manager.exchange_client.quantize_qty(symbol, max_qty)
-            if q_qty <= 0:
-                logger.info("[%s] Skip SELL for %s — qty rounds to zero.", self.name, symbol)
-                return
-
-            notional = float(q_qty) * float(price)
-            if min_notional and notional < float(min_notional):
-                logger.info("[%s] Skip SELL for %s — notional %.4f < minNotional %.4f.",
-                            self.name, symbol, notional, float(min_notional))
-                return
-
-            order = ExecOrder(
-                symbol=symbol,
-                side="sell",
-                quantity=float(q_qty),
-                tag=f"meta-{AGENT_NAME}",
-            )
-
-        await self.execution_manager.place(order)
-        if order.side == "buy" and order.planned_quote is not None:
-            logger.info("[%s] ✅ Order submitted via EM.place for %s (buy, quote=%.2f)",
-                        self.name, symbol, float(order.planned_quote))
-        else:
-            logger.info("[%s] ✅ Order submitted via EM.place for %s (sell, qty=%.6f)",
-                        self.name, symbol, float(order.quantity or 0.0))
  
     async def _submit_signal(self, symbol: str, action: str, confidence: float, reason: str) -> None:
         action_upper = action.upper().strip()
@@ -618,6 +511,43 @@ class TrendHunter:
         if float(confidence) < min_conf:
             logger.debug("[%s] Low-conf filtered for %s: %.2f < %.2f", self.name, symbol, confidence, min_conf)
             return
+        
+        # Multi-timeframe gating for BUY signals
+        # 1h = brain (regime decision), 5m = hands (execution)
+        if action_upper == "BUY":
+            try:
+                sym_u = str(symbol).replace("/", "").upper()
+                # Get 1h regime (brain)
+                regime_1h = None
+                try:
+                    reginfo_1h = await self.shared_state.get_volatility_regime(sym_u, timeframe="1h")
+                    if not reginfo_1h:
+                        reginfo_1h = await self.shared_state.get_volatility_regime("GLOBAL", timeframe="1h")
+                    regime_1h = (reginfo_1h or {}).get("regime", "").lower() if reginfo_1h else None
+                except Exception as e:
+                    logger.debug("[%s] Failed to get 1h regime for %s: %s", self.name, symbol, e)
+                    regime_1h = None
+                
+                # Block BUY if 1h regime is bear
+                if regime_1h == "bear":
+                    logger.info(
+                        "[%s] BUY filtered for %s — 1h regime is BEAR (hands blocked by brain)",
+                        self.name,
+                        symbol,
+                    )
+                    return
+                elif regime_1h == "bull":
+                    logger.debug("[%s] BUY allowed for %s — 1h regime is BULL", self.name, symbol)
+                else:
+                    logger.debug(
+                        "[%s] BUY allowed for %s — 1h regime is %s (neutral/unknown, proceeding)",
+                        self.name,
+                        symbol,
+                        regime_1h or "unknown",
+                    )
+            except Exception as e:
+                logger.debug("[%s] Multi-timeframe gating error for %s: %s (proceeding with caution)", self.name, symbol, e)
+        
         if action_upper == "SELL":
             pos_qty = 0.0
             gpq = getattr(self.shared_state, "get_position_quantity", None)
@@ -648,24 +578,11 @@ class TrendHunter:
                 )
                 return  # Don't emit sub-minimum quotes
 
-        # Mandatory P9 Signal Contract: Emit to Signal Bus
-        if hasattr(self.shared_state, "add_agent_signal"):
-            try:
-                # determine tier based on confidence
-                tier = "A" if confidence >= 0.85 else "B"
-                await self.shared_state.add_agent_signal(
-                    symbol=symbol,
-                    agent=self.name,
-                    side=action_upper,
-                    confidence=float(confidence),
-                    ttl_sec=300,
-                    tier=tier,
-                    rationale=reason
-                )
-            except Exception as e:
-                logger.warning(f"[{self.name}] Failed to emit to signal bus: {e}")
-
-        # P9 CONTRACT: Build and buffer signal dict for AgentManager collection
+        # Compute expected move based on TP distance, ML forecast, ATR, and historical ROI
+        expected_move_pct = await self._compute_expected_move_pct(symbol, action_upper)
+        
+        # Single-path emission: buffer for AgentManager collection only.
+        # Avoid dual bus+buffer publication because cache key collisions can clobber metadata.
         signal = {
             "symbol": symbol,
             "action": action_upper,
@@ -676,9 +593,10 @@ class TrendHunter:
             "quote_hint": quote_hint,
             "horizon_hours": 6.0,
             "agent": self.name,
+            "expected_move_pct": float(expected_move_pct),  # Alpha signal for EV gate
         }
         self._collected_signals.append(signal)
-        logger.info("[%s] Buffered %s for %s (conf=%.2f)", self.name, action_upper, symbol, confidence)
+        logger.info("[%s] Buffered %s for %s (conf=%.2f, exp_move=%.2f%%)", self.name, action_upper, symbol, confidence, expected_move_pct)
 
     async def _generate_signal(self, symbol: str, is_ml_capable: bool = False) -> Tuple[str, float, str]:
         """
@@ -771,6 +689,145 @@ class TrendHunter:
             return "SELL", h_conf, f"Heuristic MACD Bearish (hist={h_val:.6f})"
         return "HOLD", 0.0, "No clear heuristic signal"
 
+    async def _compute_expected_move_pct(self, symbol: str, action: str) -> float:
+        """
+        Compute expected move percentage based on:
+        1. TP/SL distance from current price
+        2. ML forecast (if available)
+        3. ATR multiple volatility adjustment
+        4. Historical ROI on similar setups
+        
+        Returns: Expected move as percentage (0-100+)
+        
+        This is the TRUE alpha signal for EV gate evaluation,
+        replacing the fallback ATR-only approach.
+        """
+        try:
+            # Get current market data
+            data = await self._get_market_data_safe(symbol, self.timeframe)
+            if not data or len(data) == 0:
+                logger.debug("[%s] No market data for %s, using ATR fallback", self.name, symbol)
+                return 1.5  # Conservative fallback
+            
+            rows = [self._std_row(r) for r in data]
+            rows = [r for r in rows if r is not None]
+            
+            if len(rows) == 0:
+                return 1.5
+            
+            current_close = float(rows[-1][3])  # r[3] is close
+            
+            # === Component 1: TP/SL Distance ===
+            tp_pct = 0.0
+            try:
+                if self.tp_sl_engine:
+                    tp, sl = self.tp_sl_engine.calculate_tp_sl(symbol, current_close)
+                    if action == "BUY" and tp > current_close:
+                        tp_pct = ((tp - current_close) / current_close) * 100
+                    elif action == "SELL" and sl < current_close:
+                        tp_pct = ((current_close - sl) / current_close) * 100
+                    logger.debug("[%s] TP distance for %s: %.2f%%", self.name, symbol, tp_pct)
+            except Exception as e:
+                logger.debug("[%s] TP/SL calculation failed for %s: %s", self.name, symbol, e)
+                tp_pct = 0.0
+            
+            # === Component 2: ATR Multiple Volatility ===
+            atr_pct = 1.5  # Default conservative move
+            try:
+                closes = np.asarray([r[3] for r in rows], dtype=float)
+                highs = np.asarray([r[1] for r in rows], dtype=float)
+                lows = np.asarray([r[2] for r in rows], dtype=float)
+                
+                if _HAS_TALIB:
+                    atr_val = talib.ATR(highs, lows, closes, timeperiod=14)[-1]
+                else:
+                    # Manual ATR: (H-L, L-PC, PC-H) with exponential smoothing
+                    tr_list = []
+                    for i in range(len(highs)):
+                        tr = max(
+                            highs[i] - lows[i],
+                            abs(highs[i] - closes[i-1]) if i > 0 else 0,
+                            abs(lows[i] - closes[i-1]) if i > 0 else 0
+                        )
+                        tr_list.append(tr)
+                    atr_val = np.mean(tr_list[-14:]) if len(tr_list) >= 14 else np.mean(tr_list)
+                
+                atr_pct = (atr_val / current_close) * 100
+                atr_pct = max(1.5, atr_pct)  # Floor at 1.5%
+                logger.debug("[%s] ATR-based move for %s: %.2f%%", self.name, symbol, atr_pct)
+            except Exception as e:
+                logger.debug("[%s] ATR calculation failed for %s: %s", self.name, symbol, e)
+                atr_pct = 1.5
+            
+            # === Component 3: ML Forecast (if available) ===
+            ml_pct = 0.0
+            ml_weight = 0.0
+            try:
+                if self.model_cache.get(symbol):
+                    model = self.model_cache.get(symbol)
+                    lookback = int(self._cfg("TRENDHUNTER_RETRAIN_LOOKBACK", 100))
+                    if len(rows) >= lookback:
+                        window = np.asarray([rows[-lookback:]], dtype=np.float32)
+                        pred = model.predict(window, verbose=0)[0]
+                        
+                        # pred[0] = Up probability, pred[1] = Down probability
+                        # Use predicted direction's probability as confidence
+                        if action == "BUY":
+                            ml_confidence = float(pred[0])  # Up probability
+                        else:
+                            ml_confidence = float(pred[1])  # Down probability
+                        
+                        # Map confidence to expected move magnitude (0.5 to 4.0%)
+                        ml_pct = 1.5 + (ml_confidence * 2.5)
+                        ml_weight = 0.15  # 15% weight for ML component
+                        logger.debug("[%s] ML predicted move for %s: %.2f%% (conf=%.2f)", self.name, symbol, ml_pct, ml_confidence)
+            except Exception as e:
+                logger.debug("[%s] ML forecast failed for %s: %s", self.name, symbol, e)
+                ml_pct = 0.0
+                ml_weight = 0.0
+            
+            # === Component 4: Historical ROI on similar setups ===
+            # (Simplified: use recent win rate as proxy for setup quality)
+            roi_pct = 1.0
+            try:
+                if self.trades_count > 5:
+                    win_rate = self.win_count / max(self.trades_count, 1)
+                    # High win rate → higher expected move on future trades
+                    # Low win rate → conservative
+                    roi_pct = 1.0 + (win_rate * 2.0)  # Range: 1.0-3.0%
+                    logger.debug("[%s] Historical ROI factor for %s: %.2f%% (wins=%d/%d)", 
+                                self.name, symbol, roi_pct, self.win_count, self.trades_count)
+            except Exception as e:
+                logger.debug("[%s] Historical ROI calculation failed: %s", self.name, e)
+                roi_pct = 1.0
+            
+            # === Aggregate Expected Move ===
+            # Weighted average: TP (40%) + ATR (30%) + ML (15%) + Historical (15%)
+            weights = {
+                "tp": (tp_pct, 0.40),
+                "atr": (atr_pct, 0.30),
+                "ml": (ml_pct, 0.15 + ml_weight),  # Boost ML weight if available
+                "roi": (roi_pct, 0.15),
+            }
+            
+            total_weight = sum(w for _, w in weights.values())
+            if total_weight == 0:
+                return 1.5  # Fallback
+            
+            expected_move = sum(val * (w / total_weight) for val, w in weights.values())
+            
+            # Apply EV multiplier (reduced from 2.0 to 1.65 for better frequency)
+            ev_multiplier = float(self._cfg("EV_MULTIPLIER", 1.65))
+            expected_move *= ev_multiplier
+            
+            logger.info("[%s] Expected move for %s (%s): %.2f%% (TP=%.2f, ATR=%.2f, ML=%.2f, ROI=%.2f)",
+                       self.name, symbol, action, expected_move, tp_pct, atr_pct, ml_pct, roi_pct)
+            
+            return max(0.5, expected_move)  # Floor at 0.5%
+            
+        except Exception as e:
+            logger.warning("[%s] Expected move calculation failed for %s: %s, using fallback", self.name, symbol, e)
+            return 1.5  # Conservative fallback
 
 
 def _iso_now():

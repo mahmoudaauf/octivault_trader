@@ -1,0 +1,82 @@
+{
+  "BTCUSDT": {
+    "status": "SUCCESS",
+    "sequences_created": 651,
+    "train_samples": 390,
+    "val_samples": 130,
+    "test_samples": 131,
+    "class_distribution": {
+      "test_negative": 93,
+      "test_positive": 38,
+      "test_positive_pct": 29.00763358778626
+    },
+    "training": {
+      "epochs": 50,
+      "batch_size": 16,
+      "final_train_loss": 0.380842387676239,
+      "final_train_acc": 0.7871794700622559,
+      "final_val_loss": 2.837664842605591,
+      "final_val_acc": 0.7307692170143127
+    },
+    "evaluation": {
+      "accuracy": 0.6717557251908397,
+      "baseline": 0.7099236641221374,
+      "real_edge": -0.03816793893129766,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "auc": 0.3815789473684211,
+      "confusion_matrix": {
+        "tn": 88,
+        "fp": 5,
+        "fn": 38,
+        "tp": 0
+      },
+      "class_distribution": {
+        "negative": 93,
+        "positive": 38
+      }
+    },
+    "pass_fail": "MARGINAL"
+  },
+  "ETHUSDT": {
+    "status": "SUCCESS",
+    "sequences_created": 651,
+    "train_samples": 390,
+    "val_samples": 130,
+    "test_samples": 131,
+    "class_distribution": {
+      "test_negative": 82,
+      "test_positive": 49,
+      "test_positive_pct": 37.404580152671755
+    },
+    "training": {
+      "epochs": 50,
+      "batch_size": 16,
+      "final_train_loss": 0.48271963000297546,
+      "final_train_acc": 0.735897421836853,
+      "final_val_loss": 1.8877849578857422,
+      "final_val_acc": 0.5615384578704834
+    },
+    "evaluation": {
+      "accuracy": 0.5419847328244275,
+      "baseline": 0.6259541984732825,
+      "real_edge": -0.08396946564885499,
+      "precision": 0.2962962962962963,
+      "recall": 0.16326530612244897,
+      "f1": 0.21052631578947367,
+      "auc": 0.42160278745644597,
+      "confusion_matrix": {
+        "tn": 63,
+        "fp": 19,
+        "fn": 41,
+        "tp": 8
+      },
+      "class_distribution": {
+        "negative": 82,
+        "positive": 49
+      }
+    },
+    "pass_fail": "MARGINAL"
+  }
+}

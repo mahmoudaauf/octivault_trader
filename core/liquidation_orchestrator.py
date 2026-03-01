@@ -372,19 +372,25 @@ class LiquidationOrchestrator:
                 self.log.info("[ORCH] BOOTSTRAP: No liquidation agent; no action required")
                 return {"ok": True, "freed": 0.0, "path": "no_agent", "submitted": 0, "approx_quote": 0.0, "status": "NO_ACTION_REQUIRED"}
             
-            # BOOTSTRAP FIX: Check if we have any positions to liquidate
+            # BOOTSTRAP FIX: Check if we have any positions to liquidate (excluding permanent dust)
             has_positions = False
+            permanent_dust_threshold = 1.0
             try:
                 if self.ss and hasattr(self.ss, "_positions"):
-                    for p in self.ss._positions.values():
-                        if float(p.get("quantity", 0.0)) > 0:
+                    permanent_dust_symbols = set()
+                    if hasattr(self.ss, 'get_permanent_dust_positions'):
+                        permanent_dust_symbols = set(self.ss.get_permanent_dust_positions())
+                    
+                    for sym, p in self.ss._positions.items():
+                        qty = float(p.get("quantity", 0.0))
+                        if qty > 0 and sym not in permanent_dust_symbols:
                             has_positions = True
                             break
             except Exception:
                 pass
             
             if not has_positions and target <= 0:
-                self.log.info("[ORCH] BOOTSTRAP: No positions to liquidate; no action required")
+                self.log.info("[ORCH] BOOTSTRAP: No significant positions to liquidate (permanent dust excluded); no action required")
                 return {"ok": True, "freed": 0.0, "path": "no_positions", "submitted": 0, "approx_quote": 0.0, "status": "NO_ACTION_REQUIRED"}
             
             try:

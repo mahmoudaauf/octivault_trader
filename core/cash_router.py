@@ -25,12 +25,14 @@ class CashRouter:
 
     def __init__(self, config: Any, logger: Optional[logging.Logger] = None,
                  app: Optional[Any] = None, shared_state: Optional[Any] = None,
-                 exchange_client: Optional[Any] = None) -> None:
+                 exchange_client: Optional[Any] = None,
+                 execution_manager: Optional[Any] = None) -> None:
         self.config = config
         self.logger = logger or logging.getLogger("CashRouter")
         self.app = app
         self.shared_state = shared_state
         self.ex = exchange_client
+        self.execution_manager = execution_manager
         # single-flight guard to avoid concurrent frees racing
         self._lock = asyncio.Lock()
 
@@ -185,20 +187,53 @@ class CashRouter:
         # floor to step size to avoid rejection
         return math.floor(qty / step) * step
 
+    def _resolve_execution_manager(self) -> Optional[Any]:
+        em = getattr(self, "execution_manager", None)
+        if em is not None:
+            return em
+        app = getattr(self, "app", None)
+        if app is not None:
+            em = getattr(app, "execution_manager", None)
+            if em is not None:
+                self.execution_manager = em
+                return em
+        return None
+
     async def _market_sell(self, symbol: str, qty: float, *, tag: str = "balancer") -> Any:
         """
-        Wrapper over exchange.market_sell that prefers passing an audit tag, and falls back
-        to a tag-less call for exchanges that don't accept it.
+        Route every liquidation/balancing sell through ExecutionManager.
+        Fail closed when ExecutionManager is unavailable.
         """
-        if not hasattr(self.ex, "market_sell"):
+        em = self._resolve_execution_manager()
+        if not (em and hasattr(em, "execute_trade")):
+            self.logger.error(
+                "[CashRouter] ExecutionManager unavailable. Refusing direct sell for %s qty=%.8f tag=%s",
+                symbol,
+                float(qty or 0.0),
+                tag,
+            )
             return None
         try:
-            r = self.ex.market_sell(symbol, qty, tag=tag)
-            return (await r) if asyncio.iscoroutine(r) else r
-        except TypeError:
-            # Some clients don't accept tag kwarg
-            r = self.ex.market_sell(symbol, qty)
-            return (await r) if asyncio.iscoroutine(r) else r
+            r = em.execute_trade(
+                symbol=str(symbol or "").upper(),
+                side="sell",
+                quantity=float(qty or 0.0),
+                planned_quote=None,
+                tag=str(tag or "balancer"),
+                is_liquidation=True,
+                policy_context={
+                    "reason": "CASH_ROUTER_LIQUIDITY",
+                    "liquidation_reason": "CASH_ROUTER_LIQUIDITY",
+                    "authority": "cash_router",
+                },
+            )
+            res = await r if asyncio.iscoroutine(r) else r
+            if isinstance(res, dict):
+                return res if bool(res.get("ok")) else None
+            return res
+        except Exception:
+            self.logger.debug("CashRouter ExecutionManager sell failed", exc_info=True)
+            return None
 
     # ---------- core actions ----------
     async def sweep_dust(self, *, min_quote: Optional[float] = None, want_usdt: Optional[float] = None) -> Dict[str, Any]:

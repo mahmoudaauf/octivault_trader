@@ -1,0 +1,196 @@
+{
+  "BTCUSDT": {
+    "baseline_expansion_rate": 0.3064699205448354,
+    "features": {
+      "return": {
+        "baseline_expansion_rate": 0.3064699205448354,
+        "conditional_by_quintile": {
+          "Q1": 0.3806818181818182,
+          "Q2": 0.3125,
+          "Q3": 0.2556818181818182,
+          "Q4": 0.3465909090909091,
+          "Q5": 0.23863636363636365
+        },
+        "bin_sizes": [
+          176,
+          176,
+          176,
+          176,
+          176
+        ],
+        "min_prob": 0.23863636363636365,
+        "max_prob": 0.3806818181818182,
+        "prob_range": 0.14204545454545453,
+        "chi_square": 8.231913917823741,
+        "p_value": 0.08344291878423071,
+        "information_gain": 0.009362040847269992,
+        "significance": "\u26a0\ufe0f  MARGINAL"
+      },
+      "volatility": {
+        "baseline_expansion_rate": 0.3064699205448354,
+        "conditional_by_quintile": {
+          "Q1": 0.2727272727272727,
+          "Q2": 0.36,
+          "Q3": 0.2857142857142857,
+          "Q4": 0.2914285714285714,
+          "Q5": 0.3314285714285714
+        },
+        "bin_sizes": [
+          176,
+          175,
+          175,
+          175,
+          175
+        ],
+        "min_prob": 0.2727272727272727,
+        "max_prob": 0.36,
+        "prob_range": 0.08727272727272728,
+        "chi_square": 3.0209818066016068,
+        "p_value": 0.5543203056449952,
+        "information_gain": 0.001486033445597279,
+        "significance": "\u26a0\ufe0f  MARGINAL"
+      },
+      "momentum": {
+        "baseline_expansion_rate": 0.3064699205448354,
+        "conditional_by_quintile": {
+          "Q1": 0.36049382716049383,
+          "Q2": 0.2698412698412698,
+          "Q3": 0.2484076433121019
+        },
+        "bin_sizes": [
+          405,
+          315,
+          157
+        ],
+        "min_prob": 0.2484076433121019,
+        "max_prob": 0.36049382716049383,
+        "prob_range": 0.11208618384839192,
+        "chi_square": 6.962937802885424,
+        "p_value": 0.1378598032124766,
+        "information_gain": 0.006599378942722223,
+        "significance": "\u26a0\ufe0f  MARGINAL"
+      },
+      "position": {
+        "baseline_expansion_rate": 0.3064699205448354,
+        "conditional_by_quintile": {
+          "Q1": 0.3389830508474576,
+          "Q2": 0.32386363636363635,
+          "Q3": 0.32954545454545453,
+          "Q4": 0.2556818181818182,
+          "Q5": 0.2840909090909091
+        },
+        "bin_sizes": [
+          177,
+          176,
+          176,
+          176,
+          176
+        ],
+        "min_prob": 0.2556818181818182,
+        "max_prob": 0.3389830508474576,
+        "prob_range": 0.08330123266563944,
+        "chi_square": 2.8589931803861917,
+        "p_value": 0.5816929668437367,
+        "information_gain": 0.0034205732726834137,
+        "significance": "\u26a0\ufe0f  MARGINAL"
+      }
+    }
+  },
+  "ETHUSDT": {
+    "baseline_expansion_rate": 0.3116438356164384,
+    "features": {
+      "return": {
+        "baseline_expansion_rate": 0.3116438356164384,
+        "conditional_by_quintile": {
+          "Q1": 0.33714285714285713,
+          "Q2": 0.29714285714285715,
+          "Q3": 0.3142857142857143,
+          "Q4": 0.28,
+          "Q5": 0.32571428571428573
+        },
+        "bin_sizes": [
+          175,
+          175,
+          175,
+          175,
+          175
+        ],
+        "min_prob": 0.28,
+        "max_prob": 0.33714285714285713,
+        "prob_range": 0.057142857142857106,
+        "chi_square": 1.160569665166363,
+        "p_value": 0.884546912804408,
+        "information_gain": 0.0022967153790224293,
+        "significance": "\u26a0\ufe0f  MARGINAL"
+      },
+      "volatility": {
+        "baseline_expansion_rate": 0.3116438356164384,
+        "conditional_by_quintile": {
+          "Q1": 0.3942857142857143,
+          "Q2": 0.29310344827586204,
+          "Q3": 0.3045977011494253,
+          "Q4": 0.3045977011494253,
+          "Q5": 0.2471264367816092
+        },
+        "bin_sizes": [
+          175,
+          174,
+          174,
+          174,
+          174
+        ],
+        "min_prob": 0.2471264367816092,
+        "max_prob": 0.3942857142857143,
+        "prob_range": 0.1471592775041051,
+        "chi_square": 6.4065358698137915,
+        "p_value": 0.17077546893842332,
+        "information_gain": 0.010851069169528493,
+        "significance": "\u26a0\ufe0f  MARGINAL"
+      },
+      "momentum": {
+        "baseline_expansion_rate": 0.3116438356164384,
+        "conditional_by_quintile": {
+          "Q1": 0.3111111111111111,
+          "Q2": 0.3018867924528302,
+          "Q3": 0.31543624161073824
+        },
+        "bin_sizes": [
+          405,
+          318,
+          149
+        ],
+        "min_prob": 0.3018867924528302,
+        "max_prob": 0.31543624161073824,
+        "prob_range": 0.013549449157908067,
+        "chi_square": 0.10438670042982273,
+        "p_value": 0.9986844063457851,
+        "information_gain": 0.003736055039887276,
+        "significance": "\u274c NO SIGNAL"
+      },
+      "position": {
+        "baseline_expansion_rate": 0.3116438356164384,
+        "conditional_by_quintile": {
+          "Q1": 0.2784090909090909,
+          "Q2": 0.29714285714285715,
+          "Q3": 0.35428571428571426,
+          "Q4": 0.3485714285714286,
+          "Q5": 0.28
+        },
+        "bin_sizes": [
+          176,
+          175,
+          175,
+          175,
+          175
+        ],
+        "min_prob": 0.2784090909090909,
+        "max_prob": 0.35428571428571426,
+        "prob_range": 0.07587662337662338,
+        "chi_square": 3.090959040953379,
+        "p_value": 0.5427206915812134,
+        "information_gain": 0.0036817769584813753,
+        "significance": "\u26a0\ufe0f  MARGINAL"
+      }
+    }
+  }
+}

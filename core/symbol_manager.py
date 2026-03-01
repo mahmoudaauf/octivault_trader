@@ -86,6 +86,7 @@ class SymbolManager:
         market_data_feed: Optional[Any] = None,
         database_manager: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
+        app: Optional[Any] = None,
     ):
         self.shared_state = shared_state
         self.config = config
@@ -93,6 +94,7 @@ class SymbolManager:
         self.market_data_feed = market_data_feed
         self.database_manager = database_manager
         self.logger = logger or logging.getLogger("SymbolManager")
+        self._app = app  # AppContext reference for accessing governor
 
         # ---- config snapshot (avoid getattr in hot paths) ----
         base = str(getattr(self.config, "BASE_CURRENCY", "USDT")).upper() if self.config else "USDT"
@@ -107,14 +109,7 @@ class SymbolManager:
         self._stable_thr_pct = float(getattr(self.config, "STABLE_MAX_ABS_PCT_CHANGE_24H", 0.6)) if self.config else 0.6
         self._stable_band = float(getattr(self.config, "STABLE_TARGET_BAND", 0.03)) if self.config else 0.03
         self._stable_target = float(getattr(self.config, "STABLE_TARGET_PRICE", 1.0)) if self.config else 1.0
-        self._cap = 0
-        if self.config:
-            # P9: Try namespace first, then legacy flat keys
-            disc = getattr(self.config, "DISCOVERY", None)
-            if disc and hasattr(disc, "TOP_N_SYMBOLS"):
-                self._cap = int(disc.TOP_N_SYMBOLS or 0)
-            else:
-                self._cap = int(getattr(self.config, "discovery_top_n_symbols", getattr(self.config, "MAX_ACTIVE_SYMBOLS", 0)) or 0)
+        self._cap = self._resolve_universe_cap(self.config)
         self._accept_new = bool(getattr(self.config, "discovery_accept_new_symbols", True)) if self.config else True
 
         # blacklist (union of config knobs)
@@ -235,6 +230,7 @@ class SymbolManager:
             return
 
         # Pass allow_shrink=True when setting initial symbols
+        # Governor enforcement will happen inside _safe_set_accepted_symbols (single point of control)
         await self._safe_set_accepted_symbols(validated, allow_shrink=True)
         self.logger.info("📦 SharedState updated with %d accepted symbol(s).", len(validated))
 
@@ -409,8 +405,10 @@ class SymbolManager:
 
     async def _safe_set_accepted_symbols(self, symbols_map: dict, *, allow_shrink: bool = False, source: Optional[str] = None):
         """
-        Calls SharedState.set_accepted_symbols, passing allow_shrink only if supported.
-        Keeps behavior aligned with the current design while remaining backward compatible.
+        Gateway to SharedState.set_accepted_symbols().
+        
+        NOTE: Governor enforcement is now handled at SharedState level (canonical store).
+        This method is a simple passthrough that handles metadata sanitization.
         """
         if not self.shared_state or not hasattr(self.shared_state, "set_accepted_symbols"):
             self.logger.error("❌ SharedState missing set_accepted_symbols.")
@@ -733,7 +731,7 @@ class SymbolManager:
         self._stable_thr_pct = float(getattr(self.config, "STABLE_MAX_ABS_PCT_CHANGE_24H", 0.6))
         self._stable_band = float(getattr(self.config, "STABLE_TARGET_BAND", 0.03))
         self._stable_target = float(getattr(self.config, "STABLE_TARGET_PRICE", 1.0))
-        self._cap = int(getattr(self.config, "discovery_top_n_symbols", getattr(self.config, "MAX_ACTIVE_SYMBOLS", 0)) or 0)
+        self._cap = self._resolve_universe_cap(self.config)
         self._accept_new = bool(getattr(self.config, "discovery_accept_new_symbols", True))
 
         b1 = set(getattr(self.config, "SYMBOL_BLACKLIST", []) or [])
@@ -983,7 +981,7 @@ class SymbolManager:
     # ---------------- internals ----------------
 
     def _apply_cap(self, sym_map: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """Trim to MAX_ACTIVE_SYMBOLS using score → 24h_volume → price → symbol. 
+        """Trim to universe cap using score → 24h_volume → price → symbol.
         Active positions and pending intents are protected."""
         
         # 1. Identify protected symbols (those with balance or active allocation)
@@ -1035,6 +1033,42 @@ class SymbolManager:
         
         self.logger.info("✂️ Trimmed to %d symbols (cap=%d, protected=%d).", len(trimmed), self._cap, len(protected))
         return trimmed
+
+    @staticmethod
+    def _resolve_universe_cap(config: Optional[Any]) -> int:
+        """
+        Resolve discovery/universe cap with structural precedence:
+          1) DISCOVERY.TOP_N_SYMBOLS
+          2) MAX_UNIVERSE_SYMBOLS
+          3) discovery_top_n_symbols (legacy)
+          4) MAX_ACTIVE_SYMBOLS (legacy compatibility only)
+        """
+        if not config:
+            return 0
+        cap = 0
+        try:
+            disc = getattr(config, "DISCOVERY", None)
+            if disc and hasattr(disc, "TOP_N_SYMBOLS"):
+                cap = int(getattr(disc, "TOP_N_SYMBOLS", 0) or 0)
+        except Exception:
+            cap = 0
+        if cap <= 0:
+            try:
+                cap = int(getattr(config, "MAX_UNIVERSE_SYMBOLS", 0) or 0)
+            except Exception:
+                cap = 0
+        if cap <= 0:
+            try:
+                cap = int(getattr(config, "discovery_top_n_symbols", 0) or 0)
+            except Exception:
+                cap = 0
+        if cap <= 0:
+            try:
+                # Legacy fallback only.
+                cap = int(getattr(config, "MAX_ACTIVE_SYMBOLS", 0) or 0)
+            except Exception:
+                cap = 0
+        return max(0, int(cap))
 
     async def _get_symbols_snapshot(self, *, force: bool = False) -> Dict[str, Any]:
         if not self.shared_state or not hasattr(self.shared_state, "get_symbols_snapshot"):

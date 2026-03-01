@@ -1,0 +1,18 @@
+{
+  "BTCUSDT": {
+    "symbol": "BTCUSDT",
+    "baseline_accuracy": 0.7544378698224852,
+    "positive_ratio": 0.2455621301775148,
+    "data_points": 676,
+    "temporal_sorted": true,
+    "status": "AUDIT_COMPLETE"
+  },
+  "ETHUSDT": {
+    "symbol": "ETHUSDT",
+    "baseline_accuracy": 0.6715976331360947,
+    "positive_ratio": 0.32840236686390534,
+    "data_points": 676,
+    "temporal_sorted": true,
+    "status": "AUDIT_COMPLETE"
+  }
+}

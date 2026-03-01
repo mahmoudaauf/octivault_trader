@@ -110,15 +110,38 @@ class RiskManager:
 
     @property
     def max_daily_loss_pct(self) -> float:
-        return self._normalize_pct(self._cfg("MAX_DAILY_LOSS_PCT", 0.10))
+        raw = self._cfg("MAX_DAILY_LOSS_PCT", None)
+        if raw is None:
+            raw = self._cfg("MAX_DAILY_LOSS", 0.10)
+        return self._normalize_pct(raw)
 
     @property
     def max_pos_exposure_pct(self) -> float:
-        return self._normalize_pct(self._cfg("MAX_POSITION_EXPOSURE_PCT", 0.20))
+        raw = self._cfg("MAX_POSITION_EXPOSURE_PCT", None)
+        if raw is None:
+            raw = self._cfg("MAX_POSITION_EXPOSURE_PERCENTAGE", None)
+        if raw is None:
+            raw = self._cfg("MAX_SYMBOL_EXPOSURE", 0.20)
+        return self._normalize_pct(raw)
 
     @property
     def max_total_exposure_pct(self) -> float:
-        return self._normalize_pct(self._cfg("MAX_TOTAL_EXPOSURE_PCT", 0.60))
+        raw = self._cfg("MAX_TOTAL_EXPOSURE_PCT", None)
+        if raw is None:
+            raw = self._cfg("MAX_TOTAL_EXPOSURE_PERCENTAGE", None)
+        if raw is None:
+            raw = self._cfg("MAX_PORTFOLIO_EXPOSURE", 0.60)
+        return self._normalize_pct(raw)
+
+    @property
+    def min_liquidity_buffer_quote(self) -> float:
+        raw = self._cfg("MIN_LIQUIDITY_BUFFER", None)
+        if raw is None:
+            raw = self._cfg("EXECUTION_MIN_FREE_RESERVE_USDT", 0.0)
+        try:
+            return max(0.0, float(raw or 0.0))
+        except Exception:
+            return 0.0
 
     @property
     def min_trade_quote(self) -> float:
@@ -278,6 +301,90 @@ class RiskManager:
             return out
         return {}
 
+    async def _get_free_quote_balance(self) -> float:
+        quote = str(getattr(self.config, "QUOTE_ASSET", self.base_currency) or self.base_currency).upper()
+        try:
+            getter = getattr(self.shared_state, "get_spendable_balance", None)
+            if callable(getter):
+                res = getter(quote)
+                res = await res if inspect.isawaitable(res) else res
+                free_quote = float(res or 0.0)
+                if free_quote >= 0:
+                    return free_quote
+        except Exception:
+            pass
+        try:
+            getter = getattr(self.shared_state, "get_free_balance", None)
+            if callable(getter):
+                res = getter(quote)
+                res = await res if inspect.isawaitable(res) else res
+                free_quote = float(res or 0.0)
+                if free_quote >= 0:
+                    return free_quote
+        except Exception:
+            pass
+        try:
+            snap_getter = getattr(self.shared_state, "get_balance_snapshot", None)
+            if callable(snap_getter):
+                snap = snap_getter()
+                snap = await snap if inspect.isawaitable(snap) else snap
+                if isinstance(snap, dict):
+                    return float(((snap.get(quote) or {}).get("free", 0.0)) or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    async def _projected_buy_exposure_violation(self, symbol: str, quote_qty: float) -> Optional[str]:
+        q = float(max(0.0, quote_qty or 0.0))
+        if q <= 0:
+            return None
+
+        account_value = float(await self._get_portfolio_value() or 0.0)
+        if account_value <= 0:
+            return None
+
+        open_trades = self.shared_state.get_all_open_trades() if hasattr(self.shared_state, "get_all_open_trades") else {}
+        open_trades = open_trades or {}
+        latest_prices = getattr(self.shared_state, "latest_prices", {}) or {}
+
+        def _px(sym: str, tr: Dict[str, Any]) -> Optional[float]:
+            p = latest_prices.get(sym) or tr.get("entry_price") or tr.get("price")
+            try:
+                return float(p) if p is not None else None
+            except Exception:
+                return None
+
+        sym_norm = str(symbol or "").replace("/", "").upper()
+        symbol_open_value = 0.0
+        total_open_value = 0.0
+        for tr_symbol, tr in (open_trades.items() if isinstance(open_trades, dict) else []):
+            if not isinstance(tr, dict):
+                continue
+            price = _px(tr_symbol, tr)
+            if not price or price <= 0:
+                continue
+            qty = float(tr.get("quantity", tr.get("qty", 0.0)) or 0.0)
+            pos_val = max(0.0, qty * float(price))
+            if pos_val <= 0:
+                continue
+            total_open_value += pos_val
+            if str(tr_symbol).replace("/", "").upper() == sym_norm:
+                symbol_open_value += pos_val
+
+        max_sym_pct = self.max_pos_exposure_pct
+        if max_sym_pct > 0:
+            projected_symbol_pct = (symbol_open_value + q) / account_value
+            if projected_symbol_pct > max_sym_pct:
+                return f"exceeds_symbol_exposure_{projected_symbol_pct:.4f}>{max_sym_pct:.4f}"
+
+        max_port_pct = self.max_total_exposure_pct
+        if max_port_pct > 0:
+            projected_total_pct = (total_open_value + q) / account_value
+            if projected_total_pct > max_port_pct:
+                return f"exceeds_portfolio_exposure_{projected_total_pct:.4f}>{max_port_pct:.4f}"
+
+        return None
+
     # ---------- init / metrics ----------
 
     async def _get_portfolio_value(self) -> float:
@@ -289,6 +396,9 @@ class RiskManager:
                 return await res if inspect.isawaitable(res) else float(res)
             except Exception:
                 pass
+        elif val_fn is not None:
+            with contextlib.suppress(Exception):
+                return float(val_fn)
         with contextlib.suppress(Exception):
             return float(getattr(self.shared_state, "portfolio_value", 0.0))
         pm_fn = getattr(self.shared_state, "get_portfolio_metrics", None)
@@ -479,6 +589,8 @@ class RiskManager:
             return False, "daily_halt", None, None
         if s == "BUY" and self.is_buy_freeze_active():
             return False, "buy_freeze_active", None, None
+        if s == "BUY" and self.metrics.get("trading_restricted"):
+            return False, "trading_restricted_by_exposure", None, None
 
         # enforce per-trade quote bounds for BUY
         adj_qty, adj_quote = None, None
@@ -491,6 +603,48 @@ class RiskManager:
                     adj_quote = float(self.max_trade_quote)  # cap spend
                 else:
                     adj_quote = q
+
+                liquidity_buffer = float(self.min_liquidity_buffer_quote or 0.0)
+                if liquidity_buffer > 0:
+                    free_quote = float(await self._get_free_quote_balance() or 0.0)
+                    if free_quote > 0 and (free_quote - q) < liquidity_buffer:
+                        self.logger.warning(
+                            "[RiskManager] BUY would breach liquidity buffer: free %.2f - quote %.2f < buffer %.2f",
+                            free_quote,
+                            q,
+                            liquidity_buffer,
+                        )
+                        return False, "below_min_liquidity_buffer", None, None
+
+                exposure_reason = await self._projected_buy_exposure_violation(sym, q)
+                if exposure_reason:
+                    self.logger.warning("[RiskManager] BUY rejected by projected exposure: %s", exposure_reason)
+                    return False, exposure_reason, None, None
+
+                # CRITICAL FIX: Validate against CapitalAllocator agent budgets to prevent risk multiplication
+                # Extract agent from order context
+                agent = None
+                if order and isinstance(order, dict):
+                    agent = order.get("agent") or order.get("agent_name")
+                elif hasattr(order, "get") and callable(order.get):
+                    agent = order.get("agent") or order.get("agent_name")
+
+                if agent and hasattr(self.shared_state, "get_authoritative_reservation"):
+                    try:
+                        agent_budget = float(self.shared_state.get_authoritative_reservation(agent) or 0.0)
+                        shared_wallet_mode = bool(getattr(self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True))
+                        if agent_budget <= 0.0 and shared_wallet_mode and hasattr(self.shared_state, "get_authoritative_reservations"):
+                            reservations = self.shared_state.get_authoritative_reservations() or {}
+                            if isinstance(reservations, dict) and reservations:
+                                agent_budget = float(max(float(v or 0.0) for v in reservations.values()))
+                        if agent_budget > 0 and q > agent_budget:
+                            self.logger.warning(f"[RiskManager] Agent {agent} quote {q:.2f} exceeds budget {agent_budget:.2f}")
+                            return False, f"exceeds_agent_budget_{agent}", None, None
+                        elif agent_budget <= 0:
+                            self.logger.warning(f"[RiskManager] Agent {agent} has zero budget, rejecting trade")
+                            return False, f"zero_agent_budget_{agent}", None, None
+                    except Exception as e:
+                        self.logger.debug(f"Budget validation failed for agent {agent}: {e}")
             # if no quote path, leave sizing to EM/hygiene guards; still pass ok
         else:  # SELL safety: cap by free balance if available
             # Exit-feasibility floor for SELLs (skip for liquidation)

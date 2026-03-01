@@ -47,6 +47,14 @@ from agents.wallet_scanner_agent import WalletScannerAgent
 from agents.symbol_screener import SymbolScreener as ScreenerAgent # ✅ Fixed import
 from agents.symbol_discoverer_agent import SymbolDiscovererAgent # Added/Fixed import for SymbolDiscovererAgent
 
+# === REGIME TRADING INTEGRATION (Week 2 Implementation) ===
+from core.regime_trading_integration import (
+    RegimeTradingAdapter,
+    RegimeTradingConfig,
+    create_regime_trading_adapter,
+)
+from live_trading_system_architecture import SymbolConfig
+
 logger = logging.getLogger("core.app_context")
 
 class AppContext:
@@ -91,6 +99,11 @@ class AppContext:
         # Declare new symbol proposing agents
         self.ipo_chaser = None
         self.screener_agent = None
+        
+        # === REGIME TRADING INTEGRATION ===
+        self.regime_trading_adapter = None
+        self.enable_regime_trading = os.getenv("ENABLE_REGIME_TRADING", "false").lower() == "true"
+        self.regime_trading_paper_mode = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
 
     async def __aenter__(self):
@@ -258,8 +271,60 @@ class AppContext:
         except asyncio.TimeoutError:
             logger.warning("⚠️ MarketDataFeed loading timeout. Proceeding with background tasks anyway.")
         
+        # === REGIME TRADING INTEGRATION ===
+        # Initialize regime trading adapter if enabled
+        if self.enable_regime_trading:
+            await self._initialize_regime_trading()
+        
         await self.start_background_tasks()
         logger.info("All application components and background tasks started.")
+
+
+    async def _initialize_regime_trading(self):
+        """Initialize the regime trading adapter (new system)"""
+        try:
+            logger.info("Initializing regime trading system...")
+            
+            # Create symbol configurations for regime trading
+            regime_symbols = os.getenv("REGIME_SYMBOLS", "ETHUSDT").split(",")
+            symbol_configs = {}
+            
+            for symbol in regime_symbols:
+                symbol_configs[symbol] = SymbolConfig(
+                    symbol=symbol,
+                    enabled=True,
+                    base_exposure=float(os.getenv(f"{symbol}_BASE_EXPOSURE", "1.0")),
+                    alpha_exposure=float(os.getenv(f"{symbol}_ALPHA_EXPOSURE", "2.0")),
+                    max_position_size_pct=float(os.getenv("MAX_POSITION_SIZE_PCT", "0.05")),
+                    max_drawdown_threshold=float(os.getenv("MAX_DRAWDOWN_THRESHOLD", "0.30")),
+                    daily_loss_limit=float(os.getenv("DAILY_LOSS_LIMIT", "0.02")),
+                )
+            
+            # Create configuration
+            regime_config = RegimeTradingConfig(
+                enabled=True,
+                paper_trading=self.regime_trading_paper_mode,
+                symbols=symbol_configs,
+                sync_interval_seconds=float(os.getenv("SYNC_INTERVAL_SECONDS", "60")),
+            )
+            
+            # Create and initialize adapter
+            self.regime_trading_adapter = await create_regime_trading_adapter(
+                shared_state=self.shared_state,
+                execution_manager=self.execution_manager,
+                market_data_feed=self.market_data_feed,
+                config=regime_config,
+            )
+            
+            if self.regime_trading_adapter:
+                logger.info("✅ Regime trading system initialized")
+            else:
+                logger.warning("⚠️  Regime trading initialization incomplete")
+                self.enable_regime_trading = False
+        
+        except Exception as e:
+            logger.error(f"❌ Regime trading initialization failed: {e}", exc_info=True)
+            self.enable_regime_trading = False
 
 
     async def start_background_tasks(self):

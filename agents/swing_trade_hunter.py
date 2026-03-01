@@ -5,6 +5,7 @@ import numpy as np
 import tensorflow as tf
 from datetime import datetime
 from functools import partial
+from typing import Any, Dict, List
 
 from utils.indicators import compute_ema, compute_rsi, compute_macd, compute_bollinger_bands
 from utils.status_logger import log_component_status
@@ -25,6 +26,8 @@ if not logger.hasHandlers():
     logger.addHandler(file_handler)
 
 class SwingTradeHunter:
+    agent_type = "strategy"
+
     def __init__(
         self,
         shared_state,
@@ -40,14 +43,29 @@ class SwingTradeHunter:
     ):
         self.shared_state = shared_state
         self.market_data = market_data
-        self.execution_manager = execution_manager
+        self.execution_manager = execution_manager  # kept for backward compatibility
         self.config = config
         self.tp_sl_engine = tp_sl_engine
         self.model_manager = model_manager
         self.name = name
         self.timeframe = timeframe
+        # Signal collection buffer for AgentManager
+        self._collected_signals: List[Dict[str, Any]] = []
+
         # Modified line: Use get_accepted_symbols() from shared_state
-        self.symbols = symbols or self.shared_state.get_accepted_symbols()
+        resolved_symbols = symbols or []
+        if not resolved_symbols:
+            getter = getattr(self.shared_state, "get_accepted_symbols", None)
+            if callable(getter):
+                try:
+                    resolved_symbols = getter()
+                except Exception:
+                    resolved_symbols = []
+        if asyncio.iscoroutine(resolved_symbols):
+            resolved_symbols = []
+        if isinstance(resolved_symbols, dict):
+            resolved_symbols = list(resolved_symbols.keys())
+        self.symbols = list(resolved_symbols or [])
         self.model_cache = {}
         # Performance tracking
         self.trades_count = 0
@@ -68,8 +86,21 @@ class SwingTradeHunter:
         log_component_status(self.name, "Initialized")
         logger.info(f"🚀 {self.name} initialized with {len(self.symbols)} symbols on {self.timeframe} timeframe.")
 
+    async def generate_signals(self) -> List[Dict[str, Any]]:
+        """
+        Canonical strategy contract:
+        - Generate and return signal payloads
+        - Do not execute trades directly
+        """
+        self._collected_signals = []
+        await self.run_once()
+        signals = self._collected_signals
+        self._collected_signals = []
+        return signals
+
     async def run_once(self):
         logger.info(f"[{self.name}] Entering run_once loop.")
+        await self._refresh_symbols()
         if not getattr(self.shared_state, 'initial_market_data_loaded', False):
             logger.warning(f"[{self.name}] Market data not ready. Skipping run.")
             return
@@ -79,6 +110,30 @@ class SwingTradeHunter:
         for symbol in self.symbols:
             await self._process_symbol(symbol)
         logger.info(f"[{self.name}] Exiting run_once loop.")
+
+    async def _refresh_symbols(self) -> None:
+        getter = getattr(self.shared_state, "get_accepted_symbols", None)
+        if not callable(getter):
+            return
+        try:
+            res = getter()
+            res = await res if asyncio.iscoroutine(res) else res
+            if isinstance(res, dict):
+                symbols = list(res.keys())
+            else:
+                symbols = list(res or [])
+            if symbols:
+                self.symbols = symbols
+                for symbol in symbols:
+                    if symbol in self.model_cache:
+                        continue
+                    try:
+                        path = build_model_path(self.name, symbol)
+                        self.model_cache[symbol] = safe_load_model(path)
+                    except Exception:
+                        self.model_cache[symbol] = None
+        except Exception:
+            logger.debug("[%s] Failed to refresh symbols from SharedState", self.name, exc_info=True)
 
     async def _process_symbol(self, symbol):
         logger.info(f"[{self.name}] Processing {symbol}")
@@ -101,40 +156,19 @@ class SwingTradeHunter:
         # Inject signal for tracing
         await inject_agent_signal(self.shared_state, self.name, symbol, signal)
 
-        # Execute trade if actionable
-        if action in ['buy', 'sell'] and confidence > getattr(self.config, 'SWING_MIN_CONFIDENCE', 0.5):
-            price = await self.shared_state.get_latest_price(symbol)
-            balance = self.shared_state.balances.get(self.config.BASE_CURRENCY, {}).get('free', 0)
-            qty = round(balance / price * 0.1, 6) if price and balance > 0 else 0
-            tp, sl = self.tp_sl_engine.calculate_tp_sl(symbol, price)
-            result = await self.execution_manager.execute_trade(
-                symbol=symbol,
-                side=action,
-                qty=qty,
-                mode='market',
-                take_profit=tp,
-                stop_loss=sl,
-                comment=f"{self.name}_trade"
+        # Signal-only routing: actionable signals go to signal bus + collection buffer.
+        min_conf = float(getattr(self.config, 'SWING_MIN_CONFIDENCE', 0.5) or 0.5)
+        if action in ['buy', 'sell'] and confidence > min_conf:
+            await self._submit_signal(symbol, action.upper(), float(confidence), str(reason))
+        else:
+            logger.debug(
+                "[%s] Not emitting actionable signal for %s (action=%s conf=%.2f min=%.2f)",
+                self.name,
+                symbol,
+                action,
+                float(confidence or 0.0),
+                min_conf,
             )
-            entry = result.get('avg_price_entry', price)
-            exit_price = result.get('avg_price_exit', price)
-            filled = result.get('filled_qty', 0)
-            pnl = filled * (exit_price - entry) if action == 'buy' else filled * (entry - exit_price)
-            success = pnl > 0
-            self.trades_count += 1
-            if success:
-                self.win_count += 1
-                logger.info(f"[{self.name}] Trade success on {symbol}: PnL={pnl:.4f}")
-            else:
-                self.loss_count += 1
-                logger.info(f"[{self.name}] Trade failure on {symbol}: PnL={pnl:.4f}")
-
-            # Update agent_scores
-            stats = self.shared_state.agent_scores.setdefault(self.name, {}).setdefault(symbol, {})
-            stats['trades'] = self.trades_count
-            stats['wins'] = self.win_count
-            stats['losses'] = self.loss_count
-            stats['win_rate'] = self.win_count / self.trades_count if self.trades_count else 0
 
         # Update shared state health
         await self.shared_state.update_system_health(
@@ -142,6 +176,66 @@ class SwingTradeHunter:
             'Operational',
             f"Last signal: {action} ({confidence:.2f})"
         )
+
+    async def _submit_signal(self, symbol: str, action: str, confidence: float, reason: str) -> None:
+        action_u = str(action or "").upper().strip()
+        if action_u not in {"BUY", "SELL"}:
+            return
+
+        if action_u == "SELL":
+            try:
+                get_qty = getattr(self.shared_state, "get_position_quantity", None)
+                if callable(get_qty):
+                    res = get_qty(symbol)
+                    pos_qty = await res if asyncio.iscoroutine(res) else float(res or 0.0)
+                    if pos_qty <= 0:
+                        logger.info("[%s] Skip SELL for %s — no position.", self.name, symbol)
+                        return
+            except Exception:
+                pass
+
+        quote_hint = None
+        if action_u == "BUY":
+            try:
+                quote_hint = float(
+                    getattr(
+                        self.config,
+                        "EMIT_BUY_QUOTE",
+                        getattr(self.config, "MIN_ENTRY_USDT", getattr(self.config, "DEFAULT_PLANNED_QUOTE", 10.0)),
+                    )
+                    or 10.0
+                )
+            except Exception:
+                quote_hint = 10.0
+
+        if hasattr(self.shared_state, "add_agent_signal"):
+            try:
+                tier = "A" if float(confidence) >= 0.85 else "B"
+                await self.shared_state.add_agent_signal(
+                    symbol=symbol,
+                    agent=self.name,
+                    side=action_u,
+                    confidence=float(confidence),
+                    ttl_sec=300,
+                    tier=tier,
+                    rationale=reason,
+                )
+            except Exception as e:
+                logger.warning("[%s] Failed to emit to signal bus for %s: %s", self.name, symbol, e)
+
+        signal = {
+            "symbol": symbol,
+            "action": action_u,
+            "side": action_u,
+            "confidence": float(confidence),
+            "reason": reason,
+            "quote": quote_hint,
+            "quote_hint": quote_hint,
+            "horizon_hours": 6.0,
+            "agent": self.name,
+        }
+        self._collected_signals.append(signal)
+        logger.info("[%s] Buffered %s for %s (conf=%.2f)", self.name, action_u, symbol, float(confidence))
 
     async def _generate_signal(self, symbol):
         # Fetch market data

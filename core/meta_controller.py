@@ -476,6 +476,47 @@ class MetaController:
             except Exception:
                 pass
 
+    def _count_open_positions(self) -> int:
+        """
+        Count currently open positions across all symbols.
+        
+        PHASE B: Capital Governor Helper
+        Used to enforce position limits before BUY execution.
+        
+        Returns: Integer count of positions with quantity > 0
+        """
+        try:
+            # Try SharedState positions snapshot first (preferred method)
+            if hasattr(self.shared_state, "get_positions_snapshot"):
+                snap = self.shared_state.get_positions_snapshot()
+                count = 0
+                for symbol, pos_data in snap.items():
+                    qty = float(pos_data.get("quantity", 0.0) or pos_data.get("qty", 0.0) or 0.0)
+                    if qty > 0:
+                        count += 1
+                return count
+            
+            # Fallback: Try per-symbol lookup using available symbols
+            if hasattr(self.shared_state, "get_position_qty"):
+                symbols = self.FOCUS_SYMBOLS or set()
+                if not symbols and hasattr(self.shared_state, "get_analysis_symbols"):
+                    symbols = set(self.shared_state.get_analysis_symbols() or [])
+                
+                count = 0
+                for sym in symbols:
+                    try:
+                        qty = float(self.shared_state.get_position_qty(sym) or 0.0)
+                        if qty > 0:
+                            count += 1
+                    except Exception:
+                        pass
+                return count
+            
+        except Exception as e:
+            self.logger.warning("[Meta:PositionCount] Failed to count positions: %s", e)
+        
+        return 0
+
     @property
     def _trade_timestamps(self):
         """Delegated throughput tracking."""
@@ -699,6 +740,14 @@ class MetaController:
         self.scaling_manager = ScalingManager(self.shared_state, self.execution_manager, self.config, self.logger, mode_manager=self.mode_manager)
         # Integrate ExecutionLogic for execution path
         self.execution_logic = ExecutionLogic(self.shared_state, self.execution_manager, self.config, self.logger, self)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE B: Capital Governor Integration
+        # Enforce position structure limits before BUY execution
+        # ═══════════════════════════════════════════════════════════════════
+        from core.capital_governor import CapitalGovernor
+        self.capital_governor = CapitalGovernor(config)
+        self.logger.info("[Meta:Init] Capital Governor initialized for position limiting")
         
         self._throughput_window_sec = 600.0  # 10 minutes throughput window
         self._max_trades_per_hour = int(getattr(config, 'MAX_TRADES_PER_HOUR', 12))
@@ -10926,6 +10975,48 @@ class MetaController:
                     symbol, md_ready, as_ready
                 )
                 return {"ok": False, "status": "skipped", "reason": "p9_readiness_gate"}
+
+            # ─────────────────────────────────────────────────────────────────────
+            # PHASE B: CAPITAL GOVERNOR - Position Limit Check
+            # Enforce bracket-specific position limits before BUY execution
+            # ─────────────────────────────────────────────────────────────────────
+            try:
+                # Get current NAV to determine account bracket
+                nav = float(getattr(self.shared_state, "nav", 0.0) or 
+                           getattr(self.shared_state, "total_value", 0.0) or 0.0)
+                
+                # Query Capital Governor for position limits at current bracket
+                limits = self.capital_governor.get_position_limits(nav)
+                max_positions = limits.get("max_concurrent_positions", 1)
+                
+                # Count currently open positions
+                open_positions = self._count_open_positions()
+                
+                # Block BUY if position limit reached
+                if open_positions >= max_positions:
+                    self.logger.warning(
+                        "[Meta:CapitalGovernor] Blocking BUY %s: Position limit reached (%d/%d open)",
+                        symbol, open_positions, max_positions
+                    )
+                    return {"ok": False, "status": "skipped", "reason": "position_limit_exceeded"}
+                
+                # Log capacity warnings when approaching limits
+                remaining = max_positions - open_positions
+                if remaining <= 1:
+                    self.logger.warning(
+                        "[Meta:CapitalGovernor] ⚠️ Position capacity low: %d/%d (only %d slot(s) remaining)",
+                        open_positions, max_positions, remaining
+                    )
+                else:
+                    self.logger.info(
+                        "[Meta:CapitalGovernor] ✓ Position limit OK: %d/%d open, proceeding with BUY",
+                        open_positions, max_positions
+                    )
+                
+            except Exception as e:
+                self.logger.error("[Meta:CapitalGovernor] Position limit check failed: %s", e)
+                # CRITICAL: Do NOT block on exception - let execution proceed with warning
+                self.logger.warning("[Meta:CapitalGovernor] Proceeding with BUY (limit check failed, error: %s)", str(e))
 
         # Enforce lifecycle lock for SELL
         if side.upper() == "SELL":

@@ -1,0 +1,81 @@
+{
+  "BTCUSDT": {
+    "symbol": "BTCUSDT",
+    "folds": [
+      {
+        "fold": 1,
+        "train_period": "Months 1-12",
+        "test_period": "Months 13-18",
+        "metrics": {
+          "total_return": 0.35870523920164255,
+          "annual_return": 0.535943887976789,
+          "volatility": 0.3767750718838881,
+          "sharpe": 1.4224504962524498,
+          "max_drawdown": -0.20693300116610105,
+          "win_rate": 0.5016203703703703,
+          "tail_loss_1pct": -0.01401599658847098,
+          "n_periods": 4320
+        }
+      },
+      {
+        "fold": 2,
+        "train_period": "Months 7-18",
+        "test_period": "Months 19-24",
+        "metrics": {
+          "total_return": -0.35089880656104355,
+          "annual_return": -0.453943764584389,
+          "volatility": 0.38770176821843055,
+          "sharpe": -1.1708581229081159,
+          "max_drawdown": -0.49665704943746875,
+          "win_rate": 0.49699074074074073,
+          "tail_loss_1pct": -0.016311052614719032,
+          "n_periods": 4320
+        }
+      }
+    ],
+    "mean_sharpe": 0.12579618667216697,
+    "std_sharpe": 1.296654309580283,
+    "mean_return": 0.04100006169620002,
+    "mean_max_dd": -0.3517950253017849
+  },
+  "ETHUSDT": {
+    "symbol": "ETHUSDT",
+    "folds": [
+      {
+        "fold": 1,
+        "train_period": "Months 1-12",
+        "test_period": "Months 13-18",
+        "metrics": {
+          "total_return": 1.3743819288200592,
+          "annual_return": 2.3556048199198267,
+          "volatility": 0.635591504160591,
+          "sharpe": 3.706161590424045,
+          "max_drawdown": -0.43076979668931276,
+          "win_rate": 0.5159722222222223,
+          "tail_loss_1pct": -0.022148197626164382,
+          "n_periods": 4320
+        }
+      },
+      {
+        "fold": 2,
+        "train_period": "Months 7-18",
+        "test_period": "Months 19-24",
+        "metrics": {
+          "total_return": -0.5647434269304652,
+          "annual_return": -0.6879361416982201,
+          "volatility": 0.5742937476900183,
+          "sharpe": -1.1978819976106403,
+          "max_drawdown": -0.6239649629693388,
+          "win_rate": 0.4965277777777778,
+          "tail_loss_1pct": -0.023493434435346662,
+          "n_periods": 4320
+        }
+      }
+    ],
+    "mean_sharpe": 1.2541397964067023,
+    "std_sharpe": 2.4520217940173428,
+    "mean_return": 0.8338343391108033,
+    "mean_max_dd": -0.5273673798293258
+  },
+  "timestamp": "2026-02-21T23:39:01.034231"
+}

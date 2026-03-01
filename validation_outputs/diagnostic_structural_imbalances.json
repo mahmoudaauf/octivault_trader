@@ -1,0 +1,58 @@
+{
+  "BTCUSDT": {
+    "conditions": {
+      "thresholds": {
+        "funding_rate_extreme": 0.0010785848940711165,
+        "funding_rate_elevated": 0.0008257990242814653,
+        "oi_imbalance": 0.55
+      },
+      "statistics": {
+        "mean_funding": 0.0004990046090665219,
+        "std_funding": 0.0006885622725939637,
+        "extreme_count": 50,
+        "elevated_count": 100,
+        "imbalanced_count": 830,
+        "cooccurrence_count": 43
+      }
+    },
+    "cascades": {
+      "cascade_count": 0,
+      "cascade_indices": [],
+      "by_direction": {
+        "long_cascade": 0,
+        "short_cascade": 0
+      },
+      "success_rate": 0.0,
+      "cascade_threshold": 0.015
+    },
+    "samples": 1000
+  },
+  "ETHUSDT": {
+    "conditions": {
+      "thresholds": {
+        "funding_rate_extreme": 0.0010785848940711165,
+        "funding_rate_elevated": 0.0008257990242814653,
+        "oi_imbalance": 0.55
+      },
+      "statistics": {
+        "mean_funding": 0.0004990046090665219,
+        "std_funding": 0.0006885622725939637,
+        "extreme_count": 50,
+        "elevated_count": 100,
+        "imbalanced_count": 830,
+        "cooccurrence_count": 43
+      }
+    },
+    "cascades": {
+      "cascade_count": 0,
+      "cascade_indices": [],
+      "by_direction": {
+        "long_cascade": 0,
+        "short_cascade": 0
+      },
+      "success_rate": 0.0,
+      "cascade_threshold": 0.015
+    },
+    "samples": 1000
+  }
+}

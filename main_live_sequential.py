@@ -15,7 +15,6 @@ from stream.sentiment_stream import BinanceSentimentStream
 from agents.ml_forecaster import MLForecaster
 from agents.ipo_chaser import IPOChaser
 from agents.dip_sniper import DipSniper
-from agents.rl_strategist import RLStrategist
 from agents.trend_hunter import TrendHunter
 from agents.news_reactor import NewsReactor
 from agents.liquidation_agent import LiquidationAgent
@@ -57,7 +56,6 @@ async def main():
         MLForecaster(shared_state, market_data_feed, execution_manager, config, tp_sl_engine, symbols=symbols),
         IPOChaser(shared_state, market_data_feed, execution_manager, config, tp_sl_engine, symbols=symbols),
         DipSniper(shared_state, market_data_feed, execution_manager, config, tp_sl_engine, symbols=symbols),
-        RLStrategist(shared_state, market_data_feed, execution_manager, config, tp_sl_engine, symbols=symbols),
         TrendHunter(shared_state, market_data_feed, execution_manager, config, tp_sl_engine, symbols=symbols),
         NewsReactor(shared_state, market_data_feed, execution_manager, config, tp_sl_engine, sentiment_stream=sentiment_stream, symbols=symbols),
         LiquidationAgent(shared_state, market_data_feed, execution_manager, config, tp_sl_engine, meta_controller, symbols=symbols)

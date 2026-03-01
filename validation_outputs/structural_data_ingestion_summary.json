@@ -1,0 +1,18 @@
+{
+  "BTCUSDT": {
+    "status": "SUCCESS",
+    "ohlcv_rows": 1000,
+    "funding_rows": 200,
+    "liquidation_rows": 0,
+    "aligned_rows": 1000,
+    "file": "validation_outputs/BTCUSDT_structural_data.csv"
+  },
+  "ETHUSDT": {
+    "status": "SUCCESS",
+    "ohlcv_rows": 1000,
+    "funding_rows": 200,
+    "liquidation_rows": 0,
+    "aligned_rows": 1000,
+    "file": "validation_outputs/ETHUSDT_structural_data.csv"
+  }
+}

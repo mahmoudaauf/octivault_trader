@@ -1,0 +1,64 @@
+{
+  "BTCUSDT": {
+    "symbol": "BTCUSDT",
+    "period": "6 months (Aug 2025 - Feb 2026)",
+    "timeframe": "1H",
+    "n_candles": 4323,
+    "funding_rate": {
+      "mean": 0.003919028485409912,
+      "std": 0.004236941232484528,
+      "min": -0.015177999999999999,
+      "max": 0.01,
+      "p95": 0.01,
+      "p90": 0.009568
+    },
+    "conditions": {
+      "extreme_count": 0,
+      "extreme_pct": 0.0,
+      "elevated_count": 431,
+      "elevated_pct": 9.969928290538977
+    },
+    "cascades": {
+      "total_cascades": 78,
+      "cascade_rate": 0.018043025676613464,
+      "cascade_threshold": "2%+ move in next 3 hours"
+    },
+    "conditional_probability": {
+      "p_cascade_given_extreme": 0.0,
+      "p_cascade_baseline": 0.018043025676613464,
+      "lift": 0.0
+    },
+    "verdict": "WEAK_SIGNAL"
+  },
+  "ETHUSDT": {
+    "symbol": "ETHUSDT",
+    "period": "6 months (Aug 2025 - Feb 2026)",
+    "timeframe": "1H",
+    "n_candles": 4323,
+    "funding_rate": {
+      "mean": 0.0028704641037517365,
+      "std": 0.005109951937204609,
+      "min": -0.027709,
+      "max": 0.01,
+      "p95": 0.01,
+      "p90": 0.009056
+    },
+    "conditions": {
+      "extreme_count": 0,
+      "extreme_pct": 0.0,
+      "elevated_count": 427,
+      "elevated_pct": 9.877399953735832
+    },
+    "cascades": {
+      "total_cascades": 283,
+      "cascade_rate": 0.06546379828822577,
+      "cascade_threshold": "2%+ move in next 3 hours"
+    },
+    "conditional_probability": {
+      "p_cascade_given_extreme": 0.0,
+      "p_cascade_baseline": 0.06546379828822577,
+      "lift": 0.0
+    },
+    "verdict": "WEAK_SIGNAL"
+  }
+}

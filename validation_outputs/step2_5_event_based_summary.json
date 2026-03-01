@@ -1,0 +1,42 @@
+{
+  "BTCUSDT": {
+    "status": "SUCCESS",
+    "analysis": {
+      "total_events": 881,
+      "total_wins": 270,
+      "total_losses": 611,
+      "win_rate": 0.3064699205448354,
+      "loss_rate": 0.6935300794551645,
+      "median_bars_to_event": 4.0,
+      "mean_bars_to_event": 6.793416572077185,
+      "std_bars_to_event": 9.6915190358103,
+      "bars_distribution": {
+        "p25": 2.0,
+        "p50": 4.0,
+        "p75": 7.0,
+        "p90": 15.0
+      }
+    },
+    "output_file": "validation_outputs/BTCUSDT_event_based_targets.csv"
+  },
+  "ETHUSDT": {
+    "status": "SUCCESS",
+    "analysis": {
+      "total_events": 876,
+      "total_wins": 273,
+      "total_losses": 603,
+      "win_rate": 0.3116438356164384,
+      "loss_rate": 0.6883561643835616,
+      "median_bars_to_event": 4.0,
+      "mean_bars_to_event": 6.109589041095891,
+      "std_bars_to_event": 7.7116616498578985,
+      "bars_distribution": {
+        "p25": 2.0,
+        "p50": 4.0,
+        "p75": 7.0,
+        "p90": 13.0
+      }
+    },
+    "output_file": "validation_outputs/ETHUSDT_event_based_targets.csv"
+  }
+}
