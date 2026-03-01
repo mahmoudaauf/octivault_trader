@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# Load .env early (bootstrap safety); do not override existing OS env vars
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=False)
+
 """
 AppContext — Phased Orchestrator (P3→P9) for Octivault Trader (P9)
 - Single, clean definition
@@ -64,6 +68,8 @@ _recovery_mod       = _import_strict("core.recovery_engine")
 _watchdog_mod       = _import_strict("core.watchdog")
 _heartbeat_mod      = _import_strict("core.heartbeat")
 _symbol_mgr_mod     = _import_strict("core.symbol_manager")
+_governor_mod       = _import_strict("core.capital_symbol_governor")
+_uure_mod           = _import_strict("core.universe_rotation_engine")
 _csl_mod            = _import_strict("core.component_status_logger")
 
 # Meta/agents (canonical modules live in core for this repo)
@@ -83,6 +89,8 @@ _perf_eval_mod      = _import_optional("core.performance_evaluator")
 _liq_orch_mod       = _import_optional("core.liquidation_orchestrator")
 _cash_router_mod    = _import_optional("core.cash_router")
 _liq_agent_mod      = _import_optional("agents.liquidation_agent")
+_adaptive_capital_mod = _import_optional("core.adaptive_capital_engine")
+_truth_auditor_mod  = _import_optional("core.exchange_truth_auditor")
 _dust_monitor_mod   = _import_optional("core.dust_monitor")
 _wallet_scanner_mod = _import_optional("agents.wallet_scanner_agent")
 _dashboard_mod      = _import_optional("dashboard_server")
@@ -136,7 +144,7 @@ def log_structured_error(
     try:
         lg.error(json.dumps(payload))
     except Exception:
-        lg.error(f"[structured-error-failed] {type(error).__name__}: {error}")
+        lg.error("[structured-error-failed] %s: %s", type(error).__name__, error)
 
 
 def log_structured_info(
@@ -220,66 +228,66 @@ class AppContext:
     def _summary_ff(self, event: str, **kvs) -> None:
         """Safely schedule _emit_summary(event, **kvs) as a background task."""
         try:
-            asyncio.create_task(self._emit_summary(event, **kvs))
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._emit_summary(event, **kvs))
+        except RuntimeError:
+            # No running loop yet → skip silently
+            return
         except Exception:
-            pass
+            return
     # === SECTION: Lightweight helpers (moved out of __init__ for clarity) ===
     def _loop_time(self) -> float:
-        """Return a monotonic loop time when available, otherwise fall back to event loop time."""
+        """Return a monotonic loop time when available, otherwise fall back to time.monotonic."""
         try:
             return asyncio.get_running_loop().time()
         except RuntimeError:
-            # compat for contexts without a running loop yet
-            return asyncio.get_event_loop().time()
+            # No running loop yet — use monotonic clock as a safe fallback.
+            import time as _time
+            return _time.monotonic()
 
     def _cfg_bool(self, *names: str, default: bool = False) -> bool:
         """Lookup boolean-ish config values from attributes, dict keys, or env vars.
 
         Returns the first matching value found, converted to bool. Falls back to `default`.
         """
+        def _parse_bool_value(v) -> Optional[bool]:
+            """Convert a raw config value to bool, returning None if indeterminate."""
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                s = v.strip().lower()
+                if s in ("1", "true", "yes", "y", "on"):
+                    return True
+                if s in ("0", "false", "no", "n", "off"):
+                    return False
+            if v is not None:
+                return bool(v)
+            return None
+
         for n in names:
-            # attribute on config
+            # attribute on config object
             try:
                 if hasattr(self.config, n):
-                    v = getattr(self.config, n)
-                    if isinstance(v, bool):
-                        return v
-                    if isinstance(v, str):
-                        s = v.strip().lower()
-                        if s in ("1", "true", "yes", "y", "on"):
-                            return True
-                        if s in ("0", "false", "no", "n", "off"):
-                            return False
-                    if v is not None:
-                        return bool(v)
+                    result = _parse_bool_value(getattr(self.config, n))
+                    if result is not None:
+                        return result
             except Exception:
                 pass
-            # mapping style
+            # mapping-style config dict
             try:
                 if isinstance(self.config, dict) and n in self.config:
-                    v = self.config[n]
-                    if isinstance(v, bool):
-                        return v
-                    if isinstance(v, str):
-                        s = v.strip().lower()
-                        if s in ("1", "true", "yes", "y", "on"):
-                            return True
-                        if s in ("0", "false", "no", "n", "off"):
-                            return False
-                    if v is not None:
-                        return bool(v)
+                    result = _parse_bool_value(self.config[n])
+                    if result is not None:
+                        return result
             except Exception:
                 pass
             # env var
             try:
                 v = os.getenv(n, None)
                 if v is not None:
-                    s = str(v).strip().lower()
-                    if s in ("1", "true", "yes", "y", "on"):
-                        return True
-                    if s in ("0", "false", "no", "n", "off"):
-                        return False
-                    return bool(v)
+                    result = _parse_bool_value(v)
+                    if result is not None:
+                        return result
             except Exception:
                 pass
         return default
@@ -391,9 +399,12 @@ class AppContext:
         Does not track in _tasks (use _spawn for tracked tasks). Never raises.
         """
         try:
+            loop = asyncio.get_running_loop()
             if name:
-                return asyncio.create_task(aw, name=name)
-            return asyncio.create_task(aw)
+                return loop.create_task(aw, name=name)
+            return loop.create_task(aw)
+        except RuntimeError:
+            return None  # No running loop yet
         except Exception:
             return None
     def _components_for_shared_state(self) -> List[Any]:
@@ -402,6 +413,8 @@ class AppContext:
         """
         return [
             self.symbol_manager,
+            self.capital_symbol_governor,
+            self.universe_rotation_engine,
             self.market_data_feed,
             self.execution_manager,
             self.strategy_manager,
@@ -422,6 +435,7 @@ class AppContext:
             self.performance_evaluator,
             self.portfolio_balancer,
             self.dust_monitor,
+            self.exchange_truth_auditor,
         ]
 
     def _components_for_exchange_client(self) -> List[Any]:
@@ -438,6 +452,7 @@ class AppContext:
             self.liquidation_agent,
             self.liquidation_orchestrator,
             self.cash_router,
+            self.exchange_truth_auditor,
         ]
 
     def _components_for_shutdown(self) -> List[Any]:
@@ -448,6 +463,7 @@ class AppContext:
             self.meta_controller,
             self.agent_manager,
             self.strategy_manager,
+            self.universe_rotation_engine,
             self.tp_sl_engine,
             self.execution_manager,
             self.market_data_feed,
@@ -465,6 +481,7 @@ class AppContext:
             self.liquidation_orchestrator,
             self.liquidation_agent,
             self.cash_router,
+            self.exchange_truth_auditor,
         ]
     # === SECTION: Liquidity Result Finalization (DRY helper) ===
     async def _finalize_liq_result(self, via: str, res: Any, reason: str) -> None:
@@ -550,6 +567,154 @@ class AppContext:
                 self.logger.debug("_finalize_liq_result: persistent failure tracking failed", exc_info=True)
         except Exception:
             self.logger.debug("_finalize_liq_result failed", exc_info=True)
+
+    # === SECTION: Liquidity Enable Helper (DRY) ===
+    def _liq_enabled(self) -> bool:
+        """Unified accessor for LIQ_ORCH_ENABLE with default=True."""
+        try:
+            return bool(self._cfg_bool("LIQ_ORCH_ENABLE", default=True))
+        except Exception:
+            return True
+
+    # === SECTION: Liquidity Helper (Throttled Summary Emission + Orchestration State) ===
+    async def _maybe_emit_liquidity_needed(
+        self,
+        *,
+        symbol: str,
+        required_usdt: float,
+        free_usdt: float,
+        gap_usdt: float,
+        reason: str,
+    ) -> None:
+        """
+        Emit LIQUIDITY_NEEDED at most once per cooldown window per symbol.
+        Persist a per-symbol deficit state and (optionally) trigger orchestration
+        when the gap persists long enough or is sufficiently large.
+
+        Configs (with defaults):
+          - LIQUIDITY_NOTICE_COOLDOWN_SEC: int = 120
+          - LIQ_ORCH_ENABLE: bool = True
+          - LIQ_ORCH_MIN_GAP_USDT: float = 1.50
+          - LIQ_ORCH_CONSECUTIVE_TICKS: int = 2
+          - LIQ_ORCH_DEBOUNCE_SEC: int = 240
+        """
+        try:
+            cooldown = int(self._cfg("LIQUIDITY_NOTICE_COOLDOWN_SEC", 120) or 120)
+        except Exception:
+            cooldown = 120
+
+        try:
+            now = self._loop_time()
+        except Exception:
+            now = 0.0
+
+        last = float(self._liquidity_notice_ts.get(symbol, 0.0))
+
+        # Initialize / update per-symbol state
+        st = self._liq_need_state.setdefault(symbol, {
+            "last_ts": 0.0,
+            "last_gap": 0.0,
+            "consec": 0,           # use int counter (ticks)
+            "orch_last_ts": 0.0,
+        })
+        st["last_ts"] = now
+        st["last_gap"] = float(max(0.0, gap_usdt))
+
+        # If the gap has been resolved, reset counters and return
+        if gap_usdt <= 0:
+            st["consec"] = 0
+            st["last_gap"] = 0.0
+            return
+
+        # Common thresholds (computed once)
+        try:
+            min_gap = float(self._cfg("LIQ_ORCH_MIN_GAP_USDT", 1.50) or 1.50)
+        except Exception:
+            min_gap = 1.50
+        try:
+            need_ticks = int(self._cfg("LIQ_ORCH_CONSECUTIVE_TICKS", 2) or 2)
+        except Exception:
+            need_ticks = 2
+        try:
+            deb_sec = int(self._cfg("LIQ_ORCH_DEBOUNCE_SEC", 240) or 240)
+        except Exception:
+            deb_sec = 240
+
+        # Suppress notices/orchestration for micro gaps below actionable threshold
+        if float(gap_usdt) < float(min_gap):
+            st["consec"] = 0
+            st["last_gap"] = float(gap_usdt)
+            return
+
+        # Throttled SUMMARY emission (only for actionable gaps)
+        if (now - last) >= max(1, cooldown):
+            self._liquidity_notice_ts[symbol] = now
+            await self._emit_summary(
+                "LIQUIDITY_NEEDED",
+                symbol=symbol,
+                required_usdt=float(f"{required_usdt:.6f}"),
+                free_usdt=float(f"{free_usdt:.6f}"),
+                gap_usdt=float(f"{gap_usdt:.6f}"),
+                reason=str(reason),
+            )
+
+        st["consec"] = int(st.get("consec", 0)) + 1
+
+        # If no orchestration/agent is available, emit a DEGRADED health signal with throttling and return
+        liq_support_present = bool(getattr(self, "liquidation_orchestrator", None) or getattr(self, "liquidation_agent", None) or hasattr(self.shared_state, "emit_event"))
+        if not liq_support_present:
+            try:
+                if float(gap_usdt) >= min_gap and st["consec"] >= need_ticks:
+                    now_ts = now
+                    mute_until = float(self._liq_degraded_until.get(symbol, 0.0))
+                    if now_ts >= mute_until:
+                        self._liq_degraded_until[symbol] = now_ts + max(30, deb_sec)
+                        try:
+                            await self._emit_summary(
+                                "LIQUIDITY_ORCH_MISSING",
+                                symbol=symbol,
+                                required_usdt=float(f"{required_usdt:.6f}"),
+                                free_usdt=float(f"{free_usdt:.6f}"),
+                                gap_usdt=float(f"{gap_usdt:.6f}"),
+                                reason="NO_ORCHESTRATOR_OR_AGENT",
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await self._emit_health_status("DEGRADED", {
+                                "issues": ["NAVNotReady"],
+                                "liquidity": {symbol: {"gap_usdt": float(f"{gap_usdt:.6f}"), "consec": st["consec"]}},
+                                "note": "No liquidity orchestrator/agent available; consider enabling P8_liquidation components."
+                            })
+                        except Exception:
+                            pass
+            except Exception:
+                self.logger.debug("liquidity missing-orchestrator handler failed", exc_info=True)
+            # Do not attempt orchestration when support is missing
+            return
+
+        # Orchestration guardrails
+        enable = self._liq_enabled()
+        if not enable:
+            return
+        # Fire only if: large enough gap AND persisted enough AND outside debounce window
+        try:
+            if float(gap_usdt) >= min_gap and int(st.get("consec", 0)) >= need_ticks:
+                if (now - float(st.get("orch_last_ts", 0.0))) >= max(30, deb_sec):
+                    st["orch_last_ts"] = now
+                    try:
+                        await self.orchestrate_liquidity(
+                            symbol=symbol,
+                            required_usdt=float(required_usdt),
+                            free_usdt=float(free_usdt),
+                            gap_usdt=float(gap_usdt),
+                            reason=str(reason),
+                        )
+                    except Exception:
+                        self.logger.debug("orchestrate_liquidity call failed", exc_info=True)
+        except Exception:
+            self.logger.debug("orchestration trigger guard failed", exc_info=True)
+
     # === SECTION: Shared State Propagation ===
     def set_shared_state(self, shared_state: Any) -> None:
         """
@@ -571,7 +736,10 @@ class AppContext:
                 continue
             try:
                 if not self._try_call(comp, ("set_shared_state",), shared_state):
-                    self._set_attr_if_missing(comp, "shared_state", shared_state)
+                    try:
+                        setattr(comp, "shared_state", shared_state)
+                    except Exception:
+                        self._set_attr_if_missing(comp, "shared_state", shared_state)
             except Exception:
                 self.logger.debug("shared_state propagation failed for %r", comp, exc_info=True)
         # Subscribe to wallet-scan completion if shared_state supports subscriptions
@@ -586,30 +754,116 @@ class AppContext:
             # Ignore the returned subscription handle if any; best-effort wiring
         except Exception:
             self.logger.debug("walletscan subscriber wiring failed", exc_info=True)
-        # Schedule a delayed resync on shared_state injection to catch late universe population
+        # Schedule a delayed resync on shared_state injection to catch late universe population.
+        # Use _ff (fire-and-forget) which safely handles missing event loops — never use
+        # asyncio.run() from a sync method as it fails when a loop is already running.
         try:
-            if asyncio.get_event_loop().is_running():
-                asyncio.create_task(self._delayed_resync_liq_symbols(float(self._cfg("WALLETSCAN_RESYNC_DELAY_SEC", 30.0))))
-            else:
-                asyncio.run(self._delayed_resync_liq_symbols(float(self._cfg("WALLETSCAN_RESYNC_DELAY_SEC", 30.0))))
+            self._ff(self._delayed_resync_liq_symbols(float(self._cfg("WALLETSCAN_RESYNC_DELAY_SEC", 30.0))))
         except Exception:
             self.logger.debug("schedule delayed resync on shared_state set failed", exc_info=True)
         # Refresh LiquidationAgent symbol universe when shared_state is injected/swapped
         try:
-            if asyncio.get_event_loop().is_running():
-                # Ensure universe is bootstrapped before pushing symbols to LiquidationAgent
-                asyncio.create_task(self._ensure_universe_bootstrap())
-                asyncio.create_task(self._sync_liq_agent_symbols_once())
-            else:
-                asyncio.run(self._ensure_universe_bootstrap())
-                asyncio.run(self._sync_liq_agent_symbols_once())
+            self._ff(self._ensure_universe_bootstrap())
+            self._ff(self._sync_liq_agent_symbols_once())
         except Exception:
             self.logger.debug("set_shared_state: universe sync + liq agent symbol refresh failed", exc_info=True)
+
+    def _enforce_shared_state_identity(self, emit_summary: bool = False) -> Dict[str, Any]:
+        """
+        Ensure core components point to the single canonical SharedState instance.
+        Returns an identity snapshot for diagnostics.
+        """
+        canonical = self.shared_state
+        canonical_id = id(canonical) if canonical is not None else None
+        targets = {
+            "meta_controller": self.meta_controller,
+            "tp_sl_engine": self.tp_sl_engine,
+            "execution_manager": self.execution_manager,
+            "risk_manager": self.risk_manager,
+        }
+
+        snapshot: Dict[str, Any] = {"canonical_shared_state_id": canonical_id}
+        rewired: List[str] = []
+
+        for name, comp in targets.items():
+            comp_ss = getattr(comp, "shared_state", None) if comp else None
+            comp_id = id(comp_ss) if comp_ss is not None else None
+            match = (comp_ss is canonical) if (comp is not None and canonical is not None) else False
+
+            if comp and canonical is not None and not match:
+                try:
+                    self._try_call(comp, ("set_shared_state",), canonical)
+                except Exception:
+                    self.logger.debug("shared_state set_shared_state() failed on %s", name, exc_info=True)
+                try:
+                    setattr(comp, "shared_state", canonical)
+                    rewired.append(name)
+                    comp_ss = getattr(comp, "shared_state", None)
+                    comp_id = id(comp_ss) if comp_ss is not None else None
+                    match = (comp_ss is canonical)
+                except Exception:
+                    self.logger.debug("shared_state force-assign failed on %s", name, exc_info=True)
+
+            snapshot[f"{name}_shared_state_id"] = comp_id
+            snapshot[f"{name}_shared_state_match"] = bool(match)
+
+        snapshot["rewired_components"] = rewired
+        snapshot["all_core_match"] = all(
+            snapshot.get(f"{name}_shared_state_match", False)
+            for name in targets.keys()
+            if targets[name] is not None
+        )
+
+        if rewired:
+            self.logger.warning(
+                "[SharedStateIdentity] Rewired mismatched components to canonical SharedState: %s",
+                rewired,
+            )
+        else:
+            self.logger.info(
+                "[SharedStateIdentity] Core components aligned: %s",
+                {k: v for k, v in snapshot.items() if k.endswith("_match") or k == "all_core_match"},
+            )
+
+        if emit_summary:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._emit_summary("SHARED_STATE_IDENTITY", **snapshot))
+            except RuntimeError:
+                pass  # No running loop yet
+            except Exception:
+                pass
+
+        try:
+            strict_identity = bool(self._cfg_bool("STRICT_SHARED_STATE_IDENTITY", default=False))
+        except Exception:
+            strict_identity = False
+        if strict_identity and not bool(snapshot.get("all_core_match", False)):
+            raise RuntimeError(f"SharedState identity mismatch detected: {snapshot}")
+
+        return snapshot
     """
     Central wiring orchestrator for Octivault Trader (P9). Handles phased init & teardown.
     """
 
     # === SECTION: Exchange Readiness Gate ===
+    def _assert_execution_manager_path_guard(self) -> None:
+        """
+        Hard startup invariant: ExchangeClient must enforce ExecutionManager-only order path.
+        """
+        ec = self.exchange_client
+        if ec is None:
+            raise RuntimeError("ExchangeClientNotReady")
+
+        guard_flag = getattr(ec, "ENFORCE_EXECUTION_MANAGER_PATH", None)
+        if guard_flag is None:
+            guard_flag = getattr(ec, "_enforce_execution_manager_path", None)
+
+        if bool(guard_flag) is not True:
+            raise AssertionError(
+                "ExchangeClient.ENFORCE_EXECUTION_MANAGER_PATH must be True at startup"
+            )
+
     async def _gate_exchange_ready(self) -> None:
         """
         Hard gate: ensure an ExchangeClient exists, its public session is started,
@@ -621,6 +875,8 @@ class AppContext:
             raise RuntimeError("ExchangeClientNotReady")
         # Propagate client to already-built components
         self._propagate_exchange_client()
+        # Boot-time assertion: fail fast if execution-path guard is disabled.
+        self._assert_execution_manager_path_guard()
 
     # === SECTION: Attempt Fetch Balances ===
     async def _attempt_fetch_balances(self) -> None:
@@ -650,14 +906,30 @@ class AppContext:
     # === SECTION: Constructor & Initialization ===
     def __init__(
         self,
-        config: Any,  # Config instance or dict-like
+        config: Any = None,  # Config instance or dict-like
         logger: Optional[logging.Logger] = None,
         exchange_client: Optional[Any] = None,
         shared_state: Optional[Any] = None,
+        up_to_phase: Optional[int] = None,  # back-compat: older scripts passed this to ctor
+        **kwargs: Any,  # back-compat sink for stale constructor kwargs
     ) -> None:
         # Safety fix: ensure no_remainder_below_quote is always initialized
         self.no_remainder_below_quote = 0.0
         self.config = config or {}
+        
+        # Set default timeframe configurations if not already present
+        # Multi-timeframe hierarchy: 1h = brain (regime), 5m = hands (execution)
+        if not isinstance(self.config, dict):
+            # If config is an object, ensure it has these attributes
+            if not hasattr(self.config, "VOLATILITY_REGIME_TIMEFRAME"):
+                self.config.VOLATILITY_REGIME_TIMEFRAME = "1h"  # Brain: slow, strategic
+            if not hasattr(self.config, "ohlcv_timeframes"):
+                self.config.ohlcv_timeframes = ["5m", "1h"]  # Hands: 5m execution, Brain: 1h regime
+        else:
+            # If config is a dict, set defaults
+            self.config.setdefault("VOLATILITY_REGIME_TIMEFRAME", "1h")  # Brain: slow, strategic
+            self.config.setdefault("ohlcv_timeframes", ["5m", "1h"])  # Hands: 5m execution, Brain: 1h regime
+        
         self.logger = logger or logging.getLogger("AppContext")
         if not self.logger.handlers:
             h = logging.StreamHandler()
@@ -684,14 +956,16 @@ class AppContext:
 
         # Announce strict imports mode (no fallbacks)
         try:
-            asyncio.get_event_loop()  # ensure loop exists or will exist
+            asyncio.get_running_loop()  # only emit async summary if a loop is already running
             self._summary_ff("STRICT_IMPORTS_ENABLED", enabled=True)
-        except Exception:
+        except RuntimeError:
+            # No running loop yet — log synchronously.
             try:
-                # Fallback: log info synchronously if no loop yet
                 self.logger.info("SUMMARY %s", {"component": "AppContext", "event": "STRICT_IMPORTS_ENABLED", "enabled": True})
             except Exception:
                 pass
+        except Exception:
+            pass
 
         # Optional: quiet third-party verbose logs (e.g., TensorFlow C++ messages)
         try:
@@ -709,9 +983,18 @@ class AppContext:
         # External (may be injected)
         self.exchange_client = exchange_client
         self.shared_state = shared_state
+        self._ctor_up_to_phase = up_to_phase
+
+        if kwargs:
+            try:
+                self.logger.warning("[AppContext] Ignoring unknown constructor kwargs: %s", sorted(kwargs.keys()))
+            except Exception:
+                pass
 
         # Components (optional; can be injected externally before init)
         self.symbol_manager: Any = None
+        self.capital_symbol_governor: Optional[Any] = None
+        self.universe_rotation_engine: Optional[Any] = None
         self.market_data_feed: Optional[Any] = None
         self.agent_manager: Optional[Any] = None
         self.risk_manager: Optional[Any] = None
@@ -735,6 +1018,13 @@ class AppContext:
         self.capital_allocator: Optional[Any] = None # P9 Wealth
         self.profit_target_engine: Optional[Any] = None # P9 Wealth
         self.dust_monitor: Optional[Any] = None  # Phase G: Real-time dust monitoring
+        self.adaptive_capital_engine: Optional[Any] = None  # Adaptive sizing engine
+        self.exchange_truth_auditor: Optional[Any] = None  # P3 exchange truth reconciliation
+
+        # Persistent execution journal (crash-safe JSONL)
+        from core.trade_journal import TradeJournal
+        self.trade_journal: TradeJournal = TradeJournal()
+        self.session_id: str = datetime.now(timezone.utc).isoformat()
 
         # Back-compat aliases removed.
 
@@ -752,6 +1042,8 @@ class AppContext:
         # Background affordability scout (round-robin over symbols)
         self._scout_task: Optional[asyncio.Task] = None
         self._scout_index: int = 0
+        # Background universe rotation task (periodic UURE)
+        self._uure_task: Optional[asyncio.Task] = None
         # Per-symbol throttle map for liquidity events
         self._liquidity_notice_ts: Dict[str, float] = {}
         self._liq_need_state: Dict[str, Dict[str, float]] = {}  # per-symbol persistence for liquidity orchestration
@@ -761,8 +1053,9 @@ class AppContext:
 
         # Concurrency / lifecycle guards
         self._init_lock: asyncio.Lock = asyncio.Lock()
-        self._init_started: bool = False
         self._init_completed: bool = False
+        self._init_highest_phase: int = 0  # highest phase successfully completed
+        self._tpsl_started: bool = False
 
         # Idempotent guard for public bootstrap
         self._public_ready_once: bool = False
@@ -773,154 +1066,8 @@ class AppContext:
         # longer defined as nested functions to keep __init__ concise.
         
 
-        # === SECTION: Liquidity Helper (Throttled Summary Emission + Orchestration State) ===
-        async def _maybe_emit_liquidity_needed(
-            self,
-            *,
-            symbol: str,
-            required_usdt: float,
-            free_usdt: float,
-            gap_usdt: float,
-            reason: str,
-        ) -> None:
-            """
-            Emit LIQUIDITY_NEEDED at most once per cooldown window per symbol.
-            Persist a per-symbol deficit state and (optionally) trigger orchestration
-            when the gap persists long enough or is sufficiently large.
-
-            Configs (with defaults):
-              - LIQUIDITY_NOTICE_COOLDOWN_SEC: int = 120
-              - LIQ_ORCH_ENABLE: bool = True
-              - LIQ_ORCH_MIN_GAP_USDT: float = 1.50
-              - LIQ_ORCH_CONSECUTIVE_TICKS: int = 2
-              - LIQ_ORCH_DEBOUNCE_SEC: int = 240
-            """
-            try:
-                cooldown = int(self._cfg("LIQUIDITY_NOTICE_COOLDOWN_SEC", 120) or 120)
-            except Exception:
-                cooldown = 120
-
-            try:
-                now = self._loop_time()
-            except Exception:
-                now = 0.0
-
-            last = float(self._liquidity_notice_ts.get(symbol, 0.0))
-
-            # Initialize / update per-symbol state
-            st = self._liq_need_state.setdefault(symbol, {
-                "last_ts": 0.0,
-                "last_gap": 0.0,
-                "consec": 0,           # use int counter (ticks)
-                "orch_last_ts": 0.0,
-            })
-            st["last_ts"] = now
-            st["last_gap"] = float(max(0.0, gap_usdt))
-
-            # If the gap has been resolved, reset counters and return
-            if gap_usdt <= 0:
-                st["consec"] = 0
-                st["last_gap"] = 0.0
-                return
-
-            # Common thresholds (computed once)
-            try:
-                min_gap = float(self._cfg("LIQ_ORCH_MIN_GAP_USDT", 1.50) or 1.50)
-            except Exception:
-                min_gap = 1.50
-            try:
-                need_ticks = int(self._cfg("LIQ_ORCH_CONSECUTIVE_TICKS", 2) or 2)
-            except Exception:
-                need_ticks = 2
-            try:
-                deb_sec = int(self._cfg("LIQ_ORCH_DEBOUNCE_SEC", 240) or 240)
-            except Exception:
-                deb_sec = 240
-
-            # Suppress notices/orchestration for micro gaps below actionable threshold
-            if float(gap_usdt) < float(min_gap):
-                st["consec"] = 0
-                st["last_gap"] = float(gap_usdt)
-                return
-
-            # Throttled SUMMARY emission (only for actionable gaps)
-            if (now - last) >= max(1, cooldown):
-                self._liquidity_notice_ts[symbol] = now
-                await self._emit_summary(
-                    "LIQUIDITY_NEEDED",
-                    symbol=symbol,
-                    required_usdt=float(f"{required_usdt:.6f}"),
-                    free_usdt=float(f"{free_usdt:.6f}"),
-                    gap_usdt=float(f"{gap_usdt:.6f}"),
-                    reason=str(reason),
-                )
-
-            st["consec"] = int(st.get("consec", 0)) + 1
-
-            # If no orchestration/agent is available, emit a DEGRADED health signal with throttling and return
-            liq_support_present = bool(getattr(self, "liquidation_orchestrator", None) or getattr(self, "liquidation_agent", None) or hasattr(self.shared_state, "emit_event"))
-            if not liq_support_present:
-                try:
-                    if float(gap_usdt) >= min_gap and st["consec"] >= need_ticks:
-                        now_ts = now
-                        mute_until = float(self._liq_degraded_until.get(symbol, 0.0))
-                        if now_ts >= mute_until:
-                            self._liq_degraded_until[symbol] = now_ts + max(30, deb_sec)
-                            # Emit a single summary + health update then back off
-                            try:
-                                await self._emit_summary(
-                                    "LIQUIDITY_ORCH_MISSING",
-                                    symbol=symbol,
-                                    required_usdt=float(f"{required_usdt:.6f}"),
-                                    free_usdt=float(f"{free_usdt:.6f}"),
-                                    gap_usdt=float(f"{gap_usdt:.6f}"),
-                                    reason="NO_ORCHESTRATOR_OR_AGENT",
-                                )
-                            except Exception:
-                                pass
-                            try:
-                                await self._emit_health_status("DEGRADED", {
-                                    "issues": ["NAVNotReady"],
-                                    "liquidity": {symbol: {"gap_usdt": float(f"{gap_usdt:.6f}"), "consec": st["consec"]}},
-                                    "note": "No liquidity orchestrator/agent available; consider enabling P8_liquidation components."
-                                })
-                            except Exception:
-                                pass
-                except Exception:
-                    self.logger.debug("liquidity missing-orchestrator handler failed", exc_info=True)
-                # Do not attempt orchestration when support is missing
-                return
-
-            # Orchestration guardrails
-            enable = self._liq_enabled()
-            if not enable:
-                return
-            # Fire only if: large enough gap AND persisted enough AND outside debounce window
-            try:
-                if float(gap_usdt) >= min_gap and int(st.get("consec", 0)) >= need_ticks:
-                    if (now - float(st.get("orch_last_ts", 0.0))) >= max(30, deb_sec):
-                        st["orch_last_ts"] = now
-                        try:
-                            await self.orchestrate_liquidity(
-                                symbol=symbol,
-                                required_usdt=float(required_usdt),
-                                free_usdt=float(free_usdt),
-                                gap_usdt=float(gap_usdt),
-                                reason=str(reason),
-                            )
-                        except Exception:
-                            self.logger.debug("orchestrate_liquidity call failed", exc_info=True)
-            except Exception:
-                self.logger.debug("orchestration trigger guard failed", exc_info=True)
-        # === SECTION: Liquidity Enable Helper (DRY) ===
-        def _liq_enabled(self) -> bool:
-            """Unified accessor for LIQ_ORCH_ENABLE with default=True."""
-            try:
-                return bool(self._cfg_bool("LIQ_ORCH_ENABLE", default=True))
-            except Exception:
-                return True
-        self._maybe_emit_liquidity_needed = _maybe_emit_liquidity_needed.__get__(self)
-
+        # NOTE: _maybe_emit_liquidity_needed and _liq_enabled are proper class methods
+        # (see below class body) — no longer defined as closures here.
         # === SECTION: Liquidity Plane (Single Construction Point) ===
         try:
             # Optional CashRouter (if module present)
@@ -932,6 +1079,7 @@ class AppContext:
                     logger=self.logger,
                     app=self,
                     shared_state=self.shared_state,
+                    execution_manager=self.execution_manager,
                 )
         except Exception:
             self.logger.debug("CashRouter construct failed", exc_info=True)
@@ -1253,7 +1401,10 @@ class AppContext:
     def _phase_emit(self, event: str, **kvs) -> None:
         """Fire-and-forget wrapper around _emit_summary for PHASE_* events."""
         try:
-            asyncio.create_task(self._emit_summary(event, **kvs))
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._emit_summary(event, **kvs))
+        except RuntimeError:
+            return  # No running loop yet
         except Exception:
             pass
 
@@ -1396,7 +1547,7 @@ class AppContext:
                         except Exception:
                             pass
                     except asyncio.TimeoutError:
-                        self.logger.warning(f"[{phase_key}] warmup() timed out at {timeout:.1f}s — continuing in background")
+                        self.logger.warning("[%s] warmup() timed out at %.1fs — continuing in background", phase_key, timeout)
                         try:
                             self._phase_timeout(phase_key, timeout)
                         except Exception:
@@ -1421,7 +1572,7 @@ class AppContext:
                         try:
                             exc = t.exception()
                         except asyncio.CancelledError:
-                            self.logger.warning(f"[{phase_key}] loop task was cancelled")
+                            self.logger.warning("[%s] loop task was cancelled", phase_key)
                             return
                         except Exception as e:
                             log_structured_error(e, context={"phase": phase_key, "when": "loop_done_cb-extract"},
@@ -1473,7 +1624,7 @@ class AppContext:
                 try:
                     exc = t.exception()
                 except asyncio.CancelledError:
-                    self.logger.warning(f"[{phase_key}] start() task was cancelled")
+                    self.logger.warning("[%s] start() task was cancelled", phase_key)
                     return
                 except Exception as e:
                     log_structured_error(e, context={"phase": phase_key, "when": "done_cb-extract"},
@@ -1502,7 +1653,7 @@ class AppContext:
                 await asyncio.wait_for(asyncio.shield(start_task), timeout=timeout)
                 log_structured_info(f"[{phase_key}] start() returned", component="AppContext", phase=phase_key)
             except asyncio.TimeoutError:
-                self.logger.warning(f"[{phase_key}] start() timed out at {timeout:.1f}s — continuing in background")
+                self.logger.warning("[%s] start() timed out at %.1fs — continuing in background", phase_key, timeout)
                 try:
                     self._phase_timeout(phase_key, timeout)
                 except Exception:
@@ -1578,7 +1729,7 @@ class AppContext:
                 await pw.start()
                 self.logger.info("PerformanceWatcher started.")
             except Exception as e:
-                self.logger.warning(f"PerformanceWatcher failed to start: {e}")
+                self.logger.warning("PerformanceWatcher failed to start: %s", e)
             try:
                 if hasattr(orch, "on_completed") and self.meta_controller:
                     def _liq_done_cb(*_a, **_kw):
@@ -1653,13 +1804,13 @@ class AppContext:
         snap = await self._ops_plane_snapshot()
         blocked = _blocked(snap)
         while blocked and self._loop_time() < deadline:
-            self.logger.info(f"[Init] waiting on gates: {blocked} (poll {poll_sec:.1f}s)")
+            self.logger.info("[Init] waiting on gates: %s (poll %.1fs)", blocked, poll_sec)
             await asyncio.sleep(poll_sec)
             snap = await self._ops_plane_snapshot()
             blocked = _blocked(snap)
 
         if blocked:
-            self.logger.warning(f"[Init] readiness gate timed out; still blocked: {blocked}")
+            self.logger.warning("[Init] readiness gate timed out; still blocked: %s", blocked)
         else:
             self.logger.info("[Init] readiness gates cleared")
             # Start the background affordability scout now that gates are clear
@@ -1667,6 +1818,11 @@ class AppContext:
                 self._start_affordability_scout()
             except Exception:
                 self.logger.debug("failed to start affordability scout after gates clear", exc_info=True)
+            # Start the background UURE loop now that gates are clear
+            try:
+                self._start_uure_loop()
+            except Exception:
+                self.logger.debug("failed to start UURE loop after gates clear", exc_info=True)
 
         return snap
 
@@ -1748,10 +1904,31 @@ class AppContext:
             except Exception as e:
                 self.logger.debug("[RestartDetect] NAV history check failed: %s", e)
             
+            # Check 5: Database / persistence file exists (any DB means NOT first-ever launch)
+            try:
+                db_path = self._cfg("DB_PATH", self._cfg("DATABASE_PATH", None))
+                snapshot_path = self._cfg("SNAPSHOT_PATH", self._cfg("STATE_SNAPSHOT_FILE", None))
+                if db_path and os.path.exists(str(db_path)):
+                    self.logger.warning(
+                        "[AppContext:RestartDetect] RESTART MODE: Database file exists at %s. "
+                        "This is not a first-ever launch.",
+                        db_path,
+                    )
+                    return True
+                if snapshot_path and os.path.exists(str(snapshot_path)):
+                    self.logger.warning(
+                        "[AppContext:RestartDetect] RESTART MODE: State snapshot exists at %s. "
+                        "This is not a first-ever launch.",
+                        snapshot_path,
+                    )
+                    return True
+            except Exception as e:
+                self.logger.debug("[RestartDetect] DB/snapshot check failed: %s", e)
+
             # No restart indicators found
             self.logger.info(
-                "[AppContext:RestartDetect] COLD_START MODE: No existing positions, intents, or history found. "
-                "System initializing fresh (is_cold_bootstrap=True)."
+                "[AppContext:RestartDetect] COLD_START MODE: No existing positions, intents, history, or DB found. "
+                "True first-ever launch detected."
             )
             return False
             
@@ -1888,6 +2065,135 @@ class AppContext:
         except Exception:
             self.logger.debug("on_summary_walletscan failed", exc_info=True)
 
+    # === SECTION: Adaptive Capital Engine Background Monitor ===
+    async def _run_adaptive_capital_monitor(self):
+        """
+        Background task for AdaptiveCapitalEngine monitoring.
+        Periodically evaluates adaptive sizing decisions and logs them.
+        """
+        try:
+            self.logger.info("[AdaptiveCapitalEngine] Monitor starting")
+            
+            # Initial health report
+            await self._emit_health_status("OK", {
+                "component": "AdaptiveCapitalEngine",
+                "status": "initialized",
+                "enabled": bool(getattr(self.adaptive_capital_engine, 'enabled', False))
+            })
+            
+            while True:
+                try:
+                    # Wait 5 minutes between evaluations
+                    await asyncio.sleep(300)
+                    
+                    if not self.adaptive_capital_engine or not getattr(self.adaptive_capital_engine, 'enabled', False):
+                        continue
+                    
+                    # Get current market conditions for evaluation
+                    nav = 0.0
+                    free_capital = 0.0
+                    volatility_pct = self._cfg_float("ACE_DEFAULT_VOLATILITY_PCT", 0.015)
+                    drawdown_pct = 0.0
+                    fee_bps = self._cfg_float("ACE_DEFAULT_FEE_BPS", 10.0)
+                    slippage_bps = self._cfg_float("ACE_DEFAULT_SLIPPAGE_BPS", 5.0)
+                    min_notional = self._cfg_float("ACE_DEFAULT_MIN_NOTIONAL", 30.0)
+                    slot_utilization = 0.0
+                    throughput_per_hour = 0.0
+                    target_throughput_per_hour = self._cfg_float("MAX_TRADES_PER_HOUR", 4.0)
+                    
+                    try:
+                        if self.shared_state:
+                            nav = float(await self.shared_state.get_nav_quote() or 0.0)
+                            free_capital = float(await self.shared_state.get_spendable_balance("USDT") or 0.0)
+                            
+                            # Get drawdown from metrics
+                            metrics = getattr(self.shared_state, 'metrics', {}) or {}
+                            drawdown_pct = float(metrics.get('drawdown_pct', 0.0) or 0.0)
+                            
+                            # Get throughput from recent trades
+                            recent_trades = getattr(self.shared_state, 'recent_trades', []) or []
+                            if recent_trades:
+                                # Count trades in last hour
+                                now = asyncio.get_running_loop().time()
+                                hour_ago = now - 3600
+                                recent_count = sum(1 for t in recent_trades[-50:] if getattr(t, 'ts', 0) > hour_ago)
+                                throughput_per_hour = recent_count
+                    except Exception as e:
+                        self.logger.debug("[AdaptiveCapitalEngine] Failed to gather market data: %s", e)
+
+                    # Get trade history for performance analysis
+                    trade_history = []
+                    try:
+                        if self.shared_state:
+                            # Get recent trades from shared_state
+                            recent_trades = getattr(self.shared_state, 'recent_trades', []) or []
+                            trade_history = recent_trades[-50:]  # Last 50 trades
+                    except Exception as e:
+                        self.logger.debug("[AdaptiveCapitalEngine] Failed to get trade history: %s", e)
+                    
+                    # Evaluate adaptive sizing
+                    decision = self.adaptive_capital_engine.evaluate(
+                        symbol="ADAPTIVE_GLOBAL",  # Global evaluation
+                        nav=nav,
+                        free_capital=free_capital,
+                        base_risk_fraction=0.10,  # 10% base risk
+                        volatility_pct=volatility_pct,
+                        drawdown_pct=drawdown_pct,
+                        fee_bps=fee_bps,
+                        slippage_bps=slippage_bps,
+                        min_notional=min_notional,
+                        slot_utilization=slot_utilization,
+                        throughput_per_hour=throughput_per_hour,
+                        target_throughput_per_hour=target_throughput_per_hour,
+                        trade_history=trade_history,
+                        now_ts=None
+                    )
+                    
+                    # Log the decision
+                    self.logger.info(
+                        "[AdaptiveCapitalEngine] Evaluation: risk=%.3f, min_quote=%.2f, win_rate=%.3f, "
+                        "avg_r=%.4f, reasons=%s",
+                        decision.risk_fraction,
+                        decision.min_trade_quote,
+                        decision.win_rate,
+                        decision.avg_r_multiple,
+                        ",".join(decision.reasons) if decision.reasons else "none"
+                    )
+                    
+                    # Emit health status with current adaptive metrics
+                    await self._emit_health_status("OK", {
+                        "component": "AdaptiveCapitalEngine",
+                        "risk_fraction": float(f"{decision.risk_fraction:.3f}"),
+                        "min_trade_quote": float(f"{decision.min_trade_quote:.2f}"),
+                        "win_rate": float(f"{decision.win_rate:.3f}"),
+                        "avg_r_multiple": float(f"{decision.avg_r_multiple:.4f}"),
+                        "reasons": decision.reasons,
+                        "last_evaluation": asyncio.get_running_loop().time()
+                    })
+
+                except Exception as e:
+                    self.logger.warning("[AdaptiveCapitalEngine] Evaluation failed: %s", e)
+                    await self._emit_health_status("DEGRADED", {
+                        "component": "AdaptiveCapitalEngine",
+                        "error": str(e),
+                        "last_error_ts": asyncio.get_running_loop().time()
+                    })
+                    await asyncio.sleep(60)  # Wait 1 minute before retrying
+                    
+        except asyncio.CancelledError:
+            self.logger.info("[AdaptiveCapitalEngine] Monitor cancelled")
+            await self._emit_health_status("SHUTDOWN", {
+                "component": "AdaptiveCapitalEngine",
+                "status": "shutdown"
+            })
+        except Exception as e:
+            self.logger.error("[AdaptiveCapitalEngine] Monitor crashed: %s", e)
+            await self._emit_health_status("ERROR", {
+                "component": "AdaptiveCapitalEngine",
+                "error": str(e),
+                "crashed": True
+            })
+
     # === SECTION: Shutdown ===
     async def shutdown(self, save_snapshot: bool = False) -> None:
         """
@@ -1902,6 +2208,12 @@ class AppContext:
             await self._stop_affordability_scout()
         except Exception:
             self.logger.debug("shutdown: stop scout failed", exc_info=True)
+
+        # Stop background UURE loop
+        try:
+            await self._stop_uure_loop()
+        except Exception:
+            self.logger.debug("shutdown: stop UURE loop failed", exc_info=True)
 
         # Ordered stop: higher-level controllers first
         comps = self._components_for_shutdown()
@@ -2062,10 +2374,10 @@ class AppContext:
                         # Use the smaller of (Compounded Size, Hard Max Cap) to manage risk
                         # If user wants purely compounding without cap, they can set MAX_PER_TRADE_USDT very high.
                         target_usdt = min(compounded_size, max_spend)
-                        
-                        # Ensure we don't go below a reasonable floor (e.g. $11) just because equity is small
-                        # But never exceed equity itself (of course)
-                        target_usdt = max(target_usdt, 11.0)
+
+                        # Ensure we don't go below the configured floor just because equity is small.
+                        _compound_floor = self._cfg_float("COMPOUND_SIZE_FLOOR_USDT", 11.0)
+                        target_usdt = max(target_usdt, _compound_floor)
                     else:
                         target_usdt = max_spend
                 except Exception:
@@ -2077,8 +2389,9 @@ class AppContext:
             qty = target_usdt / float(current_price)
             
             # --- 3. Check against Exit-Feasibility Floor (Safety & Dust) ---
-            min_notional = 5.0  # Default fallback
-            safe_floor = min_notional * 1.1
+            min_notional = self._cfg_float("MIN_NOTIONAL_FLOOR_USDT", 5.0)  # operator-configurable fallback
+            _floor_multiplier = self._cfg_float("MIN_NOTIONAL_FLOOR_MULTIPLIER", 1.1)
+            safe_floor = min_notional * _floor_multiplier
 
             try:
                 if hasattr(self.shared_state, "compute_min_entry_quote"):
@@ -2101,16 +2414,16 @@ class AppContext:
                                 min_notional = float(mn)
                     except Exception:
                         pass
-                safe_floor = min_notional * 1.1
+                safe_floor = min_notional * _floor_multiplier
             
             notional = qty * current_price
             if notional < safe_floor:
-                self.logger.info(f"[{symbol}] Trade quantity {qty:.6f} (${notional:.2f}) < safe min notional (${safe_floor:.2f}). Skipping.")
+                self.logger.info("[%s] Trade quantity %.6f ($%.2f) < safe min notional ($%.2f). Skipping.", symbol, qty, notional, safe_floor)
                 return 0.0
-                
+
             return qty
         except Exception as e:
-            self.logger.error(f"get_trade_quantity failed for {symbol}: {e}")
+            self.logger.error("get_trade_quantity failed for %s: %s", symbol, e)
             return 0.0
 
     # === SECTION: Ensure Exchange Public Ready ===
@@ -2232,8 +2545,10 @@ class AppContext:
                 mode = "paper"
             if signal_only:
                 mode = "signal_only"
-            msg = f"Runtime mode: {mode} (testnet={is_testnet}, paper={is_paper}, signal_only={signal_only})"
-            self.logger.info(msg)
+            self.logger.info(
+                "Runtime mode: %s (testnet=%s, paper=%s, signal_only=%s)",
+                mode, is_testnet, is_paper, signal_only,
+            )
             if hasattr(self.shared_state, "emit_event"):
                 try:
                     res = self.shared_state.emit_event("RuntimeModeChanged", {
@@ -2243,7 +2558,11 @@ class AppContext:
                         "signal_only": bool(signal_only),
                     })
                     if asyncio.iscoroutine(res):
-                        asyncio.create_task(res)
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(res)
+                        except RuntimeError:
+                            pass
                 except Exception:
                     pass
         except Exception:
@@ -2319,7 +2638,7 @@ class AppContext:
                 ok = bool(ap.get("ok"))
                 amt = float(ap.get("amount", 0.0))
                 code = str(ap.get("code", "UNKNOWN"))
-                self.logger.info(f"[ExecutionProbe] {symbol} quote≈{planned_quote} → ({ok}, {amt}, '{code}')")
+                self.logger.info("[ExecutionProbe] %s quote≈%s → (%s, %s, '%s')", symbol, planned_quote, ok, amt, code)
                 return
 
             # Fallback to ExecutionManager probe
@@ -2330,7 +2649,7 @@ class AppContext:
                     ok, amt, code = res
                 except Exception:
                     ok, amt, code = (bool(res), 0.0, "UNKNOWN")
-                self.logger.info(f"[ExecutionProbe] {symbol} quote≈{planned_quote} → ({ok}, {amt}, '{code}')")
+                self.logger.info("[ExecutionProbe] %s quote≈%s → (%s, %s, '%s')", symbol, planned_quote, ok, amt, code)
         except Exception:
             self.logger.debug("dry-probe failed (non-fatal)", exc_info=True)
 
@@ -2472,12 +2791,11 @@ class AppContext:
 
     # === SECTION: Start Affordability Scout ===
     def _start_affordability_scout(self) -> None:
-        
         """
         Idempotently start the background affordability scout loop (if enabled).
         """
-         # Idempotence guard: avoid duplicate background scouts
-        if getattr(self, "_scout_task", None) and not self._scout_task.done():
+        # Idempotence guard: avoid duplicate background scouts
+        if self._scout_task and not self._scout_task.done():
             return
         try:
             if not self._cfg_bool("AFFORD_SCOUT_ENABLE", default=True):
@@ -2485,12 +2803,10 @@ class AppContext:
         except Exception:
             pass
         try:
-            if self._scout_task and not self._scout_task.done():
-                return
-        except Exception:
-            pass
-        try:
-            self._scout_task = asyncio.create_task(self._affordability_scout_loop(), name="affordability_scout")
+            loop = asyncio.get_running_loop()
+            self._scout_task = loop.create_task(self._affordability_scout_loop(), name="affordability_scout")
+        except RuntimeError:
+            self.logger.debug("failed to start affordability scout: no running loop")
         except Exception:
             self.logger.debug("failed to start affordability scout", exc_info=True)
 
@@ -2507,6 +2823,136 @@ class AppContext:
                     await t
             finally:
                 self._scout_task = None
+
+    # === SECTION: Universe Rotation Engine Background Loop ===
+    async def _uure_loop(self) -> None:
+        """
+        Background Universe Rotation Engine loop:
+          - Runs immediately once at startup (critical for universe population)
+          - Then periodically calls UURE every UURE_INTERVAL_SEC seconds (default: 300, i.e., 5 minutes)
+          - Enterprise best practice: immediate + periodic (not sleep-first)
+          - Graceful error handling with debug logging
+        Config (defaults):
+          UURE_ENABLE=True
+          UURE_INTERVAL_SEC=300 (5 minutes)
+        """
+        try:
+            if not self._cfg_bool("UURE_ENABLE", default=True):
+                return
+        except Exception:
+            pass
+
+        lg = self.logger
+        try:
+            interval = float(self._cfg("UURE_INTERVAL_SEC", 300) or 300.0)
+        except Exception:
+            interval = 300.0
+
+        lg.info("[UURE] background loop started (immediate + periodic every %ss)", interval)
+
+        async def _execute_rotation():
+            """Execute universe rotation with comprehensive error handling."""
+            try:
+                # Preconditions
+                if not self.universe_rotation_engine:
+                    lg.debug("[UURE] engine not ready, skipping")
+                    return
+
+                if not hasattr(self.universe_rotation_engine, "compute_and_apply_universe"):
+                    lg.debug("[UURE] engine missing compute_and_apply_universe method, skipping")
+                    return
+
+                # Call UURE to compute and apply universe
+                lg.debug("[UURE] invoking compute_and_apply_universe()")
+                result = self.universe_rotation_engine.compute_and_apply_universe()
+                if asyncio.iscoroutine(result):
+                    result = await result
+
+                # Log result
+                if isinstance(result, dict):
+                    rotation = result.get("rotation", {}) or {}
+                    lg.info("[UURE] rotation result: added=%d, removed=%d, kept=%d",
+                            len(rotation.get("added", [])),
+                            len(rotation.get("removed", [])),
+                            len(rotation.get("kept", [])))
+                else:
+                    lg.debug("[UURE] rotation result: %s", result)
+
+                # Emit summary
+                try:
+                    rotation = result.get("rotation", {}) if isinstance(result, dict) else {}
+                    await self._emit_summary(
+                        "UNIVERSE_ROTATION",
+                        added=len(rotation.get("added", [])),
+                        removed=len(rotation.get("removed", [])),
+                        kept=len(rotation.get("kept", [])),
+                    )
+                except Exception:
+                    lg.debug("[UURE] emit_summary failed", exc_info=True)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                lg.debug("[UURE] rotation execution failed", exc_info=True)
+
+        # Run immediately once at startup (critical for universe population)
+        lg.debug("[UURE] running immediate execution at startup")
+        try:
+            await _execute_rotation()
+        except asyncio.CancelledError:
+            lg.info("[UURE] loop cancelled during immediate execution.")
+            raise
+        except Exception:
+            lg.debug("[UURE] immediate execution failed", exc_info=True)
+
+        # Then periodic loop every interval
+        while True:
+            try:
+                # Wait before each periodic iteration
+                await asyncio.sleep(interval)
+                # Execute periodic rotation
+                await _execute_rotation()
+
+            except asyncio.CancelledError:
+                lg.info("[UURE] loop cancelled.")
+                raise
+            except Exception:
+                lg.debug("[UURE] loop iteration failed", exc_info=True)
+
+    # === SECTION: Start UURE Background Loop ===
+    def _start_uure_loop(self) -> None:
+        """
+        Idempotently start the background UURE loop (if enabled).
+        """
+        # Idempotence guard: avoid duplicate background loops
+        if self._uure_task and not self._uure_task.done():
+            return
+        try:
+            if not self._cfg_bool("UURE_ENABLE", default=True):
+                return
+        except Exception:
+            pass
+        try:
+            loop = asyncio.get_running_loop()
+            self._uure_task = loop.create_task(self._uure_loop(), name="uure_rotation")
+        except RuntimeError:
+            self.logger.debug("failed to start UURE loop: no running loop")
+        except Exception:
+            self.logger.debug("failed to start UURE loop", exc_info=True)
+
+    # === SECTION: Stop UURE Background Loop ===
+    async def _stop_uure_loop(self) -> None:
+        """
+        Stop the background UURE loop if running.
+        """
+        t = getattr(self, "_uure_task", None)
+        if t:
+            try:
+                t.cancel()
+                with contextlib.suppress(Exception):
+                    await t
+            finally:
+                self._uure_task = None
 
     async def _is_market_data_ready(self) -> bool:
         try:
@@ -2538,7 +2984,36 @@ class AppContext:
         issues = []
         detail: Dict[str, Any] = {}
         aff_ok_flag = False
-        # Quick free-quote probe for NAV gating heuristics
+
+        # --- A) ExchangeClient readiness ---
+        if self.exchange_client is None:
+            issues.append("ExchangeClientNotReady")
+
+        # --- B) Market data readiness ---
+        try:
+            md_ready = await self._is_market_data_ready()
+            if not md_ready:
+                issues.append("MarketDataNotReady")
+        except Exception:
+            issues.append("MarketDataNotReady")
+
+        # --- C) Symbols universe ---
+        try:
+            has_universe = await self._has_nonempty_universe()
+            if not has_universe:
+                issues.append("SymbolsUniverseEmpty")
+        except Exception:
+            issues.append("SymbolsUniverseEmpty")
+
+        # --- D) Execution manager readiness ---
+        try:
+            exec_ready = await self._is_execution_ready()
+            if not exec_ready:
+                issues.append("ExecutionManagerNotReady")
+        except Exception:
+            issues.append("ExecutionManagerNotReady")
+
+        # --- E) Balances / NAV readiness ---
         free_usdt_now = 0.0
         try:
             if self.shared_state:
@@ -2551,11 +3026,42 @@ class AppContext:
         except Exception:
             free_usdt_now = 0.0
 
+        try:
+            balances_ready = bool(getattr(self.shared_state, "balances_ready", False)) or free_usdt_now > 0
+            if not balances_ready:
+                issues.append("BalancesNotReady")
+        except Exception:
+            issues.append("BalancesNotReady")
+
+        try:
+            nav = 0.0
+            if self.shared_state and hasattr(self.shared_state, "get_nav_quote"):
+                nav_v = self.shared_state.get_nav_quote()
+                nav = float(await nav_v) if asyncio.iscoroutine(nav_v) else float(nav_v or 0.0)
+            if nav <= 0 and free_usdt_now <= 0:
+                if "BalancesNotReady" not in issues:
+                    issues.append("NAVNotReady")
+        except Exception:
+            pass
+
         # Capital gate epsilon (tolerance to avoid penny-level stalls)
         try:
             eps = float(self._cfg("CAPITAL_GATE_EPS_USDT", 0.10) or 0.10)
         except Exception:
             eps = 0.10
+
+        # --- E2) Startup sanity: filters coverage & free-quote floor ---
+        try:
+            coverage_pct, free_floor = await self._compute_startup_sanity_requirements()
+            detail["FiltersCoveragePct"] = float(f"{coverage_pct:.1f}")
+            detail["FreeQuoteFloor"] = float(f"{free_floor:.2f}")
+            min_coverage = float(self._cfg("STARTUP_MIN_FILTERS_COVERAGE_PCT", 50.0))
+            if coverage_pct < min_coverage:
+                issues.append("FiltersCoverageLow")
+            if free_floor > 0 and (free_usdt_now + eps) < free_floor:
+                issues.append("FreeQuoteBelowFloor")
+        except Exception:
+            self.logger.debug("startup sanity requirements check failed", exc_info=True)
 
         # --- F) Affordability probe (Path A: SharedState snapshot; Path B: ExecutionManager fallback) ---
         try:
@@ -2649,7 +3155,7 @@ class AppContext:
             detail["affordability_failure"] = "Amount rounded to zero (Rule 2)"
         elif probe.get("ok") and float(probe.get("amount", 0.0)) > 0:
             # This would be an internal inconsistency in EM (ok=True but gap > 0)
-            self.logger.warning(f"EM internal inconsistency: ok=True but gap={probe.get('amount')}")
+            self.logger.warning("EM internal inconsistency: ok=True but gap=%s", probe.get("amount"))
 
         # De-duplicate any accumulated issues
         issues = list(dict.fromkeys(issues))
@@ -2775,7 +3281,7 @@ class AppContext:
                         asyncio.create_task(evt)
 
                 self.logger.info(
-                    "⬆️ Raised unified min-notional floor from %.2f → %.2f (sym=%s, reason=%s)",
+                    "Raised unified min-notional floor from %.2f -> %.2f (sym=%s, reason=%s)",
                     floor_now, target_floor, symbol, reason,
                 )
         except Exception:
@@ -2789,6 +3295,9 @@ class AppContext:
         """
         def _get_cls(mod, name: str):
             return getattr(mod, name, None) if mod else None
+
+        def _missing_deps(**deps: Any) -> List[str]:
+            return [name for name, value in deps.items() if value is None]
 
         # ExchangeClient (before others that depend on it)
         # Load API keys from environment
@@ -2806,11 +3315,49 @@ class AppContext:
                 api_key=BINANCE_API_KEY,
                 api_secret=BINANCE_API_SECRET
             )
+            if self.exchange_client is None and ExchangeClient is not None:
+                try:
+                    self.logger.warning(
+                        "[Bootstrap] ExchangeClient _try_construct returned None; attempting direct construction for diagnostics..."
+                    )
+                    self.exchange_client = ExchangeClient(
+                        config=self.config,
+                        logger=self.logger,
+                        app=self,
+                        shared_state=self.shared_state,
+                        api_key=BINANCE_API_KEY,
+                        api_secret=BINANCE_API_SECRET,
+                    )
+                except Exception as e_direct:
+                    self.logger.error(
+                        "[Bootstrap] ExchangeClient direct construction failed: %s: %s",
+                        type(e_direct).__name__,
+                        e_direct,
+                        exc_info=True,
+                    )
         # Fallback: use module-level factory if direct construction failed
         if self.exchange_client is None and _exchange_mod is not None:
             _factory = getattr(_exchange_mod, "get_global_exchange_client", None)
             if callable(_factory):
-                self.exchange_client = _factory(config=self.config, logger=self.logger, app=self, shared_state=self.shared_state)
+                try:
+                    self.exchange_client = _factory(
+                        config=self.config,
+                        logger=self.logger,
+                        app=self,
+                        shared_state=self.shared_state,
+                    )
+                except Exception as e_factory:
+                    self.logger.error(
+                        "[Bootstrap] ExchangeClient factory construction failed: %s: %s",
+                        type(e_factory).__name__,
+                        e_factory,
+                        exc_info=True,
+                    )
+
+        if self.exchange_client is None:
+            self.logger.error(
+                "[Bootstrap] ExchangeClient unavailable; downstream components requiring signed/order-capable exchange access may be skipped."
+            )
 
         # SharedState
         if self.shared_state is None:
@@ -2847,6 +3394,38 @@ class AppContext:
             except Exception:
                 self.logger.debug("ComponentStatusLogger binding failed in _ensure_components_built", exc_info=True)
 
+        # ExchangeTruthAuditor (governance-only reconciliation layer)
+        if self.exchange_truth_auditor is None:
+            ExchangeTruthAuditor = _get_cls(_truth_auditor_mod, "ExchangeTruthAuditor")
+            if ExchangeTruthAuditor:
+                self.exchange_truth_auditor = _try_construct(
+                    ExchangeTruthAuditor,
+                    config=self.config,
+                    logger=self.logger,
+                    app=self,
+                    shared_state=self.shared_state,
+                    exchange_client=self.exchange_client,
+                )
+                if self.exchange_truth_auditor is None:
+                    try:
+                        self.logger.warning(
+                            "[Bootstrap] ExchangeTruthAuditor _try_construct returned None; attempting direct construction for diagnostics..."
+                        )
+                        self.exchange_truth_auditor = ExchangeTruthAuditor(
+                            config=self.config,
+                            logger=self.logger,
+                            shared_state=self.shared_state,
+                            exchange_client=self.exchange_client,
+                            app=self,
+                        )
+                    except Exception as e_direct:
+                        self.logger.error(
+                            "[Bootstrap] ExchangeTruthAuditor direct construction failed: %s: %s",
+                            type(e_direct).__name__,
+                            e_direct,
+                            exc_info=True,
+                        )
+
         # Prepare candidate kwargs for all subsequent components
         ck = {
             "config": self.config,
@@ -2871,12 +3450,37 @@ class AppContext:
         if self.cash_router is None:
             CashRouter = _get_cls(_cash_router_mod, "CashRouter")
             if CashRouter:
-                self.cash_router = _try_construct(CashRouter, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state)
+                self.cash_router = _try_construct(
+                    CashRouter,
+                    config=self.config,
+                    logger=self.logger,
+                    app=self,
+                    shared_state=self.shared_state,
+                    execution_manager=self.execution_manager,
+                )
 
         # SymbolManager
         if self.symbol_manager is None:
             SymbolManager = _get_cls(_symbol_mgr_mod, "SymbolManager")
             self.symbol_manager = _try_construct(SymbolManager, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, exchange_client=self.exchange_client)
+
+        # CapitalSymbolGovernor
+        if self.capital_symbol_governor is None:
+            CapitalSymbolGovernor = _get_cls(_governor_mod, "CapitalSymbolGovernor")
+            self.capital_symbol_governor = _try_construct(CapitalSymbolGovernor, config=self.config, logger=self.logger, shared_state=self.shared_state)
+
+        # UniverseRotationEngine
+        if self.universe_rotation_engine is None:
+            UniverseRotationEngine = _get_cls(_uure_mod, "UniverseRotationEngine")
+            self.universe_rotation_engine = _try_construct(
+                UniverseRotationEngine,
+                shared_state=self.shared_state,
+                capital_governor=self.capital_symbol_governor,
+                config=self.config,
+                execution_manager=self.execution_manager,
+                meta_controller=self.meta_controller,
+                logger=self.logger,
+            )
 
         # MarketDataFeed
         if self.market_data_feed is None:
@@ -2887,38 +3491,114 @@ class AppContext:
         if self.execution_manager is None:
             ExecutionManager = _get_cls(_execution_mod, "ExecutionManager")
             self.execution_manager = _try_construct(ExecutionManager, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, exchange_client=self.exchange_client)
+            if self.execution_manager is None and ExecutionManager is not None:
+                missing = _missing_deps(shared_state=self.shared_state, exchange_client=self.exchange_client)
+                if missing:
+                    self.logger.error(
+                        "[Bootstrap] ExecutionManager skipped: missing dependencies (%s).",
+                        ", ".join(missing),
+                    )
+                else:
+                    try:
+                        self.logger.warning(
+                            "[Bootstrap] ExecutionManager _try_construct returned None; attempting direct construction for diagnostics..."
+                        )
+                        self.execution_manager = ExecutionManager(
+                            config=self.config,
+                            shared_state=self.shared_state,
+                            exchange_client=self.exchange_client,
+                        )
+                    except Exception as e_direct:
+                        self.logger.error(
+                            "[Bootstrap] ExecutionManager direct construction failed: %s: %s",
+                            type(e_direct).__name__,
+                            e_direct,
+                            exc_info=True,
+                        )
+
+        # Inject TradeJournal + session_id into ExecutionManager
+        if self.execution_manager:
+            self.execution_manager.trade_journal = self.trade_journal
+            self.execution_manager.session_id = self.session_id
+
+        # Wire ExecutionManager into ExchangeTruthAuditor for full SELL lifecycle finalization
+        if self.exchange_truth_auditor and self.execution_manager:
+            if hasattr(self.exchange_truth_auditor, "set_execution_manager"):
+                self.exchange_truth_auditor.set_execution_manager(self.execution_manager)
+
+        # AdaptiveCapitalEngine - after execution manager is ready
+        if self.adaptive_capital_engine is None:
+            AdaptiveCapitalEngine = _get_cls(_adaptive_capital_mod, "AdaptiveCapitalEngine")
+            if AdaptiveCapitalEngine:
+                # AdaptiveCapitalEngine only needs config and logger
+                self.adaptive_capital_engine = AdaptiveCapitalEngine(config=self.config, logger=self.logger)
+                self.logger.info("[Bootstrap] AdaptiveCapitalEngine constructed successfully")
+            else:
+                self.logger.warning("[Bootstrap] AdaptiveCapitalEngine class not found in module")
 
         # MetaController - Direct import due to file/package naming conflict
         if self.meta_controller is None:
-            try:
-                from core.meta_controller import MetaController
-                
-                # NOTE: MetaController creates its own logger internally, don't pass logger parameter
-                self.meta_controller = _try_construct(
-                    MetaController,
-                    config=self.config,
-                    app=self,
-                    shared_state=self.shared_state,
-                    execution_manager=self.execution_manager,
-                    exchange_client=self.exchange_client,
-                    cash_router=self.cash_router,
+            missing = _missing_deps(
+                shared_state=self.shared_state,
+                exchange_client=self.exchange_client,
+                execution_manager=self.execution_manager,
+            )
+            if missing:
+                self.logger.error(
+                    "[Bootstrap] MetaController skipped: missing dependencies (%s).",
+                    ", ".join(missing),
                 )
-                # If _try_construct returns None, attempt a direct construction for visibility
-                if self.meta_controller is None:
-                    try:
-                        self.logger.warning("[Bootstrap] MetaController _try_construct returned None; attempting direct construction for diagnostics...")
-                        self.meta_controller = MetaController(
-                            shared_state=self.shared_state,
-                            exchange_client=self.exchange_client,
-                            execution_manager=self.execution_manager,
-                            config=self.config,
-                        )
-                    except Exception as e_direct:
-                        self.logger.error(f"[Bootstrap] MetaController direct construction failed: {e_direct}", exc_info=True)
-                        self.meta_controller = None
-            except Exception as e:
-                self.logger.error(f"[Bootstrap] MetaController construction failed: {e}", exc_info=True)
-                self.meta_controller = None
+            else:
+                try:
+                    from core.meta_controller import MetaController
+
+                    # NOTE: MetaController creates its own logger internally, don't pass logger parameter
+                    self.meta_controller = _try_construct(
+                        MetaController,
+                        config=self.config,
+                        app=self,
+                        shared_state=self.shared_state,
+                        execution_manager=self.execution_manager,
+                        exchange_client=self.exchange_client,
+                        cash_router=self.cash_router,
+                        adaptive_capital_engine=self.adaptive_capital_engine,
+                    )
+                    # If _try_construct returns None, attempt a direct construction for visibility
+                    if self.meta_controller is None:
+                        try:
+                            self.logger.warning("[Bootstrap] MetaController _try_construct returned None; attempting direct construction for diagnostics...")
+                            self.meta_controller = MetaController(
+                                shared_state=self.shared_state,
+                                exchange_client=self.exchange_client,
+                                execution_manager=self.execution_manager,
+                                config=self.config,
+                                adaptive_capital_engine=self.adaptive_capital_engine,
+                            )
+                        except Exception as e_direct:
+                            self.logger.error("[Bootstrap] MetaController direct construction failed: %s", e_direct, exc_info=True)
+                            self.meta_controller = None
+                except Exception as e:
+                    self.logger.error("[Bootstrap] MetaController construction failed: %s", e, exc_info=True)
+                    self.meta_controller = None
+
+        # Ensure UURE has late-bound runtime deps needed for eviction/liquidation.
+        try:
+            if self.universe_rotation_engine:
+                if hasattr(self.universe_rotation_engine, "wire_runtime_dependencies"):
+                    self.universe_rotation_engine.wire_runtime_dependencies(
+                        capital_governor=self.capital_symbol_governor,
+                        execution_manager=self.execution_manager,
+                        meta_controller=self.meta_controller,
+                    )
+                else:
+                    if self.capital_symbol_governor is not None:
+                        setattr(self.universe_rotation_engine, "governor", self.capital_symbol_governor)
+                    if self.execution_manager is not None:
+                        setattr(self.universe_rotation_engine, "exec", self.execution_manager)
+                    if self.meta_controller is not None:
+                        setattr(self.universe_rotation_engine, "mc", self.meta_controller)
+        except Exception:
+            self.logger.debug("UURE runtime dependency wiring failed", exc_info=True)
 
         # Strategy/Agents/Risk
         if self.strategy_manager is None:
@@ -2945,11 +3625,47 @@ class AppContext:
             self.alert_system = _try_construct(AlertSystem, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state)
         if self.tp_sl_engine is None:
             TPSLEngine = _get_cls(_tpsl_mod, "TPSLEngine")
-            self.tp_sl_engine = _try_construct(TPSLEngine, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, execution_manager=self.execution_manager)
+            missing = _missing_deps(shared_state=self.shared_state, execution_manager=self.execution_manager)
+            if missing:
+                self.logger.error(
+                    "[Bootstrap] TPSLEngine skipped: missing dependencies (%s).",
+                    ", ".join(missing),
+                )
+            else:
+                self.tp_sl_engine = _try_construct(
+                    TPSLEngine,
+                    config=self.config,
+                    logger=self.logger,
+                    app=self,
+                    shared_state=self.shared_state,
+                    execution_manager=self.execution_manager,
+                )
+                if self.tp_sl_engine is None and TPSLEngine is not None:
+                    try:
+                        self.logger.warning(
+                            "[Bootstrap] TPSLEngine _try_construct returned None; attempting direct construction for diagnostics..."
+                        )
+                        self.tp_sl_engine = TPSLEngine(
+                            shared_state=self.shared_state,
+                            config=self.config,
+                            execution_manager=self.execution_manager,
+                        )
+                    except Exception as e_direct:
+                        self.logger.error(
+                            "[Bootstrap] TPSLEngine direct construction failed: %s: %s",
+                            type(e_direct).__name__,
+                            e_direct,
+                            exc_info=True,
+                        )
             if self.tp_sl_engine is None:
                 self.logger.error("[Bootstrap] TPSLEngine construction failed or returned None")
             else:
                 self.logger.info("[Bootstrap] TPSLEngine constructed: %s", type(self.tp_sl_engine).__name__)
+        # Inject TradeJournal + session_id into TPSLEngine
+        if self.tp_sl_engine:
+            self.tp_sl_engine.trade_journal = self.trade_journal
+            self.tp_sl_engine.session_id = self.session_id
+
         # Wire TP/SL engine into core execution path (mandatory exits)
         try:
             if self.tp_sl_engine and self.execution_manager:
@@ -3006,10 +3722,15 @@ class AppContext:
         # Recovery bits
         if self.recovery_engine is None:
             RecoveryEngine = _get_cls(_recovery_mod, "RecoveryEngine")
-            self.recovery_engine = _try_construct(RecoveryEngine, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, exchange_client=self.exchange_client, database_manager=self.database_manager)
-        if self.pnl_calculator is None:
-            PnLCalculator = _get_cls(_pnl_mod, "PnLCalculator")
-            self.pnl_calculator = _try_construct(PnLCalculator, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state)
+            self.recovery_engine = _try_construct(
+                RecoveryEngine,
+                config=self.config,
+                logger=self.logger,
+                app=self,
+                shared_state=self.shared_state,
+                exchange_client=self.exchange_client,
+                execution_manager=self.execution_manager,
+            )
 
         if self.profit_target_engine is None:
             ProfitTargetEngine = _get_cls(_ptg_mod, "ProfitTargetEngine")
@@ -3046,15 +3767,20 @@ class AppContext:
         self.liq_orch = self.liquidation_orchestrator
 
         if self.meta_controller and self.liquidation_orchestrator:
-             # P9: Wire orchestration for opportunistic liquidations
-             if hasattr(self.meta_controller, "set_liquidation_orchestrator"):
-                 self.meta_controller.set_liquidation_orchestrator(self.liquidation_orchestrator)
+            # P9: Wire orchestration for opportunistic liquidations
+            if hasattr(self.meta_controller, "set_liquidation_orchestrator"):
+                self.meta_controller.set_liquidation_orchestrator(self.liquidation_orchestrator)
 
         if self.meta_controller and self.compounding_engine:
-             # P9: Wire compounding for loop summary reporting
-             if hasattr(self.meta_controller, "set_compounding_engine"):
-                 self.meta_controller.set_compounding_engine(self.compounding_engine)
+            # P9: Wire compounding for loop summary reporting
+            if hasattr(self.meta_controller, "set_compounding_engine"):
+                self.meta_controller.set_compounding_engine(self.compounding_engine)
 
+        # Enforce single SharedState identity across core execution components.
+        try:
+            self._enforce_shared_state_identity(emit_summary=True)
+        except Exception:
+            self.logger.debug("shared_state identity enforcement failed", exc_info=True)
 
         dust_metrics = self._dust_metrics_snapshot()
 
@@ -3063,34 +3789,31 @@ class AppContext:
                          bool(self.execution_manager), bool(self.meta_controller),
                          bool(self.agent_manager), bool(self.risk_manager), bool(self.dashboard_server),
                          bool(self.capital_allocator), bool(self.dust_monitor))
-        try:
-            asyncio.create_task(self._emit_summary(
-                "BOOT_INVENTORY",
-                exch=bool(self.exchange_client),
-                shared=bool(self.shared_state),
-                mdf=bool(self.market_data_feed),
-                exec=bool(self.execution_manager),
-                meta=bool(self.meta_controller),
-                agents=bool(self.agent_manager),
-                risk=bool(self.risk_manager),
-                liq_agent=bool(self.liquidation_agent),
-                liq_orch=bool(self.liquidation_orchestrator),
-                cap_alloc=bool(self.capital_allocator),
-                dust_monitor=bool(self.dust_monitor),
-                dust_registry_size=dust_metrics.get("registry_size"),
-                dust_origin_breakdown=dust_metrics.get("origin_breakdown"),
-                dust_external_pct=dust_metrics.get("external_pct"),
-            ))
-        except Exception:
-            pass
+        self._summary_ff(
+            "BOOT_INVENTORY",
+            exch=bool(self.exchange_client),
+            shared=bool(self.shared_state),
+            mdf=bool(self.market_data_feed),
+            exec=bool(self.execution_manager),
+            meta=bool(self.meta_controller),
+            agents=bool(self.agent_manager),
+            risk=bool(self.risk_manager),
+            liq_agent=bool(self.liquidation_agent),
+            liq_orch=bool(self.liquidation_orchestrator),
+            cap_alloc=bool(self.capital_allocator),
+            dust_monitor=bool(self.dust_monitor),
+            dust_registry_size=dust_metrics.get("registry_size"),
+            dust_origin_breakdown=dust_metrics.get("origin_breakdown"),
+            dust_external_pct=dust_metrics.get("external_pct"),
+        )
 
     @property
     def has_liq_agent(self) -> bool:
-        return bool(self.liquidation_agent or self.liq_agent)
+        return bool(self.liquidation_agent)
 
     @property
     def has_liq_orch(self) -> bool:
-        return bool(self.liquidation_orchestrator or self.liq_orch)
+        return bool(self.liquidation_orchestrator)
 
     async def _periodic_readiness_log(self, every_sec: int = 30):
         while True:
@@ -3150,9 +3873,17 @@ class AppContext:
         """Run phased initialization. Phases are best-effort; optional comps may be absent."""
         # Prevent concurrent init runs
         async with self._init_lock:
-            if self._init_started:
-                self.logger.info("[Init] initialize_all called again; waiting for current run to progress")
-            self._init_started = True
+            if self._init_completed and up_to_phase <= self._init_highest_phase:
+                self.logger.info(
+                    "[Init] initialize_all already completed up to P%s; skipping (requested up_to_phase=%s)",
+                    self._init_highest_phase, up_to_phase,
+                )
+                try:
+                    await self._emit_summary("INIT_DUPLICATE_CALL_SKIPPED", up_to_phase=up_to_phase,
+                                             highest_phase=self._init_highest_phase)
+                except Exception:
+                    pass
+                return
             log_structured_info("[Init] Starting phased initialization up to P%d" % up_to_phase, component="AppContext")
             await self._emit_summary("INIT_START", up_to_phase=up_to_phase)
             await self._emit_health_status("STARTING", {"up_to_phase": up_to_phase})
@@ -3180,7 +3911,7 @@ class AppContext:
             if wait_ready_secs > 0 and not gate_list:
                 gate_list = ["market_data", "execution", "capital", "exchange", "startup_sanity"]
             if wait_ready_secs > 0:
-                self.logger.info("⏳ Ready-gating → wait_ready_secs=%s | gates=%s", wait_ready_secs, ",".join(gate_list))
+                self.logger.info("[AppContext] Ready-gating wait_ready_secs=%s gates=%s", wait_ready_secs, ",".join(gate_list))
 
             # P3: Hard gate exchange public readiness + balances, then universe bootstrap
             if up_to_phase >= 3:
@@ -3206,6 +3937,22 @@ class AppContext:
                 except Exception:
                     self.logger.debug("P3.55 ensure_exchange_public_ready failed (non-fatal)", exc_info=True)
 
+                # P3.58: Exchange truth reconciliation loop (governance-only)
+                if self.exchange_truth_auditor and any(
+                    hasattr(self.exchange_truth_auditor, nm) for nm in ("start", "start_async", "run", "run_async")
+                ):
+                    await self._start_with_timeout("P3_truth_auditor", self.exchange_truth_auditor)
+                else:
+                    try:
+                        await self._emit_summary(
+                            "PHASE_SKIP",
+                            phase="P3_truth_auditor",
+                            status="SKIPPED",
+                            reason=("ComponentMissing" if not self.exchange_truth_auditor else "NoStartMethod"),
+                        )
+                    except Exception:
+                        pass
+
             # P3.6: SharedState background tasks (balances/NAV/events)
             if up_to_phase >= 3 and self.shared_state and hasattr(self.shared_state, "start_background_tasks"):
                 try:
@@ -3221,13 +3968,42 @@ class AppContext:
             # This guards against treating "existing positions" as errors on restart
             # ═══════════════════════════════════════════════════════════════════════════════════
             is_restart = await self._detect_restart_mode()
-            if is_restart:
+
+            # Propagate restart detection into SharedState so downstream components
+            # (MetaController, ExecutionLogic) can check it without re-running detection.
+            try:
+                if self.shared_state:
+                    self.shared_state._is_restart = is_restart
+            except Exception:
+                self.logger.debug("failed to set _is_restart on shared_state", exc_info=True)
+
+            # Check LIVE_MODE: live systems ALWAYS use pure reconciliation startup
+            is_live_mode = self._cfg_bool("LIVE_MODE", default=False)
+
+            if is_restart or is_live_mode:
                 self.logger.warning(
-                    "[AppContext:RestartMode] System operating in RESTART mode. "
-                    "Existing positions will be OBSERVED and MANAGED per strategy, not liquidated."
+                    "[AppContext:StartupPolicy] PURE RECONCILIATION startup (restart=%s, live_mode=%s). "
+                    "No forced entries. No seed trades. No capital overrides. No confidence bypasses. "
+                    "Existing positions will be OBSERVED and MANAGED per strategy.",
+                    is_restart, is_live_mode,
                 )
+                # Force-disable bootstrap seed so MetaController cannot fire it
+                try:
+                    setattr(self.config, "BOOTSTRAP_SEED_ENABLED", False)
+                    setattr(self.config, "COLD_BOOTSTRAP_ENABLED", False)
+                except Exception:
+                    pass
+                try:
+                    await self._emit_summary("STARTUP_POLICY", mode="RECONCILIATION_ONLY",
+                                             is_restart=is_restart, is_live_mode=is_live_mode,
+                                             bootstrap_seed_enabled=False, cold_bootstrap_enabled=False)
+                except Exception:
+                    pass
             else:
-                self.logger.info("[AppContext:ColdStart] System operating in COLD_START mode (no prior trading history)")
+                self.logger.info(
+                    "[AppContext:ColdStart] System operating in COLD_START mode (no prior trading history). "
+                    "Bootstrap seed will only fire if COLD_BOOTSTRAP_ENABLED=True and BOOTSTRAP_SEED_ENABLED=True."
+                )
             
             # P3.65: Ensure SymbolManager is fully wired before any symbol proposals (e.g., WalletScanner)
             try:
@@ -3354,8 +4130,9 @@ class AppContext:
             except Exception:
                 self.logger.debug("P3.95 exchange client propagation failed (non-fatal)", exc_info=True)
 
+            # P4: Market data feed (HARD GATE — failure blocks P5+ if gate not met)
+            _p4_gate_ok = True
             try:
-                # P4: Market data feed (HARD GATE)
                 if up_to_phase >= 4 and self.market_data_feed and any(hasattr(self.market_data_feed, nm) for nm in ("start","start_async","run","run_async")):
                     # Start MDF (supports start/start_async/run/run_async) and apply timeout handling
                     await self._start_with_timeout("P4_market_data", self.market_data_feed)
@@ -3366,7 +4143,16 @@ class AppContext:
                         md_timeout = 180
                     snap = await self._wait_until_ready(gates=["exchange","universe","market_data"], timeout_sec=md_timeout, poll_sec=2.0)
                     if "SymbolsUniverseEmpty" in snap.get("issues", []) or "MarketDataNotReady" in snap.get("issues", []):
-                        raise RuntimeError("P4GateNotSatisfied")
+                        _p4_gate_ok = False
+                        log_structured_error(
+                            RuntimeError("P4GateNotSatisfied"),
+                            context={"where": "initialize_all:P4", "issues": snap.get("issues", [])},
+                            logger=self.logger, component="AppContext", phase="INIT", event="p4_gate_failed",
+                        )
+                        try:
+                            await self._emit_summary("INIT_EXCEPTION", error="P4GateNotSatisfied", issues=snap.get("issues", []))
+                        except Exception:
+                            pass
                 else:
                     # Explain why we skipped P4
                     reason = "PhaseDisabled" if up_to_phase < 4 else ("ComponentMissing" if not self.market_data_feed else "NoStartMethod")
@@ -3382,8 +4168,20 @@ class AppContext:
                                              requested=(up_to_phase >= 4))
                 except Exception:
                     pass
+            except Exception as e:
+                _p4_gate_ok = False
+                log_structured_error(e, context={"where": "initialize_all:P4"}, logger=self.logger,
+                                     component="AppContext", phase="INIT", event="init_exception")
+                try:
+                    await self._emit_summary("INIT_EXCEPTION", error=str(e))
+                except Exception:
+                    pass
 
-                # P5: Execution manager warmup (requires exchange + universe + balances)
+            # P5: Execution manager warmup — only proceeds if P4 gate passed
+            if not _p4_gate_ok:
+                self.logger.error("[AppContext] P4 gate failed — aborting P5+ startup to avoid trading with bad market data.")
+                return
+            try:
                 if up_to_phase >= 5 and self.execution_manager and any(hasattr(self.execution_manager, nm) for nm in ("start","start_async","run","run_async")):
                     # Allow execution warmup if balances are reported ready OR we can observe non-zero free USDT.
                     balances_ready_flag = bool(getattr(self.shared_state, "balances_ready", False))
@@ -3417,6 +4215,19 @@ class AppContext:
                             self.logger.info("[P5_execution] warmup complete — symbol filters and balances should now be available to ExecutionManager.")
                         except Exception:
                             pass
+
+                        # Start AdaptiveCapitalEngine background task after execution manager is ready
+                        if self.adaptive_capital_engine:
+                            try:
+                                adaptive_task = asyncio.create_task(
+                                    self._run_adaptive_capital_monitor(),
+                                    name="adaptive_capital_monitor"
+                                )
+                                self._tasks.append(adaptive_task)
+                                self._tasks_map["adaptive_capital_monitor"] = adaptive_task
+                                self.logger.info("[AdaptiveCapitalEngine] Background monitoring task started")
+                            except Exception as e:
+                                self.logger.warning("[AdaptiveCapitalEngine] Failed to start background task: %s", e)
                 else:
                     try:
                         await self._emit_summary("PHASE_SKIP", phase="P5_execution", status="SKIPPED",
@@ -3424,7 +4235,7 @@ class AppContext:
                     except Exception:
                         pass
             except Exception as e:
-                log_structured_error(e, context={"where": "initialize_all:P4_P5"}, logger=self.logger,
+                log_structured_error(e, context={"where": "initialize_all:P5"}, logger=self.logger,
                                      component="AppContext", phase="INIT", event="init_exception")
                 try:
                     await self._emit_summary("INIT_EXCEPTION", error=str(e))
@@ -3454,7 +4265,7 @@ class AppContext:
                     # Sanity Check as requested
                     if not getattr(self.meta_controller, "_running", False):
                         raise RuntimeError("MetaController failed to enter running state; aborting downstream phases.")
-                    self.logger.info("✅ MetaController running state declared VALID. Proceeding to AgentManager.")
+                    self.logger.info("[AppContext] MetaController running state declared VALID. Proceeding to AgentManager.")
 
                 else:
                     try:
@@ -3463,7 +4274,8 @@ class AppContext:
                     except Exception:
                         pass
 
-                if self.strategy_manager and hasattr(self.strategy_manager, "start"):
+                _p6_start_methods = ("start", "start_async", "run", "run_async")
+                if self.strategy_manager and any(hasattr(self.strategy_manager, nm) for nm in _p6_start_methods):
                     await self._start_with_timeout("P6_strategy", self.strategy_manager)
                 else:
                     try:
@@ -3472,7 +4284,7 @@ class AppContext:
                     except Exception:
                         pass
 
-                if self.agent_manager and hasattr(self.agent_manager, "start"):
+                if self.agent_manager and any(hasattr(self.agent_manager, nm) for nm in _p6_start_methods):
                     await self._start_with_timeout("P6_agent_manager", self.agent_manager)
                 else:
                     try:
@@ -3481,7 +4293,7 @@ class AppContext:
                     except Exception:
                         pass
 
-                if self.risk_manager and hasattr(self.risk_manager, "start"):
+                if self.risk_manager and any(hasattr(self.risk_manager, nm) for nm in _p6_start_methods):
                     await self._start_with_timeout("P6_risk_manager", self.risk_manager)
                 else:
                     try:
@@ -3508,6 +4320,20 @@ class AppContext:
 
             # P7: Protective services
             if up_to_phase >= 7:
+                # CRITICAL FIX: Register components with shared_state BEFORE they start
+                # This prevents health gate from seeing "no-report" status
+                component_registrations = {
+                    "pnl_calculator": ("PnLCalculator", self.pnl_calculator),
+                    "tp_sl_engine": ("TPSLEngine", self.tp_sl_engine),
+                }
+                for comp_name, (display_name, obj) in component_registrations.items():
+                    if obj and hasattr(self.shared_state, "register_component"):
+                        try:
+                            await self.shared_state.register_component(display_name)
+                            await self.shared_state.update_component_status(display_name, "Initializing")
+                        except Exception:
+                            self.logger.debug(f"Failed to register {display_name} component status", exc_info=True)
+                
                 for name, phase in (
                     ("pnl_calculator", "P7_pnl_calculator"),
                     ("heartbeat", "P7_heartbeat"),
@@ -3517,8 +4343,25 @@ class AppContext:
                     ("dust_monitor", "P7_dust_monitor"),
                 ):
                     obj = getattr(self, name, None)
+                    if name == "tp_sl_engine":
+                        # Enforce single TPSL instance
+                        if self._tpsl_started:
+                            self.logger.info("[AppContext] TPSLEngine already started, skipping duplicate start")
+                            continue
+                        self._tpsl_started = True
                     if obj and hasattr(obj, "start"):
                         await self._start_with_timeout(phase, obj)
+                        # Update status after successful start
+                        if name == "tp_sl_engine" and hasattr(self.shared_state, "update_component_status"):
+                            try:
+                                await self.shared_state.update_component_status("TPSLEngine", "Running")
+                            except Exception:
+                                self.logger.debug("Failed to update TPSLEngine status", exc_info=True)
+                        elif name == "pnl_calculator" and hasattr(self.shared_state, "update_component_status"):
+                            try:
+                                await self.shared_state.update_component_status("PnLCalculator", "Running")
+                            except Exception:
+                                self.logger.debug("Failed to update PnLCalculator status", exc_info=True)
                     else:
                         try:
                             await self._emit_summary("PHASE_SKIP", phase=phase, status="SKIPPED",
@@ -3537,6 +4380,14 @@ class AppContext:
 
             # P8: Analytics / portfolio / orchestration
             if up_to_phase >= 8:
+                # CRITICAL FIX: Register PerformanceEvaluator with shared_state BEFORE it starts
+                if self.performance_evaluator and hasattr(self.shared_state, "register_component"):
+                    try:
+                        await self.shared_state.register_component("PerformanceEvaluator")
+                        await self.shared_state.update_component_status("PerformanceEvaluator", "Initializing")
+                    except Exception:
+                        self.logger.debug("Failed to register PerformanceEvaluator component status", exc_info=True)
+                
                 for name, phase in (
                     ("performance_monitor", "P8_performance_monitor"),
                     ("compounding_engine", "P8_compounding_engine"),
@@ -3569,6 +4420,12 @@ class AppContext:
                                     pass
                                 continue
                         await self._start_with_timeout(phase, obj)
+                        # Update status after successful start
+                        if name == "performance_evaluator" and hasattr(self.shared_state, "update_component_status"):
+                            try:
+                                await self.shared_state.update_component_status("PerformanceEvaluator", "Running")
+                            except Exception:
+                                self.logger.debug("Failed to update PerformanceEvaluator status", exc_info=True)
                     else:
                         try:
                             await self._emit_summary("PHASE_SKIP", phase=phase, status="SKIPPED",
@@ -3621,7 +4478,7 @@ class AppContext:
                 except Exception:
                     self.logger.debug("failed to spawn periodic readiness logger", exc_info=True)
                 ready = bool(snap.get("ready"))
-                log_structured_info("✅ Phased initialization complete.")
+                log_structured_info("Phased initialization complete.")
                 try:
                     await self._emit_summary("INIT_PHASES_SUMMARY", requested_up_to=up_to_phase,
                                              comps={"mdf": bool(self.market_data_feed),
@@ -3631,7 +4488,8 @@ class AppContext:
                                                     "risk": bool(self.risk_manager)})
                 except Exception:
                     pass
-                # Mark init completed and emit terminal health for startup
+                # Mark init completed and record highest phase reached
+                self._init_highest_phase = max(self._init_highest_phase, up_to_phase)
                 self._init_completed = True
                 try:
                     await self._emit_summary("INIT_COMPLETE", ready=bool(snap.get("ready")))
