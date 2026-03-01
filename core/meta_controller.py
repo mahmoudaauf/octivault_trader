@@ -10990,24 +10990,44 @@ class MetaController:
             # ─────────────────────────────────────────────────────────────────────
             # PHASE B: CAPITAL GOVERNOR - Position Limit Check
             # Enforce bracket-specific position limits before BUY execution
+            # CRITICAL: Sync authoritative balance first to ensure fresh NAV
             # ─────────────────────────────────────────────────────────────────────
             try:
-                # Get current NAV to determine account bracket
+                # Step 1: Sync authoritative balance to get fresh NAV
+                if hasattr(self.shared_state, "sync_authoritative_balance"):
+                    try:
+                        await self.shared_state.sync_authoritative_balance(force=True)
+                        self.logger.debug(
+                            "[Meta:CapitalGovernor] Synced authoritative balance for position limit check"
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            "[Meta:CapitalGovernor] Failed to sync balance: %s", e
+                        )
+                
+                # Step 2: Get fresh NAV after sync
                 nav = float(getattr(self.shared_state, "nav", 0.0) or 
                            getattr(self.shared_state, "total_value", 0.0) or 0.0)
                 
-                # Query Capital Governor for position limits at current bracket
+                if nav <= 0:
+                    self.logger.error(
+                        "[Meta:CapitalGovernor] Invalid NAV: %.2f - cannot evaluate position limits",
+                        nav
+                    )
+                    return None
+                
+                # Step 3: Query Capital Governor for position limits at current bracket
                 limits = self.capital_governor.get_position_limits(nav)
                 max_positions = limits.get("max_concurrent_positions", 1)
                 
-                # Count currently open positions
+                # Step 4: Count currently open positions
                 open_positions = self._count_open_positions()
                 
-                # Block BUY if position limit reached
+                # Step 5: Block BUY if position limit reached
                 if open_positions >= max_positions:
                     self.logger.warning(
-                        "[Meta:CapitalGovernor] Blocking BUY %s: Position limit reached (%d/%d open)",
-                        symbol, open_positions, max_positions
+                        "[Meta:CapitalGovernor] Blocking BUY %s: Position limit reached (%d/%d open) at NAV=$%.2f",
+                        symbol, open_positions, max_positions, nav
                     )
                     return {"ok": False, "status": "skipped", "reason": "position_limit_exceeded"}
                 
