@@ -9,10 +9,25 @@ from typing import Dict, Any, List, Optional, Tuple
 from utils.shared_state_tools import fee_bps
 
 class RotationExitAuthority:
-    def __init__(self, logger: logging.Logger, config: Any, shared_state: Any):
+    def __init__(self, logger: logging.Logger, config: Any, shared_state: Any, capital_governor=None):
         self.logger = logger
         self.config = config
         self.ss = shared_state
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PHASE C: Capital Governor Integration
+        # Enforce bracket-based rotation restrictions
+        # ═══════════════════════════════════════════════════════════════════
+        self.capital_governor = capital_governor
+        if self.capital_governor is None:
+            # Try to import if not provided (fallback)
+            try:
+                from core.capital_governor import CapitalGovernor
+                self.capital_governor = CapitalGovernor(config)
+                self.logger.info("[REA:Init] Capital Governor initialized for rotation enforcement (PHASE C)")
+            except ImportError:
+                self.logger.warning("[REA:Init] Capital Governor not available, rotation will not be restricted by bracket")
+                self.capital_governor = None
         
         # Configuration
         self.base_alpha_gap = float(getattr(config, "ROTATION_BASE_ALPHA_GAP", 0.005)) # 0.5% alpha gap
@@ -85,6 +100,60 @@ class RotationExitAuthority:
             except Exception:
                 return False
         return bool(getattr(self.ss, "cold_bootstrap", False))
+
+    def should_restrict_rotation(self, symbol: str) -> Tuple[bool, str]:
+        """
+        PHASE C: Check if rotation should be restricted for this symbol.
+        
+        Uses Capital Governor to enforce bracket-based rotation rules:
+        - MICRO: ✅ Restrict (no rotation allowed - focused learning)
+        - SMALL+: ❌ Allow (rotation permitted within tier limits)
+        
+        Args:
+            symbol: Symbol being considered for rotation
+            
+        Returns:
+            Tuple[bool, str]: (should_restrict, reason)
+            - (True, "micro_bracket_restriction") if rotation should be blocked
+            - (False, "") if rotation is allowed
+        """
+        if not self.capital_governor:
+            # No Governor available, allow rotation
+            return False, ""
+        
+        try:
+            # Get current NAV from SharedState
+            nav = float(getattr(self.ss, "nav", 0.0) or 
+                       getattr(self.ss, "total_value", 0.0) or 0.0)
+            
+            if nav <= 0:
+                # Default to allowing if NAV unavailable
+                return False, ""
+            
+            # Check if rotation should be restricted (MICRO bracket only)
+            should_restrict = self.capital_governor.should_restrict_rotation(nav)
+            
+            if should_restrict:
+                self.logger.warning(
+                    "[REA:RotationRestriction] Rotation blocked for %s: "
+                    "MICRO bracket (NAV=$%.2f) - focused learning phase",
+                    symbol, nav
+                )
+                return True, "micro_bracket_restriction"
+            else:
+                # Rotation allowed for this bracket
+                bracket = self.capital_governor.get_bracket(nav).value
+                self.logger.debug(
+                    "[REA:RotationRestriction] Rotation allowed for %s: "
+                    "%s bracket (NAV=$%.2f)",
+                    symbol, bracket, nav
+                )
+                return False, ""
+            
+        except Exception as e:
+            self.logger.error("[REA:RotationRestriction] Check failed: %s", e)
+            # Graceful fallback: allow rotation on error
+            return False, ""
 
     def _continuation_score(self, pos: Dict[str, Any]) -> float:
         """Best-effort continuation strength used to avoid rotating strong trend holds."""
@@ -200,6 +269,21 @@ class RotationExitAuthority:
         OVERRIDE AUTHORITY: This can override standard TPSL and mode constraints
         if the alpha gap (opportunity cost) is sufficient.
         """
+        # ─────────────────────────────────────────────────────────────────
+        # PHASE C: Capital Governor Rotation Restriction Check
+        # Block rotation in MICRO bracket for focused learning
+        # ─────────────────────────────────────────────────────────────────
+        if owned_positions:
+            first_symbol = next(iter(owned_positions.keys()), None)
+            if first_symbol:
+                should_restrict, reason = self.should_restrict_rotation(first_symbol)
+                if should_restrict:
+                    self.logger.warning(
+                        "[REA:authorize_rotation] PHASE_C_BLOCK: Rotation denied for %s: %s",
+                        first_symbol, reason
+                    )
+                    return None  # Block rotation
+        
         # Condition Check: Either we are full OR we are out of capital
         if sig_pos < max_pos and not is_starved:
             return None # Sufficient slots and capital; no rotation needed
@@ -318,6 +402,22 @@ class RotationExitAuthority:
             self._stagnation_streaks.clear()
             self.logger.debug("[REA:Stagnation] Cold bootstrap active; stagnation rotation disabled.")
             return None
+
+        # ─────────────────────────────────────────────────────────────────
+        # PHASE C: Capital Governor Rotation Restriction Check
+        # Block stagnation-based rotation in MICRO bracket
+        # ─────────────────────────────────────────────────────────────────
+        if owned_positions:
+            first_symbol = next(iter(owned_positions.keys()), None)
+            if first_symbol:
+                should_restrict, reason = self.should_restrict_rotation(first_symbol)
+                if should_restrict:
+                    self.logger.warning(
+                        "[REA:authorize_stagnation_exit] PHASE_C_BLOCK: "
+                        "Stagnation-based rotation denied for %s: %s",
+                        first_symbol, reason
+                    )
+                    return None
 
         # Startup grace: avoid purge during initial warm-up period after process start
         try:
