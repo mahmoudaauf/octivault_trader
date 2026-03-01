@@ -1,17 +1,5 @@
-# =============================
-# 1. Exchange Error Shims
-# Handles import of exchange-related exception classes. If unavailable, provides local fallback definitions for:
-# - BinanceAPIException
-# - ExecutionError
-# - ExecutionBlocked
-# =============================
 """
 Octivault Trader — P9 Canonical ExecutionManager (native to your SharedState & ExchangeClient)
-
-ARCHITECTURE MAINTENANCE NOTE:
-When making changes to execution logic, order placement, or component interfaces,
-please update the ARCHITECTURE.md file in the project root to reflect these changes.
-Key areas to review: execution flows, safety mechanisms, and component relationships.
 """
 
 from __future__ import annotations
@@ -25,157 +13,112 @@ from collections import deque
 import logging
 import json
 import time
-from decimal import Decimal, ROUND_DOWN
-# uuid import removed (unused)
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, Optional, Tuple, Union, Literal
-from core.stubs import resilient_trade, maybe_call
-from core.shared_state import PendingPositionIntent
+from core.stubs import resilient_trade, maybe_call, BinanceAPIException, ExecutionError
 
 # =============================
-# Utility shims (maybe_call, round_step, resilient_trade)
+# Utility shims
 # =============================
+try:
+    from core.shared_state import PendingPositionIntent
+except Exception:
+    PendingPositionIntent = None
+
 try:
     from utils import shared_state_tools, indicators, pnl_calculator
 except Exception:
-    import asyncio as _asyncio
-    from functools import wraps as _wraps
+    pass
 
 def round_step(value: float, step: float) -> float:
-    if step <= 0: return float(value)
+    if step <= 0:
+        return float(value)
     q = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
     return float(q * Decimal(str(step)))
 
 
-
-
 # =============================
-# Exchange error shims (BinanceAPIException, ExecutionError)
+# Exchange error shims
 # =============================
 try:
-    from core.stubs import BinanceAPIException, ExecutionError
-# type: ignore
+    from core.stubs import ExecutionBlocked
 except Exception:
-    class BinanceAPIException(Exception):
-        def __init__(self, code: int | None = None, message: str = ""):
+    class ExecutionBlocked(Exception):
+        def __init__(self, code: str, planned_quote: float, available_quote: float, min_required: float):
             self.code = code
-            super().__init__(message or f"BinanceAPIException({code})")
+            self.planned_quote = float(planned_quote or 0.0)
+            self.available_quote = float(available_quote or 0.0)
+            self.min_required = float(min_required or 0.0)
+            super().__init__(f"{code}: planned={self.planned_quote:.2f} available={self.available_quote:.2f} min_required={self.min_required:.2f}")
 
-    class ExecutionError(Exception):
-        def __init__(self, error_type: str, message: str = "", symbol: str = "", meta: dict | None = None):
-            self.error_type = error_type
-            self.symbol = symbol
-            self.meta = meta or {}
-            super().__init__(message or error_type)
 
-class ExecutionBlocked(Exception):
-    def __init__(self, code: str, planned_quote: float, available_quote: float, min_required: float):
-        self.code = code
-        self.planned_quote = float(planned_quote or 0.0)
-        self.available_quote = float(available_quote or 0.0)
-        self.min_required = float(min_required or 0.0)
-        super().__init__(f"{code}: planned={self.planned_quote:.2f} available={self.available_quote:.2f} min_required={self.min_required:.2f}")
-
-# =============================
-# 2. Order Filter Shims
-# Imports and/or defines data classes and validation helpers for order filtering and symbol constraints, such as:
-# - Symbol filters (e.g., min/max quantity, tick size)
-# - Order request validation
-# =============================
-# =============================
-# 3. Execution Manager Core
-# Contains the main ExecutionManager class and its methods, responsible for:
-# - Managing order execution logic
-# - Handling buy/sell blocks and cooldowns
-# - Logging and emitting execution events
-# - Pruning stale reservations and handling order failures
-# - Classifying and sanitizing execution errors and tags
-# =============================
-# =============================
-# 4. Position and Portfolio Management
-# Implements logic for:
-# - Checking and updating position readiness
-# - Calculating available balances and notional values
-# - Enforcing portfolio-level PnL improvement and dust retirement rules
-# - Handling terminal dust and minimum notional checks
-# =============================
-# =============================
-# 5. Utility Methods
-# Provides helper methods for:
-# - Symbol normalization and splitting
-# - Decision ID resolution
-# - Miscellaneous internal utilities for the execution manager
-# =============================
-# =============================
-# 6. Exception and Error Handling
-# Defines custom exceptions and error classification logic to:
-# - Standardize error reporting
-# - Integrate with exchange and portfolio state
-# - Support robust error handling throughout the execution process
-# =============================
-from dataclasses import dataclass
-@dataclass
 class SymbolFilters:
-    step_size: float
-    min_qty: float
-    max_qty: float
-    tick_size: float
-    min_notional: float
-    min_entry_quote: float = 0.0
+    def __init__(self, step_size: float = 0.0, min_qty: float = 0.0,
+                 max_qty: float = 0.0, tick_size: float = 0.0,
+                 min_notional: float = 0.0, min_entry_quote: float = 0.0):
+        self.step_size = step_size
+        self.min_qty = min_qty
+        self.max_qty = max_qty
+        self.tick_size = tick_size
+        self.min_notional = min_notional
+        self.min_entry_quote = min_entry_quote
+
 
 async def validate_order_request(*, side: str, qty: float, price: float,
-                                    filters: SymbolFilters, taker_fee_bps: int = 10,
-                                    use_quote_amount: Optional[float] = None):
+                                  filters: SymbolFilters, taker_fee_bps: int = 10,
+                                  use_quote_amount: Optional[float] = None):
     if price <= 0:
         return False, 0.0, 0.0, "invalid_price"
     if use_quote_amount is not None:
-        spend = float(use_quote_amount)
-        # 1. Nominal Floor Check (Spec Requirement 1.1)
-        if spend < max(filters.min_notional, filters.min_entry_quote or 0.0):
+        # INSTITUTIONAL FIX: Round UP to satisfy min_notional, not down
+        min_required_notional = max(filters.min_notional, filters.min_entry_quote or 0.0)
+        if use_quote_amount < min_required_notional:
             return False, 0.0, 0.0, "QUOTE_LT_MIN_NOTIONAL"
+
+        step = float(filters.step_size or 0.0)
+        price_safe = price if price > 0 else 1.0
         
-        # 2. Executable Quantity Check (Spec Requirement 1.2)
-        # Affordability = "The trade produces a non-zero executable quantity"
-        from decimal import Decimal, ROUND_DOWN
-        step = float(filters.step_size or 0.0) # BOOTSTRAP FIX: Handle 0.0 step
-        price_safe = price if price > 0 else 1.0 # Guard zero div
-        estimated_qty = spend / price_safe
-        
+        # Calculate minimum required quote to meet notional floor
+        min_required_quote = max(use_quote_amount, min_required_notional)
+        estimated_qty = min_required_quote / price_safe
+
         if step > 0:
-            q = (Decimal(str(estimated_qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+            # Round UP to ensure we meet min_notional constraint
+            q = (Decimal(str(estimated_qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_UP)
             qty = float(q * Decimal(str(step)))
         else:
             qty = estimated_qty
-            
-        # STRICT CHECK: If rounding kills the quantity, we CANNOT execute.
+
         if qty <= 0:
             return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
 
         if qty < float(filters.min_qty):
             return False, 0.0, 0.0, "QTY_LT_MIN"
-            
-        # STRICT CHECK: Final notional must still meet min_notional after rounding
-        if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
+
+        final_notional = qty * price
+        
+        # Final validation: notional must meet minimum
+        if final_notional < min_required_notional:
             return False, 0.0, 0.0, "NOTIONAL_LT_MIN_AFTER_ROUNDING"
-            
+
+        # Spend amount is recalculated based on rounded-up qty
+        spend = final_notional
         return True, float(qty), spend, "OK"
     else:
-        from decimal import Decimal, ROUND_DOWN
         step = float(filters.step_size or 0.0)
         if step > 0:
             q = (Decimal(str(qty)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
             qty = float(q * Decimal(str(step)))
-        
+
         if qty <= 0:
             return False, 0.0, 0.0, "ZERO_QTY_AFTER_ROUNDING"
-            
+
         if qty * price < max(filters.min_notional, filters.min_entry_quote or 0.0):
-            # Strict Rule 2.1: amount == 0 -> ExecutionProbe = FAIL
             return False, 0.0, 0.0, "NOTIONAL_LT_MIN"
         return True, float(qty), 0.0, "OK"
 
-# =============================
-# ExecutionManager
-# =============================
+
+logger = logging.getLogger("ExecutionManager")
 
 class ExecutionManager:
     """
@@ -185,42 +128,199 @@ class ExecutionManager:
     """
     
     @staticmethod
-    def _round_step_down(value: float, step: float) -> float:
-        """Safe step rounding (floor)."""
-        if step <= 0: return value
-        import math
-        # Avoid float precision garbage
-        steps = math.floor(value / step)
-        return steps * step
-
-    def _normalize_quote_precision(self, symbol: str, quote: float) -> float:
-        """Normalize quote amount to exchange precision requirements."""
-        precision = 8
+    def _safe_float(val: Any, default: float = 0.0) -> float:
         try:
-            precision = int(self.exchange_client.get_quote_precision(symbol))
+            return float(val)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _round_step_down(value: float, step: float) -> float:
+        if step <= 0:
+            return float(value)
+        try:
+            q = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+            return float(q * Decimal(str(step)))
         except Exception:
-            precision = 8
-        scale = Decimal("1").scaleb(-max(0, precision))
-        q = Decimal(str(float(quote or 0.0))).quantize(scale, rounding=ROUND_DOWN)
-        return float(q)
+            return float(0.0)
+
+    def _resolve_post_fill_price(self, order: Dict[str, Any], exec_qty: float) -> float:
+        """
+        Resolve best-effort execution price from exchange payload.
+        Handles MARKET responses where `price` may be "0.00000000".
+        """
+        avg_price = self._safe_float(order.get("avgPrice") or order.get("avg_price") or 0.0, 0.0)
+        if avg_price > 0:
+            return float(avg_price)
+
+        cumm_quote = self._safe_float(
+            order.get("cummulativeQuoteQty") or order.get("cummulative_quote"),
+            0.0,
+        )
+        if cumm_quote > 0 and exec_qty > 0:
+            return float(cumm_quote / max(exec_qty, 1e-12))
+
+        fills = order.get("fills") or []
+        if isinstance(fills, list) and fills:
+            weighted_num = 0.0
+            weighted_den = 0.0
+            for f in fills:
+                if not isinstance(f, dict):
+                    continue
+                q = self._safe_float(f.get("qty"), 0.0)
+                p = self._safe_float(f.get("price"), 0.0)
+                if q > 0 and p > 0:
+                    weighted_num += q * p
+                    weighted_den += q
+            if weighted_den > 0:
+                return float(weighted_num / weighted_den)
+            for f in fills:
+                if not isinstance(f, dict):
+                    continue
+                p = self._safe_float(f.get("price"), 0.0)
+                if p > 0:
+                    return float(p)
+
+        px = self._safe_float(order.get("price"), 0.0)
+        if px > 0:
+            return float(px)
+        return 0.0
+
+    def _canonical_exec_result(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        raw_order: Optional[Dict[str, Any]] = None,
+        default_status: str = "REJECTED",
+        default_reason: str = "",
+        default_quote: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        Normalize order responses to a symmetric canonical contract.
+        Prevents raw exchange payload leakage from internal placement helpers.
+        """
+        raw = dict(raw_order) if isinstance(raw_order, dict) else {}
+        sym = self._norm_symbol(symbol)
+        side_u = str(side or "").upper()
+        status = str(raw.get("status") or default_status or "REJECTED").upper()
+
+        executed_qty = self._safe_float(raw.get("executedQty") or raw.get("executed_qty"), 0.0)
+        price = self._resolve_post_fill_price(raw, executed_qty)
+        if price <= 0:
+            price = self._safe_float(raw.get("price"), 0.0)
+
+        cumm_quote = self._safe_float(raw.get("cummulativeQuoteQty") or raw.get("cummulative_quote"), 0.0)
+        if cumm_quote <= 0 and executed_qty > 0 and price > 0:
+            cumm_quote = float(executed_qty) * float(price)
+        if cumm_quote <= 0 and float(default_quote or 0.0) > 0:
+            cumm_quote = float(default_quote)
+
+        exchange_order_id = raw.get("orderId") or raw.get("exchange_order_id") or raw.get("order_id")
+        client_order_id = raw.get("clientOrderId") or raw.get("client_order_id") or raw.get("origClientOrderId")
+        if not client_order_id:
+            oid_fallback = raw.get("order_id")
+            if isinstance(oid_fallback, str) and oid_fallback and not oid_fallback.isdigit():
+                client_order_id = oid_fallback
+
+        is_fill = status in ("FILLED", "PARTIALLY_FILLED") and executed_qty > 0
+        ok = bool(raw.get("ok", False) or is_fill)
+
+        reason = str(raw.get("reason") or raw.get("error_msg") or default_reason or "")
+        error_code = raw.get("error_code")
+        if not error_code and status in ("REJECTED", "EXPIRED", "CANCELED"):
+            error_code = status
+
+        out = dict(raw)
+        out.update(
+            {
+                "ok": ok,
+                "symbol": sym,
+                "side": side_u,
+                "status": status,
+                "executedQty": float(executed_qty),
+                "price": float(price),
+                "avgPrice": float(price),
+                "cummulativeQuoteQty": float(cumm_quote),
+                "orderId": exchange_order_id,
+                "exchange_order_id": exchange_order_id,
+                "clientOrderId": client_order_id,
+                "client_order_id": client_order_id,
+                "order_id": raw.get("order_id") or exchange_order_id or client_order_id or "",
+                "reason": reason,
+                "error_code": error_code,
+            }
+        )
+        return out
 
     # --- Post-fill realized PnL emitter (P9 observability contract) ---
-    async def _handle_post_fill(self, symbol: str, side: str, order: Dict[str, Any], tier: Optional[str] = None) -> Dict[str, Any]:
+    async def _handle_post_fill(
+        self,
+        symbol: str,
+        side: str,
+        order: Dict[str, Any],
+        tier: Optional[str] = None,
+        tag: str = "",
+        confidence: Optional[float] = None,
+        agent: Optional[str] = None,
+        planned_quote: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """
         Best-effort: compute/record realized PnL delta when a trade fills, then emit
         a `RealizedPnlUpdated` event and persist the delta via SharedState if possible.
         This is tolerant to different SharedState contract shapes.
         """
+        # DEBUG: Log entry for post-fill handling
+        try:
+            self.logger.debug(f"[DEBUG] Entering _handle_post_fill: symbol={symbol} side={side} exec_qty={order.get('executedQty')}")
+        except Exception:
+            pass
         emitted = False
         realized_committed = False
+        trade_event_emitted = False
         delta_f = None
         try:
             sym = self._norm_symbol(symbol)
             side_u = (side or "").upper()
-            exec_qty = float(order.get("executedQty") or order.get("executed_qty") or 0.0)
-            price = float(order.get("avgPrice") or order.get("price") or 0.0)
-            if exec_qty <= 0 or price <= 0:
-                return
+            exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+            if exec_qty <= 0:
+                return {
+                    "delta": delta_f,
+                    "realized_committed": realized_committed,
+                    "emitted": emitted,
+                    "trade_event_emitted": trade_event_emitted,
+                }
+
+            price = self._resolve_post_fill_price(order, exec_qty)
+            if price > 0:
+                order.setdefault("avgPrice", float(price))
+                if self._safe_float(order.get("price"), 0.0) <= 0:
+                    order["price"] = float(price)
+            # P9 event contract: every confirmed fill must emit TRADE_EXECUTED.
+            # Emission is anchored to post-fill processing, independent of tag/agent/side.
+            # DEBUG: Log before emitting trade event
+            self.logger.debug(f"[DEBUG] Emitting trade executed event: symbol={sym} side={side_u} tag={tag}")
+            trade_event_emitted = bool(
+                await self._emit_trade_executed_event(sym, side_u, str(tag or ""), order)
+            )
+            # DEBUG: Log after emitting trade event
+            self.logger.debug(f"[DEBUG] Trade executed event emitted: symbol={sym} side={side_u} tag={tag} emitted={trade_event_emitted}")
+
+            if price <= 0:
+                self.logger.warning(
+                    "[POST_FILL_PRICE_MISSING] symbol=%s side=%s qty=%.8f order_id=%s client_order_id=%s",
+                    sym,
+                    side_u,
+                    exec_qty,
+                    order.get("orderId") or order.get("order_id") or order.get("exchange_order_id"),
+                    order.get("clientOrderId") or order.get("client_order_id"),
+                )
+                return {
+                    "delta": delta_f,
+                    "realized_committed": realized_committed,
+                    "emitted": emitted,
+                    "trade_event_emitted": trade_event_emitted,
+                }
 
             ss = self.shared_state
             realized_before = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
@@ -249,16 +349,40 @@ class ExecutionManager:
             if hasattr(ss, "record_trade"):
                 try:
                     # Get fee if available
-                    await ss.record_trade(sym, side_u, exec_qty, price, fee_quote=fee_quote, fee_base=fee_base, tier=tier)
+                    _rt_result = await ss.record_trade(sym, side_u, exec_qty, price, fee_quote=fee_quote, fee_base=fee_base, tier=tier)
                     trade_recorded = True
+                    if isinstance(_rt_result, dict) and _rt_result.get("realized_pnl_delta") is not None:
+                        delta = _rt_result["realized_pnl_delta"]
                     
                     # Frequency Engineering: Trigger TP/SL setup for BUYs
-                    if side_u == "BUY" and hasattr(self, "tp_sl_engine") and self.tp_sl_engine:
-                        if hasattr(self.tp_sl_engine, "set_initial_tp_sl"):
+                    # [FIX] Add economic guard: only arm TP/SL if trade is economically viable
+                    if (
+                        side_u == "BUY"
+                        and exec_qty > 0
+                        and price > 0
+                        and hasattr(self, "tp_sl_engine")
+                        and self.tp_sl_engine
+                    ):
+                        # Economic guard: check notional value before arming
+                        notional = exec_qty * price
+                        min_notional = float(self._cfg("MIN_ECONOMIC_TRADE_USDT", 10.0) or 10.0)
+
+                        if notional >= min_notional and hasattr(self.tp_sl_engine, "set_initial_tp_sl"):
                             try:
                                 self.tp_sl_engine.set_initial_tp_sl(sym, price, exec_qty, tier=tier)
                             except Exception as e:
-                                self.logger.warning(f"Failed to set initial TP/SL: {e}")
+                                self.logger.error("[TPSL_ARM_FAILED] %s: %s", sym, e, exc_info=True)
+                                try:
+                                    ot = getattr(ss, "open_trades", None)
+                                    if isinstance(ot, dict) and sym in ot:
+                                        ot[sym]["_tpsl_armed"] = False
+                                except Exception:
+                                    pass
+                        elif notional < min_notional:
+                            self.logger.info(
+                                "[TPSL_SKIPPED_ECONOMIC] %s notional=%.4f < min=%.2f",
+                                sym, notional, min_notional
+                            )
                 except Exception as e:
                     self.logger.warning(f"Failed to record trade in SharedState: {e}")
 
@@ -310,25 +434,31 @@ class ExecutionManager:
                     now = time.time()
                     try:
                         ss.metrics["realized_pnl"] = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0) + delta_f
+                        # Manual commit to metrics succeeded — mark committed so callers won't double-write
+                        realized_committed = True
                     except Exception:
                         pass
                     # Persist via public API when available
                     if hasattr(ss, "append_realized_pnl_delta"):
                         with contextlib.suppress(Exception):
                             await maybe_call(ss, "append_realized_pnl_delta", now, delta_f)
+                        # Best-effort: mark as committed when public API wrote the delta
+                        realized_committed = True
                     else:
                         # Fallback to internal store (bounded deque)
                         try:
                             ss._realized_pnl.append((now, delta_f))
+                            realized_committed = True
                         except Exception:
                             ss._realized_pnl = deque(maxlen=4096)
                             ss._realized_pnl.append((now, delta_f))
+                            realized_committed = True
 
                     # Emit the event with optional nav_quote
                     nav_q = None
                     try:
                         if hasattr(ss, "get_nav_quote"):
-                            nav_q = float(await maybe_call(ss, "get_nav_quote", sym))
+                            nav_q = float(await maybe_call(ss, "get_nav_quote"))
                     except Exception:
                         nav_q = None
 
@@ -340,11 +470,701 @@ class ExecutionManager:
                         emitted = True
         except Exception:
             self.logger.debug("post-fill PnL handler failed (non-fatal)", exc_info=True)
-        return {
-            "delta": delta_f,
-            "realized_committed": realized_committed,
-            "emitted": emitted,
+
+        # Unified TRADE_AUDIT: one structured record per confirmed fill
+        pf_result = {"delta": delta_f, "realized_committed": realized_committed, "emitted": emitted, "trade_event_emitted": trade_event_emitted}
+        with contextlib.suppress(Exception):
+            await self._emit_trade_audit(
+                symbol=symbol,
+                side=side,
+                order=order,
+                tier=tier,
+                tag=tag,
+                confidence=confidence,
+                agent=agent,
+                planned_quote=planned_quote,
+                post_fill_result=pf_result,
+            )
+
+        return pf_result
+
+    async def _update_position_from_fill(
+        self,
+        symbol: str,
+        side: str,
+        order: Dict[str, Any],
+        tag: str = ""
+    ) -> bool:
+        """
+        PHASE 4: Update position using actual fill data.
+        
+        Uses order["executedQty"] (actual filled quantity) instead of planned amounts.
+        This ensures positions reflect reality.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            side: "BUY" or "SELL"
+            order: Binance order response with executedQty
+            tag: Optional tag for logging
+        
+        Returns:
+            bool: True if position was updated successfully
+        """
+        try:
+            sym = self._norm_symbol(symbol)
+            side_u = (side or "").upper()
+            
+            # CRITICAL: Use actual fill, not planned amount
+            executed_qty = float(order.get("executedQty") or 0.0)
+            if executed_qty <= 0:
+                self.logger.warning(
+                    "[PHASE4] Position update skipped: no executed quantity. "
+                    "symbol=%s side=%s orderId=%s",
+                    sym, side_u, order.get("orderId")
+                )
+                return False
+            
+            # Get actual execution price (what was really spent/received)
+            executed_price = self._resolve_post_fill_price(order, executed_qty)
+            if executed_price <= 0:
+                self.logger.warning(
+                    "[PHASE4] Position update skipped: missing execution price. "
+                    "symbol=%s orderId=%s",
+                    sym, order.get("orderId")
+                )
+                return False
+            
+            ss = self.shared_state
+            if not ss:
+                return False
+            
+            # Get current position
+            positions = getattr(ss, "positions", {}) or {}
+            pos = dict(positions.get(sym, {}) or {})
+            
+            # PHASE 4: Calculate new position using ACTUAL fills
+            current_qty = float(pos.get("quantity", 0.0) or 0.0)
+            current_cost = float(pos.get("cost_basis", 0.0) or 0.0)
+            current_avg_price = float(pos.get("avg_price", 0.0) or 0.0)
+            
+            if side_u == "BUY":
+                # BUY: add to position
+                new_qty = current_qty + executed_qty
+                new_cost = current_cost + (executed_qty * executed_price)
+                new_avg_price = new_cost / new_qty if new_qty > 0 else 0.0
+            elif side_u == "SELL":
+                # SELL: reduce position
+                new_qty = current_qty - executed_qty
+                # Keep cost basis proportional
+                if current_qty > 0:
+                    new_cost = current_cost * (new_qty / current_qty) if new_qty > 0 else 0.0
+                else:
+                    new_cost = 0.0
+                new_avg_price = new_cost / new_qty if new_qty > 0 else 0.0
+            else:
+                self.logger.error("[PHASE4] Unknown side: %s", side_u)
+                return False
+            
+            # Update position with actual values
+            pos["quantity"] = float(new_qty)
+            pos["cost_basis"] = float(new_cost)
+            pos["avg_price"] = float(new_avg_price)
+            pos["last_executed_price"] = float(executed_price)
+            pos["last_executed_qty"] = float(executed_qty)
+            pos["last_filled_time"] = order.get("updateTime") or order.get("timestamp") or int(time.time() * 1000)
+            
+            # Preserve metadata
+            for key in ["status", "state", "is_significant", "is_dust", "_is_dust", "open_position"]:
+                pos.pop(key, None)
+            
+            # Persist updated position
+            if hasattr(ss, "update_position"):
+                await ss.update_position(sym, pos)
+                self.logger.info(
+                    "[PHASE4_POSITION_UPDATED] %s side=%s qty=%.10f avg_price=%.10f "
+                    "executed_qty=%.10f executed_price=%.10f tag=%s",
+                    sym, side_u, new_qty, new_avg_price,
+                    executed_qty, executed_price, tag
+                )
+                return True
+            else:
+                self.logger.warning(
+                    "[PHASE4_NO_POSITION_API] SharedState missing update_position method"
+                )
+                return False
+                
+        except Exception as e:
+            self.logger.error(
+                "[PHASE4_POSITION_UPDATE_FAILED] symbol=%s side=%s error=%s",
+                symbol, side, e, exc_info=True
+            )
+            return False
+
+    async def _ensure_post_fill_handled(
+        self,
+        symbol: str,
+        side: str,
+        order: Optional[Dict[str, Any]],
+        *,
+        tier: Optional[str] = None,
+        tag: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Idempotent post-fill hook wrapper.
+        Reuses cached result on the order payload when available to prevent
+        duplicate realized-PnL/event emissions across overlapping call paths.
+        """
+        default = {
+            "delta": None,
+            "realized_committed": False,
+            "emitted": False,
+            "trade_event_emitted": False,
         }
+        if not isinstance(order, dict):
+            return dict(default)
+
+        exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+        if exec_qty <= 0.0:
+            # Avoid caching non-fill results on mutable order payloads. If the same
+            # payload later reconciles to a real fill, post-fill must still execute.
+            return dict(default)
+
+        cached = order.get("_post_fill_result")
+        if isinstance(cached, dict) and bool(order.get("_post_fill_done")):
+            # Cache is valid once post-fill processing has completed.
+            out = dict(default)
+            out.update(cached)
+            if str(side or "").upper() == "SELL":
+                with contextlib.suppress(Exception):
+                    self._track_sell_fill_observed(
+                        symbol=symbol,
+                        order=order,
+                        tag=str(tag or ""),
+                    )
+            return out
+
+        res = await self._handle_post_fill(
+            symbol=symbol,
+            side=side,
+            order=order,
+            tier=tier,
+            tag=tag,
+        )
+        out = dict(default)
+        if isinstance(res, dict):
+            out.update(res)
+        order["_post_fill_result"] = out
+        order["_post_fill_done"] = True
+        if str(side or "").upper() == "SELL":
+            with contextlib.suppress(Exception):
+                self._track_sell_fill_observed(
+                    symbol=symbol,
+                    order=order,
+                    tag=str(tag or ""),
+                )
+        return out
+
+    async def _reconcile_delayed_fill(
+        self,
+        symbol: str,
+        side: str,
+        order: Optional[Dict[str, Any]],
+        *,
+        tag: str = "",
+        tier: Optional[str] = None,
+        order_id_hint: Optional[Union[str, int]] = None,
+        client_order_id_hint: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reconcile orders that may fill slightly after initial placement response.
+        """
+        merged: Dict[str, Any] = dict(order) if isinstance(order, dict) else {}
+        if not merged:
+            if order_id_hint not in (None, ""):
+                merged["orderId"] = order_id_hint
+                merged["exchange_order_id"] = order_id_hint
+            if client_order_id_hint:
+                merged["clientOrderId"] = str(client_order_id_hint)
+                merged["client_order_id"] = str(client_order_id_hint)
+            if merged:
+                merged.setdefault("symbol", self._norm_symbol(symbol))
+                merged.setdefault("side", str(side or "").upper())
+
+        if not merged:
+            return order
+
+        get_order = getattr(self.exchange_client, "get_order", None)
+        status = str(merged.get("status", "")).upper()
+        exec_qty = self._safe_float(merged.get("executedQty") or merged.get("executed_qty"), 0.0)
+        # FILLED payloads from normalized exchange-client responses can carry only
+        # client order IDs (`order_id`) and omit exchange `orderId`. Enrich once so
+        # canonical TRADE_EXECUTED emits and auditor matching use exchange order IDs.
+        if status in ("FILLED", "PARTIALLY_FILLED") and exec_qty > 0:
+            has_exchange_oid = bool(
+                merged.get("orderId") or merged.get("exchange_order_id")
+            )
+            cid_probe = (
+                merged.get("clientOrderId")
+                or merged.get("client_order_id")
+                or merged.get("origClientOrderId")
+            )
+            if (not has_exchange_oid) and cid_probe and callable(get_order):
+                fresh = None
+                with contextlib.suppress(Exception):
+                    fresh = await get_order(symbol, client_order_id=str(cid_probe))
+                if isinstance(fresh, dict) and fresh:
+                    merged.update(fresh)
+                    merged.setdefault(
+                        "exchange_order_id",
+                        fresh.get("orderId") or fresh.get("order_id"),
+                    )
+                    merged.setdefault(
+                        "client_order_id",
+                        fresh.get("clientOrderId") or fresh.get("origClientOrderId") or cid_probe,
+                    )
+            # [FIX] Reconcile returns merged order without calling _ensure_post_fill_handled().
+            # Caller (close_position) is responsible for post-fill + finalize.
+            # Reason: Double-calling _ensure_post_fill_handled causes idempotency issues:
+            # - First call (here) sets _post_fill_done=True
+            # - Second call (in close_position) returns cached result
+            # - Finalize then sees empty cached dict and skips _emit_close_events
+            # - Position never reduces in SharedState
+            return merged
+
+        if not callable(get_order):
+            return merged
+
+        oid_raw = (
+            merged.get("orderId")
+            or merged.get("exchange_order_id")
+            or merged.get("order_id")
+            or order_id_hint
+        )
+        cid_raw = (
+            merged.get("clientOrderId")
+            or merged.get("client_order_id")
+            or merged.get("origClientOrderId")
+            or merged.get("order_id")
+            or client_order_id_hint
+        )
+        if oid_raw in (None, "") and not cid_raw:
+            if str(side or "").upper() == "SELL":
+                self._journal("SELL_RECOVERY_UNAVAILABLE_NO_IDS", {
+                    "symbol": self._norm_symbol(symbol),
+                    "side": "SELL",
+                    "status": str(merged.get("status", "")).upper() or "UNKNOWN",
+                    "reason": "missing_order_id_and_client_order_id",
+                    "tag": str(tag or ""),
+                    "timestamp": time.time(),
+                })
+            return merged
+
+        delay_s = float(self._cfg("POST_SUBMIT_RECHECK_DELAY_S", 0.2) or 0.2)
+        delay_s = min(max(delay_s, 0.1), 0.5)
+        attempts = int(self._cfg("POST_SUBMIT_RECHECK_ATTEMPTS", 6) or 6)
+        attempts = max(1, min(attempts, 20))
+
+        last_fresh: Optional[Dict[str, Any]] = None
+
+        for attempt in range(1, attempts + 1):
+            await asyncio.sleep(delay_s)
+
+            fresh: Optional[Dict[str, Any]] = None
+            if oid_raw not in (None, ""):
+                with contextlib.suppress(Exception):
+                    fresh = await get_order(symbol, order_id=int(str(oid_raw)))
+            if fresh is None and cid_raw:
+                with contextlib.suppress(Exception):
+                    fresh = await get_order(symbol, client_order_id=str(cid_raw))
+
+            if not isinstance(fresh, dict) or not fresh:
+                continue
+            last_fresh = fresh
+
+            merged.update(fresh)
+            merged.setdefault("exchange_order_id", fresh.get("orderId") or fresh.get("order_id") or oid_raw)
+            merged.setdefault(
+                "client_order_id",
+                fresh.get("clientOrderId") or fresh.get("origClientOrderId") or cid_raw,
+            )
+            oid_raw = merged.get("orderId") or merged.get("exchange_order_id") or merged.get("order_id") or oid_raw
+            cid_raw = (
+                merged.get("clientOrderId")
+                or merged.get("client_order_id")
+                or merged.get("origClientOrderId")
+                or cid_raw
+            )
+
+            fresh_status = str(merged.get("status", "")).upper()
+            fresh_qty = self._safe_float(merged.get("executedQty") or merged.get("executed_qty"), 0.0)
+            if fresh_status in ("FILLED", "PARTIALLY_FILLED") and fresh_qty > 0:
+                # [FIX] Reconcile merges fresh order data but does NOT call _ensure_post_fill_handled().
+                # Caller (e.g. close_position or execute_trade) handles post-fill + finalize.
+                # This prevents double-idempotency-check that causes finalize to skip.
+                
+                # ✅ CRITICAL: Log to journal IMMEDIATELY when fill is detected
+                # This ensures the exchange execution is captured even if subsequent
+                # processing fails or returns None
+                self._journal("RECONCILED_DELAYED_FILL", {
+                    "symbol": symbol,
+                    "side": side.upper() if side else "UNKNOWN",
+                    "executed_qty": fresh_qty,
+                    "avg_price": self._safe_float(merged.get("avgPrice") or merged.get("price"), 0.0),
+                    "cumm_quote": self._safe_float(merged.get("cummulativeQuoteQty"), 0.0),
+                    "order_id": merged.get("orderId") or merged.get("exchange_order_id") or merged.get("order_id"),
+                    "status": fresh_status,
+                    "attempt": attempt,
+                    "total_attempts": attempts,
+                    "timestamp": time.time(),
+                })
+                
+                # ✅ ELITE: Verify position invariants after SELL
+                if side and side.upper() == "SELL":
+                    invariant_ok = await self._verify_position_invariants(
+                        symbol=symbol,
+                        event_type="RECONCILED_DELAYED_FILL",
+                        before_qty=0.0,  # We don't have before_qty here, but check will validate monotonicity
+                    )
+                    if not invariant_ok:
+                        self.logger.error(
+                            "[EM:INVARIANT] SELL reconciliation on %s failed invariant check - position may be corrupted",
+                            symbol
+                        )
+                
+                self.logger.info(
+                    "[EM:DelayedFill] Reconciled delayed fill symbol=%s side=%s order_id=%s status=%s qty=%.8f attempt=%d/%d",
+                    self._norm_symbol(symbol),
+                    str(side or "").upper(),
+                    merged.get("orderId") or merged.get("exchange_order_id") or merged.get("order_id"),
+                    fresh_status,
+                    fresh_qty,
+                    attempt,
+                    attempts,
+                )
+                return merged
+
+        if isinstance(last_fresh, dict) and last_fresh:
+            self.logger.debug(
+                "[EM:DelayedFill] Pending after retries symbol=%s side=%s order_id=%s status=%s qty=%.8f attempts=%d",
+                self._norm_symbol(symbol),
+                str(side or "").upper(),
+                merged.get("orderId") or merged.get("order_id") or merged.get("exchange_order_id"),
+                str(merged.get("status", "")).upper(),
+                self._safe_float(merged.get("executedQty") or merged.get("executed_qty"), 0.0),
+                attempts,
+            )
+            if str(side or "").upper() == "SELL":
+                with contextlib.suppress(Exception):
+                    self._schedule_sell_fill_recovery(
+                        symbol=symbol,
+                        order=merged,
+                        tag=str(tag or ""),
+                        tier=tier,
+                    )
+            return merged
+
+        if str(side or "").upper() == "SELL":
+            with contextlib.suppress(Exception):
+                self._schedule_sell_fill_recovery(
+                    symbol=symbol,
+                    order=merged,
+                    tag=str(tag or ""),
+                    tier=tier,
+                )
+        return merged if merged else order
+
+    async def _get_exchange_position_qty(self, symbol: str) -> Tuple[bool, float]:
+        """Authoritative base-asset quantity from exchange account balance."""
+        get_bal = getattr(self.exchange_client, "get_account_balance", None)
+        if not callable(get_bal):
+            return False, 0.0
+        base_asset, _ = self._split_base_quote(symbol)
+        try:
+            bal = await get_bal(base_asset)
+            if isinstance(bal, dict):
+                free = self._safe_float(bal.get("free"), 0.0)
+                locked = self._safe_float(bal.get("locked"), 0.0)
+                return True, max(0.0, float(free + locked))
+            return True, max(0.0, self._safe_float(bal, 0.0))
+        except Exception:
+            return False, 0.0
+
+    async def _position_sync_qty_tol(self, symbol: str) -> float:
+        tol = max(1e-10, float(self._cfg("POSITION_SYNC_QTY_TOL", 1e-8) or 1e-8))
+        try:
+            filters = await self.exchange_client.ensure_symbol_filters_ready(self._norm_symbol(symbol))
+            step_size, min_qty, _, _, _ = self._extract_filter_vals(filters)
+            if step_size > 0:
+                tol = max(tol, float(step_size) * 0.5)
+            if min_qty > 0:
+                tol = max(tol, float(min_qty) * 0.5)
+        except Exception:
+            pass
+        return float(tol)
+
+    async def _sync_shared_position_after_sell_fill(
+        self,
+        *,
+        symbol: str,
+        order: Optional[Dict[str, Any]],
+        reason: str,
+    ) -> None:
+        """
+        Reconcile SharedState to exchange truth after a confirmed SELL fill.
+        Prevents phantom positions when post-fill bookkeeping partially fails.
+        """
+        if not isinstance(order, dict):
+            return
+        sym = self._norm_symbol(symbol)
+        ss = self.shared_state
+        tol = await self._position_sync_qty_tol(sym)
+
+        local_qty = 0.0
+        try:
+            if hasattr(ss, "get_position_quantity"):
+                local_qty = float(await maybe_call(ss, "get_position_quantity", sym) or 0.0)
+            elif isinstance(getattr(ss, "positions", None), dict):
+                local_qty = float((ss.positions.get(sym, {}) or {}).get("quantity", 0.0) or 0.0)
+        except Exception:
+            local_qty = 0.0
+
+        exchange_ok, exchange_qty = await self._get_exchange_position_qty(sym)
+        exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+        exec_px = self._resolve_post_fill_price(order, exec_qty)
+
+        # If exchange cannot be queried, use conservative fallback:
+        # when executed qty fully covers local qty, force local close.
+        if not exchange_ok:
+            if local_qty > tol and exec_qty >= max(local_qty - tol, 0.0):
+                with contextlib.suppress(Exception):
+                    await self._force_finalize_position(sym, f"{reason}_fallback")
+            return
+
+        # Exchange is flat but SharedState still shows qty -> phantom position.
+        if exchange_qty <= tol and local_qty > tol:
+            self.logger.error(
+                "[EM:PhantomRepair] %s exchange_qty=%.10f local_qty=%.10f reason=%s -> force finalize",
+                sym,
+                float(exchange_qty),
+                float(local_qty),
+                reason,
+            )
+            # 🔥 MANDATORY: Journal position closure BEFORE mark_position_closed
+            self._journal("PHANTOM_POSITION_CLOSURE", {
+                "symbol": sym,
+                "local_qty": float(local_qty),
+                "exchange_qty": float(exchange_qty),
+                "exec_price": float(exec_px or 0.0),
+                "reason": str(reason),
+                "timestamp": time.time(),
+            })
+            with contextlib.suppress(Exception):
+                if hasattr(ss, "mark_position_closed"):
+                    await maybe_call(
+                        ss,
+                        "mark_position_closed",
+                        symbol=sym,
+                        qty=float(local_qty),
+                        price=float(exec_px or 0.0),
+                        reason=str(reason),
+                        tag="execution_sync",
+                    )
+            with contextlib.suppress(Exception):
+                await self._force_finalize_position(sym, reason)
+            return
+
+        # Exchange has remaining qty and local qty drifted materially -> align local state.
+        if exchange_qty > tol and abs(local_qty - exchange_qty) > tol:
+            self.logger.warning(
+                "[EM:QtyResync] %s local_qty=%.10f exchange_qty=%.10f reason=%s",
+                sym,
+                float(local_qty),
+                float(exchange_qty),
+                reason,
+            )
+            with contextlib.suppress(Exception):
+                pos = dict((getattr(ss, "positions", {}) or {}).get(sym, {}) or {})
+                if pos:
+                    pos["quantity"] = float(exchange_qty)
+                    for k in ("status", "state", "is_significant", "is_dust", "_is_dust", "open_position"):
+                        pos.pop(k, None)
+                    await maybe_call(ss, "update_position", sym, pos)
+            with contextlib.suppress(Exception):
+                ot = getattr(ss, "open_trades", None)
+                if isinstance(ot, dict):
+                    tr = dict(ot.get(sym, {}) or {})
+                    if tr:
+                        tr["quantity"] = float(exchange_qty)
+                        ot[sym] = tr
+
+    def _schedule_sell_fill_recovery(
+        self,
+        *,
+        symbol: str,
+        order: Optional[Dict[str, Any]],
+        tag: str = "",
+        tier: Optional[str] = None,
+    ) -> None:
+        """Background recovery for SELL orders that remain pending after short reconciliation."""
+        if not isinstance(order, dict):
+            return
+        status = str(order.get("status", "")).upper()
+        exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+        if status in ("FILLED", "PARTIALLY_FILLED") and exec_qty > 0:
+            return
+        oid = order.get("orderId") or order.get("order_id") or order.get("exchange_order_id")
+        cid = order.get("clientOrderId") or order.get("client_order_id") or order.get("origClientOrderId")
+        if not oid and not cid:
+            return
+
+        sym = self._norm_symbol(symbol)
+        key = str(order.get("_sell_finalize_key") or "").strip() or self._sell_finalize_key(sym, order)
+        tasks = getattr(self, "_sell_fill_recovery_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._sell_fill_recovery_tasks = tasks
+        existing = tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        task = loop.create_task(
+            self._recover_sell_fill_task(
+                symbol=sym,
+                order=dict(order),
+                key=key,
+                tag=str(tag or ""),
+                tier=tier,
+            ),
+            name=f"em.sell_recover.{sym}",
+        )
+        tasks[key] = task
+
+        def _cleanup(done_task: asyncio.Task) -> None:
+            with contextlib.suppress(Exception):
+                tasks.pop(key, None)
+            # 🔥 FIX: Log recovery task exceptions (don't silently suppress)
+            # Reason: Silent failures hide orphaned positions
+            try:
+                done_task.exception()  # Will raise if task failed
+            except asyncio.CancelledError:
+                pass  # Expected for cancelled tasks
+            except Exception as e:
+                self.logger.error(
+                    "[EM:RecoveryTaskFailed] Recovery task failed for symbol=%s key=%s: %s",
+                    sym, key, str(e), exc_info=True
+                )
+
+        task.add_done_callback(_cleanup)
+        self.logger.info(
+            "[EM:DelayedFillRecover] Scheduled SELL recovery key=%s symbol=%s status=%s qty=%.8f",
+            key,
+            sym,
+            status or "UNKNOWN",
+            float(exec_qty),
+        )
+
+    async def _recover_sell_fill_task(
+        self,
+        *,
+        symbol: str,
+        order: Dict[str, Any],
+        key: str,
+        tag: str = "",
+        tier: Optional[str] = None,
+    ) -> None:
+        """Poll exchange order status until terminal, then finalize SELL fill if observed."""
+        get_order = getattr(self.exchange_client, "get_order", None)
+        if not callable(get_order):
+            return
+
+        poll_s = float(self._cfg("SELL_RECOVERY_POLL_SEC", 0.5) or 0.5)
+        poll_s = min(max(poll_s, 0.2), 2.0)
+        # 🔥 FIX: Increase recovery window from 20s to 60s
+        # Reason: Exchange stale timeout is 120s, recovery must complete before then
+        # This prevents orphaned fills that occur after recovery window closes
+        max_wait_s = float(self._cfg("SELL_RECOVERY_MAX_WAIT_SEC", 60.0) or 60.0)
+        max_wait_s = min(max(max_wait_s, 2.0), 180.0)
+        deadline = time.time() + max_wait_s
+
+        sym = self._norm_symbol(symbol)
+        merged = dict(order)
+        oid_raw = merged.get("orderId") or merged.get("order_id") or merged.get("exchange_order_id")
+        cid_raw = (
+            merged.get("clientOrderId")
+            or merged.get("client_order_id")
+            or merged.get("origClientOrderId")
+            or merged.get("order_id")
+        )
+
+        while time.time() < deadline:
+            status = str(merged.get("status", "")).upper()
+            exec_qty = self._safe_float(merged.get("executedQty") or merged.get("executed_qty"), 0.0)
+            if status in ("FILLED", "PARTIALLY_FILLED") and exec_qty > 0:
+                post_fill = await self._ensure_post_fill_handled(
+                    symbol=sym,
+                    side="SELL",
+                    order=merged,
+                    tier=tier,
+                    tag=str(tag or ""),
+                )
+                await self._finalize_sell_post_fill(
+                    symbol=sym,
+                    order=merged,
+                    tag=str(tag or ""),
+                    post_fill=post_fill,
+                    policy_ctx={"reason": "delayed_fill_recovery"},
+                    tier=tier,
+                )
+                with contextlib.suppress(Exception):
+                    await self._audit_post_fill_accounting(
+                        symbol=sym,
+                        side="sell",
+                        raw=merged,
+                        stage="delayed_fill_recovery",
+                    )
+                self.logger.warning(
+                    "[EM:DelayedFillRecover] Finalized delayed SELL fill key=%s symbol=%s qty=%.8f status=%s",
+                    key,
+                    sym,
+                    float(exec_qty),
+                    status,
+                )
+                return
+            if status in ("CANCELED", "REJECTED", "EXPIRED"):
+                return
+
+            fresh = None
+            if oid_raw not in (None, ""):
+                with contextlib.suppress(Exception):
+                    fresh = await get_order(sym, order_id=int(str(oid_raw)))
+            if fresh is None and cid_raw:
+                with contextlib.suppress(Exception):
+                    fresh = await get_order(sym, client_order_id=str(cid_raw))
+
+            if isinstance(fresh, dict) and fresh:
+                merged.update(fresh)
+                oid_raw = merged.get("orderId") or merged.get("order_id") or merged.get("exchange_order_id") or oid_raw
+                cid_raw = (
+                    merged.get("clientOrderId")
+                    or merged.get("client_order_id")
+                    or merged.get("origClientOrderId")
+                    or cid_raw
+                )
+
+            await asyncio.sleep(poll_s)
+
+        # Timeout fallback: if exchange is flat while SharedState still open, repair phantom.
+        with contextlib.suppress(Exception):
+            await self._sync_shared_position_after_sell_fill(
+                symbol=sym,
+                order=merged,
+                reason="SELL_RECOVERY_TIMEOUT",
+            )
 
     def _calc_close_payload(self, sym: str, raw: Dict[str, Any]) -> Tuple[float, float, float, float]:
         entry_price = float(self._get_entry_price_for_sell(sym) or 0.0)
@@ -376,11 +1196,32 @@ class ExecutionManager:
 
     async def _emit_close_events(self, sym: str, raw: Dict[str, Any], post_fill: Optional[Dict[str, Any]] = None) -> None:
         entry_price, exec_px, exec_qty, realized_pnl = self._calc_close_payload(sym, raw)
-        if exec_qty <= 0 or exec_px <= 0:
+        
+        # 🔴 FIX: Use executedQty from the filled order directly, not from remaining position state.
+        # The distinction is critical:
+        # - exec_qty from _calc_close_payload() = remaining position (may be dust → 0)
+        # - executedQty from raw order = what was actually FILLED in this order
+        # We should emit POSITION_CLOSED based on the FILLED quantity, not the remaining.
+        actual_executed_qty = self._safe_float(raw.get("executedQty") or raw.get("executed_qty"), 0.0)
+        
+        if actual_executed_qty <= 0 or exec_px <= 0:
             return
 
-        committed = bool(post_fill or {}).get("realized_committed", False)
-        emitted = bool(post_fill or {}).get("emitted", False)
+        # committed/emitted come from _ensure_post_fill_handled return dict when available
+        committed = (post_fill or {}).get("realized_committed", False)
+        emitted = (post_fill or {}).get("emitted", False)
+
+        # Ensure canonical TRADE_EXECUTED exists for SELL closes. Some paths (recovered fills,
+        # transient emit failures, or external/order-recovery flows) may reach close events
+        # without a prior canonical TRADE_EXECUTED. To preserve the architecture invariant
+        # (every confirmed fill must emit TRADE_EXECUTED) we re-emit here when missing.
+        try:
+            tag = (raw or {}).get("tag") or (raw or {}).get("order_tag") or ""
+            # Idempotent/dedupe-protected: always attempt canonical emit for invariants
+            with contextlib.suppress(Exception):
+                await self._emit_trade_executed_event(sym, "SELL", str(tag or ""), raw)
+        except Exception:
+            self.logger.debug("[EM:CloseEmitRecover] re-emit TRADE_EXECUTED failed", exc_info=True)
 
         if not committed:
             try:
@@ -396,7 +1237,7 @@ class ExecutionManager:
                 "pnl_delta": float(realized_pnl),
                 "symbol": sym,
                 "price": exec_px,
-                "qty": exec_qty,
+                "qty": actual_executed_qty,  # ← Use actual filled quantity
                 "timestamp": now,
             }
             with contextlib.suppress(Exception):
@@ -407,19 +1248,565 @@ class ExecutionManager:
             "symbol": sym,
             "entry_price": entry_price,
             "exit_price": exec_px,
-            "qty": exec_qty,
+            "qty": actual_executed_qty,  # ← Use actual filled quantity (not remaining)
             "realized_pnl": realized_pnl,
         }, separators=(",", ":")))
+        # Emit canonical POSITION_CLOSED so other components observe lifecycle transitions
+        try:
+            await maybe_call(self.shared_state, "emit_event", "POSITION_CLOSED", {
+                "symbol": sym,
+                "entry_price": float(entry_price or 0.0),
+                "price": float(exec_px or 0.0),
+                "qty": float(actual_executed_qty or 0.0),  # ← Use actual filled quantity
+                "realized_pnl": float(realized_pnl or 0.0),
+                "timestamp": time.time(),
+            })
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_tp_sl_exit_reason(reason: Optional[str]) -> bool:
+        reason_u = str(reason or "").strip().upper()
+        if not reason_u:
+            return False
+        if reason_u in {"TP", "SL", "TP_HIT", "SL_HIT", "TPSL_EXIT", "TP_SL", "TAKE_PROFIT", "STOP_LOSS"}:
+            return True
+        return ("TP_SL" in reason_u) or ("TAKE_PROFIT" in reason_u) or ("STOP_LOSS" in reason_u)
+
+    async def _record_sell_exit_bookkeeping(
+        self,
+        *,
+        symbol: str,
+        tag: str,
+        policy_ctx: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Record canonical SELL exit metadata so Meta re-entry lock can see fresh exits.
+        This is a backup path for TP/SL and liquidation exits.
+        """
+        sym = self._norm_symbol(symbol)
+        ctx = policy_ctx or {}
+        raw_reason = str(
+            ctx.get("exit_reason")
+            or ctx.get("reason")
+            or ctx.get("liquidation_reason")
+            or ""
+        ).strip()
+        reason_u = raw_reason.upper()
+        tag_u = str(tag or "").upper()
+
+        reason_code = ""
+        if self._is_tp_sl_exit_reason(reason_u) or ("TP_SL" in tag_u):
+            if reason_u in {"TP", "TP_HIT", "TAKE_PROFIT"}:
+                reason_code = "TP"
+            elif reason_u in {"SL", "SL_HIT", "STOP_LOSS"}:
+                reason_code = "SL"
+            else:
+                reason_code = "TPSL_EXIT"
+        elif "LIQUIDATION" in tag_u or "LIQ" in reason_u:
+            reason_code = "LIQUIDATION"
+
+        if not reason_code:
+            return
+
+        with contextlib.suppress(Exception):
+            if hasattr(self.shared_state, "record_exit_reason"):
+                self.shared_state.record_exit_reason(sym, reason_code, source="execution_manager")
+
+        cooldown_sec = 0.0
+        if reason_code in {"TP", "SL", "TPSL_EXIT"}:
+            cooldown_sec = float(
+                self._cfg("TP_SL_REENTRY_LOCK_SEC", self._cfg("REENTRY_LOCK_SEC", 0.0)) or 0.0
+            )
+        elif reason_code == "LIQUIDATION":
+            cooldown_sec = float(
+                self._cfg(
+                    "LIQUIDATION_REENTRY_LOCK_SEC",
+                    self._cfg("TP_SL_REENTRY_LOCK_SEC", self._cfg("REENTRY_LOCK_SEC", 0.0)),
+                )
+                or 0.0
+            )
+        if cooldown_sec <= 0:
+            return
+
+        with contextlib.suppress(Exception):
+            if hasattr(self.shared_state, "set_cooldown"):
+                await maybe_call(self.shared_state, "set_cooldown", sym, float(cooldown_sec))
+
+    def _sell_finalize_key(self, symbol: str, order: Dict[str, Any]) -> str:
+        sym = self._norm_symbol(symbol)
+        oid = str(
+            order.get("orderId")
+            or order.get("exchange_order_id")
+            or order.get("order_id")
+            or ""
+        ).strip()
+        if oid:
+            return f"{sym}|oid:{oid}"
+
+        cid = str(
+            order.get("clientOrderId")
+            or order.get("origClientOrderId")
+            or order.get("client_order_id")
+            or ""
+        ).strip()
+        if cid:
+            return f"{sym}|cid:{cid}"
+
+        update_ms = 0
+        for k in ("updateTime", "time", "transactTime", "workingTime"):
+            raw_v = order.get(k)
+            try:
+                if raw_v is not None:
+                    update_ms = int(float(raw_v))
+                    if update_ms > 0:
+                        break
+            except Exception:
+                continue
+        qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+        if update_ms > 0 and qty > 0:
+            return f"{sym}|ts:{update_ms}|qty:{qty:.12f}"
+        return f"{sym}|obj:{id(order)}"
+
+    def _track_sell_fill_observed(self, *, symbol: str, order: Dict[str, Any], tag: str = "") -> None:
+        if not isinstance(order, dict):
+            return
+        status = str(order.get("status", "")).upper()
+        qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+        if status not in ("FILLED", "PARTIALLY_FILLED") or qty <= 0:
+            return
+
+        sym = self._norm_symbol(symbol)
+        key = str(order.get("_sell_finalize_key") or "").strip() or self._sell_finalize_key(sym, order)
+        order["_sell_finalize_key"] = key
+        now = time.time()
+
+        row = self._sell_finalize_state.get(key)
+        if not isinstance(row, dict):
+            row = {
+                "symbol": sym,
+                "order_id": str(order.get("orderId") or order.get("exchange_order_id") or order.get("order_id") or ""),
+                "client_order_id": str(order.get("clientOrderId") or order.get("origClientOrderId") or order.get("client_order_id") or ""),
+                "fill_seen": 0,
+                "finalized": 0,
+                "fill_ts": now,
+                "finalized_ts": 0.0,
+                "last_ts": now,
+                "tag": str(tag or ""),
+                "timeout_reported": False,
+                "dup_reported": False,
+                "missing_fill_reported": False,
+            }
+            self._sell_finalize_state[key] = row
+
+        row["symbol"] = sym
+        row["last_ts"] = now
+        row["status"] = status
+        row["qty"] = float(qty)
+        if tag:
+            row["tag"] = str(tag)
+        if not row.get("order_id"):
+            row["order_id"] = str(order.get("orderId") or order.get("exchange_order_id") or order.get("order_id") or "")
+        if not row.get("client_order_id"):
+            row["client_order_id"] = str(order.get("clientOrderId") or order.get("origClientOrderId") or order.get("client_order_id") or "")
+
+        if int(row.get("fill_seen", 0) or 0) <= 0:
+            row["fill_seen"] = 1
+            row["fill_ts"] = now
+            self._sell_finalize_stats["fills_seen"] = int(self._sell_finalize_stats.get("fills_seen", 0) or 0) + 1
+        else:
+            self._sell_finalize_stats["fills_seen_duplicate"] = int(self._sell_finalize_stats.get("fills_seen_duplicate", 0) or 0) + 1
+
+        self._audit_sell_finalize_invariant(now=now)
+
+    def _track_sell_finalize(
+        self,
+        *,
+        symbol: str,
+        order: Dict[str, Any],
+        tag: str = "",
+        duplicate_attempt: bool = False,
+    ) -> None:
+        if not isinstance(order, dict):
+            return
+
+        sym = self._norm_symbol(symbol)
+        key = str(order.get("_sell_finalize_key") or "").strip() or self._sell_finalize_key(sym, order)
+        order["_sell_finalize_key"] = key
+        now = time.time()
+
+        row = self._sell_finalize_state.get(key)
+        if not isinstance(row, dict):
+            row = {
+                "symbol": sym,
+                "order_id": str(order.get("orderId") or order.get("exchange_order_id") or order.get("order_id") or ""),
+                "client_order_id": str(order.get("clientOrderId") or order.get("origClientOrderId") or order.get("client_order_id") or ""),
+                "fill_seen": 0,
+                "finalized": 0,
+                "fill_ts": now,
+                "finalized_ts": 0.0,
+                "last_ts": now,
+                "tag": str(tag or ""),
+                "timeout_reported": False,
+                "dup_reported": False,
+                "missing_fill_reported": False,
+            }
+            self._sell_finalize_state[key] = row
+
+        row["symbol"] = sym
+        row["last_ts"] = now
+        if tag:
+            row["tag"] = str(tag)
+        if not row.get("order_id"):
+            row["order_id"] = str(order.get("orderId") or order.get("exchange_order_id") or order.get("order_id") or "")
+        if not row.get("client_order_id"):
+            row["client_order_id"] = str(order.get("clientOrderId") or order.get("origClientOrderId") or order.get("client_order_id") or "")
+
+        already_finalized = int(row.get("finalized", 0) or 0) > 0
+        if duplicate_attempt:
+            if already_finalized:
+                self._sell_finalize_stats["duplicate_finalize"] = int(self._sell_finalize_stats.get("duplicate_finalize", 0) or 0) + 1
+                if not bool(row.get("dup_reported")):
+                    self.logger.error(
+                        "[EM:SellFinalizeAssert] Duplicate SELL close finalization attempt key=%s symbol=%s order_id=%s client_order_id=%s tag=%s",
+                        key,
+                        sym,
+                        row.get("order_id") or "n/a",
+                        row.get("client_order_id") or "n/a",
+                        row.get("tag") or "",
+                    )
+                    row["dup_reported"] = True
+            self._audit_sell_finalize_invariant(now=now)
+            return
+
+        if int(row.get("fill_seen", 0) or 0) <= 0:
+            self._sell_finalize_stats["finalize_without_fill"] = int(self._sell_finalize_stats.get("finalize_without_fill", 0) or 0) + 1
+            if not bool(row.get("missing_fill_reported")):
+                self.logger.error(
+                    "[EM:SellFinalizeAssert] SELL close finalized without prior fill observation key=%s symbol=%s order_id=%s client_order_id=%s tag=%s",
+                    key,
+                    sym,
+                    row.get("order_id") or "n/a",
+                    row.get("client_order_id") or "n/a",
+                    row.get("tag") or "",
+                )
+                row["missing_fill_reported"] = True
+
+        if already_finalized:
+            self._sell_finalize_stats["duplicate_finalize"] = int(self._sell_finalize_stats.get("duplicate_finalize", 0) or 0) + 1
+            if not bool(row.get("dup_reported")):
+                self.logger.error(
+                    "[EM:SellFinalizeAssert] Duplicate SELL close finalization key=%s symbol=%s order_id=%s client_order_id=%s tag=%s",
+                    key,
+                    sym,
+                    row.get("order_id") or "n/a",
+                    row.get("client_order_id") or "n/a",
+                    row.get("tag") or "",
+                )
+                row["dup_reported"] = True
+        else:
+            row["finalized"] = 1
+            row["finalized_ts"] = now
+            self._sell_finalize_stats["finalized"] = int(self._sell_finalize_stats.get("finalized", 0) or 0) + 1
+            row["dup_reported"] = False
+
+        self._audit_sell_finalize_invariant(now=now)
+
+    def _audit_sell_finalize_invariant(self, *, now: Optional[float] = None, force_log: bool = False) -> None:
+        now_ts = float(now if now is not None else time.time())
+        assert_window = max(3.0, float(self._sell_finalize_assert_window_s or 30.0))
+        ttl = max(assert_window * 4.0, float(self._sell_finalize_track_ttl_s or 3600.0))
+
+        pending = 0
+        for key, row in list(self._sell_finalize_state.items()):
+            if not isinstance(row, dict):
+                self._sell_finalize_state.pop(key, None)
+                continue
+
+            fill_seen = int(row.get("fill_seen", 0) or 0)
+            finalized = int(row.get("finalized", 0) or 0)
+            fill_ts = float(row.get("fill_ts", row.get("last_ts", now_ts)) or now_ts)
+            last_ts = float(row.get("last_ts", fill_ts) or fill_ts)
+
+            if fill_seen > 0 and finalized <= 0:
+                pending += 1
+                age_s = max(0.0, now_ts - fill_ts)
+                if age_s >= assert_window and not bool(row.get("timeout_reported")):
+                    row["timeout_reported"] = True
+                    self._sell_finalize_stats["pending_timeout"] = int(self._sell_finalize_stats.get("pending_timeout", 0) or 0) + 1
+                    self.logger.error(
+                        "[EM:SellFinalizeAssert] Missing SELL close finalization key=%s symbol=%s age=%.2fs order_id=%s client_order_id=%s tag=%s",
+                        key,
+                        row.get("symbol") or "UNKNOWN",
+                        age_s,
+                        row.get("order_id") or "n/a",
+                        row.get("client_order_id") or "n/a",
+                        row.get("tag") or "",
+                    )
+
+            if ttl > 0 and (now_ts - last_ts) > ttl:
+                self._sell_finalize_state.pop(key, None)
+
+        self._sell_finalize_pending = int(pending)
+
+        finalized_total = int(self._sell_finalize_stats.get("finalized", 0) or 0)
+        fills_total = int(self._sell_finalize_stats.get("fills_seen", 0) or 0)
+        should_log = bool(force_log)
+
+        if self._sell_finalize_log_every > 0 and finalized_total > 0:
+            if finalized_total % self._sell_finalize_log_every == 0 and finalized_total != int(self._sell_finalize_last_report_finalized):
+                should_log = True
+
+        if not should_log and (now_ts - float(self._sell_finalize_last_report_ts or 0.0)) >= 180.0:
+            if fills_total > 0 or pending > 0:
+                should_log = True
+
+        if should_log:
+            self._sell_finalize_last_report_ts = now_ts
+            self._sell_finalize_last_report_finalized = finalized_total
+            self.logger.info(
+                "[EM:SellFinalizeCounter] fills_seen=%d finalized=%d pending=%d duplicate_finalize=%d finalize_without_fill=%d pending_timeout=%d fills_seen_duplicate=%d",
+                fills_total,
+                finalized_total,
+                pending,
+                int(self._sell_finalize_stats.get("duplicate_finalize", 0) or 0),
+                int(self._sell_finalize_stats.get("finalize_without_fill", 0) or 0),
+                int(self._sell_finalize_stats.get("pending_timeout", 0) or 0),
+                int(self._sell_finalize_stats.get("fills_seen_duplicate", 0) or 0),
+            )
+
+    async def _finalize_sell_post_fill(
+        self,
+        *,
+        symbol: str,
+        order: Optional[Dict[str, Any]],
+        tag: str = "",
+        post_fill: Optional[Dict[str, Any]] = None,
+        policy_ctx: Optional[Dict[str, Any]] = None,
+        tier: Optional[str] = None,
+    ) -> None:
+        """
+        Canonical SELL post-fill finalizer.
+        Ensures close bookkeeping/events are emitted exactly once per order payload.
+        
+        OPTION 1: Implements idempotent finalization via result cache.
+        Tracks finalization by (symbol, order_id) to prevent duplicate execution
+        when called multiple times with same position close.
+        
+        OPTION 3: After finalization, verifies the close actually worked by checking
+        if position qty decreased as expected.
+        """
+        if not isinstance(order, dict):
+            return
+        
+        sym = self._norm_symbol(symbol)
+        order_id = str(order.get("orderId") or order.get("order_id") or "")
+        
+        # --- OPTION 1: Check finalization result cache ---
+        cache_key = f"{sym}:{order_id}"
+        now_ts = time.time()
+        
+        # Prune expired cache entries
+        if cache_key in self._sell_finalize_result_cache_ts:
+            entry_ts = self._sell_finalize_result_cache_ts[cache_key]
+            if now_ts - entry_ts > self._sell_finalize_cache_ttl_s:
+                self._sell_finalize_result_cache.pop(cache_key, None)
+                self._sell_finalize_result_cache_ts.pop(cache_key, None)
+        
+        # If already finalized, return cached result
+        if cache_key in self._sell_finalize_result_cache:
+            cached_result = self._sell_finalize_result_cache[cache_key]
+            with contextlib.suppress(Exception):
+                self._track_sell_finalize(
+                    symbol=sym,
+                    order=order,
+                    tag=str(tag or ""),
+                    duplicate_attempt=True,
+                )
+            self.logger.debug(
+                "[SELL_FINALIZE:Idempotent] Skipped duplicate finalization for %s order_id=%s (cached)",
+                sym, order_id or "unknown"
+            )
+            return
+        
+        # Check old-style flag (backward compat with existing code)
+        if bool(order.get("_sell_close_events_done")):
+            with contextlib.suppress(Exception):
+                self._track_sell_finalize(
+                    symbol=symbol,
+                    order=order,
+                    tag=str(tag or ""),
+                    duplicate_attempt=True,
+                )
+            return
+
+        status = str(order.get("status", "")).upper()
+        exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+        if status not in ("FILLED", "PARTIALLY_FILLED") or exec_qty <= 0:
+            return
+
+        # Ensure post-fill processing has actually run. callers may pass an empty dict,
+        # so treat only a real dict with _post_fill_done as valid. Otherwise, force
+        # execution of the post-fill handler to guarantee accounting/emits happen here.
+        pf = post_fill if isinstance(post_fill, dict) else None
+        if not pf or not order.get("_post_fill_done"):
+            pf = await self._ensure_post_fill_handled(
+                symbol=sym,
+                side="SELL",
+                order=order,
+                tier=tier,
+                tag=str(tag or ""),
+            )
+
+        with contextlib.suppress(Exception):
+            await self._record_sell_exit_bookkeeping(
+                symbol=sym,
+                tag=str(tag or ""),
+                policy_ctx=policy_ctx,
+            )
+
+        try:
+            await self._emit_close_events(sym, order, pf if isinstance(pf, dict) else None)
+        except Exception as e:
+            self.logger.error(f"[SELL_CLOSE_EVENTS_CRASH] {sym}: {e}", exc_info=True)
+            with contextlib.suppress(Exception):
+                await self._sync_shared_position_after_sell_fill(
+                    symbol=sym,
+                    order=order,
+                    reason="SELL_CLOSE_EVENTS_CRASH_RECOVERY",
+                )
+            if bool(self._cfg("STRICT_ACCOUNTING_INTEGRITY", False)):
+                raise
+            return
+
+        with contextlib.suppress(Exception):
+            await self._sync_shared_position_after_sell_fill(
+                symbol=sym,
+                order=order,
+                reason="SELL_FILLED_SYNC",
+            )
+
+        order["_sell_close_events_done"] = True
+        
+        # --- OPTION 1: Cache the finalization result ---
+        finalize_result = {
+            "symbol": sym,
+            "order_id": order_id,
+            "executed_qty": exec_qty,
+            "timestamp": now_ts,
+            "tag": str(tag or ""),
+        }
+        self._sell_finalize_result_cache[cache_key] = finalize_result
+        self._sell_finalize_result_cache_ts[cache_key] = now_ts
+        
+        # --- OPTION 3: Queue for post-finalize verification ---
+        try:
+            pos_qty_before = exec_qty  # What we closed
+            verification_entry = {
+                "symbol": sym,
+                "order_id": order_id,
+                "expected_close_qty": pos_qty_before,
+                "verified_at_ts": None,
+                "verification_status": None,
+                "created_ts": now_ts,
+            }
+            self._pending_close_verification[cache_key] = verification_entry
+            self.logger.debug(
+                "[SELL_FINALIZE:PostVerify] Queued verification for %s order_id=%s (expect qty reduced by %.8f)",
+                sym, order_id or "unknown", pos_qty_before
+            )
+        except Exception as e:
+            self.logger.debug("[SELL_FINALIZE:PostVerify] Failed to queue verification: %s", e, exc_info=True)
+        
+        with contextlib.suppress(Exception):
+            self._track_sell_finalize(
+                symbol=sym,
+                order=order,
+                tag=str(tag or ""),
+                duplicate_attempt=False,
+            )
+
+    async def _verify_pending_closes(self) -> None:
+        """
+        OPTION 3: Post-finalize verification.
+        Periodically checks that positions marked for close verification are actually closed.
+        
+        This is a background task that runs independently to ensure finalization actually
+        resulted in the expected position reduction. If verification fails, it can:
+        1. Log warnings for monitoring/alerting
+        2. Retry finalization if position still exists
+        3. Update verification tracking state
+        """
+        now_ts = time.time()
+        to_remove = []
+        
+        for cache_key, entry in list(self._pending_close_verification.items()):
+            try:
+                symbol = entry.get("symbol", "")
+                order_id = entry.get("order_id", "")
+                expected_close_qty = float(entry.get("expected_close_qty", 0.0) or 0.0)
+                created_ts = float(entry.get("created_ts", now_ts) or now_ts)
+                
+                # Check age: remove old entries after timeout
+                age_s = now_ts - created_ts
+                timeout_s = float(self._cfg("CLOSE_VERIFICATION_TIMEOUT_SEC", 60.0) or 60.0)
+                if age_s > timeout_s:
+                    to_remove.append(cache_key)
+                    self.logger.warning(
+                        "[SELL_VERIFY:Timeout] Position close verification timed out: %s order_id=%s (age=%.1fs)",
+                        symbol, order_id or "unknown", age_s
+                    )
+                    continue
+                
+                # Get current position qty
+                try:
+                    current_qty = 0.0
+                    if hasattr(self.shared_state, "get_position_qty"):
+                        current_qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
+                    else:
+                        positions = getattr(self.shared_state, "positions", {}) or {}
+                        pos_entry = positions.get(symbol, {})
+                        if isinstance(pos_entry, dict):
+                            current_qty = float(pos_entry.get("qty", pos_entry.get("quantity", 0.0)) or 0.0)
+                except Exception:
+                    current_qty = 0.0
+                
+                # Verification success: position is closed (qty near zero)
+                if current_qty <= 1e-8:
+                    entry["verification_status"] = "VERIFIED_CLOSED"
+                    entry["verified_at_ts"] = now_ts
+                    to_remove.append(cache_key)
+                    self.logger.debug(
+                        "[SELL_VERIFY:Success] Position close verified: %s order_id=%s (final_qty=%.8f)",
+                        symbol, order_id or "unknown", current_qty
+                    )
+                    continue
+                
+                # Position still open: log warning but don't remove yet
+                if age_s > 10.0:  # Only warn after 10s, allow some grace
+                    self.logger.warning(
+                        "[SELL_VERIFY:Pending] Position close not yet verified: %s order_id=%s current_qty=%.8f expected_close=%.8f (age=%.1fs)",
+                        symbol, order_id or "unknown", current_qty, expected_close_qty, age_s
+                    )
+                    
+            except Exception as e:
+                self.logger.debug("[SELL_VERIFY] Error during verification: %s", e, exc_info=True)
+                to_remove.append(cache_key)
+        
+        # Cleanup expired entries
+        for key in to_remove:
+            self._pending_close_verification.pop(key, None)
 
     # Consider consolidating _split_symbol_quote and _split_base_quote to avoid drift.
     def _split_base_quote(self, symbol: str) -> Tuple[str, str]:
         s = (symbol or "").upper()
+        # Check configured quote currency first so instance config takes precedence
+        _base_ccy = (self.base_ccy or "").upper()
+        if _base_ccy and s.endswith(_base_ccy):
+            return s[:-len(_base_ccy)], _base_ccy
         for q in ("USDT", "FDUSD", "USDC", "BUSD", "TUSD", "BTC", "ETH"):
             if s.endswith(q):
                 return s[:-len(q)], q
-        # fallback: treat configured base_ccy as quote
-        if s.endswith(self.base_ccy):
-            return s[:-len(self.base_ccy)], self.base_ccy
         # last resort: naive 3–4 letter quote split
         return s[:-4], s[-4:]
 
@@ -432,8 +1819,6 @@ class ExecutionManager:
         self.exchange_client = exchange_client
         self.alert_callback = alert_callback
         self.logger = logging.getLogger(self.__class__.__name__)
-        # Add min_free_reserve_usdt attribute
-        self.min_free_reserve_usdt = float(getattr(config, 'EXECUTION_MIN_FREE_RESERVE_USDT', 0.50))
 
         # Execution-block cooldowns (finite no-trade states)
         self._buy_block_state: Dict[str, Dict[str, float]] = {}
@@ -446,13 +1831,19 @@ class ExecutionManager:
         self.meta_controller = None
         self.risk_manager = None
         self.tp_sl_engine = None
+        self.trade_journal = None  # injected by AppContext
+        self.session_id: str = ""  # injected by AppContext
+        self._journal_bootstrap_attempted = False
+        self._journal_fallback_warned = False
+        self._require_trade_journal_live = bool(self._cfg("REQUIRE_TRADE_JOURNAL_IN_LIVE", True))
+        self._journal_log_dir = str(self._cfg("TRADE_JOURNAL_LOG_DIR", "logs") or "logs")
 
         # Config
         self.base_ccy = str(getattr(config, "BASE_CURRENCY", "USDT")).upper()
         self.safety_headroom = float(getattr(config, "QUOTE_HEADROOM", 1.02))
         self.trade_fee_pct = float(getattr(config, "TRADE_FEE_PCT", 0.001))
         self.max_spend_per_trade = float(getattr(config, "MAX_SPEND_PER_TRADE_USDT", 0))
-        self.min_conf = float(getattr(config, "MIN_CONFIDENCE", 0.6))
+        self.min_conf = float(getattr(config, "MIN_EXECUTION_CONFIDENCE", 0.6))
         self.min_entry_quote_usdt = float(getattr(config, "MIN_ENTRY_QUOTE_USDT", 0.0))
         self.order_monitor_interval = float(getattr(config, "ORDER_MONITOR_INTERVAL", 15))
         self.stale_order_timeout_s = int(getattr(config, "STALE_ORDER_TIMEOUT_SECONDS", 120))
@@ -467,13 +1858,40 @@ class ExecutionManager:
         # ExecutionManager no longer enforces capital policy
         self.maker_grace_s = float(self._cfg('execution.maker_grace_s', 0.0))
         self.allow_taker_if_within_bps = float(self._cfg('execution.allow_taker_if_within_bps', 0.0))
-        self.min_free_reserve_usdt = float(self._cfg('execution.min_free_reserve_usdt', 0.0))
+        
+        # CRITICAL: Initialize min_free_reserve_usdt to 0.0 FIRST to avoid AttributeError
+        # Then assign from config sources
+        self.min_free_reserve_usdt = 0.0
+        self.min_free_reserve_usdt = float(
+            max(
+                float(self._cfg('execution.min_free_reserve_usdt', 0.0) or 0.0),
+                float(getattr(config, "EXECUTION_MIN_FREE_RESERVE_USDT", 0.0) or 0.0),
+                float(getattr(config, "MIN_LIQUIDITY_BUFFER", 0.0) or 0.0),
+            )
+        )
         self.no_remainder_below_quote = float(
             self._cfg('execution.no_remainder_below_quote', getattr(config, "NO_REMAINDER_BELOW_QUOTE", 0.0)) or 0.0
         )
         # When NAV is tiny, serialize placement globally
         self.small_nav_threshold = float(self._cfg('capital.small_nav_threshold_usdt', 50.0))
 
+        # ========== PHASE-BASED BOOTSTRAP CONTROL ==========
+        # Consultant Recommendation:
+        # Phase 1: Fix idempotency + allow ONE clean bootstrap execution (capital ~100-170 USDT)
+        # Phase 2: Disable bootstrap override entirely (after first fill confirmed)
+        # Phase 3: Re-enable smart bootstrap logic if needed (capital > 400 USDT)
+        
+        self.bootstrap_phase_1_capital_min = float(self._cfg('BOOTSTRAP_PHASE_1_CAPITAL_MIN', 50.0))
+        self.bootstrap_phase_1_capital_max = float(self._cfg('BOOTSTRAP_PHASE_1_CAPITAL_MAX', 200.0))
+        self.bootstrap_phase_3_capital_threshold = float(self._cfg('BOOTSTRAP_PHASE_3_CAPITAL_THRESHOLD', 400.0))
+        
+        # Phase 2 explicitly disables bootstrap override
+        self.bootstrap_allow_override = bool(self._cfg('BOOTSTRAP_ALLOW_OVERRIDE', False))
+        
+        # Track if we've done the first bootstrap fill
+        self._bootstrap_first_fill_done = False
+        self._bootstrap_phase_2_active = False
+        
         # Liquidity healing
         self.max_liquidity_retries = int(getattr(config, "MAX_LIQUIDITY_RETRIES", 1))
         self.liquidity_retry_delay = float(getattr(config, "LIQUIDITY_RETRY_DELAY_SECONDS", 3.0))
@@ -490,7 +1908,34 @@ class ExecutionManager:
         # Idempotency + active order guards (symbol, side)
         self._active_symbol_side_orders = set()
         self._seen_client_order_ids: Dict[str, float] = {}
-        self._decision_id_seq = 0
+        # SELL close-finalization runtime invariant tracker.
+        self._sell_finalize_state: Dict[str, Dict[str, Any]] = {}
+        self._sell_finalize_stats: Dict[str, int] = {
+            "fills_seen": 0,
+            "finalized": 0,
+            "fills_seen_duplicate": 0,
+            "duplicate_finalize": 0,
+            "finalize_without_fill": 0,
+            "pending_timeout": 0,
+        }
+        # --- OPTION 1: Idempotent finalize cache ---
+        # Maps (symbol, side) -> finalization result to prevent duplicate finalization
+        # Survives the lifetime of the position close, TTL-based cleanup
+        self._sell_finalize_result_cache: Dict[str, Dict[str, Any]] = {}
+        self._sell_finalize_result_cache_ts: Dict[str, float] = {}
+        self._sell_finalize_cache_ttl_s = float(self._cfg("SELL_FINALIZE_CACHE_TTL_SEC", 300.0) or 300.0)
+        # --- OPTION 3: Post-finalize verification tracking ---
+        # Tracks positions that should be closed to verify finalization actually worked
+        self._pending_close_verification: Dict[str, Dict[str, Any]] = {}
+        self._close_verification_check_interval_s = float(self._cfg("CLOSE_VERIFICATION_INTERVAL_SEC", 2.0) or 2.0)
+        self._sell_finalize_pending = 0
+        self._sell_finalize_assert_window_s = float(self._cfg("SELL_FINALIZE_ASSERT_WINDOW_SEC", 30.0) or 30.0)
+        self._sell_finalize_track_ttl_s = float(self._cfg("SELL_FINALIZE_TRACK_TTL_SEC", 3600.0) or 3600.0)
+        self._sell_finalize_log_every = int(self._cfg("SELL_FINALIZE_LOG_EVERY", 25) or 25)
+        self._sell_finalize_last_report_ts = 0.0
+        self._sell_finalize_last_report_finalized = -1
+        self._sell_fill_recovery_tasks: Dict[str, asyncio.Task] = {}
+        self._exchange_zero_mismatch_counts: Dict[str, int] = {}
 
         # Optional local cache to serve callers that want filters without reaching ExchangeClient internals.
         # ExchangeClient already maintains its own `symbol_filters` cache; this layer is primarily API sugar.
@@ -498,10 +1943,8 @@ class ExecutionManager:
         self._symbol_filters_cache_ts: Dict[str, float] = {}
         self._symbol_filters_cache_max_age_s = float(getattr(config, "SYMBOL_FILTERS_CACHE_MAX_AGE_S", 900.0) or 900.0)
 
-        # Heartbeat task (will be created on first async operation)
-        self._heartbeat_task = None
-
         self.logger.info("ExecutionManager initialized with P9 configuration")
+        self._ensure_trade_journal_ready(reason="init")
 
         # --- Health: mark as Initialized right away (so Watchdog stops "no-report") ---
         try:
@@ -511,7 +1954,11 @@ class ExecutionManager:
             if callable(upd):
                 res = upd("ExecutionManager", "Initialized", "Ready")
                 if asyncio.iscoroutine(res):
-                    asyncio.create_task(res)
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(res)
+                    except RuntimeError:
+                        pass  # No running loop yet (called from __init__)
             # compatibility mirror for Watchdog (_safe_status fallback)
             try:
                 now_ts = time.time()
@@ -533,6 +1980,98 @@ class ExecutionManager:
             default = cur if cur is not None else default
         return cur if cur is not None else default
 
+    # ========== BOOTSTRAP PHASE MANAGEMENT ==========
+    def _get_current_nav(self) -> float:
+        """Get current portfolio NAV in USDT."""
+        try:
+            if hasattr(self.shared_state, "portfolio_nav"):
+                nav = self.shared_state.portfolio_nav
+                if callable(nav):
+                    nav = nav()
+                return float(nav or 0.0)
+            if hasattr(self.shared_state, "total_equity_usdt"):
+                return float(self.shared_state.total_equity_usdt or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    def _get_bootstrap_phase(self) -> str:
+        """
+        Determine current bootstrap phase based on capital and state.
+        
+        Returns: "phase_1", "phase_2", or "phase_3"
+        """
+        nav = self._get_current_nav()
+        
+        # Phase 2: Explicitly enabled (takes precedence)
+        if self._bootstrap_phase_2_active or not self.bootstrap_allow_override:
+            return "phase_2"
+        
+        # Phase 3: High capital
+        if nav >= self.bootstrap_phase_3_capital_threshold:
+            return "phase_3"
+        
+        # Phase 1: Bootstrap capital range
+        if self.bootstrap_phase_1_capital_min <= nav <= self.bootstrap_phase_1_capital_max:
+            return "phase_1"
+        
+        # Default: Phase 1 if below Phase 1 max
+        if nav < self.bootstrap_phase_1_capital_max:
+            return "phase_1"
+        
+        # High capital but Phase 2 not explicitly disabled
+        return "phase_3"
+
+    def _is_bootstrap_allowed(self) -> bool:
+        """Check if bootstrap override is allowed in current phase."""
+        phase = self._get_bootstrap_phase()
+        
+        if phase == "phase_1":
+            # Phase 1: Allow ONE bootstrap execution
+            return not self._bootstrap_first_fill_done
+        elif phase == "phase_2":
+            # Phase 2: Disable bootstrap entirely
+            return False
+        elif phase == "phase_3":
+            # Phase 3: Allow smart bootstrap logic
+            return True
+        
+        return False
+
+    def _mark_bootstrap_fill_done(self):
+        """Mark that first bootstrap fill has been executed."""
+        self._bootstrap_first_fill_done = True
+        self.logger.info(
+            "[BOOTSTRAP] First fill confirmed. Moving to Phase 2 (bootstrap disabled). "
+            "Re-enable at capital > %.2f USDT",
+            self.bootstrap_phase_3_capital_threshold
+        )
+
+    def _activate_phase_2(self):
+        """Explicitly activate Phase 2 (disable bootstrap override)."""
+        self._bootstrap_phase_2_active = True
+        self.bootstrap_allow_override = False
+        self.logger.warning(
+            "[BOOTSTRAP] Phase 2 activated: bootstrap override DISABLED. "
+            "EV + adaptive logic will handle entries naturally. "
+            "Phase 3 available at capital > %.2f USDT",
+            self.bootstrap_phase_3_capital_threshold
+        )
+
+    def _exit_phase_2(self):
+        """Exit Phase 2 when capital conditions are met."""
+        nav = self._get_current_nav()
+        if nav >= self.bootstrap_phase_3_capital_threshold:
+            self._bootstrap_phase_2_active = False
+            self.logger.info(
+                "[BOOTSTRAP] Phase 2 exited: Entering Phase 3 (smart bootstrap). "
+                "Capital: %.2f USDT >= threshold: %.2f USDT",
+                nav,
+                self.bootstrap_phase_3_capital_threshold
+            )
+            return True
+        return False
+
     def _exit_fee_bps(self) -> float:
         cfg_val = float(self._cfg("EXIT_FEE_BPS", self._cfg("CR_FEE_BPS", 0.0)) or 0.0)
         fee_from_pct = float(self.trade_fee_pct or 0.0) * 10000.0
@@ -551,22 +2090,332 @@ class ExecutionManager:
             )
         return {"min_exit_quote": 0.0, "min_notional": 0.0}
 
-    async def _get_min_entry_quote(self, symbol: str, price: Optional[float] = None, min_notional: Optional[float] = None, policy_context: Optional[Dict[str, Any]] = None) -> float:
-        policy_ctx = policy_context or {}
-        base_quote = float(policy_ctx.get("min_entry_quote", self._cfg("DEFAULT_PLANNED_QUOTE", self._cfg("MIN_ENTRY_QUOTE_USDT", 0.0)) or 0.0))
-        exit_info = await self._get_exit_floor_info(symbol, price=price)
+    async def _get_total_equity(self) -> float:
+        """Best-effort total equity (USDT) from SharedState across sync/async variants."""
+        try:
+            val = await maybe_call(self.shared_state, "get_total_equity")
+            if val is not None:
+                num = float(val)
+                if num > 0:
+                    return num
+        except Exception:
+            pass
+        try:
+            val = await maybe_call(self.shared_state, "get_nav")
+            if val is not None:
+                num = float(val)
+                if num > 0:
+                    return num
+        except Exception:
+            pass
+        try:
+            val = await maybe_call(self.shared_state, "get_nav_quote")
+            if val is not None:
+                num = float(val)
+                if num > 0:
+                    return num
+        except Exception:
+            pass
+        try:
+            num = float(getattr(self.shared_state, "total_equity", 0.0) or 0.0)
+            if num > 0:
+                return num
+        except Exception:
+            pass
+        try:
+            metrics = getattr(self.shared_state, "metrics", {}) or {}
+            num = float(metrics.get("nav", 0.0) or metrics.get("total_equity", 0.0) or 0.0)
+            if num > 0:
+                return num
+        except Exception:
+            pass
+        return 0.0
 
-        min_position_usdt = float(self._cfg("MIN_POSITION_USDT", 0.0) or 0.0)
-        min_notional_mult = float(self._cfg("MIN_POSITION_MIN_NOTIONAL_MULT", 2.0) or 2.0)
+    async def _resolve_nav_tier_economic_floor(
+        self,
+        symbol: Optional[str] = None,
+        min_notional: Optional[float] = None,
+    ) -> float:
+        """
+        NAV-tiered economic floor:
+        - nav < 500: max(min_notional, 10)
+        - 500 <= nav < 2000: nav * 0.08
+        - nav >= 2000: nav * 0.05
+        """
+        sym = self._norm_symbol(symbol or "")
         min_notional_val = float(min_notional or 0.0)
-        if min_notional_val <= 0:
+        if min_notional_val <= 0 and sym:
             try:
-                filters = await self.exchange_client.ensure_symbol_filters_ready(symbol)
+                filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
                 min_notional_val = float(self._extract_min_notional(filters) or 0.0)
             except Exception:
                 min_notional_val = 0.0
+
+        nav = float(await self._get_total_equity() or 0.0)
+        if nav <= 0:
+            # Safety fallback if NAV is temporarily unavailable.
+            legacy_floor = float(
+                self._cfg(
+                    "MIN_ECONOMIC_TRADE_USDT",
+                    self._cfg("MIN_ECONOMIC_TRADE_USD", 10.0),
+                )
+                or 10.0
+            )
+            return max(min_notional_val, legacy_floor, 10.0)
+
+        if nav < 500.0:
+            floor = max(min_notional_val, 10.0)
+        elif nav < 2000.0:
+            floor = nav * 0.08
+        else:
+            floor = nav * 0.05
+        return max(float(floor), min_notional_val)
+
+    async def _resolve_nav_tier_profit_target(self) -> float:
+        """
+        Dynamic NAV-aware hourly profit target.
+        Replaces static PROFIT_TARGET_BASE_USD_PER_HOUR.
+        """
+        try:
+            nav = float(await self._get_total_equity() or 0.0)
+        except Exception:
+            nav = 0.0
+
+        if nav <= 0:
+            return 0.5  # safe fallback
+
+        if nav < 500:
+            return max(0.5, nav * 0.01)        # 1% hourly
+        elif nav < 2000:
+            return nav * 0.005                # 0.5%
+        elif nav < 10000:
+            return nav * 0.003                # 0.3%
+        else:
+            return nav * 0.002                # 0.2%
+
+    async def _calculate_adaptive_execution_threshold(
+        self,
+        symbol: str,
+        planned_quote: float,
+        price: float,
+        signal_confidence: Optional[float] = None,
+        policy_context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Adaptive Execution Threshold Engine (Institutional-Grade)
+
+        Calculates minimum required edge for execution using multi-factor analysis:
+        minimum_edge_required = fee_cost + volatility_regime_factor + confidence_discount + NAV_risk_profile
+
+        Returns dict with threshold analysis and decision
+        """
+        policy_ctx = policy_context or {}
+
+        # 1. Fee Cost Component
+        round_trip_fee_rate = float(self.trade_fee_pct) * 2.0  # Round trip fees
+        slippage_estimate = float(self._cfg("SLIPPAGE_ESTIMATE_PCT", 0.0005) or 0.0005)  # 0.05% slippage
+        fee_cost = round_trip_fee_rate + slippage_estimate
+
+        # 2. Volatility Regime Factor
+        atr_pct = 0.0
+        volatility_regime = "normal"
+        try:
+            if hasattr(self.shared_state, "calc_atr"):
+                atr_5m = float(await self.shared_state.calc_atr(symbol, "5m", 14) or 0.0)
+                atr_1h = float(await self.shared_state.calc_atr(symbol, "1h", 14) or 0.0)
+                if atr_5m <= 0:
+                    atr_5m = float(await self.shared_state.calc_atr(symbol, "1m", 14) or 0.0)
+
+                if atr_5m > 0 and price > 0:
+                    atr_pct = atr_5m / price
+
+                    # Determine volatility regime
+                    if atr_pct > 0.02:  # >2% ATR = high volatility
+                        volatility_regime = "high"
+                        volatility_factor = atr_pct * 1.5  # Require 50% more edge in high vol
+                    elif atr_pct < 0.005:  # <0.5% ATR = low volatility
+                        volatility_regime = "low"
+                        volatility_factor = atr_pct * 0.7  # Allow 30% less edge in low vol
+                    else:
+                        volatility_regime = "normal"
+                        volatility_factor = atr_pct
+                else:
+                    atr_pct = float(self._cfg("MICRO_TRADE_KILL_FALLBACK_ATR_PCT", 0.005) or 0.005)
+                    volatility_factor = atr_pct
+        except Exception:
+            atr_pct = float(self._cfg("MICRO_TRADE_KILL_FALLBACK_ATR_PCT", 0.005) or 0.005)
+            volatility_factor = atr_pct
+
+        # 3. Confidence Discount Factor
+        if signal_confidence is not None:
+            confidence = float(signal_confidence)
+        elif policy_ctx.get("confidence") is not None:
+            confidence = float(policy_ctx.get("confidence"))
+        else:
+            confidence = 0.5
+        # High confidence (0.8+) gets discount, low confidence (<0.4) requires premium
+        if confidence >= 0.8:
+            confidence_adjustment = 0.7  # 30% discount for high confidence
+        elif confidence >= 0.6:
+            confidence_adjustment = 0.85  # 15% discount for good confidence
+        elif confidence >= 0.4:
+            confidence_adjustment = 1.0  # No adjustment for neutral confidence
+        else:
+            confidence_adjustment = 1.3  # 30% premium for low confidence
+
+        # 4. NAV Risk Profile
+        nav = float(await self._get_total_equity() or 0.0)
+        if nav <= 0:
+            nav_risk_profile = 1.5  # Conservative when NAV unknown
+        elif nav < 100:
+            nav_risk_profile = 1.0  # Allow bootstrap growth
+        elif nav < 500:
+            nav_risk_profile = 0.95  # Slightly relaxed for small accounts
+        elif nav < 2000:
+            nav_risk_profile = 1.0  # Standard risk for established accounts
+        elif nav < 10000:
+            nav_risk_profile = 0.9  # Slightly relaxed for larger accounts
+        else:
+            nav_risk_profile = 0.8  # More relaxed for institutional accounts
+
+        # 5. NAV-Aware Position Sizing Factor
+        position_size_pct_of_nav = (planned_quote / nav) if nav > 0 else 0.1
+        if nav < 500:
+            size_risk_factor = 1.0  # Small accounts: 25% positions are normal
+        elif position_size_pct_of_nav > 0.05:  # >5% of NAV
+            size_risk_factor = 1.05  # Require more edge for large positions
+        elif position_size_pct_of_nav > 0.02:  # >2% of NAV
+            size_risk_factor = 1.1  # Moderate premium for medium positions
+        else:
+            size_risk_factor = 1.0  # No adjustment for small positions
+
+        # Calculate Final Required Edge
+        base_required_edge = fee_cost + volatility_factor
+        confidence_adjusted_edge = base_required_edge * confidence_adjustment
+        nav_adjusted_edge = confidence_adjusted_edge * nav_risk_profile
+        final_required_edge = nav_adjusted_edge * size_risk_factor
+
+        # 🛡️ Safe Guard: Clamp required edge for small accounts
+        if nav < 500:
+            final_required_edge = min(final_required_edge, atr_pct * 0.9)
+
+        # Current Market Edge (simplified - in reality would use order book analysis)
+        # For now, use ATR as proxy for available edge
+        current_market_edge = atr_pct
+
+        # Decision Logic
+        can_execute = current_market_edge >= final_required_edge
+        edge_sufficiency_ratio = current_market_edge / final_required_edge if final_required_edge > 0 else 0
+
+        return {
+            "can_execute": can_execute,
+            "required_edge_pct": final_required_edge,
+            "current_edge_pct": current_market_edge,
+            "edge_sufficiency_ratio": edge_sufficiency_ratio,
+            "components": {
+                "fee_cost": fee_cost,
+                "volatility_factor": volatility_factor,
+                "confidence_adjustment": confidence_adjustment,
+                "nav_risk_profile": nav_risk_profile,
+                "size_risk_factor": size_risk_factor,
+                "volatility_regime": volatility_regime
+            },
+            "analysis": {
+                "confidence_level": confidence,
+                "nav_amount": nav,
+                "position_size_pct": position_size_pct_of_nav,
+                "kill_reason": None if can_execute else "INSUFFICIENT_EDGE"
+            }
+        }
+
+    async def _get_min_entry_quote(
+        self,
+        symbol: str,
+        price: Optional[float] = None,
+        min_notional: Optional[float] = None,
+        policy_context: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        """
+        Canonical BUY economic-floor resolver.
+
+        This is the single method used by execution paths to compute the minimum
+        acceptable planned quote for entry decisions.
+        """
+        sym = self._norm_symbol(symbol)
+        policy_ctx = policy_context or {}
+
+        base_quote = float(
+            policy_ctx.get(
+                "min_entry_quote",
+                self._cfg("DEFAULT_PLANNED_QUOTE", self._cfg("MIN_ENTRY_QUOTE_USDT", 0.0)) or 0.0,
+            )
+            or 0.0
+        )
+
+        price_f = float(price or 0.0)
+        if price_f <= 0:
+            try:
+                price_f = float(getattr(self.shared_state, "latest_prices", {}).get(sym, 0.0) or 0.0)
+            except Exception:
+                price_f = 0.0
+        if price_f <= 0:
+            with contextlib.suppress(Exception):
+                price_f = float(await maybe_call(self.exchange_client, "get_current_price", sym) or 0.0)
+        if price_f <= 0:
+            with contextlib.suppress(Exception):
+                price_f = float(await maybe_call(self.exchange_client, "get_price", sym) or 0.0)
+
+        min_notional_val = float(min_notional or policy_ctx.get("min_notional", 0.0) or 0.0)
+        if min_notional_val <= 0:
+            try:
+                filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
+                min_notional_val = float(self._extract_min_notional(filters) or 0.0)
+            except Exception:
+                min_notional_val = 0.0
+
+        exit_info: Dict[str, float] = {"min_exit_quote": 0.0, "min_entry_quote": 0.0}
+        with contextlib.suppress(Exception):
+            exit_info = await self._get_exit_floor_info(sym, price=price_f if price_f > 0 else None)
+
+        nav_floor = 0.0
+        with contextlib.suppress(Exception):
+            nav_floor = float(
+                await self._resolve_nav_tier_economic_floor(
+                    symbol=sym, min_notional=min_notional_val
+                )
+                or 0.0
+            )
+
+        shared_state_floor = 0.0
+        if hasattr(self.shared_state, "compute_min_entry_quote"):
+            with contextlib.suppress(Exception):
+                shared_state_floor = float(
+                    await self.shared_state.compute_min_entry_quote(
+                        sym,
+                        default_quote=base_quote,
+                        price=price_f if price_f > 0 else None,
+                        min_notional_override=min_notional_val if min_notional_val > 0 else None,
+                    )
+                    or 0.0
+                )
+
+        min_position_usdt = float(self._cfg("MIN_POSITION_USDT", 0.0) or 0.0)
+        min_notional_mult = float(self._cfg("MIN_POSITION_MIN_NOTIONAL_MULT", 2.0) or 2.0)
         min_position_floor = min_notional_val * min_notional_mult if min_notional_val > 0 else 0.0
-        return max(float(exit_info.get("min_exit_quote", 0.0)), float(base_quote), min_position_usdt, min_position_floor)
+
+        candidates = (
+            base_quote,
+            float(policy_ctx.get("min_entry_quote", 0.0) or 0.0),
+            float(min_notional_val or 0.0),
+            float(exit_info.get("min_exit_quote", 0.0) or 0.0),
+            float(exit_info.get("min_entry_quote", 0.0) or 0.0),
+            float(min_position_usdt or 0.0),
+            float(min_position_floor or 0.0),
+            float(nav_floor or 0.0),
+            float(shared_state_floor or 0.0),
+        )
+        final_floor = max(float(x) for x in candidates if float(x) >= 0.0)
+        return final_floor
 
     def _is_dust_operation_context(
         self,
@@ -612,6 +2461,22 @@ class ExecutionManager:
                 await self._emit_status("Operational", "Idle / Ready")
             except Exception:
                 pass
+            with contextlib.suppress(Exception):
+                self._audit_sell_finalize_invariant()
+            # Prune expired _sell_finalize_result_cache entries
+            with contextlib.suppress(Exception):
+                _now = time.time()
+                _ttl = self._sell_finalize_cache_ttl_s
+                _expired = [
+                    k for k, ts in list(self._sell_finalize_result_cache_ts.items())
+                    if _now - ts > _ttl
+                ]
+                for k in _expired:
+                    self._sell_finalize_result_cache.pop(k, None)
+                    self._sell_finalize_result_cache_ts.pop(k, None)
+            # --- OPTION 3: Run post-finalize verification checks ---
+            with contextlib.suppress(Exception):
+                await self._verify_pending_closes()
             await asyncio.sleep(60)
 
     def _ensure_heartbeat(self) -> None:
@@ -629,7 +2494,6 @@ class ExecutionManager:
 
     # small helper to emit status consistently
     async def _emit_status(self, status: str, detail: str = ""):
-        self._ensure_heartbeat()
         try:
             # Update timestamp so Watchdog sees activity
             if hasattr(self.shared_state, "update_timestamp"):
@@ -658,7 +2522,7 @@ class ExecutionManager:
         try:
             if self._concurrent_orders_sem is None:
                 self._concurrent_orders_sem = asyncio.Semaphore(self.max_concurrent_orders)
-                cfg_max_conc = int(getattr(self.config, 'execution.max_concurrency', self.max_concurrent_orders))
+                cfg_max_conc = int(self._cfg('execution.max_concurrency', self.max_concurrent_orders))
                 if cfg_max_conc and cfg_max_conc < self.max_concurrent_orders:
                     self._concurrent_orders_sem = asyncio.Semaphore(cfg_max_conc)
             if self._cancel_sem is None:
@@ -691,7 +2555,67 @@ class ExecutionManager:
             "heartbeat": "running" if hb_ok else "stopped",
             "active_symbol_side_orders": len(getattr(self, "_active_symbol_side_orders", set()) or set()),
             "seen_client_order_ids": len(getattr(self, "_seen_client_order_ids", {}) or {}),
+            "sell_finalize_fills_seen": int(getattr(self, "_sell_finalize_stats", {}).get("fills_seen", 0) or 0),
+            "sell_finalize_finalized": int(getattr(self, "_sell_finalize_stats", {}).get("finalized", 0) or 0),
+            "sell_finalize_pending": int(getattr(self, "_sell_finalize_pending", 0) or 0),
+            "sell_finalize_duplicate": int(getattr(self, "_sell_finalize_stats", {}).get("duplicate_finalize", 0) or 0),
+            "sell_finalize_pending_timeout": int(getattr(self, "_sell_finalize_stats", {}).get("pending_timeout", 0) or 0),
         }
+
+    async def wait_for_inflight_sells(self, timeout: float = 3.0, poll_sec: float = 0.1) -> bool:
+        """
+        Wait briefly for SELL lifecycle activity to quiesce.
+        Used during controller shutdown to avoid canceling mid-finalization.
+        """
+        timeout_s = max(0.0, float(timeout or 0.0))
+        poll = min(max(float(poll_sec or 0.1), 0.05), 0.5)
+        deadline = time.time() + timeout_s
+
+        while True:
+            with contextlib.suppress(Exception):
+                self._audit_sell_finalize_invariant()
+
+            active_sells = 0
+            with contextlib.suppress(Exception):
+                active_sells = sum(
+                    1
+                    for item in (getattr(self, "_active_symbol_side_orders", set()) or set())
+                    if isinstance(item, tuple) and len(item) >= 2 and str(item[1]).upper() == "SELL"
+                )
+
+            recovery_pending = 0
+            with contextlib.suppress(Exception):
+                recovery_pending = sum(
+                    1
+                    for task in (getattr(self, "_sell_fill_recovery_tasks", {}) or {}).values()
+                    if task is not None and not task.done()
+                )
+
+            finalize_pending = int(getattr(self, "_sell_finalize_pending", 0) or 0)
+
+            exit_lock_pending = 0
+            with contextlib.suppress(Exception):
+                exit_lock_pending = sum(
+                    1
+                    for v in (getattr(self.shared_state, "exit_in_progress", {}) or {}).values()
+                    if bool(v)
+                )
+
+            if active_sells <= 0 and recovery_pending <= 0 and finalize_pending <= 0 and exit_lock_pending <= 0:
+                return True
+
+            if time.time() >= deadline:
+                self.logger.warning(
+                    "[EM:SellDrainTimeout] active_sells=%d recovery_pending=%d finalize_pending=%d exit_lock_pending=%d timeout=%.2fs",
+                    int(active_sells),
+                    int(recovery_pending),
+                    int(finalize_pending),
+                    int(exit_lock_pending),
+                    timeout_s,
+                )
+                return False
+
+            await asyncio.sleep(poll)
 
     async def get_symbol_filters_cached(self, symbol: str, *, max_age_s: Optional[float] = None) -> Dict[str, Any]:
         """Return normalized exchange filters for `symbol` (best-effort, cached).
@@ -757,18 +2681,50 @@ class ExecutionManager:
         try:
             qty = 0.0
             base_asset, _ = self._split_base_quote(sym)
+            exchange_checked = False
             
             # ✅ FIX #2: CHECK EXCHANGE FIRST (authoritative source, < 50ms)
             get_bal = getattr(self.exchange_client, "get_account_balance", None)
             if callable(get_bal):
                 with contextlib.suppress(Exception):
+                    exchange_checked = True
                     bal = await get_bal(base_asset)
                     free = float((bal or {}).get("free", 0.0))
                     locked = float((bal or {}).get("locked", 0.0))
                     qty = float(free + locked)
                     if qty > 0:
+                        self._exchange_zero_mismatch_counts.pop(sym, None)
                         self.logger.debug(f"[GetSellable] {sym}: qty={qty:.6f} from Exchange (AUTHORITATIVE)")
                         return qty
+
+            if exchange_checked:
+                local_qty = 0.0
+                with contextlib.suppress(Exception):
+                    if hasattr(self.shared_state, "get_position_quantity"):
+                        local_qty = float(await self.shared_state.get_position_quantity(sym) or 0.0)
+                    elif isinstance(getattr(self.shared_state, "positions", None), dict):
+                        local_qty = float((self.shared_state.positions.get(sym, {}) or {}).get("quantity", 0.0) or 0.0)
+                
+                # ✅ CRITICAL FIX: If exchange=0 but local>0, allow SELL attempt for reconciliation
+                # (Don't immediately return 0; let canonical SELL flow process mutation)
+                if local_qty > 0:
+                    mismatch_count = int(self._exchange_zero_mismatch_counts.get(sym, 0) or 0) + 1
+                    self._exchange_zero_mismatch_counts[sym] = mismatch_count
+                    repair_threshold = int(self._cfg("EXCHANGE_ZERO_REPAIR_THRESHOLD", 2) or 2)
+                    
+                    # ✅ NEW: Return local_qty immediately to allow canonical SELL path
+                    # Don't wait for threshold - let reconciliation finalize the mutation
+                    self.logger.warning(
+                        "[GetSellable] %s exchange qty=0 but local qty=%.8f (count=%d) -> returning local qty for canonical SELL",
+                        sym,
+                        local_qty,
+                        mismatch_count,
+                    )
+                    return float(local_qty)
+                else:
+                    self._exchange_zero_mismatch_counts.pop(sym, None)
+                    self.logger.debug(f"[GetSellable] {sym}: qty=0 from Exchange (authoritative, no local position)")
+                    return 0.0
             
             # ✅ FIX #2: FALLBACK to SharedState only if Exchange unavailable
             if hasattr(self.shared_state, "get_position_quantity"):
@@ -829,8 +2785,7 @@ class ExecutionManager:
                     f"[PositionReady] {sym}: qty={qty:.6f} available (attempt {attempt + 1}/{max_retries})"
                 )
                 return qty
-            
-            # If we found it, return early
+
             if attempt < max_retries - 1:
                 # State might be in flight; trigger refresh and retry
                 self.logger.warning(
@@ -920,6 +2875,86 @@ class ExecutionManager:
             return False, detail
         return True, detail
 
+    async def _resolve_dynamic_sell_threshold(
+        self,
+        *,
+        sym: str,
+        entry: float,
+        price: float,
+        qty: float,
+        policy_ctx: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Compute dynamic sell edge threshold: fees + slippage + volatility noise + USDT floor."""
+        ctx = policy_ctx or {}
+        fee_component = (float(self._exit_fee_bps() or 0.0) / 10000.0) * 2.0
+
+        atr_tf = str(
+            self._cfg("SELL_DYNAMIC_ATR_TIMEFRAME", self._cfg("VOLATILITY_REGIME_TIMEFRAME", "5m")) or "5m"
+        )
+        atr_period = int(
+            self._cfg("SELL_DYNAMIC_ATR_PERIOD", self._cfg("VOLATILITY_REGIME_ATR_PERIOD", 14)) or 14
+        )
+        atr_pct = 0.0
+        try:
+            if hasattr(self.shared_state, "calc_atr"):
+                atr_val = float(await maybe_call(self.shared_state, "calc_atr", sym, atr_tf, atr_period) or 0.0)
+                if atr_val <= 0:
+                    atr_val = float(await maybe_call(self.shared_state, "calc_atr", sym, "1m", atr_period) or 0.0)
+                if atr_val > 0 and float(price or 0.0) > 0:
+                    atr_pct = atr_val / max(float(price), 1e-9)
+        except Exception:
+            atr_pct = 0.0
+        if atr_pct <= 0:
+            atr_pct = float(
+                self._cfg(
+                    "SELL_DYNAMIC_FALLBACK_ATR_PCT",
+                    self._cfg("MICRO_TRADE_KILL_FALLBACK_ATR_PCT", 0.0),
+                )
+                or 0.0
+            )
+
+        slippage_min_pct = float(self._cfg("SELL_DYNAMIC_SLIPPAGE_MIN_PCT", 0.0003) or 0.0003)
+        slippage_atr_mult = float(self._cfg("SELL_DYNAMIC_SLIPPAGE_ATR_MULT", 0.05) or 0.05)
+        slippage_component = max(slippage_min_pct, atr_pct * slippage_atr_mult)
+
+        vol_buffer_atr_mult = float(self._cfg("SELL_DYNAMIC_VOL_BUFFER_ATR_MULT", 0.15) or 0.15)
+        volatility_buffer = max(0.0, atr_pct * vol_buffer_atr_mult)
+
+        strategic_buffer = float(self._cfg("SELL_DYNAMIC_STRATEGIC_BUFFER_PCT", 0.0) or 0.0)
+        min_usdt_floor = float(self._cfg("SELL_DYNAMIC_MIN_USDT_FLOOR", 0.12) or 0.12)
+        pos_notional_quote = max(float(qty or 0.0) * float(price or 0.0), float(qty or 0.0) * float(entry or 0.0), 0.0)
+        usdt_floor_pct = (min_usdt_floor / pos_notional_quote) if pos_notional_quote > 0 else 0.0
+
+        required_profit_pct = fee_component + slippage_component + volatility_buffer + strategic_buffer
+        required_profit_pct = max(required_profit_pct, usdt_floor_pct)
+
+        regime = str(
+            ctx.get("volatility_regime")
+            or ctx.get("tradeability_regime")
+            or (getattr(self.shared_state, "metrics", {}) or {}).get("volatility_regime")
+            or "normal"
+        ).lower()
+        regime_mult = 1.0
+        if regime == "high":
+            regime_mult = float(self._cfg("SELL_DYNAMIC_REGIME_HIGH_MULT", 1.3) or 1.3)
+        elif regime == "low":
+            regime_mult = float(self._cfg("SELL_DYNAMIC_REGIME_LOW_MULT", 0.8) or 0.8)
+        required_profit_pct *= regime_mult
+
+        return {
+            "required_profit_pct": float(required_profit_pct),
+            "fee_component_pct": float(fee_component),
+            "slippage_component_pct": float(slippage_component),
+            "volatility_buffer_pct": float(volatility_buffer),
+            "strategic_buffer_pct": float(strategic_buffer),
+            "usdt_floor_pct": float(usdt_floor_pct),
+            "atr_pct": float(atr_pct),
+            "regime": regime,
+            "regime_mult": float(regime_mult),
+            "position_notional_quote": float(pos_notional_quote),
+            "min_usdt_floor": float(min_usdt_floor),
+        }
+
     async def _check_sell_net_pnl_gate(
         self,
         *,
@@ -983,52 +3018,64 @@ class ExecutionManager:
 
         expected_move_pct = (price - entry) / max(entry, 1e-9)
         fee_bps = float(self._exit_fee_bps() or 0.0)
-        slippage_bps = float(self._exit_slippage_bps() or 0.0)
-        fee_pct_total = (fee_bps / 10000.0) * 2.0
-        slippage_pct = slippage_bps / 10000.0
-        buffer_pct = float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
-        entry_fee_mult = float(self._cfg("MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
-        exit_fee_mult = float(self._cfg("MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
-        exit_fee_mult = max(exit_fee_mult, entry_fee_mult)
-        net_after_fees_pct = expected_move_pct - fee_pct_total - slippage_pct
-        min_net_pct = float(self.min_net_profit_after_fees_pct or 0.0)
-        required_move_pct = (fee_pct_total * exit_fee_mult) + slippage_pct + buffer_pct
-        if expected_move_pct < required_move_pct:
+        dynamic_gate_enabled = bool(self._cfg("SELL_DYNAMIC_EDGE_GATE_ENABLED", True))
+        dynamic = await self._resolve_dynamic_sell_threshold(
+            sym=sym,
+            entry=entry,
+            price=price,
+            qty=qty,
+            policy_ctx=policy_ctx,
+        )
+
+        slippage_component = float(dynamic.get("slippage_component_pct", 0.0) or 0.0)
+        fee_component = float(dynamic.get("fee_component_pct", 0.0) or 0.0)
+        slippage_bps = slippage_component * 10000.0
+        net_after_fees_pct = expected_move_pct - fee_component - slippage_component
+        required_move_pct = float(dynamic.get("required_profit_pct", 0.0) or 0.0)
+        if dynamic_gate_enabled and expected_move_pct < required_move_pct:
             self.logger.info(
-                "[EM:SellNetPctGate] Blocked SELL %s: move=%.4f%% < required=%.4f%% (fee_mult=%.2f fees=%.4f%% slip=%.4f%% buffer=%.4f%%)",
+                "[EM:SellDynamicGate] Blocked SELL %s: edge=%.4f%% < required=%.4f%% "
+                "(fee=%.4f%% slip=%.4f%% vol=%.4f%% floor=%.4f%% regime=%s x%.2f atr=%.4f%% pos=%.4f)",
                 sym,
                 expected_move_pct * 100.0,
                 required_move_pct * 100.0,
-                exit_fee_mult,
-                fee_pct_total * 100.0,
-                slippage_pct * 100.0,
-                buffer_pct * 100.0,
+                fee_component * 100.0,
+                slippage_component * 100.0,
+                float(dynamic.get("volatility_buffer_pct", 0.0) or 0.0) * 100.0,
+                float(dynamic.get("usdt_floor_pct", 0.0) or 0.0) * 100.0,
+                str(dynamic.get("regime", "normal")),
+                float(dynamic.get("regime_mult", 1.0) or 1.0),
+                float(dynamic.get("atr_pct", 0.0) or 0.0) * 100.0,
+                float(dynamic.get("position_notional_quote", 0.0) or 0.0),
             )
             try:
-                await self.shared_state.record_rejection(sym, "SELL", "SELL_BELOW_FEE", source="ExecutionManager")
+                await self.shared_state.record_rejection(sym, "SELL", "SELL_DYNAMIC_EDGE_MIN", source="ExecutionManager")
             except Exception:
                 pass
             return {
                 "ok": False,
                 "status": "blocked",
-                "reason": "sell_below_fees",
-                "error_code": "SELL_BELOW_FEE",
+                "reason": "sell_dynamic_edge_below_min",
+                "error_code": "SELL_DYNAMIC_EDGE_MIN",
                 "expected_move_pct": expected_move_pct,
                 "required_move_pct": required_move_pct,
-                "fee_mult": exit_fee_mult,
                 "fee_bps": fee_bps,
-                "slippage_bps": slippage_bps,
-                "buffer_bps": float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0),
+                "fee_component_pct": fee_component,
+                "slippage_component_pct": slippage_component,
+                "volatility_buffer_pct": float(dynamic.get("volatility_buffer_pct", 0.0) or 0.0),
+                "usdt_floor_pct": float(dynamic.get("usdt_floor_pct", 0.0) or 0.0),
+                "atr_pct": float(dynamic.get("atr_pct", 0.0) or 0.0),
+                "regime": str(dynamic.get("regime", "normal")),
+                "regime_mult": float(dynamic.get("regime_mult", 1.0) or 1.0),
             }
-        if min_net_pct > 0 and net_after_fees_pct < min_net_pct:
+        min_net_pct = float(self.min_net_profit_after_fees_pct or 0.0)
+        legacy_net_pct_guard = bool(self._cfg("SELL_DYNAMIC_LEGACY_NET_PCT_GUARD", False))
+        if legacy_net_pct_guard and min_net_pct > 0 and net_after_fees_pct < min_net_pct:
             self.logger.info(
-                "[EM:SellNetPctGate] Blocked SELL %s: net_after_fees=%.4f%% < min=%.4f%% (move=%.4f%% fees=%.4f%% slip=%.4f%%)",
+                "[EM:SellNetPctGate] Blocked SELL %s: net_after_fees=%.4f%% < min=%.4f%% (legacy guard enabled)",
                 sym,
                 net_after_fees_pct * 100.0,
                 min_net_pct * 100.0,
-                expected_move_pct * 100.0,
-                fee_pct_total * 100.0,
-                slippage_pct * 100.0,
             )
             try:
                 await self.shared_state.record_rejection(sym, "SELL", "SELL_NET_PCT_MIN", source="ExecutionManager")
@@ -1097,11 +3144,11 @@ class ExecutionManager:
 
     async def _check_dust_retirement_before_rejection(self, symbol: str, side: str) -> bool:
         """
-        🔒 DUST RETIREMENT RULE: Check if position should be retired to PERMANENT_DUST.
-        
+        Check if position should be retired to PERMANENT_DUST before recording a rejection.
+
         Returns True if position was retired (rejection should be skipped).
         Returns False if safe to record rejection.
-        
+
         Prevents dust positions from entering infinite rejection loops.
         """
         sym = symbol.upper()
@@ -1148,9 +3195,8 @@ class ExecutionManager:
                 self.logger.warning(f"[DUST_RETIRED] Fallback permanent_dust tracking for {sym}")
             
             # Clear existing rejections
-            if hasattr(self.shared_state, "clear_rejections"):
-                await self.shared_state.clear_rejections(sym, side_upper)
-            
+            await maybe_call(self.shared_state, "clear_rejections", sym, side_upper)
+
             # Don't record new rejection
             return True
         
@@ -1181,6 +3227,13 @@ class ExecutionManager:
         
         if qty <= 0:
             return False  # No position = not dust
+
+        # Permanent dust is terminal by governance definition.
+        try:
+            if hasattr(self.shared_state, "is_permanent_dust") and self.shared_state.is_permanent_dust(sym):
+                return True
+        except Exception:
+            pass
         
         # Get minNotional for this symbol
         try:
@@ -1203,6 +3256,22 @@ class ExecutionManager:
         
         # Calculate notional value
         notional_value = qty * float(price)
+
+        # Institutional residual floor: treat sub-threshold value as permanent dust noise.
+        permanent_dust_threshold = float(
+            self._cfg("PERMANENT_DUST_USDT_THRESHOLD", 1.0) or 1.0
+        )
+        if 0 < notional_value < permanent_dust_threshold:
+            self.logger.info(
+                "[TERMINAL_DUST] %s value=%.4f < permanent_threshold=%.4f -> PERMANENT_DUST",
+                sym,
+                notional_value,
+                permanent_dust_threshold,
+            )
+            with contextlib.suppress(Exception):
+                if hasattr(self.shared_state, "mark_as_permanent_dust"):
+                    self.shared_state.mark_as_permanent_dust(sym)
+            return True
         
         # TERMINAL_DUST: Value is below minNotional
         is_terminal_dust = notional_value < min_notional
@@ -1223,15 +3292,25 @@ class ExecutionManager:
         
         return is_terminal_dust
 
+    def _normalize_quote_precision(self, symbol: str, quote: float) -> float:
+        """Round quote amount down to exchange tick precision to avoid rejection."""
+        try:
+            filters = self._symbol_filters_cache.get(self._norm_symbol(symbol), {})
+            price_filter = filters.get("PRICE_FILTER", {})
+            tick = float(price_filter.get("tickSize", 0) or 0)
+            if tick > 0:
+                return float(Decimal(str(quote)).quantize(Decimal(str(tick)), rounding=ROUND_DOWN))
+        except Exception:
+            pass
+        # Fallback: round to 8 decimal places
+        return round(float(quote), 8)
+
     def _norm_symbol(self, s: str) -> str:
         return (s or "").replace("/", "").upper()
 
     def _split_symbol_quote(self, symbol: str) -> str:
-        s = (symbol or "").upper()
-        for q in ("USDT", "FDUSD", "USDC", "BUSD", "TUSD", "BTC", "ETH"):
-            if s.endswith(q):
-                return q
-        return self.base_ccy
+        _, quote = self._split_base_quote(symbol)
+        return quote
 
     async def _get_available_quote(self, symbol: str) -> float:
         quote_asset = self._split_symbol_quote(symbol)
@@ -1283,9 +3362,408 @@ class ExecutionManager:
 
     async def _log_execution_event(self, event_type: str, symbol: str, details: Dict[str, Any]):
         event = {"ts": time.time(), "component": "ExecutionManager", "event": event_type, "symbol": symbol, **details}
-        self.logger.info(f"[{event_type}] {symbol}: {details}")
+        self.logger.debug(f"[{event_type}] {symbol}: {details}")
         # Use SharedState.emit_event (exists) — not append_event
         await maybe_call(self.shared_state, "emit_event", "ExecEvent", event)
+
+    def _is_live_trading_mode(self) -> bool:
+        return bool(self._cfg("LIVE_MODE", False)) and not bool(self._cfg("SIMULATION_MODE", False)) \
+            and not bool(self._cfg("PAPER_MODE", False)) and not bool(self._cfg("TESTNET_MODE", False))
+
+    def _ensure_trade_journal_ready(self, *, reason: str = "runtime") -> bool:
+        tj = getattr(self, "trade_journal", None)
+        if tj is not None and callable(getattr(tj, "record", None)):
+            return True
+
+        if not bool(self._journal_bootstrap_attempted):
+            self._journal_bootstrap_attempted = True
+            try:
+                from core.trade_journal import TradeJournal
+                self.trade_journal = TradeJournal(log_dir=self._journal_log_dir)
+                self.logger.warning(
+                    "[EM:Journal] TradeJournal auto-initialized (reason=%s, log_dir=%s)",
+                    reason,
+                    self._journal_log_dir,
+                )
+                self._journal_fallback_warned = False
+                return True
+            except Exception as e:
+                severe = bool(self._require_trade_journal_live and self._is_live_trading_mode())
+                if severe:
+                    self.logger.critical(
+                        "[EM:Journal] TradeJournal unavailable in live mode (reason=%s): %s",
+                        reason,
+                        e,
+                    )
+                else:
+                    self.logger.warning(
+                        "[EM:Journal] TradeJournal unavailable (reason=%s): %s",
+                        reason,
+                        e,
+                    )
+                self.logger.debug("[EM:Journal] auto-init stack", exc_info=True)
+                self._journal_fallback_warned = True
+                return False
+
+        if bool(self._require_trade_journal_live and self._is_live_trading_mode()) and not bool(self._journal_fallback_warned):
+            self.logger.critical(
+                "[EM:Journal] TradeJournal still unavailable in live mode (reason=%s).",
+                reason,
+            )
+            self._journal_fallback_warned = True
+        return False
+
+    def _is_order_fill_confirmed(self, order: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(order, dict):
+            return False
+        status = str(order.get("status", "")).upper()
+        exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+        return status in ("FILLED", "PARTIALLY_FILLED") and exec_qty > 0.0
+
+    def _is_ambiguous_submit_error(self, exc: Exception) -> bool:
+        if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
+            return True
+        if isinstance(exc, BinanceAPIException):
+            with contextlib.suppress(Exception):
+                code = int(getattr(exc, "code", 0) or 0)
+                if code in {-1000, -1001, -1006, -1007, -1008, -1015, -1021}:
+                    return True
+        msg = str(exc or "").lower()
+        markers = (
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "service unavailable",
+            "gateway timeout",
+            "temporarily unavailable",
+            "read timed out",
+        )
+        return any(m in msg for m in markers)
+
+    async def _recover_order_by_client_id(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        client_order_id: str,
+        retries: int,
+        delay_s: float,
+    ) -> Optional[Dict[str, Any]]:
+        get_order = getattr(self.exchange_client, "get_order", None)
+        if not callable(get_order):
+            return None
+
+        sym = self._norm_symbol(symbol)
+        for attempt in range(1, retries + 1):
+            if attempt > 1:
+                await asyncio.sleep(delay_s)
+            try:
+                fresh = await get_order(sym, client_order_id=str(client_order_id))
+            except TypeError:
+                try:
+                    fresh = await get_order(sym, clientOrderId=str(client_order_id))
+                except Exception:
+                    fresh = None
+            except Exception:
+                fresh = None
+            if isinstance(fresh, dict) and fresh:
+                self.logger.warning(
+                    "[EM:ConnErrRecover] Recovered order after transport failure symbol=%s side=%s client_id=%s attempt=%d/%d",
+                    sym,
+                    str(side or "").upper(),
+                    str(client_order_id),
+                    attempt,
+                    retries,
+                )
+                return fresh
+        return None
+
+    def _build_submission_unknown_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        client_order_id: Optional[str],
+        reason: str,
+        error_code: str,
+        error_text: str,
+    ) -> Dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        payload: Dict[str, Any] = {
+            "ok": False,
+            "symbol": self._norm_symbol(symbol),
+            "side": str(side or "").upper(),
+            "status": "UNKNOWN_SUBMISSION",
+            "executedQty": 0.0,
+            "cummulativeQuoteQty": 0.0,
+            "reason": str(reason),
+            "error_code": str(error_code),
+            "error_message": str(error_text or ""),
+            "_submission_unknown": True,
+            "updateTime": now_ms,
+            "time": now_ms,
+        }
+        if client_order_id:
+            payload["clientOrderId"] = str(client_order_id)
+            payload["client_order_id"] = str(client_order_id)
+        return payload
+
+    def _journal(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Write to the persistent trade journal (fire-and-forget, never raises)."""
+        tj = getattr(self, "trade_journal", None)
+        if tj is None:
+            self._ensure_trade_journal_ready(reason=f"event:{event_type}")
+            tj = getattr(self, "trade_journal", None)
+        try:
+            data.setdefault("session_id", getattr(self, "session_id", ""))
+            if tj is not None and callable(getattr(tj, "record", None)):
+                tj.record(event_type, data)
+                return
+            self.logger.info(
+                "[TRADE_JOURNAL_FALLBACK] %s",
+                json.dumps(
+                    {
+                        "event": event_type,
+                        "epoch": time.time(),
+                        **dict(data or {}),
+                    },
+                    separators=(",", ":"),
+                    default=str,
+                ),
+            )
+        except Exception:
+            self.logger.debug("TradeJournal write failed", exc_info=True)
+
+    async def _verify_position_invariants(self, symbol: str, event_type: str, before_qty: float = 0.0) -> bool:
+        """
+        ✅ ELITE-LEVEL: Invariant check after SELL events.
+        
+        Guarantees:
+        1. After SELL: position_qty_after <= position_qty_before (monotonic decrease)
+        2. Periodically: exchange_position == internal_position (drift detection)
+        
+        On violation:
+        - Log CRITICAL error
+        - Emit health status DEGRADED
+        - Hard-stop trading (optional, depends on STRICT_POSITION_INVARIANTS)
+        
+        Returns: True if invariants pass, False if violated
+        """
+        try:
+            sym = self._norm_symbol(symbol)
+            
+            # Get current internal position from SharedState
+            internal_qty = 0.0
+            try:
+                if hasattr(self.shared_state, "get_position_quantity"):
+                    internal_qty = float(await self.shared_state.get_position_quantity(sym) or 0.0)
+                elif isinstance(getattr(self.shared_state, "positions", None), dict):
+                    internal_qty = float((self.shared_state.positions.get(sym, {}) or {}).get("quantity", 0.0) or 0.0)
+            except Exception:
+                pass
+            
+            # Get current exchange position
+            exchange_qty = 0.0
+            try:
+                base_asset = self._split_base_quote(sym)[0]
+                get_bal = getattr(self.exchange_client, "get_account_balance", None)
+                if callable(get_bal):
+                    bal = await get_bal(base_asset)
+                    free = float((bal or {}).get("free", 0.0))
+                    locked = float((bal or {}).get("locked", 0.0))
+                    exchange_qty = float(free + locked)
+            except Exception:
+                pass
+            
+            # INVARIANT #1: SELL should monotonically decrease position
+            if event_type in ("ORDER_FILLED", "RECONCILED_DELAYED_FILL", "SELL_ORDER_PLACED"):
+                if before_qty > 0 and internal_qty > before_qty:
+                    # ❌ CRITICAL: Position INCREASED after SELL (should have decreased)
+                    error_msg = (
+                        f"🚨 INVARIANT VIOLATED: {sym} position INCREASED during SELL "
+                        f"(before={before_qty:.8f} after={internal_qty:.8f}). "
+                        f"This indicates double-execution or state corruption."
+                    )
+                    self.logger.critical(error_msg)
+                    self._journal("INVARIANT_VIOLATION", {
+                        "symbol": sym,
+                        "event_type": event_type,
+                        "violation_type": "POSITION_INCREASED_DURING_SELL",
+                        "before_qty": float(before_qty),
+                        "after_qty": float(internal_qty),
+                        "exchange_qty": float(exchange_qty),
+                    })
+                    
+                    # Emit CRITICAL health status
+                    try:
+                        if hasattr(self.shared_state, "emit_event"):
+                            self.shared_state.emit_event("HealthStatus", {
+                                "level": "CRITICAL",
+                                "component": "ExecutionManager",
+                                "issue": "PositionInvariantViolation",
+                                "symbol": sym,
+                                "details": {"before": before_qty, "after": internal_qty},
+                            })
+                    except Exception:
+                        pass
+                    
+                    # Hard-stop if configured
+                    if bool(self._cfg("STRICT_POSITION_INVARIANTS", False)):
+                        raise RuntimeError(f"Position invariant violation on {sym}: HALTING")
+                    
+                    return False
+            
+            # INVARIANT #2: Exchange and internal should not drift significantly
+            # (This runs periodically, not on every trade)
+            if event_type == "PERIODIC_SYNC_CHECK":
+                eps = float(self._cfg("POSITION_SYNC_TOLERANCE", 0.00001))
+                drift = abs(exchange_qty - internal_qty)
+                
+                if drift > eps:
+                    # ⚠️ WARNING: Position drift detected
+                    self.logger.warning(
+                        f"⚠️ Position drift on {sym}: exchange={exchange_qty:.8f} "
+                        f"internal={internal_qty:.8f} drift={drift:.8f}"
+                    )
+                    
+                    # Only escalate to CRITICAL if drift is large (> 1% of position)
+                    if internal_qty > 0 and (drift / internal_qty) > 0.01:
+                        self.logger.critical(
+                            f"🚨 LARGE DRIFT on {sym}: {(drift/internal_qty)*100:.2f}% "
+                            f"(exchange={exchange_qty:.8f} internal={internal_qty:.8f})"
+                        )
+                        self._journal("LARGE_POSITION_DRIFT", {
+                            "symbol": sym,
+                            "exchange_qty": float(exchange_qty),
+                            "internal_qty": float(internal_qty),
+                            "drift_abs": float(drift),
+                            "drift_pct": float((drift / internal_qty) * 100) if internal_qty > 0 else 0.0,
+                        })
+                        
+                        # Emit health warning
+                        try:
+                            if hasattr(self.shared_state, "emit_event"):
+                                self.shared_state.emit_event("HealthStatus", {
+                                    "level": "DEGRADED",
+                                    "component": "ExecutionManager",
+                                    "issue": "PositionDriftDetected",
+                                    "symbol": sym,
+                                    "details": {"exchange": exchange_qty, "internal": internal_qty},
+                                })
+                        except Exception:
+                            pass
+                        
+                        return False
+            
+            return True  # All invariants pass
+            
+        except Exception:
+            self.logger.debug("Position invariant check failed", exc_info=True)
+            return True  # Don't halt trading on check failure itself
+
+    async def _passes_profit_gate(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        current_price: float,
+    ) -> bool:
+        """
+        🔥 CRITICAL EXECUTION LAYER PROFIT GATE
+        
+        Enforces profit constraint at the EXECUTION layer, BEFORE place_market_order.
+        This gate CANNOT be bypassed, even by recovery or emergency modes.
+        
+        Purpose:
+        --------
+        Prevent unprofitable SELL orders from executing, protecting capital.
+        
+        Rules:
+        ------
+        1. BUY orders: Always allow (gate is for SELL only)
+        2. SELL orders (NOT recovery/force_close):
+           - Get entry price from position
+           - Calculate: profit = (current_price - entry_price) * quantity - fees
+           - Check: profit >= SELL_MIN_NET_PNL_USDT (default=0)
+           - If profit < gate: BLOCK and return False
+        3. Recovery/Force-close SELL: Allow (bypass gate with explicit intent)
+        
+        Returns
+        -------
+        True: SELL allowed (passes profit gate)
+        False: SELL blocked (fails profit gate)
+        """
+        symbol = self._norm_symbol(symbol)
+        
+        # BUY orders always pass
+        if side.upper() != "SELL":
+            return True
+        
+        # Get sell threshold from config
+        sell_min_net_pnl_usdt = float(self._cfg("SELL_MIN_NET_PNL_USDT", 0.0) or 0.0)
+        
+        # If gate is disabled (threshold = 0), allow all SELL
+        if sell_min_net_pnl_usdt <= 0:
+            return True
+        
+        # Get position entry price
+        try:
+            pos = await self.shared_state.get_position(symbol) if hasattr(self.shared_state, "get_position") else None
+            if not pos or not isinstance(pos, dict):
+                # Position not found → allow SELL (may be already closed or phantom)
+                self.logger.warning(f"[EM:ProfitGate] Position not found for {symbol}, allowing SELL")
+                return True
+            
+            entry_price = float(pos.get("entry_price") or pos.get("entryPrice") or 0.0)
+            if entry_price <= 0:
+                # No entry price → allow SELL
+                self.logger.warning(f"[EM:ProfitGate] No entry price for {symbol}, allowing SELL")
+                return True
+        except Exception as e:
+            # On error, allow SELL (fail-open to prevent blocking)
+            self.logger.warning(f"[EM:ProfitGate] Error getting position {symbol}: {e}, allowing SELL")
+            return True
+        
+        # Calculate gross profit (before fees)
+        gross_profit = (current_price - entry_price) * quantity
+        
+        # Estimate fees
+        fee_rate = float(self.trade_fee_pct or 0.001)
+        estimated_entry_fee = entry_price * quantity * fee_rate
+        estimated_exit_fee = current_price * quantity * fee_rate
+        estimated_fees = estimated_entry_fee + estimated_exit_fee
+        
+        # Net profit = gross profit - fees
+        net_profit = gross_profit - estimated_fees
+        
+        # Check gate
+        if net_profit < sell_min_net_pnl_usdt:
+            self.logger.warning(
+                f"🚫 [EM:ProfitGate] SELL BLOCKED for {symbol}: "
+                f"net_profit={net_profit:.2f} < threshold={sell_min_net_pnl_usdt:.2f} "
+                f"(entry={entry_price:.8f} current={current_price:.8f} qty={quantity:.8f} fees={estimated_fees:.2f})"
+            )
+            self._journal("SELL_BLOCKED_BY_PROFIT_GATE", {
+                "symbol": symbol,
+                "side": "SELL",
+                "quantity": float(quantity),
+                "entry_price": float(entry_price),
+                "current_price": float(current_price),
+                "gross_profit": float(gross_profit),
+                "estimated_fees": float(estimated_fees),
+                "net_profit": float(net_profit),
+                "threshold": float(sell_min_net_pnl_usdt),
+                "timestamp": time.time(),
+            })
+            return False
+        
+        # SELL allowed
+        self.logger.info(
+            f"✅ [EM:ProfitGate] SELL ALLOWED for {symbol}: "
+            f"net_profit={net_profit:.2f} >= threshold={sell_min_net_pnl_usdt:.2f}"
+        )
+        return True
 
     async def _emit_trade_executed_event(
         self,
@@ -1293,28 +3771,414 @@ class ExecutionManager:
         side: str,
         tag: str,
         order: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        tag_lower = str(tag or "").lower()
-        if side.lower() != "sell" or "tp_sl" not in tag_lower:
-            return
+    ) -> bool:
+        sym = self._norm_symbol(symbol)
+        side_u = str(side or "").upper()
         payload = {
             "ts": time.time(),
-            "symbol": symbol,
-            "side": side.upper(),
+            "symbol": sym,
+            "side": side_u,
             "tag": tag,
             "source": "ExecutionManager",
         }
+        dedupe_key = ""
         if isinstance(order, dict):
+            exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+            avg_price = self._safe_float(order.get("avgPrice") or order.get("avg_price"), 0.0)
+            if avg_price <= 0:
+                avg_price = self._resolve_post_fill_price(order, exec_qty)
+            exchange_order_id = order.get("orderId") or order.get("exchange_order_id")
+            internal_order_id = order.get("order_id")
+            order_id = exchange_order_id or internal_order_id
+            client_order_id = (
+                order.get("clientOrderId") or order.get("client_order_id") or order.get("origClientOrderId")
+            )
             payload.update({
-                "executed_qty": float(order.get("executedQty", 0.0) or 0.0),
-                "avg_price": float(order.get("avgPrice", order.get("price", 0.0)) or 0.0),
-                "order_id": order.get("orderId") or order.get("order_id") or order.get("exchange_order_id"),
+                "executed_qty": float(exec_qty),
+                "avg_price": float(avg_price),
+                "order_id": order_id,
+                "exchange_order_id": exchange_order_id or order_id,
+                "client_order_id": client_order_id,
+                "cummulative_quote": order.get("cummulativeQuoteQty") or order.get("cummulative_quote"),
                 "status": str(order.get("status", "")).lower(),
             })
+            if exchange_order_id not in (None, ""):
+                dedupe_key = f"{sym}:{side_u}:OID:{exchange_order_id}"
+            elif internal_order_id not in (None, "") and str(internal_order_id).isdigit():
+                dedupe_key = f"{sym}:{side_u}:OID:{internal_order_id}"
+            elif client_order_id not in (None, ""):
+                dedupe_key = f"{sym}:{side_u}:CID:{client_order_id}"
+            else:
+                order_ts = (
+                    order.get("updateTime")
+                    or order.get("transactTime")
+                    or order.get("time")
+                    or order.get("timestamp")
+                    or int(time.time() * 1000)
+                )
+                dedupe_key = (
+                    f"{sym}:{side_u}:QTY:{float(exec_qty):.12f}:PX:{float(avg_price):.12f}:"
+                    f"TS:{int(float(order_ts) or 0.0)}"
+                )
+
+        lock = getattr(self, "_trade_event_emit_lock", None)
+        if lock is None:
+            try:
+                asyncio.get_running_loop()
+                lock = asyncio.Lock()
+                self._trade_event_emit_lock = lock
+            except RuntimeError:
+                return False  # No running loop yet
+
+        cache = getattr(self, "_trade_event_emit_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._trade_event_emit_cache = cache
+
+        ttl_sec = float(self._cfg("TRADE_EXECUTED_DEDUPE_TTL_SEC", 86400.0) or 86400.0)
         try:
-            await maybe_call(self.shared_state, "emit_event", "TRADE_EXECUTED", payload)
+            async with lock:
+                now = time.time()
+                if dedupe_key:
+                    prev_ts = float(cache.get(dedupe_key, 0.0) or 0.0)
+                    if prev_ts > 0 and (now - prev_ts) <= ttl_sec:
+                        self.logger.debug(
+                            "[TRADE_EXECUTED_DEDUP] Skip duplicate canonical emit %s key=%s",
+                            sym,
+                            dedupe_key,
+                        )
+                        return True
+
+                emit = getattr(self.shared_state, "emit_event", None)
+                if not callable(emit):
+                    raise RuntimeError("SharedState missing emit_event() for TRADE_EXECUTED")
+
+                last_err = None
+                for attempt in (1, 2):
+                    try:
+                        res = emit("TRADE_EXECUTED", payload)
+                        if asyncio.iscoroutine(res):
+                            await res
+                        if dedupe_key:
+                            cache[dedupe_key] = time.time()
+                            if len(cache) > 8000:
+                                cutoff = time.time() - max(60.0, ttl_sec)
+                                for k, ts in list(cache.items()):
+                                    if float(ts or 0.0) < cutoff:
+                                        cache.pop(k, None)
+                        return True
+                    except Exception as e:
+                        last_err = e
+                        if attempt == 1:
+                            await asyncio.sleep(0)
+                        else:
+                            raise last_err
+        except Exception as e:
+            self.logger.error(
+                "[TRADE_EXECUTED_EVENT_FAIL] symbol=%s side=%s tag=%s err=%s",
+                sym,
+                side_u,
+                tag,
+                e,
+                exc_info=True,
+            )
+            if bool(self._cfg("STRICT_OBSERVABILITY_EVENTS", False)):
+                raise
+            return False
+
+    # ── Unified TRADE_AUDIT layer ──────────────────────────────────────
+    async def _emit_trade_audit(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order: Dict[str, Any],
+        tier: Optional[str] = None,
+        tag: str = "",
+        confidence: Optional[float] = None,
+        agent: Optional[str] = None,
+        planned_quote: Optional[float] = None,
+        post_fill_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Unified TRADE_AUDIT: single structured record for every confirmed fill.
+        Captures complete context (exchange, routing, PnL, TP/SL, market regime)
+        so every trade is fully auditable from one event/log line.
+        """
+        try:
+            sym = self._norm_symbol(symbol)
+            side_u = str(side or "").upper()
+            now = time.time()
+
+            exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
+            avg_price = self._safe_float(order.get("avgPrice") or order.get("avg_price"), 0.0)
+            if avg_price <= 0:
+                avg_price = self._resolve_post_fill_price(order, exec_qty)
+            order_id = order.get("orderId") or order.get("exchange_order_id") or order.get("order_id") or ""
+            client_order_id = order.get("clientOrderId") or order.get("client_order_id") or order.get("origClientOrderId") or ""
+            cumm_quote = self._safe_float(order.get("cummulativeQuoteQty") or order.get("cummulative_quote"), 0.0)
+            status = str(order.get("status", "")).upper()
+
+            # Fee breakdown
+            fee_quote = 0.0
+            fee_base = 0.0
+            try:
+                base_asset, quote_asset = self._split_base_quote(sym)
+                fills = order.get("fills") or []
+                if isinstance(fills, list) and fills:
+                    fee_base = sum(
+                        float(f.get("commission", 0.0) or 0.0)
+                        for f in fills
+                        if str(f.get("commissionAsset") or "").upper() == base_asset
+                    )
+                    fee_quote = sum(
+                        float(f.get("commission", 0.0) or 0.0)
+                        for f in fills
+                        if str(f.get("commissionAsset") or "").upper() == quote_asset
+                    )
+                if fee_quote <= 0:
+                    fee_quote = float(order.get("fee_quote", 0.0) or order.get("fee", 0.0) or 0.0)
+                if fee_base <= 0:
+                    fee_base = float(order.get("fee_base", 0.0) or 0.0)
+            except Exception:
+                pass
+
+            # Position context (entry price, TP/SL, holding time)
+            ss = self.shared_state
+            positions = getattr(ss, "positions", {}) or {}
+            open_trades = getattr(ss, "open_trades", {}) or {}
+            pos = positions.get(sym, {}) if isinstance(positions, dict) else {}
+            ot = open_trades.get(sym, {}) if isinstance(open_trades, dict) else {}
+
+            entry_price = float(
+                (ot or {}).get("entry_price")
+                or (ot or {}).get("avg_price")
+                or (pos or {}).get("avg_price")
+                or 0.0
+            )
+            tp = float((ot or {}).get("tp") or 0.0)
+            sl = float((ot or {}).get("sl") or 0.0)
+            tp_sl_method = str((ot or {}).get("tp_sl_method") or "")
+
+            # PnL (for SELLs)
+            realized_pnl = 0.0
+            pnl_pct = 0.0
+            if side_u == "SELL" and entry_price > 0 and avg_price > 0:
+                realized_pnl = (avg_price - entry_price) * exec_qty - fee_quote
+                pnl_pct = (avg_price - entry_price) / entry_price
+            pf = post_fill_result if isinstance(post_fill_result, dict) else {}
+            if pf.get("delta") is not None:
+                realized_pnl = float(pf["delta"])
+
+            # Holding time (for SELLs)
+            holding_sec = 0.0
+            if side_u == "SELL":
+                opened_at = float((ot or {}).get("opened_at") or (ot or {}).get("created_at") or 0.0)
+                if opened_at > 0:
+                    holding_sec = now - opened_at
+
+            # Exit reason from policy context or tag
+            exit_reason = ""
+            if side_u == "SELL":
+                tag_u = str(tag or "").upper()
+                if "TP" in tag_u and "SL" not in tag_u:
+                    exit_reason = "TP"
+                elif "SL" in tag_u:
+                    exit_reason = "SL"
+                elif "LIQUIDATION" in tag_u or "LIQ" in tag_u:
+                    exit_reason = "LIQUIDATION"
+                elif "STAGNATION" in tag_u:
+                    exit_reason = "STAGNATION"
+                elif "ROTATION" in tag_u:
+                    exit_reason = "ROTATION"
+                elif tag_u:
+                    exit_reason = tag_u
+
+            # Market context
+            atr_pct = 0.0
+            regime = ""
+            try:
+                if avg_price > 0 and hasattr(ss, "calc_atr"):
+                    atr_period = int(self._cfg("SELL_DYNAMIC_ATR_PERIOD", 14) or 14)
+                    atr_tf_primary = str(self._cfg("SELL_DYNAMIC_ATR_TIMEFRAME", "5m") or "5m").strip()
+                    atr_val = 0.0
+                    checked = set()
+                    for tf in (atr_tf_primary, "5m", "1h", "1m"):
+                        tf_norm = str(tf or "").strip().lower()
+                        if not tf_norm or tf_norm in checked:
+                            continue
+                        checked.add(tf_norm)
+                        with contextlib.suppress(Exception):
+                            atr_candidate = float(await maybe_call(ss, "calc_atr", sym, tf_norm, atr_period) or 0.0)
+                            if atr_candidate > 0:
+                                atr_val = atr_candidate
+                                break
+                    if atr_val > 0:
+                        atr_pct = atr_val / max(float(avg_price), 1e-9)
+                vs = getattr(ss, "volatility_state", {}) or {}
+                regime = str(vs.get(sym, "") or "")
+            except Exception:
+                pass
+
+            # Compounding phase
+            phase = ""
+            try:
+                dyn = getattr(ss, "dynamic_config", {}) or {}
+                phase = str(dyn.get("compounding_phase") or dyn.get("COMPOUNDING_PHASE") or "")
+            except Exception:
+                pass
+
+            payload = {
+                "ts": now,
+                "symbol": sym,
+                "side": side_u,
+                "executed_qty": float(exec_qty),
+                "avg_price": float(avg_price),
+                "cummulative_quote": float(cumm_quote),
+                "order_id": str(order_id),
+                "client_order_id": str(client_order_id),
+                "status": status,
+                "tier": str(tier or ""),
+                "tag": str(tag or ""),
+                "source": "ExecutionManager",
+                "agent": str(agent or ""),
+                "confidence": float(confidence or 0.0),
+                "planned_quote": float(planned_quote or 0.0),
+                "entry_price": float(entry_price),
+                "pnl_pct": round(float(pnl_pct), 6),
+                "realized_pnl": round(float(realized_pnl), 6),
+                "fee_quote": round(float(fee_quote), 8),
+                "fee_base": round(float(fee_base), 8),
+                "exit_reason": exit_reason,
+                "tp": float(tp),
+                "sl": float(sl),
+                "tp_sl_method": tp_sl_method,
+                "atr_pct": round(float(atr_pct), 6),
+                "regime": regime,
+                "phase": phase,
+                "holding_sec": round(float(holding_sec), 1),
+            }
+
+            # Structured log line (greppable independently of event bus)
+            self.logger.info("[TRADE_AUDIT] %s", json.dumps(payload, separators=(",", ":")))
+
+            # Emit to event bus
+            emit = getattr(ss, "emit_event", None)
+            if callable(emit):
+                res = emit("TRADE_AUDIT", payload)
+                if asyncio.iscoroutine(res):
+                    await res
         except Exception:
-            pass
+            self.logger.debug("[TRADE_AUDIT] emit failed (non-fatal)", exc_info=True)
+
+    async def _audit_post_fill_accounting(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        raw: Dict[str, Any],
+        stage: str,
+        decision_id: str = "",
+    ) -> None:
+        """
+        Runtime accounting integrity audit after state mutation.
+        Logs a compact snapshot for observability and emits an invariant-breach event
+        when post-fill state is inconsistent.
+        """
+        sym = self._norm_symbol(symbol)
+        side_l = str(side or "").lower()
+        strict_accounting = bool(self._cfg("STRICT_ACCOUNTING_INTEGRITY", False))
+
+        positions = getattr(self.shared_state, "positions", {}) or {}
+        open_trades = getattr(self.shared_state, "open_trades", {}) or {}
+        pos = dict(positions.get(sym, {}) or {}) if isinstance(positions, dict) else {}
+        ot = dict(open_trades.get(sym, {}) or {}) if isinstance(open_trades, dict) else {}
+
+        qty_pos = float((pos or {}).get("quantity", 0.0) or (pos or {}).get("qty", 0.0) or 0.0)
+        qty_ot = float((ot or {}).get("quantity", 0.0) or (ot or {}).get("qty", 0.0) or 0.0)
+        exec_qty = float((raw or {}).get("executedQty", 0.0) or 0.0)
+        order_status = str((raw or {}).get("status", "")).upper()
+        exec_px = float((raw or {}).get("avgPrice", (raw or {}).get("price", 0.0)) or 0.0)
+
+        # For BUY, use executed cost (cummulativeQuoteQty) if available; else fallback to position value_usdt
+        value_usdt = float((pos or {}).get("value_usdt", 0.0) or 0.0)
+        if side_l == "buy":
+            cumm_quote = self._safe_float((raw or {}).get("cummulativeQuoteQty") or (raw or {}).get("cummulative_quote"), 0.0)
+            if cumm_quote > 0:
+                value_usdt = cumm_quote
+        significant = bool((pos or {}).get("is_significant", False))
+        floor_usdt = float((pos or {}).get("significant_floor_usdt", 0.0) or 0.0)
+        classifier = "position_fields"
+
+        try:
+            if hasattr(self.shared_state, "classify_position_snapshot"):
+                gate_ref = pos if pos else {"quantity": qty_pos}
+                significant, cls_value, floor_usdt = self.shared_state.classify_position_snapshot(
+                    sym,
+                    gate_ref,
+                    price_hint=exec_px if exec_px > 0 else 0.0,
+                )
+                if float(cls_value or 0.0) > 0:
+                    value_usdt = float(cls_value)
+                classifier = "classify_position_snapshot"
+        except Exception as e:
+            self.logger.error(
+                "[ACCOUNTING_AUDIT_CLASSIFY_FAIL] symbol=%s side=%s stage=%s err=%s",
+                sym,
+                side_l,
+                stage,
+                e,
+                exc_info=True,
+            )
+            if strict_accounting:
+                raise
+
+        issues: list[str] = []
+        if exec_qty > 0 and side_l == "buy" and qty_pos <= 0 and qty_ot <= 0:
+            issues.append("BUY_FILL_NOT_REGISTERED")
+        if exec_qty > 0 and side_l == "sell" and order_status == "FILLED":
+            if qty_ot > 0:
+                issues.append("SELL_FILLED_BUT_OPEN_TRADE_PRESENT")
+            if qty_pos > 0 and bool(significant):
+                issues.append("SELL_FILLED_BUT_POSITION_STILL_SIGNIFICANT")
+        if qty_pos > 0 and value_usdt > 1.0 and floor_usdt <= 0:
+            issues.append("FLOOR_ZERO_WITH_NONTRIVIAL_POSITION")
+
+        snapshot = {
+            "event": "ACCOUNTING_AUDIT",
+            "symbol": sym,
+            "side": side_l,
+            "stage": stage,
+            "decision_id": str(decision_id or ""),
+            "order_status": order_status,
+            "executed_qty": float(exec_qty),
+            "position_qty": float(qty_pos),
+            "open_trade_qty": float(qty_ot),
+            "value_usdt": float(value_usdt),
+            "significant": bool(significant),
+            "floor_usdt": float(floor_usdt),
+            "status_field": str((pos or {}).get("status", "")),
+            "classifier": classifier,
+            "issues": list(issues),
+        }
+        self.logger.info("[ACCOUNTING_AUDIT] %s", json.dumps(snapshot, separators=(",", ":")))
+
+        if issues:
+            self.logger.error(
+                "[ACCOUNTING_INVARIANT_BREACH] symbol=%s side=%s stage=%s issues=%s",
+                sym,
+                side_l,
+                stage,
+                ",".join(issues),
+            )
+            try:
+                await maybe_call(self.shared_state, "emit_event", "ACCOUNTING_INVARIANT_BREACH", snapshot)
+            except Exception:
+                self.logger.debug("emit ACCOUNTING_INVARIANT_BREACH failed", exc_info=True)
+            if strict_accounting:
+                raise RuntimeError(
+                    f"ACCOUNTING_INVARIANT_BREACH:{sym}:{side_l}:{stage}:{','.join(issues)}"
+                )
 
     async def _on_order_failed(self, symbol: str, side: str, reason: str, quote: Optional[float] = None):
         """
@@ -1325,7 +4189,7 @@ class ExecutionManager:
             # If order failed due to insufficient capital, trigger immediate prune
             if quote and reason in ("InsufficientBalance", "InsufficientLiquidity", "INSUFFICIENT_BALANCE"):
                 try:
-                    spendable = await maybe_call(self.shared_state, "get_free_usdt", return_default=0.0)
+                    spendable = await maybe_call(self.shared_state, "get_free_usdt") or 0.0
                     if float(spendable) < (quote * 0.5):
                         self.logger.warning(
                             f"[OrderFailed:Prune] {symbol} {side} failed with low capital ({spendable:.2f} < {quote * 0.5:.2f}). "
@@ -1388,6 +4252,27 @@ class ExecutionManager:
         self._decision_id_seq += 1
         return f"auto-{int(time.time() * 1000)}-{self._decision_id_seq}"
 
+    def _enter_exchange_order_scope(self) -> Optional[str]:
+        """Authorize ExchangeClient order APIs for this ExecutionManager call stack."""
+        begin = getattr(self.exchange_client, "begin_execution_order_scope", None)
+        if not callable(begin):
+            return None
+        try:
+            return begin("ExecutionManager")
+        except Exception:
+            self.logger.debug("begin_execution_order_scope failed", exc_info=True)
+            return None
+
+    def _exit_exchange_order_scope(self, token: Optional[str]) -> None:
+        """Release ExchangeClient order API authorization scope."""
+        end = getattr(self.exchange_client, "end_execution_order_scope", None)
+        if not callable(end):
+            return
+        try:
+            end(token)
+        except Exception:
+            self.logger.debug("end_execution_order_scope failed", exc_info=True)
+
     def _build_client_order_id(self, symbol: str, side: str, decision_id: str) -> str:
         return f"{symbol}:{side}:{decision_id}"
 
@@ -1396,13 +4281,50 @@ class ExecutionManager:
         seen = self._seen_client_order_ids
         if client_id in seen:
             return True
-        seen[client_id] = now
-        if len(seen) > 5000:
-            cutoff = now - 86400
+        # Evict stale entries before adding so the new key is eligible for future pruning
+        if len(seen) > 500:
+            cutoff = now - 3600  # Keep only 1 hour of history
+            removed = 0
             for key, ts in list(seen.items()):
                 if ts < cutoff:
                     seen.pop(key, None)
+                    removed += 1
+            if removed > 0:
+                self.logger.debug(
+                    "[EM:DupIdCleanup] Cleaned %d stale client_order_ids, dict_size=%d",
+                    removed, len(seen)
+                )
+        seen[client_id] = now
         return False
+
+    async def _validate_order_request_contract(self, **kwargs) -> Tuple[bool, float, float, str]:
+        """
+        Contract adapter for local P9 validator.
+
+        Enforces tuple contract: (ok, qty, adjusted_quote, reason).
+        Raises explicit runtime error on interface mismatch to avoid silent
+        zero-qty / unexpected-error fallthrough.
+        """
+        res = await validate_order_request(**kwargs)
+        if not isinstance(res, (tuple, list)) or len(res) != 4:
+            self.logger.error(
+                "[EM:HygieneContract] validate_order_request returned invalid payload: type=%s value=%r",
+                type(res).__name__,
+                res,
+            )
+            raise RuntimeError("HYGIENE_INTERFACE_MISMATCH")
+
+        ok_raw, qty_raw, adjusted_quote_raw, reason_raw = res
+        try:
+            qty = float(qty_raw or 0.0)
+        except Exception:
+            qty = 0.0
+        try:
+            adjusted_quote = float(adjusted_quote_raw or 0.0)
+        except Exception:
+            adjusted_quote = 0.0
+        reason = str(reason_raw or "UNKNOWN")
+        return bool(ok_raw), qty, adjusted_quote, reason
 
 
     @asynccontextmanager
@@ -1479,6 +4401,19 @@ class ExecutionManager:
         # --- BOOTSTRAP OVERRIDE ---
         skip_micro_trade_kill_switch = False
         policy_ctx = policy_context or {}  # Ensure it's never None
+        bootstrap_mode_active = bool(policy_ctx.get("bootstrap_mode", False))
+        bootstrap_bypass = bool(policy_ctx.get("bootstrap_bypass", False))
+        if not bootstrap_mode_active:
+            try:
+                if hasattr(self.shared_state, "is_bootstrap_mode"):
+                    bootstrap_mode_active = bool(await maybe_call(self.shared_state, "is_bootstrap_mode"))
+            except Exception:
+                bootstrap_mode_active = False
+        if bootstrap_mode_active or bootstrap_bypass:
+            # Bootstrap is capital deployment initialization; bypass micro/edge-only filters.
+            skip_micro_trade_kill_switch = True
+            policy_ctx.setdefault("bootstrap_mode", True)
+            policy_ctx.setdefault("bootstrap_bypass", True)
         # --- EXPLICIT BOOTSTRAP ESCAPE HATCH ---
         if policy_ctx.get("is_flat", False) and policy_ctx.get("bootstrap_mode", False):
             # Allow exactly one BUY regardless of economic/micro trade guards
@@ -1492,13 +4427,25 @@ class ExecutionManager:
             # For dust healing/recovery, only validate step_size, min_notional, available balance
             # Skip all other guards: min_econ_trade, profitability, micro_trade_kill_switch, fee_floor
             skip_micro_trade_kill_switch = True
-        self.logger.warning(f"[EXEC_TRACE] received bootstrap_bypass={policy_ctx.get('bootstrap_bypass', False)}")
+        self.logger.warning(
+            f"[EXEC_TRACE] received bootstrap_bypass={policy_ctx.get('bootstrap_bypass', False)} "
+            f"bootstrap_mode={policy_ctx.get('bootstrap_mode', False)} "
+            f"skip_micro_gate={skip_micro_trade_kill_switch}"
+        )
         try:
             if qa is None or float(qa) <= 0:
                 # Zero-sized trades MUST be treated as failure (Behavior Change 1.1)
                 return (False, Decimal("0"), "ZERO_SIZE_TRADE")
 
-            min_econ_trade_cfg = Decimal(str(policy_ctx.get("min_economic_trade", self._cfg("MIN_ECONOMIC_TRADE_USDT", 0.0)) or 0.0))
+            policy_min_notional = float(policy_ctx.get("min_notional", 0.0) or 0.0)
+            nav_tier_min_econ = Decimal(
+                str(
+                    await self._resolve_nav_tier_economic_floor(
+                        symbol=symbol,
+                        min_notional=policy_min_notional,
+                    )
+                )
+            )
             dynamic_min_econ = Decimal("0")
             if hasattr(self.shared_state, "compute_min_entry_quote") and not is_dust_healing_buy:
                 try:
@@ -1509,7 +4456,7 @@ class ExecutionManager:
                     dynamic_min_econ = Decimal(str(dyn_floor or 0.0))
                 except Exception:
                     dynamic_min_econ = Decimal("0")
-            min_econ_trade = max(min_econ_trade_cfg, dynamic_min_econ)
+            min_econ_trade = max(nav_tier_min_econ, dynamic_min_econ)
             if min_econ_trade > 0 and qa < min_econ_trade and not is_dust_operation:
                 gap = (min_econ_trade - qa).max(Decimal("0"))
                 return (False, gap, "QUOTE_LT_MIN_ECONOMIC")
@@ -1544,13 +4491,174 @@ class ExecutionManager:
             atr_pct = 0.0
             try:
                 if hasattr(self.shared_state, "calc_atr"):
-                    atr = float(await self.shared_state.calc_atr(sym, "5m", 14) or 0.0)
-                    if atr <= 0:
-                        atr = float(await self.shared_state.calc_atr(sym, "1m", 14) or 0.0)
+                    atr_period = int(self._cfg("SELL_DYNAMIC_ATR_PERIOD", 14) or 14)
+                    atr_tf_primary = str(self._cfg("SELL_DYNAMIC_ATR_TIMEFRAME", "5m") or "5m").strip()
+
+                    atr = 0.0
+                    atr_timeframes = []
+                    for tf in (atr_tf_primary, "5m", "1h", "1m"):
+                        tf_norm = str(tf or "").strip()
+                        if tf_norm and tf_norm not in atr_timeframes:
+                            atr_timeframes.append(tf_norm)
+
+                    for tf in atr_timeframes:
+                        atr_candidate = float(
+                            await maybe_call(self.shared_state, "calc_atr", sym, tf, atr_period) or 0.0
+                        )
+                        if atr_candidate > 0:
+                            atr = atr_candidate
+                            break
                     if atr and price > 0:
                         atr_pct = float(atr) / float(price)
             except Exception:
                 atr_pct = 0.0
+
+            trade_regime = str(
+                policy_ctx.get("tradeability_regime") or policy_ctx.get("_regime") or ""
+            ).strip().lower()
+            vol_regime = str(policy_ctx.get("volatility_regime") or "").strip().lower()
+            if not vol_regime:
+                tf = str(self._cfg("VOLATILITY_REGIME_TIMEFRAME", "1h") or "1h")
+                try:
+                    if hasattr(self.shared_state, "get_volatility_regime"):
+                        reginfo = await maybe_call(self.shared_state, "get_volatility_regime", sym, tf, 600)
+                        if not reginfo:
+                            reginfo = await maybe_call(self.shared_state, "get_volatility_regime", "GLOBAL", tf, 600)
+                        if isinstance(reginfo, dict):
+                            vol_regime = str(reginfo.get("regime") or "").strip().lower()
+                except Exception:
+                    vol_regime = vol_regime or ""
+            if not vol_regime:
+                try:
+                    vol_regime = str(
+                        (getattr(self.shared_state, "metrics", {}) or {}).get("volatility_regime") or ""
+                    ).strip().lower()
+                except Exception:
+                    vol_regime = ""
+
+            # Sideways (low-vol) regime trading is disabled by default (noise protection).
+            if not skip_micro_trade_kill_switch and bool(self._cfg("DISABLE_SIDEWAYS_REGIME_TRADING", True)):
+                if trade_regime == "sideways" or vol_regime == "low":
+                    self.logger.info(
+                        "[EM:SidewaysDisabled] Blocked BUY %s (trade_regime=%s vol_regime=%s)",
+                        sym,
+                        trade_regime or "unknown",
+                        vol_regime or "unknown",
+                    )
+                    with contextlib.suppress(Exception):
+                        await maybe_call(
+                            self.shared_state,
+                            "emit_event",
+                            "EntrySidewaysRegimeBlocked",
+                            {
+                                "symbol": sym,
+                                "trade_regime": trade_regime,
+                                "vol_regime": vol_regime,
+                                "timestamp": time.time(),
+                            },
+                        )
+                    return (False, Decimal("0"), "SIDEWAYS_REGIME_DISABLED")
+
+            if not skip_micro_trade_kill_switch:
+                expected_move_pct = None
+                expected_move_key = None
+                for key in (
+                    "tradeability_expected_move_pct",
+                    "_expected_move_pct",
+                    "expected_move_pct",
+                    "expected_alpha_pct",
+                ):
+                    if key in policy_ctx and policy_ctx.get(key) is not None:
+                        with contextlib.suppress(Exception):
+                            expected_move_pct = float(policy_ctx.get(key))
+                            expected_move_key = str(key)
+                            break
+                if expected_move_pct is None:
+                    econ_guard = policy_ctx.get("economic_guard") if isinstance(policy_ctx, dict) else None
+                    if isinstance(econ_guard, dict):
+                        edge_bps = econ_guard.get("edge_bps")
+                        with contextlib.suppress(Exception):
+                            if edge_bps is not None:
+                                expected_move_pct = float(edge_bps) / 10000.0
+                if expected_move_pct is not None and expected_move_key is None:
+                    expected_move_key = "economic_guard"
+
+                expected_move_key = expected_move_key or "atr_fallback"
+                expected_move_raw_pct = float(expected_move_pct or 0.0)
+                expected_move_used_pct = float(expected_move_raw_pct)
+                expected_move_floor_pct = 0.0
+
+                slippage_bps = float(
+                    self._cfg("EXIT_SLIPPAGE_BPS", self._cfg("CR_PRICE_SLIPPAGE_BPS", 15.0)) or 0.0
+                )
+                buffer_bps = float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0)
+                round_trip_cost_pct = (float(self.trade_fee_pct or 0.0) * 2.0) + (
+                    (slippage_bps + buffer_bps) / 10000.0
+                )
+                base_mult = float(self._cfg("EV_HARD_SAFETY_MULT", 2.0) or 2.0)
+                # Strict hard-gate: trades require expected_move >= 2x round-trip costs.
+                mult = max(2.0, float(base_mult))
+
+                # Expected-move calibration (ATR floor). If upstream doesn't provide an expected-move,
+                # we still enforce the gate using an ATR-based proxy (1h preferred).
+                if bool(self._cfg("EV_EXPECTED_MOVE_CALIBRATION_ENABLED", True)):
+                    try:
+                        em_tf = str(self._cfg("EV_EXPECTED_MOVE_ATR_TIMEFRAME", "1h") or "1h")
+                        em_period = int(self._cfg("EV_EXPECTED_MOVE_ATR_PERIOD", 14) or 14)
+                        em_mult = float(self._cfg("EV_EXPECTED_MOVE_ATR_MULT", 1.0) or 1.0)
+                        if hasattr(self.shared_state, "calc_atr") and em_mult > 0:
+                            em_atr = float(await maybe_call(self.shared_state, "calc_atr", sym, em_tf, em_period) or 0.0)
+                            if em_atr > 0 and price > 0:
+                                expected_move_floor_pct = (em_atr / max(float(price), 1e-9)) * em_mult
+                    except Exception:
+                        expected_move_floor_pct = 0.0
+                    if expected_move_floor_pct <= 0.0:
+                        fallback_scale = float(self._cfg("EV_EXPECTED_MOVE_FALLBACK_SCALE", 3.0) or 3.0)
+                        expected_move_floor_pct = float(atr_pct or 0.0) * max(1.0, fallback_scale)
+                    if expected_move_floor_pct > 0:
+                        expected_move_used_pct = max(float(expected_move_used_pct), float(expected_move_floor_pct))
+
+                atr_ref_pct = float(expected_move_floor_pct or 0.0)
+                required_move_pct = round_trip_cost_pct * float(mult)
+                if float(expected_move_used_pct) <= float(required_move_pct):
+                    self.logger.warning(
+                        "[EM:EV_HARD_GATE] Blocked BUY %s: expected_move=%.4f%% (raw=%.4f%% key=%s floor=%.4f%%) <= required=%.4f%% "
+                        "(round_trip=%.4f%% mult=%.2f vol_regime=%s trade_regime=%s atr_ref=%.4f%%)",
+                        sym,
+                        float(expected_move_used_pct) * 100.0,
+                        float(expected_move_raw_pct) * 100.0,
+                        expected_move_key or "unknown",
+                        float(expected_move_floor_pct) * 100.0,
+                        float(required_move_pct) * 100.0,
+                        float(round_trip_cost_pct) * 100.0,
+                        float(mult),
+                        vol_regime or "unknown",
+                        trade_regime or "unknown",
+                        float(atr_ref_pct) * 100.0,
+                    )
+                    with contextlib.suppress(Exception):
+                        await maybe_call(
+                            self.shared_state,
+                            "emit_event",
+                            "EntryExpectedMoveBlocked",
+                            {
+                                "symbol": sym,
+                                "expected_move_pct": float(expected_move_used_pct),
+                                "expected_move_raw_pct": float(expected_move_raw_pct),
+                                "expected_move_key": expected_move_key,
+                                "expected_move_floor_pct": float(expected_move_floor_pct),
+                                "required_move_pct": float(required_move_pct),
+                                "round_trip_cost_pct": float(round_trip_cost_pct),
+                                "safety_mult": float(mult),  # back-compat key
+                                "ev_mult": float(mult),
+                                "vol_regime": vol_regime,
+                                "trade_regime": trade_regime,
+                                "atr_ref_pct": float(atr_ref_pct),
+                                "base_mult": float(base_mult),
+                                "timestamp": time.time(),
+                            },
+                        )
+                    return (False, Decimal("0"), "EXPECTED_MOVE_LT_ROUND_TRIP_COST")
 
             feasible, feas_detail = self._entry_profitability_feasible(sym, price=price, atr_pct=atr_pct)
             if not feasible and not is_dust_operation:
@@ -1564,29 +4672,33 @@ class ExecutionManager:
                     await maybe_call(self.shared_state, "emit_event", "EntryProfitabilityBlocked", payload)
                 return (False, Decimal("0"), "INFEASIBLE_PROFITABILITY")
 
-            # Micro-trade kill switch: low equity + low volatility
+            # Adaptive Execution Threshold Engine (Institutional-Grade)
             if not skip_micro_trade_kill_switch:
-                if self._cfg("MICRO_TRADE_KILL_SWITCH_ENABLED", False):
-                    nav = await self.shared_state.get_nav()
-                    nav_max = float(self._cfg("MICRO_TRADE_KILL_EQUITY_MAX", 0.0) or 0.0)
-                    if nav_max > 0 and nav > 0 and nav < nav_max:
-                        atr_pct = 0.0
-                        try:
-                            if hasattr(self.shared_state, "calc_atr"):
-                                atr = float(await self.shared_state.calc_atr(sym, "5m", 14) or 0.0)
-                                if atr <= 0:
-                                    atr = float(await self.shared_state.calc_atr(sym, "1m", 14) or 0.0)
-                                if atr and price > 0:
-                                    atr_pct = float(atr) / float(price)
-                        except Exception:
-                            atr_pct = 0.0
-                        if atr_pct <= 0:
-                            atr_pct = float(self._cfg("MICRO_TRADE_KILL_FALLBACK_ATR_PCT", 0.0) or 0.0)
-                        round_trip_fee_rate = float(self.trade_fee_pct) * 2.0
-                        fee_mult = float(self._cfg("MICRO_TRADE_KILL_ATR_FEE_MULT", 1.0) or 1.0)
-                        fee_threshold = round_trip_fee_rate * fee_mult
-                        if fee_threshold > 0 and atr_pct < fee_threshold:
-                            return (False, Decimal("0"), "MICRO_TRADE_KILL_SWITCH")
+                if self._cfg("ADAPTIVE_EXECUTION_THRESHOLD_ENABLED", True):  # Default enabled
+                    # Extract signal confidence from policy context
+                    signal_confidence = None
+                    if policy_context:
+                        signal_confidence = policy_context.get("confidence") or policy_context.get("signal_confidence")
+
+                    # Calculate adaptive execution threshold
+                    threshold_analysis = await self._calculate_adaptive_execution_threshold(
+                        symbol=sym,
+                        planned_quote=float(qa or 0.0),
+                        price=price,
+                        signal_confidence=signal_confidence,
+                        policy_context=policy_context
+                    )
+
+                    if not threshold_analysis["can_execute"]:
+                        kill_reason = threshold_analysis["analysis"]["kill_reason"] or "ADAPTIVE_THRESHOLD_KILL"
+                        self.logger.warning(
+                            f"[ADAPTIVE_THRESHOLD] Execution blocked for {sym}: "
+                            f"required_edge={threshold_analysis['required_edge_pct']*100:.3f}%, "
+                            f"current_edge={threshold_analysis['current_edge_pct']*100:.3f}%, "
+                            f"ratio={threshold_analysis['edge_sufficiency_ratio']:.2f}, "
+                            f"confidence={threshold_analysis['analysis']['confidence_level']:.2f}"
+                        )
+                        return (False, Decimal("0"), kill_reason)
 
             # --- P9 Phase 4: Accumulation Synergy ---
             # 1. Fetch existing intent to check for frozen constraints (Point 2)
@@ -1800,7 +4912,7 @@ class ExecutionManager:
                 filters_obj.step_size = step_size
                 filters_obj.min_qty = min_qty
 
-                v_ok, v_qty, _, v_reason = await validate_order_request(
+                v_ok, v_qty, _, v_reason = await self._validate_order_request_contract(
                     side="BUY", qty=0, price=price, filters=filters_obj, use_quote_amount=float(effective_qa)
                 )
                 
@@ -1944,28 +5056,60 @@ class ExecutionManager:
                     str(res.get("status", "")),
                     str(res.get("reason", "")),
                     str(res.get("error_code", "")),
-                    str(res.get("orderId", res.get("order_id", ""))),
-                    str(res.get("executedQty", res.get("executed_qty", ""))),
-                    str(res.get("cummulativeQuoteQty", res.get("cummulative_quote", ""))),
+                    str(res.get("orderId") or res.get("order_id") or res.get("exchange_order_id")),
+                    str(res.get("executedQty") or res.get("executed_qty")),
+                    str(res.get("cummulativeQuoteQty") or res.get("cummulative_quote", "")),
                 )
             else:
                 self.logger.warning("[EM:CLOSE_RESULT] symbol=%s non-dict response=%r", sym, res)
         except Exception:
             self.logger.debug("[EM] close result logging failed for %s", sym, exc_info=True)
-        if force_finalize:
+        if isinstance(res, dict):
             try:
-                status = str(res.get("status", "")).lower() if isinstance(res, dict) else ""
-                ok = bool(res.get("ok")) if isinstance(res, dict) else False
-                if ok or status in {"placed", "executed", "filled", "partially_filled"}:
-                    await self._force_finalize_position(symbol, reason_text)
-                    self.logger.info("[EM:CLOSE_FINALIZE] symbol=%s applied=True reason=%s", sym, reason_text)
+                res = await self._reconcile_delayed_fill(
+                    symbol=sym,
+                    side="SELL",
+                    order=res,
+                    tag=str(tag or "tp_sl"),
+                    tier=None,
+                )
+                if not isinstance(res, dict):
+                    raise ValueError(f"reconcile returned non-dict: {type(res)}")
+                
+                # [FIX] Single responsibility: reconcile returns merged order,
+                # close_position handles post-fill + finalize exactly once.
+                status = str(res.get("status", "")).lower()
+                exec_qty = float(res.get("executedQty", res.get("executed_qty", 0.0)) or 0.0)
+                is_fill = status in {"filled", "partially_filled"} and exec_qty > 0.0
+                
+                if is_fill:
+                    # Handle post-fill and finalize in single call sequence
+                    post_fill = await self._ensure_post_fill_handled(
+                        symbol=sym,
+                        side="SELL",
+                        order=res,
+                        tier=None,
+                        tag=str(tag or "tp_sl"),
+                    )
+                    await self._finalize_sell_post_fill(
+                        symbol=sym,
+                        order=res,
+                        tag=str(tag or "tp_sl"),
+                        post_fill=post_fill,
+                        policy_ctx={"exit_reason": reason_text, "reason": reason_text},
+                        tier=None,
+                    )
+
+                    if force_finalize:
+                        await self._force_finalize_position(sym, reason_text)
+                        self.logger.info("[EM:CLOSE_FINALIZE] symbol=%s applied=True reason=%s", sym, reason_text)
                 else:
                     self.logger.warning(
-                        "[EM:CLOSE_FINALIZE] symbol=%s applied=False status=%s ok=%s reason=%s",
-                        sym, status, ok, reason_text
+                        "[EM:CLOSE_FINALIZE] symbol=%s applied=False status=%s exec_qty=%.8f reason=%s",
+                        sym, status, exec_qty, reason_text
                     )
             except Exception:
-                self.logger.debug("[EM] force_finalize_position failed for %s", symbol, exc_info=True)
+                self.logger.error("[EM:CLOSE_RECONCILE_FAILED] symbol=%s — post-fill may be lost", symbol, exc_info=True)
         return res
 
     async def _force_finalize_position(self, symbol: str, reason: str) -> None:
@@ -2002,6 +5146,7 @@ class ExecutionManager:
         quantity: Optional[float] = None,
         planned_quote: Optional[float] = None,
         tag: str = "meta/Agent",
+        trace_id: Optional[str] = None,
         tier: Optional[str] = None,
         is_liquidation: bool = False,
         policy_context: Optional[Dict[str, Any]] = None,
@@ -2010,6 +5155,11 @@ class ExecutionManager:
         Tier-aware execution (Phase A Frequency Engineering).
 
         ExecutionManager answers: "Given this allowed intent, what is the maximum safe executable order?"
+
+        [PHASE 2 REQUIREMENT] trace_id from MetaController:
+        - All orders (except liquidation) REQUIRE trace_id from MetaController decision
+        - Enforces that CompoundingEngine directives go through MetaController validation
+        - Every order has an audit trail back to MetaController decision
 
         Respects (unless is_liquidation=True):
         - RiskManager caps (already checked via pre_check)
@@ -2030,12 +5180,27 @@ class ExecutionManager:
         """
         self._ensure_heartbeat()
         side = (side or "").lower()
+
         sym = self._norm_symbol(symbol)
         policy_ctx = dict(policy_context or {})
         decision_id = self._resolve_decision_id(policy_ctx)
         policy_ctx.setdefault("decision_id", decision_id)
         if tier is not None and "tier" not in policy_ctx:
             policy_ctx["tier"] = tier
+
+        # [PHASE 2] GUARD: Require trace_id for all orders (except liquidation)
+        # This ensures CompoundingEngine directives go through MetaController validation
+        if not trace_id and not is_liquidation:
+            self.logger.warning(
+                "[EXEC:TraceID] Blocked %s %s: missing trace_id from MetaController (Phase 2 architecture)",
+                side.upper(), sym,
+            )
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "missing_meta_trace_id",
+                "error_code": "MISSING_META_TRACE_ID",
+            }
 
         # Contract guard: if tradeability metadata is present, Meta must have evaluated
         # _passes_tradeability_gate before any quote reservation in this method.
@@ -2068,9 +5233,14 @@ class ExecutionManager:
         is_dust_healing_buy = str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
         is_dust_operation = self._is_dust_operation_context(policy_ctx, tier=tier, tag=tag, symbol=sym)
 
+        tag_raw = tag or ""
+        tag_lower = tag_raw.lower()
+        clean_tag = self._sanitize_tag(tag)
+        tier_label = f" tier={tier}" if tier else ""
+
         # 🛡️ P9 SOP GOVERNANCE: Last line of defense (unless full liquidation bypass)
         # Exits/Liquidation are usually allowed even in safety modes to protect capital.
-        is_liq_full = is_liquidation or any(x in (tag or "").lower() for x in ("tp_sl", "balancer"))
+        is_liq_full = is_liquidation or any(x in tag_lower for x in ("tp_sl", "balancer", "meta_exit"))
 
         # Global SELL guard (real capital only): allow only TP/SL (liquidation) or explicit EMERGENCY exits.
         # This prevents state/rotation/recovery SELLs from fragmenting compounding on live capital.
@@ -2098,7 +5268,7 @@ class ExecutionManager:
                 }
         
         if not is_liq_full:
-            mode = str(self.shared_state.metrics.get("current_mode", "NORMAL")).upper()
+            mode = str((getattr(self.shared_state, "metrics", None) or {}).get("current_mode", "NORMAL")).upper()
             if mode == "PAUSED":
                 self.logger.warning(f"[EM:GovBlock] Blocked {side.upper()} {sym}: System is PAUSED.")
                 return {"ok": False, "status": "blocked", "reason": "System PAUSED", "error_code": "PAUSED_MODE"}
@@ -2106,11 +5276,6 @@ class ExecutionManager:
             if side == "buy" and mode == "PROTECTIVE":
                 self.logger.warning(f"[EM:GovBlock] Blocked BUY {sym}: System is in PROTECTIVE mode.")
                 return {"ok": False, "status": "blocked", "reason": "BUY Disabled in PROTECTIVE Mode", "error_code": "PROTECTIVE_MODE"}
-        tag_raw = tag or ""
-        tag_lower = tag_raw.lower()
-        clean_tag = self._sanitize_tag(tag)
-        tier_label = f" tier={tier}" if tier else ""
-
         allow_partial = bool(
             policy_ctx.get("allow_partial")
             or policy_ctx.get("partial_exit")
@@ -2123,9 +5288,6 @@ class ExecutionManager:
                 quantity = qty_full
                 planned_quote = None
         
-        # [FIX #9] Detect liquidation: explicit flag OR tag contains tp_sl/balancer
-        # NOTE: tag 'liquidation' alone no longer implies full bypass.
-        is_liq_full = is_liquidation or any(x in tag_lower for x in ("tp_sl", "balancer"))
         liq_reason = str(
             policy_ctx.get("liquidation_reason")
             or policy_ctx.get("reason")
@@ -2174,9 +5336,15 @@ class ExecutionManager:
                 current_value = 0.0
             
             new_position_value = current_value + deficit
-            economic_floor = float(self._cfg("MIN_ECONOMIC_TRADE_USD", 75.0))
+            economic_floor = await self._resolve_nav_tier_economic_floor(
+                symbol=sym,
+                min_notional=float(policy_ctx.get("min_notional", 0.0) or 0.0),
+            )
             if new_position_value >= economic_floor:
-                self.logger.warning(f"[EM:DUST_HEALING] Blocking {sym} healing: new_position_value={new_position_value:.2f} >= economic_floor={economic_floor:.2f} (already healed)")
+                self.logger.warning(
+                    "[EM:DUST_HEALING] Blocking %s healing: new_position_value=%.2f >= economic_floor=%.2f (already healed)",
+                    sym, new_position_value, economic_floor
+                )
                 return {"ok": False, "status": "blocked", "reason": "dust_already_healed", "error_code": "DUST_ALREADY_HEALED"}
             
             planned_quote = deficit  # Exact deficit, no buffer for dust healing
@@ -2207,6 +5375,8 @@ class ExecutionManager:
                 special_liq_bypass=special_liq_bypass,
             )
             if net_gate is not None:
+                if self.shared_state:
+                    self.shared_state.exit_in_progress[sym] = False
                 return net_gate
         policy_authority = str(policy_ctx.get("authority") or policy_ctx.get("policy_authority") or "").lower()
         policy_validated = policy_authority == "metacontroller"
@@ -2222,9 +5392,8 @@ class ExecutionManager:
         if unified_sell_authority and side == "sell":
             self.logger.info(f"[EM:UnifiedSell] {sym} SELL has UNIFIED_SELL_AUTHORITY: bypassing operational veto points")
         
-        # 🚫 TERMINAL_DUST BLOCK: If position < minNotional, block all liquidation attempts
-        # MODIFIED [FIX #4]: Allow terminal dust block to be overridden by unified sell authority
-        # This prevents endless liquidation loops UNLESS MetaController explicitly overrides
+        # 🚫 TERMINAL_DUST BLOCK: If position is terminal dust, block liquidation attempts.
+        # Permanent dust is always blocked (never override with unified sell authority).
         if side == "sell" and (is_liq_full or special_liq_bypass):
             if special_liq_bypass:
                 self.logger.warning(
@@ -2236,6 +5405,27 @@ class ExecutionManager:
                 # Check if this position is below minNotional (dust)
                 is_dust = await self._is_position_terminal_dust(sym)
                 if is_dust:
+                    is_permanent = False
+                    with contextlib.suppress(Exception):
+                        if hasattr(self.shared_state, "is_permanent_dust"):
+                            is_permanent = bool(self.shared_state.is_permanent_dust(sym))
+                    if is_permanent:
+                        self.logger.warning(
+                            "[TERMINAL_DUST] %s is PERMANENT_DUST. Blocking liquidation attempt.",
+                            sym,
+                        )
+                        await self._log_execution_event("terminal_dust_blocked", sym, {
+                            "reason": "permanent_dust_terminal",
+                            "side": "sell",
+                            "liquidation_blocked": True
+                        })
+                        return {
+                            "ok": False,
+                            "status": "blocked",
+                            "reason": "permanent_dust_terminal",
+                            "error_code": "PermanentDust",
+                            "executedQty": 0.0
+                        }
                     # If UNIFIED_SELL_AUTHORITY, allow the liquidation (to clean dust)
                     if unified_sell_authority:
                         self.logger.warning(
@@ -2272,7 +5462,7 @@ class ExecutionManager:
                 }
             self.shared_state.exit_in_progress[sym] = True
             self.logger.info(f"[EXEC:EXIT_LOCK] {sym} SELL exit lock acquired")
-        
+
         # [FIX #9] LIQUIDATION BYPASS: If this is liquidation, skip ALL guards and go straight to execution
         if is_liq_full and side == "sell":
             self.logger.info(f"[EXEC:LIQ] LIQUIDATION SELL: {sym} - bypassing all guards (capital, min-notional, throughput)")
@@ -2283,10 +5473,11 @@ class ExecutionManager:
                 if qty <= 0:
                     self.logger.warning(f"[EXEC:LIQ] No position to liquidate for {sym}")
                     await self.shared_state.record_rejection(sym, "SELL", "NO_POSITION_QUANTITY", source="ExecutionManager")
+                    self.shared_state.exit_in_progress[sym] = False
                     return {"ok": False, "status": "skipped", "reason": "no_position_quantity", "error_code": "NoPosition"}
                 quantity = qty
             
-            # Execute SELL immediately without any guards
+            # Execute SELL immediately without any guards, then always reconcile delayed fill
             raw = await self._place_market_order_qty(
                 sym,
                 float(quantity),
@@ -2295,13 +5486,28 @@ class ExecutionManager:
                 is_liquidation=True,
                 decision_id=decision_id,
             )
-            
-            # Normalize output
-            status = str(raw.get("status", "REJECTED")).upper()
-            exec_qty = float(raw.get("executedQty", 0.0))
+            liq_client_hint = self._build_client_order_id(sym, "SELL", decision_id) if decision_id else None
+
+            # Always reconcile delayed fill and finalize only once with correct policy_ctx
+            merged = await self._reconcile_delayed_fill(
+                symbol=sym,
+                side="SELL",
+                order=raw,
+                tag=clean_tag,
+                tier=tier,
+                client_order_id_hint=liq_client_hint,
+            )
+
+            status = str(merged.get("status", "REJECTED")).upper()
+            exec_qty = float(merged.get("executedQty", 0.0))
             is_filled = status in ("FILLED", "PARTIALLY_FILLED") and exec_qty > 0
-            
+
             if is_filled:
+                # Track bootstrap fill if this was a bootstrap signal
+                is_bootstrap_sig = bool(policy_ctx.get("_bootstrap", False)) if policy_ctx else False
+                if is_bootstrap_sig and not self._bootstrap_first_fill_done:
+                    self._mark_bootstrap_fill_done()
+                
                 await self._emit_status("Operational", f"filled {sym} {side} status={status}")
                 try:
                     if hasattr(self.shared_state, "clear_rejections"):
@@ -2309,79 +5515,86 @@ class ExecutionManager:
                         self.logger.info(f"[MemoryOfFailure] ✅ Cleared rejections for {sym} {side} (liquidation success)")
                 except Exception as e:
                     self.logger.debug(f"[MemoryOfFailure] Failed to clear: {e}")
-                
-                post_fill = None
-                with contextlib.suppress(Exception):
-                    post_fill = await self._handle_post_fill(sym, side, raw, tier=tier)
-
-                with contextlib.suppress(Exception):
-                    await self._emit_close_events(sym, raw, post_fill)
-
-                with contextlib.suppress(Exception):
-                    await self._emit_trade_executed_event(sym, side, tag_raw, raw)
-
-                # Close position explicitly on liquidation SELL fills
+                # --- Canonical accounting: ONE path for all SELL fills ---
+                # _handle_post_fill computes realized delta, updates metrics,
+                # appends rolling PnL, emits RealizedPnlUpdated, and runs audit.
+                # This replaces manual pm.close_position PnL logic.
+                # [FIX] Now that _reconcile_delayed_fill no longer calls post-fill,
+                # liquidation path must call it directly. Set _post_fill_done flag
+                # so _finalize_sell_post_fill doesn't call it again.
                 try:
-                    pm = getattr(self.shared_state, "position_manager", None)
-                    exec_qty = float(raw.get("executedQty", 0.0))
-                    exec_px = float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0)
-                    fee_quote = float(raw.get("fee_quote", 0.0) or raw.get("fee", 0.0) or 0.0)
-                    try:
-                        _, quote_asset = self._split_base_quote(sym)
-                        fills = raw.get("fills") or []
-                        if isinstance(fills, list):
-                            fee_quote = sum(
-                                float(f.get("commission", 0.0) or 0.0)
-                                for f in fills
-                                if str(f.get("commissionAsset") or f.get("commission_asset") or "").upper() == quote_asset
-                            ) or fee_quote
-                    except Exception:
-                        pass
-                    if pm and hasattr(pm, "close_position"):
-                        await pm.close_position(
+                    if not merged.get("_post_fill_done"):
+                        pf_result = await self._handle_post_fill(
                             symbol=sym,
-                            executed_qty=exec_qty,
-                            executed_price=exec_px,
-                            fee_quote=fee_quote,
-                            reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
+                            side="SELL",
+                            order=merged,
+                            tag=str(clean_tag or ""),
+                            tier=tier,
                         )
-                    elif pm and hasattr(pm, "finalize_position"):
-                        await pm.finalize_position(
-                            symbol=sym,
-                            executed_qty=exec_qty,
-                            executed_price=exec_px,
-                            reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
-                        )
-                    elif hasattr(self.shared_state, "close_position"):
-                        await self.shared_state.close_position(
-                            sym,
-                            reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
-                        )
+                        # Mark as done and cache the result so finalize won't duplicate
+                        merged["_post_fill_done"] = True
+                        merged["_post_fill_result"] = pf_result if isinstance(pf_result, dict) else {}
                 except Exception:
-                    self.logger.debug("[EM] finalize_position failed for %s", sym, exc_info=True)
-                
+                    self.logger.error("[LIQUIDATION_ACCOUNTING_FAIL] %s", sym, exc_info=True)
+                    if bool(self._cfg("STRICT_ACCOUNTING_INTEGRITY", False)):
+                        raise
+
+                try:
+                    await self._finalize_sell_post_fill(
+                        symbol=sym,
+                        order=merged,
+                        tag=str(clean_tag or ""),
+                        post_fill=merged.get("_post_fill_result") or {},
+                        policy_ctx=policy_ctx,
+                        tier=tier,
+                    )
+                except Exception:
+                    self.logger.error("[EM:LIQ_FINALIZE_CRASH] %s: canonical SELL finalization failed", sym, exc_info=True)
+
+                try:
+                    await self._audit_post_fill_accounting(
+                        symbol=sym,
+                        side=side,
+                        raw=merged,
+                        stage="liq_post_mutation",
+                        decision_id=decision_id,
+                    )
+                except Exception:
+                    self.logger.error(f"[ACCOUNTING_AUDIT_CRASH] {sym} sell liquidation audit failed", exc_info=True)
+                    # Fill already confirmed/finalized; keep canonical execution outcome.
+
+                # Build result from `merged` (reconciled data), not `raw` (may be stale
+                # for delayed fills). Propagate post-fill flags so callers like
+                # close_position safely deduplicate instead of double-counting PnL.
                 result = {
                     "ok": True,
-                    "status": str(raw.get("status", "FILLED")).lower(),
-                    "executedQty": float(raw.get("executedQty", 0.0)),
-                    "avgPrice": float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0),
-                    "cummulativeQuoteQty": float(raw.get("cummulativeQuoteQty", 0.0)),
-                    "orderId": raw.get("orderId") or raw.get("order_id") or raw.get("exchange_order_id"),
+                    "status": str(merged.get("status", "FILLED")).lower(),
+                    "executedQty": float(merged.get("executedQty", 0.0)),
+                    "avgPrice": float(merged.get("avgPrice", merged.get("price", 0.0)) or 0.0),
+                    "cummulativeQuoteQty": float(merged.get("cummulativeQuoteQty", 0.0)),
+                    "orderId": merged.get("orderId") or merged.get("order_id") or merged.get("exchange_order_id"),
+                    "clientOrderId": merged.get("clientOrderId") or merged.get("client_order_id") or merged.get("origClientOrderId"),
                     "reason": "[LIQUIDATION]",
+                    # Propagate idempotency flags so upstream callers skip redundant finalization
+                    "_post_fill_result": merged.get("_post_fill_result"),
+                    "_post_fill_done": merged.get("_post_fill_done"),
+                    "_sell_close_events_done": merged.get("_sell_close_events_done"),
+                    "_sell_finalize_key": merged.get("_sell_finalize_key"),
                 }
                 self.logger.info(f"[EXEC:LIQ] ✅ Liquidation SELL executed: {sym} qty={result['executedQty']:.6f}")
-                # Release exit lock
                 self.shared_state.exit_in_progress[sym] = False
                 return result
             else:
                 self.logger.warning(f"[EXEC:LIQ] ⚠️ Liquidation SELL failed: status={status}, qty={exec_qty}")
                 await self._log_execution_event("liquidation_fail", sym, {"reason": "not_filled"})
-                # Release exit lock
                 self.shared_state.exit_in_progress[sym] = False
                 return {
                     "ok": False,
                     "status": status.lower(),
                     "executedQty": exec_qty,
+                    "orderId": raw.get("orderId") or raw.get("exchange_order_id") or raw.get("order_id"),
+                    "exchange_order_id": raw.get("exchange_order_id") or raw.get("orderId") or raw.get("order_id"),
+                    "client_order_id": raw.get("clientOrderId") or raw.get("client_order_id") or raw.get("origClientOrderId"),
                     "reason": "[LIQUIDATION_FAILED]",
                     "error_code": "LiquidationFailed"
                 }
@@ -2418,11 +5631,15 @@ class ExecutionManager:
                         # 🔒 DUST RETIREMENT CHECK: Don't record rejection for permanent dust
                         if await self._check_dust_retirement_before_rejection(sym, side.upper()):
                             await self._log_execution_event("risk_block", sym, {"side": side, "reason": "permanent_dust_retired"})
+                            if side == "sell" and self.shared_state:
+                                self.shared_state.exit_in_progress[sym] = False
                             return {"ok": False, "status": "skipped", "reason": "permanent_dust_retired", "error_code": "DustRetired"}
-                        
+
                         await self._log_execution_event("risk_block", sym, {"side": side, "reason": risk_reason})
                         await self.shared_state.record_rejection(sym, side.upper(), "RISK_CAP_EXCEEDED", source="ExecutionManager")
                         self.logger.info(f"[EXEC_REJECT] symbol={sym} side={side.upper()} reason=RISK_CAP_EXCEEDED count={self.shared_state.get_rejection_count(sym, side.upper())} action=SKIP")
+                        if side == "sell" and self.shared_state:
+                            self.shared_state.exit_in_progress[sym] = False
                         return {"ok": False, "status": "skipped" if not strict_risk else "error",
                                 "reason": "RiskCapExceeded", "error_code": "RiskCapExceeded"}
                 if adjusted:
@@ -2442,6 +5659,8 @@ class ExecutionManager:
             except Exception as _e:
                 self.logger.warning(f"Risk check failed open: {_e}")
                 if strict_risk:
+                    if side == "sell" and self.shared_state:
+                        self.shared_state.exit_in_progress[sym] = False
                     return {"ok": False, "status": "error", "reason": "RiskCheckFailed", "error_code": "RiskCheckFailed"}
 
         # ---- ProfitTarget guard (optional) ----
@@ -2450,9 +5669,14 @@ class ExecutionManager:
             if callable(guard_fn):
                 # Do not let the profit guard block SELLs or liquidity/TP-SL ops or dust healing
                 if side == "buy" and not any(x in (tag or "") for x in ("liquidation", "tp_sl", "balancer")) and not is_dust_operation:
-                    # P9: Use dynamic profit target from shared_state/config
-                    min_target = float(self._cfg("PROFIT_TARGET_BASE_USD_PER_HOUR", 20.0))
+                    # P9: Use NAV-aware dynamic profit target instead of static USD/hour
+                    min_target = await self._resolve_nav_tier_profit_target()
                     guard_ok = bool(await guard_fn(min_usdt_per_hour=min_target))
+                    self.logger.debug(
+                        "[EXEC:ProfitGuard] NAV-aware target=%.4f NAV=%.2f",
+                        min_target,
+                        float(await self._get_total_equity() or 0.0)
+                    )
                     if not guard_ok:
                         # 🔒 DUST RETIREMENT CHECK: Don't record rejection for permanent dust
                         if await self._check_dust_retirement_before_rejection(sym, side.upper()):
@@ -2466,6 +5690,7 @@ class ExecutionManager:
         except Exception:
             pass  # non-fatal
 
+        raw: Dict[str, Any] = {}
         try:
             # ---- Safety Check: Circuit Breaker & Health (Invariant 2) ----
             if hasattr(self.shared_state, "is_circuit_breaker_open") and await self.shared_state.is_circuit_breaker_open():
@@ -2588,9 +5813,7 @@ class ExecutionManager:
                                 if not healed:
                                     # 🔒 DUST RETIREMENT CHECK: Don't record rejection for permanent dust
                                     if await self._check_dust_retirement_before_rejection(sym, "BUY"):
-                                        if self.shared_state and hasattr(self.shared_state, "report_agent_capital_failure"):
-                                            self.shared_state.report_agent_capital_failure(f"exec_fail_{sym}")
-                                        await self._log_execution_event("order_skip", sym, {"side": "buy", "reason": "permanent_dust_retired"})
+                                        self.logger.warning(f"[EM] {sym} is PERMANENT_DUST, skipping rejection recording")
                                         return {"ok": False, "status": "skipped", "reason": "permanent_dust_retired", "error_code": "DustRetired"}
                                     
                                     if self.shared_state and hasattr(self.shared_state, "report_agent_capital_failure"):
@@ -2604,9 +5827,7 @@ class ExecutionManager:
                             else:
                                 # 🔒 DUST RETIREMENT CHECK: Don't record rejection for permanent dust
                                 if await self._check_dust_retirement_before_rejection(sym, "BUY"):
-                                    if self.shared_state and hasattr(self.shared_state, "report_agent_capital_failure"):
-                                        self.shared_state.report_agent_capital_failure(f"exec_fail_{sym}")
-                                    await self._log_execution_event("order_skip", sym, {"side": "buy", "reason": "permanent_dust_retired"})
+                                    self.logger.warning(f"[EM] {sym} is PERMANENT_DUST, skipping rejection recording")
                                     return {"ok": False, "status": "skipped", "reason": "permanent_dust_retired", "error_code": "DustRetired"}
                                 
                                 if self.shared_state and hasattr(self.shared_state, "report_agent_capital_failure"):
@@ -2654,11 +5875,31 @@ class ExecutionManager:
                         # Normalize execute_quote to exchange precision requirements
                         execute_quote = self._normalize_quote_precision(sym, execute_quote)
 
-                        order = await self.exchange_client.market_buy(sym, execute_quote, tag=clean_tag)
-                        filled_qty = float(order.get("executedQty", 0.0) or 0.0)
+                        # Route BUY-by-quote through canonical placement path so delayed fills are
+                        # reconciled before post-fill accounting/mutation checks.
+                        raw = await self._place_market_order_quote(
+                            sym,
+                            float(execute_quote),
+                            clean_tag,
+                            side="BUY",
+                            policy_validated=True,
+                            is_liquidation=False,
+                            bypass_min_notional=bool(
+                                policy_ctx.get("bootstrap_bypass", False) or is_dust_operation
+                            ),
+                            decision_id=decision_id,
+                        )
+                        if not isinstance(raw, dict):
+                            raw = {
+                                "status": "REJECTED",
+                                "executedQty": 0.0,
+                                "reason": "order_not_placed",
+                            }
+
+                        filled_qty = float(raw.get("executedQty", 0.0) or 0.0)
                         avg_price = 0.0
                         if filled_qty > 0:
-                            avg_price = float(order.get("cummulativeQuoteQty", 0.0) or 0.0) / filled_qty
+                            avg_price = float(raw.get("cummulativeQuoteQty", 0.0) or 0.0) / filled_qty
                         
                         # [ECON_INVARIANT] Debug invariant: Log once per BUY to verify notional >= min_notional
                         if filled_qty > 0:
@@ -2679,9 +5920,8 @@ class ExecutionManager:
                                 # This should never happen - if it does, we have a critical bug
                         
                         if avg_price > 0:
-                            order.setdefault("avgPrice", avg_price)
-                            order.setdefault("price", avg_price)
-                        raw = order
+                            raw.setdefault("avgPrice", avg_price)
+                            raw.setdefault("price", avg_price)
                     else:
                         if not quantity or quantity <= 0:
                             await self._log_execution_event("order_skip", sym, {"side": "buy", "reason": "InvalidQuantity"})
@@ -2703,7 +5943,7 @@ class ExecutionManager:
                                     # Calculate avg price from cummulativeQuoteQty if not provided
                                     cummulative_quote = float(raw.get("cummulativeQuoteQty", 0.0) or 0.0)
                                     if cummulative_quote > 0:
-                                        avg_price = cummulative_quote / filled_qty
+                                        avg_price = cummulative_quote / max(filled_qty, 1e-12)
                                 
                                 if avg_price > 0:
                                     # Get min_notional for this symbol
@@ -2731,7 +5971,7 @@ class ExecutionManager:
                     if not policy_validated:
                         is_cold = self.shared_state and hasattr(self.shared_state, "is_cold_bootstrap") and \
                                 self.shared_state.is_cold_bootstrap()
-                        is_liquidation = any(x in (tag or "") for x in ("liquidation", "tp_sl", "balancer"))
+                        is_liquidation = any(x in tag_lower for x in ("liquidation", "tp_sl", "balancer"))
 
                         if is_cold and not is_liquidation:
                             # 🔒 DUST RETIREMENT CHECK: Don't record rejection for permanent dust
@@ -2824,6 +6064,11 @@ class ExecutionManager:
             is_filled = status in ("FILLED", "PARTIALLY_FILLED") and exec_qty > 0
 
             if is_filled:
+                # Track bootstrap fill if this was a bootstrap signal
+                is_bootstrap_sig = bool(policy_ctx.get("_bootstrap", False)) if policy_ctx else False
+                if is_bootstrap_sig and not self._bootstrap_first_fill_done:
+                    self._mark_bootstrap_fill_done()
+                
                 # Health: success path
                 await self._emit_status("Operational", f"filled {sym} {side} status={status}")
                 
@@ -2846,7 +6091,7 @@ class ExecutionManager:
                     if side == "buy":
                         self._buy_block_state.pop(sym, None)
                 except Exception as e:
-                    self.logger.debug(f"[MemoryOfFailure] Failed to clear rejections: {e}")
+                    self.logger.debug(f"[MemoryOfFailure] Failed to clear: {e}")
 
                 # Ensure BUY positions have an entry timestamp for time-based exits.
                 if side == "buy":
@@ -2872,22 +6117,38 @@ class ExecutionManager:
                 
                 # Emit realized PnL delta if SharedState can compute it
                 post_fill = None
-                with contextlib.suppress(Exception):
-                    post_fill = await self._handle_post_fill(sym, side, raw, tier=tier)
+                try:
+                    post_fill = await self._ensure_post_fill_handled(sym, side, raw, tier=tier, tag=tag_raw)
+                except Exception as e:
+                    self.logger.error(f"[POST_FILL_ACCOUNTING_CRASH] {sym}: {e}", exc_info=True)
+                    if bool(self._cfg("STRICT_ACCOUNTING_INTEGRITY", False)):
+                        raise
 
-                if side == "sell":
-                    with contextlib.suppress(Exception):
-                        await self._emit_close_events(sym, raw, post_fill)
-
-                with contextlib.suppress(Exception):
-                    await self._emit_trade_executed_event(sym, side, tag_raw, raw)
-
-                # Finalize position on SELL fills
-                if side == "sell":
+                # Explicit BUY registration/finalization hook for position observability parity.
+                if side == "buy":
                     try:
                         pm = getattr(self.shared_state, "position_manager", None)
-                        exec_qty = float(raw.get("executedQty", 0.0))
                         exec_px = float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0)
+                        if exec_px <= 0 and exec_qty > 0:
+                            cum_quote = float(raw.get("cummulativeQuoteQty", 0.0) or 0.0)
+                            if cum_quote > 0:
+                                exec_px = cum_quote / max(exec_qty, 1e-12)
+                        significant_floor_usdt = 0.0
+                        try:
+                            if hasattr(self.shared_state, "get_significant_position_floor"):
+                                significant_floor_usdt = float(
+                                    await maybe_call(self.shared_state, "get_significant_position_floor", sym) or 0.0
+                                )
+                        except Exception:
+                            significant_floor_usdt = 0.0
+                        if significant_floor_usdt <= 0:
+                            significant_floor_usdt = float(
+                                self._cfg(
+                                    "SIGNIFICANT_POSITION_FLOOR",
+                                    self._cfg("MIN_SIGNIFICANT_POSITION_USDT", 25.0),
+                                )
+                                or 25.0
+                            )
                         fee_quote = float(raw.get("fee_quote", 0.0) or raw.get("fee", 0.0) or 0.0)
                         try:
                             _, quote_asset = self._split_base_quote(sym)
@@ -2900,36 +6161,50 @@ class ExecutionManager:
                                 ) or fee_quote
                         except Exception:
                             pass
-                        if pm and hasattr(pm, "close_position"):
-                            await pm.close_position(
+
+                        if pm and hasattr(pm, "open_position"):
+                            await pm.open_position(
                                 symbol=sym,
                                 executed_qty=exec_qty,
                                 executed_price=exec_px,
                                 fee_quote=fee_quote,
-                                reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
-                            )
-                        elif pm and hasattr(pm, "finalize_position"):
-                            await pm.finalize_position(
-                                symbol=sym,
-                                executed_qty=exec_qty,
-                                executed_price=exec_px,
-                                reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
-                            )
-                        elif hasattr(self.shared_state, "close_position"):
-                            await self.shared_state.close_position(
-                                sym,
-                                reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
-                            )
-                        if hasattr(self.shared_state, "mark_position_closed"):
-                            await self.shared_state.mark_position_closed(
-                                symbol=sym,
-                                qty=exec_qty,
-                                price=exec_px,
-                                reason=str(policy_ctx.get("exit_reason") or policy_ctx.get("reason") or "SELL_FILLED"),
+                                reason=str(policy_ctx.get("entry_reason") or policy_ctx.get("reason") or "BUY_FILLED"),
                                 tag=str(tag_raw or ""),
+                                tier=tier,
+                                significant_floor_usdt=float(significant_floor_usdt),
+                            )
+                        elif hasattr(self.shared_state, "open_position"):
+                            await maybe_call(
+                                self.shared_state,
+                                "open_position",
+                                sym,
+                                quantity=exec_qty,
+                                avg_price=exec_px,
                             )
                     except Exception:
-                        self.logger.debug("[EM] finalize_position failed for %s", sym, exc_info=True)
+                        self.logger.debug("[EM] open_position finalize failed for %s", sym, exc_info=True)
+
+                if side == "sell":
+                    await self._finalize_sell_post_fill(
+                        symbol=sym,
+                        order=raw,
+                        tag=str(tag_raw or ""),
+                        post_fill=post_fill,
+                        policy_ctx=policy_ctx,
+                        tier=tier,
+                    )
+
+                try:
+                    await self._audit_post_fill_accounting(
+                        symbol=sym,
+                        side=side,
+                        raw=raw,
+                        stage="post_mutation",
+                        decision_id=decision_id,
+                    )
+                except Exception:
+                    self.logger.error("[ACCOUNTING_AUDIT_CRASH] %s %s audit failed", sym, side, exc_info=True)
+                    raise
 
                 result = {
                     "ok": True,
@@ -2937,7 +6212,7 @@ class ExecutionManager:
                     "executedQty": float(raw.get("executedQty", 0.0)),
                     "avgPrice": float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0),
                     "cummulativeQuoteQty": float(raw.get("cummulativeQuoteQty", 0.0)),
-                    "orderId": raw.get("orderId") or raw.get("order_id") or raw.get("exchange_order_id"),
+                    "orderId": raw.get("orderId") or raw.get("exchange_order_id") or raw.get("order_id"),
                     "reason": raw.get("reason"),
                 }
                 
@@ -2961,6 +6236,9 @@ class ExecutionManager:
                     "ok": False,
                     "status": status.lower(),
                     "executedQty": exec_qty,
+                    "orderId": raw.get("orderId") or raw.get("exchange_order_id") or raw.get("order_id"),
+                    "exchange_order_id": raw.get("exchange_order_id") or raw.get("orderId") or raw.get("order_id"),
+                    "client_order_id": raw.get("clientOrderId") or raw.get("client_order_id") or raw.get("origClientOrderId"),
                     "reason": raw.get("reason") or "NOT_FILLED",
                     "error_code": raw.get("error_code") or "NOT_FILLED"
                 }
@@ -2989,6 +6267,46 @@ class ExecutionManager:
                 "min_required": eb.min_required,
             }
         except Exception as e:
+            recovered_sell_fill = False
+            recovered_post_fill: Optional[Dict[str, Any]] = None
+            recovered_status = ""
+            recovered_exec_qty = 0.0
+            if side == "sell" and isinstance(raw, dict):
+                recovered_status = str(raw.get("status", "")).upper()
+                recovered_exec_qty = float(raw.get("executedQty", 0.0) or 0.0)
+                if recovered_status in ("FILLED", "PARTIALLY_FILLED") and recovered_exec_qty > 0.0:
+                    try:
+                        recovered_post_fill = await self._ensure_post_fill_handled(
+                            sym,
+                            "SELL",
+                            raw,
+                            tier=tier,
+                            tag=str(tag_raw or ""),
+                        )
+                        await self._finalize_sell_post_fill(
+                            symbol=sym,
+                            order=raw,
+                            tag=str(tag_raw or ""),
+                            post_fill=recovered_post_fill,
+                            policy_ctx=policy_ctx,
+                            tier=tier,
+                        )
+                        recovered_sell_fill = True
+                        self.logger.warning(
+                            "[EM:SELL_EXCEPTION_RECOVERY] symbol=%s status=%s qty=%.8f order_id=%s",
+                            sym,
+                            recovered_status,
+                            recovered_exec_qty,
+                            raw.get("orderId") or raw.get("exchange_order_id") or raw.get("order_id"),
+                        )
+                    except Exception:
+                        self.logger.error(
+                            "[EM:SELL_EXCEPTION_RECOVERY_FAIL] symbol=%s status=%s qty=%.8f",
+                            sym,
+                            recovered_status or "UNKNOWN",
+                            recovered_exec_qty,
+                            exc_info=True,
+                        )
             # Point 5: Escape Hatch - Report exception failure
             if self.shared_state and hasattr(self.shared_state, "report_agent_capital_failure"):
                 self.shared_state.report_agent_capital_failure(f"exec_fail_{sym}")
@@ -3000,6 +6318,19 @@ class ExecutionManager:
                 "side": side, "error_type": error_type,
                 "error": error_msg, "tag": clean_tag, "exception_type": type(e).__name__
             })
+            if recovered_sell_fill:
+                await self._emit_status("Warning", f"sell_fill_recovered_after_exception {sym}")
+                return {
+                    "ok": True,
+                    "status": recovered_status.lower() or "filled",
+                    "executedQty": recovered_exec_qty,
+                    "avgPrice": float(raw.get("avgPrice", raw.get("price", 0.0)) or 0.0),
+                    "cummulativeQuoteQty": float(raw.get("cummulativeQuoteQty", 0.0) or 0.0),
+                    "orderId": raw.get("orderId") or raw.get("exchange_order_id") or raw.get("order_id"),
+                    "client_order_id": raw.get("clientOrderId") or raw.get("client_order_id") or raw.get("origClientOrderId"),
+                    "reason": "sell_fill_recovered_after_exception",
+                    "error_code": error_type,
+                }
             # GAP #2 FIX: Trigger pruning on exception
             await self._on_order_failed(sym, side, error_type, planned_quote)
             # Health: hard error
@@ -3007,6 +6338,13 @@ class ExecutionManager:
             return {"ok": False, "status": "error",
                     "reason": f"exception:{error_type}",
                     "error_code": error_type}
+        finally:
+            # SAFETY: Always release exit lock for SELL orders, regardless of how we exit
+            if side == "sell" and self.shared_state:
+                try:
+                    self.shared_state.exit_in_progress[sym] = False
+                except Exception:
+                    pass
 
     async def execute_liquidation_plan(self, exits: list[dict]) -> bool:
         def _coalesce(exits_list: list[dict]) -> list[dict]:
@@ -3058,8 +6396,19 @@ class ExecutionManager:
                 sym = self._norm_symbol(ex.get("symbol"))
                 qty = float(ex.get("quantity", 0))
                 tag = self._sanitize_tag(ex.get("tag") or "liquidation")
+                # Build policy_ctx for this exit (if any context is available)
+                policy_ctx = ex.get("policy_ctx") if isinstance(ex, dict) and ex.get("policy_ctx") else {}
                 if qty <= 0:
                     continue
+                await self._log_execution_event(
+                    "liquidation_exit_attempt",
+                    sym,
+                    {
+                        "qty": float(qty),
+                        "tag": tag,
+                        "coalesced_count": int(ex.get("_coalesced_count") or 1),
+                    },
+                )
                 if int(ex.get("_coalesced_count") or 0) > 1:
                     self.logger.info(
                         "[ExecutionManager] Coalesced %d liquidation exits for %s into qty=%.8f (tags=%s)",
@@ -3069,8 +6418,66 @@ class ExecutionManager:
                         ",".join(ex.get("_coalesced_tags") or [])
                     )
                 raw = await self._place_market_order_qty(sym, qty, "SELL", tag)
-                if raw and raw.get("ok"):
+                # Always reconcile delayed fill and finalize only once with correct policy_ctx
+                merged = await self._reconcile_delayed_fill(
+                    symbol=sym,
+                    side="SELL",
+                    order=raw,
+                    tag=tag,
+                    tier=None,
+                    client_order_id_hint=(
+                        (raw or {}).get("clientOrderId")
+                        or (raw or {}).get("client_order_id")
+                        or (raw or {}).get("origClientOrderId")
+                    ) if isinstance(raw, dict) else None,
+                )
+                status = str((merged or {}).get("status", "")).upper() if isinstance(merged, dict) else ""
+                exec_qty = self._safe_float((merged or {}).get("executedQty") if isinstance(merged, dict) else 0.0, 0.0)
+                ok_field = bool((merged or {}).get("ok")) if isinstance(merged, dict) else False
+                is_filled = bool(
+                    ok_field
+                    or (status in ("FILLED", "PARTIALLY_FILLED") and exec_qty > 0.0)
+                )
+                await self._log_execution_event(
+                    "liquidation_exit_result",
+                    sym,
+                    {
+                        "status": status or "unknown",
+                        "ok_field": bool(ok_field),
+                        "filled": bool(is_filled),
+                        "executed_qty": float(exec_qty),
+                        "order_id": (merged or {}).get("orderId") if isinstance(merged, dict) else None,
+                        "exchange_order_id": (merged or {}).get("exchange_order_id") if isinstance(merged, dict) else None,
+                        "client_order_id": (merged or {}).get("clientOrderId") if isinstance(merged, dict) else None,
+                        "error_code": (merged or {}).get("error_code") if isinstance(merged, dict) else None,
+                        "reason": (merged or {}).get("reason") if isinstance(merged, dict) else "no_raw_response",
+                        "tag": tag,
+                    },
+                )
+                if is_filled and isinstance(merged, dict):
                     any_success = True
+                    # Ensure canonical SELL finalization for fills reconciled
+                    # after _place_market_order_qty returned (late fills).
+                    try:
+                        lp_post = await self._ensure_post_fill_handled(
+                            symbol=sym, side="SELL", order=merged,
+                            tier=None, tag=str(tag or ""),
+                        )
+                        await self._finalize_sell_post_fill(
+                            symbol=sym, order=merged, tag=str(tag or ""),
+                            post_fill=lp_post, policy_ctx=policy_ctx, tier=None,
+                        )
+                    except Exception:
+                        self.logger.error("[EM:LiqPlan:FINALIZE_CRASH] %s", sym, exc_info=True)
+                else:
+                    self.logger.warning(
+                        "[ExecutionManager] Liquidation exit not filled for %s qty=%.8f status=%s ok=%s reason=%s",
+                        sym,
+                        float(qty),
+                        status or "unknown",
+                        ok_field,
+                        (merged or {}).get("reason") if isinstance(merged, dict) else "no_raw_response",
+                    )
             except Exception as e:
                 self.logger.warning(f"Liquidation exit failed for {ex}: {e}")
         return any_success
@@ -3083,6 +6490,71 @@ class ExecutionManager:
         while True:
             # Placeholder: In future, check for orders stuck in NEW/PARTIALLY_FILLED for too long
             await asyncio.sleep(self.order_monitor_interval)
+
+    async def start_position_sync_monitor(self):
+        """
+        ✅ ELITE: Background loop for periodic position invariant checks.
+        
+        Runs every N seconds (configurable) to detect:
+        - Exchange/internal position drift
+        - Phantom positions (position exists but shouldn't)
+        - Lost executions (internal has execution but exchange doesn't)
+        
+        On violation: Logs CRITICAL, emits health status DEGRADED, optionally halts.
+        
+        Config:
+        - POSITION_SYNC_CHECK_INTERVAL_SEC=60 (default)
+        - POSITION_SYNC_TOLERANCE=0.00001 (absolute drift allowed)
+        - STRICT_POSITION_INVARIANTS=False (if True, halt on violation)
+        """
+        try:
+            check_interval = float(self._cfg("POSITION_SYNC_CHECK_INTERVAL_SEC", 60.0) or 60.0)
+            check_interval = max(5.0, min(check_interval, 300.0))  # 5-300 sec range
+            
+            self.logger.info("[EM:PosSyncMonitor] Started (interval=%.1fs)", check_interval)
+            
+            while True:
+                try:
+                    await asyncio.sleep(check_interval)
+                    
+                    # Get all symbols being tracked
+                    symbols = []
+                    try:
+                        if hasattr(self.shared_state, "positions"):
+                            symbols = [str(s).upper() for s in self.shared_state.positions.keys()]
+                    except Exception:
+                        pass
+                    
+                    if not symbols:
+                        continue
+                    
+                    # Check each symbol's invariants
+                    violations = []
+                    for symbol in symbols[:20]:  # Limit per cycle to avoid hammering exchange
+                        try:
+                            ok = await self._verify_position_invariants(
+                                symbol=symbol,
+                                event_type="PERIODIC_SYNC_CHECK",
+                            )
+                            if not ok:
+                                violations.append(symbol)
+                        except Exception:
+                            pass
+                    
+                    if violations:
+                        self.logger.warning(
+                            "[EM:PosSyncMonitor] Invariant violations on: %s",
+                            ", ".join(violations)
+                        )
+                
+                except asyncio.CancelledError:
+                    self.logger.info("[EM:PosSyncMonitor] Stopped")
+                    break
+                except Exception:
+                    self.logger.debug("[EM:PosSyncMonitor] Iteration failed", exc_info=True)
+                    
+        except Exception:
+            self.logger.error("[EM:PosSyncMonitor] Failed to start", exc_info=True)
 
     # =============================
     # Placement internals
@@ -3102,12 +6574,24 @@ class ExecutionManager:
         current_price = await get_px(symbol)
         if not current_price:
             await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": "no_price"})
-            return {"ok": False, "reason": "no_price"}
+            return self._canonical_exec_result(
+                symbol=symbol,
+                side=side,
+                raw_order=None,
+                default_status="REJECTED",
+                default_reason="no_price",
+            )
 
         qty = float(quantity or 0.0)
         if qty <= 0:
             await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": "qty_invalid"})
-            return {"ok": False, "reason": "qty_invalid"}
+            return self._canonical_exec_result(
+                symbol=symbol,
+                side=side,
+                raw_order=None,
+                default_status="REJECTED",
+                default_reason="qty_invalid",
+            )
 
         if side.upper() == "BUY" and not policy_validated:
             ok_aff, why = await self.explain_afford_market_buy(symbol, Decimal(str(qty)))
@@ -3118,10 +6602,24 @@ class ExecutionManager:
                     healed = await self._attempt_liquidity_healing(symbol, need_quote, heal_context)
                     if not healed:
                         await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": str(why)})
-                        return {"ok": False, "reason": why}
+                        return self._canonical_exec_result(
+                            symbol=symbol,
+                            side=side,
+                            raw_order=None,
+                            default_status="REJECTED",
+                            default_reason=str(why),
+                            default_quote=float(qty) * float(current_price),
+                        )
                 else:
                     await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": str(why)})
-                    return {"ok": False, "reason": why}
+                    return self._canonical_exec_result(
+                        symbol=symbol,
+                        side=side,
+                        raw_order=None,
+                        default_status="REJECTED",
+                        default_reason=str(why),
+                        default_quote=float(qty) * float(current_price),
+                    )
 
         quote_asset = self._split_symbol_quote(symbol)
         reservation_id: Optional[str] = None
@@ -3147,34 +6645,125 @@ class ExecutionManager:
                 bypass_min_notional=bypass_min_notional,
                 decision_id=decision_id,
             )
-            if not raw_order:
+
+            order_res = self._canonical_exec_result(
+                symbol=symbol,
+                side=side,
+                raw_order=raw_order,
+                default_status="REJECTED",
+                default_quote=planned_quote,
+            )
+
+            has_submission_ref = bool(
+                order_res.get("orderId")
+                or order_res.get("exchange_order_id")
+                or order_res.get("client_order_id")
+                or order_res.get("clientOrderId")
+            )
+            status = str(order_res.get("status", "")).upper()
+            is_filled = status in ("FILLED", "PARTIALLY_FILLED")
+
+            # Treat only truly unplaced payloads as order-not-placed.
+            if not has_submission_ref and not is_filled:
+                # Order not placed or failed
                 if reservation_id:
+                    with contextlib.suppress(Exception):
+                        await self.shared_state.rollback_liquidity(quote_asset, reservation_id)
+                        await self._log_execution_event("liquidity_rolled_back", symbol, {
+                            "asset": quote_asset,
+                            "amount": float(planned_quote),
+                            "scope": "buy_by_qty",
+                            "reason": "order_not_placed",
+                            "reservation_id": reservation_id
+                        })
+                await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": "order_not_placed"})
+                return self._canonical_exec_result(
+                    symbol=symbol,
+                    side=side,
+                    raw_order=raw_order,
+                    default_status="REJECTED",
+                    default_reason="order_not_placed",
+                    default_quote=planned_quote,
+                )
+
+            # PHASE 4: Update position with actual fills (before post-fill and liquidity release)
+            if is_filled:
+                position_updated = await self._update_position_from_fill(
+                    symbol=symbol,
+                    side=side,
+                    order=order_res,
+                    tag=str(tag or "")
+                )
+                if not position_updated:
+                    self.logger.warning(
+                        "[PHASE4_SKIPPED] Position not updated for %s", symbol
+                    )
+            else:
+                self.logger.info(
+                    "[PHASE4_SKIPPED_NO_FILL] Position update skipped (order not filled). "
+                    "symbol=%s status=%s", symbol, status
+                )
+
+            if reservation_id:
+                if is_filled:
+                    # Release: Order was filled (or partially filled)
+                    spent = float(order_res.get("cummulativeQuoteQty", planned_quote))
                     with contextlib.suppress(Exception):
                         await self.shared_state.release_liquidity(quote_asset, reservation_id)
                         await self._log_execution_event("liquidity_released", symbol, {
-                            "asset": quote_asset, "amount": float(planned_quote), "scope": "buy_by_qty",
-                            "reason": "order_not_placed", "reservation_id": reservation_id
+                            "asset": quote_asset,
+                            "amount": float(spent),
+                            "scope": "buy_by_qty",
+                            "reason": "order_filled",
+                            "reservation_id": reservation_id,
+                            "actual_status": status,
                         })
-                await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": "order_not_placed"})
-                return {"ok": False, "reason": "order_not_placed"}
+                else:
+                    # Rollback: Order not filled yet (pending, new, etc.)
+                    with contextlib.suppress(Exception):
+                        await self.shared_state.rollback_liquidity(quote_asset, reservation_id)
+                        await self._log_execution_event("liquidity_rolled_back", symbol, {
+                            "asset": quote_asset,
+                            "amount": float(planned_quote),
+                            "scope": "buy_by_qty",
+                            "reason": "order_not_filled",
+                            "reservation_id": reservation_id,
+                            "actual_status": status,
+                        })
 
-            if reservation_id:
-                spent = float(raw_order.get("cummulativeQuoteQty") or planned_quote)
-                with contextlib.suppress(Exception):
-                    await self.shared_state.release_liquidity(quote_asset, reservation_id)
-                    await self._log_execution_event("liquidity_released", symbol, {
-                        "asset": quote_asset, "amount": float(spent), "scope": "buy_by_qty",
-                        "reason": "order_filled", "reservation_id": reservation_id
-                    })
+            # Continue with post-fill handling (only if filled)
+            if order_res and is_filled:
+                try:
+                    post_fill = await self._ensure_post_fill_handled(
+                        symbol,
+                        side.upper(),
+                        order_res,
+                        tier=None,
+                        tag=str(tag or ""),
+                    )
+                    if side.upper() == "SELL":
+                        await self._finalize_sell_post_fill(
+                            symbol=symbol,
+                            order=order_res,
+                            tag=str(tag or ""),
+                            post_fill=post_fill,
+                            policy_ctx=None,
+                            tier=None,
+                        )
+                except Exception as e:
+                    self.logger.error(f"[POST_FILL_CRASH_DIRECT_PATH] {symbol}: {e}", exc_info=True)
 
-            return raw_order
+            return order_res
         except Exception:
             if reservation_id:
                 with contextlib.suppress(Exception):
-                    await self.shared_state.release_liquidity(quote_asset, reservation_id)
-                    await self._log_execution_event("liquidity_released", symbol, {
-                        "asset": quote_asset, "amount": float(planned_quote), "scope": "buy_by_qty",
-                        "reason": "exception", "reservation_id": reservation_id
+                    await self.shared_state.rollback_liquidity(quote_asset, reservation_id)
+                    await self._log_execution_event("liquidity_rolled_back", symbol, {
+                        "asset": quote_asset,
+                        "amount": float(planned_quote),
+                        "scope": "buy_by_qty",
+                        "reason": "exception",
+                        "reservation_id": reservation_id
                     })
             raise
 
@@ -3193,7 +6782,13 @@ class ExecutionManager:
         current_price = await get_px(symbol)
         if not current_price:
             await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": "no_price"})
-            return {"ok": False, "reason": "no_price"}
+            return self._canonical_exec_result(
+                symbol=symbol,
+                side=side,
+                raw_order=None,
+                default_status="REJECTED",
+                default_reason="no_price",
+            )
 
         # For SELL orders, skip affordability check (they use position quantity, not capital)
         if side.upper() == "BUY" and not policy_validated:
@@ -3205,10 +6800,24 @@ class ExecutionManager:
                     healed = await self._attempt_liquidity_healing(symbol, need_quote, heal_context)
                     if not healed:
                         await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": str(why)})
-                        return {"ok": False, "reason": why}
+                        return self._canonical_exec_result(
+                            symbol=symbol,
+                            side=side,
+                            raw_order=None,
+                            default_status="REJECTED",
+                            default_reason=str(why),
+                            default_quote=quote,
+                        )
                 else:
                     await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": str(why)})
-                    return {"ok": False, "reason": why}
+                    return self._canonical_exec_result(
+                        symbol=symbol,
+                        side=side,
+                        raw_order=None,
+                        default_status="REJECTED",
+                        default_reason=str(why),
+                        default_quote=quote,
+                    )
 
         quote_asset = self._split_symbol_quote(symbol)
 
@@ -3236,34 +6845,144 @@ class ExecutionManager:
                 bypass_min_notional=bypass_min_notional,
                 decision_id=decision_id,
             )
-            if not raw_order:
+
+            order_res = self._canonical_exec_result(
+                symbol=symbol,
+                side=side,
+                raw_order=raw_order,
+                default_status="REJECTED",
+                default_quote=quote,
+            )
+
+            has_submission_ref = bool(
+                order_res.get("orderId")
+                or order_res.get("exchange_order_id")
+                or order_res.get("client_order_id")
+                or order_res.get("clientOrderId")
+            )
+            status = str(order_res.get("status", "")).upper()
+            is_filled = status in ("FILLED", "PARTIALLY_FILLED")
+
+            # Treat only truly unplaced payloads as order-not-placed.
+            if not has_submission_ref and not is_filled:
+                # Order not placed or failed
                 if reservation_id:
+                    with contextlib.suppress(Exception):
+                        await self.shared_state.rollback_liquidity(quote_asset, reservation_id)
+                        await self._log_execution_event("liquidity_rolled_back", symbol, {
+                            "asset": quote_asset,
+                            "amount": float(quote),
+                            "scope": "buy_by_quote",
+                            "reason": "order_not_placed",
+                            "reservation_id": reservation_id
+                        })
+                await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": "order_not_placed"})
+                return self._canonical_exec_result(
+                    symbol=symbol,
+                    side=side,
+                    raw_order=raw_order,
+                    default_status="REJECTED",
+                    default_reason="order_not_placed",
+                    default_quote=quote,
+                )
+
+            # PHASE 4: Update position with actual fills (before post-fill and liquidity release)
+            if is_filled:
+                position_updated = await self._update_position_from_fill(
+                    symbol=symbol,
+                    side=side,
+                    order=order_res,
+                    tag=str(tag or "")
+                )
+                if not position_updated:
+                    self.logger.warning(
+                        "[PHASE4_SKIPPED] Position not updated for %s", symbol
+                    )
+                else:
+                    # CRITICAL: Journal ORDER_FILLED for audit trail and invariant validation
+                    self._journal("ORDER_FILLED", {
+                        "symbol": symbol,
+                        "side": side.upper(),
+                        "executed_qty": float(order_res.get("executedQty", 0.0) or 0.0),
+                        "avg_price": self._resolve_post_fill_price(
+                            order_res,
+                            float(order_res.get("executedQty", 0.0) or 0.0)
+                        ),
+                        "cumm_quote": float(order_res.get("cummulativeQuoteQty", quote) or quote),
+                        "order_id": str(order_res.get("orderId", "")),
+                        "status": str(order_res.get("status", "")),
+                        "tag": str(tag or ""),
+                        "path": "quote_based",
+                    })
+            else:
+                self.logger.info(
+                    "[PHASE4_SKIPPED_NO_FILL] Position update skipped (order not filled). "
+                    "symbol=%s status=%s", symbol, status
+                )
+
+            if reservation_id:
+                if is_filled:
+                    # Release: Order was filled (or partially filled)
+                    spent = float(order_res.get("cummulativeQuoteQty", quote))
                     with contextlib.suppress(Exception):
                         await self.shared_state.release_liquidity(quote_asset, reservation_id)
                         await self._log_execution_event("liquidity_released", symbol, {
-                            "asset": quote_asset, "amount": float(quote), "scope": "buy_by_quote",
-                            "reason": "order_not_placed", "reservation_id": reservation_id
+                            "asset": quote_asset,
+                            "amount": float(spent),
+                            "scope": "buy_by_quote",
+                            "reason": "order_filled",
+                            "reservation_id": reservation_id,
+                            "actual_status": status,
                         })
-                await self._log_execution_event("order_skip", symbol, {"side": side, "reason": "order_not_placed"})
-                return {"ok": False, "reason": "order_not_placed"}
+                else:
+                    # Rollback: Order not filled yet (pending, new, etc.)
+                    with contextlib.suppress(Exception):
+                        await self.shared_state.rollback_liquidity(quote_asset, reservation_id)
+                        await self._log_execution_event("liquidity_rolled_back", symbol, {
+                            "asset": quote_asset,
+                            "amount": float(quote),
+                            "scope": "buy_by_quote",
+                            "reason": "order_not_filled",
+                            "reservation_id": reservation_id,
+                            "actual_status": status,
+                        })
 
-            if reservation_id:
-                spent = float(raw_order.get("cummulativeQuoteQty") or quote)
-                with contextlib.suppress(Exception):
-                    await self.shared_state.release_liquidity(quote_asset, reservation_id)
-                    await self._log_execution_event("liquidity_released", symbol, {
-                        "asset": quote_asset, "amount": float(spent), "scope": "buy_by_qty",
-                        "reason": "order_filled", "reservation_id": reservation_id
-                    })
+            # Continue with post-fill handling (only if filled)
+            if order_res and is_filled:
+                try:
+                    post_fill = await self._ensure_post_fill_handled(
+                        symbol,
+                        side.upper(),
+                        order_res,
+                        tier=None,
+                        tag=str(tag or ""),
+                    )
+                    if side.upper() == "SELL":
+                        await self._finalize_sell_post_fill(
+                            symbol=symbol,
+                            order=order_res,
+                            tag=str(tag or ""),
+                            post_fill=post_fill,
+                            policy_ctx=None,
+                            tier=None,
+                        )
+                except Exception as e:
+                    self.logger.error(
+                        f"[POST_FILL_CRASH_QUOTE_PATH] {symbol}: {e}",
+                        exc_info=True,
+                    )
 
-            return raw_order
+            return order_res
         except Exception:
             if reservation_id:
                 with contextlib.suppress(Exception):
-                    await self.shared_state.release_liquidity(quote_asset, reservation_id)
-                    await self._log_execution_event("liquidity_released", symbol, {
-                        "asset": quote_asset, "amount": float(quote), "scope": "buy_by_quote",
-                        "reason": "exception", "reservation_id": reservation_id
+                    await self.shared_state.rollback_liquidity(quote_asset, reservation_id)
+                    await self._log_execution_event("liquidity_rolled_back", symbol, {
+                        "asset": quote_asset,
+                        "amount": float(quote),
+                        "scope": "buy_by_quote",
+                        "reason": "exception",
+                        "reservation_id": reservation_id
                     })
             raise
 
@@ -3305,6 +7024,21 @@ class ExecutionManager:
         decision_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         symbol = self._norm_symbol(symbol)
+        if not self._ensure_trade_journal_ready(reason="pre_submit"):
+            if self._is_live_trading_mode() and bool(self._require_trade_journal_live):
+                with contextlib.suppress(Exception):
+                    await self._log_execution_event("order_skip", symbol, {
+                        "side": side.upper(),
+                        "reason": "TRADE_JOURNAL_UNAVAILABLE",
+                    })
+                return {
+                    "ok": False,
+                    "status": "SKIPPED",
+                    "reason": "TRADE_JOURNAL_UNAVAILABLE",
+                    "error_code": "TRADE_JOURNAL_UNAVAILABLE",
+                    "symbol": symbol,
+                    "side": side.upper(),
+                }
 
         # --- Filters from ExchangeClient (raw) ---
         filters = await self.exchange_client.ensure_symbol_filters_ready(symbol)
@@ -3316,9 +7050,23 @@ class ExecutionManager:
         decision_id = decision_id or self._resolve_decision_id(getattr(self, "_current_policy_context", None))
         client_id = self._build_client_order_id(symbol, side.upper(), decision_id)
 
-        if self._is_duplicate_client_order_id(client_id):
-            self.logger.debug("[EM] Duplicate client_order_id for %s %s; skipping.", symbol, side.upper())
-            return {"status": "SKIPPED", "reason": "IDEMPOTENT"}
+        # Check for bootstrap flag - bypass idempotency check if bootstrap is allowed and flagged
+        is_bootstrap_signal = False
+        if hasattr(self, "_current_policy_context") and self._current_policy_context:
+            is_bootstrap_signal = bool(self._current_policy_context.get("_bootstrap", False))
+        
+        # Only allow bootstrap bypass if:
+        # 1. Signal is marked as bootstrap
+        # 2. We're in a phase that allows bootstrap override
+        allow_bootstrap_bypass = is_bootstrap_signal and self._is_bootstrap_allowed()
+        
+        # is_bootstrap flag for use in quote adjustment logic
+        is_bootstrap = allow_bootstrap_bypass or bypass_min_notional
+        
+        if not allow_bootstrap_bypass:
+            if self._is_duplicate_client_order_id(client_id):
+                self.logger.debug("[EM] Duplicate client_order_id for %s %s; skipping.", symbol, side.upper())
+                return {"status": "SKIPPED", "reason": "IDEMPOTENT"}
 
         order_key = (symbol, side.upper())
         if order_key in self._active_symbol_side_orders:
@@ -3326,31 +7074,79 @@ class ExecutionManager:
             return {"status": "SKIPPED", "reason": "ACTIVE_ORDER"}
         self._active_symbol_side_orders.add(order_key)
 
+        sem_acquired = False
         try:
             # Lazy-init semaphores (need running loop)
             self._ensure_semaphores_ready()
 
-            async with self._concurrent_orders_sem:
-                # Use quote-amount path whenever BUY + planned_quote is given
+            # 🔥 FIX: Add timeout to semaphore acquisition to prevent deadlock
+            # Reason: If all semaphore slots fill up, prevent indefinite blocking
+            try:
+                await asyncio.wait_for(
+                    self._concurrent_orders_sem.acquire(),
+                    timeout=10.0  # 10 second timeout
+                )
+                sem_acquired = True
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    "[EM:SemaphoreTimeout] Semaphore acquisition timeout for %s %s - order placement blocked",
+                    symbol, side.upper()
+                )
+                return {
+                    "ok": False,
+                    "status": "SKIPPED",
+                    "reason": "SEMAPHORE_TIMEOUT",
+                    "error_code": "SEMAPHORE_TIMEOUT",
+                    "symbol": symbol,
+                    "side": side.upper(),
+                }
 
-                if side.upper() == "BUY" and planned_quote and planned_quote > 0:
+            # Use quote-amount path whenever BUY + planned_quote is given
 
-                    spend = float(planned_quote)
-
-                    # Enforce both venue min_notional (with buffer) and minimal execution floor
-                    # PHASE 2 NOTE: Capital floor check already done in MetaController
+            if side.upper() == "BUY" and planned_quote and planned_quote > 0:
+                    # Bootstrap/dust bypass modes intentionally skip this internal floor and rely on
+                    # executable-qty + exchange min_notional checks downstream.
                     min_entry = await self._get_min_entry_quote(symbol, price=current_price, min_notional=min_notional)
-                    if spend < min_entry:
-                        await self._log_execution_event("order_skip", symbol, {"side": "BUY", "reason": "NOTIONAL_LT_MIN", "min_required": min_entry})
-                        return None
+                    
+                    # PROPER FIX: Adjust min_entry to account for step_size rounding
+                    # When order is placed with quote=X, Binance computes qty = X / price and rounds by step_size.
+                    # This can result in final_quote < min_entry. We must increase min_entry to the actual
+                    # minimum that will SURVIVE rounding.
+                    min_entry_after_rounding = self._adjust_quote_for_step_rounding(
+                        min_entry_quote=min_entry,
+                        current_price=current_price,
+                        step_size=step_size,
+                    )
+                    self.logger.info(
+                        "[EM:RoundingAdjust] %s min_entry before rounding=%.2f after rounding=%.2f",
+                        symbol, float(min_entry), float(min_entry_after_rounding)
+                    )
+                    
+                    if spend < min_entry_after_rounding and not (is_bootstrap or bypass_min_notional):
+                        self.logger.info(
+                            "[EM:AutoAdjust] Escalating %s BUY spend from %.2f → %.2f to meet min_entry_after_rounding",
+                            symbol, float(spend), float(min_entry_after_rounding)
+                        )
+                        spend = float(min_entry_after_rounding)
+                    if spend < min_entry_after_rounding and (is_bootstrap or bypass_min_notional):
+                        self.logger.info(
+                            "[EM:MinEntryBypass] %s BUY bypassing min_entry floor %.4f with spend %.4f "
+                            "(bootstrap=%s bypass_min_notional=%s)",
+                            symbol,
+                            float(min_entry_after_rounding),
+                            float(spend),
+                            bool(is_bootstrap),
+                            bool(bypass_min_notional),
+                        )
 
                     # DEADLOCK FIX: Escalation logic for gross notional requirements
                     # Check if planned quote meets GROSS requirements (net + fees + safety)
+                    # Use min_entry_after_rounding to ensure we meet minimum AFTER step rounding
                     q_asset = self._split_symbol_quote(symbol)
                     trade_fee_pct = float(self.trade_fee_pct)
                     safety_headroom = float(self.safety_headroom)
                     gross_factor = (1.0 + trade_fee_pct) * safety_headroom
-                    min_required_gross = min_entry * gross_factor
+                    min_required_gross = min_entry_after_rounding * gross_factor
 
                     no_downscale = False
                     if hasattr(self, "_current_policy_context") and self._current_policy_context:
@@ -3401,20 +7197,13 @@ class ExecutionManager:
                         return None
 
                     filters_obj = SymbolFilters(
-                        step_size=step_size, min_qty=min_qty, max_qty=max_qty,
-                        tick_size=tick_size, min_notional=min_notional, min_entry_quote=min_entry
+                        step_size=step_size,
+                        min_qty=min_qty,
+                        max_qty=max_qty,
+                        tick_size=tick_size,
+                        min_notional=min_notional,
+                        min_entry_quote=(0.0 if bypass_min_notional else min_entry_after_rounding),
                     )
-                    
-                    # BOOTSTRAP FIX: Check if this is a bootstrap bypass scenario
-                    is_bootstrap = False
-                    try:
-                        # Check if we're in bootstrap mode (from policy context or shared state)
-                        if hasattr(self, '_current_policy_context') and self._current_policy_context:
-                            is_bootstrap = bool(self._current_policy_context.get("bootstrap_bypass", False))
-                        if not is_bootstrap and hasattr(self.shared_state, "is_bootstrap_mode"):
-                            is_bootstrap = self.shared_state.is_bootstrap_mode()
-                    except Exception:
-                        pass
                     
                     if is_bootstrap:
                         # BOOTSTRAP: Use true quote-based market order (quoteOrderQty) for guaranteed execution
@@ -3426,13 +7215,23 @@ class ExecutionManager:
                         # Use exchange client's quote-based order directly
                         try:
                             if hasattr(self.exchange_client, '_send_real_order_quote'):
-                                order_id = await self.exchange_client._send_real_order_quote(
-                                    symbol=symbol, 
-                                    side="BUY", 
-                                    quote=float(spend), 
-                                    tag=safe_tag,
-                                    client_order_id=client_id,
-                                )
+                                self._journal("ORDER_SUBMITTED", {
+                                    "symbol": symbol, "side": "BUY", "qty": 0,
+                                    "price": current_price, "quote": float(spend),
+                                    "tag": safe_tag, "client_order_id": client_id,
+                                    "path": "bootstrap_quote",
+                                })
+                                order_scope = self._enter_exchange_order_scope()
+                                try:
+                                    order_id = await self.exchange_client._send_real_order_quote(
+                                        symbol=symbol,
+                                        side="BUY",
+                                        quote=float(spend),
+                                        tag=safe_tag,
+                                        client_order_id=client_id,
+                                    )
+                                finally:
+                                    self._exit_exchange_order_scope(order_scope)
                                 if order_id:
                                     # Create a minimal order result for consistency
                                     order = {
@@ -3448,12 +7247,41 @@ class ExecutionManager:
                                         "type": "MARKET_QUOTE", "side": "BUY", "tag": safe_tag,
                                         "using": "quoteOrderQty", "quote_amount": spend
                                     })
+                                    order = await self._reconcile_delayed_fill(
+                                        symbol=symbol,
+                                        side="BUY",
+                                        order=order,
+                                        tag=safe_tag,
+                                        tier=None,
+                                        client_order_id_hint=client_id,
+                                    )
+                                    if self._is_order_fill_confirmed(order):
+                                        self._journal("ORDER_FILLED", {
+                                            "symbol": symbol, "side": "BUY",
+                                            "executed_qty": self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0),
+                                            "avg_price": self._resolve_post_fill_price(order, self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)),
+                                            "cumm_quote": self._safe_float(order.get("cummulativeQuoteQty") or order.get("cummulative_quote"), 0.0),
+                                            "order_id": str(order.get("orderId") or order.get("order_id") or ""),
+                                            "status": str(order.get("status", "")),
+                                            "tag": safe_tag, "client_order_id": client_id,
+                                            "path": "bootstrap_quote",
+                                        })
+                                    elif isinstance(order, dict):
+                                        self._journal("ORDER_PENDING", {
+                                            "symbol": symbol,
+                                            "side": "BUY",
+                                            "status": str(order.get("status", "")).upper() or "UNKNOWN",
+                                            "order_id": str(order.get("orderId") or order.get("order_id") or ""),
+                                            "tag": safe_tag,
+                                            "client_order_id": client_id,
+                                            "path": "bootstrap_quote",
+                                        })
                                     return order
                         except Exception as e:
                             self.logger.warning(f"[EM:BOOTSTRAP] Quote-based order failed: {e}, falling back to quantity-based")
                     
                     # Standard quantity-based execution path
-                    ok, qty, adjusted_quote, _ = await validate_order_request(
+                    ok, qty, adjusted_quote, _ = await self._validate_order_request_contract(
                         side="BUY", qty=0, price=current_price, filters=filters_obj,
                         taker_fee_bps=self._cfg("TAKER_FEE_BPS", 10), use_quote_amount=spend
                     )
@@ -3492,6 +7320,14 @@ class ExecutionManager:
                                     "type": "LIMIT_POST_ONLY", "side": "BUY", "tag": safe_tag,
                                     "client_id": client_id, "using": "qty"
                                 })
+                                lim = await self._reconcile_delayed_fill(
+                                    symbol=symbol,
+                                    side="BUY",
+                                    order=lim,
+                                    tag=safe_tag,
+                                    tier=None,
+                                    client_order_id_hint=client_id,
+                                )
                                 return lim
                             # cancel and consider taker fallback
                             with contextlib.suppress(Exception):
@@ -3508,13 +7344,45 @@ class ExecutionManager:
                             # fall back to market path if maker path errors
                             pass
 
+                    self._journal("ORDER_SUBMITTED", {
+                        "symbol": symbol, "side": "BUY", "qty": final_qty,
+                        "price": current_price, "quote": final_qty * current_price,
+                        "tag": safe_tag, "client_order_id": client_id,
+                    })
                     order = await self._place_with_client_id(
                         symbol=symbol, side="BUY", quantity=final_qty, tag=safe_tag, clientOrderId=client_id
                     )
-                    if order:
+                    if isinstance(order, dict) and not bool(order.get("_submission_unknown")):
                         await self._log_execution_event("order_placed", symbol, {
                             "type": "MARKET", "side": "BUY", "tag": safe_tag,
                             "client_id": client_id, "using": "qty"
+                        })
+                    order = await self._reconcile_delayed_fill(
+                        symbol=symbol,
+                        side="BUY",
+                        order=order,
+                        tag=safe_tag,
+                        tier=None,
+                        client_order_id_hint=client_id,
+                    )
+                    if self._is_order_fill_confirmed(order):
+                        self._journal("ORDER_FILLED", {
+                            "symbol": symbol, "side": "BUY",
+                            "executed_qty": self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0),
+                            "avg_price": self._resolve_post_fill_price(order, self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)),
+                            "cumm_quote": self._safe_float(order.get("cummulativeQuoteQty") or order.get("cummulative_quote"), 0.0),
+                            "order_id": str(order.get("orderId") or order.get("order_id") or ""),
+                            "status": str(order.get("status", "")),
+                            "tag": safe_tag, "client_order_id": client_id,
+                        })
+                    elif isinstance(order, dict):
+                        self._journal("ORDER_PENDING", {
+                            "symbol": symbol,
+                            "side": "BUY",
+                            "status": str(order.get("status", "")).upper() or "UNKNOWN",
+                            "order_id": str(order.get("orderId") or order.get("order_id") or ""),
+                            "tag": safe_tag,
+                            "client_order_id": client_id,
                         })
                     return order
 
@@ -3566,7 +7434,7 @@ class ExecutionManager:
                 # For liquidation, just ensure qty > 0 and apply step size rounding
                 final_qty = max(float(qty), 0.0)
             else:
-                ok, adj_qty, _, _ = await validate_order_request(
+                ok, adj_qty, _, _ = await self._validate_order_request_contract(
                     side=side.upper(), qty=qty, price=current_price, filters=filters_obj,
                     taker_fee_bps=self._cfg("TAKER_FEE_BPS", 10), use_quote_amount=None
                 )
@@ -3579,7 +7447,7 @@ class ExecutionManager:
                 # Per-trade cap for qty path
                 if self.max_spend_per_trade > 0:
                     est_quote = final_qty * current_price
-                    if est_quote > self.max_spend_per_trade:
+                    if est_quote > self.max_spend_per_trade and current_price > 0:
                         final_qty = round_step(self.max_spend_per_trade / current_price, step_size)
 
                 notional_now = final_qty * current_price
@@ -3616,16 +7484,93 @@ class ExecutionManager:
                     })
                     return None
 
+                # 🔥 CRITICAL: Profit gate at execution layer (CANNOT be bypassed)
+                if not await self._passes_profit_gate(symbol, side, final_qty, current_price):
+                    self.logger.warning(f"🚫 SELL blocked at Execution layer by profit gate for {symbol}")
+                    return None
+
+                self._journal("ORDER_SUBMITTED", {
+                    "symbol": symbol, "side": side.upper(), "qty": final_qty,
+                    "price": current_price, "quote": final_qty * current_price,
+                    "tag": safe_tag, "client_order_id": client_id,
+                    "timestamp": time.time(),
+                })
                 order = await self._place_with_client_id(
                     symbol=symbol, side=side.upper(), quantity=final_qty, tag=safe_tag, clientOrderId=client_id
                 )
-                if order:
+                if isinstance(order, dict) and not bool(order.get("_submission_unknown")):
                     await self._log_execution_event("order_placed", symbol, {
                         "type": "MARKET", "side": side.upper(), "tag": safe_tag,
                         "client_id": client_id, "using": "qty"
                     })
+                
+                # ✅ CRITICAL: For SELL orders, capture the order response IMMEDIATELY
+                # If exchange executed but returned None/empty, we still need to log it
+                # This prevents state-sync issues where SELL is executed but never logged
+                if side.upper() == "SELL":
+                    self._journal("SELL_ORDER_PLACED", {
+                        "symbol": symbol, "qty": final_qty, "price": current_price,
+                        "client_order_id": client_id, "response_received": bool(order),
+                        "timestamp": time.time(),
+                    })
+                
+                order = await self._reconcile_delayed_fill(
+                    symbol=symbol,
+                    side=side.upper(),
+                    order=order,
+                    tag=safe_tag,
+                    tier=None,
+                    client_order_id_hint=client_id,
+                )
+
+                if self._is_order_fill_confirmed(order):
+                    self._journal("ORDER_FILLED", {
+                        "symbol": symbol, "side": side.upper(),
+                        "executed_qty": self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0),
+                        "avg_price": self._resolve_post_fill_price(order, self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)),
+                        "cumm_quote": self._safe_float(order.get("cummulativeQuoteQty") or order.get("cummulative_quote"), 0.0),
+                        "order_id": str(order.get("orderId") or order.get("order_id") or ""),
+                        "status": str(order.get("status", "")),
+                        "tag": safe_tag, "client_order_id": client_id,
+                    })
+                elif isinstance(order, dict):
+                    self._journal("ORDER_PENDING", {
+                        "symbol": symbol,
+                        "side": side.upper(),
+                        "status": str(order.get("status", "")).upper() or "UNKNOWN",
+                        "order_id": str(order.get("orderId") or order.get("order_id") or ""),
+                        "tag": safe_tag,
+                        "client_order_id": client_id,
+                    })
+
+                if order:
+                    post_fill = await self._ensure_post_fill_handled(
+                        symbol=symbol,
+                        side=side.upper(),
+                        order=order,
+                        tier=None,
+                        tag=str(safe_tag or ""),
+                    )
+                    if isinstance(order, dict) and isinstance(post_fill, dict):
+                        order["_post_fill_result"] = dict(post_fill)
+                        order["_post_fill_done"] = True
+                    if side.upper() == "SELL":
+                        await self._finalize_sell_post_fill(
+                            symbol=symbol,
+                            order=order,
+                            tag=str(safe_tag or ""),
+                            post_fill=post_fill,
+                            policy_ctx=None,
+                            tier=None,
+                        )
                 return order
         finally:
+            # Release semaphore if acquired
+            if sem_acquired:
+                try:
+                    self._concurrent_orders_sem.release()
+                except Exception:
+                    pass
             self._active_symbol_side_orders.discard(order_key)
 
     async def _place_with_client_id(self, **kwargs) -> Any:
@@ -3639,48 +7584,169 @@ class ExecutionManager:
         - Network/Connection errors: Classify as EXTERNAL_API_ERROR
         - Unknown exceptions: Log and classify as EXTERNAL_API_ERROR (never propagate raw)
         """
-        symbol = kwargs.get("symbol", "UNKNOWN")
-        side = kwargs.get("side", "UNKNOWN")
-        
-        try:
-            return await self.exchange_client.place_market_order(**kwargs)
-        except TypeError as te:
-            # Some clients may not accept clientOrderId; retry without it
-            if "clientOrderId" in kwargs:
-                self.logger.debug(f"[EM:TypeErr] clientOrderId not supported, retrying: {te}")
-                kwargs.pop("clientOrderId", None)
-                try:
-                    return await self.exchange_client.place_market_order(**kwargs)
-                except Exception as retry_err:
-                    # Classify retry error
-                    return await self._classify_exchange_error(
-                        symbol, side, retry_err, "place_market_order_retry"
-                    )
-            # If not a clientOrderId issue, re-raise as deterministic ExecutionError
-            return await self._classify_exchange_error(
-                symbol, side, te, "place_market_order"
-            )
-        except BinanceAPIException as bex:
-            # Binance-specific API error with code
-            return await self._classify_exchange_error(
-                symbol, side, bex, "place_market_order"
-            )
-        except (ConnectionError, TimeoutError, asyncio.TimeoutError) as conn_err:
-            # Network/connection issues
-            self.logger.error(
-                f"[EM:ConnErr] {symbol} {side}: Connection error from ExchangeClient: {conn_err}"
-            )
-            return None  # Network error → order not sent (deterministic)
-        except Exception as unknown_err:
-            # P9 MANDATE: No unknown exceptions allowed
-            self.logger.error(
-                f"[EM:UnknownErr] {symbol} {side}: Unclassified exception from place_market_order: "
-                f"{type(unknown_err).__name__}: {unknown_err}",
-                exc_info=True
-            )
-            return None  # Unknown error → order not sent (deterministic fallback)
+        request_kwargs = dict(kwargs)
+        symbol = self._norm_symbol(request_kwargs.get("symbol", "UNKNOWN"))
+        side = str(request_kwargs.get("side", "UNKNOWN")).upper()
+        coid = (
+            request_kwargs.get("clientOrderId")
+            or request_kwargs.get("client_order_id")
+            or request_kwargs.get("origClientOrderId")
+        )
+        retries = int(self._cfg("ORDER_RECOVERY_RETRIES", 5) or 5)
+        retries = max(1, min(retries, 20))
+        delay_s = float(self._cfg("ORDER_RECOVERY_RETRY_DELAY_S", 0.2) or 0.2)
+        delay_s = min(max(delay_s, 0.05), 1.0)
 
-    async def _classify_exchange_error(
+        scope_token = self._enter_exchange_order_scope()
+        try:
+            try:
+                return await self.exchange_client.place_market_order(**request_kwargs)
+            except TypeError as te:
+                # Some clients may not accept clientOrderId; retry without it
+                if "clientOrderId" in request_kwargs:
+                    self.logger.debug(f"[EM:TypeErr] clientOrderId not supported, retrying: {te}")
+                    retry_kwargs = dict(request_kwargs)
+                    retry_kwargs.pop("clientOrderId", None)
+                    try:
+                        return await self.exchange_client.place_market_order(**retry_kwargs)
+                    except Exception as retry_err:
+                        if coid and self._is_ambiguous_submit_error(retry_err):
+                            recovered = await self._recover_order_by_client_id(
+                                symbol=symbol,
+                                side=side,
+                                client_order_id=str(coid),
+                                retries=retries,
+                                delay_s=delay_s,
+                            )
+                            if isinstance(recovered, dict) and recovered:
+                                return recovered
+                            self._journal("ORDER_SUBMISSION_AMBIGUOUS", {
+                                "symbol": symbol,
+                                "side": side,
+                                "client_order_id": str(coid),
+                                "context": "place_market_order_retry",
+                                "error": str(retry_err),
+                                "timestamp": time.time(),
+                            })
+                            return self._build_submission_unknown_order(
+                                symbol=symbol,
+                                side=side,
+                                client_order_id=str(coid),
+                                reason="order_submission_ambiguous",
+                                error_code="ORDER_SUBMISSION_AMBIGUOUS",
+                                error_text=str(retry_err),
+                            )
+                        # Classify retry error
+                        return self._classify_exchange_error(
+                            symbol, side, retry_err, "place_market_order_retry"
+                        )
+                # If not a clientOrderId issue, re-raise as deterministic ExecutionError
+                return self._classify_exchange_error(
+                    symbol, side, te, "place_market_order"
+                )
+            except BinanceAPIException as bex:
+                if coid and self._is_ambiguous_submit_error(bex):
+                    recovered = await self._recover_order_by_client_id(
+                        symbol=symbol,
+                        side=side,
+                        client_order_id=str(coid),
+                        retries=retries,
+                        delay_s=delay_s,
+                    )
+                    if isinstance(recovered, dict) and recovered:
+                        return recovered
+                    self._journal("ORDER_SUBMISSION_AMBIGUOUS", {
+                        "symbol": symbol,
+                        "side": side,
+                        "client_order_id": str(coid),
+                        "context": "place_market_order_binance_exception",
+                        "error": str(bex),
+                        "code": getattr(bex, "code", None),
+                        "timestamp": time.time(),
+                    })
+                    return self._build_submission_unknown_order(
+                        symbol=symbol,
+                        side=side,
+                        client_order_id=str(coid),
+                        reason="order_submission_ambiguous",
+                        error_code="ORDER_SUBMISSION_AMBIGUOUS",
+                        error_text=str(bex),
+                    )
+                # Binance-specific API error with code
+                return self._classify_exchange_error(
+                    symbol, side, bex, "place_market_order"
+                )
+            except (ConnectionError, TimeoutError, asyncio.TimeoutError) as conn_err:
+                # Network/connection issues
+                self.logger.error(
+                    f"[EM:ConnErr] {symbol} {side}: Connection error from ExchangeClient: {conn_err}"
+                )
+                # Best-effort: if a clientOrderId was provided, probe the exchange for the order
+                if coid:
+                    recovered = await self._recover_order_by_client_id(
+                        symbol=symbol,
+                        side=side,
+                        client_order_id=str(coid),
+                        retries=retries,
+                        delay_s=delay_s,
+                    )
+                    if isinstance(recovered, dict) and recovered:
+                        return recovered
+                    self._journal("ORDER_SUBMISSION_AMBIGUOUS", {
+                        "symbol": symbol,
+                        "side": side,
+                        "client_order_id": str(coid),
+                        "context": "place_market_order_transport_error",
+                        "error": str(conn_err),
+                        "timestamp": time.time(),
+                    })
+                    return self._build_submission_unknown_order(
+                        symbol=symbol,
+                        side=side,
+                        client_order_id=str(coid),
+                        reason="order_submission_ambiguous",
+                        error_code="ORDER_SUBMISSION_AMBIGUOUS",
+                        error_text=str(conn_err),
+                    )
+                return None  # Network error → order not sent (deterministic)
+            except Exception as unknown_err:
+                # P9 MANDATE: No unknown exceptions allowed
+                self.logger.error(
+                    f"[EM:UnknownErr] {symbol} {side}: Unclassified exception from place_market_order: "
+                    f"{type(unknown_err).__name__}: {unknown_err}",
+                    exc_info=True
+                )
+                if coid and self._is_ambiguous_submit_error(unknown_err):
+                    recovered = await self._recover_order_by_client_id(
+                        symbol=symbol,
+                        side=side,
+                        client_order_id=str(coid),
+                        retries=retries,
+                        delay_s=delay_s,
+                    )
+                    if isinstance(recovered, dict) and recovered:
+                        return recovered
+                    self._journal("ORDER_SUBMISSION_AMBIGUOUS", {
+                        "symbol": symbol,
+                        "side": side,
+                        "client_order_id": str(coid),
+                        "context": "place_market_order_unknown_error",
+                        "error": str(unknown_err),
+                        "timestamp": time.time(),
+                    })
+                    return self._build_submission_unknown_order(
+                        symbol=symbol,
+                        side=side,
+                        client_order_id=str(coid),
+                        reason="order_submission_ambiguous",
+                        error_code="ORDER_SUBMISSION_AMBIGUOUS",
+                        error_text=str(unknown_err),
+                    )
+                return None  # Unknown error → order not sent (deterministic fallback)
+        finally:
+            self._exit_exchange_order_scope(scope_token)
+
+    def _classify_exchange_error(
         self, symbol: str, side: str, exc: Exception, context: str
     ) -> None:
         """
@@ -3764,6 +7830,75 @@ class ExecutionManager:
         except Exception:
             return 0.0
 
+    def _adjust_quote_for_step_rounding(
+        self,
+        min_entry_quote: float,
+        current_price: float,
+        step_size: float,
+    ) -> float:
+        """
+        Compute the ACTUAL quote needed to satisfy min_entry AFTER step_size rounding.
+        
+        Problem:
+          min_entry = 30 USDT
+          When we send quote=31, Binance computes qty = 31 / 45000 = 0.000688...
+          After step rounding (0.001), qty becomes 0.001
+          Final quote = 0.001 * 45000 = 45 USDT ✓ OK
+        
+        But if min_entry_quote is very close to a step boundary, quote might round DOWN:
+          min_entry = 30 USDT
+          price = 45000
+          qty_raw = 30 / 45000 = 0.000666...
+          After step round (0.001), qty = 0.0 (too small!)
+          This violates the min_entry requirement.
+        
+        Solution:
+          1. Compute exact qty that satisfies min_entry:  qty = min_entry / price
+          2. Round UP to next step:  qty_rounded = ceil(qty / step) * step
+          3. Compute adjusted quote:  adjusted_quote = qty_rounded * price
+          4. Return this adjusted quote so order satisfies min_entry AFTER rounding
+        
+        Args:
+            min_entry_quote: Target minimum quote (30 USDT)
+            current_price: Asset price (45000 USDT)
+            step_size: Lot step for quantity (0.001)
+        
+        Returns:
+            Adjusted quote that, when rounded, still >= min_entry_quote
+        """
+        try:
+            # Avoid division by zero
+            if not step_size or step_size <= 0 or current_price <= 0:
+                return float(min_entry_quote)
+            
+            from decimal import Decimal, ROUND_UP
+            
+            # Convert to Decimal for precision
+            min_quote = Decimal(str(max(0.0, float(min_entry_quote))))
+            price = Decimal(str(max(0.0001, float(current_price))))
+            step = Decimal(str(max(0.0001, float(step_size))))
+            
+            # qty_raw = min_quote / price
+            qty_raw = min_quote / price
+            
+            # Round UP to next step: ceil(qty_raw / step) * step
+            qty_rounded = (qty_raw / step).to_integral_value(rounding=ROUND_UP) * step
+            
+            # Final adjusted quote
+            adjusted_quote = qty_rounded * price
+            
+            result = float(adjusted_quote)
+            self.logger.debug(
+                "[AdjustQuote] min_entry=%.2f price=%.2f step_size=%.8f -> "
+                "qty_raw=%.8f -> qty_rounded=%.8f -> adjusted_quote=%.2f",
+                float(min_quote), float(price), float(step),
+                float(qty_raw), float(qty_rounded), result
+            )
+            return result
+        except Exception as e:
+            self.logger.debug(f"[AdjustQuote] Error: {e}, returning min_entry as-is")
+            return float(min_entry_quote)
+
     def _extract_filter_vals(self, filters: Dict[str, Any]):
         fs = filters or {}
         # P9 Fix 4: Prefer LOT_SIZE for small capital/micro trading
@@ -3833,6 +7968,7 @@ class ExecutionManager:
         )
 
         return step_size, min_qty, min_notional
+
     async def start(self):
         """
         Minimal start hook so AppContext can warm this component during P5.
@@ -3842,10 +7978,13 @@ class ExecutionManager:
             # Initialize semaphores and heartbeat when loop is available
             self._ensure_semaphores_ready()
             
-            # Start heartbeat task if not already started
+            # Start heartbeat task if not already started (use loop.create_task for safety)
             if self._heartbeat_task is None or self._heartbeat_task.done():
                 try:
-                    self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ExecutionManager:heartbeat")
+                    loop = asyncio.get_running_loop()
+                    self._heartbeat_task = loop.create_task(self._heartbeat_loop(), name="ExecutionManager:heartbeat")
+                except RuntimeError:
+                    pass  # No running loop
                 except Exception as e:
                     self.logger.debug(f"Failed to start heartbeat task: {e}")
             
