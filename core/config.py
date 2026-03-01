@@ -27,6 +27,29 @@ class Config:
     REQUIRED_TIMEFRAMES_FOR_AGENTS = ["1m", "5m"]
     MIN_BARS_FOR_MARKET_READY = 150
     REQUIRED_SYMBOL_COVERAGE_FOR_READY = 0.70
+    # Universe-layer cap (discovery/watchlist breadth). Must stay independent from
+    # position/allocation limits such as MAX_POSITIONS_TOTAL.
+    MAX_UNIVERSE_SYMBOLS = 30
+    MAX_POSITIONS_TOTAL = 2
+    
+    # ---------- Phase 1: Safe Upgrade - Symbol Rotation ----------
+    # Soft bootstrap lock: prevents rotation for duration after trade
+    BOOTSTRAP_SOFT_LOCK_ENABLED = True
+    BOOTSTRAP_SOFT_LOCK_DURATION_SEC = 3600  # 1 hour
+    
+    # Replacement multiplier: score threshold to trigger rotation
+    # e.g., 1.10 means candidate must be 10% better than current to rotate
+    SYMBOL_REPLACEMENT_MULTIPLIER = 1.10
+    
+    # Universe size limits (must fit within discovery cap)
+    MAX_ACTIVE_SYMBOLS = 5       # Do not exceed this many active symbols
+    MIN_ACTIVE_SYMBOLS = 3       # Maintain at least this many
+    
+    # Symbol screener targets (Phase 1 implementation)
+    SCREENER_MIN_PROPOSALS = 20   # Minimum candidates to propose
+    SCREENER_MAX_PROPOSALS = 30   # Maximum candidates to propose
+    SCREENER_MIN_VOLUME = 1000000 # $1M minimum 24h volume
+    SCREENER_MIN_PRICE = 0.01     # Filter dust coins
 
     # ---------- Volatility regime (ATR%) ----------
     VOLATILITY_REGIME_TIMEFRAME = "5m"
@@ -49,30 +72,105 @@ class Config:
     STAGNATION_EXIT_ENABLED = True
     STAGNATION_EXIT_MAX_LOSS_PCT = 0.0002
 
-    # ---------- Min-notional avoidance (NEW) ----------
-    # NOTE: Keep all min-notional knobs aligned via .env:
-    #   MIN_ORDER_USDT, QUOTE_MIN_NOTIONAL, EXECUTION_MIN_NOTIONAL_QUOTE, DUST_MIN_QUOTE_USDT, EXEC_PROBE_QUOTE.
-    #   On Binance spot, use a slight cushion (e.g., 5.10–5.25 USDT) to avoid fee/rounding rejections.
-    MIN_ORDER_USDT = 40.0
-    QUOTE_MIN_NOTIONAL = 40.0
-    EXECUTION_MIN_NOTIONAL_QUOTE = 40.0
+    # ---------- CAPITAL PROFILES (Dynamic NAV-based switching) ----------
+    # P9 Architecture: Profile system maintains integrity while adapting to capital scale
+    # 
+    # The system automatically switches profiles based on Net Asset Value (NAV):
+    # 
+    # BOOTSTRAP_GROWTH (NAV < 500 USDT)
+    #   Objective: Unblock engine, accumulate learning data, enable compounding
+    #   EV Multiplier: 1.4 (permissive gate to unlock alpha)
+    #   Sizing: Adaptive 12-24 USDT (micro capital aware)
+    #   Profit Lock: Disabled (priority = learning)
+    #   Warning: Per-trade PnL will be small. This is expected.
+    #   Goal: Enable market learning, not magical profits.
+    #
+    # INSTITUTIONAL (NAV >= 500 USDT)
+    #   Objective: Proven profitability with discipline
+    #   EV Multiplier: 2.0 (strict gate)
+    #   Sizing: Scales to 30+ USDT (institutional standard)
+    #   Profit Lock: Enabled (harvest earned edge)
+    #   Discipline: Full P9 constraints applied
+    #   Goal: Sustainable long-term compounding
+    
+    CAPITAL_PROFILE_NAV_THRESHOLD = 500.0  # Switch threshold (USDT)
+    
+    # Profile definitions (can be extended for intermediate phases)
+    CAPITAL_PROFILES = {
+        "BOOTSTRAP_GROWTH": {
+            "ev_multiplier": 1.4,
+            "default_planned_quote": 24.0,
+            "min_trade_quote": 12.0,
+            "min_order_usdt": 12.0,
+            "enable_profit_lock": False,
+            "enable_strict_gating": False,
+            "description": "Learning phase: unblock trading, enable compounding",
+        },
+        "INSTITUTIONAL": {
+            "ev_multiplier": 2.0,
+            "default_planned_quote": 30.0,
+            "min_trade_quote": 20.0,
+            "min_order_usdt": 20.0,
+            "enable_profit_lock": True,
+            "enable_strict_gating": True,
+            "description": "Production phase: proven edge, institutional discipline",
+        },
+    }
+    
+    def get_capital_profile(self, nav: float) -> dict:
+        """
+        Dynamically select capital profile based on NAV.
+        
+        Args:
+            nav: Net Asset Value in USDT
+            
+        Returns:
+            Profile dict with EV multiplier, sizing, gates
+        """
+        if nav < self.CAPITAL_PROFILE_NAV_THRESHOLD:
+            profile_name = "BOOTSTRAP_GROWTH"
+        else:
+            profile_name = "INSTITUTIONAL"
+        
+        profile = self.CAPITAL_PROFILES.get(profile_name, self.CAPITAL_PROFILES["BOOTSTRAP_GROWTH"])
+        logger.info(
+            f"[Profile] NAV={nav:.2f} → {profile_name} "
+            f"(EV×{profile['ev_multiplier']}, quote={profile['default_planned_quote']:.0f})"
+        )
+        return profile
+
+    # ---------- Min-notional avoidance (P9 Defaults - profile-overrideable) ----------
+    # NOTE: These are the DEFAULT values for BOOTSTRAP phase.
+    #   When capital < 500: Uses BOOTSTRAP_GROWTH profile (12-24 USDT)
+    #   When capital >= 500: Uses INSTITUTIONAL profile (20-30+ USDT)
+    # 
+    # The get_capital_profile() method dynamically returns appropriate values.
+    MIN_ORDER_USDT = 12.0
+    QUOTE_MIN_NOTIONAL = 12.0
+    EXECUTION_MIN_NOTIONAL_QUOTE = 12.0
     SAFE_ENTRY_USDT = 12.0
     MIN_POSITION_VALUE_USDT = 10.0
-    MIN_POSITION_USDT = 80.0
+    MIN_POSITION_USDT = 24.0
     MIN_POSITION_MIN_NOTIONAL_MULT = 2.0
-    MIN_ENTRY_USDT = 80.0
-    MIN_ENTRY_QUOTE_USDT = 80.0
-    DEFAULT_PLANNED_QUOTE = 80.0
-    EMIT_BUY_QUOTE = 80.0
-    MIN_TRADE_QUOTE = 50.0
+    MIN_ENTRY_USDT = 24.0
+    MIN_ENTRY_QUOTE_USDT = 24.0
+    DEFAULT_PLANNED_QUOTE = 24.0
+    EMIT_BUY_QUOTE = 24.0
+    MIN_TRADE_QUOTE = 12.0
     MAX_TRADE_QUOTE = 250.0
-    MIN_SIGNIFICANT_POSITION_USDT = 25.0
-    EXEC_PROBE_QUOTE = 40.0
+    MIN_SIGNIFICANT_POSITION_USDT = 20.0
+    SIGNIFICANT_POSITION_FLOOR = MIN_SIGNIFICANT_POSITION_USDT
+    EXEC_PROBE_QUOTE = 12.0
+    MAX_HOLD_SEC = 1800.0
     MAX_HOLD_TIME_SEC = 1800.0
     LIQ_ORCH_MIN_USDT_FLOOR = 5.0
     LIQ_ORCH_MIN_USDT_TARGET = 6.0
     DUST_MIN_QUOTE_USDT = 5.0
     DUST_POSITION_QTY = 0.0001
+    PERMANENT_DUST_USDT_THRESHOLD = 1.0
+    STRICT_ACCOUNTING_INTEGRITY = False
+    STRICT_OBSERVABILITY_EVENTS = False
+    CAPITAL_ALLOCATOR_SHARED_WALLET = True
 
     EXIT_EXCURSION_TICK_MULT = 2.0
     EXIT_EXCURSION_ATR_MULT = 0.35
@@ -82,15 +180,99 @@ class Config:
     TP_MIN_BUFFER_BPS = 8.0
     TP_MICRO_NOTIONAL_USDT = 25.0
     TP_MICRO_EXTRA_BPS = 20.0
-    TP_ATR_MULT = 1.0
-    SL_ATR_MULT = 1.1
-    TP_PCT_MIN = 0.0015
-    TP_PCT_MAX = 0.0060
+    TP_ATR_MULT = 1.5  # Increased for RR viability (was 1.0)
+    SL_ATR_MULT = 1.0  # ATR base for SL (was 1.1)
+    TARGET_RR_RATIO = 1.8  # Target risk-reward ratio (TP = RR × SL)
+    TRAILING_ATR_MULT = 1.5
+    TPSL_RV_LOOKBACK = 20
+    TPSL_VOL_LOW_ATR_PCT = 0.0045
+    TPSL_VOL_HIGH_ATR_PCT = 0.0150
+    TPSL_VOL_TARGET_ATR_PCT = 0.0090
+    TPSL_DYNAMIC_RR_MIN = 1.35
+    TPSL_DYNAMIC_RR_MAX = 2.60
+    TRAILING_ACTIVATE_R_MULT = 0.60
+    TPSL_PROFILE = "balanced"
+    TPSL_PROFILE_PRESETS = {
+        "scalp": {
+            "TARGET_RR_RATIO": 1.45,
+            "TP_ATR_MULT": 1.20,
+            "SL_ATR_MULT": 0.95,
+            "TRAILING_ATR_MULT": 1.10,
+            "TPSL_VOL_LOW_ATR_PCT": 0.0035,
+            "TPSL_VOL_HIGH_ATR_PCT": 0.0120,
+            "TPSL_VOL_TARGET_ATR_PCT": 0.0075,
+            "TPSL_DYNAMIC_RR_MIN": 1.20,
+            "TPSL_DYNAMIC_RR_MAX": 2.00,
+            "TP_PCT_MIN": 0.0020,
+            "TP_PCT_MAX": 0.0120,
+            "SL_PCT_MIN": 0.0020,
+            "SL_PCT_MAX": 0.0080,
+            "TRAILING_ACTIVATE_R_MULT": 0.70,
+        },
+        "balanced": {
+            "TARGET_RR_RATIO": 1.80,
+            "TP_ATR_MULT": 1.50,
+            "SL_ATR_MULT": 1.00,
+            "TRAILING_ATR_MULT": 1.50,
+            "TPSL_VOL_LOW_ATR_PCT": 0.0045,
+            "TPSL_VOL_HIGH_ATR_PCT": 0.0150,
+            "TPSL_VOL_TARGET_ATR_PCT": 0.0090,
+            "TPSL_DYNAMIC_RR_MIN": 1.35,
+            "TPSL_DYNAMIC_RR_MAX": 2.60,
+            "TP_PCT_MIN": 0.0030,
+            "TP_PCT_MAX": 0.0200,
+            "SL_PCT_MIN": 0.0030,
+            "SL_PCT_MAX": 0.0100,
+            "TRAILING_ACTIVATE_R_MULT": 0.60,
+        },
+        "swing": {
+            "TARGET_RR_RATIO": 2.20,
+            "TP_ATR_MULT": 1.90,
+            "SL_ATR_MULT": 1.10,
+            "TRAILING_ATR_MULT": 1.90,
+            "TPSL_VOL_LOW_ATR_PCT": 0.0050,
+            "TPSL_VOL_HIGH_ATR_PCT": 0.0180,
+            "TPSL_VOL_TARGET_ATR_PCT": 0.0110,
+            "TPSL_DYNAMIC_RR_MIN": 1.50,
+            "TPSL_DYNAMIC_RR_MAX": 3.00,
+            "TP_PCT_MIN": 0.0040,
+            "TP_PCT_MAX": 0.0250,
+            "SL_PCT_MIN": 0.0040,
+            "SL_PCT_MAX": 0.0120,
+            "TRAILING_ACTIVATE_R_MULT": 0.55,
+        },
+    }
+    TP_PCT_MIN = 0.003  # Increased minimum TP
+    TP_PCT_MAX = 0.020  # Increased maximum TP for asymmetry headroom
+    # Spread-adaptive TP shaping (microstructure-aware TP optimization)
+    TPSL_SPREAD_ADAPTIVE_ENABLED = True
+    TPSL_SPREAD_TIGHT_BPS = 6.0
+    TPSL_SPREAD_HIGH_BPS = 18.0
+    TPSL_SPREAD_EXTREME_BPS = 45.0
+    TPSL_SPREAD_RR_BONUS_MAX = 0.18
+    TPSL_SPREAD_RR_DISCOUNT_MAX = 0.06
+    TPSL_SPREAD_TP_FLOOR_MULT = 2.0
+    # Risk-based position sizing
+    RISK_PCT_PER_TRADE = 0.01  # 1% of equity risk per trade
+    TIER_B_RISK_PCT = 0.005  # 0.5% for micro trades
+    TIER_B_MAX_QUOTE = 40.0  # Max quote for tier B trades
     # Entry economics guards
     MIN_PLANNED_QUOTE_FEE_MULT = 3.0
-    MIN_PROFIT_EXIT_FEE_MULT = 3.5
-    MIN_ECONOMIC_TRADE_USDT = 40.0
+    MIN_PROFIT_EXIT_FEE_MULT = 2.5
+    MIN_ECONOMIC_TRADE_USDT = 30.0
     MIN_NET_PROFIT_AFTER_FEES = 0.004
+    SELL_DYNAMIC_EDGE_GATE_ENABLED = True
+    SELL_DYNAMIC_SLIPPAGE_MIN_PCT = 0.0003
+    SELL_DYNAMIC_SLIPPAGE_ATR_MULT = 0.05
+    SELL_DYNAMIC_VOL_BUFFER_ATR_MULT = 0.15
+    SELL_DYNAMIC_STRATEGIC_BUFFER_PCT = 0.0
+    SELL_DYNAMIC_MIN_USDT_FLOOR = 0.12
+    SELL_DYNAMIC_ATR_TIMEFRAME = "5m"
+    SELL_DYNAMIC_ATR_PERIOD = 14
+    SELL_DYNAMIC_FALLBACK_ATR_PCT = 0.0
+    SELL_DYNAMIC_REGIME_HIGH_MULT = 1.3
+    SELL_DYNAMIC_REGIME_LOW_MULT = 0.8
+    SELL_DYNAMIC_LEGACY_NET_PCT_GUARD = False
     MIN_PORTFOLIO_IMPROVEMENT_USD = 0.05
     MIN_PORTFOLIO_IMPROVEMENT_PCT = 0.0015
     BOOTSTRAP_VETO_COOLDOWN_SEC = 600.0
@@ -102,7 +284,7 @@ class Config:
     # Bootstrap escape hatch: allow ONE trade to bypass kill-switch + min-economic
     # when portfolio is FLAT (cold bootstrap). Auto-disables after first trade.
     BOOTSTRAP_ESCAPE_HATCH_ENABLED = True
-    BUY_COOLDOWN_SEC = 120
+    BUY_COOLDOWN_SEC = 300
     ENTRY_COOLDOWN_SEC = 120
     MAX_OPEN_POSITIONS_PER_SYMBOL = 1
     BUY_REENTRY_MIN_DELTA_PCT = 0.001
@@ -128,6 +310,9 @@ class Config:
     PROFIT_TARGET_COMPOUND_THROTTLE = 0.5   # 50% of excess profit reinvested (rest banked)
     PROFIT_TARGET_BASE_USD_PER_HOUR = 0.0   # 0 = use ratio-based target; >0 overrides
     PROFIT_TARGET_GRACE_MINUTES = 30        # Ignore target enforcement during startup
+    # Grace period to prevent stagnation purges immediately after startup
+    # Units: minutes (default 30 minutes)
+    STARTUP_STAGNATION_GRACE_MINUTES = float(os.getenv("STARTUP_STAGNATION_GRACE_MINUTES", "30"))
     TPSL_PROFIT_AUDIT = True
     TPSL_PROFIT_AUDIT_SEC = 300
     MAX_TRADES_PER_DAY = 0
@@ -206,6 +391,161 @@ class Config:
             "goal": "Prove scalability before automation",
         },
     ]
+
+    # ---------- Compounding growth curve (Phase 1 -> Phase 4) ----------
+    COMPOUNDING_ENABLED = True
+    COMPOUNDING_GROWTH_CURVE_ENABLED = True  # backward-compat alias
+    # Ratio uses: growth_ratio = total_equity / bootstrap_equity
+    GROWTH_PHASE_THRESHOLDS = [
+        {"name": "PHASE_1_SEED", "min_ratio": 0.0, "max_ratio": 1.25},
+        {"name": "PHASE_2_TRACTION", "min_ratio": 1.25, "max_ratio": 1.75},
+        {"name": "PHASE_3_ACCELERATE", "min_ratio": 1.75, "max_ratio": 2.50},
+        {"name": "PHASE_4_SNOWBALL", "min_ratio": 2.50, "max_ratio": None},
+    ]
+    PHASE_SIZE_MULTIPLIERS = {
+        "PHASE_1_SEED": 1.20,
+        "PHASE_2_TRACTION": 1.10,
+        "PHASE_3_ACCELERATE": 1.28,
+        # Phase 4 prioritizes capital defense over further aggression.
+        "PHASE_4_SNOWBALL": 1.12,
+    }
+    PHASE_MAX_TRADE_CAP = {
+        "PHASE_1_SEED": 45.0,
+        "PHASE_2_TRACTION": 140.0,
+        "PHASE_3_ACCELERATE": 210.0,
+        "PHASE_4_SNOWBALL": 180.0,
+    }
+    COMPOUNDING_MAX_DRAWDOWN_PCT = 2.5
+    COMPOUNDING_MIN_POSITIVE_STREAK = 0
+    COMPOUNDING_GROWTH_PHASES = [
+        {
+            "name": "PHASE_1_SEED",
+            "min_equity": 0.0,
+            "max_equity": 249.99,
+            "min_momentum": -9999.0,
+            "quote_mult": 1.20,
+            "risk_mult": 1.20,
+            "min_quote": 25.0,
+            "max_quote": 45.0,
+            "tp_asym_mult": 1.20,
+            "sl_asym_mult": 1.00,
+            "rr_bonus": 0.04,
+        },
+        {
+            "name": "PHASE_2_TRACTION",
+            "min_equity": 250.0,
+            "max_equity": 399.99,
+            "min_momentum": 0.0,
+            "quote_mult": 1.10,
+            "risk_mult": 1.10,
+            "min_quote": 55.0,
+            "max_quote": 140.0,
+            "tp_asym_mult": 1.40,
+            "sl_asym_mult": 0.95,
+            "rr_bonus": 0.12,
+        },
+        {
+            "name": "PHASE_3_ACCELERATE",
+            "min_equity": 400.0,
+            "max_equity": 699.99,
+            "min_momentum": 0.0,
+            "quote_mult": 1.28,
+            "risk_mult": 1.22,
+            "min_quote": 70.0,
+            "max_quote": 210.0,
+            "tp_asym_mult": 1.60,
+            "sl_asym_mult": 0.90,
+            "rr_bonus": 0.22,
+        },
+        {
+            "name": "PHASE_4_SNOWBALL",
+            "min_equity": 700.0,
+            "max_equity": None,
+            "min_momentum": 0.0,
+            "quote_mult": 1.12,
+            "risk_mult": 1.05,
+            "min_quote": 80.0,
+            "max_quote": 180.0,
+            "tp_asym_mult": 1.30,
+            "sl_asym_mult": 0.75,
+            "rr_bonus": 0.10,
+        },
+    ]
+
+    # ---------- Dynamic position sizing ----------
+    DYNAMIC_POSITION_SIZING_ENABLED = True
+    DYNAMIC_SIZE_CONF_FLOOR_MULT = 0.85
+    DYNAMIC_SIZE_CONF_CEIL_MULT = 1.25
+    DYNAMIC_SIZE_VOL_FLOOR_MULT = 0.70
+    DYNAMIC_SIZE_VOL_CEIL_MULT = 1.35
+    DYNAMIC_SIZE_MOMENTUM_MULT = 0.45
+    DYNAMIC_SIZE_BLEND_WEIGHT = 0.65
+    DYNAMIC_SIZE_UPSIDE_CAP_MULT = 2.25
+    DYNAMIC_SIZE_MOMENTUM_LOOKBACK_TRADES = 20
+    DYNAMIC_RISK_BUDGET_PCT = 0.30
+    DYNAMIC_RISK_BUDGET_PCT_TIER_B = 0.10
+    DYNAMIC_CONFIDENCE_MIN = 0.65
+    DYNAMIC_CONFIDENCE_MAX = 0.90
+    STABLE_RISK_BUDGET_ENABLED = True
+    STABLE_RISK_BUDGET_MULT = 1.15
+    STABLE_RISK_MIN_POSITIVE_STREAK = 3
+    STABLE_RISK_MAX_DRAWDOWN_PCT = 1.5
+    ADAPTIVE_CAPITAL_ENGINE_ENABLED = True
+    ADAPTIVE_PERF_REVIEW_SEC = 3600.0
+    ADAPTIVE_RISK_FRACTION_MIN = 0.05
+    ADAPTIVE_RISK_FRACTION_MAX = 0.35
+    ADAPTIVE_DRAWDOWN_SOFT_PCT = 2.0
+    ADAPTIVE_DRAWDOWN_HARD_PCT = 4.0
+    ADAPTIVE_HIGH_VOL_PCT = 0.015
+    ADAPTIVE_LOW_VOL_PCT = 0.004
+    ADAPTIVE_THROUGHPUT_LOW_RATIO = 0.50
+    ADAPTIVE_IDLE_FREE_CAPITAL_PCT = 0.60
+    ADAPTIVE_IDLE_TIME_SEC = 1800.0
+    ADAPTIVE_WIN_STREAK_TRADES = 3
+    ADAPTIVE_LOSS_STREAK_TRADES = 3
+    ADAPTIVE_WIN_STREAK_RISK_BONUS = 0.10
+    ADAPTIVE_LOSS_STREAK_RISK_PENALTY = 0.18
+    ADAPTIVE_WIN_RATE_BONUS_THRESHOLD = 0.60
+    ADAPTIVE_WIN_RATE_PENALTY_THRESHOLD = 0.45
+    ADAPTIVE_WIN_RATE_BONUS = 0.08
+    ADAPTIVE_WIN_RATE_PENALTY = 0.10
+    ADAPTIVE_FEE_GROSS_THRESHOLD = 0.35
+    ADAPTIVE_FEE_GROSS_BONUS = 0.06
+    ADAPTIVE_ECON_MIN_NOTIONAL_MULT = 1.20
+    ADAPTIVE_ECON_TARGET_PROFIT_PCT = 0.004
+    ADAPTIVE_MIN_QUOTE_BUFFER_MULT = 1.20
+
+    # ---------- Stagnation forced rotation ----------
+    STAGNATION_AGE_SEC = 1500.0  # 25m
+    STAGNATION_PNL_THRESHOLD = 0.0030
+    STAGNATION_STREAK_LIMIT = 2
+    STAGNATION_CONTINUATION_MIN_SCORE = 0.65
+    STAGNATION_FORCE_ROTATION_ENABLED = True
+    STAGNATION_FORCE_ROTATION_CONSEC_CYCLES = 2  # backward-compat alias
+    STAGNATION_FORCE_ROTATION_MIN_AGE_MULT = 2.5
+    STAGNATION_FORCE_ROTATION_PNL_BAND = 0.0030  # backward-compat alias
+    STAGNATION_FORCE_ROTATION_SELL_FRACTION = 0.40
+
+    # ---------- TP/SL snowball asymmetry ----------
+    TPSL_SNOWBALL_ASYMMETRY_ENABLED = True
+    TP_PHASE_MULTIPLIERS = {
+        "PHASE_1_SEED": 1.20,
+        "PHASE_2_TRACTION": 1.54,
+        "PHASE_3_ACCELERATE": 1.60,
+        "PHASE_4_SNOWBALL": 1.30,
+    }
+    SL_PHASE_MULTIPLIERS = {
+        "PHASE_1_SEED": 1.00,
+        "PHASE_2_TRACTION": 0.95,
+        "PHASE_3_ACCELERATE": 0.90,
+        "PHASE_4_SNOWBALL": 0.75,
+    }
+    COMPOUNDING_TPSL_PHASE_PROFILES = {
+        "PHASE_1_SEED": {"tp_mult": 1.20, "sl_mult": 1.00, "rr_bonus": 0.04},
+        "PHASE_2_TRACTION": {"tp_mult": 1.54, "sl_mult": 0.95, "rr_bonus": 0.16},
+        "PHASE_3_ACCELERATE": {"tp_mult": 1.60, "sl_mult": 0.90, "rr_bonus": 0.22},
+        "PHASE_4_SNOWBALL": {"tp_mult": 1.30, "sl_mult": 0.75, "rr_bonus": 0.10},
+    }
 
     ALLOW_DEBUG_SYMBOLS: bool = False
     TRENDHUNTER_MIN_DATA = 50
@@ -312,10 +652,58 @@ class Config:
 
         self.BASE_CURRENCY = os.getenv("BASE_CURRENCY", "USDT").upper()
 
+        # ---------- Universe & allocation defaults ----------
+        # Structural separation:
+        # - MAX_UNIVERSE_SYMBOLS controls discovery/watchlist breadth.
+        # - MAX_POSITIONS_TOTAL controls concurrent capital deployment.
+        self.MAX_UNIVERSE_SYMBOLS = int(
+            os.getenv("MAX_UNIVERSE_SYMBOLS", str(getattr(Config, "MAX_UNIVERSE_SYMBOLS", 30)))
+        )
+        if self.MAX_UNIVERSE_SYMBOLS <= 0:
+            self.MAX_UNIVERSE_SYMBOLS = int(getattr(Config, "MAX_UNIVERSE_SYMBOLS", 30))
+        # Legacy aliases kept for compatibility with existing modules.
+        self.discovery_top_n_symbols = int(
+            os.getenv("DISCOVERY_TOP_N_SYMBOLS", str(self.MAX_UNIVERSE_SYMBOLS))
+        )
+        self.MAX_ACTIVE_SYMBOLS = int(
+            os.getenv("MAX_ACTIVE_SYMBOLS", str(self.MAX_UNIVERSE_SYMBOLS))
+        )
+        self.MAX_POSITIONS_TOTAL = int(
+            os.getenv("MAX_POSITIONS_TOTAL", str(getattr(Config, "MAX_POSITIONS_TOTAL", 2)))
+        )
+        if self.MAX_POSITIONS_TOTAL <= 0:
+            self.MAX_POSITIONS_TOTAL = int(getattr(Config, "MAX_POSITIONS_TOTAL", 2))
+
+        # ---------- Phase 1: Safe Upgrade - Symbol Rotation ----------
+        self.BOOTSTRAP_SOFT_LOCK_ENABLED = os.getenv("BOOTSTRAP_SOFT_LOCK_ENABLED", "true").lower() == "true"
+        self.BOOTSTRAP_SOFT_LOCK_DURATION_SEC = int(
+            os.getenv("BOOTSTRAP_SOFT_LOCK_DURATION_SEC", "3600")
+        )
+        self.SYMBOL_REPLACEMENT_MULTIPLIER = float(
+            os.getenv("SYMBOL_REPLACEMENT_MULTIPLIER", "1.10")
+        )
+        self.MIN_ACTIVE_SYMBOLS = int(
+            os.getenv("MIN_ACTIVE_SYMBOLS", "3")
+        )
+        
+        # Symbol screener (Phase 1)
+        self.SCREENER_MIN_PROPOSALS = int(
+            os.getenv("SCREENER_MIN_PROPOSALS", "20")
+        )
+        self.SCREENER_MAX_PROPOSALS = int(
+            os.getenv("SCREENER_MAX_PROPOSALS", "30")
+        )
+        self.SCREENER_MIN_VOLUME = float(
+            os.getenv("SCREENER_MIN_VOLUME", "1000000")
+        )
+        self.SCREENER_MIN_PRICE = float(
+            os.getenv("SCREENER_MIN_PRICE", "0.01")
+        )
+
         # Dynamic Symbol Discovery Settings
         self.DISCOVERY = SimpleNamespace(
-            # Default to top 10 by volume if not specified (Phase 1 minimal fix)
-            TOP_N_SYMBOLS=int(os.getenv("DISCOVERY_TOP_N_SYMBOLS", "10")),
+            # Discovery breadth is decoupled from allocation limits.
+            TOP_N_SYMBOLS=int(os.getenv("DISCOVERY_TOP_N_SYMBOLS", str(self.MAX_UNIVERSE_SYMBOLS))),
             ACCEPT_NEW_SYMBOLS=os.getenv("DISCOVERY_ACCEPT_NEW_SYMBOLS", "true").lower() == "true",
             MIN_24H_VOL=float(os.getenv("MIN_TRADE_VOLUME", "100000.0")),
             # Dynamic blacklist for leveraged/ETP tokens
@@ -356,6 +744,297 @@ class Config:
             str(Config.EQUITY_TIER_USE_REALIZED_ONLY)
         ).lower() == "true"
         self.SCALING_EQUITY_TIERS = Config.SCALING_EQUITY_TIERS
+
+        # ---------- Compounding growth curve (Phase 1 -> Phase 4) ----------
+        self.COMPOUNDING_ENABLED = os.getenv(
+            "COMPOUNDING_ENABLED",
+            str(Config.COMPOUNDING_ENABLED),
+        ).lower() == "true"
+        # Backward-compatible alias for old flag consumers.
+        self.COMPOUNDING_GROWTH_CURVE_ENABLED = os.getenv(
+            "COMPOUNDING_GROWTH_CURVE_ENABLED",
+            str(self.COMPOUNDING_ENABLED and Config.COMPOUNDING_GROWTH_CURVE_ENABLED),
+        ).lower() == "true"
+
+        growth_json = os.getenv("COMPOUNDING_GROWTH_PHASES_JSON", "").strip()
+        if growth_json:
+            try:
+                parsed = json.loads(growth_json)
+                self.COMPOUNDING_GROWTH_PHASES = parsed if isinstance(parsed, list) and parsed else Config.COMPOUNDING_GROWTH_PHASES
+            except Exception:
+                self.COMPOUNDING_GROWTH_PHASES = Config.COMPOUNDING_GROWTH_PHASES
+        else:
+            self.COMPOUNDING_GROWTH_PHASES = Config.COMPOUNDING_GROWTH_PHASES
+
+        thresholds_json = os.getenv("GROWTH_PHASE_THRESHOLDS_JSON", "").strip()
+        if thresholds_json:
+            try:
+                parsed_thresholds = json.loads(thresholds_json)
+                self.GROWTH_PHASE_THRESHOLDS = parsed_thresholds if isinstance(parsed_thresholds, list) and parsed_thresholds else Config.GROWTH_PHASE_THRESHOLDS
+            except Exception:
+                self.GROWTH_PHASE_THRESHOLDS = Config.GROWTH_PHASE_THRESHOLDS
+        else:
+            self.GROWTH_PHASE_THRESHOLDS = Config.GROWTH_PHASE_THRESHOLDS
+
+        size_map_json = os.getenv("PHASE_SIZE_MULTIPLIERS_JSON", "").strip()
+        if size_map_json:
+            try:
+                parsed_size = json.loads(size_map_json)
+                self.PHASE_SIZE_MULTIPLIERS = parsed_size if isinstance(parsed_size, dict) and parsed_size else Config.PHASE_SIZE_MULTIPLIERS
+            except Exception:
+                self.PHASE_SIZE_MULTIPLIERS = Config.PHASE_SIZE_MULTIPLIERS
+        else:
+            self.PHASE_SIZE_MULTIPLIERS = Config.PHASE_SIZE_MULTIPLIERS
+
+        phase_cap_json = os.getenv("PHASE_MAX_TRADE_CAP_JSON", "").strip()
+        if phase_cap_json:
+            try:
+                parsed_cap = json.loads(phase_cap_json)
+                self.PHASE_MAX_TRADE_CAP = parsed_cap if isinstance(parsed_cap, dict) and parsed_cap else Config.PHASE_MAX_TRADE_CAP
+            except Exception:
+                self.PHASE_MAX_TRADE_CAP = Config.PHASE_MAX_TRADE_CAP
+        else:
+            self.PHASE_MAX_TRADE_CAP = Config.PHASE_MAX_TRADE_CAP
+
+        self.COMPOUNDING_MAX_DRAWDOWN_PCT = float(
+            os.getenv(
+                "COMPOUNDING_MAX_DRAWDOWN_PCT",
+                str(Config.COMPOUNDING_MAX_DRAWDOWN_PCT),
+            )
+        )
+        self.COMPOUNDING_MIN_POSITIVE_STREAK = int(
+            os.getenv(
+                "COMPOUNDING_MIN_POSITIVE_STREAK",
+                str(Config.COMPOUNDING_MIN_POSITIVE_STREAK),
+            )
+        )
+
+        # ---------- Dynamic position sizing ----------
+        self.DYNAMIC_POSITION_SIZING_ENABLED = os.getenv(
+            "DYNAMIC_POSITION_SIZING_ENABLED",
+            str(Config.DYNAMIC_POSITION_SIZING_ENABLED),
+        ).lower() == "true"
+        self.DYNAMIC_SIZE_CONF_FLOOR_MULT = float(
+            os.getenv("DYNAMIC_SIZE_CONF_FLOOR_MULT", str(Config.DYNAMIC_SIZE_CONF_FLOOR_MULT))
+        )
+        self.DYNAMIC_SIZE_CONF_CEIL_MULT = float(
+            os.getenv("DYNAMIC_SIZE_CONF_CEIL_MULT", str(Config.DYNAMIC_SIZE_CONF_CEIL_MULT))
+        )
+        self.DYNAMIC_SIZE_VOL_FLOOR_MULT = float(
+            os.getenv("DYNAMIC_SIZE_VOL_FLOOR_MULT", str(Config.DYNAMIC_SIZE_VOL_FLOOR_MULT))
+        )
+        self.DYNAMIC_SIZE_VOL_CEIL_MULT = float(
+            os.getenv("DYNAMIC_SIZE_VOL_CEIL_MULT", str(Config.DYNAMIC_SIZE_VOL_CEIL_MULT))
+        )
+        self.DYNAMIC_SIZE_MOMENTUM_MULT = float(
+            os.getenv("DYNAMIC_SIZE_MOMENTUM_MULT", str(Config.DYNAMIC_SIZE_MOMENTUM_MULT))
+        )
+        self.DYNAMIC_SIZE_BLEND_WEIGHT = float(
+            os.getenv("DYNAMIC_SIZE_BLEND_WEIGHT", str(Config.DYNAMIC_SIZE_BLEND_WEIGHT))
+        )
+        self.DYNAMIC_SIZE_UPSIDE_CAP_MULT = float(
+            os.getenv("DYNAMIC_SIZE_UPSIDE_CAP_MULT", str(Config.DYNAMIC_SIZE_UPSIDE_CAP_MULT))
+        )
+        self.DYNAMIC_SIZE_MOMENTUM_LOOKBACK_TRADES = int(
+            os.getenv(
+                "DYNAMIC_SIZE_MOMENTUM_LOOKBACK_TRADES",
+                str(Config.DYNAMIC_SIZE_MOMENTUM_LOOKBACK_TRADES),
+            )
+        )
+        self.DYNAMIC_RISK_BUDGET_PCT = float(
+            os.getenv("DYNAMIC_RISK_BUDGET_PCT", str(Config.DYNAMIC_RISK_BUDGET_PCT))
+        )
+        self.DYNAMIC_RISK_BUDGET_PCT_TIER_B = float(
+            os.getenv("DYNAMIC_RISK_BUDGET_PCT_TIER_B", str(Config.DYNAMIC_RISK_BUDGET_PCT_TIER_B))
+        )
+        self.DYNAMIC_CONFIDENCE_MIN = float(
+            os.getenv("DYNAMIC_CONFIDENCE_MIN", str(Config.DYNAMIC_CONFIDENCE_MIN))
+        )
+        self.DYNAMIC_CONFIDENCE_MAX = float(
+            os.getenv("DYNAMIC_CONFIDENCE_MAX", str(Config.DYNAMIC_CONFIDENCE_MAX))
+        )
+        self.MIN_EXECUTION_CONFIDENCE = float(
+            os.getenv("MIN_EXECUTION_CONFIDENCE", "0.6")
+        )
+        self.MIN_SIGNAL_CONF = float(
+            os.getenv("MIN_SIGNAL_CONF", "0.5")
+        )
+        self.STABLE_RISK_BUDGET_ENABLED = os.getenv(
+            "STABLE_RISK_BUDGET_ENABLED",
+            str(Config.STABLE_RISK_BUDGET_ENABLED),
+        ).lower() == "true"
+        self.STABLE_RISK_BUDGET_MULT = float(
+            os.getenv("STABLE_RISK_BUDGET_MULT", str(Config.STABLE_RISK_BUDGET_MULT))
+        )
+        self.STABLE_RISK_MIN_POSITIVE_STREAK = int(
+            os.getenv(
+                "STABLE_RISK_MIN_POSITIVE_STREAK",
+                str(Config.STABLE_RISK_MIN_POSITIVE_STREAK),
+            )
+        )
+        self.STABLE_RISK_MAX_DRAWDOWN_PCT = float(
+            os.getenv(
+                "STABLE_RISK_MAX_DRAWDOWN_PCT",
+                str(Config.STABLE_RISK_MAX_DRAWDOWN_PCT),
+            )
+        )
+        self.ADAPTIVE_CAPITAL_ENGINE_ENABLED = os.getenv(
+            "ADAPTIVE_CAPITAL_ENGINE_ENABLED",
+            str(Config.ADAPTIVE_CAPITAL_ENGINE_ENABLED),
+        ).lower() == "true"
+        self.ADAPTIVE_PERF_REVIEW_SEC = float(
+            os.getenv("ADAPTIVE_PERF_REVIEW_SEC", str(Config.ADAPTIVE_PERF_REVIEW_SEC))
+        )
+        self.ADAPTIVE_RISK_FRACTION_MIN = float(
+            os.getenv("ADAPTIVE_RISK_FRACTION_MIN", str(Config.ADAPTIVE_RISK_FRACTION_MIN))
+        )
+        self.ADAPTIVE_RISK_FRACTION_MAX = float(
+            os.getenv("ADAPTIVE_RISK_FRACTION_MAX", str(Config.ADAPTIVE_RISK_FRACTION_MAX))
+        )
+        self.ADAPTIVE_DRAWDOWN_SOFT_PCT = float(
+            os.getenv("ADAPTIVE_DRAWDOWN_SOFT_PCT", str(Config.ADAPTIVE_DRAWDOWN_SOFT_PCT))
+        )
+        self.ADAPTIVE_DRAWDOWN_HARD_PCT = float(
+            os.getenv("ADAPTIVE_DRAWDOWN_HARD_PCT", str(Config.ADAPTIVE_DRAWDOWN_HARD_PCT))
+        )
+        self.ADAPTIVE_HIGH_VOL_PCT = float(
+            os.getenv("ADAPTIVE_HIGH_VOL_PCT", str(Config.ADAPTIVE_HIGH_VOL_PCT))
+        )
+        self.ADAPTIVE_LOW_VOL_PCT = float(
+            os.getenv("ADAPTIVE_LOW_VOL_PCT", str(Config.ADAPTIVE_LOW_VOL_PCT))
+        )
+        self.ADAPTIVE_THROUGHPUT_LOW_RATIO = float(
+            os.getenv("ADAPTIVE_THROUGHPUT_LOW_RATIO", str(Config.ADAPTIVE_THROUGHPUT_LOW_RATIO))
+        )
+        self.ADAPTIVE_IDLE_FREE_CAPITAL_PCT = float(
+            os.getenv("ADAPTIVE_IDLE_FREE_CAPITAL_PCT", str(Config.ADAPTIVE_IDLE_FREE_CAPITAL_PCT))
+        )
+        self.ADAPTIVE_IDLE_TIME_SEC = float(
+            os.getenv("ADAPTIVE_IDLE_TIME_SEC", str(Config.ADAPTIVE_IDLE_TIME_SEC))
+        )
+        self.ADAPTIVE_WIN_STREAK_TRADES = int(
+            os.getenv("ADAPTIVE_WIN_STREAK_TRADES", str(Config.ADAPTIVE_WIN_STREAK_TRADES))
+        )
+        self.ADAPTIVE_LOSS_STREAK_TRADES = int(
+            os.getenv("ADAPTIVE_LOSS_STREAK_TRADES", str(Config.ADAPTIVE_LOSS_STREAK_TRADES))
+        )
+        self.ADAPTIVE_WIN_STREAK_RISK_BONUS = float(
+            os.getenv("ADAPTIVE_WIN_STREAK_RISK_BONUS", str(Config.ADAPTIVE_WIN_STREAK_RISK_BONUS))
+        )
+        self.ADAPTIVE_LOSS_STREAK_RISK_PENALTY = float(
+            os.getenv("ADAPTIVE_LOSS_STREAK_RISK_PENALTY", str(Config.ADAPTIVE_LOSS_STREAK_RISK_PENALTY))
+        )
+        self.ADAPTIVE_WIN_RATE_BONUS_THRESHOLD = float(
+            os.getenv("ADAPTIVE_WIN_RATE_BONUS_THRESHOLD", str(Config.ADAPTIVE_WIN_RATE_BONUS_THRESHOLD))
+        )
+        self.ADAPTIVE_WIN_RATE_PENALTY_THRESHOLD = float(
+            os.getenv("ADAPTIVE_WIN_RATE_PENALTY_THRESHOLD", str(Config.ADAPTIVE_WIN_RATE_PENALTY_THRESHOLD))
+        )
+        self.ADAPTIVE_WIN_RATE_BONUS = float(
+            os.getenv("ADAPTIVE_WIN_RATE_BONUS", str(Config.ADAPTIVE_WIN_RATE_BONUS))
+        )
+        self.ADAPTIVE_WIN_RATE_PENALTY = float(
+            os.getenv("ADAPTIVE_WIN_RATE_PENALTY", str(Config.ADAPTIVE_WIN_RATE_PENALTY))
+        )
+        self.ADAPTIVE_FEE_GROSS_THRESHOLD = float(
+            os.getenv("ADAPTIVE_FEE_GROSS_THRESHOLD", str(Config.ADAPTIVE_FEE_GROSS_THRESHOLD))
+        )
+        self.ADAPTIVE_FEE_GROSS_BONUS = float(
+            os.getenv("ADAPTIVE_FEE_GROSS_BONUS", str(Config.ADAPTIVE_FEE_GROSS_BONUS))
+        )
+        self.ADAPTIVE_ECON_MIN_NOTIONAL_MULT = float(
+            os.getenv("ADAPTIVE_ECON_MIN_NOTIONAL_MULT", str(Config.ADAPTIVE_ECON_MIN_NOTIONAL_MULT))
+        )
+        self.ADAPTIVE_ECON_TARGET_PROFIT_PCT = float(
+            os.getenv("ADAPTIVE_ECON_TARGET_PROFIT_PCT", str(Config.ADAPTIVE_ECON_TARGET_PROFIT_PCT))
+        )
+        self.ADAPTIVE_MIN_QUOTE_BUFFER_MULT = float(
+            os.getenv("ADAPTIVE_MIN_QUOTE_BUFFER_MULT", str(Config.ADAPTIVE_MIN_QUOTE_BUFFER_MULT))
+        )
+
+        # ---------- Stagnation forced rotation ----------
+        self.STAGNATION_FORCE_ROTATION_ENABLED = os.getenv(
+            "STAGNATION_FORCE_ROTATION_ENABLED",
+            str(Config.STAGNATION_FORCE_ROTATION_ENABLED),
+        ).lower() == "true"
+        self.STAGNATION_AGE_SEC = float(
+            os.getenv("STAGNATION_AGE_SEC", str(Config.STAGNATION_AGE_SEC))
+        )
+        self.STAGNATION_PNL_THRESHOLD = float(
+            os.getenv("STAGNATION_PNL_THRESHOLD", str(Config.STAGNATION_PNL_THRESHOLD))
+        )
+        self.STAGNATION_STREAK_LIMIT = int(
+            os.getenv("STAGNATION_STREAK_LIMIT", str(Config.STAGNATION_STREAK_LIMIT))
+        )
+        self.STAGNATION_CONTINUATION_MIN_SCORE = float(
+            os.getenv(
+                "STAGNATION_CONTINUATION_MIN_SCORE",
+                str(Config.STAGNATION_CONTINUATION_MIN_SCORE),
+            )
+        )
+        self.STAGNATION_FORCE_ROTATION_CONSEC_CYCLES = int(
+            os.getenv(
+                "STAGNATION_FORCE_ROTATION_CONSEC_CYCLES",
+                str(self.STAGNATION_STREAK_LIMIT or Config.STAGNATION_FORCE_ROTATION_CONSEC_CYCLES),
+            )
+        )
+        self.STAGNATION_FORCE_ROTATION_MIN_AGE_MULT = float(
+            os.getenv(
+                "STAGNATION_FORCE_ROTATION_MIN_AGE_MULT",
+                str(Config.STAGNATION_FORCE_ROTATION_MIN_AGE_MULT),
+            )
+        )
+        self.STAGNATION_FORCE_ROTATION_PNL_BAND = float(
+            os.getenv(
+                "STAGNATION_FORCE_ROTATION_PNL_BAND",
+                str(self.STAGNATION_PNL_THRESHOLD or Config.STAGNATION_FORCE_ROTATION_PNL_BAND),
+            )
+        )
+        self.STAGNATION_FORCE_ROTATION_SELL_FRACTION = float(
+            os.getenv(
+                "STAGNATION_FORCE_ROTATION_SELL_FRACTION",
+                str(Config.STAGNATION_FORCE_ROTATION_SELL_FRACTION),
+            )
+        )
+
+        # ---------- TP/SL snowball asymmetry ----------
+        self.TPSL_SNOWBALL_ASYMMETRY_ENABLED = os.getenv(
+            "TPSL_SNOWBALL_ASYMMETRY_ENABLED",
+            str(Config.TPSL_SNOWBALL_ASYMMETRY_ENABLED),
+        ).lower() == "true"
+
+        tp_map_json = os.getenv("TP_PHASE_MULTIPLIERS_JSON", "").strip()
+        if tp_map_json:
+            try:
+                parsed_tp_map = json.loads(tp_map_json)
+                self.TP_PHASE_MULTIPLIERS = parsed_tp_map if isinstance(parsed_tp_map, dict) and parsed_tp_map else Config.TP_PHASE_MULTIPLIERS
+            except Exception:
+                self.TP_PHASE_MULTIPLIERS = Config.TP_PHASE_MULTIPLIERS
+        else:
+            self.TP_PHASE_MULTIPLIERS = Config.TP_PHASE_MULTIPLIERS
+
+        sl_map_json = os.getenv("SL_PHASE_MULTIPLIERS_JSON", "").strip()
+        if sl_map_json:
+            try:
+                parsed_sl_map = json.loads(sl_map_json)
+                self.SL_PHASE_MULTIPLIERS = parsed_sl_map if isinstance(parsed_sl_map, dict) and parsed_sl_map else Config.SL_PHASE_MULTIPLIERS
+            except Exception:
+                self.SL_PHASE_MULTIPLIERS = Config.SL_PHASE_MULTIPLIERS
+        else:
+            self.SL_PHASE_MULTIPLIERS = Config.SL_PHASE_MULTIPLIERS
+
+        tpsl_profiles_json = os.getenv("COMPOUNDING_TPSL_PHASE_PROFILES_JSON", "").strip()
+        if tpsl_profiles_json:
+            try:
+                parsed_profiles = json.loads(tpsl_profiles_json)
+                if isinstance(parsed_profiles, dict) and parsed_profiles:
+                    self.COMPOUNDING_TPSL_PHASE_PROFILES = parsed_profiles
+                else:
+                    self.COMPOUNDING_TPSL_PHASE_PROFILES = Config.COMPOUNDING_TPSL_PHASE_PROFILES
+            except Exception:
+                self.COMPOUNDING_TPSL_PHASE_PROFILES = Config.COMPOUNDING_TPSL_PHASE_PROFILES
+        else:
+            self.COMPOUNDING_TPSL_PHASE_PROFILES = Config.COMPOUNDING_TPSL_PHASE_PROFILES
 
         # ---- Small-cap profile (auto-on for <= $250 unless overridden) ----
         _small_cap_env = os.getenv("SMALL_CAP_PROFILE")
@@ -399,6 +1078,13 @@ class Config:
         self.MIN_SIGNIFICANT_POSITION_USDT = float(
             os.getenv("MIN_SIGNIFICANT_POSITION_USDT", str(Config.MIN_SIGNIFICANT_POSITION_USDT))
         )
+        self.SIGNIFICANT_POSITION_FLOOR = float(
+            os.getenv("SIGNIFICANT_POSITION_FLOOR", str(self.MIN_SIGNIFICANT_POSITION_USDT))
+        )
+        if self.SIGNIFICANT_POSITION_FLOOR <= 0:
+            self.SIGNIFICANT_POSITION_FLOOR = float(self.MIN_SIGNIFICANT_POSITION_USDT)
+        # Keep legacy key aligned with canonical significant floor.
+        self.MIN_SIGNIFICANT_POSITION_USDT = float(self.SIGNIFICANT_POSITION_FLOOR)
         if self.MAX_TRADE_QUOTE and self.MAX_TRADE_QUOTE < self.MIN_TRADE_QUOTE:
             logger.warning(
                 "MAX_TRADE_QUOTE (%.2f) < MIN_TRADE_QUOTE (%.2f). Bumping max to min.",
@@ -414,6 +1100,7 @@ class Config:
             )
             self.MIN_ENTRY_USDT = float(self.MIN_POSITION_USDT)
         self.MAX_HOLD_TIME_SEC = float(os.getenv("MAX_HOLD_TIME_SEC", str(Config.MAX_HOLD_TIME_SEC)))
+        self.MAX_HOLD_SEC = float(os.getenv("MAX_HOLD_SEC", str(self.MAX_HOLD_TIME_SEC)))
         self.EXIT_EXCURSION_TICK_MULT = float(os.getenv("EXIT_EXCURSION_TICK_MULT", str(Config.EXIT_EXCURSION_TICK_MULT)))
         self.EXIT_EXCURSION_ATR_MULT = float(os.getenv("EXIT_EXCURSION_ATR_MULT", str(Config.EXIT_EXCURSION_ATR_MULT)))
         self.EXIT_EXCURSION_SPREAD_MULT = float(os.getenv("EXIT_EXCURSION_SPREAD_MULT", str(Config.EXIT_EXCURSION_SPREAD_MULT)))
@@ -432,6 +1119,19 @@ class Config:
         self.MIN_PORTFOLIO_IMPROVEMENT_USD = float(os.getenv("MIN_PORTFOLIO_IMPROVEMENT_USD", str(Config.MIN_PORTFOLIO_IMPROVEMENT_USD)))
         self.MIN_PORTFOLIO_IMPROVEMENT_PCT = float(os.getenv("MIN_PORTFOLIO_IMPROVEMENT_PCT", str(Config.MIN_PORTFOLIO_IMPROVEMENT_PCT)))
         self.BOOTSTRAP_VETO_COOLDOWN_SEC = float(os.getenv("BOOTSTRAP_VETO_COOLDOWN_SEC", str(Config.BOOTSTRAP_VETO_COOLDOWN_SEC)))
+        self.CAPITAL_ALLOCATOR_SHARED_WALLET = str(
+            os.getenv("CAPITAL_ALLOCATOR_SHARED_WALLET", str(Config.CAPITAL_ALLOCATOR_SHARED_WALLET))
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        # Medium-acceleration guardrail:
+        # If dynamic risk budget is elevated, keep floors aligned so planned quote can express 30-45 USDT sizing.
+        if float(self.DYNAMIC_RISK_BUDGET_PCT or 0.0) >= 0.20:
+            self.MIN_ENTRY_QUOTE_USDT = min(float(self.MIN_ENTRY_QUOTE_USDT), 30.0)
+            self.DEFAULT_PLANNED_QUOTE = min(float(self.DEFAULT_PLANNED_QUOTE), 30.0)
+            self.MIN_TRADE_QUOTE = min(float(self.MIN_TRADE_QUOTE), 20.0)
+            self.MIN_ECONOMIC_TRADE_USDT = min(float(self.MIN_ECONOMIC_TRADE_USDT), 30.0)
+            self.MIN_ORDER_USDT = min(float(self.MIN_ORDER_USDT), 20.0)
+
         self.MICRO_TRADE_KILL_SWITCH_ENABLED = os.getenv(
             "MICRO_TRADE_KILL_SWITCH_ENABLED",
             str(Config.MICRO_TRADE_KILL_SWITCH_ENABLED)
@@ -468,6 +1168,7 @@ class Config:
         # IMPORTANT: fallback remains small-account friendly (5.0). Override via .env as needed.
         self.DUST_MIN_QUOTE_USDT = float(os.getenv("DUST_MIN_QUOTE_USDT", str(Config.DUST_MIN_QUOTE_USDT)))
         self.DUST_POSITION_QTY = float(os.getenv("DUST_POSITION_QTY", str(Config.DUST_POSITION_QTY)))
+        self.PERMANENT_DUST_USDT_THRESHOLD = float(os.getenv("PERMANENT_DUST_USDT_THRESHOLD", str(Config.PERMANENT_DUST_USDT_THRESHOLD)))
 
         # Ensure dust controls exist (some logs assume these attributes)
         self.DUST_LIQUIDATION_ENABLED = os.getenv("DUST_LIQUIDATION_ENABLED", "false").lower() == "true"
@@ -495,6 +1196,7 @@ class Config:
         self.ML_MIN_CONF_EMIT_SELL = float(os.getenv("ML_MIN_CONF_EMIT_SELL", str(self.SELL_MIN_CONF)))
         self.ML_GOOD_CONF = float(os.getenv("ML_GOOD_CONF", "0.65"))
         self.ML_STRONG_CONF = float(os.getenv("ML_STRONG_CONF", "0.75"))
+        self.ML_CONF_BACKTEST_ON_STARTUP = os.getenv("ML_CONF_BACKTEST_ON_STARTUP", "true").lower() == "true"
 
         self.TREND_MIN_CONF = float(os.getenv("TREND_MIN_CONF", "0.60"))
         self.TREND_MIN_CONF_SELL = float(os.getenv("TREND_MIN_CONF_SELL", str(self.SELL_MIN_CONF)))
@@ -511,9 +1213,16 @@ class Config:
             "COLD_BOOTSTRAP_BLOCK,PORTFOLIO_FULL",
         )
 
+        # ---------- Global Economic Thresholds ----------
+        self.CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.75"))
+        self.ARBITRAGE_THRESHOLD = float(os.getenv("ARBITRAGE_THRESHOLD", "0.002"))
+        self.DUST_EXIT_THRESHOLD = float(os.getenv("DUST_EXIT_THRESHOLD", "0.60"))
+        self.SFA_SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SFA_SIGNAL_CONFIDENCE_THRESHOLD", "0.60"))
+        self.TIER_A_CONFIDENCE_THRESHOLD = float(os.getenv("TIER_A_CONFIDENCE_THRESHOLD", "0.75"))
+
         # ---------- MetaController Execution (Phase A) ----------
         self.META_MIN_AGENTS = int(os.getenv("META_MIN_AGENTS", "1"))
-        self.META_MIN_CONF = float(os.getenv("META_MIN_CONF", "0.70"))
+        self.META_MIN_CONF = float(os.getenv("META_MIN_CONF", "0.75"))
         self.MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "8"))
         self.MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", str(Config.MAX_TRADES_PER_DAY)))
         self.MAX_TRADES_PER_SYMBOL_PER_HOUR = int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_HOUR", "2"))
@@ -531,13 +1240,89 @@ class Config:
         self.MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.02"))
         self.BASE_MIN_NOTIONAL = float(os.getenv("BASE_MIN_NOTIONAL", "5.0"))
         self.SCOUT_MIN_NOTIONAL = float(os.getenv("SCOUT_MIN_NOTIONAL", "6.0"))
+        self.MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "10.0"))
+        self.MAX_DAILY_LOSS_PCT = float(
+            os.getenv("MAX_DAILY_LOSS_PCT", os.getenv("MAX_DAILY_LOSS", "0.10"))
+        )
+        self.MAX_POSITION_EXPOSURE_PCT = float(
+            os.getenv(
+                "MAX_POSITION_EXPOSURE_PCT",
+                os.getenv(
+                    "MAX_POSITION_EXPOSURE_PERCENTAGE",
+                    os.getenv("MAX_SYMBOL_EXPOSURE", "0.20"),
+                ),
+            )
+        )
+        self.MAX_POSITION_EXPOSURE_PERCENTAGE = float(self.MAX_POSITION_EXPOSURE_PCT)
+        self.MAX_TOTAL_EXPOSURE_PCT = float(
+            os.getenv(
+                "MAX_TOTAL_EXPOSURE_PCT",
+                os.getenv(
+                    "MAX_TOTAL_EXPOSURE_PERCENTAGE",
+                    os.getenv("MAX_PORTFOLIO_EXPOSURE", "0.60"),
+                ),
+            )
+        )
+        self.MAX_TOTAL_EXPOSURE_PERCENTAGE = float(self.MAX_TOTAL_EXPOSURE_PCT)
+        _env_exec_reserve = float(os.getenv("EXECUTION_MIN_FREE_RESERVE_USDT", "0.0") or 0.0)
+        _env_liq_buffer = float(os.getenv("MIN_LIQUIDITY_BUFFER", str(_env_exec_reserve)) or _env_exec_reserve)
+        self.MIN_LIQUIDITY_BUFFER = float(max(_env_exec_reserve, _env_liq_buffer))
+        self.EXECUTION_MIN_FREE_RESERVE_USDT = float(max(_env_exec_reserve, self.MIN_LIQUIDITY_BUFFER))
 
-        self.TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.0"))
-        self.SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.1"))
+        self.TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", str(Config.TP_ATR_MULT)))
+        self.SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", str(Config.SL_ATR_MULT)))
+        self.TARGET_RR_RATIO = float(os.getenv("TARGET_RR_RATIO", str(Config.TARGET_RR_RATIO)))
+        self.TRAILING_ATR_MULT = float(os.getenv("TRAILING_ATR_MULT", str(Config.TRAILING_ATR_MULT)))
+        self.TPSL_RV_LOOKBACK = int(os.getenv("TPSL_RV_LOOKBACK", str(Config.TPSL_RV_LOOKBACK)))
+        self.TPSL_VOL_LOW_ATR_PCT = float(os.getenv("TPSL_VOL_LOW_ATR_PCT", str(Config.TPSL_VOL_LOW_ATR_PCT)))
+        self.TPSL_VOL_HIGH_ATR_PCT = float(os.getenv("TPSL_VOL_HIGH_ATR_PCT", str(Config.TPSL_VOL_HIGH_ATR_PCT)))
+        self.TPSL_VOL_TARGET_ATR_PCT = float(os.getenv("TPSL_VOL_TARGET_ATR_PCT", str(Config.TPSL_VOL_TARGET_ATR_PCT)))
+        self.TPSL_DYNAMIC_RR_MIN = float(os.getenv("TPSL_DYNAMIC_RR_MIN", str(Config.TPSL_DYNAMIC_RR_MIN)))
+        self.TPSL_DYNAMIC_RR_MAX = float(os.getenv("TPSL_DYNAMIC_RR_MAX", str(Config.TPSL_DYNAMIC_RR_MAX)))
+        self.TRAILING_ACTIVATE_R_MULT = float(os.getenv("TRAILING_ACTIVATE_R_MULT", str(Config.TRAILING_ACTIVATE_R_MULT)))
+        self.TPSL_PROFILE = str(os.getenv("TPSL_PROFILE", str(Config.TPSL_PROFILE))).strip().lower()
+        self.TPSL_SPREAD_ADAPTIVE_ENABLED = os.getenv(
+            "TPSL_SPREAD_ADAPTIVE_ENABLED",
+            str(Config.TPSL_SPREAD_ADAPTIVE_ENABLED),
+        ).lower() == "true"
+        self.TPSL_SPREAD_TIGHT_BPS = float(
+            os.getenv("TPSL_SPREAD_TIGHT_BPS", str(Config.TPSL_SPREAD_TIGHT_BPS))
+        )
+        self.TPSL_SPREAD_HIGH_BPS = float(
+            os.getenv("TPSL_SPREAD_HIGH_BPS", str(Config.TPSL_SPREAD_HIGH_BPS))
+        )
+        self.TPSL_SPREAD_EXTREME_BPS = float(
+            os.getenv("TPSL_SPREAD_EXTREME_BPS", str(Config.TPSL_SPREAD_EXTREME_BPS))
+        )
+        self.TPSL_SPREAD_RR_BONUS_MAX = float(
+            os.getenv("TPSL_SPREAD_RR_BONUS_MAX", str(Config.TPSL_SPREAD_RR_BONUS_MAX))
+        )
+        self.TPSL_SPREAD_RR_DISCOUNT_MAX = float(
+            os.getenv("TPSL_SPREAD_RR_DISCOUNT_MAX", str(Config.TPSL_SPREAD_RR_DISCOUNT_MAX))
+        )
+        self.TPSL_SPREAD_TP_FLOOR_MULT = float(
+            os.getenv("TPSL_SPREAD_TP_FLOOR_MULT", str(Config.TPSL_SPREAD_TP_FLOOR_MULT))
+        )
+
+        # Profile-aware defaults:
+        # Apply preset values only when explicit env keys are NOT provided.
+        preset = Config.TPSL_PROFILE_PRESETS.get(self.TPSL_PROFILE)
+        if preset:
+            for key, val in preset.items():
+                if key in os.environ:
+                    continue
+                setattr(self, key, val)
+        elif self.TPSL_PROFILE:
+            logger.warning("Unknown TPSL_PROFILE=%r. Using explicit/default TPSL values.", self.TPSL_PROFILE)
+        # Minimum acceptable RR for guardrails (can be stricter than target for specific paths)
+        self.TP_SL_MIN_RR = float(os.getenv("TP_SL_MIN_RR", "1.4"))
+        # First-cycle profitability uplift for cold bootstrap / first trade
+        self.FIRST_CYCLE_TP_BOOST_MULT = float(os.getenv("FIRST_CYCLE_TP_BOOST_MULT", "1.15"))
+        self.FIRST_CYCLE_SL_TIGHTEN_MULT = float(os.getenv("FIRST_CYCLE_SL_TIGHTEN_MULT", "0.90"))
         # Optional percent clamps for TP/SL distances (fallbacks for ATR variance)
-        self.TP_PCT_MIN = float(os.getenv("TP_PCT_MIN", "0.0015"))  # 0.15%
-        self.TP_PCT_MAX = float(os.getenv("TP_PCT_MAX", "0.0060"))  # 0.60%
-        self.SL_PCT_MIN = float(os.getenv("SL_PCT_MIN", "0.008"))  # 0.80%
+        self.TP_PCT_MIN = float(os.getenv("TP_PCT_MIN", str(Config.TP_PCT_MIN)))
+        self.TP_PCT_MAX = float(os.getenv("TP_PCT_MAX", str(Config.TP_PCT_MAX)))
+        self.SL_PCT_MIN = float(os.getenv("SL_PCT_MIN", "0.003"))  # 0.30%
         self.SL_PCT_MAX = float(os.getenv("SL_PCT_MAX", "0.010"))  # 1.00%
         self.TP_TARGET_PCT = float(os.getenv("TP_TARGET_PCT", str(Config.TP_TARGET_PCT)))
         self.SL_CAP_PCT = float(os.getenv("SL_CAP_PCT", str(Config.SL_CAP_PCT)))
@@ -557,12 +1342,59 @@ class Config:
             float(getattr(self, "MIN_PLANNED_QUOTE_FEE_MULT", 0.0) or 0.0),
             float(getattr(self, "MIN_PROFIT_EXIT_FEE_MULT", 0.0) or 0.0),
         )
+        logger.info(
+            "TPSLProfile profile=%s rr=%.2f tp_atr=%.2f sl_atr=%.2f trail_atr=%.2f trail_activate_r=%.2f vol_low=%.4f vol_high=%.4f",
+            str(getattr(self, "TPSL_PROFILE", "balanced")),
+            float(getattr(self, "TARGET_RR_RATIO", 0.0) or 0.0),
+            float(getattr(self, "TP_ATR_MULT", 0.0) or 0.0),
+            float(getattr(self, "SL_ATR_MULT", 0.0) or 0.0),
+            float(getattr(self, "TRAILING_ATR_MULT", 0.0) or 0.0),
+            float(getattr(self, "TRAILING_ACTIVATE_R_MULT", 0.0) or 0.0),
+            float(getattr(self, "TPSL_VOL_LOW_ATR_PCT", 0.0) or 0.0),
+            float(getattr(self, "TPSL_VOL_HIGH_ATR_PCT", 0.0) or 0.0),
+        )
 
         # ---------- SELL economic gates ----------
         # If False, non-liquidation SELLs must clear fee-aware net PnL gate.
         self.ALLOW_SELL_BELOW_FEE = os.getenv("ALLOW_SELL_BELOW_FEE", "false").lower() == "true"
         # Minimum net PnL (USDT) required for non-liquidation SELLs (fees included).
         self.SELL_MIN_NET_PNL_USDT = float(os.getenv("SELL_MIN_NET_PNL_USDT", "0.05"))
+        self.SELL_DYNAMIC_EDGE_GATE_ENABLED = os.getenv(
+            "SELL_DYNAMIC_EDGE_GATE_ENABLED", str(Config.SELL_DYNAMIC_EDGE_GATE_ENABLED)
+        ).lower() == "true"
+        self.SELL_DYNAMIC_SLIPPAGE_MIN_PCT = float(
+            os.getenv("SELL_DYNAMIC_SLIPPAGE_MIN_PCT", str(Config.SELL_DYNAMIC_SLIPPAGE_MIN_PCT))
+        )
+        self.SELL_DYNAMIC_SLIPPAGE_ATR_MULT = float(
+            os.getenv("SELL_DYNAMIC_SLIPPAGE_ATR_MULT", str(Config.SELL_DYNAMIC_SLIPPAGE_ATR_MULT))
+        )
+        self.SELL_DYNAMIC_VOL_BUFFER_ATR_MULT = float(
+            os.getenv("SELL_DYNAMIC_VOL_BUFFER_ATR_MULT", str(Config.SELL_DYNAMIC_VOL_BUFFER_ATR_MULT))
+        )
+        self.SELL_DYNAMIC_STRATEGIC_BUFFER_PCT = float(
+            os.getenv("SELL_DYNAMIC_STRATEGIC_BUFFER_PCT", str(Config.SELL_DYNAMIC_STRATEGIC_BUFFER_PCT))
+        )
+        self.SELL_DYNAMIC_MIN_USDT_FLOOR = float(
+            os.getenv("SELL_DYNAMIC_MIN_USDT_FLOOR", str(Config.SELL_DYNAMIC_MIN_USDT_FLOOR))
+        )
+        self.SELL_DYNAMIC_ATR_TIMEFRAME = str(
+            os.getenv("SELL_DYNAMIC_ATR_TIMEFRAME", str(Config.SELL_DYNAMIC_ATR_TIMEFRAME))
+        )
+        self.SELL_DYNAMIC_ATR_PERIOD = int(
+            os.getenv("SELL_DYNAMIC_ATR_PERIOD", str(Config.SELL_DYNAMIC_ATR_PERIOD))
+        )
+        self.SELL_DYNAMIC_FALLBACK_ATR_PCT = float(
+            os.getenv("SELL_DYNAMIC_FALLBACK_ATR_PCT", str(Config.SELL_DYNAMIC_FALLBACK_ATR_PCT))
+        )
+        self.SELL_DYNAMIC_REGIME_HIGH_MULT = float(
+            os.getenv("SELL_DYNAMIC_REGIME_HIGH_MULT", str(Config.SELL_DYNAMIC_REGIME_HIGH_MULT))
+        )
+        self.SELL_DYNAMIC_REGIME_LOW_MULT = float(
+            os.getenv("SELL_DYNAMIC_REGIME_LOW_MULT", str(Config.SELL_DYNAMIC_REGIME_LOW_MULT))
+        )
+        self.SELL_DYNAMIC_LEGACY_NET_PCT_GUARD = os.getenv(
+            "SELL_DYNAMIC_LEGACY_NET_PCT_GUARD", str(Config.SELL_DYNAMIC_LEGACY_NET_PCT_GUARD)
+        ).lower() == "true"
 
         # Bootstrap SELL override: allow break-even/small-loss exits to free capital
         self.BOOTSTRAP_ALLOW_SELL_BELOW_FEE = os.getenv("BOOTSTRAP_ALLOW_SELL_BELOW_FEE", "true").lower() == "true"
@@ -585,7 +1417,7 @@ class Config:
         self.REENTRY_REQUIRE_SIGNAL_CHANGE = os.getenv("REENTRY_REQUIRE_SIGNAL_CHANGE", "false").lower() == "true"
 
         # ---------- Min-hold guard for SELLs ----------
-        self.MIN_HOLD_SEC = float(os.getenv("MIN_HOLD_SEC", "120"))
+        self.MIN_HOLD_SEC = float(os.getenv("MIN_HOLD_SEC", "300"))
         # Bootstrap min-hold override (allow fast exits during bootstrap)
         self.MIN_HOLD_SEC_BOOTSTRAP = float(os.getenv("MIN_HOLD_SEC_BOOTSTRAP", "30"))
         # Optional price expansion gate (exit only after sufficient move)
@@ -599,182 +1431,12 @@ class Config:
         self.MICRO_PROFIT_CYCLE_MAX_AGE_HOURS = float(os.getenv("MICRO_PROFIT_CYCLE_MAX_AGE_HOURS", "4.0"))
         self.MICRO_PROFIT_CYCLE_MIN_PNL_PCT = float(os.getenv("MICRO_PROFIT_CYCLE_MIN_PNL_PCT", "0.0005"))  # 0.05%
 
-        # ---------- Capital recovery (floor-triggered SELL escalation) ----------
-        # Force small-profit or time-based exits when capital floor is violated.
-        # 0.0002 = 0.02%; 10 minutes default max age.
-        self.CAPITAL_RECOVERY_MIN_PNL_PCT = float(os.getenv("CAPITAL_RECOVERY_MIN_PNL_PCT", "0.0002"))
-        self.CAPITAL_RECOVERY_MAX_AGE_MINUTES = float(os.getenv("CAPITAL_RECOVERY_MAX_AGE_MINUTES", "10"))
-        self.CAPITAL_RECOVERY_FORCE_SELL_AFTER_SEC = float(os.getenv("CAPITAL_RECOVERY_FORCE_SELL_AFTER_SEC", "600"))
-
-        # ---------- Meta time-exit (capital rotation) ----------
-        self.TIME_EXIT_ENABLED = os.getenv("TIME_EXIT_ENABLED", "false").lower() == "true"
-        self.TPSL_TIME_EXIT_ENABLED = os.getenv("TPSL_TIME_EXIT_ENABLED", "false").lower() == "true"
-        self.TIME_EXIT_MIN_SECONDS = float(os.getenv("TIME_EXIT_MIN_SECONDS", "0"))
-        self.TIME_EXIT_MIN_MINUTES = float(os.getenv("TIME_EXIT_MIN_MINUTES", "10"))
-        self.TIME_EXIT_MIN_HOURS = float(os.getenv("TIME_EXIT_MIN_HOURS", "0"))
-        self.TIME_EXIT_MIN_PNL_PCT = float(os.getenv("TIME_EXIT_MIN_PNL_PCT", "0.0"))
-        self.TIME_EXIT_FORCE_SELL = os.getenv("TIME_EXIT_FORCE_SELL", "true").lower() == "true"
-        
-        # ---------- Phase A - Frequency Engineering ----------
-        # Tiered Confidence System
-        self.META_TIER_A_CONF = float(os.getenv("META_TIER_A_CONF", "0.70"))  # Confidence baseline
-        self.META_TIER_B_CONF = float(os.getenv("META_TIER_B_CONF", "0.50"))  # Micro-sizing threshold
-        self.META_MICRO_SIZE_USDT = float(os.getenv("META_MICRO_SIZE_USDT", "25.0"))  # Micro trade size
-        
-        # Symbol Concentration
-        self.META_SYMBOL_CONCENTRATION_LIMIT = int(os.getenv("META_SYMBOL_CONCENTRATION_LIMIT", "2"))
-        self.MAX_POSITIONS_TOTAL = int(os.getenv("MAX_POSITIONS_TOTAL", "2")) # Limit open positions
-        self.MAX_OPEN_POSITIONS_PER_SYMBOL = int(os.getenv("MAX_OPEN_POSITIONS_PER_SYMBOL", "1"))
-        
-        # RiskManager - Tier B Allowance
-        self.TIER_B_MAX_QUOTE = float(os.getenv("TIER_B_MAX_QUOTE", "12.0"))  # Max quote for micro trades
-        min_econ_floor = float(getattr(self, "MIN_ECONOMIC_TRADE_USDT", 0.0) or 0.0)
-        if min_econ_floor > 0 and self.TIER_B_MAX_QUOTE < min_econ_floor:
-            logger.warning(
-                "TIER_B_MAX_QUOTE (%.2f) < MIN_ECONOMIC_TRADE_USDT (%.2f). Bumping Tier-B cap to match economic floor.",
-                self.TIER_B_MAX_QUOTE,
-                min_econ_floor,
-            )
-            self.TIER_B_MAX_QUOTE = float(min_econ_floor)
-        
-        # Portfolio Replacement
-        self.REPLACEMENT_THRESHOLD_ROI = float(os.getenv("REPLACEMENT_THRESHOLD_ROI", "0.02")) # 2% gap required
-        
-        # TP/SL Engine - Tier B Fast Exits
-        self.TIER_B_TTL_SEC = int(os.getenv("TIER_B_TTL_SEC", "300"))  # 5 minutes max holding time
-        
-        # Scaling Target based on NAV
-        self.TARGET_PROFIT_RATIO_PER_HOUR = float(os.getenv("TARGET_PROFIT_RATIO_PER_HOUR", "0.0008"))
-        self.TPSL_PROFIT_AUDIT = os.getenv("TPSL_PROFIT_AUDIT", "true").lower() == "true"
-        self.TPSL_PROFIT_AUDIT_SEC = int(os.getenv("TPSL_PROFIT_AUDIT_SEC", "300"))
-        self.UPTIME_GRACE_PERIOD_MIN = int(os.getenv("UPTIME_GRACE_PERIOD_MIN", "30"))
-
-        # ---------- Execution policy ----------
-        self.EXECUTION = SimpleNamespace(
-            MIN_ORDER_USDT=self.MIN_ORDER_USDT,
-            SAFE_ENTRY_USDT=self.SAFE_ENTRY_USDT,
-            MIN_POSITION_VALUE_USDT=self.MIN_POSITION_VALUE_USDT,
-            MIN_ENTRY_USDT=self.MIN_ENTRY_USDT,
-            MAX_HOLD_TIME_SEC=self.MAX_HOLD_TIME_SEC,
-            QUOTE_MIN_NOTIONAL=float(os.getenv("QUOTE_MIN_NOTIONAL", str(self.MIN_ORDER_USDT))),
-            RESPECT_EXCHANGE_MIN_NOTIONAL=os.getenv("RESPECT_EXCHANGE_MIN_NOTIONAL", "true").lower() == "true",
-            ALLOW_PARTIAL_FILLS=os.getenv("ALLOW_PARTIAL_FILLS", "true").lower() == "true",
-            MIN_NOTIONAL_QUOTE=float(os.getenv("EXECUTION_MIN_NOTIONAL_QUOTE",
-                                os.getenv("MIN_NOTIONAL_QUOTE", str(self.MIN_ORDER_USDT)))),
-            MAKER_GRACE_S=float(os.getenv("EXECUTION_MAKER_GRACE_S", "1.5")),
-            ALLOW_TAKER_IF_WITHIN_BPS=float(os.getenv("EXECUTION_ALLOW_TAKER_IF_WITHIN_BPS", "3.0")),
-            MAX_CONCURRENCY=int(os.getenv("EXECUTION_MAX_CONCURRENCY", os.getenv("MAX_CONCURRENCY", "8"))),
-            MIN_FREE_RESERVE_USDT=float(os.getenv("EXECUTION_MIN_FREE_RESERVE_USDT", "0.50")),
-            NO_REMAINDER_BELOW_QUOTE=float(os.getenv("EXECUTION_NO_REMAINDER_BELOW_QUOTE", "2.0")),
-        )
-
-        # ---------- Capital Allocator ----------
-        _alloc_ranges_raw = os.getenv("CAPITAL_ALLOCATOR_AGENT_ALLOC_RANGES", "")
-        if _alloc_ranges_raw:
-            try:
-                _alloc_ranges = json.loads(_alloc_ranges_raw)
-            except Exception:
-                _alloc_ranges = {}
-        else:
-            # Default: MLForecaster gets 40-60% of free capital
-            _alloc_ranges = {"MLForecaster": [0.40, 0.60]}
-
-        self.CAPITAL_ALLOCATOR = {
-            "ENABLED": os.getenv("CAPITAL_ALLOCATOR_ENABLED", "true").lower() == "true",  # Changed default to "true"
-            "INTERVAL_MIN": float(os.getenv("CAPITAL_ALLOCATOR_INTERVAL_MIN", "15")),
-            "AGENT_ALLOC_RANGES": _alloc_ranges,
-        }
-
-        # --- SINGLE place to enforce the unified notional floor (do this AFTER EXECUTION exists)
-        # Allow a configurable baseline so small-account runs are not silently clamped by a hard literal.
-        _baseline = float(os.getenv("MIN_NOTIONAL_BASELINE", "5.10"))
-        _floor = max(
-            float(self.MIN_ORDER_USDT),
-            float(getattr(self.EXECUTION, "QUOTE_MIN_NOTIONAL", 0.0)),
-            float(getattr(self.EXECUTION, "MIN_NOTIONAL_QUOTE", 0.0)),
-            float(self.EXEC_PROBE_QUOTE),
-            _baseline,  # safety baseline (Binance 1–5 USDT tier compatible)
-        )
-        self.MIN_ORDER_USDT = _floor
-        self.EXEC_PROBE_QUOTE = _floor
-        self.EXECUTION.QUOTE_MIN_NOTIONAL = _floor
-        self.EXECUTION.MIN_NOTIONAL_QUOTE = _floor
-
-        # (Optional) keep dust aligned to floor only if the user did NOT set it explicitly in the environment.
-        # This respects .env values like DUST_MIN_QUOTE_USDT=5.0 even when floor is higher.
-        if "DUST_MIN_QUOTE_USDT" not in os.environ:
-            self.DUST_MIN_QUOTE_USDT = max(self.DUST_MIN_QUOTE_USDT, _floor)
-
-        # Log after enforcement to reflect final values
-        logger.info(
-            "🧮 Effective notional floor (all paths) = %.2f | probe=%.2f | quote_min=%.2f | baseline=%.2f",
-            self.MIN_ORDER_USDT, self.EXEC_PROBE_QUOTE, self.EXECUTION.MIN_NOTIONAL_QUOTE, _baseline
-        )
-        self.LIVE_MODE = os.getenv("LIVE_MODE", "True").lower() == "true"
-        self.SIMULATION_MODE = os.getenv("SIMULATION_MODE", "False").lower() == "true"
-        self.PAPER_MODE = os.getenv("PAPER_MODE", "False").lower() == "true"
-        self.TESTNET_MODE = os.getenv("TESTNET_MODE", "False").lower() == "true"
-
-        # ---------- Region / Account Type (NEW) ----------
-        # BINANCE_REGION: 'global' or 'us'
-        self.BINANCE_REGION = os.getenv("BINANCE_REGION", "global").strip().lower()
-        # BINANCE_ACCOUNT_TYPE: 'spot' or 'futures' (UM)
-        self.BINANCE_ACCOUNT_TYPE = os.getenv("BINANCE_ACCOUNT_TYPE", "spot").strip().lower()
-
-        # ---------- Binance Keys ----------
-        self.BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-        self.BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-        self.BINANCE_TESTNET_API_KEY = os.getenv("BINANCE_TESTNET_API_KEY", "")
-        self.BINANCE_TESTNET_API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET", "")
-
-        # ---------- Resolve endpoints (NEW) ----------
-        # Allow manual override, otherwise derive from region+type+testnet.
-        self.BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "").strip()
-        if not self.BINANCE_BASE_URL:
-            self.BINANCE_BASE_URL = self._resolve_base_url(
-                region=self.BINANCE_REGION,
-                account_type=self.BINANCE_ACCOUNT_TYPE,
-                testnet=self.TESTNET_MODE,
-            )
-
-        # ---------- Intervals & Timeouts ----------
-        self.WATCHDOG_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", os.getenv("WATCHDOG_CHECK_INTERVAL_SECONDS", str(self.DEFAULT_WATCHDOG_INTERVAL))))
-        self.WATCHDOG_WARN_COOLDOWN_SEC = int(os.getenv("WATCHDOG_WARN_COOLDOWN_SEC", 60))
-        self.HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 30))
-        self.EXECUTION_INTERVAL = float(os.getenv("EXECUTION_INTERVAL", 1.0))
-        self.DIAGNOSTICS_INTERVAL = int(os.getenv("DIAGNOSTICS_INTERVAL", 60))
-        self.AGENT_MANAGER_INTERVAL = int(os.getenv("AGENT_MANAGER_INTERVAL", 60))
-        self.META_CONTROLLER_INTERVAL = int(os.getenv("META_CONTROLLER_INTERVAL", 30))
-        self.TPSL_ENGINE_INTERVAL = int(os.getenv("TPSL_ENGINE_INTERVAL", 10))
-        self.META_SIGNAL_COOLDOWN = int(os.getenv("META_SIGNAL_COOLDOWN", 10))
-        self.RECOVERY_CHECK_INTERVAL = int(os.getenv("RECOVERY_CHECK_INTERVAL", 10))
-        self.RECOVERY_MAX_INACTIVE_TIME = int(os.getenv("RECOVERY_MAX_INACTIVE_TIME", 60))
-        # Expose AppContext startup timeout knob with a safer default
-        self.START_TIMEOUT_SEC = float(os.getenv("START_TIMEOUT_SEC", "30"))
-        self.SHUTDOWN_TIMEOUT_SECONDS = int(os.getenv("SHUTDOWN_TIMEOUT_SECONDS", 10))
-        self.DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() == "true"
-
-        # ---- Readiness gating knobs ----
-        self.WAIT_READY_SECS = int(os.getenv("WAIT_READY_SECS", "90"))
-        self.GATE_READY_ON = [s.strip() for s in os.getenv("GATE_READY_ON", "market_data,execution,capital,exchange,startup_sanity").split(",") if s.strip()]
-        # Bridge: keep a plain string version for AppContext._cfg("GATE_READY_ON", ...) which expects a CSV string
-        try:
-            _gate_csv = ",".join(self.GATE_READY_ON) if isinstance(self.GATE_READY_ON, list) else str(self.GATE_READY_ON)
-            os.environ["GATE_READY_ON"] = _gate_csv
-        except Exception:
-            pass
-
-        # ---- Startup namespace for thresholds ----
-        self.STARTUP = SimpleNamespace(
-            FILTERS_COVERAGE_PCT=float(os.getenv("STARTUP.filters_coverage_pct", "80")),
-            MIN_FREE_QUOTE_FACTOR=float(os.getenv("STARTUP.min_free_quote_factor", "1.2")),
-        )
-        # Bridge: publish dotted-key env vars for AppContext._cfg("STARTUP.*") lookups
-        try:
-            os.environ.setdefault("STARTUP.filters_coverage_pct", str(getattr(self.STARTUP, "FILTERS_COVERAGE_PCT", 80.0)))
-            os.environ.setdefault("STARTUP.min_free_quote_factor", str(getattr(self.STARTUP, "MIN_FREE_QUOTE_FACTOR", 1.2)))
-        except Exception:
-            pass
+        # ---------- Phase 9: Wealth engine (scaling/compounding) ----------
+        # Lower friction for safe compounding while preventing startup flip.
+        # SCALE_IN_MIN_AGE_MIN: minimum position age in minutes before scaling in (default 3 min)
+        # SCALE_IN_MIN_PNL_PCT: minimum pnl (in percent units) required to consider scaling in (default 0.2 == 0.2%)
+        self.SCALE_IN_MIN_AGE_MIN = float(os.getenv("SCALE_IN_MIN_AGE_MIN", "3.0"))
+        self.SCALE_IN_MIN_PNL_PCT = float(os.getenv("SCALE_IN_MIN_PNL_PCT", "0.2"))
 
     # ---------- Endpoint resolver (NEW) ----------
     def _resolve_base_url(self, region: str, account_type: str, testnet: bool) -> str:
@@ -905,6 +1567,6 @@ class Config:
     # ---------- Static fallbacks (kept for compatibility with older imports) ----------
     GLOBAL = globals().get("GLOBAL") or SimpleNamespace(
         MIN_ENTRY_QUOTE_USDT=20.0,
-            DEFAULT_PLANNED_QUOTE=80.0,
+            DEFAULT_PLANNED_QUOTE=30.0,
         MAX_SPEND_PER_TRADE_USDT=50.0,
     )

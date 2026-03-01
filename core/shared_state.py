@@ -20,7 +20,7 @@ from collections import deque, defaultdict
 from contextlib import asynccontextmanager
 from functools import wraps
 from typing import Any, Dict, List, Set, Tuple, Optional, Callable, TypedDict, TYPE_CHECKING
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, is_dataclass
 from enum import Enum
 
 # ---- Optional Third-Party Imports ----
@@ -38,7 +38,7 @@ __version__ = "2.0.1"
 __component__ = "core.shared_state"
 __contract_id__ = "core:SharedState:v2.0.0"
 
-__all__ = ["SharedState", "State", "SharedStateConfig", "StateConfig", "HealthCode", "Component", "SharedStateError", "ErrorCode", "CircuitBreaker", "CircuitBreakerState", "OHLCVBar", "SellableLine"]
+__all__ = ["SharedState", "SharedStateConfig", "HealthCode", "Component", "SharedStateError", "ErrorCode", "CircuitBreaker", "CircuitBreakerState", "OHLCVBar", "SellableLine"]
 
 # ---- Decimal Precision ----
 getcontext().prec = 28
@@ -171,9 +171,11 @@ class CircuitBreaker:
             return False
         return True
     def record_success(self) -> None:
-        self.failure_count = 0; self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.state = CircuitBreakerState.CLOSED
     def record_failure(self) -> None:
-        self.failure_count += 1; self.last_failure_time = time.time()
+        self.failure_count += 1
+        self.last_failure_time = time.time()
         if self.failure_count >= self.failure_threshold:
             self.state = CircuitBreakerState.OPEN
 
@@ -213,6 +215,45 @@ async def _safe_await(maybe):
     if asyncio.iscoroutine(maybe):
         return await maybe
     return maybe
+
+
+class _SharedStateEventBus:
+    """
+    Thin topic bus adapter over SharedState's event log/queue fanout.
+    Exposes the explicit API requested by strategist routing:
+      - publish(topic, payload)
+      - subscribe(subscriber_name, max_queue)
+      - unsubscribe(subscriber_name)
+    """
+
+    def __init__(self, shared_state: "SharedState"):
+        self._ss = shared_state
+
+    def _to_event_dict(self, payload: Any) -> Dict[str, Any]:
+        if payload is None:
+            return {}
+        if isinstance(payload, dict):
+            return dict(payload)
+        if is_dataclass(payload):
+            try:
+                return asdict(payload)
+            except Exception:
+                return dict(getattr(payload, "__dict__", {}) or {})
+        if hasattr(payload, "__dict__"):
+            return dict(getattr(payload, "__dict__", {}) or {})
+        return {"payload": payload}
+
+    async def publish(self, topic: str, payload: Any) -> None:
+        data = self._to_event_dict(payload)
+        if "ts" not in data and "timestamp" not in data:
+            data["ts"] = time.time()
+        await self._ss.emit_event(str(topic or ""), data)
+
+    async def subscribe(self, subscriber_name: str, max_queue: int = 1000) -> asyncio.Queue:
+        return await self._ss.subscribe_events(subscriber_name, max_queue=max_queue)
+
+    async def unsubscribe(self, subscriber_name: str) -> None:
+        await self._ss.unsubscribe(subscriber_name)
 
 class SharedState:
 
@@ -307,7 +348,6 @@ class SharedState:
         # No await here (sync context) — it's fine to skip emit_event in this path
 
     # ---- Component status API (CSL + Watchdog friendly) ----
-    # ---- Component status API (CSL + Watchdog friendly) ----
     async def update_component_status(self, component: str, status: str, detail: str = "", *, timestamp: float | None = None):
         ts = float(timestamp or time.time())
         payload = {"status": status, "message": detail, "timestamp": ts}
@@ -360,7 +400,7 @@ class SharedState:
         finally:
             lock.release()
 
-    def __init__(self, config: Optional[Dict | Any]=None, database_manager=None, exchange_client: Optional[Any]=None) -> None:
+    def __init__(self, config: Optional[Dict | Any]=None, database_manager=None, exchange_client: Optional[Any]=None, app: Optional[Any]=None) -> None:
         # Logger must be initialized FIRST (before any self.logger calls)
         self.logger = logging.getLogger("SharedState")
         
@@ -385,6 +425,7 @@ class SharedState:
         # Dynamic Configuration Overrides (Memory-resident)
         self.dynamic_config: Dict[str, Any] = {}
         self._exchange_client = exchange_client
+        self._app = app  # AppContext reference for accessing governor
         
         self._profit_guard: Optional[Callable[[Dict[str, Any]], Any]] = None  # P9 Integration
 
@@ -457,6 +498,7 @@ class SharedState:
         self.positions: Dict[str, Dict[str, Any]] = {}
         self.balances: Dict[str, Dict[str, float]] = {}
         self.trade_history: deque = deque(maxlen=self.config.max_trade_history_size)
+        self._realized_pnl: deque = deque(maxlen=4096)
         self.trade_count: int = 0
         self._avg_price_cache: Dict[str, float] = {}
         # Exit tracking (anti-churn / re-entry guard)
@@ -487,6 +529,8 @@ class SharedState:
         self.cooldowns = {}
         self.active_liquidations = set()
         self.exit_in_progress: Dict[str, bool] = {}  # Symbol-level exit lock
+        self.dust_operation_symbols: Dict[str, float] = {}  # Dust op timestamps by symbol
+        self.risk_based_quote: Dict[str, float] = {}  # Risk-sized quote per symbol
         self.rebalance_targets: Set[str] = set()
 
         # Agent state
@@ -526,6 +570,9 @@ class SharedState:
         self.alerts = deque(maxlen=1000)
         self._pending_reservation_requests = [] # Pending P9 meta-healing requests
 
+        # 🔄 LIGHTWEIGHT SIGNAL OUTCOME TRACKING
+        self._signal_outcomes = []  # List of signal outcome records for periodic evaluation
+
         # Liquidity reservations
         self._quote_reservations = {}
         self._authoritative_reservations: Dict[str, float] = {} # Per-agent authoritative budget (P9 Strict)
@@ -552,6 +599,7 @@ class SharedState:
         self._start_monotonic = time.monotonic()
         self._cache_enabled = True
         self._subscribers: Dict[str, asyncio.Queue] = {}
+        self.event_bus = _SharedStateEventBus(self)
 
         # Perf stats
         self._performance_stats = {
@@ -574,6 +622,8 @@ class SharedState:
         # Prevent dust positions from entering infinite rejection loops
         self.permanent_dust: Set[str] = set()  # Symbols marked as irrevocable dust
         self.dust_retirement_rejection_threshold: int = 3  # After N rejections, dust is PERMANENT
+        self.dust_unhealable: Dict[str, str] = {}  # symbol -> reason; positions excluded from dust healing
+        self._price_history: Dict[str, Any] = {}  # symbol -> deque/list of recent prices (used by get_market_state)
 
     @property
     def avg_holding_time_sec(self) -> float:
@@ -597,11 +647,14 @@ class SharedState:
             except Exception as e:
                 self.logger.warning(f"Could not load legacy snapshot: {e}")
 
-    async def add_agent_signal(self, symbol: str, agent: str, side: str, confidence: float, ttl_sec: int = 300, tier: str = "B", rationale: str = "") -> None:
+    async def add_agent_signal(self, symbol: str, agent: str, side: str, confidence: float, ttl_sec: int = 300, tier: str = "B", rationale: str = "", **extra_fields) -> None:
         """
         P9 Mandatory Signal Contract:
         Every trading agent must call this when it emits a signal.
         This is the shared 'signal bus' used by MetaController and other evaluators.
+        
+        Extra fields (e.g., _expected_move_pct, expected_edge_bps) are injected into the signal
+        for downstream use by PolicyManager and ExecutionManager.
         """
         sym = self._norm_sym(symbol)
         now = time.time()
@@ -617,6 +670,11 @@ class SharedState:
             "ts": now,
             "timestamp": now,
         }
+        
+        # Inject optional extra signal fields (e.g., expected_edge_bps, _expected_move_pct)
+        if extra_fields:
+            for k, v in extra_fields.items():
+                sig[k] = v
         
         # P9 Core storage (latest_signals_by_symbol)
         async with self._lock_context("signals"):
@@ -644,10 +702,6 @@ class SharedState:
             if sym not in self.latest_signals_by_symbol:
                 self.latest_signals_by_symbol[sym] = {}
             self.latest_signals_by_symbol[sym][agent] = signal
-
-    def get_latest_signals_by_symbol(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
-        """Return a shallow copy of the latest signals map."""
-        return dict(self.latest_signals_by_symbol)
 
     # -------------------
     # Pending Position Accumulation (P9 Phase 4)
@@ -761,8 +815,8 @@ class SharedState:
         if not per_agent:
             return False
         
-        # Take the most recent/best signal (or agent match if we add agent filtering here)
-        signal = list(per_agent.values())[0]
+        # Take the most-recent signal by timestamp across all agents
+        signal = max(per_agent.values(), key=lambda s: float(s.get("timestamp", 0.0)))
             
         # 1. Action Alignment
         action = str(signal.get("action", "") or signal.get("side", "")).upper()
@@ -810,13 +864,12 @@ class SharedState:
                         to_del.append(key)
                         self.logger.info(f"Market validity lost for {key}. Dropping intent.")
             
-            for symbol, side in to_del:
-                key = (symbol.upper(), side.upper())
+            for key in to_del:
                 if key in self._pending_position_intents:
                     del self._pending_position_intents[key]
                     if self._database_manager:
                         with contextlib.suppress(Exception):
-                            await self._database_manager.delete_pending_intent(symbol.upper(), side.upper())
+                            await self._database_manager.delete_pending_intent(key[0], key[1])
 
     async def load_pending_intents_from_db(self) -> None:
         """Hydrate memory registry from persisted DB state on startup."""
@@ -1148,10 +1201,7 @@ class SharedState:
             pass
 
     async def free_usdt(self) -> float:
-        """
-        Back-compat getter probed by AppContext startup sanity.
-        Returns spendable quote funds (after reserve policy) for the configured quote asset.
-        """
+        """Spendable quote funds after reserve policy. Delegates to get_spendable_balance()."""
         try:
             return await self.get_spendable_quote(
                 self.quote_asset,
@@ -1469,9 +1519,9 @@ class SharedState:
     async def classify_positions_by_size(self) -> Dict[str, List[str]]:
         """
         FIX #6, Step 3: Classify positions into SIGNIFICANT and DUST based on minNotional.
-        
+
         ✅ FIX #1: Use position's own price data when market price unavailable
-        
+
         Critical for portfolio "flat" detection.
         Dust positions:
         - Do NOT block capital allocation
@@ -1480,9 +1530,18 @@ class SharedState:
         """
         significant = []
         dust = []
-        
-        for symbol, position in self.positions.items():
+
+        # Snapshot keys to avoid mutation-during-iteration issues
+        position_keys = list(self.positions.keys())
+
+        for symbol in position_keys:
             try:
+                async with self._lock_context("positions"):
+                    position = self.positions.get(symbol)
+                    if not position:
+                        continue
+                    position = dict(position)  # Work on a copy
+
                 qty = float(position.get("quantity", 0.0) or position.get("qty", 0.0) or 0.0)
                 if qty <= 0:
                     continue
@@ -1501,7 +1560,8 @@ class SharedState:
                     position["is_dust"] = False
                     position["_is_dust"] = False
                     position["open_position"] = True
-                    self.positions[symbol] = position
+                    async with self._lock_context("positions"):
+                        self.positions[symbol] = position
                     self.dust_registry.pop(self._norm_sym(symbol), None)
                 else:
                     dust.append(symbol)
@@ -1516,7 +1576,7 @@ class SharedState:
                 self.logger.warning(f"[SS:Dust] Error classifying {symbol}: {e}")
                 dust.append(symbol)
                 self.mark_as_dust(symbol)
-        
+
         return {"significant": significant, "dust": dust}
 
     def mark_as_dust(self, symbol: str) -> None:
@@ -1603,22 +1663,6 @@ class SharedState:
         """
         classification = await self.classify_positions_by_size()
         return len(classification["significant"])
-
-    async def is_portfolio_flat(self) -> bool:
-        """
-        Returns True only if portfolio has ZERO SIGNIFICANT positions.
-        """
-        all_positions = self.get_open_positions()
-        total_positions = len(all_positions)
-
-        if total_positions == 0:
-            self.logger.debug("[SS:Portfolio] Portfolio is FLAT - no positions")
-            return True
-        else:
-            self.logger.debug(
-                f"[SS:Portfolio] Portfolio NOT flat - {total_positions} significant positions exist"
-            )
-            return False
 
     async def get_occupied_capital(self) -> float:
         """
@@ -1942,34 +1986,55 @@ class SharedState:
     async def set_accepted_symbols(self, symbols: Dict[str, Dict[str, Any]], *, allow_shrink: bool = False, source: Optional[str] = None) -> None:
         if not isinstance(symbols, dict):
             raise SharedStateError("symbols must be a dictionary", ErrorCode.CONFIGURATION_ERROR)
+        
+        # === CANONICAL GOVERNOR ENFORCEMENT ===
+        # Apply governor cap at the authoritative store (SharedState)
+        # This ensures NO component can bypass the cap, regardless of code path
+        try:
+            if hasattr(self, '_app') and self._app and hasattr(self._app, 'capital_symbol_governor'):
+                governor = self._app.capital_symbol_governor
+                if governor:
+                    cap = await governor.compute_symbol_cap()
+                    
+                    if cap is not None and len(symbols) > cap:
+                        self.logger.info(
+                            f"🎛️ CANONICAL GOVERNOR: {len(symbols)} → {cap} symbols (at SharedState)"
+                        )
+                        symbol_items = list(symbols.items())
+                        symbols = dict(symbol_items[:cap])
+        except Exception as e:
+            self.logger.warning(f"⚠️ Canonical governor enforcement failed: {e}")
+        
         async with self._lock_context("global"):
-            if allow_shrink:
-                current_count = len(self.accepted_symbols)
-                new_count = len(symbols)
-                wanted = { self._norm_sym(k) for k in symbols.keys() }
-                
-                # P9 Guard: Collapse Protection
-                # If we are about to shrink from a healthy universe (>10) to a broken one (<=1),
-                # this is almost certainly a discovery filter failure or config error.
-                # Propagating this would freeze the bot since agents won't have symbols.
-                if current_count > 10 and new_count <= 1:
-                    self.logger.error(
-                        "🛡️ PANIC GUARD: Universe collapse detected (%d -> %d)! Refusing to shrink below safety floor.",
-                        current_count, new_count
-                    )
-                    # We continue but don't delete anything, making the operation ADDITIVE
-                else:
-                    current_keys = set(self.accepted_symbols.keys())
-                    for s in (current_keys - wanted):
-                        # P9 Guard: Wallet-force symbols are sticky
-                        # They should only be removed if the source specifies it or if we are doing a hard reset.
-                        meta = self.accepted_symbols.get(s, {})
-                        if meta.get("accept_policy") == "wallet_force" and source != "WalletScannerAgent":
-                            self.logger.debug("🛡️ Protected wallet_force symbol %s from removal", s)
-                            continue
-                            
-                        self.accepted_symbols.pop(s, None)
-                        self.symbols.pop(s, None)
+            current_count = len(self.accepted_symbols)
+            new_count = len(symbols)
+
+            # === STRICT MODE: Reject shrink if not allowed ===
+            if not allow_shrink and new_count < current_count:
+                self.logger.warning(
+                    "[SS] Rejecting shrink because allow_shrink=False. "
+                    f"Current={current_count}, Incoming={new_count}, Source={source}"
+                )
+                return
+
+            # === HARD REPLACE MODE ===
+            # Build wanted set from incoming symbols
+            wanted = { self._norm_sym(k) for k in symbols.keys() }
+            
+            # Remove everything not wanted (but protect wallet_force from non-wallet sources)
+            current_keys = set(self.accepted_symbols.keys())
+            for s in (current_keys - wanted):
+                meta = self.accepted_symbols.get(s, {})
+                # Wallet-force symbols are sticky: only remove if source is WalletScannerAgent
+                # (which means it's explicitly updating the wallet-forced set)
+                if meta.get("accept_policy") == "wallet_force" and source != "WalletScannerAgent":
+                    self.logger.debug("🛡️ Protected wallet_force symbol %s from removal", s)
+                    continue
+                    
+                self.accepted_symbols.pop(s, None)
+                self.symbols.pop(s, None)
+
+            # Now insert incoming symbols (hard replace of normal symbols)
             wallet_forced = []
             normal_accepted = []
             for raw_sym, meta in symbols.items():
@@ -2008,13 +2073,6 @@ class SharedState:
                 # Publish a SymbolManager-shaped topic to improve cross-component compatibility
                 await self.publish_event("symbol_manager.accepted.updated", {"symbols": sym_list, "count": len(sym_list)})
         
-        # Defensive logging for accidental shrink (if allow_shrink=False)
-        if not allow_shrink and len(symbols) < len(self.accepted_symbols):
-            self.logger.warning(
-                "[SS] Accepted symbols update is smaller than current set (no shrink allowed). "
-                f"Current={len(self.accepted_symbols)}, Incoming={len(symbols)}, Source={source}"
-            )
-            
         if not self.accepted_symbols_ready_event.is_set():
             self.accepted_symbols_ready_event.set()
             sym_list = list(self.accepted_symbols.keys())
@@ -2051,12 +2109,10 @@ class SharedState:
         return dict(self.accepted_symbols)
     async def get_symbols(self) -> List[str]:
         return list(self.accepted_symbols.keys())
-    async def get_symbol_filters_cached(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """P9: Jurisdictional getter for cached symbol filters."""
-        return self.symbol_filters.get(self._norm_sym(symbol))
-
     def _norm_sym(self, s: str) -> str:
         return (s or "").upper().replace("/", "")
+    def _norm_tf(self, timeframe: str) -> str:
+        return str(timeframe or "").strip().lower()
 
     def _significant_position_floor_from_min_notional(self, min_notional: float = 0.0) -> float:
         """Canonical significant-position floor used across Meta/SharedState/TPSL."""
@@ -2140,7 +2196,14 @@ class SharedState:
         return is_open, float(value_usdt), float(floor)
 
     def get_ohlcv_count(self, symbol: str, timeframe: str) -> int:
-        return len(self.market_data.get((symbol, timeframe), []))
+        sym = self._norm_sym(symbol)
+        tf = self._norm_tf(timeframe)
+        rows = self.market_data.get((sym, tf))
+        if rows is None:
+            rows = self.market_data.get((sym, str(timeframe or "").strip()))
+        if rows is None:
+            rows = self.market_data.get((symbol, timeframe))
+        return len(rows or [])
 
     def have_min_bars(self, symbols: list[str], timeframe: str, min_bars: int) -> bool:
         return all(self.get_ohlcv_count(s, timeframe) >= min_bars for s in symbols)
@@ -2150,6 +2213,11 @@ class SharedState:
             syms = list(self.accepted_symbols.keys())
             if self.have_min_bars(syms, timeframe, min_bars):
                 self.market_data_ready_event.set()
+                self.logger.warning(
+                    "[DEBUG_MDF_SET] shared_state_id=%s event_id=%s",
+                    id(self),
+                    id(self.market_data_ready_event),
+                )
                 await self.emit_event("MarketDataReady", {"symbols": syms, "timeframe": timeframe, "min_bars": min_bars})
 
     def is_symbol_tradable(self, symbol: str) -> bool:
@@ -2162,15 +2230,17 @@ class SharedState:
         and normalized filter schemas. If an exchange client is present, refresh cache first.
         """
         sym = self._norm_sym(symbol)
-        try:
-            if self._exchange_client and hasattr(self._exchange_client, "ensure_symbol_filters_ready"):
-                await self._exchange_client.ensure_symbol_filters_ready(sym)
-        except Exception:
-            pass
+        f = await self._fetch_and_cache_symbol_filters(sym)
+        step_size, _min_qty, _tick_size, min_notional = self._extract_symbol_filter_values(f)
+        return step_size, min_notional
 
+    async def _fetch_and_cache_symbol_filters(self, sym: str) -> Dict[str, Any]:
+        """Fetch symbol filters from exchange (raw → normalized fallback) and cache in symbol_filters."""
         f = dict(self.symbol_filters.get(sym, {}))
         if self._exchange_client:
             try:
+                if hasattr(self._exchange_client, "ensure_symbol_filters_ready"):
+                    await self._exchange_client.ensure_symbol_filters_ready(sym)
                 raw = await self._exchange_client.get_symbol_filters_raw(sym) if hasattr(self._exchange_client, "get_symbol_filters_raw") else {}
             except Exception:
                 raw = {}
@@ -2185,20 +2255,7 @@ class SharedState:
                 if isinstance(norm, dict) and norm:
                     f = {"_normalized": dict(norm)}
                     self.symbol_filters[sym] = dict(f)
-
-        lot_step = float(
-            f.get("LOT_SIZE", {}).get("stepSize")
-            or f.get("stepSize")
-            or f.get("_normalized", {}).get("step_size", 0.0)
-            or 0.0
-        )
-        min_notional = float(
-            f.get("MIN_NOTIONAL", {}).get("minNotional")
-            or f.get("minNotional")
-            or f.get("_normalized", {}).get("min_notional", 0.0)
-            or 0.0
-        )
-        return lot_step, min_notional
+        return f
 
     def _extract_symbol_filter_values(self, filters: Dict[str, Any]) -> Tuple[float, float, float, float]:
         """Return (step_size, min_qty, tick_size, min_notional) from raw or normalized filters."""
@@ -2266,26 +2323,7 @@ class SharedState:
                 price = price or 0.0
 
         # Fetch filters (refresh cache if supported)
-        f = dict(self.symbol_filters.get(sym, {}))
-        if self._exchange_client:
-            try:
-                if hasattr(self._exchange_client, "ensure_symbol_filters_ready"):
-                    await self._exchange_client.ensure_symbol_filters_ready(sym)
-                raw = await self._exchange_client.get_symbol_filters_raw(sym) if hasattr(self._exchange_client, "get_symbol_filters_raw") else {}
-            except Exception:
-                raw = {}
-            if isinstance(raw, dict) and raw:
-                f = dict(raw)
-                self.symbol_filters[sym] = dict(raw)
-            elif not f:
-                try:
-                    norm = await self._exchange_client.get_symbol_filters(sym) if hasattr(self._exchange_client, "get_symbol_filters") else {}
-                except Exception:
-                    norm = {}
-                if isinstance(norm, dict) and norm:
-                    f = {"_normalized": dict(norm)}
-                    self.symbol_filters[sym] = dict(f)
-
+        f = await self._fetch_and_cache_symbol_filters(sym)
         step_size, min_qty, tick_size, min_notional = self._extract_symbol_filter_values(f)
         if min_notional_override is not None:
             min_notional = float(min_notional_override)
@@ -2334,10 +2372,8 @@ class SharedState:
         volatility_adjusted_min_move = float(min_notional or 0.0) * float(volatility_move_pct)
 
         # Profitability sizing: require expected move × position size to exceed fees × multiplier
-        try:
-            expected_move_fee_mult = float(self._cfg("ENTRY_EXPECTED_MOVE_FEE_MULT", 2.0) or 2.0)
-        except Exception:
-            expected_move_fee_mult = 2.0
+        expected_move_fee_mult = float(self._cfg("ENTRY_EXPECTED_MOVE_FEE_MULT", 2.0) or 2.0)
+        expected_move_fee_mult = max(2.0, float(expected_move_fee_mult))
         profitability_floor = 0.0
         if round_trip_fee_rate > 0:
             required_move_pct = float(expected_move_fee_mult) * float(round_trip_fee_rate)
@@ -2456,7 +2492,9 @@ class SharedState:
         Append/merge a single OHLCV bar ensuring ascending ts and 6-field hygiene.
         bar keys: ts,o,h,l,c,v  (epoch seconds float)
         """
-        key = (symbol, timeframe)
+        sym = self._norm_sym(symbol)
+        tf = self._norm_tf(timeframe)
+        key = (sym, tf)
         b = {
             "ts": float(bar["ts"]),
             "o": float(bar["o"]),
@@ -2466,6 +2504,11 @@ class SharedState:
             "v": float(bar["v"]),
         }
         async with self._lock_context("market_data"):
+            # Canonicalize legacy non-normalized keys on write.
+            legacy_key = (symbol, timeframe)
+            if legacy_key != key and legacy_key in self.market_data and key not in self.market_data:
+                self.market_data[key] = list(self.market_data.get(legacy_key) or [])
+                self.market_data.pop(legacy_key, None)
             lst = self.market_data.setdefault(key, [])
             if lst and abs(lst[-1]["ts"] - b["ts"]) < 1e-9:
                 lst[-1] = b
@@ -2474,15 +2517,24 @@ class SharedState:
                 if len(lst) >= 2 and lst[-2]["ts"] > lst[-1]["ts"]:
                     lst.sort(key=lambda r: r["ts"])
             # Invalidate ATR cache entries for this (symbol, timeframe)
-            self._atr_cache = {k:v for k,v in self._atr_cache.items() if not (k[0]==symbol and k[1]==timeframe)}
+            self._atr_cache = {
+                k: v
+                for k, v in self._atr_cache.items()
+                if not (
+                    (k[0] == sym and k[1] == tf)
+                    or (k[0] == symbol and k[1] == timeframe)
+                )
+            }
         # price keep-warm
-        await self.update_latest_price(symbol, b["c"])
+        await self.update_latest_price(sym, b["c"])
         # Do not set MarketDataReady here; rely on coverage check
         await self._maybe_set_market_data_ready()
 
     async def set_market_data(self, symbol: str, timeframe: str, ohlcv_data: List[Dict[str, Any]]) -> None:
         """Batch set (not used by MDF warmup, but kept for completeness)."""
-        key = (symbol, timeframe)
+        sym = self._norm_sym(symbol)
+        tf = self._norm_tf(timeframe)
+        key = (sym, tf)
         norm: List[OHLCVBar] = []
         for r in ohlcv_data or []:
             if {"ts","o","h","l","c","v"} <= r.keys():
@@ -2499,31 +2551,57 @@ class SharedState:
                 ))
         norm.sort(key=lambda x: x["ts"])
         async with self._lock_context("market_data"):
+            legacy_key = (symbol, timeframe)
+            if legacy_key != key:
+                self.market_data.pop(legacy_key, None)
             self.market_data[key] = norm
             # Invalidate ATR cache entries for this (symbol, timeframe)
-            self._atr_cache = {k:v for k,v in self._atr_cache.items() if not (k[0]==symbol and k[1]==timeframe)}
+            self._atr_cache = {
+                k: v
+                for k, v in self._atr_cache.items()
+                if not (
+                    (k[0] == sym and k[1] == tf)
+                    or (k[0] == symbol and k[1] == timeframe)
+                )
+            }
         if norm:
-            await self.update_latest_price(symbol, norm[-1]["c"])
+            await self.update_latest_price(sym, norm[-1]["c"])
         # Do not set MarketDataReady here; rely on coverage check
         await self._maybe_set_market_data_ready()
 
     async def get_market_data(self, symbol: str, timeframe: str) -> Optional[List[OHLCVBar]]:
-        return self.market_data.get((symbol, timeframe))
+        sym = self._norm_sym(symbol)
+        tf = self._norm_tf(timeframe)
+        rows = self.market_data.get((sym, tf))
+        if rows is None:
+            rows = self.market_data.get((sym, str(timeframe or "").strip()))
+        if rows is None:
+            rows = self.market_data.get((symbol, timeframe))
+        return rows
 
     # -------- ATR utility (used by MDF warm cache) --------
     async def calc_atr(self, symbol: str, timeframe: str, period: int = 14) -> Optional[float]:
-        key = (symbol, timeframe)
-        rows = self.market_data.get(key) or []
+        sym = self._norm_sym(symbol)
+        tf = self._norm_tf(timeframe)
+        key = (sym, tf)
+        rows = self.market_data.get(key)
+        if rows is None:
+            rows = self.market_data.get((sym, str(timeframe or "").strip()))
+        if rows is None:
+            rows = self.market_data.get((symbol, timeframe))
+        rows = rows or []
         if len(rows) < max(2, period+1):
             return None
-        cache_key = (symbol, timeframe, period)
+        cache_key = (sym, tf, period)
         if cache_key in self._atr_cache:
             return self._atr_cache[cache_key]
         # Compute True Range & ATR
         trs: List[float] = []
         for i in range(1, len(rows)):
             c_prev = rows[i-1]["c"]
-            h = rows[i]["h"]; l = rows[i]["l"]; c = rows[i]["c"]
+            h = rows[i]["h"]
+            l = rows[i]["l"]
+            c = rows[i]["c"]
             tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
             trs.append(tr)
         if len(trs) < period:
@@ -2615,28 +2693,6 @@ class SharedState:
         except Exception as e:
             self.logger.warning(f"hydrate_positions_from_balances failed: {e}")
 
-        # Best-effort: update dust register for assets without tradable symbol/price yet
-        try:
-            quote = self.quote_asset.upper()
-            for asset, data in list(self.balances.items()):
-                a = asset.upper()
-                if a == quote:
-                    continue
-                free_qty = float(data.get("free", 0.0))
-                if free_qty <= 0:
-                    continue
-                sym = f"{a}{quote}"
-                # If we have no price yet, still track as dust candidate so later price updates can reevaluate
-                if sym not in self.latest_prices:
-                    self.record_dust(
-                        sym,
-                        free_qty,
-                        origin="wallet_balance_sync",
-                        context={"source": "balance_sync", "has_price": False},
-                    )
-        except Exception:
-            pass
-
     async def get_balance(self, asset: str) -> Dict[str, float]:
         """P9: Authoritative balance retrieval with mandatory freshness check."""
         a = asset.upper()
@@ -2681,7 +2737,13 @@ class SharedState:
                 self.logger.error(f"[SS] Failed to sync authoritative balance: {e}")
 
     async def get_spendable_balance(self, asset: str, *, reserve_ratio: Optional[float] = None, min_reserve: Optional[float] = None) -> float:
-        """Get spendable balance with FIX #1: proper free/locked handling."""
+        """CANONICAL: Compute spendable balance for an asset after reserves and reservation cleanup.
+
+        All other spendable-balance methods delegate here:
+          free_usdt() -> get_spendable_quote() -> get_spendable_balance()
+          get_free_quote() -> get_spendable_quote() -> get_spendable_balance()
+          get_spendable_usdt() -> get_spendable_balance()
+        """
         a = asset.upper()
         bal = await self.get_balance(a)
         
@@ -2718,24 +2780,32 @@ class SharedState:
         cleaned_reservations = []
         freed_amount = 0.0
         
+        max_reservation_age_sec = 90  # Hard ceiling: no reservation survives >90s
+
         for r in all_reservations:
             expires_at = r.get("expires_at", 0)
-            
+
+            # Skip if missing expires_at (invalid reservation)
+            if not expires_at or expires_at <= 0:
+                freed_amount += float(r.get("amount", 0.0))
+                continue
+
             # Skip if already expired (TTL passed)
             if expires_at <= now:
                 freed_amount += float(r.get("amount", 0.0))
                 continue
-            
-            # Skip if created >60 seconds ago (emergency force-expire)
-            if expires_at - 30 < now - 60:  # expires_at - ttl < now - 60
+
+            # Skip if created too long ago (emergency force-expire).
+            # Use stored created_at when available; fall back to default TTL estimate.
+            created_at = r.get("created_at", 0)
+            if not created_at or created_at <= 0:
+                # Legacy reservation without created_at: estimate from default TTL
+                created_at = expires_at - float(self.config.reservation_default_ttl)
+            age_sec = now - created_at
+            if age_sec > max_reservation_age_sec:
                 freed_amount += float(r.get("amount", 0.0))
                 continue
-                
-            # Skip if missing expires_at (invalid reservation)
-            if expires_at == 0:
-                freed_amount += float(r.get("amount", 0.0))
-                continue
-            
+
             # Valid reservation - keep it
             cleaned_reservations.append(r)
         
@@ -2786,10 +2856,14 @@ class SharedState:
         
         for r in all_reservations:
             expires_at = r.get("expires_at", 0)
-            created_age = now - (expires_at - 30) if expires_at > 0 else float('inf')
-            
-            # Force remove if older than 60 seconds
-            if created_age > 60 or expires_at == 0:
+            created_at = r.get("created_at", 0)
+            if not created_at or created_at <= 0:
+                # Legacy reservation: estimate creation from default TTL
+                created_at = (expires_at - float(self.config.reservation_default_ttl)) if expires_at > 0 else 0
+            age_sec = (now - created_at) if created_at > 0 else float('inf')
+
+            # Force remove if older than 60 seconds or invalid
+            if age_sec > 60 or expires_at <= 0:
                 freed += float(r.get("amount", 0.0))
                 removed += 1
             else:
@@ -2803,14 +2877,11 @@ class SharedState:
         return (removed, freed)
 
     async def get_spendable_quote(self, asset: str, *, reserve_ratio: float = 0.10, min_reserve: float = 0.0) -> float:
-        """Alias for get_spendable_balance for compatibility with callers using 'quote' wording."""
+        """Alias → get_spendable_balance(). Used by ml_forecaster, free_usdt(), get_free_quote()."""
         return await self.get_spendable_balance(asset, reserve_ratio=reserve_ratio, min_reserve=min_reserve)
 
     async def get_free_quote(self) -> float:
-        """
-        Convenience getter for available quote balance (free funds) after safety reserve,
-        using the configured quote_asset (default: USDT).
-        """
+        """Alias → get_spendable_quote(quote_asset). Used by execution_logic, meta_controller."""
         return await self.get_spendable_quote(
             self.quote_asset,
             reserve_ratio=self.config.quote_reserve_ratio,
@@ -2818,7 +2889,7 @@ class SharedState:
         )
 
     async def get_spendable_usdt(self) -> float:
-        """Convenience alias for the configured quote asset (usually USDT)."""
+        """Alias → get_spendable_balance(quote_asset). Used by scaling, liquidation, meta_controller."""
         return await self.get_spendable_balance(self.quote_asset)
 
     async def get_non_quote_positions(self) -> Dict[str, Dict[str, Any]]:
@@ -2860,7 +2931,13 @@ class SharedState:
         origin: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Register dust metadata so we can distinguish strategy vs. trash origins."""
+        """Register dust metadata so we can distinguish strategy vs. trash origins.
+
+        NOTE: This is sync because it's called from many sync paths (mark_as_dust,
+        hydrate_positions_from_balances, etc). Safe in single-threaded asyncio since
+        it contains no await points — all dict writes execute atomically within one
+        event loop tick.
+        """
         try:
             sym = self._norm_sym(symbol)
             now = time.time()
@@ -2881,10 +2958,13 @@ class SharedState:
                 existing_ctx.update(context)
                 entry["context"] = existing_ctx
 
+            # Write dust_registry first, then update position state.
+            # Both are single dict assignments — atomic in CPython's GIL.
             self.dust_registry[sym] = entry
 
-            if sym in self.positions:
-                self.positions[sym]["state"] = PositionState.DUST_LOCKED.value
+            pos = self.positions.get(sym)
+            if pos is not None:
+                pos["state"] = PositionState.DUST_LOCKED.value
 
             if sym not in self._dust_first_seen:
                 self._dust_first_seen[sym] = first_seen
@@ -3002,41 +3082,9 @@ class SharedState:
                 base_asset = sym
             quote_asset = quote
 
-            # Prefer RAW Binance-shaped filters first, then fall back to normalized
-            f = dict(self.symbol_filters.get(sym, {}))
-            if self._exchange_client:
-                try:
-                    raw = await self._exchange_client.get_symbol_filters_raw(sym) if hasattr(self._exchange_client, "get_symbol_filters_raw") else {}
-                except Exception:
-                    raw = {}
-                if isinstance(raw, dict) and raw:
-                    f = dict(raw)
-                    # cache RAW in shared_state for future lookups
-                    self.symbol_filters[sym] = dict(raw)
-                elif not f:
-                    # fallback to normalized map if RAW not available
-                    try:
-                        norm = await self._exchange_client.get_symbol_filters(sym) if hasattr(self._exchange_client, "get_symbol_filters") else {}
-                    except Exception:
-                        norm = {}
-                    if isinstance(norm, dict) and norm:
-                        # keep normalized under a namespaced key to avoid clobbering RAW layout
-                        f = {"_normalized": dict(norm)}
-                        self.symbol_filters[sym] = dict(f)
-
-            # Derive lot_step and min_notional supporting both schemas
-            lot_step = float(
-                f.get("LOT_SIZE", {}).get("stepSize")
-                or f.get("stepSize")
-                or f.get("_normalized", {}).get("step_size", 0.0)
-                or 0.0
-            )
-            min_notional = float(
-                f.get("MIN_NOTIONAL", {}).get("minNotional")
-                or f.get("minNotional")
-                or f.get("_normalized", {}).get("min_notional", 0.0)
-                or 0.0
-            )
+            # Fetch filters (raw → normalized fallback, cached)
+            f = await self._fetch_and_cache_symbol_filters(sym)
+            lot_step, _min_qty, _tick_size, min_notional = self._extract_symbol_filter_values(f)
 
             # Current price
             px = float(prices.get(sym) or pos.get("mark_price") or pos.get("entry_price") or 0.0)
@@ -3366,9 +3414,10 @@ class SharedState:
 
     async def get_portfolio_snapshot(self) -> Dict[str, Any]:
         prices = await self.get_all_prices()
-        nav = 0.0; unreal = 0.0
+        nav = 0.0
+        unreal = 0.0
         for asset, b in self.balances.items():
-            if asset.upper() == "USDT":
+            if asset.upper() == self.quote_asset.upper():
                 nav += float(b.get("free", 0.0)) + float(b.get("locked", 0.0))
         for sym, pos in self.positions.items():
             qty = float(pos.get("quantity", 0.0))
@@ -3378,7 +3427,8 @@ class SharedState:
             nav += qty * px
             if avg > 0 and px > 0:
                 unreal += (px - avg) * qty
-        self.metrics["nav"] = nav; self.metrics["unrealized_pnl"] = unreal
+        self.metrics["nav"] = nav
+        self.metrics["unrealized_pnl"] = unreal
         if not self.nav_ready_event.is_set():
             self.nav_ready_event.set()
             self.metrics["nav_ready"] = True
@@ -3392,7 +3442,6 @@ class SharedState:
             "prices": prices,
         }
 
-    # ---- Rejection Tracking (Deadlock Prevention) ----
     # ---- Rejection Tracking (Deadlock Prevention) ----
     async def record_rejection(self, symbol: str, side: str, reason: str, source: str = "Unknown"):
         """P9: Record a trade rejection/block for deadlock detection."""
@@ -3429,6 +3478,17 @@ class SharedState:
             policy_conflicts = self.metrics.get("policy_conflicts", {})
             if conflict_type in policy_conflicts:
                 policy_conflicts[conflict_type] = policy_conflicts.get(conflict_type, 0) + 1
+        except Exception:
+            pass
+
+    def register_signal_outcome(self, record: Dict[str, Any]) -> None:
+        """Register a signal outcome for tracking price movement after emission.
+        
+        Args:
+            record: Dict with keys: symbol, timestamp, price_at_signal, confidence, agent
+        """
+        try:
+            self._signal_outcomes.append(record)
         except Exception:
             pass
 
@@ -3528,20 +3588,28 @@ class SharedState:
         return False
 
 
-    async def record_fill(self, symbol: str, side: str, qty: float, price: float, fee_quote: float = 0.0, fee_base: float = 0.0, tier: Optional[str] = None) -> None:
+    async def record_fill(self, symbol: str, side: str, qty: float, price: float, fee_quote: float = 0.0, fee_base: float = 0.0, tier: Optional[str] = None) -> Dict[str, Any]:
         side_u = (side or "").upper()
-        qty = float(qty); price = float(price)
-        if qty <= 0 or price <= 0: return
+        qty = float(qty)
+        price = float(price)
+        if qty <= 0 or price <= 0: return {"realized_pnl_delta": 0.0}
         pos = dict(self.positions.get(symbol, {}))
         cur_qty = float(pos.get("quantity", 0.0))
         avg = float(pos.get("avg_price", self._avg_price_cache.get(symbol, 0.0) or 0.0))
         realized = 0.0
+        fee_quote = float(fee_quote or 0.0)
         fee_base = float(fee_base or 0.0)
         
         if side_u == "BUY":
-            buy_fee_base = float(pos.get("buy_fee_base", 0.0) or 0.0) + fee_base
-            new_qty = cur_qty + qty
-            new_avg = ((cur_qty * avg) + (qty * price)) / max(new_qty, 1e-12)
+            # Spot BUY fees can be charged in base or quote. Track both as base-equivalent
+            # and keep position qty net of base-fee deductions.
+            fee_quote_equiv_base = (fee_quote / price) if fee_quote > 0 and price > 0 else 0.0
+            buy_fee_base = float(pos.get("buy_fee_base", 0.0) or 0.0) + fee_base + fee_quote_equiv_base
+            net_qty = max(0.0, qty - fee_base)
+            if net_qty <= 0:
+                return {"realized_pnl_delta": 0.0}
+            new_qty = cur_qty + net_qty
+            new_avg = ((cur_qty * avg) + (net_qty * price)) / max(new_qty, 1e-12)
             pos.update({
                 "quantity": new_qty,
                 "avg_price": new_avg,
@@ -3559,8 +3627,16 @@ class SharedState:
                 
         elif side_u == "SELL":
             close_qty = min(qty, cur_qty)
+            sell_fee_quote = fee_quote
+            if qty > 0 and close_qty > 0 and close_qty < qty:
+                sell_fee_quote *= (close_qty / max(qty, 1e-12))
+            buy_fee_quote = 0.0
             if close_qty > 0 and avg > 0:
-                realized = (price - avg) * close_qty - float(fee_quote or 0.0)
+                buy_fee_base_total = float(pos.get("buy_fee_base", 0.0) or 0.0)
+                if cur_qty > 0 and buy_fee_base_total > 0:
+                    allocated_buy_fee_base = buy_fee_base_total * (close_qty / cur_qty)
+                    buy_fee_quote = allocated_buy_fee_base * avg
+                realized = (price - avg) * close_qty - float(sell_fee_quote or 0.0) - float(buy_fee_quote or 0.0)
             new_qty = max(0.0, cur_qty - qty)
             if new_qty == 0:
                 pos.pop("buy_fee_base", None)
@@ -3579,7 +3655,7 @@ class SharedState:
                 self.metrics["total_holding_time_sec"] += duration
                 self.metrics["completed_trades_count"] += 1
         else:
-            return
+            return {"realized_pnl_delta": 0.0}
 
         current_qty = float(pos.get("quantity", 0.0) or 0.0)
         significant_floor = float(await self.get_significant_position_floor(symbol) or 0.0)
@@ -3643,16 +3719,20 @@ class SharedState:
             self.dust_registry.pop(self._norm_sym(symbol), None)
             
         self.metrics["realized_pnl"] = float(self.metrics.get("realized_pnl", 0.0)) + realized
+        now_ts = time.time()
+        self._realized_pnl.append((now_ts, realized))
         self.trade_history.append({
-            "ts": time.time(), "symbol": symbol, "side": side_u, "qty": qty, "price": price, "fee_quote": fee_quote,
+            "ts": now_ts, "symbol": symbol, "side": side_u, "qty": qty, "price": price, "fee_quote": fee_quote,
             "fee_base": fee_base, "realized_delta": realized, "tier": tier
         })
         self.trade_count += 1
-        await self.emit_event("RealizedPnlUpdated", {"realized_pnl": self.metrics["realized_pnl"]})
+        total_realized = self.metrics["realized_pnl"]
+        await self.emit_event("RealizedPnlUpdated", {"realized_pnl": total_realized, "pnl_delta": realized, "symbol": symbol})
+        return {"realized_pnl_delta": realized, "realized_pnl_total": total_realized}
 
-    async def record_trade(self, symbol: str, side: str, qty: float, price: float, fee_quote: float = 0.0, fee_base: float = 0.0, tier: Optional[str] = None) -> None:
+    async def record_trade(self, symbol: str, side: str, qty: float, price: float, fee_quote: float = 0.0, fee_base: float = 0.0, tier: Optional[str] = None) -> Dict[str, Any]:
         """Compatibility alias for ExecutionManager post-fill tracking."""
-        await self.record_fill(symbol, side, qty, price, fee_quote=fee_quote, fee_base=fee_base, tier=tier)
+        return await self.record_fill(symbol, side, qty, price, fee_quote=fee_quote, fee_base=fee_base, tier=tier)
 
     def increment_idle_ticks(self) -> None:
         """Frequency Engineering: Track periods of no trading activity."""
@@ -3693,19 +3773,24 @@ class SharedState:
                 else:
                     position_data["state"] = PositionState.ACTIVE.value
             
-            # ===== CRITICAL FIX: Ensure status field exists =====
-            # Required by get_open_positions() to avoid false FLAT state
-            # If position has quantity > 0 but no status field, it will be
-            # filtered out by get_open_positions(), causing portfolio to
-            # incorrectly appear FLAT
+            # ===== Ensure status/state fields are consistent =====
+            # Use classify_position_snapshot to align with the canonical
+            # SIGNIFICANT/DUST vocabulary used everywhere else.
             if "status" not in position_data:
-                # Default to "OPEN" if not specified
-                position_data["status"] = "OPEN"
-                self.logger.debug(
-                    "[SS:UpdatePos] Added default status='OPEN' to position %s "
-                    "(missing status field could cause false FLAT state)",
-                    sym
-                )
+                qty = float(position_data.get("quantity", 0.0) or 0.0)
+                if qty > 0:
+                    is_sig, val, floor = self.classify_position_snapshot(sym, position_data)
+                    position_data["status"] = "SIGNIFICANT" if is_sig else "DUST"
+                    position_data["state"] = PositionState.ACTIVE.value if is_sig else PositionState.DUST_LOCKED.value
+                    position_data["is_significant"] = is_sig
+                    position_data["is_dust"] = not is_sig
+                    position_data["_is_dust"] = not is_sig
+                    position_data["open_position"] = is_sig
+                    position_data.setdefault("value_usdt", val)
+                    position_data.setdefault("significant_floor_usdt", floor)
+                else:
+                    position_data["status"] = "CLOSED"
+                    position_data["state"] = PositionState.DUST_LOCKED.value
             
             self.positions[sym] = dict(position_data)
 
@@ -3757,6 +3842,28 @@ class SharedState:
         cur_qty = float(pos.get("quantity", 0.0) or 0.0)
         new_qty = max(0.0, cur_qty - exec_qty) if cur_qty > 0 and exec_qty > 0 else cur_qty
 
+        # 🔥 CRITICAL: Log position closure BEFORE modifying state
+        if new_qty <= 0 and cur_qty > 0:
+            logger = logging.getLogger(self.__class__.__name__)
+            logger.critical(
+                "[SS:MarkPositionClosed] POSITION FULLY CLOSED: symbol=%s cur_qty=%.10f "
+                "exec_qty=%.10f exec_price=%.8f reason=%s tag=%s",
+                sym, cur_qty, exec_qty, exec_price, reason, tag
+            )
+            # Journal position closure
+            with contextlib.suppress(Exception):
+                if hasattr(self, "_journal") and callable(getattr(self, "_journal")):
+                    self._journal("POSITION_MARKED_CLOSED", {
+                        "symbol": sym,
+                        "prev_qty": cur_qty,
+                        "executed_qty": exec_qty,
+                        "executed_price": exec_price,
+                        "remaining_qty": new_qty,
+                        "reason": reason,
+                        "tag": tag,
+                        "timestamp": time.time(),
+                    })
+
         if pos:
             pos["quantity"] = new_qty
             if new_qty <= 0:
@@ -3776,6 +3883,12 @@ class SharedState:
                 tr_qty = float(tr.get("quantity", 0.0) or 0.0)
                 tr_new_qty = max(0.0, tr_qty - exec_qty) if tr_qty > 0 and exec_qty > 0 else tr_qty
                 if tr_new_qty <= 0:
+                    # ⚠️ IMPORTANT: Log removal of open_trades entry
+                    logger = logging.getLogger(self.__class__.__name__)
+                    logger.warning(
+                        "[SS:OpenTradesRemoved] Removing from open_trades: symbol=%s qty=%.10f reason=%s",
+                        sym, tr_qty, reason
+                    )
                     ot.pop(sym, None)
                 else:
                     tr["quantity"] = tr_new_qty
@@ -3796,7 +3909,8 @@ class SharedState:
             pass
 
     async def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
-        return self.positions.get(symbol)
+        return self.positions.get(self._norm_sym(symbol))
+
     async def get_position_quantity(self, symbol: str) -> float:
         p = await self.get_position(symbol)
         if not p:
@@ -3840,16 +3954,45 @@ class SharedState:
     # -------- Liquidity reservations --------
     async def reserve_liquidity(self, asset: str, amount: float, ttl_seconds: int = None) -> str:
         ttl = ttl_seconds if ttl_seconds is not None else self.config.reservation_default_ttl
-        rid = f"{asset}_{time.time()}_{amount}"
+        now = time.time()
+        rid = f"{asset}_{now}_{amount}"
         async with self._lock_context("balances"):
-            self._quote_reservations.setdefault(asset.upper(), []).append({"id": rid, "amount": float(amount), "expires_at": time.time()+ttl})
+            self._quote_reservations.setdefault(asset.upper(), []).append({
+                "id": rid,
+                "amount": float(amount),
+                "created_at": now,
+                "expires_at": now + ttl,
+            })
         return rid
     async def release_liquidity(self, asset: str, reservation_id: str) -> bool:
         async with self._lock_context("balances"):
             arr = self._quote_reservations.get(asset.upper(), [])
             for i, r in enumerate(arr):
                 if r.get("id") == reservation_id:
-                    arr.pop(i); return True
+                    arr.pop(i)
+                    return True
+        return False
+
+    async def rollback_liquidity(self, asset: str, reservation_id: str) -> bool:
+        """
+        PHASE 2: Rollback (cancel) a liquidity reservation without releasing it.
+        
+        Used when an order fails to fill or when execution is cancelled.
+        Identical to release_liquidity() but with explicit semantic meaning.
+        
+        Args:
+            asset: Quote asset (e.g., 'USDT')
+            reservation_id: Reservation ID returned from reserve_liquidity()
+        
+        Returns:
+            bool: True if reservation was found and rolled back, False otherwise
+        """
+        async with self._lock_context("balances"):
+            arr = self._quote_reservations.get(asset.upper(), [])
+            for i, r in enumerate(arr):
+                if r.get("id") == reservation_id:
+                    arr.pop(i)
+                    return True
         return False
 
     # -------- Liquidation requests (consumed by LiquidationAgent) --------
@@ -3992,7 +4135,7 @@ class SharedState:
         self._capital_failures.pop(agent_id, None)
 
     # -------- Events & health --------
-    async def emit_event(self, event_name: str, event_data: Dict[Dict[str, Any]]) -> None:
+    async def emit_event(self, event_name: str, event_data: Dict[str, Any]) -> None:
         """Structured event emission path; persists in-memory and notifies subscribers."""
         # Persistent storage for specific critical events (e.g. AllocationPlan)
         if event_name == "AllocationPlan":
@@ -4029,7 +4172,9 @@ class SharedState:
             try: q.put_nowait(ev)
             except Exception: pass
     async def subscribe_events(self, subscriber_name: str, max_queue: int = 1000) -> asyncio.Queue:
-        q = asyncio.Queue(maxsize=max_queue); self._subscribers[subscriber_name] = q; return q
+        q = asyncio.Queue(maxsize=max_queue)
+        self._subscribers[subscriber_name] = q
+        return q
     async def unsubscribe(self, subscriber_name: str) -> None:
         self._subscribers.pop(subscriber_name, None)
 
@@ -4050,10 +4195,59 @@ class SharedState:
 
     def is_cold_bootstrap(self) -> bool:
         """
-        GAP #4 FIX: Returns True ONLY if system has never executed ANY trade (true cold-start).
-        This is the correct semantic for "can we allow emergency operations?"
+        Returns True ONLY when ALL of these conditions are met:
+          1. Total historical trades == 0 (no prior execution history)
+          2. No database/persistence file exists (true first-ever launch)
+          3. COLD_BOOTSTRAP_ENABLED flag is explicitly True (opt-in)
+          4. LIVE_MODE is NOT True (live systems never force-bootstrap)
+
+        This prevents bootstrap logic (forced seed trades, sell blocks, confidence
+        overrides) from firing on restarts, when a DB exists, or in live trading.
+        Startup must be pure reconciliation — no forced action.
         """
-        return self.metrics.get("first_trade_at") is None and self.metrics.get("total_trades_executed", 0) == 0
+        # Condition 1: Zero historical trades
+        has_trade_history = (
+            self.metrics.get("first_trade_at") is not None
+            or self.metrics.get("total_trades_executed", 0) > 0
+        )
+        if has_trade_history:
+            return False
+
+        # Condition 2: No persistent state (DB file / snapshot) exists
+        try:
+            import os
+            db_path = getattr(self, "_db_path", None) or getattr(self.config, "DB_PATH", None) or getattr(self.config, "DATABASE_PATH", None)
+            if db_path and os.path.exists(str(db_path)):
+                return False
+            snapshot_path = getattr(self.config, "SNAPSHOT_PATH", None) or getattr(self.config, "STATE_SNAPSHOT_FILE", None)
+            if snapshot_path and os.path.exists(str(snapshot_path)):
+                return False
+        except Exception:
+            pass
+
+        # Condition 3: Explicit opt-in flag required
+        cold_enabled = False
+        try:
+            v = getattr(self.config, "COLD_BOOTSTRAP_ENABLED", None)
+            if v is None:
+                import os as _os
+                v = _os.getenv("COLD_BOOTSTRAP_ENABLED")
+            if v is not None:
+                cold_enabled = str(v).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            cold_enabled = False
+        if not cold_enabled:
+            return False
+
+        # Condition 4: Must NOT be in live trading mode
+        try:
+            is_live = bool(getattr(self.config, "LIVE_MODE", False))
+            if is_live:
+                return False
+        except Exception:
+            pass
+
+        return True
 
     def get_cold_bootstrap_duration_sec(self) -> float:
         """
@@ -4128,7 +4322,7 @@ class SharedState:
         - RESERVED: Capital locked but should recover soon
         """
         try:
-            spendable = await self._free_usdt() if hasattr(self, "_free_usdt") else 0.0
+            spendable = await self.free_usdt() if hasattr(self, "free_usdt") else 0.0
             min_viable = float(getattr(self.config, "MIN_EXECUTABLE_QUOTE", 10.0))
             
             # Count active reservations
@@ -4338,20 +4532,17 @@ class SharedState:
             try: await asyncio.gather(*tasks, return_exceptions=True)
             except Exception: pass
         self.logger.info("SharedState shutdown completed")
-    def get_positions_by_symbol(self) -> Dict[str, Dict[str, Any]]:
-        return dict(self.positions)
-    
     def get_positions(self) -> Dict[str, Dict[str, Any]]:
         """
         ✅ CANONICAL: Get all positions (both open and closed).
-        
-        Alias for get_positions_by_symbol() to maintain API compatibility.
-        Used by meta_controller and other components expecting this interface.
-        
+
         Returns:
             Dict mapping symbol → position_data
         """
         return dict(self.positions)
+
+    # Alias kept for callers that used the old name
+    get_positions_by_symbol = get_positions
     
     # ----------- Additional helpers & wrappers -----------
 
@@ -4367,14 +4558,12 @@ class SharedState:
         """Return a shallow copy of all positions."""
         return dict(self.positions)
 
-    def get_open_positions(self) -> Dict[str, Dict[str, Any]]:
+    def _sync_heal_position_states(self) -> None:
         """
-        Return only OPEN SIGNIFICANT positions.
-
-        Canonical invariant:
-        position is OPEN iff position_value_usdt >= significant_position_floor.
+        Self-heal stale position classification state.
+        Ensures dust positions are properly marked and don't block routing/capacity.
+        Call this explicitly rather than hiding mutations inside getters.
         """
-        result = {}
         for sym, pos_data in list(self.positions.items()):
             if not isinstance(pos_data, dict):
                 continue
@@ -4383,7 +4572,6 @@ class SharedState:
                 continue
             is_open, value_usdt, floor = self.classify_position_snapshot(sym, pos_data)
             if not is_open:
-                # Self-heal stale state so dust never blocks routing/capacity.
                 pos_data["status"] = "DUST"
                 pos_data["state"] = PositionState.DUST_LOCKED.value
                 pos_data["is_significant"] = False
@@ -4395,20 +4583,37 @@ class SharedState:
                 pos_data["significant_floor_usdt"] = float(floor)
                 self.positions[sym] = pos_data
                 self.open_trades.pop(sym, None)
+            else:
+                pos_data["status"] = "SIGNIFICANT"
+                pos_data["state"] = PositionState.ACTIVE.value
+                pos_data["is_significant"] = True
+                pos_data["is_dust"] = False
+                pos_data["_is_dust"] = False
+                pos_data["open_position"] = True
+                pos_data["capital_occupied"] = float(value_usdt)
+                pos_data["value_usdt"] = float(value_usdt)
+                pos_data["significant_floor_usdt"] = float(floor)
+                self.positions[sym] = pos_data
+
+    def get_open_positions(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Return only OPEN SIGNIFICANT positions.
+
+        Canonical invariant:
+        position is OPEN iff position_value_usdt >= significant_position_floor.
+
+        Side effect: heals stale position states (dust mis-classified as significant).
+        """
+        self._sync_heal_position_states()
+        result = {}
+        for sym, pos_data in list(self.positions.items()):
+            if not isinstance(pos_data, dict):
                 continue
-
-            pos_data["status"] = "SIGNIFICANT"
-            pos_data["state"] = PositionState.ACTIVE.value
-            pos_data["is_significant"] = True
-            pos_data["is_dust"] = False
-            pos_data["_is_dust"] = False
-            pos_data["open_position"] = True
-            pos_data["capital_occupied"] = float(value_usdt)
-            pos_data["value_usdt"] = float(value_usdt)
-            pos_data["significant_floor_usdt"] = float(floor)
-            self.positions[sym] = pos_data
-            result[sym] = pos_data
-
+            qty = float(pos_data.get("quantity", 0.0) or pos_data.get("qty", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+            if pos_data.get("is_significant", False) and pos_data.get("open_position", False):
+                result[sym] = pos_data
         return result
 
     def get_position_qty(self, symbol: str) -> float:
