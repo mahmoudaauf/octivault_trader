@@ -18,6 +18,28 @@ class PortfolioAuthority:
         self.target_velocity_ratio = float(getattr(config, "TARGET_PROFIT_RATIO_PER_HOUR", 0.001))
         self.max_symbol_concentration = float(getattr(config, "MAX_SYMBOL_CONCENTRATION_PCT", 0.3)) # 30%
 
+    def _is_permanent_dust_position(self, symbol: str, pos: Dict[str, Any]) -> bool:
+        """Permanent dust is invisible to portfolio governance."""
+        sym = str(symbol or "").upper()
+        try:
+            if hasattr(self.ss, "is_permanent_dust") and self.ss.is_permanent_dust(sym):
+                return True
+        except Exception:
+            pass
+        threshold = float(getattr(self.config, "PERMANENT_DUST_USDT_THRESHOLD", 1.0) or 1.0)
+        try:
+            value = float((pos or {}).get("value_usdt", 0.0) or 0.0)
+            if value <= 0:
+                qty = float((pos or {}).get("quantity", 0.0) or (pos or {}).get("qty", 0.0) or 0.0)
+                px = 0.0
+                with_ohlc = getattr(self.ss, "latest_prices", {}) or {}
+                px = float(with_ohlc.get(sym, 0.0) or 0.0) if isinstance(with_ohlc, dict) else 0.0
+                if qty > 0 and px > 0:
+                    value = qty * px
+            return bool(value > 0 and value < threshold)
+        except Exception:
+            return False
+
     def authorize_velocity_exit(self, owned_positions: Dict[str, Any], current_metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Layer 3: Evaluate if we need to force an exit because target velocity is not met.
@@ -38,6 +60,8 @@ class PortfolioAuthority:
         now = time.time()
         
         for sym, pos in owned_positions.items():
+            if self._is_permanent_dust_position(sym, pos):
+                continue
             if pos.get("state") == "EXITING":
                 continue
                 
@@ -81,6 +105,8 @@ class PortfolioAuthority:
         if nav <= 0: return None
         
         for sym, pos in owned_positions.items():
+            if self._is_permanent_dust_position(sym, pos):
+                continue
             val = float(pos.get("value_usdt", 0.0))
             concentration = val / nav
             
@@ -111,6 +137,8 @@ class PortfolioAuthority:
         
         now = time.time()
         for sym, pos in owned_positions.items():
+            if self._is_permanent_dust_position(sym, pos):
+                continue
             if pos.get("state") == "EXITING":
                 continue
                 

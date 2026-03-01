@@ -350,6 +350,13 @@ class PolicyManager:
             "symbol": symbol.upper().strip(),
             "side": side.upper(),
             "validated_at": time.time(),
+            # Unified economic thresholds from config
+            "min_notional": float(getattr(self.config, "MIN_NOTIONAL_USDT", 10.0)),
+            "min_entry_quote": float(getattr(self.config, "MIN_ENTRY_QUOTE_USDT", 80.0)),
+            "scout_min_notional": float(getattr(self.config, "SCOUT_MIN_NOTIONAL", 6.0)),
+            "base_min_notional": float(getattr(self.config, "BASE_MIN_NOTIONAL", 5.0)),
+            "dust_threshold": float(getattr(self.config, "DUST_EXIT_THRESHOLD", 0.60)),
+            "min_economic_trade": float(getattr(self.config, "MIN_ECONOMIC_TRADE_USDT", 40.0)),
         }
         if policies:
             ctx["validated_policies"] = sorted({p for p in policies if p})
@@ -388,6 +395,14 @@ class PolicyManager:
         if signal.get("expected_return") is not None:
             try:
                 return float(signal["expected_return"]) * 10000.0
+            except (TypeError, ValueError):
+                pass
+        # MLForecaster emits _expected_move_pct (percentage move expected)
+        # Convert: 0.05 (5% move) => 500 basis points
+        if signal.get("_expected_move_pct") is not None:
+            try:
+                move_pct = float(signal["_expected_move_pct"])
+                return move_pct * 10000.0  # Convert percentage to basis points
             except (TypeError, ValueError):
                 pass
         return None

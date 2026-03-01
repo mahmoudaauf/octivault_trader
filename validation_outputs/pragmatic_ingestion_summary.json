@@ -1,0 +1,24 @@
+{
+  "BTCUSDT": {
+    "status": "SUCCESS",
+    "ohlcv_rows": 4323,
+    "funding_rows": 540,
+    "merged_rows": 4323,
+    "date_range": {
+      "start": "2025-08-25 19:00:00",
+      "end": "2026-02-21 21:00:00"
+    },
+    "output_file": "validation_outputs/BTCUSDT_6month_1h_structural.csv"
+  },
+  "ETHUSDT": {
+    "status": "SUCCESS",
+    "ohlcv_rows": 4323,
+    "funding_rows": 540,
+    "merged_rows": 4323,
+    "date_range": {
+      "start": "2025-08-25 19:00:00",
+      "end": "2026-02-21 21:00:00"
+    },
+    "output_file": "validation_outputs/ETHUSDT_6month_1h_structural.csv"
+  }
+}

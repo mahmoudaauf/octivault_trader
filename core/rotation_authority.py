@@ -6,6 +6,7 @@ Provides capital velocity governance by authorizing forced exits for rotation.
 import time
 import logging
 from typing import Dict, Any, List, Optional, Tuple
+from utils.shared_state_tools import fee_bps
 
 class RotationExitAuthority:
     def __init__(self, logger: logging.Logger, config: Any, shared_state: Any):
@@ -28,6 +29,116 @@ class RotationExitAuthority:
             "PROTECTIVE": 0.9   # Minimal
         }
 
+        # Stagnation-based forced rotation controls
+        self.stagnation_force_enabled = bool(
+            getattr(config, "STAGNATION_FORCE_ROTATION_ENABLED", True)
+        )
+        self.stagnation_force_consec_cycles = int(
+            getattr(
+                config,
+                "STAGNATION_STREAK_LIMIT",
+                getattr(config, "STAGNATION_FORCE_ROTATION_CONSEC_CYCLES", 3),
+            )
+            or 3
+        )
+        self.stagnation_force_age_sec = float(
+            getattr(config, "STAGNATION_AGE_SEC", 0.0) or 0.0
+        )
+        self.stagnation_force_age_mult = float(
+            getattr(config, "STAGNATION_FORCE_ROTATION_MIN_AGE_MULT", 2.5) or 2.5
+        )
+        self.stagnation_force_pnl_band = float(
+            getattr(
+                config,
+                "STAGNATION_PNL_THRESHOLD",
+                getattr(config, "STAGNATION_FORCE_ROTATION_PNL_BAND", 0.0025),
+            )
+            or 0.0025
+        )
+        self.stagnation_force_sell_fraction = float(
+            getattr(config, "STAGNATION_FORCE_ROTATION_SELL_FRACTION", 0.50) or 0.50
+        )
+        self.stagnation_continuation_min_score = float(
+            getattr(config, "STAGNATION_CONTINUATION_MIN_SCORE", 0.65) or 0.65
+        )
+        self._stagnation_streaks: Dict[str, int] = {}
+        # Track latest seen entry timestamp per symbol to detect new buys / re-entries
+        self._stagnation_entry_ts: Dict[str, float] = {}
+    # (legacy) we track latest seen entry timestamp per symbol in
+    # _stagnation_entry_ts; no separate last_known or purge accumulators needed
+        # Grace period after opening a position during which stagnation purge is disabled
+        self.hold_grace_seconds = float(getattr(self.config, "HOLD_GRACE_SECONDS", 180.0) or 180.0)
+
+    def _is_cold_bootstrap_active(self) -> bool:
+        """Forced rotations must never fire during cold bootstrap."""
+        checker = getattr(self.ss, "is_cold_bootstrap", None)
+        if callable(checker):
+            try:
+                res = checker()
+                if hasattr(res, "__await__"):
+                    # Coroutine returned — close it to avoid RuntimeWarning,
+                    # then fall through to attribute check.
+                    res.close()
+                    self.logger.warning("[REA] is_cold_bootstrap is async; falling back to attribute check")
+                else:
+                    return bool(res)
+            except Exception:
+                return False
+        return bool(getattr(self.ss, "cold_bootstrap", False))
+
+    def _continuation_score(self, pos: Dict[str, Any]) -> float:
+        """Best-effort continuation strength used to avoid rotating strong trend holds."""
+        if not isinstance(pos, dict):
+            return 0.0
+        for key in (
+            "continuation_score",
+            "continuation_strength",
+            "signal_strength",
+            "trend_strength",
+            "_continuation_confidence",
+        ):
+            try:
+                if key in pos and pos.get(key) is not None:
+                    score = float(pos.get(key) or 0.0)
+                    return max(0.0, min(1.0, score))
+            except Exception:
+                continue
+        return 0.0
+
+    def _round_trip_fee_pct(self) -> float:
+        """Round-trip fee cost as a ratio (e.g. 0.002 = 0.2%)."""
+        try:
+            taker_bps = float(fee_bps(self.ss, "taker") or 10.0)
+            slippage_bps = float(
+                getattr(self.config, "EXIT_SLIPPAGE_BPS",
+                        getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0
+            )
+            return ((taker_bps * 2.0) + slippage_bps) / 10000.0
+        except Exception:
+            return 0.002  # conservative fallback: 20bps round-trip
+
+    def _is_permanent_dust_position(self, symbol: str, pos: Dict[str, Any]) -> bool:
+        """Permanent dust is invisible to rotation governance."""
+        sym = str(symbol or "").upper()
+        try:
+            if hasattr(self.ss, "is_permanent_dust") and self.ss.is_permanent_dust(sym):
+                return True
+        except Exception:
+            pass
+        threshold = float(getattr(self.config, "PERMANENT_DUST_USDT_THRESHOLD", 1.0) or 1.0)
+        try:
+            value = float((pos or {}).get("value_usdt", 0.0) or 0.0)
+            if value <= 0:
+                qty = float((pos or {}).get("quantity", 0.0) or (pos or {}).get("qty", 0.0) or 0.0)
+                px = 0.0
+                with_ohlc = getattr(self.ss, "latest_prices", {}) or {}
+                px = float(with_ohlc.get(sym, 0.0) or 0.0) if isinstance(with_ohlc, dict) else 0.0
+                if qty > 0 and px > 0:
+                    value = qty * px
+            return bool(value > 0 and value < threshold)
+        except Exception:
+            return False
+
     def calculate_rotation_score(self, position: Dict[str, Any], best_opp_score: float) -> float:
         """
         R2/R3: Score a held position for rotation eligibility.
@@ -43,19 +154,21 @@ class RotationExitAuthority:
         age_sec = time.time() - entry_ts
         time_factor = min(age_sec / max_hold_sec, 1.0)
         
-        # 2. PnL Efficiency (Clamped)
-        pnl_pct = float(position.get("unrealized_pnl_pct", 0.0) or 0.0)
+        # 2. PnL Efficiency (Clamped) — use net PnL after round-trip fees
+        gross_pnl_pct = float(position.get("unrealized_pnl_pct", 0.0) or 0.0)
+        rt_fee = self._round_trip_fee_pct()
+        pnl_pct = gross_pnl_pct - rt_fee  # net of fees
         target_pnl = 0.03 # 3% target
         pnl_factor = max(-1.0, min(1.0, pnl_pct / target_pnl))
-        
+
         # We want to keep winners (high pnl) and cycle losers (low/neg pnl)
         # So efficiency_score is lower for winners
         efficiency_score = 1.0 - pnl_factor
-        
+
         # 3. Opportunity Cost
         # (How much better is the candidate compared to this position?)
-        # best_opp_score is expected ROI * confidence
-        held_score = pnl_pct * 0.5 # Basic proxy for held performance expectancy
+        # best_opp_score is expected ROI * confidence; compare against net held performance
+        held_score = pnl_pct * 0.5 # Basic proxy for held performance expectancy (net of fees)
         opportunity_cost = max(0.0, best_opp_score - held_score)
         
         # Weighting
@@ -107,6 +220,8 @@ class RotationExitAuthority:
             cooldown = 60.0 # 1 min during bootstrap
             
         for sym, pos in owned_positions.items():
+            if self._is_permanent_dust_position(sym, pos):
+                continue
             if sym == best_opp_sym:
                 continue
             
@@ -117,7 +232,18 @@ class RotationExitAuthority:
             entry_ts = float(pos.get("entry_time") or pos.get("opened_at") or 0.0)
             if (now - entry_ts) < cooldown:
                 continue
-                
+
+            # Winner protection: positions above threshold need extra alpha gap to rotate out
+            pos_pnl = float(pos.get("unrealized_pnl_pct", 0.0) or 0.0)
+            if pos_pnl >= self.winner_protection_threshold:
+                alpha_gap = opp_score - pos_pnl
+                if alpha_gap < self.winner_extra_alpha:
+                    self.logger.debug(
+                        "[REA:WinnerProtect] %s pnl=%.2f%% protected (alpha_gap=%.2f%% < required=%.2f%%)",
+                        sym, pos_pnl * 100, alpha_gap * 100, self.winner_extra_alpha * 100,
+                    )
+                    continue
+
             r_score = self.calculate_rotation_score(pos, opp_score)
             candidates.append((sym, r_score, pos))
             
@@ -188,7 +314,28 @@ class RotationExitAuthority:
         
         This prevents the "zombie portfolio" where all capital is stuck in flat trades.
         """
+        if self._is_cold_bootstrap_active():
+            self._stagnation_streaks.clear()
+            self.logger.debug("[REA:Stagnation] Cold bootstrap active; stagnation rotation disabled.")
+            return None
+
+        # Startup grace: avoid purge during initial warm-up period after process start
+        try:
+            grace_min = float(getattr(self.config, "STARTUP_STAGNATION_GRACE_MINUTES", 30.0) or 30.0)
+            start_ts = None
+            if hasattr(self.ss, "_start_time_unix"):
+                start_ts = float(getattr(self.ss, "_start_time_unix", 0.0) or 0.0)
+            else:
+                # fallback to common metric keys
+                start_ts = float((getattr(self.ss, "metrics", {}) or {}).get("startup_time", 0.0) or 0.0)
+            if start_ts and ((time.time() - start_ts) < (float(grace_min) * 60.0)):
+                self.logger.debug("[REA:Stagnation] Startup grace active (%.1fmin) — skipping stagnation purge.", grace_min)
+                return None
+        except Exception:
+            pass
+
         candidates = []
+        forced_candidates = []
         now = time.time()
         
         # Stagnation Thresholds
@@ -196,32 +343,142 @@ class RotationExitAuthority:
         max_hold = float(getattr(self.config, "MAX_HOLD_SEC", 1800))
         stagnation_mult = float(getattr(self.config, "STAGNATION_HOLD_MULT", 4.0))
         stagnation_time = max_hold * stagnation_mult
+        force_age = (
+            float(self.stagnation_force_age_sec)
+            if float(self.stagnation_force_age_sec) > 0
+            else max_hold * self.stagnation_force_age_mult
+        )
         
+        rt_fee = self._round_trip_fee_pct()
+        active_symbols = set()
         for sym, pos in owned_positions.items():
+            active_symbols.add(sym)
+            if self._is_permanent_dust_position(sym, pos):
+                self._stagnation_streaks.pop(sym, None)
+                continue
             if pos.get("state") == "EXITING":
                 continue
                 
+            # Age is strictly computed from the open position's entry timestamp (NOT symbol activity)
             entry_ts = float(pos.get("entry_time") or pos.get("opened_at") or 0.0)
             age = now - entry_ts
+
+            # Reset stagnation streak when the entry timestamp changes (new BUY / re-entry)
+            prev_entry_ts = self._stagnation_entry_ts.get(sym)
+            try:
+                if prev_entry_ts is None or abs((prev_entry_ts or 0.0) - entry_ts) > 1e-6:
+                    # New position detected → reset streak
+                    self._stagnation_streaks[sym] = 0
+                    self._stagnation_entry_ts[sym] = entry_ts
+            except Exception:
+                # tolerant fallback: if anything goes wrong, don't raise
+                pass
+
+            # Note: we used to separately track a "last known" entry timestamp and
+            # an accumulator for purge scoring. That complexity caused inconsistencies
+            # and isn't necessary — the _stagnation_entry_ts above already detects
+            # entry changes and resets streaks when a new buy/re-entry occurs.
+
+            # Hold grace: do not consider positions younger than configured hold_grace_seconds
+            try:
+                if entry_ts and age < float(getattr(self.config, "HOLD_GRACE_SECONDS", self.hold_grace_seconds) or self.hold_grace_seconds):
+                    # Reset any transient stagnation state for fresh positions
+                    self._stagnation_streaks.pop(sym, None)
+                    continue
+            except Exception:
+                pass
             
-            if age < stagnation_time:
-                continue
-                
             pnl_pct = float(pos.get("unrealized_pnl_pct", 0.0) or 0.0)
-            
+            net_pnl_pct = pnl_pct - rt_fee
+            continuation_score = self._continuation_score(pos)
+            continuation_strong = continuation_score >= self.stagnation_continuation_min_score
+
+            # Reset and skip if this position has become dust / zero quantity
+            try:
+                qty = float(pos.get("quantity") or pos.get("qty") or 0.0)
+            except Exception:
+                qty = 0.0
+            if qty <= 0:
+                self._stagnation_streaks.pop(sym, None)
+                self._stagnation_entry_ts.pop(sym, None)
+                continue
+
+            # Use net PnL (after fees) for stagnation: position is stagnant if net profit < 0
+            qualifies_soft = age >= stagnation_time and net_pnl_pct < 0.0 and not continuation_strong
+            qualifies_force = (
+                self.stagnation_force_enabled
+                and age >= force_age
+                and abs(pnl_pct) <= self.stagnation_force_pnl_band
+                and not continuation_strong
+            )
+
+            prev_streak = int(self._stagnation_streaks.get(sym, 0) or 0)
+            if qualifies_force:
+                streak = prev_streak + 1
+            else:
+                streak = 0
+            self._stagnation_streaks[sym] = streak
+
             # Stagnant if very old and low/neg profit
             # (Basically it's taking up a slot and not performing)
-            if pnl_pct < 0.001: # less than 0.1% profit
+            if qualifies_soft:
                 # Calculate a stagnation score [0-1]
                 # age/max_hold clamped, weighted by lack of performance
                 score = min(age / (stagnation_time * 2), 1.0) * (1.1 - pnl_pct)
-                candidates.append((sym, score))
+                candidates.append((sym, score, age, pnl_pct))
+
+            # Forced rotation branch: explicit multi-cycle stagnation deadlock breaker
+            if qualifies_force and streak >= self.stagnation_force_consec_cycles:
+                force_score = min(age / max(force_age, 1.0), 2.0) + max(
+                    0.0,
+                    (self.stagnation_force_consec_cycles / 10.0),
+                )
+                forced_candidates.append((sym, force_score, age, pnl_pct, streak, continuation_score))
+
+        # Prune symbols that no longer exist to keep streak map bounded.
+        stale = [s for s in list(self._stagnation_streaks.keys()) if s not in active_symbols]
+        for s in stale:
+            self._stagnation_streaks.pop(s, None)
+            self._stagnation_entry_ts.pop(s, None)
+
+        if forced_candidates:
+            worst_sym, force_score, age, pnl_pct, streak, continuation_score = max(forced_candidates, key=lambda x: x[1])
+            self.logger.warning(
+                "[REA:StagnationForce] 🚨 FORCED_ROTATION: %s age=%.1fh pnl=%.3f%% streak=%d score=%.2f continuation=%.2f",
+                worst_sym,
+                age / 3600.0,
+                pnl_pct * 100.0,
+                streak,
+                force_score,
+                continuation_score,
+            )
+            return {
+                "symbol": worst_sym,
+                "action": "SELL",
+                "confidence": 1.0,
+                "agent": "RotationExitAuthority",
+                "timestamp": now,
+                "reason": "FORCED_ROTATION_STAGNATION",
+                "tag": "meta-rotation_authority",
+                "priority": "HIGH",
+                "_forced": True,
+                "_is_rotation": True,
+                "_forced_exit": True,
+                "_is_stagnation": True,
+                "_stagnation_force": True,
+                "_stagnation_override": True,
+                "_stagnation_streak": int(streak),
+                "_continuation_score": float(continuation_score),
+                "_rotation_stage": "forced",
+                "allow_partial": True,
+                "target_fraction": max(0.10, min(1.0, self.stagnation_force_sell_fraction)),
+            }
                 
         if not candidates:
             return None
             
         # Best stagnation candidate
-        worst_sym, highest_score = max(candidates, key=lambda x: x[1])
+        worst_sym, highest_score, worst_age, worst_pnl = max(candidates, key=lambda x: x[1])
         
         # High threshold for non-replacement exit to avoid churn
         # But RECOVERY mode might want it higher, BOOTSTRAP might want it lower.
@@ -230,19 +487,24 @@ class RotationExitAuthority:
         if highest_score >= stagnation_threshold:
             self.logger.warning(
                 "[REA:Stagnation] 🔥 AUTHORIZING PURGE: %s (age=%.1fh, score=%.2f) - Clearing for future velocity.",
-                worst_sym, (now - float(owned_positions[worst_sym]['entry_time']))/3600, highest_score
+                worst_sym, (worst_age / 3600.0), highest_score
             )
             
             return {
                 "symbol": worst_sym,
                 "action": "SELL",
                 "confidence": 1.0,
-                "agent": "ExitAuthority",
+                "agent": "RotationExitAuthority",
                 "timestamp": now,
-                "reason": "STAGNATION_PURGE_OVERRIDE",
+                "reason": "STAGNATION_ROTATION_NOMINATION",
+                "tag": "meta-rotation_authority",
                 "priority": "HIGH",
+                "_forced": False,
+                "_is_rotation": True,
                 "_forced_exit": True,
-                "_is_stagnation": True
+                "_is_stagnation": True,
+                "_stagnation_pnl_pct": float(worst_pnl),
+                "_rotation_stage": "nomination",
             }
             
         return None
@@ -262,6 +524,8 @@ class RotationExitAuthority:
         max_bandwidth = float(getattr(self.config, "MAX_REA_CONCENTRATION_PCT", 0.4))
         
         for sym, pos in owned_positions.items():
+            if self._is_permanent_dust_position(sym, pos):
+                continue
             val = float(pos.get("value_usdt", 0.0))
             if (val / nav) > max_bandwidth:
                 self.logger.warning(
@@ -300,6 +564,8 @@ class RotationExitAuthority:
         candidates = []
         
         for sym, pos in owned_positions.items():
+            if self._is_permanent_dust_position(sym, pos):
+                continue
             entry_ts = float(pos.get("entry_time") or pos.get("opened_at") or now)
             age_hours = (now - entry_ts) / 3600.0
             pnl_pct = float(pos.get("unrealized_pnl_pct", 0.0) or 0.0)

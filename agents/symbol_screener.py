@@ -1,7 +1,7 @@
 import logging
 import time
 import asyncio
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from math import inf
 
 logger = logging.getLogger("SymbolScreener")
@@ -106,9 +106,10 @@ class SymbolScreener:
 
         logger.info("🔭 SymbolScreener (Market Scouting Unit) initialized.")
         logger.info(f"    ➔ Screening Interval: {self.screening_interval}s")
-        logger.info(f"    ➔ Min 24h Volume: {self.min_volume}")
-        logger.info(f"    ➔ Min 24h % Change: {self.min_percent_change}%")
-        logger.info(f"    ➔ Top N Symbols: {self.top_n_symbols}")
+        logger.info(f"    ➔ Min 24h Quote Volume: {self.min_volume}")
+        logger.info(f"    ➔ Top Volume Universe: {self.top_volume_universe_size}")
+        logger.info(f"    ➔ Candidate Pool Size: {self.candidate_pool_size}")
+        logger.info(f"    ➔ Min ATR%% ({self.atr_timeframe}): {self.min_atr_pct * 100.0:.2f}")
         logger.info(f"    ➔ Exclude List: {list(self.symbol_exclude_list)}")
         logger.info(f"    ➔ Screener Loop Interval: {self.screener_loop_interval}s")
 
@@ -152,7 +153,34 @@ class SymbolScreener:
 
     @property
     def top_n_symbols(self) -> int:
-        return int(self._cfg("SYMBOL_TOP_N", 10))
+        # Legacy compatibility; preferred knob is SYMBOL_CANDIDATE_POOL_SIZE.
+        return int(self._cfg("SYMBOL_TOP_N", self._cfg("SYMBOL_CANDIDATE_POOL_SIZE", 50)))
+
+    @property
+    def candidate_pool_size(self) -> int:
+        return max(1, int(self._cfg("SYMBOL_CANDIDATE_POOL_SIZE", self.top_n_symbols)))
+
+    @property
+    def top_volume_universe_size(self) -> int:
+        base = max(1, int(self._cfg("SYMBOL_TOP_VOLUME_UNIVERSE", 50)))
+        return max(base, self.candidate_pool_size)
+
+    @property
+    def min_atr_pct(self) -> float:
+        raw = float(self._cfg("SYMBOL_MIN_ATR_PCT", 0.008) or 0.008)
+        return (raw / 100.0) if raw > 1.0 else raw
+
+    @property
+    def atr_timeframe(self) -> str:
+        return str(self._cfg("SYMBOL_ATR_TIMEFRAME", "1h") or "1h")
+
+    @property
+    def atr_period(self) -> int:
+        return int(self._cfg("SYMBOL_ATR_PERIOD", 14) or 14)
+
+    @property
+    def atr_concurrency(self) -> int:
+        return max(1, int(self._cfg("SYMBOL_ATR_CONCURRENCY", 8) or 8))
 
     @property
     def symbol_exclude_list(self) -> set:
@@ -173,6 +201,7 @@ class SymbolScreener:
     @property
     def require_trading_status(self) -> bool:
         return bool(self._cfg("REQUIRE_TRADING_STATUS", True))
+
     async def start(self):
         """
         P9 contract: start() spawns the periodic screening loop once (idempotent).
@@ -202,89 +231,180 @@ class SymbolScreener:
         logger.info("[SymbolScreener] stopped.")
 
 
-    async def _perform_scan(self) -> List[Tuple[str, float, float, Dict[str, Any]]]:
+    def _normalize_symbol(self, symbol: str) -> str:
+        return str(symbol or "").replace("/", "").upper()
+
+    def _is_leveraged_symbol(self, symbol: str) -> bool:
+        sym = self._normalize_symbol(symbol)
+        if not sym or not sym.endswith(self.base_currency):
+            return False
+        base = sym[: -len(self.base_currency)]
+        if not base:
+            return False
+        suffixes = ("UP", "DOWN", "BULL", "BEAR", "2L", "2S", "3L", "3S", "4L", "4S", "5L", "5S")
+        for suf in suffixes:
+            if base.endswith(suf) and len(base) > (len(suf) + 1):
+                return True
+        return False
+
+    async def _build_exclude_set(self) -> set:
+        exclude = {self._normalize_symbol(x) for x in self.symbol_exclude_list}
+        if not self.exchange_client:
+            return exclude
+        try:
+            balances = await self.exchange_client.get_account_balances()
+            for asset, bal in (balances or {}).items():
+                asset_u = str(asset or "").upper()
+                if not asset_u or asset_u == self.base_currency:
+                    continue
+                free = 0.0
+                locked = 0.0
+                if isinstance(bal, dict):
+                    free = float(bal.get("free", 0.0) or 0.0)
+                    locked = float(bal.get("locked", 0.0) or 0.0)
+                else:
+                    free = float(bal or 0.0)
+                if free > 0.0 or locked > 0.0:
+                    exclude.add(f"{asset_u}{self.base_currency}")
+        except Exception:
+            logger.debug("[SymbolScreener] Failed to build wallet exclude set", exc_info=True)
+        return exclude
+
+    async def _atr_pct(self, symbol: str, price: float) -> float:
+        if price <= 0:
+            return 0.0
+        try:
+            calc_atr = getattr(self.shared_state, "calc_atr", None)
+            if callable(calc_atr):
+                atr = calc_atr(symbol, self.atr_timeframe, self.atr_period)
+                atr = await atr if asyncio.iscoroutine(atr) else atr
+                atr_val = float(atr or 0.0)
+                if atr_val > 0:
+                    return float(atr_val) / max(float(price), 1e-9)
+        except Exception:
+            logger.debug("[SymbolScreener] ATR calc failed for %s", symbol, exc_info=True)
+        return 0.0
+
+    async def _evaluate_candidate(
+        self, symbol: str, quote_volume: float, pct_change: float, last_price: float, sem: asyncio.Semaphore
+    ) -> Optional[Dict[str, Any]]:
+        async with sem:
+            if not await self._prefilter_symbol(symbol):
+                return None
+            atr_pct = float(await self._atr_pct(symbol, last_price) or 0.0)
+            return {
+                "symbol": symbol,
+                "quote_volume": float(quote_volume),
+                "price_change_percent": float(pct_change),
+                "atr_pct": atr_pct,
+                "last_price": float(last_price),
+            }
+
+    async def _perform_scan(self) -> List[Dict[str, Any]]:
         """
-        Performs a scan of all tickers to identify trending symbols based on volume and
-        percentage change, excluding symbols already in the user's wallet or on an exclude list.
-        Now returns the full ticker data along with symbol, percent_change, and volume.
+        Volatility-driven candidate scan:
+          1) Top liquid symbols by 24h quote volume
+          2) Tradability prefilter (status/min notional)
+          3) ATR% threshold gate (default 1h)
 
         Returns:
-            List[Tuple[str, float, float, Dict[str, Any]]]: A list of selected trending symbols
-            with their percentage change, volume, and full ticker data.
+            List[Dict[str, Any]]: selected candidates with metadata.
         """
         try:
-            # Fetch all ticker data from the exchange
-            tickers = await self.exchange_client.get_all_tickers()
+            if not self.exchange_client:
+                logger.warning("[SymbolScreener] exchange_client missing; skipping scan.")
+                return []
+
+            tickers = await self.exchange_client.get_24hr_tickers()
             if not tickers:
                 logger.warning("No ticker data received from exchange for symbol screening.")
                 return []
 
-            # Get current account balances to exclude held assets from screening
-            account_balances = await self.exchange_client.get_account_balances()
-            current_wallet_assets = {
-                asset for asset in account_balances.keys()
-                if asset != self.base_currency
-            }
-            # Combine user-defined exclude list with currently held assets
-            combined_exclude_set = self.symbol_exclude_list.union({
-                f"{asset}{self.base_currency}" for asset in current_wallet_assets
-            })
-
-            logger.debug(f"Combined exclude set for screening: {list(combined_exclude_set)}")
-            candidates = []
-
-            # Iterate through tickers to find candidates that meet criteria
+            combined_exclude_set = await self._build_exclude_set()
+            liquid: List[Tuple[str, float, float, float]] = []
             for ticker in tickers:
-                symbol = ticker.get("symbol", "")
-                # Ensure the symbol is a pair with the base currency
-                if not symbol.endswith(self.base_currency):
+                symbol = self._normalize_symbol(ticker.get("symbol", ""))
+                if not symbol or not symbol.endswith(self.base_currency):
                     continue
-                # Exchange status & minNotional prefilter
-                try:
-                    ok = await self._prefilter_symbol(symbol)
-                    if not ok:
-                        continue
-                except Exception:
-                    logger.debug("prefilter_symbol error for %s", symbol, exc_info=True)
-                    continue
-                # Skip symbols in the combined exclude list
                 if symbol in combined_exclude_set:
-                    logger.debug(f"Skipping {symbol} as it is in the exclude list or currently held.")
+                    continue
+                if self._is_leveraged_symbol(symbol):
                     continue
                 try:
-                    # Extract and validate price change percentage and volume
-                    percent_change = float(ticker.get("priceChangePercent", 0))
-                    volume = float(ticker.get("quoteVolume", 0))
+                    quote_volume = float(ticker.get("quoteVolume", 0.0) or 0.0)
+                    pct_change = float(ticker.get("priceChangePercent", 0.0) or 0.0)
+                    last_price = float(ticker.get("lastPrice", 0.0) or 0.0)
                 except (ValueError, TypeError):
-                    logger.warning(f"Could not parse ticker data for {symbol}. Skipping.")
                     continue
+                if quote_volume < self.min_volume or last_price <= 0:
+                    continue
+                liquid.append((symbol, quote_volume, pct_change, last_price))
 
-                # Check if the symbol meets the min percentage change and min volume criteria
-                if percent_change >= self.min_percent_change and volume >= self.min_volume:
-                    candidates.append((symbol, percent_change, volume, ticker)) # Include full ticker data
+            if not liquid:
+                logger.warning("[SymbolScreener] No liquid symbols passed volume filter.")
+                return []
 
-            # Sort candidates by percentage change (desc) then volume (desc)
-            candidates.sort(key=lambda x: (-x[1], -x[2]))
-            # Select the top N symbols, keeping the full ticker data
-            selected_symbols_with_data = candidates[:self.top_n_symbols]
+            liquid.sort(key=lambda x: x[1], reverse=True)
+            top_liquid = liquid[: self.top_volume_universe_size]
 
-            logger.info(f"✅ SymbolScreener selected top {len(selected_symbols_with_data)} new symbols.")
-            return selected_symbols_with_data
+            sem = asyncio.Semaphore(self.atr_concurrency)
+            tasks = [
+                self._evaluate_candidate(sym, vol, pct, px, sem)
+                for sym, vol, pct, px in top_liquid
+            ]
+            evaluated = await asyncio.gather(*tasks, return_exceptions=True)
+            parsed = [x for x in evaluated if isinstance(x, dict)]
+            atr_filtered = [x for x in parsed if float(x.get("atr_pct", 0.0) or 0.0) >= self.min_atr_pct]
+
+            selected: List[Dict[str, Any]]
+            if atr_filtered:
+                atr_filtered.sort(
+                    key=lambda x: (
+                        -float(x.get("atr_pct", 0.0) or 0.0),
+                        -float(x.get("quote_volume", 0.0) or 0.0),
+                    )
+                )
+                selected = atr_filtered[: self.candidate_pool_size]
+            else:
+                fallback_enabled = bool(self._cfg("SYMBOL_ALLOW_ATR_FALLBACK", True))
+                if not fallback_enabled:
+                    logger.warning(
+                        "[SymbolScreener] No symbols passed ATR%% %.2f and fallback disabled.",
+                        self.min_atr_pct * 100.0,
+                    )
+                    return []
+                parsed.sort(key=lambda x: -float(x.get("quote_volume", 0.0) or 0.0))
+                selected = parsed[: self.candidate_pool_size]
+                logger.warning(
+                    "[SymbolScreener] No symbols passed ATR%% %.2f; using top-volume fallback (%d symbols).",
+                    self.min_atr_pct * 100.0,
+                    len(selected),
+                )
+
+            logger.info(
+                "[SymbolScreener] Selected %d candidates from %d top-volume symbols (min_atr%%=%.2f).",
+                len(selected),
+                len(top_liquid),
+                self.min_atr_pct * 100.0,
+            )
+            return selected
 
         except Exception as e:
             logger.error(f"❌ SymbolScreener scan error: {e}", exc_info=True)
             return []
 
-    async def _process_and_add_symbols(self, symbols_to_add_with_data: List[Tuple[str, float, float, Dict[str, Any]]]):
+    async def _process_and_add_symbols(self, candidates: List[Dict[str, Any]]):
         """
-        Helper method to log and add symbols using the symbol manager,
-        now accepting full ticker data for metadata injection.
+        Propose candidate symbols to SymbolManager / SharedState.
         """
-        if symbols_to_add_with_data:
-            symbols_only = [item[0] for item in symbols_to_add_with_data]
-            logger.info(f"📊 Polling symbols found: {symbols_only}")
-            for symbol, _, volume, ticker_data in symbols_to_add_with_data:
-                # Prefilter again at proposal time (defensive)
+        if candidates:
+            symbols_only = [str(item.get("symbol", "")) for item in candidates]
+            logger.info(f"📊 Candidate symbols found: {symbols_only}")
+            accepted = 0
+            for item in candidates:
+                symbol = self._normalize_symbol(item.get("symbol", ""))
+                if not symbol:
+                    continue
                 try:
                     if not await self._prefilter_symbol(symbol):
                         logger.warning(f"[SymbolScreener] ❌ Pre-filter rejected: {symbol}")
@@ -293,19 +413,30 @@ class SymbolScreener:
                     logger.debug("prefilter at proposal failed for %s", symbol, exc_info=True)
                     continue
                 try:
-                    accepted = await self._propose(
+                    accepted_flag = await self._propose(
                         symbol,
-                        source="SymbolScreener",
-                        metadata={"24h_volume": volume}
+                        source=self.name,
+                        metadata={
+                            "24h_quote_volume": float(item.get("quote_volume", 0.0) or 0.0),
+                            "24h_percent_change": float(item.get("price_change_percent", 0.0) or 0.0),
+                            "atr_pct": float(item.get("atr_pct", 0.0) or 0.0),
+                            "atr_timeframe": self.atr_timeframe,
+                        },
                     )
-                    if accepted:
+                    if accepted_flag:
+                        accepted += 1
                         logger.info(f"[SymbolScreener] ✅ Symbol accepted: {symbol}")
                     else:
                         logger.warning(f"[SymbolScreener] ❌ Symbol rejected/buffered: {symbol}")
                 except Exception as e:
                     logger.error(f"Failed to propose symbol {symbol} via _propose: {e}", exc_info=True)
+            logger.info(
+                "[SymbolScreener] Proposal pass complete: %d/%d accepted.",
+                accepted,
+                len(candidates),
+            )
         else:
-            logger.info("No new trending symbols met criteria in this scan.")
+            logger.info("No volatility candidates met criteria in this scan.")
 
     async def run_once(self):
         """
@@ -324,102 +455,9 @@ class SymbolScreener:
                 if not self.exchange_client:
                     logger.info("[SymbolScreener] Skipping: exchange_client not wired.")
                     return
-                logger.info("📊 Performing one-time symbol screening for startup.")
-
-                # Assuming get_24hr_tickers returns a list of dictionaries with 'symbol', 'volume', 'priceChangePercent'
-                tickers = await self.exchange_client.get_24hr_tickers()
-                if not tickers:
-                    logger.warning("No tickers received. Aborting screener.")
-                    return
-
-                filtered_by_thresholds = []
-                for t in tickers:
-                    symbol = t.get("symbol", "")
-                    if not symbol.endswith("USDT"):  # Assuming hardcoded USDT base currency for this specific run_once
-                        continue
-                    try:
-                        volume = float(t.get("volume", 0))
-                        price_change = abs(float(t.get("priceChangePercent", 0)))
-                        score = volume * price_change
-                        if volume >= self.min_volume and price_change >= self.min_percent_change:  # Apply thresholds
-                            filtered_by_thresholds.append({
-                                "symbol": symbol,
-                                "score": score,
-                                "source": self.name,
-                                "24h_volume": volume,
-                                "24h_percent_change": price_change
-                            })
-                    except (ValueError, TypeError):
-                        logger.warning(f"Skipping {symbol} due to parse error.")
-                        continue
-
-                final_candidates = []
-                if not filtered_by_thresholds:
-                    logger.warning("⚠️ No symbols passed thresholds. Falling back to best effort.")
-                    # Fallback: re-populate with all tickers (that end with USDT) and their scores
-                    for t in tickers:
-                        symbol = t.get("symbol", "")
-                        if not symbol.endswith("USDT"):
-                            continue
-                        try:
-                            volume = float(t.get("volume", 0))
-                            price_change = abs(float(t.get("priceChangePercent", 0)))
-                            score = volume * price_change
-                            final_candidates.append({
-                                "symbol": symbol,
-                                "score": score,
-                                "source": self.name,
-                                "24h_volume": volume,
-                                "24h_percent_change": price_change
-                            })
-                        except (ValueError, TypeError):
-                            continue
-                else:
-                    final_candidates = filtered_by_thresholds
-
-                # Log Top 20 candidates by score before final selection
-                logger.info("📊 Top 20 candidates by score (before final selection):")
-                for c in sorted(final_candidates, key=lambda x: x["score"], reverse=True)[:20]:
-                    logger.info(f"  ➤ {c['symbol']} | Vol: {c['24h_volume']:.2f} | Δ%: {c['24h_percent_change']:.2f} | Score: {c['score']:.2f}")
-
-                # Sort by score and take top N symbols
-                top_symbols_with_data = sorted(final_candidates, key=lambda x: x["score"], reverse=True)[:self.top_n_symbols]
-
-                accepted = 0
-                for s in top_symbols_with_data:
-                    symbol = s["symbol"]
-                    # Prefilter (status/minNotional) before proposing
-                    try:
-                        if not await self._prefilter_symbol(symbol):
-                            logger.info(f"🚫 Rejected/Buffered: {symbol} (prefilter)")
-                            continue
-                    except Exception:
-                        logger.debug("prefilter failed in run_once for %s", symbol, exc_info=True)
-                        continue
-                    logger.info(f"📤 Proposing symbol: {symbol}")
-                    try:
-                        accepted_flag = await asyncio.wait_for(
-                            self._propose(
-                                symbol,
-                                source=self.name,
-                                metadata={
-                                    "24h_volume": s["24h_volume"],
-                                    "24h_percent_change": s["24h_percent_change"]
-                                }
-                            ),
-                            timeout=5
-                        )
-                        if accepted_flag:
-                            accepted += 1
-                            logger.info(f"✅ Accepted: {symbol}")
-                        else:
-                            logger.info(f"🚫 Rejected/Buffered: {symbol}")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"⏰ Timeout proposing: {symbol}")
-                    except Exception as e:
-                        logger.error(f"❌ Error proposing {symbol}: {e}", exc_info=True)
-
-                logger.info(f"✅ Screener completed. {accepted} symbols accepted.")
+                logger.info("📊 Performing one-time volatility-driven symbol screening.")
+                candidates = await self._perform_scan()
+                await self._process_and_add_symbols(candidates)
             finally:
                 self._running = False
 
@@ -441,69 +479,15 @@ class SymbolScreener:
 
     async def run_discovery(self):
         """
-        One-shot discovery method to screen and propose top N symbols
-        based on configured 24h volume and percent change thresholds.
-        Used during Phase 3.
+        One-shot discovery method using volatility-first candidate construction.
         """
         try:
-            logger.info("🔍 [SymbolScreener] Starting one-time symbol screening (Phase 3)...")
-
-            all_stats = await self.exchange_client.get_24hr_stats()
-            if not all_stats:
-                logger.warning("⚠️ No stats returned from exchange.")
+            logger.info("🔍 [SymbolScreener] Starting one-time volatility scan...")
+            if not self.exchange_client:
+                logger.warning("[SymbolScreener] exchange_client not wired.")
                 return
-
-            candidates_with_score = []
-            for symbol, stats in all_stats.items():
-                try:
-                    volume = float(stats.get("volume", 0))
-                    price_change = float(stats.get("priceChangePercent", 0))
-                    score = volume * abs(price_change)
-                    candidates_with_score.append((symbol, volume, price_change, score))
-                except Exception:
-                    # Log if parsing fails for a specific symbol, but don't stop the whole process
-                    logger.warning(f"Could not parse stats for {symbol} during discovery, skipping.")
-                    continue
-
-            # First, try to filter by thresholds
-            threshold_met_candidates = [
-                c for c in candidates_with_score
-                if c[1] >= self.min_volume and abs(c[2]) >= self.min_percent_change # volume, price_change
-            ]
-
-            final_candidates_for_discovery = []
-            if threshold_met_candidates:
-                logger.info("Symbols met thresholds. Using filtered list for discovery.")
-                # Sort by priceChangePercent (index 2), then volume (index 1)
-                threshold_met_candidates.sort(key=lambda x: (x[2], x[1]), reverse=True)
-                final_candidates_for_discovery = threshold_met_candidates[:self.top_n_symbols]
-            else:
-                logger.warning("⚠️ No symbols met thresholds. Falling back to top symbols by score for discovery.")
-                # If no symbols met thresholds, sort all candidates by score
-                candidates_with_score.sort(key=lambda x: x[3], reverse=True) # Sort by score (index 3)
-                final_candidates_for_discovery = candidates_with_score[:self.top_n_symbols]  # Reduce to top N
-
-            top_symbols = [s[0] for s in final_candidates_for_discovery] # Extract symbols
-
-            if not top_symbols:
-                logger.warning("⚠️ No symbols passed the screening criteria for discovery.")
-                return
-
-            logger.info(f"✅ [SymbolScreener] Discovered symbols: {top_symbols}")
-
-            for s in final_candidates_for_discovery:
-                symbol = s[0]
-                volume = s[1]
-                percent_change = s[2]
-                accepted_flag = await self._propose(
-                    symbol,
-                    source="SymbolScreener",
-                    metadata={"24h_volume": volume, "24h_percent_change": percent_change}
-                )
-                if accepted_flag:
-                    logger.info(f"[SymbolScreener] ✅ Discovery symbol accepted: {symbol}")
-                else:
-                    logger.warning(f"[SymbolScreener] ❌ Discovery symbol rejected/buffered: {symbol}")
+            candidates = await self._perform_scan()
+            await self._process_and_add_symbols(candidates)
 
         except Exception as e:
             logger.error(f"❌ Error during run_discovery: {e}", exc_info=True)

@@ -11,7 +11,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
-from core.stubs import maybe_await  # safe sync/async invocation
+from core.stubs import maybe_await, maybe_call  # safe sync/async invocation
 
 logger = logging.getLogger("PositionManager")
 
@@ -160,18 +160,8 @@ class PositionManager:
                 await maybe_call(self.ss, "force_close_all_open_lots", symbol, reason)
         except Exception:
             pass
-        try:
-            realized = float(getattr(self.ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
-            await maybe_call(self.ss, "emit_event", "RealizedPnlUpdated", {
-                "realized_pnl": realized,
-                "symbol": symbol,
-                "price": float(executed_price or 0.0),
-                "qty": float(executed_qty or 0.0),
-                "reason": reason or "SELL_FILLED",
-                "timestamp": time.time(),
-            })
-        except Exception:
-            pass
+        # PositionManager: do not mutate accounting or emit realized-PnL here.
+        # ExecutionManager is responsible for realized PnL persistence and emission.
 
     async def close_position(
         self,
@@ -224,24 +214,8 @@ class PositionManager:
         except Exception:
             already_recorded = False
 
-        if not already_recorded and realized_pnl != 0.0:
-            try:
-                cur = float(getattr(self.ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
-                self.ss.metrics["realized_pnl"] = cur + realized_pnl
-            except Exception:
-                pass
-        try:
-            await maybe_call(self.ss, "emit_event", "RealizedPnlUpdated", {
-                "realized_pnl": float(getattr(self.ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0),
-                "pnl_delta": float(realized_pnl),
-                "symbol": symbol,
-                "price": float(executed_price or 0.0),
-                "qty": float(executed_qty or 0.0),
-                "reason": reason or "SELL_FILLED",
-                "timestamp": time.time(),
-            })
-        except Exception:
-            pass
+        # PositionManager must not mutate portfolio accounting or emit realized-PnL.
+        # ExecutionManager handles realized PnL persistence and emits RealizedPnlUpdated/POSITION_CLOSED.
         try:
             if hasattr(self.ss, "record_exit_reason"):
                 self.ss.record_exit_reason(symbol, reason or "SELL_FILLED", source="PositionManager")
@@ -259,16 +233,211 @@ class PositionManager:
             )
         except Exception:
             pass
+        # POSITION_CLOSED emission / realized-PnL accounting are handled by ExecutionManager
+        # to keep SELL lifecycle atomic and single-source for accounting.
+
+    async def open_position(
+        self,
+        *,
+        symbol: str,
+        executed_qty: float,
+        executed_price: float,
+        fee_quote: float = 0.0,
+        reason: str = "BUY_FILLED",
+        tag: str = "",
+        tier: Optional[str] = None,
+        significant_floor_usdt: Optional[float] = None,
+    ) -> None:
+        """
+        Canonical open hook for BUY fills.
+        Registration is normally done by SharedState.record_fill(). This hook provides:
+          - explicit POSITION_OPENED observability,
+          - a best-effort fallback if registration is unexpectedly missing.
+        """
+        sym = str(symbol or "").upper()
+        qty = float(executed_qty or 0.0)
+        price = float(executed_price or 0.0)
+        if not sym or qty <= 0 or price <= 0:
+            return
+
+        registered = False
+        pos: Dict[str, Any] = {}
         try:
-            await maybe_call(self.ss, "emit_event", "POSITION_CLOSED", {
-                "symbol": symbol,
-                "entry_price": float(entry_price or 0.0),
-                "price": float(executed_price or 0.0),
-                "qty": float(executed_qty or 0.0),
-                "realized_pnl": float(realized_pnl),
-                "reason": reason or "SELL_FILLED",
-                "timestamp": time.time(),
-            })
+            positions = getattr(self.ss, "positions", {}) or {}
+            if isinstance(positions, dict):
+                pos = dict(positions.get(sym, {}) or {})
+                registered = float(pos.get("quantity", 0.0) or pos.get("qty", 0.0) or 0.0) > 0
+        except Exception:
+            pos = {}
+            registered = False
+
+        # Fallback only when registration is missing (should be rare).
+        if not registered:
+            try:
+                if hasattr(self.ss, "record_trade"):
+                    await maybe_call(
+                        self.ss,
+                        "record_trade",
+                        sym,
+                        "BUY",
+                        qty,
+                        price,
+                        float(fee_quote or 0.0),
+                        0.0,
+                        tier,
+                    )
+                elif hasattr(self.ss, "update_position"):
+                    pos = {
+                        "symbol": sym,
+                        "quantity": qty,
+                        "avg_price": price,
+                        "status": "OPEN",
+                        "state": "ACTIVE",
+                        "last_fill_ts": time.time(),
+                    }
+                    await maybe_call(self.ss, "update_position", sym, pos)
+                positions = getattr(self.ss, "positions", {}) or {}
+                if isinstance(positions, dict):
+                    pos = dict(positions.get(sym, {}) or {})
+                    registered = float(pos.get("quantity", 0.0) or pos.get("qty", 0.0) or 0.0) > 0
+            except Exception:
+                registered = False
+
+        qty_now = 0.0
+        price_now = 0.0
+        value_usdt = 0.0
+        significant = False
+        significant_floor = 0.0
+        try:
+            qty_now = float((pos or {}).get("quantity", 0.0) or (pos or {}).get("qty", 0.0) or qty)
+            price_now = float((pos or {}).get("avg_price", 0.0) or price or 0.0)
+            if price_now <= 0:
+                price_now = float((getattr(self.ss, "latest_prices", {}) or {}).get(sym, 0.0) or 0.0)
+        except Exception:
+            qty_now = float(qty or 0.0)
+            price_now = float(price or 0.0)
+
+        # Inject canonical significant floor at BUY registration time.
+        try:
+            significant_floor = float(significant_floor_usdt or 0.0)
+        except Exception:
+            significant_floor = 0.0
+        if significant_floor <= 0:
+            try:
+                if hasattr(self.ss, "get_significant_position_floor"):
+                    significant_floor = float(await maybe_call(self.ss, "get_significant_position_floor", sym) or 0.0)
+            except Exception:
+                significant_floor = 0.0
+        if significant_floor <= 0:
+            try:
+                significant_floor = float(
+                    getattr(
+                        self.config,
+                        "SIGNIFICANT_POSITION_FLOOR",
+                        getattr(self.config, "MIN_SIGNIFICANT_POSITION_USDT", 25.0),
+                    )
+                    or 25.0
+                )
+            except Exception:
+                significant_floor = 25.0
+
+        value_usdt = qty_now * price_now if qty_now > 0 and price_now > 0 else 0.0
+        significant = bool(value_usdt >= significant_floor and value_usdt > 0.0)
+
+        # Canonical position-state injection to avoid registration-time drift.
+        try:
+            pos = dict(pos or {})
+            pos.update(
+                {
+                    "symbol": sym,
+                    "quantity": float(qty_now),
+                    "avg_price": float(price_now),
+                    "value_usdt": float(value_usdt),
+                    "significant_floor_usdt": float(significant_floor),
+                    "is_significant": bool(significant),
+                    "is_dust": not bool(significant),
+                    "_is_dust": not bool(significant),
+                    "open_position": bool(significant),
+                    "capital_occupied": float(value_usdt) if significant else 0.0,
+                    "state": "ACTIVE" if significant else "DUST_LOCKED",
+                    "status": "SIGNIFICANT" if significant else "DUST",
+                    "last_fill_ts": time.time(),
+                }
+            )
+            if hasattr(self.ss, "update_position"):
+                await maybe_call(self.ss, "update_position", sym, pos)
+        except Exception:
+            pass
+
+        # Align open_trades representation with significance classification.
+        try:
+            open_trades = getattr(self.ss, "open_trades", None)
+            if isinstance(open_trades, dict):
+                if significant and qty_now > 0:
+                    now_ts = time.time()
+                    ot = dict(open_trades.get(sym, {}) or {})
+                    ot.setdefault("symbol", sym)
+                    ot.setdefault("position", "long")
+                    ot.setdefault("opened_at", now_ts)
+                    ot.setdefault("created_at", now_ts)
+                    ot["quantity"] = float(qty_now)
+                    ot["entry_price"] = float(ot.get("entry_price", 0.0) or price_now)
+                    if tier is not None:
+                        ot["tier"] = tier
+                    open_trades[sym] = ot
+                else:
+                    open_trades.pop(sym, None)
+        except Exception:
+            pass
+
+        # Refresh registered flag after canonical injection.
+        try:
+            positions = getattr(self.ss, "positions", {}) or {}
+            if isinstance(positions, dict):
+                pos = dict(positions.get(sym, {}) or pos)
+                qty_now = float((pos or {}).get("quantity", 0.0) or (pos or {}).get("qty", 0.0) or qty_now)
+                price_now = float((pos or {}).get("avg_price", 0.0) or price_now or 0.0)
+                value_usdt = float((pos or {}).get("value_usdt", 0.0) or value_usdt)
+                significant_floor = float((pos or {}).get("significant_floor_usdt", 0.0) or significant_floor)
+                significant = bool(pos.get("is_significant", significant))
+                registered = qty_now > 0.0
+        except Exception:
+            pass
+
+        try:
+            self.logger.info(
+                "[POSITION_OPENED] %s qty=%.8f price=%.8f value=%.4f floor=%.4f significant=%s registered=%s reason=%s tag=%s",
+                sym,
+                float(qty_now),
+                float(price_now),
+                float(value_usdt),
+                float(significant_floor or 0.0),
+                bool(significant),
+                bool(registered),
+                reason or "BUY_FILLED",
+                str(tag or ""),
+            )
+        except Exception:
+            pass
+
+        try:
+            await maybe_call(
+                self.ss,
+                "emit_event",
+                "POSITION_OPENED",
+                {
+                    "symbol": sym,
+                    "qty": float(qty_now),
+                    "price": float(price_now),
+                    "value_usdt": float(value_usdt),
+                    "significant": bool(significant),
+                    "significant_floor_usdt": float(significant_floor or 0.0),
+                    "registered": bool(registered),
+                    "reason": reason or "BUY_FILLED",
+                    "tag": str(tag or ""),
+                    "timestamp": time.time(),
+                },
+            )
         except Exception:
             pass
 

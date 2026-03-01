@@ -1,0 +1,96 @@
+{
+  "BTCUSDT": {
+    "status": "SUCCESS",
+    "csv_path": "validation_outputs/BTCUSDT_5m_with_60m_labels.csv",
+    "analysis_path": "validation_outputs/BTCUSDT_60m_label_analysis.json",
+    "stats": {
+      "total_observations": 676,
+      "mean": -2.8947947068266298e-05,
+      "median": 0.00010488816137596018,
+      "std": 0.00422695266417439,
+      "min": -0.013540001471203005,
+      "max": 0.015868137832376013,
+      "percentiles": {
+        "p5": -0.007362422239365771,
+        "p10": -0.005067472912872634,
+        "p25": -0.002099409298288681,
+        "p50": 0.00010488816137596018,
+        "p75": 0.0019552694649152074,
+        "p90": 0.004625892550478114,
+        "p95": 0.007161025574864942
+      },
+      "target_distribution": {
+        "positive": 0.2455621301775148,
+        "negative_or_equal": 0.7544378698224852
+      },
+      "absolute_move_stats": {
+        "median": 0.002029993119236136,
+        "mean": 0.003043718523088511,
+        "p25": 0.0008870042496078017,
+        "p75": 0.004217730612696213,
+        "p90": 0.007305476845390256,
+        "p95": 0.009455446936446602
+      },
+      "total_candles": 1000,
+      "valid_labels_total": 988,
+      "valid_labels_after_filter": 676,
+      "regime_distribution": {
+        "low": 324,
+        "normal": 352,
+        "high": 324,
+        "total": 1000
+      },
+      "volatility_thresholds": {
+        "low_vol_threshold": 0.0008975772133427835,
+        "high_vol_threshold": 0.0012831865177048804
+      }
+    }
+  },
+  "ETHUSDT": {
+    "status": "SUCCESS",
+    "csv_path": "validation_outputs/ETHUSDT_5m_with_60m_labels.csv",
+    "analysis_path": "validation_outputs/ETHUSDT_60m_label_analysis.json",
+    "stats": {
+      "total_observations": 676,
+      "mean": -0.00034312521762480566,
+      "median": -0.0001650204014167338,
+      "std": 0.005432447032830064,
+      "min": -0.01929017049726666,
+      "max": 0.019520248616101687,
+      "percentiles": {
+        "p5": -0.009427883366204294,
+        "p10": -0.007605684351116049,
+        "p25": -0.0035739324567487956,
+        "p50": -0.0001650204014167338,
+        "p75": 0.0029173647668986817,
+        "p90": 0.005861137929991217,
+        "p95": 0.008530216037062483
+      },
+      "target_distribution": {
+        "positive": 0.32840236686390534,
+        "negative_or_equal": 0.6715976331360947
+      },
+      "absolute_move_stats": {
+        "median": 0.003175474724922315,
+        "mean": 0.004172546532731637,
+        "p25": 0.0014343282201088536,
+        "p75": 0.005938492675489122,
+        "p90": 0.00897137843262906,
+        "p95": 0.0106235599044313
+      },
+      "total_candles": 1000,
+      "valid_labels_total": 988,
+      "valid_labels_after_filter": 676,
+      "regime_distribution": {
+        "low": 324,
+        "normal": 352,
+        "high": 324,
+        "total": 1000
+      },
+      "volatility_thresholds": {
+        "low_vol_threshold": 0.0011156199882497123,
+        "high_vol_threshold": 0.001847108625578961
+      }
+    }
+  }
+}

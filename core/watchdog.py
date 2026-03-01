@@ -109,8 +109,7 @@ class Watchdog:
             "RiskManager",
             "PnLCalculator",
             "PerformanceEvaluator",
-            "TPSLEngine",   # canonical
-            "TP_SLEngine",  # legacy alias
+            "TPSLEngine",
             "Heartbeat",
         ]
         conf_list = getattr(config, "WATCHDOG_COMPONENTS", None)
@@ -183,8 +182,6 @@ class Watchdog:
                 snap = snap_fn() if not _is_coro_fn(snap_fn) else {}
                 if isinstance(snap, dict):
                     si = snap.get(name)
-                    if not si and name == "TP_SLEngine":
-                        si = snap.get("TPSLEngine")
         except Exception:
             si = None
 
@@ -194,8 +191,6 @@ class Watchdog:
                 mirror = getattr(self.shared_state, "component_statuses", {}) or {}
                 if isinstance(mirror, dict):
                     si = mirror.get(name)
-                    if not si and name == "TP_SLEngine":
-                        si = mirror.get("TPSLEngine")
             except Exception:
                 si = None
 

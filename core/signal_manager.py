@@ -38,7 +38,7 @@ class SignalManager:
                 self.signal_cache = InlineBoundedCache(max_size=1000, default_ttl=300)
 
         # Configuration for signal validation
-        self._min_conf_ingest = float(getattr(config, 'MIN_SIGNAL_CONF', 0.50))
+        self._min_conf_ingest = float(getattr(config, 'MIN_SIGNAL_CONF', 0.50))  # Defensive floor (0.50)
         self._max_age_sec = float(getattr(config, 'MAX_SIGNAL_AGE_SECONDS', 60))
         self._known_quotes = {"USDT", "FDUSD", "USDC", "BUSD", "TUSD", "DAI"}
 
@@ -61,24 +61,24 @@ class SignalManager:
         # Normalize symbol
         sym = self._normalize_symbol(symbol)
         if not sym or len(sym) < 6:
-            self.logger.debug("[SignalManager] Rejected suspicious symbol: %r", sym)
+            self.logger.debug("[SignalManager] Rejected suspicious symbol: %r (normalized from %r)", sym, symbol)
             return False
 
         # Check if base is a known quote token
         base, quote = self._split_base_quote(sym)
         if base.upper() in self._known_quotes:
-            self.logger.debug("[SignalManager] %s rejected: base is a known quote token.", sym)
+            self.logger.debug("[SignalManager] %s rejected: base '%s' is a known quote token.", sym, base)
             return False
 
         # Check if quote is a known quote token
         if quote.upper() not in self._known_quotes:
-            self.logger.debug("[SignalManager] %s rejected: quote %s is not a known quote token.", sym, quote)
+            self.logger.debug("[SignalManager] %s rejected: quote '%s' is not a known quote token. (symbol=%s, base=%s)", sym, quote, symbol, base)
             return False
 
         # Early confidence check
         conf_raw = float(signal.get("confidence", 0.0))
         if conf_raw < self._min_conf_ingest:
-            self.logger.debug("[SignalManager] %s conf %.2f < ingest floor %.2f", sym, conf_raw, self._min_conf_ingest)
+            self.logger.debug("[SignalManager] %s from %s conf %.2f < ingest floor %.2f", sym, agent_name, conf_raw, self._min_conf_ingest)
             return False
 
         if conf_raw > 1.0:
@@ -98,6 +98,7 @@ class SignalManager:
         # Store in cache with deduplication by symbol:agent
         cache_key = f"{sym}:{agent_name}"
         self.signal_cache.set(cache_key, s)
+        self.logger.debug("[SignalManager] Signal ACCEPTED and cached: %s from %s (confidence=%.2f)", sym, agent_name, s["confidence"])
         return True
 
     def store_signal(self, agent_name: str, symbol: str, signal: Dict[str, Any]) -> None:
@@ -170,6 +171,8 @@ class SignalManager:
                     d = it.to_dict()
                 elif isinstance(it, dict):
                     d = dict(it)
+                elif hasattr(it, "__dict__"):
+                    d = dict(getattr(it, "__dict__", {}) or {})
                 else:
                     continue
 
@@ -319,8 +322,8 @@ class InlineBoundedCache:
                 pass
         return len(expired)
 
-# Provide a simple list_all implementation so the SignalManager can
-# call `signal_cache.list_all()` on the inline fallback.
+    # Provide a simple list_all implementation so the SignalManager can
+    # call `signal_cache.list_all()` on the inline fallback.
     def list_all(self) -> List[Dict[str, Any]]:
         """Return a list of cached values (non-expired)."""
         now = time.time()

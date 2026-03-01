@@ -2,8 +2,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Literal
 import time
+import logging
 # Back-compat shim
 from .contracts import TradeIntent, OrderSide  # يمرر نفس الكلاس للاسم القديم
+
+_log = logging.getLogger("BaselineKernel")
 
 # ======= Enums / Aliases =======
 Side = Literal["buy", "sell"]
@@ -130,10 +133,11 @@ class ExecutionFacade:
     Thin facade the rest of the app should use.
     Your existing ExecutionManager can conform to this surface.
     """
-    def __init__(self, state: KernelState, exchange_client, risk_manager=None):
+    def __init__(self, state: KernelState, exchange_client, risk_manager=None, execution_manager=None):
         self.s = state
         self.ex = exchange_client
         self.risk = risk_manager
+        self.exec_mgr = execution_manager
 
     async def place(self, order: ExecOrder) -> OrderResult:
         # Reject ghosts/invalid right here
@@ -144,29 +148,34 @@ class ExecutionFacade:
         if self.risk and not self.risk.allow(order):
             return OrderResult(ok=False, symbol=order.symbol, side=order.side, reason="risk_veto")
 
-        # Ensure symbol filters exist & compute qty if quote given
-        try:
-            await self.ex.ensure_symbol_filters_ready(order.symbol)
-        except Exception as e:
-            return OrderResult(ok=False, symbol=order.symbol, side=order.side, reason=f"filters_missing:{e}")
+        if not (self.exec_mgr and hasattr(self.exec_mgr, "execute_trade")):
+            _log.error(
+                "[BaselineKernel] ExecutionManager missing; refusing direct exchange placement for %s %s",
+                order.symbol,
+                order.side,
+            )
+            return OrderResult(ok=False, symbol=order.symbol, side=order.side, reason="execution_manager_missing")
 
-        if order.side == "buy" and order.planned_quote:
-            res = await self.ex.place_market_order_quote(order.symbol, order.planned_quote, tag=order.tag)
-        else:
-            # SELL path: compute qty if not provided (sell all free balance)
-            qty = order.quantity
-            if qty is None:
-                qty = await self.ex.get_sellable_free_qty(order.symbol)
-            res = await self.ex.place_market_order_qty(order.symbol, qty, side=order.side, tag=order.tag)
+        try:
+            res = await self.exec_mgr.execute_trade(
+                symbol=order.symbol,
+                side=order.side,
+                quantity=order.quantity,
+                planned_quote=order.planned_quote,
+                tag=order.tag,
+            )
+        except Exception as e:
+            return OrderResult(ok=False, symbol=order.symbol, side=order.side, reason=f"exec_error:{e}")
 
         # Normalize result
-        if res.get("ok"):
+        if isinstance(res, dict) and res.get("ok"):
             return OrderResult(ok=True, symbol=order.symbol, side=order.side,
-                               txid=res.get("orderId"), notional_quote=res.get("cummulativeQuoteQty"),
+                               txid=res.get("orderId") or res.get("order_id") or res.get("exchange_order_id"),
+                               notional_quote=res.get("cummulativeQuoteQty"),
                                fills=res.get("fills"))
         else:
             return OrderResult(ok=False, symbol=order.symbol, side=order.side,
-                               reason=res.get("reason", "unknown"))
+                               reason=(res.get("reason", "unknown") if isinstance(res, dict) else "unknown"))
 
 # ======= Baseline kernel wiring (reference) =======
 class TradingKernel:

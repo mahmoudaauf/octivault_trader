@@ -1,22 +1,177 @@
 # agent_registry.py
+import logging
 import inspect
-from agents.ipo_chaser import IPOChaser
-from agents.dip_sniper import DipSniper
-# from agents.swing_trade_hunter import SwingTradeHunter
-from agents.trend_hunter import TrendHunter
-# from agents.news_reactor import NewsReactor
-# from agents.signal_fusion_agent import SignalFusion
-from agents.liquidation_agent import LiquidationAgent
-# from agents.arbitrage_hunter_agent import ArbitrageHunter
+import traceback
+
+__all__ = [
+    "AGENT_CLASS_MAP",
+    "AGENT_IMPORT_ERRORS",
+    "validate_agent_registry",
+    "register_all_discovery_agents",
+]
+
+_logger = logging.getLogger("AgentRegistry")
+AGENT_IMPORT_ERRORS: dict = {}
+
+# ---------------------------------------------------------------------------
+# Fault-isolated agent imports
+# Each agent is wrapped individually so one broken module cannot crash the
+# entire registry.  A placeholder stub is kept in AGENT_CLASS_MAP so
+# AgentManager sees the entry and emits an explicit registration failure
+# rather than silently missing the agent.
+# ---------------------------------------------------------------------------
+
+try:
+    from agents.ipo_chaser import IPOChaser
+except Exception as _e:
+    class IPOChaser:  # type: ignore
+        """Placeholder — IPOChaser module failed to import."""
+        agent_type = "discovery"
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "IPOChaser import failed: %s"
+                % AGENT_IMPORT_ERRORS.get("IPOChaser", {}).get("error", "unknown")
+            )
+
+    AGENT_IMPORT_ERRORS["IPOChaser"] = {
+        "error": repr(_e),
+        "traceback": traceback.format_exc(),
+    }
+    _logger.warning("IPOChaser import failed; placeholder kept: %s", _e, exc_info=True)
+
+try:
+    from agents.dip_sniper import DipSniper
+except Exception as _e:
+    class DipSniper:  # type: ignore
+        """Placeholder — DipSniper module failed to import."""
+        agent_type = "strategy"
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "DipSniper import failed: %s"
+                % AGENT_IMPORT_ERRORS.get("DipSniper", {}).get("error", "unknown")
+            )
+
+    AGENT_IMPORT_ERRORS["DipSniper"] = {
+        "error": repr(_e),
+        "traceback": traceback.format_exc(),
+    }
+    _logger.warning("DipSniper import failed; placeholder kept: %s", _e, exc_info=True)
+
+try:
+    from agents.trend_hunter import TrendHunter
+except Exception as _e:
+    class TrendHunter:  # type: ignore
+        """Placeholder — TrendHunter module failed to import."""
+        agent_type = "strategy"
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "TrendHunter import failed: %s"
+                % AGENT_IMPORT_ERRORS.get("TrendHunter", {}).get("error", "unknown")
+            )
+
+    AGENT_IMPORT_ERRORS["TrendHunter"] = {
+        "error": repr(_e),
+        "traceback": traceback.format_exc(),
+    }
+    _logger.warning("TrendHunter import failed; placeholder kept: %s", _e, exc_info=True)
+
+try:
+    from agents.liquidation_agent import LiquidationAgent
+except Exception as _e:
+    class LiquidationAgent:  # type: ignore
+        """Placeholder — LiquidationAgent module failed to import."""
+        agent_type = "strategy"
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "LiquidationAgent import failed: %s"
+                % AGENT_IMPORT_ERRORS.get("LiquidationAgent", {}).get("error", "unknown")
+            )
+
+    AGENT_IMPORT_ERRORS["LiquidationAgent"] = {
+        "error": repr(_e),
+        "traceback": traceback.format_exc(),
+    }
+    _logger.warning("LiquidationAgent import failed; placeholder kept: %s", _e, exc_info=True)
+
+try:
+    from agents.wallet_scanner_agent import WalletScannerAgent
+except Exception as _e:
+    class WalletScannerAgent:  # type: ignore
+        """Placeholder — WalletScannerAgent module failed to import."""
+        agent_type = "discovery"
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "WalletScannerAgent import failed: %s"
+                % AGENT_IMPORT_ERRORS.get("WalletScannerAgent", {}).get("error", "unknown")
+            )
+
+    AGENT_IMPORT_ERRORS["WalletScannerAgent"] = {
+        "error": repr(_e),
+        "traceback": traceback.format_exc(),
+    }
+    _logger.warning("WalletScannerAgent import failed; placeholder kept: %s", _e, exc_info=True)
+
+try:
+    from agents.symbol_screener import SymbolScreener
+except Exception as _e:
+    class SymbolScreener:  # type: ignore
+        """Placeholder — SymbolScreener module failed to import."""
+        agent_type = "discovery"
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "SymbolScreener import failed: %s"
+                % AGENT_IMPORT_ERRORS.get("SymbolScreener", {}).get("error", "unknown")
+            )
+
+    AGENT_IMPORT_ERRORS["SymbolScreener"] = {
+        "error": repr(_e),
+        "traceback": traceback.format_exc(),
+    }
+    _logger.warning("SymbolScreener import failed; placeholder kept: %s", _e, exc_info=True)
+
 # MLForecaster is optional in some deployments; guard import to avoid hard failures
 try:
     from agents.ml_forecaster import MLForecaster
-except Exception:
-    MLForecaster = None
-from agents.wallet_scanner_agent import WalletScannerAgent # Added import
-from agents.symbol_screener import SymbolScreener # Added import
+except Exception as _e:
+    class MLForecaster:  # type: ignore
+        """
+        Placeholder that preserves registry visibility when MLForecaster import fails.
+        AgentManager will attempt registration and emit an explicit failure.
+        """
+        agent_type = "strategy"
 
-AGENT_CLASS_MAP = {
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "MLForecaster import failed: %s"
+                % AGENT_IMPORT_ERRORS.get("MLForecaster", {}).get("error", "unknown")
+            )
+
+    AGENT_IMPORT_ERRORS["MLForecaster"] = {
+        "error": repr(_e),
+        "traceback": traceback.format_exc(),
+    }
+    _logger.warning(
+        "MLForecaster import failed; placeholder kept in AGENT_CLASS_MAP for explicit registration failure: %s",
+        _e,
+        exc_info=True,
+    )
+
+# ---------------------------------------------------------------------------
+# Agents currently disabled (commented out to suppress import overhead).
+# Re-enable by uncommenting both the import and the AGENT_CLASS_MAP entry.
+# ---------------------------------------------------------------------------
+# from agents.swing_trade_hunter import SwingTradeHunter  # disabled: strategy overlap with TrendHunter
+# from agents.news_reactor import NewsReactor              # disabled: news feed not wired
+# from agents.signal_fusion_agent import SignalFusion      # disabled: replaced by SignalManager
+# from agents.arbitrage_hunter_agent import ArbitrageHunter  # disabled: latency constraints
+
+AGENT_CLASS_MAP: dict = {
     "IPOChaser": IPOChaser,
     "DipSniper": DipSniper,
     # "SwingTradeHunter": SwingTradeHunter,
@@ -25,61 +180,88 @@ AGENT_CLASS_MAP = {
     # "SignalFusion": SignalFusion,
     "LiquidationAgent": LiquidationAgent,
     # "ArbitrageHunter": ArbitrageHunter,
-    # Only include if available in this deployment
-    **({"MLForecaster": MLForecaster} if MLForecaster else {}),
-    "WalletScannerAgent": WalletScannerAgent, # Added to map
-    "WalletScanner": WalletScannerAgent,      # Added alias
-    "SymbolScreener": SymbolScreener,         # Added to map
+    "MLForecaster": MLForecaster,
+    "WalletScannerAgent": WalletScannerAgent,
+    "WalletScanner": WalletScannerAgent,  # alias — same class as WalletScannerAgent
+    "SymbolScreener": SymbolScreener,
 }
+
 
 def validate_agent_registry(required_args):
     """
-    Validates that all agents in AGENT_CLASS_MAP accept the required constructor arguments,
-    with support for **kwargs fallback.
+    Validates that all agents in AGENT_CLASS_MAP accept the required
+    constructor arguments, with support for **kwargs fallback.
+
+    Alias entries (multiple map keys pointing to the same class) are
+    deduplicated — each class is inspected only once.
 
     Args:
-        required_args (list): A list of strings representing the required argument names
-                              (e.g., ['shared_state', 'config']).
+        required_args (list): Required argument names (e.g. ['shared_state', 'config']).
 
     Returns:
-        list: A list of strings, where each string describes an issue found (e.g.,
-              "AgentName missing required arg: arg_name"). Returns an empty list
-              if no issues are found.
+        list: Descriptions of issues found; empty list if none.
     """
     issues = []
+    seen_classes: set = set()
     for name, agent_class in AGENT_CLASS_MAP.items():
-        # Get the signature of the agent's __init__ method
-        sig = inspect.signature(agent_class.__init__)
-        # Check if the __init__ method accepts **kwargs
-        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        # Get the names of the parameters, skipping 'self'
-        init_params = list(sig.parameters.keys())[1:]
+        # Skip alias duplicates — same class already validated under another key
+        class_id = id(agent_class)
+        if class_id in seen_classes:
+            continue
+        seen_classes.add(class_id)
+
+        try:
+            sig = inspect.signature(agent_class.__init__)
+        except (ValueError, TypeError) as exc:
+            issues.append("%s __init__ is not inspectable: %s" % (name, exc))
+            continue
+
+        accepts_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        init_params = list(sig.parameters.keys())[1:]  # drop 'self'
 
         for arg in required_args:
-            # If an argument is not explicitly in init_params AND the method does not accept **kwargs,
-            # then it's a missing argument.
             if arg not in init_params and not accepts_kwargs:
-                issues.append(f"{name} missing required arg: {arg}")
+                issues.append("%s missing required arg: %s" % (name, arg))
+
     return issues
 
-if __name__ == "__main__":
-    # Optional: Validate that at least 'shared_state' and 'config' are present
-    required_args = ["shared_state", "config"]
-    # Run the validation
-    issues = validate_agent_registry(required_args)
-    # Print the results of the validation
-    if issues:
-        for issue in issues:
-            print("❌", issue)
-    else:
-        print("✅ All agent constructors are valid.")
 
-# Proposer/Discovery Agent Registration (Phase 3)
+if __name__ == "__main__":
+    _required_args = ["shared_state", "config"]
+    _issues = validate_agent_registry(_required_args)
+    if _issues:
+        for _issue in _issues:
+            print("[FAIL]", _issue)
+    else:
+        print("[OK] All agent constructors are valid.")
+
+
+# ---------------------------------------------------------------------------
+# Proposer / Discovery Agent Registration
+# ---------------------------------------------------------------------------
+
+# Explicit list of discovery agents.  Add new agents here — do NOT rely on
+# iterating AGENT_CLASS_MAP, which also contains non-discovery agents.
+_DISCOVERY_AGENTS = [
+    ("wallet_scanner_agent", "WalletScannerAgent"),
+    ("symbol_screener_agent", "SymbolScreener"),
+    ("ipo_chaser", "IPOChaser"),
+]
+
+
 def register_all_discovery_agents(agent_manager, app_context):
     """
-    Registers discovery/proposer agents. If an expected agent instance
-    wasn't pre-built on `app_context`, attempt to construct it here.
+    Registers discovery/proposer agents with the agent manager.
+
+    For each entry in ``_DISCOVERY_AGENTS`` the function first checks
+    ``app_context`` for a pre-built instance, then falls back to constructing
+    one via ``_safe_build``.  Only ``register_discovery_agent`` is called
+    (not the general ``register_agent``) to avoid double-execution in the
+    agent manager's strategy loop.
     """
+
     def _safe_build(name: str):
         cls = AGENT_CLASS_MAP.get(name)
         if not cls:
@@ -94,22 +276,14 @@ def register_all_discovery_agents(agent_manager, app_context):
         }
         try:
             return cls(**{k: v for k, v in kwargs.items() if v is not None})
-        except TypeError:
-            try:
-                return cls(kwargs["shared_state"], kwargs["config"])
-            except Exception:
-                return None
-        except Exception:
+        except Exception as exc:
+            _logger.debug("[_safe_build] %s construction failed: %s", name, exc)
             return None
 
-    wallet_scanner = getattr(app_context, "wallet_scanner_agent", None) or _safe_build("WalletScannerAgent")
-    symbol_screener = getattr(app_context, "symbol_screener_agent", None) or _safe_build("SymbolScreener")
-    ipo_chaser = getattr(app_context, "ipo_chaser", None) or _safe_build("IPOChaser")
-
-    for agent in [wallet_scanner, symbol_screener, ipo_chaser]:
+    for attr_name, map_key in _DISCOVERY_AGENTS:
+        agent = getattr(app_context, attr_name, None) or _safe_build(map_key)
         if not agent:
             continue
         if not getattr(agent, "agent_type", None):
-            setattr(agent, "agent_type", "discovery")  # tag it
-        agent_manager.register_agent(agent)            # correct signature
-        agent_manager.register_discovery_agent(agent)  # add to discovery list
+            setattr(agent, "agent_type", "discovery")
+        agent_manager.register_discovery_agent(agent)

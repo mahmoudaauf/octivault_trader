@@ -3,6 +3,7 @@ ModeManager subsystem extracted from MetaController.
 Handles mode switching, mode evaluation, and mode state tracking (NORMAL, FOCUS, RECOVERY, BOOTSTRAP).
 """
 from typing import Dict, Any, Set, Optional
+import json
 import time
 
 class ModeManager:
@@ -86,9 +87,10 @@ class ModeManager:
             }
         }
         
-        # Mode-specific symbol limits ( legacy compatibility )
-        self._bootstrap_symbol_limit = 1 
-        self._active_symbol_limit = self._bootstrap_symbol_limit 
+        # Universe-layer limit is intentionally independent from allocation-layer limits.
+        # Allocation uses envelope.max_positions; discovery/watchlist breadth uses this cap.
+        self._bootstrap_symbol_limit = int(getattr(config, "BOOTSTRAP_UNIVERSE_SYMBOLS", 1) or 1)
+        self._active_symbol_limit = self._resolve_mode_universe_limit(self._current_mode)
         
         # Mode configuration thresholds
         self._mode_config = {
@@ -105,6 +107,41 @@ class ModeManager:
         self._event_handlers = []
         
         self.logger.info(f"[ModeManager:Init] Initialized with mode: {self._current_mode}")
+
+    def _resolve_mode_universe_limit(self, mode: str) -> int:
+        """Resolve watchlist/universe cap without coupling to max_positions."""
+        base_limit = int(
+            getattr(
+                self.config,
+                "MAX_UNIVERSE_SYMBOLS",
+                getattr(getattr(self.config, "DISCOVERY", None), "TOP_N_SYMBOLS", self._bootstrap_symbol_limit),
+            )
+            or self._bootstrap_symbol_limit
+        )
+        if base_limit <= 0:
+            base_limit = max(1, self._bootstrap_symbol_limit)
+
+        overrides = getattr(self.config, "MODE_UNIVERSE_LIMITS", None)
+        if isinstance(overrides, str):
+            try:
+                parsed = json.loads(overrides)
+                overrides = parsed if isinstance(parsed, dict) else None
+            except Exception:
+                overrides = None
+
+        if isinstance(overrides, dict):
+            raw = overrides.get(mode) or overrides.get(str(mode).upper())
+            if raw is not None:
+                try:
+                    base_limit = int(raw)
+                except Exception:
+                    pass
+
+        if str(mode).upper() == "BOOTSTRAP":
+            bootstrap_limit = int(getattr(self.config, "BOOTSTRAP_UNIVERSE_SYMBOLS", self._bootstrap_symbol_limit) or self._bootstrap_symbol_limit)
+            base_limit = max(1, bootstrap_limit)
+
+        return max(1, int(base_limit))
 
     async def evaluate_state_machine(self, metrics: Dict[str, Any]):
         """
@@ -129,7 +166,7 @@ class ModeManager:
         
         # Double check if metrics missing (defensive)
         if "has_positions" not in metrics:
-            is_flat = await self._check_is_flat_async(metrics)
+            is_flat = await _check_is_flat_async(metrics)
         idle_time = float(metrics.get("idle_time_sec", 0.0))
         prolonged_idle = idle_time > float(getattr(self.config, "PROLONGED_IDLE_SECONDS", 3600))
         
@@ -184,10 +221,10 @@ class ModeManager:
         forced_liq = metrics.get("forced_liquidation", False)
         first_trades = metrics.get("first_trade_executed", False)
         
-        if ((is_restart and not first_trades) or not health_ok or forced_liq):
+        if (not health_ok or forced_liq):
             if current not in ("RECOVERY", "BOOTSTRAP", "SAFE", "PAUSED"):
-                self.logger.warning("[ModeManager:SOP] 🟨 Triggering RECOVERY: restart=%s, health_ok=%s, forced_liq=%s, status=%s", 
-                                   is_restart, health_ok, forced_liq, status)
+                self.logger.warning("[ModeManager:SOP] 🟨 Triggering RECOVERY: health_ok=%s, forced_liq=%s, status=%s", 
+                                   health_ok, forced_liq, status)
                 self.set_mode("RECOVERY")
                 return
 
@@ -324,8 +361,8 @@ class ModeManager:
             self._mode_switch_count += 1
             self._mode_switch_timestamps[mode] = time.time()
             
-            # Update active symbol limit based on envelope
-            self._active_symbol_limit = self._SOP_MATRIX[mode]["max_positions"]
+            # Update universe cap independently from allocation envelope.max_positions.
+            self._active_symbol_limit = self._resolve_mode_universe_limit(mode)
             
             self.logger.info(f"[ModeManager] Mode changed from {old_mode} to {mode} | Objective: {self._SOP_MATRIX[mode]['objective']}")
             self._emit_event('mode_changed', {'old_mode': old_mode, 'new_mode': mode})

@@ -215,7 +215,9 @@ class IPOChaser:
         # publish signal to bus if available
         await self._emit_signal(symbol, sig)
         if action == "buy":
-            await self._maybe_execute_buy(symbol, sig)
+            logger.info(
+                f"[{self.name}] BUY signal emitted for {symbol}; execution delegated to MetaController."
+            )
         return sig, float(sig["confidence"])
 
     # -------------------- Internals (ML path) --------------------
@@ -407,54 +409,3 @@ class IPOChaser:
                 )
             except Exception as e:
                 logger.warning(f"[{self.name}] Failed to emit to signal bus: {e}")
-
-    async def _maybe_execute_buy(self, symbol: str, signal: Dict[str, Any]) -> None:
-        if not self.execution_manager:
-            return
-        price = await self._get_price(symbol)
-        if price is None or price <= 0:
-            return
-
-        tp, sl = None, None
-        if self.tp_sl_engine:
-            try:
-                tp, sl = self.tp_sl_engine.calculate_tp_sl(symbol, price)
-            except Exception:
-                logger.debug(f"[{self.name}] TP/SL calc error", exc_info=True)
-
-        try:
-            usdt_bal = float((getattr(self.shared_state, "balances", {}) or {}).get("USDT", 0.0) or 0.0)
-            qty = round((usdt_bal / price) * 0.1, 6) if usdt_bal > 10 else 0.0
-            if qty <= 0:
-                return
-
-            await self.execution_manager.execute_trade(
-                symbol=symbol,
-                side="buy",
-                qty=qty,
-                mode="market",
-                take_profit=tp,
-                stop_loss=sl,
-                comment=f"{self.name}_strategy",
-            )
-        except Exception:
-            logger.debug(f"[{self.name}] execute_trade failed", exc_info=True)
-
-    async def _get_price(self, symbol: str) -> Optional[float]:
-        try:
-            if hasattr(self.shared_state, "get_latest_price_safe"):
-                return await self.shared_state.get_latest_price_safe(symbol)
-
-            md = getattr(self.shared_state, "market_data", {}) or {}
-            px = (md.get(symbol) or {}).get("close")
-            if px:
-                return float(px)
-
-            if self.exchange_client and hasattr(self.exchange_client, "get_current_price"):
-                try:
-                    return float(await asyncio.wait_for(self.exchange_client.get_current_price(symbol), timeout=10))
-                except asyncio.TimeoutError:
-                    return None
-        except Exception:
-            logger.debug(f"[{self.name}] price lookup failed", exc_info=True)
-        return None

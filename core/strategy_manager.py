@@ -1,4 +1,5 @@
 from core.component_status_logger import ComponentStatusLogger as CSL
+from core.stubs import TradeIntent
 import logging
 import asyncio
 import random
@@ -17,6 +18,7 @@ class StrategyManager:
         self.shared_state = shared_state
         self.database_manager = database_manager
         self.agents = agents
+        self.meta_controller = kwargs.get("meta_controller")
         self.active_strategies = []
 
         self.interval = float(getattr(config, "STRATEGY_ANALYSIS_INTERVAL", 300.0))
@@ -51,7 +53,7 @@ class StrategyManager:
                                           getattr(config, "strategy_manager_order_guard_cooldown_s_per_symbol",
                                           getattr(config, "strategy_manager.order_guard.cooldown_s_per_symbol", 0.0))))
 
-        # Execution forwarding state
+        # Forwarding state (signal/intents to Meta)
         self.execution_manager = None
         self._last_signal_ts_per_symbol: Dict[str, float] = {}
         self._inflight_exec = 0
@@ -107,9 +109,14 @@ class StrategyManager:
             pass
 
     def set_execution_manager(self, execution_manager):
-        """Wire the ExecutionManager for forwarding orders."""
+        """Legacy compatibility hook; StrategyManager no longer executes orders directly."""
         self.execution_manager = execution_manager
-        self.logger.info("ExecutionManager wired into StrategyManager.")
+        self.logger.info("ExecutionManager wired into StrategyManager (legacy compatibility only).")
+
+    def set_meta_controller(self, meta_controller):
+        """Preferred routing hook for strict Meta-directed execution."""
+        self.meta_controller = meta_controller
+        self.logger.info("MetaController wired into StrategyManager for signal forwarding.")
 
     async def analyze_strategies(self):
         """Pull a portfolio snapshot and return NAV in base_ccy."""
@@ -193,7 +200,7 @@ class StrategyManager:
         return left if left > 0 else 0.0
 
     async def _can_forward(self, symbol: str) -> Tuple[bool, str, dict]:
-        """Check hard guards before forwarding to ExecutionManager."""
+        """Check hard guards before forwarding to Meta intake."""
         meta = {"inflight": int(self._inflight_exec), "max_conc": int(self.exec_max_concurrency)}
         # Concurrency gate (non-blocking)
         if self._inflight_exec >= self.exec_max_concurrency:
@@ -228,18 +235,25 @@ class StrategyManager:
     async def forward_signal(self, *, symbol: str, side: str, confidence: float = 0.0,
                              planned_quote: Optional[float] = None, tag: str = "meta/Agent") -> Optional[Dict[str, Any]]:
         """
-        Hard-guarded forwarding to ExecutionManager. Returns EM result or None if gated.
+        Hard-guarded forwarding to Meta intake (intent/signal). Returns route result or None if gated.
         """
-        if not self.execution_manager:
-            self.logger.warning("Gated: NoExecutionManager | symbol=%s side=%s", symbol, side)
+        symbol_u = str(symbol or "").upper()
+        side_u = str(side or "").upper()
+        if side_u not in {"BUY", "SELL"} or not symbol_u:
+            self.logger.warning("Gated: InvalidSignal | symbol=%s side=%s", symbol, side)
+            return None
+        event_bus = getattr(self.shared_state, "event_bus", None)
+        has_event_bus = bool(getattr(event_bus, "publish", None))
+        if not has_event_bus:
+            self.logger.warning("Gated: NoEventBusRoute | symbol=%s side=%s", symbol_u, side_u)
             return None
 
-        ok, reason, meta = await self._can_forward(symbol)
+        ok, reason, meta = await self._can_forward(symbol_u)
         if not ok:
-            self.logger.info("Gated: %s | symbol=%s side=%s meta=%s", reason, symbol, side, meta)
+            self.logger.info("Gated: %s | symbol=%s side=%s meta=%s", reason, symbol_u, side_u, meta)
             try:
                 await self.shared_state.update_component_status("StrategyManager", "Degraded",
-                    f"Gated:{reason} symbol={symbol} side={side} meta={meta}")
+                    f"Gated:{reason} symbol={symbol_u} side={side_u} meta={meta}")
             except Exception:
                 pass
             return None
@@ -247,32 +261,63 @@ class StrategyManager:
         # P9 Authoritative Budget Guard
         # Block BUY signals if the agent has no allocated capital (unless allocator disabled)
         allocator_enabled = bool(getattr(self.config, "CAPITAL_ALLOCATOR_ENABLED", True))
-        if allocator_enabled and side.lower() == "buy" and hasattr(self.shared_state, "get_authoritative_reservation"):
+        if allocator_enabled and side_u == "BUY" and hasattr(self.shared_state, "get_authoritative_reservation"):
             agent_id = tag.split("/")[-1] if "/" in tag else tag
             # We treat 'meta' or 'Agent' as generic fallback, but real agents have specific IDs.
             # If specific budget prevents it, block.
-            budget = self.shared_state.get_authoritative_reservation(agent_id)
+            budget = float(self.shared_state.get_authoritative_reservation(agent_id) or 0.0)
+            shared_wallet_mode = bool(getattr(self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True))
+            if budget <= 0.0 and shared_wallet_mode and hasattr(self.shared_state, "get_authoritative_reservations"):
+                try:
+                    reservations = self.shared_state.get_authoritative_reservations() or {}
+                    if isinstance(reservations, dict) and reservations:
+                        budget = float(max(float(v or 0.0) for v in reservations.values()))
+                except Exception:
+                    pass
             if budget <= 0:
                 # Optional: Check if we are in bootstrap mode? No, strict budget applies always now.
-                self.logger.debug("Gated: NoBudget | agent=%s symbol=%s budget=%.2f", agent_id, symbol, budget)
+                self.logger.debug("Gated: NoBudget | agent=%s symbol=%s budget=%.2f", agent_id, symbol_u, budget)
                 return None
 
-        # Pass-through to EM with non-blocking concurrency accounting
+        # Forward to Meta intake with non-blocking concurrency accounting
         self._inflight_exec += 1
         try:
             async with self._exec_gate_sem:
-                # Prefer quote-amount path when provided
-                if planned_quote and planned_quote > 0 and side.lower() == "buy":
-                    res = await self.execution_manager.execute_trade(
-                        symbol=symbol, side=side, planned_quote=float(planned_quote), tag=tag
+                agent_name = (tag.split("/")[-1] if "/" in tag else str(tag or "StrategyManager"))
+                quote_hint = float(planned_quote) if (planned_quote and float(planned_quote) > 0.0) else None
+                trade_intent = TradeIntent(
+                    symbol=symbol_u,
+                    side=side_u,
+                    quote_hint=quote_hint,
+                    agent=agent_name,
+                    confidence=float(confidence or 0.0),
+                    rationale=f"StrategyManager forward ({tag})",
+                    ttl_sec=30,
+                    tag=str(tag or "strategy/StrategyManager"),
+                )
+
+                try:
+                    await event_bus.publish("events.trade.intent", trade_intent)
+                    route_name = "event_bus"
+                except Exception as e:
+                    self.logger.warning(
+                        "Event-bus routing failed for %s %s: %s",
+                        symbol_u,
+                        side_u,
+                        e,
                     )
-                else:
-                    res = await self.execution_manager.execute_trade(
-                        symbol=symbol, side=side, tag=tag
-                    )
-                # Update cooldown stamp on success/attempt
-                self._last_signal_ts_per_symbol[symbol] = time.time()
-                return res
+                    return None
+
+                self._last_signal_ts_per_symbol[symbol_u] = time.time()
+                self.logger.info(
+                    "Forwarded signal via %s | symbol=%s side=%s conf=%.2f quote=%s",
+                    route_name,
+                    symbol_u,
+                    side_u,
+                    float(confidence or 0.0),
+                    f"{float(planned_quote):.4f}" if (planned_quote and float(planned_quote) > 0.0) else "None",
+                )
+                return {"ok": True, "status": "queued", "route": route_name, "symbol": symbol_u, "side": side_u}
         finally:
             self._inflight_exec = max(0, self._inflight_exec - 1)
 

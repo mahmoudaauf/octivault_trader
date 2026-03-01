@@ -1,0 +1,78 @@
+{
+  "BTCUSDT": {
+    "status": "SUCCESS",
+    "n_candles": 1000,
+    "regime_stats": {
+      "NORMAL_MEAN_REVERT": {
+        "count": 406,
+        "mean_return": 2.2445279071558745e-05,
+        "volatility": 0.0016199079711286086,
+        "win_rate": 0.5111111111111111,
+        "positive_autocorr": 0.0049261083743842365,
+        "sharpe": 0.013855897663075798
+      },
+      "HIGH_VOL_MEAN_REVERT": {
+        "count": 297,
+        "mean_return": 5.006194147783027e-06,
+        "volatility": 0.0017474915279926508,
+        "win_rate": 0.5016835016835017,
+        "positive_autocorr": 0.0,
+        "sharpe": 0.0028647887944462077
+      },
+      "LOW_VOL_MEAN_REVERT": {
+        "count": 281,
+        "mean_return": 1.3410478599241079e-06,
+        "volatility": 0.0008401600375922101,
+        "win_rate": 0.5444839857651246,
+        "positive_autocorr": 0.31316725978647686,
+        "sharpe": 0.0015961814415350883
+      },
+      "LOW_VOL_TRENDING": {
+        "count": 16,
+        "mean_return": 0.0001382180032676178,
+        "volatility": 0.0007425613110390806,
+        "win_rate": 0.5,
+        "positive_autocorr": 1.0,
+        "sharpe": 0.1861368229300913
+      }
+    },
+    "exposure_mean": 0.9353999999999999,
+    "exposure_std": 0.27155216916935243,
+    "regime_transitions": 28,
+    "output_file": "validation_outputs/BTCUSDT_with_regime_and_exposure.csv"
+  },
+  "ETHUSDT": {
+    "status": "SUCCESS",
+    "n_candles": 1000,
+    "regime_stats": {
+      "NORMAL_MEAN_REVERT": {
+        "count": 401,
+        "mean_return": 9.952731577385631e-06,
+        "volatility": 0.0020723613098123446,
+        "win_rate": 0.51,
+        "positive_autocorr": 0.03740648379052369,
+        "sharpe": 0.0048026044156783
+      },
+      "HIGH_VOL_MEAN_REVERT": {
+        "count": 297,
+        "mean_return": -1.5603570045447084e-05,
+        "volatility": 0.0021071429358930065,
+        "win_rate": 0.5252525252525253,
+        "positive_autocorr": 0.030303030303030304,
+        "sharpe": -0.007405083812614874
+      },
+      "LOW_VOL_MEAN_REVERT": {
+        "count": 297,
+        "mean_return": -3.8664439040657255e-06,
+        "volatility": 0.0010545855003279104,
+        "win_rate": 0.5016835016835017,
+        "positive_autocorr": 0.08080808080808081,
+        "sharpe": -0.003666316199932108
+      }
+    },
+    "exposure_mean": 0.9325999999999998,
+    "exposure_std": 0.24535166075948506,
+    "regime_transitions": 20,
+    "output_file": "validation_outputs/ETHUSDT_with_regime_and_exposure.csv"
+  }
+}

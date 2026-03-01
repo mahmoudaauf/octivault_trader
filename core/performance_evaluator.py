@@ -248,6 +248,108 @@ class PerformanceEvaluator:
         uptime_sec = now_ts - start_ts
         
         if status not in ("Error", "Degraded"):  # Don't override deadlock status
+            # GLOBAL SYSTEMIC DEGRADATION GUARD - INSTITUTIONAL FEATURE
+            # Check for system-wide performance degradation that requires global risk reduction
+            global_degradation_triggered = False
+            
+            # 1. Global Sharpe Ratio Floor
+            sharpe_floor = float(getattr(self.config, "GLOBAL_SHARPE_RATIO_FLOOR", 0.0) or 0.0)
+            if sharpe_floor > 0:
+                try:
+                    # Calculate rolling Sharpe ratio from recent performance
+                    sharpe_window_hours = int(getattr(self.config, "SHARPE_WINDOW_HOURS", 24) or 24)
+                    sharpe_cutoff = now_ts - (sharpe_window_hours * 3600)
+                    
+                    returns = []
+                    if hasattr(self.ss, "trade_history"):
+                        for trade in (self.ss.trade_history or []):
+                            if isinstance(trade, dict):
+                                ts = float(trade.get("ts", 0) or 0)
+                                if ts >= sharpe_cutoff:
+                                    pnl = float(trade.get("realized_delta", 0) or 0)
+                                    if abs(pnl) > 1e-8:  # Only count meaningful trades
+                                        returns.append(pnl)
+                    
+                    if len(returns) >= 10:  # Need minimum sample size
+                        import numpy as np
+                        returns_array = np.array(returns)
+                        if returns_array.std() > 0:
+                            sharpe = returns_array.mean() / returns_array.std() * np.sqrt(365*24)  # Annualized
+                            if sharpe < sharpe_floor:
+                                status = "Degraded"
+                                msg = f"GLOBAL_DEGRADATION: Sharpe {sharpe:.2f} < floor {sharpe_floor:.2f}"
+                                global_degradation_triggered = True
+                                self.logger.warning(f"[PerfEval:GlobalDegradation] {msg}")
+                except Exception as e:
+                    self.logger.debug(f"Sharpe ratio calculation failed: {e}")
+            
+            # 2. Global Drawdown Threshold
+            if not global_degradation_triggered:
+                drawdown_threshold = float(getattr(self.config, "GLOBAL_DRAWDOWN_THRESHOLD_PCT", 0.0) or 0.0)
+                if drawdown_threshold > 0:
+                    try:
+                        # Calculate system-wide drawdown
+                        start_equity = float(getattr(self.ss, "_total_value_start", 0.0) or 0.0)
+                        current_equity = float(getattr(self.ss, "_total_value", 0.0) or 0.0)
+                        
+                        if start_equity > 0 and current_equity > 0:
+                            drawdown_pct = (start_equity - current_equity) / start_equity
+                            if drawdown_pct >= drawdown_threshold:
+                                status = "Degraded" 
+                                msg = f"GLOBAL_DRAWDOWN: {drawdown_pct:.1%} >= threshold {drawdown_threshold:.1%}"
+                                global_degradation_triggered = True
+                                self.logger.warning(f"[PerfEval:GlobalDegradation] {msg}")
+                    except Exception as e:
+                        self.logger.debug(f"Drawdown calculation failed: {e}")
+            
+            # 3. All Agents Degraded Check
+            if not global_degradation_triggered:
+                all_agents_degraded_threshold = float(getattr(self.config, "ALL_AGENTS_DEGRADED_THRESHOLD", 0.0) or 0.0)
+                if all_agents_degraded_threshold > 0:
+                    try:
+                        # Check if all agents have degraded performance
+                        perf_map = self._snapshot_performance()
+                        if perf_map and len(perf_map) > 1:  # Need multiple agents to check
+                            degraded_count = 0
+                            total_agents = len(perf_map)
+                            
+                            for agent_stats in perf_map.values():
+                                roi = float(agent_stats.get("roi", 0.0))
+                                win_rate = float(agent_stats.get("win_rate", 0.5))
+                                # Agent is degraded if both ROI negative and win rate below threshold
+                                if roi < 0 and win_rate < all_agents_degraded_threshold:
+                                    degraded_count += 1
+                            
+                            if degraded_count == total_agents:
+                                status = "Degraded"
+                                msg = f"ALL_AGENTS_DEGRADED: {degraded_count}/{total_agents} agents below threshold {all_agents_degraded_threshold:.1%}"
+                                global_degradation_triggered = True
+                                self.logger.warning(f"[PerfEval:GlobalDegradation] {msg}")
+                    except Exception as e:
+                        self.logger.debug(f"All agents degraded check failed: {e}")
+            
+            # 4. Trigger Global Risk Reduction if Degradation Detected
+            if global_degradation_triggered:
+                try:
+                    # Signal global risk reduction to CapitalAllocator and other components
+                    if hasattr(self.ss, "emit_event"):
+                        await self.ss.emit_event("GLOBAL_SYSTEMIC_DEGRADATION", {
+                            "status": status,
+                            "reason": msg,
+                            "timestamp": now_ts,
+                            "component": "PerformanceEvaluator"
+                        })
+                    
+                    # Update metrics for dashboard visibility
+                    if hasattr(self.ss, "metrics") and isinstance(self.ss.metrics, dict):
+                        self.ss.metrics["global_systemic_degradation"] = True
+                        self.ss.metrics["global_degradation_reason"] = msg
+                        self.ss.metrics["global_degradation_timestamp"] = now_ts
+                        
+                except Exception as e:
+                    self.logger.debug(f"Global degradation signaling failed: {e}")
+
+        # UPTIME GRACE (PHASE A): Ignore noise during first 30 mins
             if uptime_sec < (uptime_grace_min * 60):
                  msg = f"WarmUp Grace: uptime={uptime_sec/60:.1f}m < {uptime_grace_min}m"
             elif target_usdt_h > 0.0 and kpi_metrics["usdt_per_hour"] < target_usdt_h:

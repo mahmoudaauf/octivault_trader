@@ -1,0 +1,62 @@
+{
+  "BTCUSDT": {
+    "symbol": "BTCUSDT",
+    "n_candles": 1000,
+    "static": {
+      "total_return": 0.012153241370908674,
+      "annual_return": 0.0758734832231922,
+      "volatility": 0.11468334932113886,
+      "sharpe": 0.6615910999488652,
+      "max_drawdown": -0.030210739075009263,
+      "win_rate": 0.5175175175175175
+    },
+    "dynamic": {
+      "total_return": 0.009797929602124889,
+      "annual_return": 0.06080545934281534,
+      "volatility": 0.10220760856483732,
+      "sharpe": 0.5949210650422591,
+      "max_drawdown": -0.02536248454981116,
+      "win_rate": 0.5175175175175175
+    },
+    "aggressive": {
+      "total_return": 0.014381063916704795,
+      "annual_return": 0.09028991914580309,
+      "volatility": 0.1153594984283431,
+      "sharpe": 0.7826830072591527,
+      "max_drawdown": -0.030210739075009263,
+      "win_rate": 0.5175175175175175
+    },
+    "dynamic_improvement_pct": -10.07722669058866,
+    "aggressive_improvement_pct": 18.303134265205024
+  },
+  "ETHUSDT": {
+    "symbol": "ETHUSDT",
+    "n_candles": 1000,
+    "static": {
+      "total_return": -0.0022304795530814214,
+      "annual_return": -0.013427560884758605,
+      "volatility": 0.14268866963983268,
+      "sharpe": -0.0941039041057132,
+      "max_drawdown": -0.04280559962209629,
+      "win_rate": 0.5135135135135135
+    },
+    "dynamic": {
+      "total_return": -0.009071398723228374,
+      "annual_return": -0.05367512559487697,
+      "volatility": 0.1284471750380678,
+      "sharpe": -0.4178770422858215,
+      "max_drawdown": -0.04416411774157858,
+      "win_rate": 0.5135135135135135
+    },
+    "aggressive": {
+      "total_return": -0.0022304795530814214,
+      "annual_return": -0.013427560884758605,
+      "volatility": 0.14268866963983268,
+      "sharpe": -0.0941039041057132,
+      "max_drawdown": -0.04280559962209629,
+      "win_rate": 0.5135135135135135
+    },
+    "dynamic_improvement_pct": 344.05919845407504,
+    "aggressive_improvement_pct": 0.0
+  }
+}

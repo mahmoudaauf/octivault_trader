@@ -1,0 +1,17 @@
+{
+  "symbol": "BTCUSDT",
+  "mean_sharpe": -1.4674646649301624,
+  "std_sharpe": 0.0,
+  "splits": [
+    {
+      "split": 1,
+      "train_period": "Month 1-4",
+      "test_period": "Month 5-6",
+      "sharpe": -1.4674646649301624,
+      "annual_return": -0.6195128679496418,
+      "volatility": 0.4221654413594516,
+      "max_drawdown": -0.35589922750649755,
+      "periods": 1440
+    }
+  ]
+}
