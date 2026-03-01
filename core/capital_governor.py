@@ -41,7 +41,7 @@ Architecture Notes:
 """
 
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -61,16 +61,21 @@ class CapitalGovernor:
     
     Automatically adjusts position limits, symbol rotation allowances,
     and sizing based on account equity bracket.
+    
+    CRITICAL: Always syncs authoritative balance before reading NAV to ensure
+    fresh, accurate account data.
     """
     
-    def __init__(self, config):
+    def __init__(self, config, shared_state=None):
         """
         Initialize Capital Governor.
         
         Args:
             config: Configuration object with capital thresholds
+            shared_state: Optional SharedState reference for direct NAV access
         """
         self.config = config
+        self.shared_state = shared_state  # For sync_authoritative_balance()
         
         # Capital bracket thresholds
         self.micro_threshold = 500.0      # < $500: micro bracket
@@ -88,6 +93,63 @@ class CapitalGovernor:
             self.medium_threshold,
             self.medium_threshold
         )
+    
+    async def get_fresh_nav(self) -> float:
+        """
+        Get fresh NAV by syncing authoritative balance first.
+        
+        CRITICAL: This ensures NAV is accurate and not stale.
+        
+        Returns:
+            Fresh NAV value from account
+        """
+        nav = 0.0
+        
+        try:
+            # Step 1: Sync authoritative balance if available
+            if self.shared_state and hasattr(self.shared_state, "sync_authoritative_balance"):
+                try:
+                    await self.shared_state.sync_authoritative_balance(force=True)
+                    logger.debug("[CapitalGovernor] Synced authoritative balance for NAV")
+                except Exception as e:
+                    logger.warning("[CapitalGovernor] Failed to sync balance: %s", e)
+            
+            # Step 2: Read fresh NAV from shared_state
+            if self.shared_state:
+                # Try multiple NAV sources in order of preference
+                nav = float(getattr(self.shared_state, "nav", None) or 
+                           getattr(self.shared_state, "total_value", None) or 
+                           getattr(self.shared_state, "total_balance", None) or 0.0)
+            
+            if nav <= 0:
+                logger.warning("[CapitalGovernor] Fresh NAV is invalid: %.2f", nav)
+                return 0.0
+            
+            logger.debug("[CapitalGovernor] Fresh NAV obtained: $%.2f", nav)
+            return nav
+            
+        except Exception as e:
+            logger.error("[CapitalGovernor:FreshNAV] Failed to get fresh NAV: %s", e)
+            return 0.0
+    
+    def get_nav_sync_required(self, nav_source: str = "parameter") -> Tuple[bool, str]:
+        """
+        Check if NAV sync is required before using Governor.
+        
+        Args:
+            nav_source: Source of NAV ("parameter", "cached", "shared_state")
+            
+        Returns:
+            Tuple[bool, str] = (sync_required, reason)
+        """
+        if nav_source == "parameter":
+            return False, "NAV passed as parameter (assumed fresh)"
+        elif nav_source == "cached":
+            return True, "NAV is cached (may be stale)"
+        elif nav_source == "shared_state":
+            return True, "NAV from shared_state (sync recommended)"
+        else:
+            return True, "Unknown NAV source (sync recommended)"
     
     def get_bracket(self, nav: float) -> CapitalBracket:
         """

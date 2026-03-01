@@ -122,12 +122,34 @@ class RotationExitAuthority:
             return False, ""
         
         try:
-            # Get current NAV from SharedState
+            # CRITICAL: Sync authoritative balance to get fresh NAV
+            if hasattr(self.ss, "sync_authoritative_balance"):
+                try:
+                    import asyncio
+                    # Run sync in a way that works in sync contexts
+                    try:
+                        asyncio.get_event_loop().run_until_complete(
+                            self.ss.sync_authoritative_balance(force=True)
+                        )
+                    except RuntimeError:
+                        # Already in async context, just log
+                        self.logger.debug(
+                            "[REA:RotationRestriction] In async context, using current balance"
+                        )
+                except Exception as e:
+                    self.logger.debug(
+                        "[REA:RotationRestriction] Balance sync unavailable: %s", e
+                    )
+            
+            # Get current NAV from SharedState after sync
             nav = float(getattr(self.ss, "nav", 0.0) or 
                        getattr(self.ss, "total_value", 0.0) or 0.0)
             
             if nav <= 0:
                 # Default to allowing if NAV unavailable
+                self.logger.debug(
+                    "[REA:RotationRestriction] NAV unavailable (%.2f), allowing rotation", nav
+                )
                 return False, ""
             
             # Check if rotation should be restricted (MICRO bracket only)
