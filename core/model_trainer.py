@@ -25,9 +25,11 @@ except ImportError:
 try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.utils.class_weight import compute_class_weight
 except ImportError:
     StandardScaler = None
     CalibratedClassifierCV = None
+    compute_class_weight = None
 
 # Using ModelManager's helper to build paths if needed, 
 # or we can redefine it locally to keep it standalone.
@@ -69,6 +71,13 @@ class ModelTrainer:
         self.label_trend_threshold_pct = float(os.getenv("ML_LABEL_TREND_THRESHOLD_PCT", "0.0020") or 0.0020)
         self.label_sideways_threshold_pct = float(os.getenv("ML_LABEL_SIDEWAYS_THRESHOLD_PCT", "0.0010") or 0.0010)
         self.label_extreme_threshold_pct = float(os.getenv("ML_LABEL_EXTREME_THRESHOLD_PCT", "0.0030") or 0.0030)
+        
+        # IMPROVED LABELING: Triple Barrier Method
+        self.use_triple_barrier_labels = bool(os.getenv("ML_USE_TRIPLE_BARRIER_LABELS", "true").lower() == "true")
+        self.triple_barrier_fee_pct = float(os.getenv("ML_TRIPLE_BARRIER_FEE_PCT", "0.001") or 0.001)
+        self.triple_barrier_slippage_pct = float(os.getenv("ML_TRIPLE_BARRIER_SLIPPAGE_PCT", "0.0005") or 0.0005)
+        self.triple_barrier_buffer_pct = float(os.getenv("ML_TRIPLE_BARRIER_BUFFER_PCT", "0.0005") or 0.0005)
+        self.triple_barrier_lookforward = max(1, int(os.getenv("ML_TRIPLE_BARRIER_LOOKFORWARD_BARS", "5") or 5))
         
         # Feature scaling persistence
         self.feature_scalers = {}  # Will store sklearn scalers
@@ -210,6 +219,72 @@ class ModelTrainer:
         except Exception as e:
             self.logger.debug("Regime inference failed: %s", e)
             return "medium"
+
+    def _create_labels_triple_barrier(self, df, fee_pct: float = 0.001, slippage_pct: float = 0.0005,
+                                      buffer_pct: float = 0.0005, lookforward_bars: int = 5,
+                                      volatility_window: int = 20) -> np.ndarray:
+        """
+        IMPROVED LABELING: Triple Barrier Method (Real Quant Standard)
+        
+        Creates labels based on:
+        1. Forward return > (fees + slippage + buffer) AND within N bars
+        2. Volatility-normalized thresholds
+        3. Realistic transaction costs
+        
+        Returns:
+            np.ndarray: Binary labels (1=BUY profitable, 0=HOLD/NO trade)
+        """
+        try:
+            df_copy = df.copy()
+            
+            # Calculate volatility (ATR-based)
+            df_copy["tr"] = np.maximum(
+                df_copy["high"] - df_copy["low"],
+                np.maximum(
+                    np.abs(df_copy["high"] - df_copy["close"].shift(1)),
+                    np.abs(df_copy["low"] - df_copy["close"].shift(1))
+                )
+            )
+            df_copy["atr"] = df_copy["tr"].rolling(window=volatility_window).mean()
+            df_copy["volatility"] = df_copy["atr"] / df_copy["close"]
+            
+            # Cost threshold: fees + slippage + buffer (normalized)
+            cost_threshold = fee_pct + slippage_pct + buffer_pct
+            
+            labels = np.zeros(len(df_copy), dtype=np.float32)
+            
+            for i in range(len(df_copy) - lookforward_bars):
+                current_price = df_copy.iloc[i]["close"]
+                current_vol = df_copy.iloc[i]["volatility"]
+                
+                if current_price <= 0 or pd.isna(current_vol):
+                    labels[i] = 0
+                    continue
+                
+                # Look ahead N bars for best high
+                future_bars = df_copy.iloc[i:i + lookforward_bars + 1]
+                max_high = future_bars["high"].max()
+                
+                # Profit target: cost + vol-adjusted expectancy
+                vol_adjusted_threshold = cost_threshold + (current_vol * 0.5)  # Half volatility as minimum target
+                profit_pct = (max_high - current_price) / current_price
+                
+                # Label as BUY if profit exceeds cost + volatility buffer
+                labels[i] = 1 if profit_pct > vol_adjusted_threshold else 0
+            
+            # Log distribution
+            unique, counts = np.unique(labels, return_counts=True)
+            label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist()))
+            self.logger.info(
+                f"[ML DEBUG] Triple Barrier Labels: fee={fee_pct:.4f} "
+                f"slippage={slippage_pct:.4f} buffer={buffer_pct:.4f} "
+                f"lookforward={lookforward_bars} dist={label_dist}"
+            )
+            
+            return labels
+        except Exception as e:
+            self.logger.warning(f"Triple Barrier labeling failed: {e}, falling back to simple threshold")
+            return None
 
     @staticmethod
     def _last_history_metric(history: Dict[str, Any], keys: Union[str, tuple]) -> Optional[float]:
@@ -367,12 +442,45 @@ class ModelTrainer:
             self.input_lookback,
         )
 
-        # Create labels: next close > current close by threshold -> 1 else 0
+        # Create labels using improved Triple Barrier Method or fallback to simple threshold
         df_copy = df.copy()
         df_copy["future_return"] = df_copy["close"].pct_change().shift(-1)
         
-        # PHASE 3: Regime-aware label generation
-        if self.regime_aware_labels_enabled:
+        # IMPROVED LABELING: Try Triple Barrier first
+        if self.use_triple_barrier_labels:
+            triple_barrier_labels = self._create_labels_triple_barrier(
+                df_copy,
+                fee_pct=self.triple_barrier_fee_pct,
+                slippage_pct=self.triple_barrier_slippage_pct,
+                buffer_pct=self.triple_barrier_buffer_pct,
+                lookforward_bars=self.triple_barrier_lookforward
+            )
+            if triple_barrier_labels is not None:
+                df_copy["label"] = triple_barrier_labels
+                self.logger.info(f"Using Triple Barrier Labeling (improved method)")
+            else:
+                # Fallback to regime-aware
+                self.logger.warning("Triple Barrier failed, falling back to regime-aware labels")
+                if self.regime_aware_labels_enabled:
+                    regime = self._infer_regime_from_volatility(df)
+                    if regime == "trend":
+                        threshold = self.label_trend_threshold_pct
+                    elif regime == "sideways":
+                        threshold = self.label_sideways_threshold_pct
+                    elif regime == "extreme":
+                        threshold = self.label_extreme_threshold_pct
+                    else:  # medium or unknown
+                        threshold = self.label_threshold_pct
+                    df_copy["label"] = (df_copy["future_return"] > threshold).astype(int)
+                    self.logger.info(
+                        f"Regime-aware labels: regime={regime} threshold={threshold:.6f} "
+                        f"positive samples: {df_copy['label'].sum()}/{len(df_copy)}"
+                    )
+                else:
+                    df_copy["label"] = (df_copy["future_return"] > self.label_threshold_pct).astype(int)
+                    self.logger.info(f"Label threshold: {self.label_threshold_pct:.6f}, positive samples: {df_copy['label'].sum()}/{len(df_copy)}")
+        # PHASE 3: Regime-aware label generation (fallback)
+        elif self.regime_aware_labels_enabled:
             regime = self._infer_regime_from_volatility(df)
             if regime == "trend":
                 threshold = self.label_trend_threshold_pct
@@ -389,7 +497,7 @@ class ModelTrainer:
                 f"positive samples: {df_copy['label'].sum()}/{len(df_copy)}"
             )
         else:
-            # Fallback: use static threshold
+            # Simple threshold fallback
             df_copy["label"] = (df_copy["future_return"] > self.label_threshold_pct).astype(int)
             self.logger.info(f"Label threshold: {self.label_threshold_pct:.6f}, positive samples: {df_copy['label'].sum()}/{len(df_copy)}")
 
@@ -413,6 +521,12 @@ class ModelTrainer:
             self.logger.warning("Label set is degenerate for %s; skipping retrain.", self.symbol)
             return _ret(False, "degenerate_labels")
 
+        # === DEBUG LABEL DISTRIBUTION ===
+        unique, counts = np.unique(y, return_counts=True)
+        label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist()))
+        self.logger.info(f"[ML DEBUG] Label distribution for {self.symbol}: {label_dist}")
+        # ================================
+
         sample_count = int(X.shape[0])
         val_count = max(1, int(round(sample_count * 0.1)))
         min_train_count = max(16, int(self.batch_size))
@@ -426,6 +540,12 @@ class ModelTrainer:
         else:
             X_train_raw, y_train = X, y
             X_val_raw, y_val = None, None
+
+        # DEBUG validation distribution
+        if has_validation and y_val is not None:
+            unique_val, counts_val = np.unique(y_val, return_counts=True)
+            val_dist = dict(zip(unique_val.astype(int).tolist(), counts_val.tolist()))
+            self.logger.info(f"[ML DEBUG] Validation distribution for {self.symbol}: {val_dist}")
 
         # Leakage fix: fit feature scalers on training split only, then transform train/val.
         self.feature_scalers = {}
@@ -521,16 +641,28 @@ class ModelTrainer:
         if has_validation and X_val is not None and y_val is not None:
             fit_kwargs["validation_data"] = (X_val, y_val)
 
-        # Add class imbalance weighting
-        unique_labels, counts = np.unique(y_train, return_counts=True)
-        total_samples = len(y_train)
-        class_weights = {}
-        for label, count in zip(unique_labels, counts):
-            class_weights[int(label)] = total_samples / (len(unique_labels) * count)
+        # Add class imbalance weighting using sklearn's balanced approach
+        unique_labels = np.unique(y_train)
+        
+        # Use sklearn's compute_class_weight with balanced strategy
+        if compute_class_weight is not None:
+            weights = compute_class_weight(
+                class_weight="balanced",
+                classes=unique_labels,
+                y=y_train
+            )
+            class_weights = dict(zip(unique_labels.astype(int), weights))
+        else:
+            # Fallback to manual calculation if sklearn is unavailable
+            unique_labels, counts = np.unique(y_train, return_counts=True)
+            total_samples = len(y_train)
+            class_weights = {}
+            for label, count in zip(unique_labels, counts):
+                class_weights[int(label)] = total_samples / (len(unique_labels) * count)
         
         if len(class_weights) > 1:
             fit_kwargs["class_weight"] = class_weights
-            self.logger.info("Applied class weights for %s: %s", self.symbol, 
+            self.logger.info("Applied balanced class weights for %s (forces BUY importance): %s", self.symbol, 
                            {k: f"{v:.2f}" for k, v in class_weights.items()})
 
         history = self.model.fit(**fit_kwargs)

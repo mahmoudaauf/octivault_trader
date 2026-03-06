@@ -1,18 +1,48 @@
 from dataclasses import dataclass
 from typing import Optional, Any, Dict
+import time
 
 @dataclass
 class TradeIntent:
+    """
+    Canonical domain object representing a validated trading decision approved for execution.
+    
+    Single source of truth for all trading intents across all agents:
+    - MetaController intents
+    - Liquidation intents
+    - Compounding intents
+    - Rebalancer intents
+    - Arbitrage intents
+    - Manual override intents
+    
+    ExecutionManager receives TradeIntent, not loose parameters.
+    This eliminates coupling between controllers and execution logic.
+    """
     symbol: str
     side: str
+    quantity: Optional[float] = None
+    planned_quote: Optional[float] = None
+    confidence: float = 0.0
+    trace_id: Optional[str] = None
+    tier: Optional[str] = None
+    is_liquidation: bool = False
+    policy_context: Optional[Dict[str, Any]] = None
+    agent: Optional[str] = None
+    tag: str = "meta"
+    timestamp: Optional[float] = None
+    execution_mode: str = "live"  # "live" or "shadow"
+    
+    # Legacy hints (keep for backwards compatibility during transition)
     qty_hint: Optional[float] = None
     quote_hint: Optional[float] = None
-    agent: Optional[str] = None
-    confidence: float = 0.0
     rationale: Optional[str] = None
     ttl_sec: int = 30
-    tag: Optional[str] = None
     timeframe: Optional[str] = None
+    
+    def __post_init__(self):
+        """Ensure timestamp is set."""
+        if self.timestamp is None:
+            self.timestamp = time.time()
 
 @dataclass
 class ExecOrder:

@@ -825,7 +825,33 @@ class ExchangeClient:
     async def _guard_execution_path(self, *, method: str, symbol: str, side: str, tag: str = "") -> None:
         """
         Fail closed if someone tries to place orders outside ExecutionManager.
+        Also enforces TRADING_MODE safety gate: only live mode allowed.
         """
+        # ✅ EXTRA SAFETY: Check TRADING_MODE before any order submission
+        import os
+        mode = os.getenv("TRADING_MODE", "live").lower()
+        if mode != "live":
+            sym = self._norm_symbol(symbol)
+            self.logger.error(
+                "[TRADING_MODE_GUARD] Real order blocked: system not in LIVE mode (mode=%s method=%s symbol=%s side=%s)",
+                mode,
+                method or "unknown",
+                sym,
+                str(side or "").upper(),
+            )
+            try:
+                await self._emit_summary(
+                    "ORDER_BLOCKED_NON_LIVE_MODE",
+                    symbol=sym,
+                    side=str(side or "").upper(),
+                    tag=str(tag or ""),
+                    status="ERROR",
+                    reason=f"execution_blocked_non_live_mode_{mode}",
+                )
+            except Exception:
+                pass
+            raise RuntimeError(f"Real order blocked: system not in LIVE mode (TRADING_MODE={mode})")
+        
         if not bool(getattr(self, "_enforce_execution_manager_path", True)):
             return
         if self._is_execution_scope_active():

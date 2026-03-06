@@ -7,6 +7,23 @@ import time
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 
+
+def _dynamic_exposure_cap(nav: float) -> float:
+    """Return max single-symbol exposure fraction based on NAV bracket.
+
+    Micro accounts are allowed to be concentrated (only one position possible).
+    As NAV grows, diversification rules progressively tighten.
+    """
+    if nav < 200.0:
+        return 0.90
+    elif nav < 500.0:
+        return 0.70
+    elif nav < 2000.0:
+        return 0.50
+    else:
+        return 0.30
+
+
 class PortfolioAuthority:
     def __init__(self, logger: logging.Logger, config: Any, shared_state: Any):
         self.logger = logger
@@ -103,17 +120,20 @@ class PortfolioAuthority:
         Layer 3: Authorize exits for portfolio rebalancing (e.g. over-concentration).
         """
         if nav <= 0: return None
-        
+
+        cap = _dynamic_exposure_cap(nav)
+        self.logger.debug("[PortfolioAuth:Rebalance] DynamicExposure NAV=%.2f → cap=%.0f%%", nav, cap * 100)
+
         for sym, pos in owned_positions.items():
             if self._is_permanent_dust_position(sym, pos):
                 continue
             val = float(pos.get("value_usdt", 0.0))
             concentration = val / nav
-            
-            if concentration > self.max_symbol_concentration:
+
+            if concentration > cap:
                 self.logger.warning(
-                    "[PortfolioAuth:Rebalance] ⚖️ CONCENTRATION ALERT: %s at %.1f%% (>%.1f%%). Authorizing partial exit.",
-                    sym, concentration * 100, self.max_symbol_concentration * 100
+                    "[PortfolioAuth:Rebalance] ⚖️ CONCENTRATION ALERT: %s at %.1f%% (>%.0f%% cap for NAV=%.2f). Authorizing partial exit.",
+                    sym, concentration * 100, cap * 100, nav
                 )
                 return {
                     "symbol": sym,

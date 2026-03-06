@@ -62,6 +62,7 @@ async def main():
         shared_state=shared_state,
         exchange_client=exchange_client,
         symbol_manager=symbol_manager,
+        meta_controller=meta_controller,  # 🔥 CRITICAL FIX: Pass meta_controller to enable signal pipeline
     )
     logger.info("✅ Phase 2 complete.\n")
 

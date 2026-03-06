@@ -331,12 +331,18 @@ class SymbolManager:
                 self.logger.debug(f"[{source}] No volume info for {symbol}; allowing as authoritative")
                 return True, None
             return False, "missing 24h quote volume"
-            
-        if float(qv) < float(self._min_trade_volume):
-            if source == "WalletScannerAgent":
-                 self.logger.info(f"[WalletScannerAgent] Symbol {symbol} volume {qv} < {self._min_trade_volume}, but allowing as authoritative")
-                 return True, None
-            return False, f"below min 24h quote volume ({qv} < {self._min_trade_volume})"
+        
+        # ⚡ ARCHITECT REFINEMENT #1: Move volume filtering to ranking layer (UURE)
+        # This layer only validates TECHNICAL correctness, not trading suitability
+        # Volume filtering is now handled by UniverseRotationEngine.compute_and_apply_universe()
+        # which scores by: 40% conviction + 20% volatility + 20% momentum + 20% liquidity
+        
+        # Keep only sanity check for effectively zero-liquidity symbols (garbage pairs)
+        if float(qv) < 100:  # Less than $100 quote volume = spam/abandoned pair
+            return False, "zero liquidity (quote_volume < $100)"
+        
+        # All symbols passing technical validation (format, exchange, price, sanity check)
+        # now proceed to ranking layer where they'll be scored for trading suitability
 
         # optional: exclude stable base assets (if not using BASE_CURRENCY as base asset)
         if self._exclude_stable_base:
@@ -403,9 +409,15 @@ class SymbolManager:
         await asyncio.gather(*(_one(s) for s in symbols))
         return out
 
-    async def _safe_set_accepted_symbols(self, symbols_map: dict, *, allow_shrink: bool = False, source: Optional[str] = None):
+    async def _safe_set_accepted_symbols(self, symbols_map: dict, *, allow_shrink: bool = False, merge_mode: bool = False, source: Optional[str] = None):
         """
         Gateway to SharedState.set_accepted_symbols().
+        
+        Args:
+            symbols_map: Dict of symbol -> metadata to set/merge
+            allow_shrink: If False, reject updates that would shrink the universe (replace mode only)
+            merge_mode: If True, merge incoming symbols (additive). If False, replace (default).
+            source: Source identifier for logging (e.g., "SymbolScreener", "WalletScannerAgent")
         
         NOTE: Governor enforcement is now handled at SharedState level (canonical store).
         This method is a simple passthrough that handles metadata sanitization.
@@ -426,6 +438,8 @@ class SymbolManager:
             kwargs_call = {}
             if "allow_shrink" in sig.parameters:
                 kwargs_call["allow_shrink"] = allow_shrink
+            if "merge_mode" in sig.parameters:
+                kwargs_call["merge_mode"] = merge_mode
             if "source" in sig.parameters and source:
                 kwargs_call["source"] = source
 
@@ -439,6 +453,7 @@ class SymbolManager:
                     payload = {
                         "count": len(symbols_map),
                         "reason": "init" if allow_shrink else "finalize",
+                        "merge_mode": merge_mode,
                         "cap_applied": bool(self._cap and len(symbols_map) > self._cap),
                         "cap_value": int(self._cap or 0),
                         "symbols": list(symbols_map.keys())[:20],
@@ -451,7 +466,7 @@ class SymbolManager:
             return result
 
         except TypeError as e:
-            # Extra belt-and-suspenders fallback without allow_shrink/source
+            # Extra belt-and-suspenders fallback without merge_mode/allow_shrink/source
             self.logger.warning("set_accepted_symbols signature mismatch (%s) — retrying positional-only.", e)
             result = fn(sanitized_map)
             if asyncio.iscoroutine(result):
@@ -485,26 +500,71 @@ class SymbolManager:
         # Update price for metadata
         kwargs["price"] = validated_price
         meta = _meta_from_kwargs(symbol, source, **kwargs)
-        meta_clean = {k: v for k, v in meta.items() if k != "symbol"}
+        
         try:
-            final_map = dict(await self._get_symbols_snapshot(force=True))
-            # store meta WITHOUT "symbol" key (SharedState holds map by symbol)
-            final_map[symbol] = {k: v for k, v in meta.items() if k != "symbol"}
-
-            if self._cap and len(final_map) > self._cap:
-                final_map = self._apply_cap(final_map)
-
-            # P9 Fix: Use allow_shrink=False for additive additions. Pass source for sticky policies.
-            await self._safe_set_accepted_symbols(final_map, allow_shrink=False, source=source)
+            # FIX #1: Make SymbolManager truly additive (no shrink rejection for discovery)
+            # Simply add the symbol to accepted_symbols without comparing lengths
+            # This allows discovery to expand the universe incrementally
+            if self.shared_state and hasattr(self.shared_state, 'accepted_symbols'):
+                # Direct additive expansion: just add if not present
+                if symbol not in self.shared_state.accepted_symbols:
+                    self.shared_state.accepted_symbols[symbol] = {k: v for k, v in meta.items() if k != "symbol"}
+                    self.logger.info(f"🌟 Universe expanded: {symbol} added (discovery additive)")
+                else:
+                    # Update existing metadata
+                    self.shared_state.accepted_symbols[symbol].update({k: v for k, v in meta.items() if k != "symbol"})
+                    self.logger.debug(f"🔄 Universe updated: {symbol} metadata refreshed")
+            
+            # Also update the symbols dict if it exists
+            if self.shared_state and hasattr(self.shared_state, 'symbols'):
+                self.shared_state.symbols.setdefault(symbol, {}).update({k: v for k, v in meta.items() if k != "symbol"})
 
             if self.database_manager and hasattr(self.database_manager, "add_symbol"):
                 self.database_manager.add_symbol(symbol)
 
-            self.logger.info("✅ Accepted %s from %s.", symbol, source)
+            # FIX #3: Ensure accepted_symbols is refreshed after adding
+            await self._refresh_universe_cache()
+
+            self.logger.info("✅ Accepted %s from %s (discovery expansion).", symbol, source)
             return True, None
         except Exception as e:
             self.logger.error("❌ add_symbol exception for %s: %s", symbol, e, exc_info=True)
             return False, f"exception during addition: {e}"
+
+    async def _refresh_universe_cache(self) -> None:
+        """
+        FIX #3: Rebuild the active universe after adding symbols.
+        
+        This ensures that:
+        1. accepted_symbols dict is synchronized
+        2. symbol_pool is updated
+        3. All downstream systems see fresh universe
+        """
+        try:
+            if not self.shared_state:
+                return
+            
+            # Get the current accepted symbols set
+            if hasattr(self.shared_state, 'get_accepted_symbols'):
+                current = await self._maybe_await(self.shared_state.get_accepted_symbols())
+                if current:
+                    # Ensure it's a dict for consistency
+                    if not isinstance(current, dict):
+                        current = {s: {} for s in current}
+                    
+                    # Update the live universe
+                    if hasattr(self.shared_state, 'accepted_symbols'):
+                        self.shared_state.accepted_symbols = dict(current)
+                        self.logger.debug(f"🔄 Refreshed universe cache: {len(current)} symbols")
+            
+            # If SharedState has a refresh method, call it
+            if hasattr(self.shared_state, 'refresh_universe'):
+                await self._maybe_await(self.shared_state.refresh_universe())
+                self.logger.debug("🔄 SharedState.refresh_universe() called")
+                
+        except Exception as e:
+            self.logger.debug(f"⚠️ Universe cache refresh failed: {e}")
+            # Don't raise - this is best-effort
 
     async def propose_symbol(self, symbol: str, source: str = "unknown", **kwargs) -> Tuple[bool, Optional[str]]:
         if not self.shared_state:
@@ -561,8 +621,9 @@ class SymbolManager:
             if self._cap and len(final_map) > self._cap:
                 final_map = self._apply_cap(final_map)
 
-            # 4. Commit once with allow_shrink=False to preserve screener work
-            await self._safe_set_accepted_symbols(final_map, allow_shrink=False, source=source)
+            # 4. Commit once with merge_mode=True for additive batch proposals
+            # This allows multiple screening passes to accumulate symbols instead of replacing.
+            await self._safe_set_accepted_symbols(final_map, allow_shrink=False, merge_mode=True, source=source)
             self.logger.info("✅ Batch update complete: +%d symbol(s) from %s.", added_count, source)
         else:
             self.logger.info("ℹ️ No new symbols added from batch.")

@@ -24,17 +24,15 @@ class TPSLEngine:
         self.config = config
         self.execution_manager = execution_manager
         self.logger = logging.getLogger("TPSLEngine")
-        try:
-            self._stop_event = asyncio.Event()
-        except RuntimeError:
-            # Python 3.9 can lack a current loop after asyncio.run(); create one defensively.
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            self._stop_event = asyncio.Event()
+        self._stop_event = asyncio.Event()
         self._task = None
         self._heartbeat_task = None
         self.trade_journal = None  # injected by AppContext
         self.session_id: str = ""  # injected by AppContext
+
+        # RACE CONDITION FIX #4: Per-symbol locking to prevent concurrent closes
+        self._symbol_close_locks: Dict[str, asyncio.Lock] = {}
+        self._symbol_close_locks_lock = asyncio.Lock()
 
         # Defensive defaults on shared_state attributes we use
         if not hasattr(self.shared_state, "open_trades"): self.shared_state.open_trades = {}
@@ -126,15 +124,28 @@ class TPSLEngine:
             if bool(getattr(self.config, "TPSL_AUTO_ARM_ON_STARTUP", True)):
                 await self._auto_arm_existing_trades()
         except Exception:
-            self.logger.debug("TPSL auto-arm on startup failed (non-fatal)", exc_info=True)
+            self.logger.error(
+                "[TPSLEngine] Auto-arm failed on startup — open positions may have no stop-loss",
+                exc_info=True,
+            )
             
         self._task = asyncio.create_task(self.run())
         await self._safe_status_update("Initialized", "Ready")
 
     async def _auto_arm_existing_trades(self) -> None:
         """Ensure TP/SL is set for existing open positions at startup."""
-        open_trades = dict(getattr(self.shared_state, "open_trades", {}) or {})
-        positions = getattr(self.shared_state, "positions", {}) or {}
+        # Canonical architecture: positions are the only source of truth
+        if getattr(self.shared_state, "trading_mode", "") == "shadow":
+            positions = getattr(self.shared_state, "virtual_positions", {}) or {}
+        else:
+            positions = getattr(self.shared_state, "positions", {}) or {}
+
+        # Derive open trades from positions
+        open_trades = {
+            sym: pos
+            for sym, pos in positions.items()
+            if float(pos.get("position_qty", 0) or 0) > 0
+        }
         symbols = set(open_trades.keys()) | set(positions.keys())
 
         for symbol in symbols:
@@ -1073,21 +1084,6 @@ class TPSLEngine:
 
         Formula: Position_USD = (Equity × Risk%) / SL_Distance_USD
         """
-        # Bootstrap override: never downscale forced bootstrap trades
-        if context and (
-            context.get("bootstrap_bypass")
-            or context.get("_bootstrap_override")
-            or context.get("_force_min_notional")
-        ):
-            self.logger.warning(
-                "[TPSLEngine] Bootstrap override detected for %s — skipping risk-based sizing",
-                symbol,
-            )
-            return float(
-                context.get("_planned_quote", 0.0)
-                or getattr(self.config, "MIN_TRADE_QUOTE", 50.0)
-            )
-
         # Guard for dust healing: skip risk-based sizing
         if context and context.get("is_dust_healing", False):
             self.logger.info("[TPSLEngine] Skipping risk-based sizing for dust healing operation on %s", symbol)
@@ -1320,6 +1316,34 @@ class TPSLEngine:
             or 0.0
         )
 
+    async def _get_close_lock(self, symbol: str) -> asyncio.Lock:
+        """
+        Get or create an asyncio.Lock for close operations on this symbol.
+        
+        RACE CONDITION FIX #4: Prevents concurrent _close() calls for same symbol.
+        
+        THREAD-SAFE: Uses double-check locking pattern.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'BTC')
+            
+        Returns:
+            asyncio.Lock for close operations on this symbol
+        """
+        sym = str(symbol or "").upper()
+        
+        # Fast path: lock already exists
+        if sym in self._symbol_close_locks:
+            return self._symbol_close_locks[sym]
+        
+        # Slow path: create new lock under synchronization
+        async with self._symbol_close_locks_lock:
+            # Double-check after acquiring lock
+            if sym not in self._symbol_close_locks:
+                self._symbol_close_locks[sym] = asyncio.Lock()
+                self.logger.debug(f"[TPSL:Race:Lock] Created close lock for {sym}")
+            return self._symbol_close_locks[sym]
+
     async def _close_via_execution_manager(
         self,
         symbol: str,
@@ -1425,9 +1449,20 @@ class TPSLEngine:
                 reason,
             )
         try:
-            open_trades = dict(self.shared_state.open_trades or {})  # snapshot
+            # Canonical architecture: positions are the only source of truth
+            if getattr(self.shared_state, "trading_mode", "") == "shadow":
+                positions = getattr(self.shared_state, "virtual_positions", {}) or {}
+            else:
+                positions = getattr(self.shared_state, "positions", {}) or {}
+
+            # Derive open trades from positions
+            open_trades = {
+                sym: pos
+                for sym, pos in positions.items()
+                if float(pos.get("position_qty", 0) or 0) > 0
+            }
+            
             prices = self.shared_state.latest_prices or {}
-            positions = getattr(self.shared_state, "positions", {}) or {}
             self.logger.info("[TPSL:check] open_trades=%d prices=%d", len(open_trades), len(prices))
             to_close: List[Tuple[str, str]] = []
 
@@ -1799,42 +1834,45 @@ class TPSLEngine:
                 sem = asyncio.Semaphore(self._close_concurrency)
 
                 async def _close(sym: str, reason: str):
-                    async with sem:
-                        self.logger.info("[%s] Closing due to %s", sym, reason)
-                        # [FIX #9] CRITICAL: Mark as liquidation to bypass ALL guards
-                        # TP/SL exits are liquidation (risk management), NOT trading decisions.
-                        # They must execute regardless of: capital, throughput, min-notional, etc.
-                        reason_u = str(reason).upper()
-                        if "TP" in reason_u:
-                            close_reason = "TP_HIT"
-                        elif "SL" in reason_u:
-                            close_reason = "SL_HIT"
-                        else:
-                            close_reason = "TPSL_EXIT"
+                    # RACE CONDITION FIX #4: Hold per-symbol lock to prevent concurrent closes
+                    lock = await self._get_close_lock(sym)
+                    async with lock:
+                        async with sem:
+                            self.logger.info("[%s] Closing due to %s", sym, reason)
+                            # [FIX #9] CRITICAL: Mark as liquidation to bypass ALL guards
+                            # TP/SL exits are liquidation (risk management), NOT trading decisions.
+                            # They must execute regardless of: capital, throughput, min-notional, etc.
+                            reason_u = str(reason).upper()
+                            if "TP" in reason_u:
+                                close_reason = "TP_HIT"
+                            elif "SL" in reason_u:
+                                close_reason = "SL_HIT"
+                            else:
+                                close_reason = "TPSL_EXIT"
 
-                        try:
-                            total_position_qty = 0.0
-                            pos = getattr(self.shared_state, "positions", {}).get(sym, {}) if hasattr(self.shared_state, "positions") else {}
-                            if isinstance(pos, dict):
-                                total_position_qty = float(pos.get("quantity", 0.0) or 0.0)
-                            if total_position_qty <= 0 and hasattr(self.shared_state, "get_position_qty"):
-                                total_position_qty = float(self.shared_state.get_position_qty(sym) or 0.0)
-                            min_notional = await self._get_min_notional(sym)
-                            if min_notional > 0 and total_position_qty > 0:
-                                try:
-                                    cp_now = float((self.shared_state.latest_prices or {}).get(sym) or 0.0)
-                                    value_usdt = total_position_qty * cp_now if cp_now > 0 else 0.0
-                                    if value_usdt > 0 and value_usdt < min_notional:
-                                        self.logger.warning(
-                                            "[TPSL] Proceeding with close %s: notional=%.4f < min_notional=%.4f",
-                                            sym,
-                                            value_usdt,
-                                            min_notional,
-                                        )
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                            try:
+                                total_position_qty = 0.0
+                                pos = getattr(self.shared_state, "positions", {}).get(sym, {}) if hasattr(self.shared_state, "positions") else {}
+                                if isinstance(pos, dict):
+                                    total_position_qty = float(pos.get("quantity", 0.0) or 0.0)
+                                if total_position_qty <= 0 and hasattr(self.shared_state, "get_position_qty"):
+                                    total_position_qty = float(self.shared_state.get_position_qty(sym) or 0.0)
+                                min_notional = await self._get_min_notional(sym)
+                                if min_notional > 0 and total_position_qty > 0:
+                                    try:
+                                        cp_now = float((self.shared_state.latest_prices or {}).get(sym) or 0.0)
+                                        value_usdt = total_position_qty * cp_now if cp_now > 0 else 0.0
+                                        if value_usdt > 0 and value_usdt < min_notional:
+                                            self.logger.warning(
+                                                "[TPSL] Proceeding with close %s: notional=%.4f < min_notional=%.4f",
+                                                sym,
+                                                value_usdt,
+                                                min_notional,
+                                            )
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                         try:
                             ot = getattr(self.shared_state, "open_trades", {}) or {}
                             tr = ot.get(sym, {}) if isinstance(ot, dict) else {}

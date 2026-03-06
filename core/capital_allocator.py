@@ -1119,6 +1119,10 @@ class CapitalAllocator:
         # ISSUE 5 FIX: Apply all reservations atomically via batch API
         if hasattr(self.ss, "set_authoritative_reservations"):
             self.ss.set_authoritative_reservations(new_reservations)
+            if hasattr(self.ss, "mark_ops_plane_ready"):
+                self.ss.mark_ops_plane_ready()
+            elif hasattr(self.ss, "ops_plane_ready_event"):
+                self.ss.ops_plane_ready_event.set()
             funded_count = sum(1 for v in new_reservations.values() if v > 0)
             self.logger.info(f"[Allocator] Atomic batch update: {funded_count} agents funded")
         else:

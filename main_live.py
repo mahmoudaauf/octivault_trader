@@ -86,6 +86,11 @@ async def run_live():
         config=config
     )
 
+    # 🔥 CRITICAL FIX: Inject MetaController into AgentManager
+    # This was missing, causing signals to never reach the decision pipeline
+    agent_manager.meta_controller = meta_controller
+    logger.info("✅ Injected MetaController into AgentManager - signal pipeline connected!")
+
     # ─────────────────────────────────────────────
     # 🩺 Monitoring
     # ─────────────────────────────────────────────

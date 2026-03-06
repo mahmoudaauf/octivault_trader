@@ -1986,17 +1986,35 @@ class AppContext:
         """
         Read seed symbols from config.SYMBOLS or config.SEED_SYMBOLS.
         Uppercase, order-preserving unique. Returns [] if none.
+        
+        Safely handles:
+        - List config: ["BTCUSDT", "ETHUSDT"]
+        - Single string: "BTCUSDT"
+        - Comma-separated string: "BTCUSDT,ETHUSDT"
         """
         syms_raw: List[str] = []
+
         try:
-            syms_raw = list(self._cfg("SYMBOLS", []) or [])
+            raw = self._cfg("SYMBOLS", []) or []
+            if isinstance(raw, str):
+                # Support comma-separated or single symbol
+                syms_raw = [s.strip() for s in raw.split(",") if s.strip()]
+            else:
+                syms_raw = list(raw)
         except Exception:
             syms_raw = []
+
         if not syms_raw:
             try:
-                syms_raw = list(self._cfg("SEED_SYMBOLS", []) or [])
+                raw = self._cfg("SEED_SYMBOLS", []) or []
+                if isinstance(raw, str):
+                    # Support comma-separated or single symbol
+                    syms_raw = [s.strip() for s in raw.split(",") if s.strip()]
+                else:
+                    syms_raw = list(raw)
             except Exception:
                 syms_raw = []
+
         try:
             out: List[str] = []
             seen = set()
@@ -3395,7 +3413,18 @@ class AppContext:
                 self.logger.debug("ComponentStatusLogger binding failed in _ensure_components_built", exc_info=True)
 
         # ExchangeTruthAuditor (governance-only reconciliation layer)
+        # 🔧 MODE-BASED DESIGN: Determine TruthAuditor mode based on trading_mode
+        # DISABLED: shadow mode (no exchange truth to reconcile)
+        # CONTINUOUS: live mode (startup + passive monitoring)
         if self.exchange_truth_auditor is None:
+            trading_mode = str(getattr(self.config, "trading_mode", "live") or "live").lower()
+            
+            # Infer TruthAuditor mode from trading_mode
+            if trading_mode == "shadow":
+                auditor_mode = "disabled"
+            else:
+                auditor_mode = "continuous"  # Default for live/paper
+            
             ExchangeTruthAuditor = _get_cls(_truth_auditor_mod, "ExchangeTruthAuditor")
             if ExchangeTruthAuditor:
                 self.exchange_truth_auditor = _try_construct(
@@ -3405,11 +3434,12 @@ class AppContext:
                     app=self,
                     shared_state=self.shared_state,
                     exchange_client=self.exchange_client,
+                    mode=auditor_mode,
                 )
                 if self.exchange_truth_auditor is None:
                     try:
                         self.logger.warning(
-                            "[Bootstrap] ExchangeTruthAuditor _try_construct returned None; attempting direct construction for diagnostics..."
+                            "[Bootstrap] ExchangeTruthAuditor _try_construct returned None; attempting direct construction..."
                         )
                         self.exchange_truth_auditor = ExchangeTruthAuditor(
                             config=self.config,
@@ -3417,14 +3447,15 @@ class AppContext:
                             shared_state=self.shared_state,
                             exchange_client=self.exchange_client,
                             app=self,
+                            mode=auditor_mode,
                         )
                     except Exception as e_direct:
-                        self.logger.error(
-                            "[Bootstrap] ExchangeTruthAuditor direct construction failed: %s: %s",
-                            type(e_direct).__name__,
-                            e_direct,
-                            exc_info=True,
-                        )
+                            self.logger.error(
+                                "[Bootstrap] ExchangeTruthAuditor direct construction failed: %s: %s",
+                                type(e_direct).__name__,
+                                e_direct,
+                                exc_info=True,
+                            )
 
         # Prepare candidate kwargs for all subsequent components
         ck = {
@@ -3607,11 +3638,66 @@ class AppContext:
 
         if self.agent_manager is None:
             AgentManager = _get_cls(_agent_mgr_mod, "AgentManager")
-            self.agent_manager = _try_construct(AgentManager, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, execution_manager=self.execution_manager, exchange_client=self.exchange_client, market_data=self.market_data_feed, symbol_manager=self.symbol_manager)
+            self.agent_manager = _try_construct(AgentManager, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, execution_manager=self.execution_manager, exchange_client=self.exchange_client, market_data=self.market_data_feed, symbol_manager=self.symbol_manager, meta_controller=self.meta_controller)
+        
+        # 🔥 CRITICAL FIX: Ensure MetaController is injected into AgentManager
+        # This was missing, causing signals to never reach the decision pipeline
+        if self.agent_manager and self.meta_controller:
+            self.agent_manager.meta_controller = self.meta_controller
+            self.logger.info("[Bootstrap] ✅ Injected MetaController into AgentManager - signal pipeline connected!")
+
+        # 🔥 CRITICAL FIX: Register discovery agents with AgentManager
+        # This was missing, preventing discovery agents (IPOChaser, WalletScanner, etc.) from running
+        if self.agent_manager:
+            try:
+                # Try importing from agent_registry first
+                try:
+                    from core.agent_registry import register_all_discovery_agents as _reg_discovery, register_all_strategy_agents as _reg_strategy
+                    _reg_discovery(self.agent_manager, self)
+                    _reg_strategy(self.agent_manager, self)
+                except ImportError:
+                    # Fall back to local implementations if import fails
+                    self.logger.warning("[Bootstrap] ⚠️ core.agent_registry import failed, using local agent registration functions")
+                    register_all_discovery_agents(self.agent_manager, self)
+                    register_all_strategy_agents(self.agent_manager, self)
+                
+                self.logger.info("[Bootstrap] ✅ Registered discovery agents with AgentManager (IPOChaser, WalletScanner, SymbolScreener, LiquidationAgent)")
+                self.logger.info("[Bootstrap] ✅ Registered strategy agents with AgentManager (MLForecaster, DipSniper, TrendHunter, SwingTradeHunter, NewsReactor)")
+            except Exception as e:
+                self.logger.error("[Bootstrap] ❌ Failed to register agents: %s", e, exc_info=True)
 
         if self.risk_manager is None:
             RiskManager = _get_cls(_risk_mod, "RiskManager")
             self.risk_manager = _try_construct(RiskManager, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, exchange_client=self.exchange_client)
+
+        # Portfolio accounting
+        if self.pnl_calculator is None and _pnl_mod:
+            PnLCalculator = _get_cls(_pnl_mod, "PnLCalculator")
+            self.pnl_calculator = _try_construct(
+                PnLCalculator,
+                config=self.config,
+                logger=self.logger,
+                app=self,
+                shared_state=self.shared_state,
+                exchange_client=self.exchange_client,
+            )
+            if self.pnl_calculator is None and PnLCalculator is not None:
+                try:
+                    self.logger.warning(
+                        "[Bootstrap] PnLCalculator _try_construct returned None; attempting direct construction for diagnostics..."
+                    )
+                    self.pnl_calculator = PnLCalculator(
+                        shared_state=self.shared_state,
+                        config=self.config,
+                        exchange_client=self.exchange_client,
+                    )
+                except Exception as e_direct:
+                    self.logger.error(
+                        "[Bootstrap] PnLCalculator direct construction failed: %s: %s",
+                        type(e_direct).__name__,
+                        e_direct,
+                        exc_info=True,
+                    )
 
         # Protective services
         if self.heartbeat is None:
@@ -3938,20 +4024,26 @@ class AppContext:
                     self.logger.debug("P3.55 ensure_exchange_public_ready failed (non-fatal)", exc_info=True)
 
                 # P3.58: Exchange truth reconciliation loop (governance-only)
-                if self.exchange_truth_auditor and any(
-                    hasattr(self.exchange_truth_auditor, nm) for nm in ("start", "start_async", "run", "run_async")
-                ):
-                    await self._start_with_timeout("P3_truth_auditor", self.exchange_truth_auditor)
+                # 🔧 BOUNDARY CHECK: Only run in LIVE mode
+                # Shadow mode must be pure simulation without exchange reconciliation
+                trading_mode = str(getattr(self.shared_state, "trading_mode", "live") or "live").lower()
+                if trading_mode == "live":
+                    if self.exchange_truth_auditor and any(
+                        hasattr(self.exchange_truth_auditor, nm) for nm in ("start", "start_async", "run", "run_async")
+                    ):
+                        await self._start_with_timeout("P3_truth_auditor", self.exchange_truth_auditor)
+                    else:
+                        try:
+                            await self._emit_summary(
+                                "PHASE_SKIP",
+                                phase="P3_truth_auditor",
+                                status="SKIPPED",
+                                reason=("ComponentMissing" if not self.exchange_truth_auditor else "NoStartMethod"),
+                            )
+                        except Exception:
+                            pass
                 else:
-                    try:
-                        await self._emit_summary(
-                            "PHASE_SKIP",
-                            phase="P3_truth_auditor",
-                            status="SKIPPED",
-                            reason=("ComponentMissing" if not self.exchange_truth_auditor else "NoStartMethod"),
-                        )
-                    except Exception:
-                        pass
+                    self.logger.info("[Bootstrap] Skipping TruthAuditor in shadow mode")
 
             # P3.6: SharedState background tasks (balances/NAV/events)
             if up_to_phase >= 3 and self.shared_state and hasattr(self.shared_state, "start_background_tasks"):
@@ -3977,8 +4069,18 @@ class AppContext:
             except Exception:
                 self.logger.debug("failed to set _is_restart on shared_state", exc_info=True)
 
-            # Check LIVE_MODE: live systems ALWAYS use pure reconciliation startup
-            is_live_mode = self._cfg_bool("LIVE_MODE", default=False)
+            # Single source of truth: trading_mode controls live/shadow globally
+            is_live_mode = (str(getattr(self.config, "trading_mode", "live")).lower() == "live")
+
+            # P3.63: SHADOW MODE VIRTUAL PORTFOLIO INITIALIZATION
+            # Before trading starts: Initialize virtual portfolio from real balances
+            # This is the CRITICAL MISSING PIECE - without this, virtual_balances stays at 0
+            if not is_live_mode and self.shared_state:
+                try:
+                    await self.shared_state.init_virtual_portfolio_from_real_snapshot()
+                    self.logger.info("[P3_shadow_mode] Virtual portfolio initialized from real snapshot")
+                except Exception as e:
+                    self.logger.error("[P3_shadow_mode] Failed to initialize virtual portfolio: %s", e, exc_info=True)
 
             if is_restart or is_live_mode:
                 self.logger.warning(
@@ -4243,6 +4345,14 @@ class AppContext:
                     pass
             # P6: Strategy/agents/risk/meta
             if up_to_phase >= 6:
+                # Pre-register MetaController to avoid startup races being classified as "no-report".
+                if self.meta_controller and hasattr(self.shared_state, "register_component"):
+                    try:
+                        await self.shared_state.register_component("MetaController")
+                        await self.shared_state.update_component_status("MetaController", "Initialized", "Constructed")
+                    except Exception:
+                        self.logger.debug("Failed to register MetaController component status", exc_info=True)
+
                 if self.meta_controller:
                     # [DIAGNOSTIC] Log available methods if start is missing
                     if not hasattr(self.meta_controller, "start"):
@@ -4283,6 +4393,21 @@ class AppContext:
                                                  reason=("ComponentMissing" if not self.strategy_manager else "NoStartMethod"))
                     except Exception:
                         pass
+
+                # 🔥 CRITICAL RACE CONDITION FIX
+                # Wait for strategies to finish registering agents before starting AgentManager.
+                # This ensures the pipeline order: StrategyManager → register agents → AgentManager → schedule agents
+                # Without this wait, AgentManager starts with empty agents={} and runs with no strategy agents.
+                if self.strategy_manager and self.agent_manager:
+                    LOGGER.info("[P6_Race] Waiting for agents to be registered by StrategyManager...")
+                    for _ in range(30):
+                        if getattr(self.agent_manager, "agents", None):
+                            if len(self.agent_manager.agents) > 0:
+                                LOGGER.info("[P6_Race] ✅ Agents registered! Found %d agents. Starting AgentManager.", len(self.agent_manager.agents))
+                                break
+                        await asyncio.sleep(1)
+                    else:
+                        LOGGER.warning("[P6_Race] ⚠️ Timeout waiting for agents. Proceeding anyway (agents may register during startup).")
 
                 if self.agent_manager and any(hasattr(self.agent_manager, nm) for nm in _p6_start_methods):
                     await self._start_with_timeout("P6_agent_manager", self.agent_manager)
@@ -4455,6 +4580,59 @@ class AppContext:
                 except Exception:
                     pass
 
+            # P8.5: STARTUP ORCHESTRATOR - Canonical P9 sequencing gate
+            # BLOCKING GATE: Coordinates reconciliation components (RecoveryEngine, ExchangeTruthAuditor, etc.)
+            # in correct order BEFORE MetaController begins. Prevents race condition.
+            # CRITICAL: This is an ORCHESTRATOR, not a reconciliation engine.
+            # It delegates to existing components to avoid duplication.
+            if up_to_phase >= 8.5:
+                from core.startup_orchestrator import StartupOrchestrator
+                
+                self.logger.warning("[P8.5_orchestrator] ═══════════════════════════════════════════════════")
+                self.logger.warning("[P8.5_orchestrator] PHASE 8.5: STARTUP ORCHESTRATOR")
+                self.logger.warning("[P8.5_orchestrator] Canonical sequencing: RecoveryEngine → SharedState → Auditor → Manager → Verify")
+                self.logger.warning("[P8.5_orchestrator] ═══════════════════════════════════════════════════")
+                
+                try:
+                    # Create orchestrator with all available components
+                    orchestrator = StartupOrchestrator(
+                        config=self.config,
+                        shared_state=self.shared_state,
+                        exchange_client=self.exchange_client,
+                        recovery_engine=getattr(self, 'recovery_engine', None),
+                        exchange_truth_auditor=getattr(self, 'exchange_truth_auditor', None),
+                        portfolio_manager=getattr(self, 'portfolio_manager', None),
+                        logger=self.logger,
+                    )
+                    
+                    # Run orchestration sequence (BLOCKING - does not return until complete)
+                    await orchestrator.execute_startup_sequence()
+                    
+                    # Verify orchestrator completed
+                    if not orchestrator.is_ready():
+                        raise RuntimeError("[P8.5] Orchestrator marked incomplete despite success signal")
+                    
+                    # Log metrics for audit trail
+                    metrics = orchestrator.get_metrics()
+                    self.logger.warning(f"[P8.5_orchestrator] Orchestration metrics: {metrics}")
+                    
+                    self.logger.warning("[P8.5_orchestrator] ✅ Phase 8.5 complete - portfolio ready for MetaController")
+                    try:
+                        await self._emit_summary("P8.5_ORCHESTRATOR_COMPLETE", metrics=metrics)
+                    except Exception:
+                        pass
+                    
+                except RuntimeError as e:
+                    self.logger.error(
+                        f"[P8.5_orchestrator] 💥 FATAL ERROR: {e}",
+                        exc_info=True
+                    )
+                    try:
+                        await self._emit_summary("P8.5_ORCHESTRATOR_FAILED", error=str(e))
+                    except Exception:
+                        pass
+                    raise
+
             # P9: Finalize, announce mode, probe, health
             if up_to_phase >= 9:
                 self._announce_runtime_mode()
@@ -4496,3 +4674,108 @@ class AppContext:
                     await self._emit_health_status("OK" if bool(snap.get("ready")) else "DEGRADED", {"startup_ready": bool(snap.get("ready")), "issues": snap.get("issues", [])})
                 except Exception:
                     pass
+
+
+# === SECTION: Agent Registration Helpers ===
+# Fallback agent registration functions (in case core.agent_registry is unavailable)
+
+def register_all_strategy_agents(agent_manager, app_context):
+    """
+    Register all strategy agents with AgentManager.
+    
+    This is a standalone function that can be called even if core.agent_registry
+    import fails. It uses AGENT_CLASS_MAP from the registry if available.
+    
+    Intelligently passes only the parameters each agent's __init__ accepts
+    to avoid "unexpected keyword argument" errors.
+    """
+    import inspect
+    
+    try:
+        from core.agent_registry import AGENT_CLASS_MAP
+    except ImportError:
+        LOGGER.warning("[register_all_strategy_agents] core.agent_registry not available, skipping strategy agent registration")
+        return
+    
+    for name, cls in AGENT_CLASS_MAP.items():
+        try:
+            if getattr(cls, "agent_type", None) == "strategy":
+                # Introspect the __init__ signature to determine valid parameters
+                try:
+                    sig = inspect.signature(cls.__init__)
+                    valid_params = set(sig.parameters.keys()) - {'self'}
+                except Exception:
+                    valid_params = set()
+                
+                # Build kwargs only with parameters the agent accepts
+                all_kwargs = {
+                    "shared_state": getattr(app_context, "shared_state", None),
+                    "market_data_feed": getattr(app_context, "market_data_feed", None),
+                    "execution_manager": getattr(app_context, "execution_manager", None),
+                    "config": getattr(app_context, "config", None),
+                    "tp_sl_engine": getattr(app_context, "tp_sl_engine", None),
+                    "model_manager": getattr(app_context, "model_manager", None),
+                }
+                
+                kwargs = {k: v for k, v in all_kwargs.items() if k in valid_params or len(valid_params) == 0}
+                
+                # Build agent instance from class
+                agent = cls(**kwargs)
+                
+                # register_agent() expects an agent INSTANCE with a 'name' attribute
+                agent_manager.register_agent(agent)
+                LOGGER.info("[register_all_strategy_agents] Registered strategy agent: %s", name)
+        except Exception as e:
+            LOGGER.error("[register_all_strategy_agents] Failed to register %s: %s", name, e)
+
+
+def register_all_discovery_agents(agent_manager, app_context):
+    """
+    Register all discovery agents with AgentManager.
+    
+    This is a standalone function that can be called even if core.agent_registry
+    import fails. It uses AGENT_CLASS_MAP from the registry if available.
+    
+    Intelligently passes only the parameters each agent's __init__ accepts
+    to avoid "unexpected keyword argument" errors.
+    """
+    import inspect
+    
+    try:
+        from core.agent_registry import AGENT_CLASS_MAP
+    except ImportError:
+        LOGGER.warning("[register_all_discovery_agents] core.agent_registry not available, skipping discovery agent registration")
+        return
+    
+    for name, cls in AGENT_CLASS_MAP.items():
+        try:
+            if getattr(cls, "agent_type", None) == "discovery":
+                # Introspect the __init__ signature to determine valid parameters
+                try:
+                    sig = inspect.signature(cls.__init__)
+                    valid_params = set(sig.parameters.keys()) - {'self'}
+                except Exception:
+                    valid_params = set()
+                
+                # Build kwargs only with parameters the agent accepts
+                all_kwargs = {
+                    "shared_state": getattr(app_context, "shared_state", None),
+                    "config": getattr(app_context, "config", None),
+                    "market_data_feed": getattr(app_context, "market_data_feed", None),
+                    "execution_manager": getattr(app_context, "execution_manager", None),
+                    "exchange_client": getattr(app_context, "exchange_client", None),
+                    "symbol_manager": getattr(app_context, "symbol_manager", None),
+                    "tp_sl_engine": getattr(app_context, "tp_sl_engine", None),
+                    "model_manager": getattr(app_context, "model_manager", None),
+                }
+                
+                kwargs = {k: v for k, v in all_kwargs.items() if k in valid_params or len(valid_params) == 0}
+                
+                # Build agent instance from class
+                agent = cls(**kwargs)
+                
+                # register_discovery_agent() expects an agent INSTANCE
+                agent_manager.register_discovery_agent(agent)
+                LOGGER.info("[register_all_discovery_agents] Registered discovery agent: %s", name)
+        except Exception as e:
+            LOGGER.error("[register_all_discovery_agents] Failed to register %s: %s", name, e)

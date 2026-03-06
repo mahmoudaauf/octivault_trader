@@ -90,7 +90,13 @@ class PnLCalculator:
 
         # 3) Fallback to internal store (best-effort)
         try:
-            pos = getattr(self.shared_state, "positions", {}) or {}
+            trading_mode = getattr(self.shared_state, "trading_mode", "live")
+
+            if trading_mode == "shadow":
+                pos = getattr(self.shared_state, "virtual_positions", {}) or {}
+            else:
+                pos = getattr(self.shared_state, "positions", {}) or {}
+
             if isinstance(pos, dict):
                 return {k: v for k, v in pos.items() if isinstance(v, dict) and self._is_open(v)}
         except Exception:
@@ -277,14 +283,16 @@ class PnLCalculator:
 
     async def _after_valuation_bookkeeping(self):
         """Write total_equity and feed 60m realized pnl rolling window."""
-        # 1) total_equity (canonical: total_value + realized + unrealized)
+        # 1) total_equity = NAV (wallet + position_market_value)
+        # NOTE: Realized and unrealized PnL are informational only.
+        # They are NOT added to total_equity because:
+        # - Realized is already reflected in the wallet balance
+        # - Unrealized is already embedded in position_market_value (mark-to-market)
         try:
             total_equity = float(self.shared_state.get_total_equity())
         except Exception:
-            tv  = float(getattr(self.shared_state, "total_value", 0.0))
-            rp  = float(getattr(self.shared_state, "realized_pnl", 0.0))
-            up  = float(getattr(self.shared_state, "unrealized_pnl", 0.0))
-            total_equity = tv + rp + up
+            # NAV already reflects wallet + market value
+            total_equity = float(getattr(self.shared_state, "total_value", 0.0))
         setattr(self.shared_state, "total_equity", total_equity)
 
         # 2) rolling 60m realized PnL feed (append deltas)
@@ -322,7 +330,7 @@ class PnLCalculator:
         P9 contract: start() spawns the main loop and health loop (idempotent).
         """
         if getattr(self, "_task", None) and not self._task.done():
-            return
+            return self._task
         self._stop_event.clear()
         # Spawn health loop first (so Watchdog sees us early)
         if not getattr(self, "_health_task", None) or self._health_task.done():
@@ -342,6 +350,7 @@ class PnLCalculator:
             )
         except Exception:
             logger.debug("PnLCalculator initial health update failed", exc_info=True)
+        return self._task
 
     async def stop(self):
         """
@@ -373,14 +382,6 @@ class PnLCalculator:
             )
         except Exception:
             logger.debug("PnLCalculator final health update failed", exc_info=True)
-
-    async def start(self):
-        """Standard lifecycle start."""
-        if self._stop_event.is_set():
-            self._stop_event.clear()
-        loop = asyncio.get_running_loop()
-        self._task = loop.create_task(self.run())
-        return self._task
 
     async def run(self):
         """

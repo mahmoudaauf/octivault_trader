@@ -153,7 +153,7 @@ class Config:
     MIN_POSITION_USDT = 24.0
     MIN_POSITION_MIN_NOTIONAL_MULT = 2.0
     MIN_ENTRY_USDT = 24.0
-    MIN_ENTRY_QUOTE_USDT = 24.0
+    MIN_ENTRY_QUOTE_USDT = 15.0
     DEFAULT_PLANNED_QUOTE = 24.0
     EMIT_BUY_QUOTE = 24.0
     MIN_TRADE_QUOTE = 12.0
@@ -566,6 +566,9 @@ class Config:
 
     def __init__(self, config_file_path: Optional[str] = None):
         logger.info("⚙️ Config initialized (LIVE-safe defaults). Loading .env overrides...")
+
+        # --- P9 SHADOW MODE: Load trading mode (live or shadow) ---
+        self.trading_mode = os.getenv("TRADING_MODE", "live").lower()
 
         # --- read early knobs with class defaults as fallbacks
         self.EXEC_PROBE_QUOTE = float(os.getenv("EXEC_PROBE_QUOTE", str(Config.EXEC_PROBE_QUOTE)))

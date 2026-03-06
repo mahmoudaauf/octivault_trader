@@ -3480,6 +3480,39 @@ class MLForecaster:
         except Exception:
             pass
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # ML POSITION SCALING: Calculate position scale based on buy probability
+        # ═══════════════════════════════════════════════════════════════════════
+        position_scale = 1.0  # Default: no scaling
+        
+        if action.upper() == "BUY":
+            # Extract buy probability from the model output
+            # The confidence here represents our prediction strength
+            prob = float(confidence)
+            
+            # Tiered position scaling based on confidence bands
+            if prob >= 0.75:
+                position_scale = 1.5  # 50% larger position
+            elif prob >= 0.65:
+                position_scale = 1.2  # 20% larger position
+            elif prob >= 0.55:
+                position_scale = 1.0  # Standard position size
+            elif prob >= 0.45:
+                position_scale = 0.8  # 20% smaller position
+            else:
+                position_scale = 0.6  # 40% smaller position
+            
+            # Store ML position scale in SharedState for downstream use by MetaController
+            try:
+                if hasattr(self.shared_state, "set_ml_position_scale"):
+                    await self.shared_state.set_ml_position_scale(cur_sym, position_scale)
+                    self.logger.info(
+                        f"[{self.name}] ML position scale stored for {cur_sym}: {position_scale:.2f}x "
+                        f"(confidence={prob:.2f})"
+                    )
+            except Exception as e:
+                self.logger.warning(f"[{self.name}] Failed to store ML position scale: {e}")
+
         # --------- Emission (signal-only) ---------
         await self._collect_signal(
             symbol=cur_sym,

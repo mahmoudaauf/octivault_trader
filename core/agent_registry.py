@@ -8,6 +8,7 @@ __all__ = [
     "AGENT_IMPORT_ERRORS",
     "validate_agent_registry",
     "register_all_discovery_agents",
+    "register_all_strategy_agents",
 ]
 
 _logger = logging.getLogger("AgentRegistry")
@@ -287,3 +288,55 @@ def register_all_discovery_agents(agent_manager, app_context):
         if not getattr(agent, "agent_type", None):
             setattr(agent, "agent_type", "discovery")
         agent_manager.register_discovery_agent(agent)
+
+
+# ---------------------------------------------------------------------------
+# Strategy Agent Registration
+# ---------------------------------------------------------------------------
+
+# Explicit list of strategy agents.  Add new agents here — do NOT rely on
+# iterating AGENT_CLASS_MAP, which also contains non-strategy agents.
+_STRATEGY_AGENTS = [
+    ("ml_forecaster", "MLForecaster"),
+    ("dip_sniper", "DipSniper"),
+    ("trend_hunter", "TrendHunter"),
+    ("swing_trade_hunter", "SwingTradeHunter"),
+    ("news_reactor", "NewsReactor"),
+]
+
+
+def register_all_strategy_agents(agent_manager, app_context):
+    """
+    Registers strategy agents with the agent manager.
+
+    For each entry in ``_STRATEGY_AGENTS`` the function first checks
+    ``app_context`` for a pre-built instance, then falls back to constructing
+    one via ``_safe_build``.  Only ``register_agent`` is called to allow
+    strategy agents to run in the agent manager's strategy execution loop.
+    """
+
+    def _safe_build(name: str):
+        cls = AGENT_CLASS_MAP.get(name)
+        if not cls:
+            return None
+        kwargs = {
+            "shared_state": getattr(app_context, "shared_state", None),
+            "config": getattr(app_context, "config", None),
+            "exchange_client": getattr(app_context, "exchange_client", None),
+            "symbol_manager": getattr(app_context, "symbol_manager", None),
+            "execution_manager": getattr(app_context, "execution_manager", None),
+            "tp_sl_engine": getattr(app_context, "tp_sl_engine", None),
+        }
+        try:
+            return cls(**{k: v for k, v in kwargs.items() if v is not None})
+        except Exception as exc:
+            _logger.debug("[_safe_build] %s construction failed: %s", name, exc)
+            return None
+
+    for attr_name, map_key in _STRATEGY_AGENTS:
+        agent = getattr(app_context, attr_name, None) or _safe_build(map_key)
+        if not agent:
+            continue
+        if not getattr(agent, "agent_type", None):
+            setattr(agent, "agent_type", "strategy")
+        agent_manager.register_agent(agent)
