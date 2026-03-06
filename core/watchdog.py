@@ -26,8 +26,14 @@ def _schedule_coro(coro) -> None:
         loop = asyncio.get_running_loop()
         loop.create_task(coro)
     except RuntimeError:
-        # No running loop (e.g., unit tests instantiating before loop); ignore.
-        pass
+        # No running loop (e.g., unit tests instantiating before loop).
+        # Close coroutine object to avoid RuntimeWarning: coroutine was never awaited.
+        try:
+            close_fn = getattr(coro, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
 
 
 class Watchdog:
@@ -46,13 +52,6 @@ class Watchdog:
         or keyword-based calls such as:
             Watchdog(shared_state=..., interval_sec=30.0)
             Watchdog(shared_state=..., check_sec=30.0)
-        # =============================
-        # Globals & Utilities
-        # =============================
-        logger = logging.getLogger("Watchdog")
-
-        _HEALTHY = {"operational", "running", "initialized", "active", "healthy", "ok"}
-
         """
         # Map legacy/new keyword aliases if provided
         # Prefer explicit keyword args over positional defaults
@@ -70,15 +69,16 @@ class Watchdog:
 
         # Interval from arg or config, with sane defaults
         if interval_candidate is None:
-        # =============================
-        # Watchdog Class
-        # =============================
             interval_candidate = float(getattr(config, "WATCHDOG_CHECK_INTERVAL", 30.0) or 30.0)
+        try:
+            interval_candidate = max(1.0, float(interval_candidate))
+        except Exception:
+            interval_candidate = 30.0
 
         # Tolerance: multiplier and optional cap
         tol_mult = float(getattr(config, "WATCHDOG_TOLERANCE_MULTIPLIER", 3.0) or 3.0)
         tol_cap  = getattr(config, "WATCHDOG_MAX_TOLERANCE_SEC", None)
-        tolerance_time_seconds = float(interval_candidate) * tol_mult
+        tolerance_time_seconds = max(float(interval_candidate), float(interval_candidate) * tol_mult)
         if tol_cap is not None:
             try:
                 tolerance_time_seconds = min(float(tolerance_time_seconds), float(tol_cap))
@@ -91,6 +91,7 @@ class Watchdog:
         self.tolerance_time_seconds: float = float(tolerance_time_seconds)
         self.config = config
         self.shared_state = shared_state
+        self.app = kwargs.pop("app", None)
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.info(
             "✅ Watchdog initialized (interval=%.1fs, tolerance=%.1fs).",
@@ -113,7 +114,14 @@ class Watchdog:
             "Heartbeat",
         ]
         conf_list = getattr(config, "WATCHDOG_COMPONENTS", None)
-        self.monitored_components: List[str] = list(conf_list) if conf_list else default_components
+        if isinstance(conf_list, str):
+            comps = [c.strip() for c in conf_list.split(",") if c and c.strip()]
+            self.monitored_components = comps or list(default_components)
+        elif isinstance(conf_list, (list, tuple, set)):
+            comps = [str(c).strip() for c in conf_list if str(c).strip()]
+            self.monitored_components = comps or list(default_components)
+        else:
+            self.monitored_components = list(default_components)
 
         # Track last time a component was confirmed healthy
         self.last_healthy_report: Dict[str, float] = {}
@@ -232,6 +240,32 @@ class Watchdog:
             pass
         return out
 
+    def _is_component_wired(self, component_name: str) -> Optional[bool]:
+        """
+        Best-effort check: is this monitored component actually wired in AppContext?
+        Returns:
+          - True/False when mapping is known and app is available
+          - None when unknown (cannot determine)
+        """
+        app = getattr(self, "app", None)
+        if app is None:
+            return None
+        attr_map = {
+            "MarketDataFeed": "market_data_feed",
+            "ExecutionManager": "execution_manager",
+            "MetaController": "meta_controller",
+            "AgentManager": "agent_manager",
+            "RiskManager": "risk_manager",
+            "PnLCalculator": "pnl_calculator",
+            "PerformanceEvaluator": "performance_evaluator",
+            "TPSLEngine": "tp_sl_engine",
+            "Heartbeat": "heartbeat",
+        }
+        attr_name = attr_map.get(component_name)
+        if not attr_name:
+            return None
+        return getattr(app, attr_name, None) is not None
+
     async def _safe_update_component_status(self, comp: str, status: str, detail: str):
         """
         Call shared_state.update_component_status / set_component_status (async or sync).
@@ -333,6 +367,18 @@ class Watchdog:
 
         # Case 1: never reported
         if last_ts == 0.0:
+            wired = self._is_component_wired(component_name)
+            if wired is False:
+                if self._should_warn(component_name):
+                    logger.warning(
+                        "🚨 Watchdog: '%s' is configured but component instance is not wired.",
+                        component_name,
+                    )
+                    await self._safe_update_component_status(
+                        "Watchdog", "Warning",
+                        f"'{component_name}' missing-component (not wired in AppContext)."
+                    )
+                return component_name, False, "missing-component"
             if self._should_warn(component_name):
                 logger.warning("🚨 Watchdog: '%s' has not reported any status yet.", component_name)
                 await self._safe_update_component_status(
@@ -345,7 +391,12 @@ class Watchdog:
         healthy_string = _is_healthy(status)
 
         # Special-case: status is "Unknown" but timestamp is present and not stale → warn, not error
-        if not healthy_string and status == "Unknown" and last_ts > 0.0 and (stale_s is None or stale_s <= self.tolerance_time_seconds):
+        if (
+            not healthy_string
+            and status.strip().lower() == "unknown"
+            and last_ts > 0.0
+            and (stale_s is None or stale_s <= self.tolerance_time_seconds)
+        ):
             if self._should_warn(component_name):
                 logger.warning(
                     "⚠️ Watchdog: '%s' has timestamp but no status; treating as Degraded until status arrives.",

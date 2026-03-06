@@ -16,10 +16,12 @@ except ImportError:
         return now_ts
 
 class SignalManager:
-    def __init__(self, config, logger, signal_cache=None, intent_manager=None):
+    def __init__(self, config, logger, signal_cache=None, intent_manager=None, shared_state=None, position_count_source=None):
         self.config = config
         self.logger = logger
         self.intent_manager = intent_manager
+        self.shared_state = shared_state  # NAV source
+        self.position_count_source = position_count_source  # Position count source
         
         # Use provided cache or create new one
         if signal_cache is not None:
@@ -41,6 +43,10 @@ class SignalManager:
         self._min_conf_ingest = float(getattr(config, 'MIN_SIGNAL_CONF', 0.50))  # Defensive floor (0.50)
         self._max_age_sec = float(getattr(config, 'MAX_SIGNAL_AGE_SECONDS', 60))
         self._known_quotes = {"USDT", "FDUSD", "USDC", "BUSD", "TUSD", "DAI"}
+        
+        if shared_state or position_count_source:
+            self.logger.info("[SignalManager] Initialized with NAV source: shared_state=%s, position_count_source=%s",
+                           "yes" if shared_state else "no", "yes" if position_count_source else "no")
 
     def receive_signal(self, agent_name: str, symbol: str, signal: Dict[str, Any]) -> bool:
         """
@@ -91,9 +97,29 @@ class SignalManager:
         s["timestamp"] = time.time()
         s["confidence"] = max(0.0, min(1.0, conf_raw))
 
+        # Microstructure hints (optional, only if provided by agent)
+        if "spread_bps" in signal:
+            try:
+                s["spread_bps"] = float(signal.get("spread_bps") or 0.0)
+            except Exception:
+                pass
+        if "atr_pct" in signal:
+            try:
+                s["atr_pct"] = float(signal.get("atr_pct") or 0.0)
+            except Exception:
+                pass
+
         # Set default quote if not provided
         if "quote" not in s or float(s.get("quote") or 0) <= 0:
             s["quote"] = float(getattr(self.config, 'DEFAULT_PLANNED_QUOTE', 10.0))
+
+        # Economic hints: buffered min_notional for early filtering
+        try:
+            min_notional_cfg = float(getattr(self.config, 'MIN_NOTIONAL_USDT', 10.0))
+            safety_buf = float(getattr(self.config, 'NOTIONAL_SAFETY_BUFFER_USDT', 2.0))
+            s["_min_notional_with_buffer"] = max(0.0, min_notional_cfg + safety_buf)
+        except Exception:
+            s["_min_notional_with_buffer"] = None
 
         # Store in cache with deduplication by symbol:agent
         cache_key = f"{sym}:{agent_name}"
@@ -246,6 +272,80 @@ class SignalManager:
         if accepted > 0:
             self.logger.info("[SignalManager:Flush] Successfully ingested %d signals into cache.", accepted)
         return accepted
+
+    def get_current_nav(self) -> float:
+        """
+        Get current NAV from configured source (shared_state).
+        
+        Returns:
+            Current NAV in USDT, or 0.0 if unavailable
+        """
+        if not self.shared_state:
+            return 0.0
+        
+        try:
+            # Try get_nav_quote() method first (async, but wrapped by caller if needed)
+            if hasattr(self.shared_state, "nav"):
+                nav = getattr(self.shared_state, "nav", 0.0)
+                if callable(nav):
+                    # If it's a method, just skip async methods here
+                    pass
+                else:
+                    val = float(nav or 0.0)
+                    if val > 0:
+                        return val
+            
+            # Fallback to portfolio_nav
+            if hasattr(self.shared_state, "portfolio_nav"):
+                nav = getattr(self.shared_state, "portfolio_nav", 0.0)
+                if callable(nav):
+                    pass
+                else:
+                    val = float(nav or 0.0)
+                    if val > 0:
+                        return val
+            
+            # Final fallback
+            if hasattr(self.shared_state, "total_equity_usdt"):
+                return float(getattr(self.shared_state, "total_equity_usdt") or 0.0)
+        except Exception as e:
+            self.logger.debug("[SignalManager] Failed to get NAV from shared_state: %s", e)
+        
+        return 0.0
+
+    def get_position_count(self) -> int:
+        """
+        Get current position count from configured source.
+        
+        Returns:
+            Number of open positions, or 0 if unavailable
+        """
+        if self.position_count_source:
+            try:
+                # If position_count_source is callable
+                if callable(self.position_count_source):
+                    count = self.position_count_source()
+                    if isinstance(count, int):
+                        return count
+            except Exception as e:
+                self.logger.debug("[SignalManager] Failed to get position count from source: %s", e)
+        
+        # Fallback: try to get from shared_state if available
+        if self.shared_state:
+            try:
+                if hasattr(self.shared_state, "get_positions_snapshot"):
+                    snap = self.shared_state.get_positions_snapshot()
+                    if snap and isinstance(snap, dict):
+                        count = 0
+                        for sym, pos_data in snap.items():
+                            qty = float((pos_data or {}).get("quantity", 0.0) or (pos_data or {}).get("qty", 0.0) or 0.0)
+                            if qty > 0:
+                                count += 1
+                        return count
+            except Exception as e:
+                self.logger.debug("[SignalManager] Failed to count positions from shared_state: %s", e)
+        
+        return 0
 
     def _normalize_symbol(self, symbol: str) -> str:
         """Normalize symbol to uppercase."""

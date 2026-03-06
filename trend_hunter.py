@@ -7,7 +7,12 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import tensorflow as tf  # retrain uses to_thread; non-blocking for loop
+
+# Safe TensorFlow import with fallback
+try:
+    import tensorflow as tf  # retrain uses to_thread; non-blocking for loop
+except ImportError:
+    tf = None
 
 _HAS_TALIB = True
 try:
@@ -15,11 +20,34 @@ try:
 except Exception:
     _HAS_TALIB = False
 
-from utils.status_logger import log_component_status
-from utils.indicators import compute_ema, compute_macd
-from core.model_manager import safe_load_model, build_model_path
-from agents.signal_utils import emit_to_meta, is_fresh  # New import for signal utilities
-from core.baseline_trading_kernel import ExecOrder
+try:
+    from utils.status_logger import log_component_status
+except ImportError:
+    def log_component_status(*args, **kwargs):
+        pass
+
+try:
+    from utils.indicators import compute_ema, compute_macd
+except ImportError:
+    compute_ema = None
+    compute_macd = None
+
+try:
+    from core.model_manager import safe_load_model, build_model_path
+except ImportError:
+    safe_load_model = None
+    build_model_path = None
+
+try:
+    from agents.signal_utils import emit_to_meta, is_fresh  # New import for signal utilities
+except ImportError:
+    emit_to_meta = None
+    is_fresh = None
+
+try:
+    from core.baseline_trading_kernel import ExecOrder
+except ImportError:
+    ExecOrder = None
 
 AGENT_NAME = "TrendHunter"
 

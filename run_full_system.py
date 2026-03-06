@@ -88,6 +88,10 @@ class AppContext:
 
         if up_to_phase >= 7:
             self.meta_controller = MetaController(self.shared_state, self.config, self.execution_manager)
+            # 🔥 CRITICAL FIX: Inject MetaController into AgentManager
+            # This was missing, causing signals to never reach the decision pipeline
+            self.agent_manager.meta_controller = self.meta_controller
+            logger.info("✅ Phase 7 Complete: Meta control layer initialized & signal pipeline connected!")
             self.recovery_engine = RecoveryEngine(self.shared_state, self.config)
             logger.info("✅ Phase 7 Complete: Meta control layer initialized")
 

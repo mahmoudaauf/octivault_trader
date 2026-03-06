@@ -621,6 +621,49 @@ class RiskManager:
                     self.logger.warning("[RiskManager] BUY rejected by projected exposure: %s", exposure_reason)
                     return False, exposure_reason, None, None
 
+                # ════════════════════════════════════════════════════════════════════════════════
+                # CAPITAL FLOOR VALIDATION: Recalculated every trade
+                # Formula: capital_floor = max(8, NAV * 0.12, trade_size * 0.5)
+                # ════════════════════════════════════════════════════════════════════════════════
+                if hasattr(self.shared_state, "calculate_capital_floor"):
+                    try:
+                        nav = 0.0
+                        try:
+                            if hasattr(self.shared_state, "get_nav_quote"):
+                                nav = float(await self.shared_state.get_nav_quote() or 0.0)
+                            else:
+                                nav = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
+                        except Exception:
+                            nav = 0.0
+                        
+                        trade_size = float(self._cfg("TRADE_AMOUNT_USDT", self._cfg("DEFAULT_PLANNED_QUOTE", 30.0)) or 30.0)
+                        capital_floor = self.shared_state.calculate_capital_floor(nav=nav, trade_size=trade_size)
+                        
+                        # Get current free USDT balance
+                        quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
+                        if hasattr(self.shared_state, "get_spendable_balance"):
+                            free_usdt = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
+                        else:
+                            free_usdt = float(await self._get_free_quote_balance() or 0.0)
+                        
+                        # Check if trade would breach capital floor
+                        # Allow trade only if: free_usdt - quote_qty > capital_floor
+                        remaining_after_trade = free_usdt - q
+                        if remaining_after_trade < capital_floor:
+                            self.logger.warning(
+                                "[RiskManager] CAPITAL_FLOOR: BUY would breach capital floor | "
+                                f"free_usdt=${free_usdt:.2f} - quote=${q:.2f} = ${remaining_after_trade:.2f} < floor=${capital_floor:.2f} | "
+                                f"(nav=${nav:.2f}, trade_size=${trade_size:.2f})"
+                            )
+                            return False, "capital_floor_breach", None, None
+                        else:
+                            self.logger.debug(
+                                f"[RiskManager] CAPITAL_FLOOR: ✓ PASS | "
+                                f"remaining=${remaining_after_trade:.2f} >= floor=${capital_floor:.2f}"
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"[RiskManager] Capital floor check error: {e}, continuing...")
+
                 # CRITICAL FIX: Validate against CapitalAllocator agent budgets to prevent risk multiplication
                 # Extract agent from order context
                 agent = None

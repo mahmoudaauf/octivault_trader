@@ -72,11 +72,10 @@ class PortfolioManager:
     # ------------- Dust classification -------------
     async def _is_dust(self, asset: str, amount: Decimal, price: Optional[Decimal]) -> bool:
         """
-        اعتبر الرصيد Dust إذا كانت قيمته الاسمية أقل من حد التداول (minNotional).
-        - للستيبلكوينز 1:1 (USDT/USDC/FDUSD/BUSD/TUSD): نستخدم عتبة ثابتة صغيرة من config.
-        - لباقي الأصول: نقارن (amount * price) بـ minNotional من exchange_client.get_symbol_info،
-          مع fallback إلى config.MIN_NOTIONAL_USDT (افتراضياً 5.0).
-        - Fail-safe: أي حالة غير مؤكدة تُعتبر Dust لحماية النظام.
+        Check if position is dust (notional < MIN_ECONOMIC_TRADE_USDT).
+        
+        Uses unified dust threshold from config for consistency across all layers.
+        Fail-safe: any classification uncertainty returns True (dust) to protect the system.
         """
         try:
             asset = (asset or "").upper()
@@ -85,54 +84,25 @@ class PortfolioManager:
             if amount <= Decimal("0"):
                 return True
 
-            # Stablecoins: 1:1 → استخدم حد صغير من الإعدادات
+            # Get unified dust threshold from config
+            min_usdt = getattr(self._cfg, "MIN_ECONOMIC_TRADE_USDT", 30.0)
+            if callable(self._cfg):
+                min_usdt = self._cfg("MIN_ECONOMIC_TRADE_USDT", 30.0) or 30.0
+            min_usdt = float(min_usdt or 30.0)
+
+            # Stablecoins: use 1:1 ratio (quantity = notional in USDT)
             if asset in STABLECOIN_1to1:
-                stbl_thr = self.dust_threshold_stables
-                return amount < stbl_thr
+                return amount < Decimal(str(min_usdt))
 
-            # للأصول غير المستقرة نحتاج سعر مقابل العملة الأساسية
+            # Non-stablecoins: need price to calculate notional
             if price is None or price <= Decimal("0"):
-                return True  # تحفظياً اعتبره Dust
+                return True  # Conservative: treat as dust if no price
 
-            notional = amount * price
-
-            # حاول جلب minNotional من معلومات الرمز (نمط Binance)
-            min_notional = None
-            symbol = f"{asset}{self._base_ccy}"
-            get_info = getattr(self.exchange_client, "get_symbol_info", None)
-            if callable(get_info):
-                try:
-                    info = await get_info(symbol)
-                    if info:
-                        # شكل شائع في Binance
-                        filters = info.get("filters") if isinstance(info, dict) else None
-                        if isinstance(filters, list):
-                            for f in filters:
-                                ftype = (f.get("filterType") or "").upper()
-                                if ftype in {"MIN_NOTIONAL", "NOTIONAL"}:
-                                    mn = f.get("minNotional") or f.get("notional")
-                                    if mn is not None:
-                                        try:
-                                            min_notional = Decimal(str(mn))
-                                        except Exception:
-                                            pass
-                                            break
-                        # بعض التغليفات قد تضع القيمة مباشرة
-                        if min_notional is None and "minNotional" in info:
-                            try:
-                                min_notional = Decimal(str(info["minNotional"]))
-                            except Exception:
-                                pass
-                except Exception:
-                    # تجاهل أخطاء الميتاداتا واستعمل fallback
-                    pass
-
-            if min_notional is None:
-                min_notional = self.min_notional_usdt
-
-            return notional < min_notional
+            notional = float(amount) * float(price)
+            return notional < min_usdt
+            
         except Exception:
-            # أي فشل في التصنيف → Dust كتحفّظ
+            # Any classification failure → dust (fail-safe)
             return True
 
     # ===== Internal helpers (I/O) =====

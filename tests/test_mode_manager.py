@@ -53,7 +53,7 @@ def test_mode_envelopes():
         ("NORMAL", {"max_trade_usdt": 150.0, "max_positions": 3, "confidence_floor": 0.65}),
         ("AGGRESSIVE", {"max_trade_usdt": 300.0, "max_positions": 5, "confidence_floor": 0.55}),
         ("RECOVERY", {"max_trade_usdt": 50.0, "max_positions": 1, "confidence_floor": 0.80}),
-        ("BOOTSTRAP", {"max_trade_usdt": 20.0, "max_positions": 1, "confidence_floor": 0.70}),
+        ("BOOTSTRAP", {"max_trade_usdt": 20.0, "max_positions": 5, "confidence_floor": 0.70}),
         ("PAUSED", {"max_trade_usdt": 0.0, "max_positions": 0, "confidence_floor": 1.0}),
         ("SIGNAL_ONLY", {"max_trade_usdt": 1000.0, "max_positions": 10, "confidence_floor": 0.40}),
     ]

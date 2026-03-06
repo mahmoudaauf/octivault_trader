@@ -18,7 +18,7 @@ except Exception:
 
 try:
     # Older helper that calls obj.method(...) and awaits result iff needed
-    from core.stubs import maybe_awaitll as _maybe_call  # type: ignore
+    from core.stubs import maybe_call as _maybe_call  # type: ignore
 except Exception:
     _maybe_call = None  # noqa: N816
 

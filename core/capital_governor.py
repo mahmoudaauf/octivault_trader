@@ -77,11 +77,12 @@ class CapitalGovernor:
         self.config = config
         self.shared_state = shared_state  # For sync_authoritative_balance()
         
-        # Capital bracket thresholds
-        self.micro_threshold = 500.0      # < $500: micro bracket
-        self.small_threshold = 2000.0     # $500-$2000: small bracket
-        self.medium_threshold = 10000.0   # $2000-$10000: medium bracket
-        # >= $10000: large bracket
+        # Capital bracket thresholds — configurable via CAPITAL_*_THRESHOLD, fall back to defaults.
+        # Allows threshold adjustment without code changes; changes take effect on next init.
+        self.micro_threshold = float(getattr(config, "CAPITAL_MICRO_THRESHOLD", 500.0) or 500.0)
+        self.small_threshold = float(getattr(config, "CAPITAL_SMALL_THRESHOLD", 2000.0) or 2000.0)
+        self.medium_threshold = float(getattr(config, "CAPITAL_MEDIUM_THRESHOLD", 10000.0) or 10000.0)
+        # >= medium_threshold: LARGE bracket
         
         logger.info(
             "[CapitalGovernor] Initialized with brackets: "
@@ -270,31 +271,43 @@ class CapitalGovernor:
         
         return limits
     
-    def get_position_sizing(self, nav: float, symbol: str = "") -> Dict[str, float]:
+    def get_position_sizing(self, nav: float, symbol: str = "", current_position_value: float = 0.0) -> Dict[str, float]:
         """
-        Get position sizing based on capital bracket.
+        Get position sizing based on capital bracket WITH CONCENTRATION GATING.
+        
+        ===== PHASE 5: PRE-TRADE RISK GATE (Concentration-Aware Sizing) =====
+        
+        CRITICAL FIX: This implements risk enforcement BEFORE execution, not after.
+        
+        Instead of:  Signal → BUY huge position → System tries to fix
+        Now we do:  Signal → Check concentration → Return adjusted size
         
         Args:
             nav: Net Asset Value (current account equity)
             symbol: Symbol being sized (optional, for logging)
+            current_position_value: Current market value of position in this symbol (USDT)
             
         Returns:
             Dict with sizing parameters:
             {
-                "quote_per_position": float,     # USDT per position
+                "quote_per_position": float,     # USDT per position (CONCENTRATION-CAPPED)
                 "max_per_symbol": float,         # Max total USDT per symbol
+                "max_position_pct": float,       # Max % of NAV for single position
                 "portfolio_allocation_pct": float,  # % of capital per position
                 "min_order_usdt": float,         # Minimum order size
                 "enable_profit_lock": bool,      # Enable profit lock
                 "ev_multiplier": float,          # EV gate multiplier
+                "concentration_headroom": float, # Remaining headroom (USDT) before limit
             }
         """
         bracket = self.get_bracket(nav)
         
+        # Step 1: Get base sizing for bracket
         if bracket == CapitalBracket.MICRO:
             sizing = {
                 "quote_per_position": 12.0,       # Very small orders
                 "max_per_symbol": 24.0,           # Max 2x position per symbol
+                "max_position_pct": 0.50,         # ← NEW: Max 50% of NAV per position (MICRO)
                 "portfolio_allocation_pct": 5.0,  # 5% of capital per position
                 "min_order_usdt": 12.0,
                 "enable_profit_lock": False,      # Learning phase
@@ -305,6 +318,7 @@ class CapitalGovernor:
             sizing = {
                 "quote_per_position": 15.0,
                 "max_per_symbol": 30.0,
+                "max_position_pct": 0.35,         # ← NEW: Max 35% of NAV per position (SMALL)
                 "portfolio_allocation_pct": 3.0,  # 3% per position
                 "min_order_usdt": 15.0,
                 "enable_profit_lock": False,
@@ -315,6 +329,7 @@ class CapitalGovernor:
             sizing = {
                 "quote_per_position": 25.0,
                 "max_per_symbol": 75.0,
+                "max_position_pct": 0.25,         # ← NEW: Max 25% of NAV per position (MEDIUM)
                 "portfolio_allocation_pct": 2.0,  # 2% per position
                 "min_order_usdt": 20.0,
                 "enable_profit_lock": True,       # Start locking profits
@@ -325,19 +340,54 @@ class CapitalGovernor:
             sizing = {
                 "quote_per_position": 50.0,
                 "max_per_symbol": 150.0,
+                "max_position_pct": 0.20,         # ← NEW: Max 20% of NAV per position (LARGE)
                 "portfolio_allocation_pct": 1.0,  # 1% per position
                 "min_order_usdt": 30.0,
                 "enable_profit_lock": True,
                 "ev_multiplier": 2.0,             # Strict gate
             }
         
+        # ===== PHASE 5: CONCENTRATION GATING (NEW) =====
+        # Calculate max allowed position size based on NAV
+        if nav > 0:
+            max_position = nav * sizing["max_position_pct"]
+            
+            # Calculate remaining headroom (how much we can add to this symbol)
+            current_value = float(current_position_value or 0.0)
+            headroom = max(0.0, max_position - current_value)
+            
+            # Cap the quote to not exceed headroom
+            original_quote = sizing["quote_per_position"]
+            adjusted_quote = min(original_quote, headroom)
+            
+            sizing["concentration_headroom"] = headroom
+            sizing["quote_per_position"] = adjusted_quote
+            
+            # Log concentration gating if applied
+            if adjusted_quote < original_quote:
+                logger.warning(
+                    "[CapitalGovernor:ConcentrationGate] %s CAPPED: "
+                    "max_position=%.2f%% (%.0f USDT), current=%.0f, "
+                    "headroom=%.0f → quote adjusted %.0f → %.0f USDT",
+                    symbol or "symbol",
+                    sizing["max_position_pct"] * 100,
+                    max_position,
+                    current_value,
+                    headroom,
+                    original_quote,
+                    adjusted_quote
+                )
+        else:
+            sizing["concentration_headroom"] = 0.0
+        
         if symbol:
             logger.debug(
                 "[CapitalGovernor:Sizing] NAV=$%.2f → %s: "
-                "$%.1f per position, EV×%.1f, profit_lock=%s",
+                "$%.1f per position (max_pct=%.0f%%), EV×%.1f, profit_lock=%s",
                 nav,
                 symbol,
                 sizing["quote_per_position"],
+                sizing["max_position_pct"] * 100,
                 sizing["ev_multiplier"],
                 sizing["enable_profit_lock"]
             )

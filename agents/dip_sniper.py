@@ -97,6 +97,27 @@ class DipSniper:
         logger.info(f"[{self.name}] Generated {len(signals)} signals across {len(self.symbols)} symbols")
         return signals
 
+    async def run_once(self):
+        """
+        P9 bridge: allows AgentManager to trigger this strategy.
+        Generates signals and emits them to MetaController.
+        """
+        try:
+            signals = await self.generate_signals()
+
+            for signal in signals:
+                symbol = signal.get("symbol")
+
+                if hasattr(self.shared_state, "submit_agent_signal"):
+                    await self.shared_state.submit_agent_signal(
+                        agent_name=self.name,
+                        symbol=symbol,
+                        signal=signal
+                    )
+
+        except Exception as e:
+            logger.exception(f"[{self.name}] run_once failed: {e}")
+
     async def _safe_get_symbols(self) -> List[str]:
         """P9 FIX: Use canonical symbol source."""
         try:

@@ -8,6 +8,22 @@ import logging
 from typing import Dict, Any, List, Optional, Tuple
 from utils.shared_state_tools import fee_bps
 
+
+def _dynamic_exposure_cap(nav: float) -> float:
+    """Return max single-symbol exposure fraction based on NAV bracket.
+
+    Micro accounts are allowed to be concentrated (only one position possible).
+    As NAV grows, diversification rules progressively tighten.
+    """
+    if nav < 200.0:
+        return 0.90
+    elif nav < 500.0:
+        return 0.70
+    elif nav < 2000.0:
+        return 0.50
+    else:
+        return 0.30
+
 class RotationExitAuthority:
     def __init__(self, logger: logging.Logger, config: Any, shared_state: Any, capital_governor=None):
         self.logger = logger
@@ -126,15 +142,17 @@ class RotationExitAuthority:
             if hasattr(self.ss, "sync_authoritative_balance"):
                 try:
                     import asyncio
-                    # Run sync in a way that works in sync contexts
+                    # Check if we're already in an async context
                     try:
-                        asyncio.get_event_loop().run_until_complete(
-                            self.ss.sync_authoritative_balance(force=True)
+                        loop = asyncio.get_running_loop()
+                        # Already in async context - can't use run_until_complete
+                        self.logger.debug(
+                            "[REA:RotationRestriction] In async context, skipping sync"
                         )
                     except RuntimeError:
-                        # Already in async context, just log
-                        self.logger.debug(
-                            "[REA:RotationRestriction] In async context, using current balance"
+                        # No running loop - we're in sync context, safe to use run_until_complete
+                        asyncio.get_event_loop().run_until_complete(
+                            self.ss.sync_authoritative_balance(force=True)
                         )
                 except Exception as e:
                     self.logger.debug(
@@ -641,18 +659,20 @@ class RotationExitAuthority:
         Different from Layer 3 rebalancing, this is about ALPHA-weighted concentration.
         """
         if nav <= 0: return None
-        
-        # Max bandwidth for any single signal (e.g. 40%)
-        max_bandwidth = float(getattr(self.config, "MAX_REA_CONCENTRATION_PCT", 0.4))
-        
+
+        # Dynamic cap: config override takes precedence; fallback to NAV-bracket table.
+        config_cap = float(getattr(self.config, "MAX_REA_CONCENTRATION_PCT", 0.0) or 0.0)
+        cap = config_cap if config_cap > 0 else _dynamic_exposure_cap(nav)
+        self.logger.debug("[REA:Concentration] DynamicExposure NAV=%.2f → cap=%.0f%%", nav, cap * 100)
+
         for sym, pos in owned_positions.items():
             if self._is_permanent_dust_position(sym, pos):
                 continue
             val = float(pos.get("value_usdt", 0.0))
-            if (val / nav) > max_bandwidth:
+            if (val / nav) > cap:
                 self.logger.warning(
-                    "[REA:Concentration] 🛡️ BANDWIDTH LIMIT: %s consuming over %.1f%% of NAV. Triggering tactical exit.",
-                    sym, max_bandwidth * 100
+                    "[REA:Concentration] 🛡️ BANDWIDTH LIMIT: %s consuming over %.0f%% of NAV (NAV=%.2f). Triggering tactical exit.",
+                    sym, cap * 100, nav
                 )
                 return {
                     "symbol": sym,

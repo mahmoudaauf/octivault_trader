@@ -259,7 +259,10 @@ class AgentManager:
           events.trade.intent
         """
         if not intents:
+            self.logger.warning("[AgentManager:SUBMIT] submit_trade_intents called with empty list - no-op")
             return
+
+        self.logger.warning("[AgentManager:SUBMIT] Publishing %d intents to event_bus", len(intents))
 
         event_bus = getattr(self.shared_state, "event_bus", None)
         publish = getattr(event_bus, "publish", None)
@@ -280,6 +283,7 @@ class AgentManager:
 
         if published > 0:
             self.logger.info("[AgentManager] Published %d trade intent events", published)
+            self.logger.warning("[AgentManager:SUBMIT] ✓ Published %d intents to event_bus", published)
 
     def _coerce_trade_intent(self, raw: Any) -> Optional[TradeIntent]:
         """Best-effort conversion into canonical TradeIntent."""
@@ -294,6 +298,27 @@ class AgentManager:
                 return None
             qty_hint = raw.get("qty_hint", raw.get("quantity", raw.get("planned_qty")))
             quote_hint = raw.get("quote_hint", raw.get("quote", raw.get("planned_quote")))
+            # Preserve extra metadata in policy_context so downstream can recover regime info
+            passthrough_keys = [
+                "_regime",
+                "regime",
+                "_regime_scaling",
+                "_expected_move_pct",
+                "expected_move_pct",
+                "_tradeability_hint",
+                "_break_even_prob",
+                "_required_conf",
+                "tradeability_regime",
+                "volatility_regime",
+                "_atr_pct",
+                "atr_pct",
+            ]
+            policy_ctx: Dict[str, Any] = {}
+            if isinstance(raw.get("policy_context"), dict):
+                policy_ctx.update(raw.get("policy_context"))
+            for k in passthrough_keys:
+                if k in raw and k not in policy_ctx:
+                    policy_ctx[k] = raw[k]
             return TradeIntent(
                 symbol=symbol,
                 side=side,
@@ -305,6 +330,7 @@ class AgentManager:
                 ttl_sec=int(raw.get("ttl_sec", 30) or 30),
                 tag=str(raw.get("tag") or f"strategy/{raw.get('agent', 'AgentManager')}"),
                 timeframe=(str(raw.get("timeframe")) if raw.get("timeframe") else None),
+                policy_context=policy_ctx or None,
             )
         except Exception:
             return None
@@ -313,18 +339,20 @@ class AgentManager:
     def _normalize_to_intents(self, agent_name: str, raw: Any) -> list:
         intents = []
         if not raw:
+            self.logger.warning("[AgentManager:NORMALIZE] Empty/None raw signals from %s", agent_name)
             return intents
         if isinstance(raw, dict):
             raw = [raw]
         elif not isinstance(raw, (list, tuple, set)):
             raw = [raw]
+        self.logger.warning("[AgentManager:NORMALIZE] Normalizing %d raw signals from %s", len(raw), agent_name)
         for s in raw:
             # Handle canonical TradeIntent objects directly (previously dropped silently).
             if isinstance(TradeIntent, type) and isinstance(s, TradeIntent):
                 side = (getattr(s, "side", "") or "").upper()
                 if side not in ("BUY", "SELL"):
                     continue
-                intents.append({
+                intent_obj = {
                     "symbol": (getattr(s, "symbol", "") or "").replace("/", "").upper(),
                     "action": side,
                     "side": side,
@@ -337,7 +365,12 @@ class AgentManager:
                     "ttl_sec": int(getattr(s, "ttl_sec", 30) or 30),
                     "tag": f"strategy/{agent_name}",
                     "budget_required": (side == "BUY"),
-                })
+                }
+                # Pass through policy_context metadata if present on the TradeIntent
+                ctx = getattr(s, "policy_context", None)
+                if isinstance(ctx, dict) and ctx:
+                    intent_obj["policy_context"] = dict(ctx)
+                intents.append(intent_obj)
                 continue
             # Accept dict signals {"symbol","action","confidence",...}
             if not isinstance(s, dict):
@@ -350,7 +383,7 @@ class AgentManager:
             act = (s.get("action") or s.get("side") or "").lower()
             if not sym or act not in ("buy", "sell"):
                 continue
-            intents.append({
+            intent = {
                 "symbol": sym,
                 "action": act.upper(),
                 "side": act.upper(),
@@ -363,12 +396,36 @@ class AgentManager:
                 "ttl_sec": int(s.get("ttl_sec") or 30),
                 "tag": f"strategy/{agent_name}",
                 "budget_required": (act == "buy"),
-            })
+            }
+            # Preserve regime / expected-move metadata so MetaController can build policy context
+            passthrough_keys = [
+                "_regime",
+                "regime",
+                "_regime_scaling",
+                "_expected_move_pct",
+                "expected_move_pct",
+                "_tradeability_hint",
+                "_break_even_prob",
+                "_required_conf",
+                "tradeability_regime",
+                "volatility_regime",
+                "_atr_pct",
+                "atr_pct",
+            ]
+            for k in passthrough_keys:
+                if k in s:
+                    intent[k] = s[k]
+            # If agent already built a policy_context, keep it
+            if isinstance(s.get("policy_context"), dict):
+                intent["policy_context"] = dict(s["policy_context"])
+            intents.append(intent)
         if raw and not intents:
             self.logger.warning(
                 "[_normalize_to_intents] Agent '%s' provided %d raw signals but NONE passed normalization. First item: %s",
                 agent_name, len(raw), raw[0] if raw else "N/A",
             )
+        if intents:
+            self.logger.warning("[AgentManager:NORMALIZE] ✓ Successfully normalized %d intents from %s", len(intents), agent_name)
         return intents
 
     async def collect_and_forward_signals(self):
@@ -380,6 +437,12 @@ class AgentManager:
             for name, agent in list(self.agents.items())
             if getattr(agent, "agent_type", None) != "discovery" and hasattr(agent, "generate_signals")
         ]
+        
+        # 🔥 CRITICAL DEBUG: Log if no strategy agents found
+        if not strategy_agents:
+            self.logger.warning("[AgentManager] ⚠️ NO STRATEGY AGENTS FOUND! registered_agents=%s agent_types=%s", 
+                               list(self.agents.keys()),
+                               {n: getattr(a, "agent_type", "unknown") for n, a in self.agents.items()})
         if not strategy_agents:
             now_ts = time.time()
             retry_interval = max(5.0, float(self._strategy_autoregister_retry_interval_s or 60.0))
@@ -442,6 +505,58 @@ class AgentManager:
         if batch:
             await self.submit_trade_intents(batch)
             self.logger.info("Submitted %d TradeIntents to Meta", len(batch))
+            
+            # 🔥 CRITICAL DEBUG: Log submission
+            self.logger.warning("[AgentManager:BATCH] Submitted batch of %d intents: %s", 
+                               len(batch),
+                               [f"{i.get('agent')}:{i.get('symbol')}" for i in batch])
+            
+            # 🔥 CRITICAL FIX: DIRECT PATH TO METACONTROLLER
+            # Don't wait for event bus drain - forward signals directly to MetaController
+            # This ensures signals reach the signal_cache IMMEDIATELY
+            if self.meta_controller:
+                direct_count = 0
+                for intent in batch:
+                    try:
+                        symbol = intent.get("symbol")
+                        agent = intent.get("agent", "AgentManager")
+                        # Convert TradeIntent back to signal format for direct reception
+                        signal = {
+                            "action": intent.get("action") or intent.get("side"),
+                            "confidence": float(intent.get("confidence", 0.0)),
+                            "reason": intent.get("rationale") or intent.get("reason", ""),
+                            "quote": intent.get("quote_hint") or intent.get("quote"),
+                            "timestamp": time.time(),
+                        }
+                        passthrough_keys = [
+                            "_regime",
+                            "regime",
+                            "_regime_scaling",
+                            "_expected_move_pct",
+                            "expected_move_pct",
+                            "_tradeability_hint",
+                            "_break_even_prob",
+                            "_required_conf",
+                            "tradeability_regime",
+                            "volatility_regime",
+                            "_atr_pct",
+                            "atr_pct",
+                        ]
+                        for k in passthrough_keys:
+                            if k in intent:
+                                signal[k] = intent[k]
+                        if isinstance(intent.get("policy_context"), dict):
+                            # Merge policy_context fields but don't overwrite explicit signal keys
+                            for k, v in intent["policy_context"].items():
+                                signal.setdefault(k, v)
+                        await self.meta_controller.receive_signal(agent, symbol, signal)
+                        direct_count += 1
+                    except Exception as e:
+                        self.logger.debug("[AgentManager] Direct signal forward failed for %s from %s: %s", 
+                                        intent.get("symbol"), agent, e)
+                
+                if direct_count > 0:
+                    self.logger.info("[AgentManager:DIRECT] Forwarded %d signals directly to MetaController.signal_cache", direct_count)
         else:
             now_ts = time.time()
             interval = max(5.0, float(self._empty_intent_log_interval_s or 60.0))
@@ -952,18 +1067,23 @@ class AgentManager:
 
     async def _tick_loop(self):  # New method for continuous ticking
         self._strategies_started = True  # Set flag when the loop starts
+        self.logger.warning("🔥 [AgentManager:TICK] ✅ TICK LOOP STARTED - will collect signals every %d seconds", getattr(self.config, "AGENT_TICK_SEC", 5))
+        tick_count = 0
         try:
             while True:
                 try:
+                    tick_count += 1
+                    self.logger.debug("[AgentManager:TICK] Iteration #%d: tick_all_once", tick_count)
                     await self.tick_all_once()                 # agents do their work
+                    self.logger.debug("[AgentManager:TICK] Iteration #%d: collect_and_forward_signals", tick_count)
                     await self.collect_and_forward_signals()   # NEW: forward to Meta
                 except _asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    self.logger.error("AgentManager.tick loop iteration failed: %s", e, exc_info=True)
+                    self.logger.error("AgentManager.tick loop iteration #%d failed: %s", tick_count, e, exc_info=True)
                 await _asyncio.sleep(getattr(self.config, "AGENT_TICK_SEC", 5))  # Use AGENT_TICK_SEC from config
         except _asyncio.CancelledError:
-            self.logger.info("AgentManager.tick loop cancelled.")
+            self.logger.info("AgentManager.tick loop cancelled after %d iterations.", tick_count)
             raise
 
     async def run_strategy_retrain_loop(self):
@@ -1059,10 +1179,14 @@ class AgentManager:
         self.logger.info("🚀 AgentManager run_loop started (Unblocked Mode).")
         
         # schedule manager tasks so stop() can cancel them
+        # 🔥 CRITICAL FIX: Create tick task FIRST and ensure it starts immediately
+        # This unblocks the tick loop from waiting for other tasks to complete
+        self._manager_tasks["tick"] = _asyncio.create_task(self._tick_loop(), name="AgentManager:tick")
+        self.logger.info("🔥 [AgentManager] Tick loop scheduled - signal collection will begin immediately")
+        
         self._manager_tasks["discovery"] = _asyncio.create_task(self.run_discovery_agents_loop(), name="AgentManager:discovery")
         self._manager_tasks["run_all_agents"] = _asyncio.create_task(self.run_all_agents(), name="AgentManager:run_all_agents")
         self._manager_tasks["health"] = _asyncio.create_task(self.report_health_loop(), name="AgentManager:health")
-        self._manager_tasks["tick"] = _asyncio.create_task(self._tick_loop(), name="AgentManager:tick")
         if float(self._strategy_retrain_interval_s or 0.0) > 0:
             self._manager_tasks["strategy_retrain"] = _asyncio.create_task(
                 self.run_strategy_retrain_loop(),

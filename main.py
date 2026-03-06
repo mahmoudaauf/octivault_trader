@@ -33,6 +33,10 @@ from datetime import datetime
 from utils.pid_manager import PIDManager
 from core.symbol_manager import SymbolManager
 
+# ⚡ ARCHITECT REFINEMENT #3: Import UniverseRotationEngine for ranking cycle
+from core.universe_rotation_engine import UniverseRotationEngine
+from core.capital_governor import CapitalSymbolGovernor
+
 # Import RetrainingEngine
 from core.retraining_engine import RetrainingEngine
 from agents.ml_forecaster import MLForecaster # Importing MLForecaster as suggested for retrainable agents
@@ -99,6 +103,10 @@ class AppContext:
         # Declare new symbol proposing agents
         self.ipo_chaser = None
         self.screener_agent = None
+        
+        # ⚡ ARCHITECT REFINEMENT #3: Add universe rotation engine for cycle separation
+        self.universe_rotation_engine = None
+        self.capital_symbol_governor = None
         
         # === REGIME TRADING INTEGRATION ===
         self.regime_trading_adapter = None
@@ -260,6 +268,27 @@ class AppContext:
             symbol_manager=self.symbol_manager
         )
 
+        # ⚡ ARCHITECT REFINEMENT #3: Initialize UniverseRotationEngine for ranking cycle
+        try:
+            self.capital_symbol_governor = CapitalSymbolGovernor(
+                config=self.config,
+                shared_state=self.shared_state
+            )
+            logger.info("✅ CapitalSymbolGovernor initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ CapitalSymbolGovernor initialization failed: {e}. Ranking cycle may be limited.")
+        
+        try:
+            self.universe_rotation_engine = UniverseRotationEngine(
+                shared_state=self.shared_state,
+                capital_governor=self.capital_symbol_governor,
+                config=self.config
+            )
+            logger.info("✅ UniverseRotationEngine initialized for ranking cycle")
+        except Exception as e:
+            logger.error(f"❌ UniverseRotationEngine initialization failed: {e}", exc_info=True)
+            self.universe_rotation_engine = None
+
 
     async def start_all(self):
         """
@@ -344,6 +373,10 @@ class AppContext:
             'volatility_regime': asyncio.create_task(self.volatility_regime.run()),
             'symbol_screener': asyncio.create_task(self.symbol_screener.start_periodic_screening()),
             'execution_order_monitoring': asyncio.create_task(self.execution_manager.start_order_monitoring()),
+            # ⚡ ARCHITECT REFINEMENT #3: Add cycle separation
+            'discovery_cycle': asyncio.create_task(self._discovery_cycle()),
+            'ranking_cycle': asyncio.create_task(self._ranking_cycle()),
+            # Trading cycle already exists as meta_controller
             # 🔥 This is what starts the agents
             'agent_manager': asyncio.create_task(self.agent_manager.run_loop()),
             
@@ -358,6 +391,59 @@ class AppContext:
         if self.config.RETRAINING_ENABLED:
             self.active_tasks['retraining_engine'] = asyncio.create_task(self.retraining_engine.run())
 
+    # ⚡ ARCHITECT REFINEMENT #3: Separate discovery, ranking, and trading cycles
+    
+    async def _discovery_cycle(self):
+        """
+        Discovery cycle runs every 5 minutes.
+        Market research phase: Find new trading candidates.
+        Independent from ranking and trading to allow different frequencies.
+        """
+        logger.info("🔍 Discovery cycle initialized (runs every 5 minutes)")
+        while True:
+            try:
+                logger.info("🔍 Starting discovery cycle")
+                # Run all discovery agents
+                await self.agent_manager.run_loop()  # This runs IPO chaser, wallet scanner, screener
+                logger.info("✅ Discovery cycle complete - symbols fed to validation")
+            except Exception as e:
+                logger.error(f"❌ Discovery cycle failed: {e}", exc_info=True)
+            await asyncio.sleep(300)  # Every 5 minutes
+    
+    async def _ranking_cycle(self):
+        """
+        Ranking cycle runs every 5 minutes.
+        Portfolio management phase: Rank discovered symbols and update active universe.
+        Independent from discovery and trading to allow periodic portfolio rebalancing.
+        """
+        logger.info("📊 Ranking cycle initialized (runs every 5 minutes)")
+        while True:
+            try:
+                logger.info("📊 Starting UURE ranking cycle")
+                # Compute and apply universe with new 40/20/20/20 scoring
+                if hasattr(self, 'universe_rotation_engine') and self.universe_rotation_engine:
+                    await self.universe_rotation_engine.compute_and_apply_universe()
+                    logger.info("✅ Ranking cycle complete - active universe updated")
+                else:
+                    logger.warning("⚠️ UURE not available, skipping ranking cycle")
+            except Exception as e:
+                logger.error(f"❌ Ranking cycle failed: {e}", exc_info=True)
+            await asyncio.sleep(300)  # Every 5 minutes
+    
+    async def _trading_cycle(self):
+        """
+        Trading cycle runs every 10 seconds.
+        Execution phase: Evaluate current universe and execute trades.
+        Frequent independent cycle for responsive market opportunity capture.
+        """
+        logger.info("🏃 Trading cycle initialized (runs every 10 seconds)")
+        while True:
+            try:
+                # MetaController evaluates once per cycle
+                await self.meta_controller.evaluate_once()
+            except Exception as e:
+                logger.error(f"❌ Trading cycle failed: {e}", exc_info=True)
+            await asyncio.sleep(10)  # Every 10 seconds
 
     async def shutdown(self):
         logger.info("Shutting down application context.")

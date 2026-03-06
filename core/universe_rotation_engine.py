@@ -568,18 +568,45 @@ class UniverseRotationEngine:
         """Step 2: Unified score for all candidates."""
         try:
             scores = {}
-            for sym in candidates:
-                score = self.ss.get_unified_score(sym)
-                scores[sym] = score
+            for candidate in candidates:
+                # FIX #2: Safe handling of mixed candidate types
+                # Handle string candidates, dict candidates, and float/invalid candidates
+                if isinstance(candidate, str):
+                    symbol = candidate
+                elif isinstance(candidate, dict):
+                    # If candidate is a dict, extract symbol
+                    symbol = candidate.get("symbol")
+                    if not symbol:
+                        self.logger.debug(f"[UURE] Skipping candidate dict without symbol: {candidate}")
+                        continue
+                    symbol = str(symbol).upper()
+                else:
+                    # Skip invalid types (float, int, None, etc.)
+                    self.logger.debug(f"[UURE] Skipping non-string/non-dict candidate: {type(candidate).__name__} = {candidate}")
+                    continue
+                
+                # Ensure symbol is string and uppercase
+                symbol = str(symbol).upper()
+                
+                try:
+                    score = self.ss.get_unified_score(symbol)
+                    scores[symbol] = score
+                except Exception as score_err:
+                    self.logger.debug(f"[UURE] Failed to score {symbol}: {score_err}")
+                    # Continue with next candidate
+                    continue
 
-            self.logger.debug(
-                f"[UURE] Scored {len(scores)} candidates. "
-                f"Mean: {sum(scores.values())/len(scores):.3f}"
-            )
+            if scores:
+                self.logger.debug(
+                    f"[UURE] Scored {len(scores)} candidates. "
+                    f"Mean: {sum(scores.values())/len(scores):.3f}"
+                )
+            else:
+                self.logger.warning(f"[UURE] No candidates scored (processed {len(candidates)} inputs)")
             return scores
 
         except Exception as e:
-            self.logger.error(f"[UURE] Error scoring candidates: {e}")
+            self.logger.error(f"[UURE] Error scoring candidates: {e}", exc_info=True)
             return {}
 
     def _rank_by_score(

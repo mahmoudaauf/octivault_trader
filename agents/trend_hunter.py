@@ -42,6 +42,13 @@ from core.stubs import TradeIntent, ExecOrder
 from core.model_manager import load_model as _load_model, build_model_path, safe_load_model
 from core.component_status_logger import log_component_status
 from utils.indicators import compute_ema, compute_macd
+from core.volatility_adjusted_confidence import (
+    compute_heuristic_confidence,
+    categorize_signal,
+    get_signal_quality_metrics,
+)
+
+from agents.edge_calculator import compute_agent_edge, merge_signal_with_edge  # ALPHA AMPLIFIER
 import time
 
 
@@ -500,6 +507,129 @@ class TrendHunter:
             detail=f"Last signal: {action} ({confidence:.2f}), regime={regime or ''}",
         )
  
+    async def _get_regime_aware_confidence(self, symbol: str, timeframe: str = None) -> str:
+        """
+        Get volatility regime for signal confidence calculation.
+        
+        Preferentially uses high timeframe (1h) brain regime for entry decisions,
+        falls back to symbol/global regime on the current timeframe.
+        
+        Returns:
+            Regime string: "trend", "sideways", "high_vol", "bear", "normal", etc.
+        """
+        if timeframe is None:
+            timeframe = self.timeframe
+        
+        try:
+            sym_u = str(symbol).replace("/", "").upper()
+            
+            # Try 1h regime first (longer-term context)
+            try:
+                reginfo_1h = await self.shared_state.get_volatility_regime(sym_u, timeframe="1h")
+                if not reginfo_1h:
+                    reginfo_1h = await self.shared_state.get_volatility_regime("GLOBAL", timeframe="1h")
+                regime = (reginfo_1h or {}).get("regime", "").lower() if reginfo_1h else None
+                if regime:
+                    return regime
+            except Exception:
+                pass
+            
+            # Fallback to symbol regime on current timeframe
+            try:
+                reginfo = await self.shared_state.get_volatility_regime(sym_u, timeframe=timeframe)
+                if not reginfo:
+                    reginfo = await self.shared_state.get_volatility_regime("GLOBAL", timeframe=timeframe)
+                regime = (reginfo or {}).get("regime", "").lower() if reginfo else None
+                if regime:
+                    return regime
+            except Exception:
+                pass
+            
+            # Fallback to normal if no regime available
+            return "normal"
+            
+        except Exception as e:
+            logger.debug("[%s] Failed to get regime for %s: %s", self.name, symbol, e)
+            return "normal"
+
+    def _get_regime_scaling_factors(self, regime: str) -> Dict[str, float]:
+        """
+        Regime-based scaling factors instead of binary gating.
+        
+        Returns dict with:
+        - position_size_mult: scale position size
+        - tp_target_mult: scale TP distance
+        - excursion_requirement_mult: scale minimum price movement required
+        - trail_mult: scale trailing SL aggressiveness
+        - confidence_boost: confidence adjustment
+        
+        Architecture:
+        - trending (uptrend/downtrend): full size, full TP, aggressive trail
+        - normal/neutral: baseline (1.0x)
+        - sideways/chop: reduced size, reduced TP, increased excursion requirement
+        - bear: defensive posture (slightly reduced)
+        - high_vol: slightly reduced size, wider trails
+        """
+        regime_norm = str(regime or "normal").lower()
+        
+        # Default: no scaling
+        default_scaling = {
+            "position_size_mult": 1.0,
+            "tp_target_mult": 1.0,
+            "excursion_requirement_mult": 1.0,
+            "trail_mult": 1.0,
+            "confidence_boost": 0.0,
+            "regime": regime_norm,
+        }
+        
+        # Trending regimes: aggressive
+        if regime_norm in {"trend", "uptrend", "downtrend"}:
+            return {
+                "position_size_mult": 1.0,      # Full size
+                "tp_target_mult": 1.0,          # Full TP
+                "excursion_requirement_mult": 0.85,  # Easier to trigger
+                "trail_mult": 1.3,              # Aggressive trailing
+                "confidence_boost": 0.05,       # +5% confidence bonus
+                "regime": regime_norm,
+            }
+        
+        # High volatility: be cautious with position size but aggressive with trails
+        elif regime_norm in {"high_vol", "high"}:
+            return {
+                "position_size_mult": 0.80,     # 80% size
+                "tp_target_mult": 1.05,         # Slightly wider TP
+                "excursion_requirement_mult": 1.0,
+                "trail_mult": 1.2,              # Moderately aggressive trailing
+                "confidence_boost": 0.0,
+                "regime": regime_norm,
+            }
+        
+        # Sideways/Chop: significantly reduced
+        elif regime_norm in {"sideways", "chop", "range"}:
+            return {
+                "position_size_mult": 0.50,     # 50% size
+                "tp_target_mult": 0.60,         # 60% of normal TP
+                "excursion_requirement_mult": 1.4,  # Require more movement
+                "trail_mult": 0.9,              # Tighter trailing (less aggressive)
+                "confidence_boost": -0.05,      # -5% confidence penalty
+                "regime": regime_norm,
+            }
+        
+        # Bear market: defensive
+        elif regime_norm in {"bear", "bearish", "downtrend"}:
+            return {
+                "position_size_mult": 0.60,     # 60% size
+                "tp_target_mult": 0.80,         # 80% TP
+                "excursion_requirement_mult": 1.2,  # Harder to trigger
+                "trail_mult": 0.95,             # Very tight trailing
+                "confidence_boost": -0.08,      # -8% confidence penalty
+                "regime": regime_norm,
+            }
+        
+        # Default/Unknown: baseline
+        else:
+            return default_scaling
+
     async def _submit_signal(self, symbol: str, action: str, confidence: float, reason: str) -> None:
         action_upper = action.upper().strip()
         if action_upper == "HOLD":
@@ -512,41 +642,72 @@ class TrendHunter:
             logger.debug("[%s] Low-conf filtered for %s: %.2f < %.2f", self.name, symbol, confidence, min_conf)
             return
         
-        # Multi-timeframe gating for BUY signals
-        # 1h = brain (regime decision), 5m = hands (execution)
+        # Regime-aware scaling for BUY signals (no binary gating, scaling instead)
+        regime_1h = "normal"  # default
+        regime_scaling = {"position_size_mult": 1.0, "tp_target_mult": 1.0, "excursion_requirement_mult": 1.0, "trail_mult": 1.0, "confidence_boost": 0.0}
+        
         if action_upper == "BUY":
             try:
                 sym_u = str(symbol).replace("/", "").upper()
                 # Get 1h regime (brain)
-                regime_1h = None
                 try:
                     reginfo_1h = await self.shared_state.get_volatility_regime(sym_u, timeframe="1h")
                     if not reginfo_1h:
                         reginfo_1h = await self.shared_state.get_volatility_regime("GLOBAL", timeframe="1h")
-                    regime_1h = (reginfo_1h or {}).get("regime", "").lower() if reginfo_1h else None
+                    regime_1h = (reginfo_1h or {}).get("regime", "").lower() if reginfo_1h else "normal"
                 except Exception as e:
                     logger.debug("[%s] Failed to get 1h regime for %s: %s", self.name, symbol, e)
-                    regime_1h = None
+                    regime_1h = "normal"
                 
-                # Block BUY if 1h regime is bear
-                if regime_1h == "bear":
+                # Get regime scaling factors (no binary gate)
+                regime_scaling = self._get_regime_scaling_factors(regime_1h)
+                
+                # Apply confidence adjustment based on regime
+                adjusted_confidence = float(confidence) + regime_scaling["confidence_boost"]
+                
+                # Re-check confidence after regime adjustment
+                if adjusted_confidence < min_conf:
                     logger.info(
-                        "[%s] BUY filtered for %s — 1h regime is BEAR (hands blocked by brain)",
+                        "[%s] BUY filtered for %s — regime=%s reduces confidence from %.2f → %.2f (below min %.2f)",
+                        self.name,
+                        symbol,
+                        regime_1h,
+                        float(confidence),
+                        adjusted_confidence,
+                        min_conf,
+                    )
+                    return
+                
+                # Only block on bear regime if institutional filter is enabled
+                allow_bear_with_high_conf = bool(self._cfg("TREND_ALLOW_BEAR_IF_HIGH_CONF", False))
+                if (regime_1h == "bear" and 
+                    not (allow_bear_with_high_conf and adjusted_confidence >= 0.85)):
+                    logger.info(
+                        "[%s] BUY filtered for %s — 1h regime is BEAR (pos_size will be reduced 40% if proceeded)",
                         self.name,
                         symbol,
                     )
                     return
-                elif regime_1h == "bull":
-                    logger.debug("[%s] BUY allowed for %s — 1h regime is BULL", self.name, symbol)
-                else:
-                    logger.debug(
-                        "[%s] BUY allowed for %s — 1h regime is %s (neutral/unknown, proceeding)",
-                        self.name,
-                        symbol,
-                        regime_1h or "unknown",
-                    )
+                
+                # Log scaling factors being applied
+                logger.info(
+                    "[%s] BUY allowed for %s | regime=%s | "
+                    "pos_size_mult=%.2f tp_mult=%.2f excursion_mult=%.2f trail_mult=%.2f | "
+                    "conf_orig=%.2f → adjusted=%.2f",
+                    self.name,
+                    symbol,
+                    regime_1h,
+                    regime_scaling["position_size_mult"],
+                    regime_scaling["tp_target_mult"],
+                    regime_scaling["excursion_requirement_mult"],
+                    regime_scaling["trail_mult"],
+                    float(confidence),
+                    adjusted_confidence,
+                )
+                
             except Exception as e:
-                logger.debug("[%s] Multi-timeframe gating error for %s: %s (proceeding with caution)", self.name, symbol, e)
+                logger.debug("[%s] Regime scaling error for %s: %s (proceeding with baseline)", self.name, symbol, e)
+                regime_scaling = self._get_regime_scaling_factors("normal")
         
         if action_upper == "SELL":
             pos_qty = 0.0
@@ -581,6 +742,16 @@ class TrendHunter:
         # Compute expected move based on TP distance, ML forecast, ATR, and historical ROI
         expected_move_pct = await self._compute_expected_move_pct(symbol, action_upper)
         
+        # ALPHA AMPLIFIER: Compute edge score for composite aggregation
+        edge = compute_agent_edge(
+            agent_name=self.name,
+            action=action_upper,
+            confidence=float(confidence),
+            expected_move_pct=expected_move_pct,
+            symbol=symbol,
+            timeframe=self.timeframe,
+        )
+        
         # Single-path emission: buffer for AgentManager collection only.
         # Avoid dual bus+buffer publication because cache key collisions can clobber metadata.
         signal = {
@@ -594,9 +765,18 @@ class TrendHunter:
             "horizon_hours": 6.0,
             "agent": self.name,
             "expected_move_pct": float(expected_move_pct),  # Alpha signal for EV gate
+            "edge": float(edge),  # ALPHA AMPLIFIER: Composite edge for institutional selection
+            # NEW: Regime-based scaling factors for MetaController/ExecutionManager
+            "_regime_scaling": dict(regime_scaling) if regime_scaling else {},
+            "_regime": regime_1h if action_upper == "BUY" else "normal",
         }
         self._collected_signals.append(signal)
-        logger.info("[%s] Buffered %s for %s (conf=%.2f, exp_move=%.2f%%)", self.name, action_upper, symbol, confidence, expected_move_pct)
+        logger.info(
+            "[%s] Buffered %s for %s (conf=%.2f, exp_move=%.2f%%, edge=%.3f, regime=%s, pos_scale=%.2f)",
+            self.name, action_upper, symbol, confidence, expected_move_pct, edge,
+            regime_1h if action_upper == "BUY" else "N/A",
+            regime_scaling.get("position_size_mult", 1.0) if regime_scaling else 1.0
+        )
 
     async def _generate_signal(self, symbol: str, is_ml_capable: bool = False) -> Tuple[str, float, str]:
         """
@@ -672,22 +852,57 @@ class TrendHunter:
             logger.error("[%s] Indicator calc failed for %s: %s", self.name, symbol, e, exc_info=True)
             return "HOLD", 0.0, "Indicator error"
 
-        # 2) Fallback to MACD/EMA Heuristic
+        # 2) Fallback to MACD/EMA Heuristic with Volatility-Adjusted Confidence
         s_val = float(np.asarray(ema_short)[-1])
         l_val = float(np.asarray(ema_long)[-1])
         h_val = float(np.asarray(hist)[-1])
         
         logger.debug("[%s] Heuristic check for %s: EMA_S=%.2f EMA_L=%.2f HIST=%.6f", 
                      self.name, symbol, s_val, l_val, h_val)
-                     
+        
+        # Get regime for volatility-aware confidence (CRITICAL FIX)
+        regime = await self._get_regime_aware_confidence(symbol)
+        
+        # Compute volatility-adjusted confidence instead of hardcoded 0.70
+        h_conf = compute_heuristic_confidence(
+            hist_value=h_val,
+            hist_values=np.asarray(hist[-50:], dtype=float) if len(hist) >= 50 else np.asarray(hist, dtype=float),
+            regime=regime,
+            closes=closes[-50:] if len(closes) >= 50 else closes,
+        )
+        
+        # Get metrics for detailed logging
+        metrics = get_signal_quality_metrics(
+            hist_values=np.asarray(hist[-50:], dtype=float) if len(hist) >= 50 else np.asarray(hist, dtype=float),
+            regime=regime,
+            closes=closes[-50:] if len(closes) >= 50 else closes,
+        )
+        
+        # Determine action from histogram sign
         if h_val > 0:
-            # P9: Heuristic signals have lower confidence than ML but must pass floors
-            h_conf = float(self._cfg("HEURISTIC_CONFIDENCE", 0.70))
-            return "BUY", h_conf, f"Heuristic MACD Bullish (hist={h_val:.6f})"
-        if h_val < 0:
-            h_conf = float(self._cfg("HEURISTIC_CONFIDENCE", 0.70))
-            return "SELL", h_conf, f"Heuristic MACD Bearish (hist={h_val:.6f})"
-        return "HOLD", 0.0, "No clear heuristic signal"
+            action = "BUY"
+        elif h_val < 0:
+            action = "SELL"
+        else:
+            return "HOLD", 0.0, "No clear heuristic signal"
+        
+        # Log confidence breakdown for debugging
+        logger.info(
+            "[%s] %s heuristic for %s (regime=%s) | "
+            "mag=%.4f accel=%.4f raw=%.3f → adj=%.3f (floor=%.2f) → final=%.3f",
+            self.name,
+            action,
+            symbol,
+            regime,
+            metrics.get("histogram_magnitude", 0),
+            metrics.get("histogram_acceleration", 0),
+            metrics.get("raw_confidence", 0),
+            metrics.get("adjusted_confidence", 0),
+            metrics.get("regime_floor", 0),
+            h_conf,
+        )
+        
+        return action, h_conf, f"Heuristic MACD {action.title()} (hist={h_val:.6f}, conf={h_conf:.3f}, regime={regime})"
 
     async def _compute_expected_move_pct(self, symbol: str, action: str) -> float:
         """

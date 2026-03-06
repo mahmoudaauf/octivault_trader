@@ -15,7 +15,15 @@ import json
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, Optional, Tuple, Union, Literal
-from core.stubs import resilient_trade, maybe_call, BinanceAPIException, ExecutionError
+from core.stubs import resilient_trade, maybe_call, BinanceAPIException, ExecutionError, TradeIntent
+from core.maker_execution import MakerExecutor, MakerExecutionConfig
+
+# Optional: Import EventStore for Phase 5 event sourcing
+try:
+    from core.event_store import EventStore, EventType
+except Exception:
+    EventStore = None
+    EventType = None
 
 # =============================
 # Utility shims
@@ -142,6 +150,49 @@ class ExecutionManager:
             q = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
             return float(q * Decimal(str(step)))
         except Exception:
+            return float(0.0)
+
+    def _normalize_quantity(self, quantity: float, step_size: float) -> float:
+        """
+        ✅ BEST PRACTICE: Normalize quantity to exchange step_size precision.
+        
+        This ensures the order respects exchange precision requirements:
+        - Rounds DOWN to the nearest valid step
+        - Rounds to 8 decimal places (standard for crypto)
+        - Safe for all symbol types (spot, margin, futures)
+        
+        Example:
+          quantity=0.99000900, step_size=0.01 → 0.99
+          quantity=1.234567891, step_size=0.1 → 1.2
+        """
+        qty = float(quantity or 0.0)
+        if qty <= 0 or step_size <= 0:
+            return 0.0
+        
+        try:
+            # Use Decimal for precision
+            qty_dec = Decimal(str(qty))
+            step_dec = Decimal(str(step_size))
+            
+            # Round DOWN to nearest step
+            normalized = (qty_dec / step_dec).to_integral_value(rounding=ROUND_DOWN) * step_dec
+            
+            # Round to 8 decimal places (standard for crypto)
+            result = float(normalized)
+            result = round(result, 8)
+            
+            if result != qty:
+                self.logger.debug(
+                    "[EM:NormalizeQty] quantity=%.8f step_size=%.8f normalized=%.8f",
+                    qty, step_size, result
+                )
+            
+            return float(result)
+        except Exception as e:
+            self.logger.warning(
+                "[EM:NormalizeQty] Error normalizing qty=%.8f step=%.8f: %s",
+                qty, step_size, str(e)
+            )
             return float(0.0)
 
     def _resolve_post_fill_price(self, order: Dict[str, Any], exec_qty: float) -> float:
@@ -1810,7 +1861,7 @@ class ExecutionManager:
         # last resort: naive 3–4 letter quote split
         return s[:-4], s[-4:]
 
-    def __init__(self, config: Any, shared_state: Any, exchange_client: Any, alert_callback=None):
+    def __init__(self, config: Any, shared_state: Any, exchange_client: Any, alert_callback=None, event_store: Optional[Any] = None):
         # Heartbeat task (must be set before any other logic to avoid AttributeError)
         self._heartbeat_task = None
         self._decision_id_seq = 0
@@ -1818,6 +1869,7 @@ class ExecutionManager:
         self.shared_state = shared_state
         self.exchange_client = exchange_client
         self.alert_callback = alert_callback
+        self.event_store = event_store  # Phase 5: Event sourcing
         self.logger = logging.getLogger(self.__class__.__name__)
 
         # Execution-block cooldowns (finite no-trade states)
@@ -1892,6 +1944,24 @@ class ExecutionManager:
         self._bootstrap_first_fill_done = False
         self._bootstrap_phase_2_active = False
         
+        # ========== MAKER-BIASED EXECUTION CONFIGURATION ==========
+        # Initialize MakerExecutor for limit order placement inside spread
+        # Reduces execution cost from ~0.34% (market order) to ~0.03% (maker order + fee)
+        maker_config = MakerExecutionConfig(
+            enable_maker_orders=bool(self._cfg('maker_execution.enable', True)),
+            nav_threshold=float(self._cfg('maker_execution.nav_threshold', 500.0)),
+            spread_placement_ratio=float(self._cfg('maker_execution.spread_placement_ratio', 0.2)),
+            limit_order_timeout_sec=float(self._cfg('maker_execution.timeout_sec', 5.0)),
+            max_spread_pct=float(self._cfg('maker_execution.max_spread_pct', 0.002)),
+            aggressive_spread_ratio=float(self._cfg('maker_execution.aggressive_ratio', 0.5)),
+        )
+        self.maker_executor = MakerExecutor(config=maker_config)
+        self.logger.info(
+            f"[MakerExecution] Initialized: enable={maker_config.enable_maker_orders} "
+            f"nav_threshold={maker_config.nav_threshold} "
+            f"timeout={maker_config.limit_order_timeout_sec}s spread_placement={maker_config.spread_placement_ratio}"
+        )
+        
         # Liquidity healing
         self.max_liquidity_retries = int(getattr(config, "MAX_LIQUIDITY_RETRIES", 1))
         self.liquidity_retry_delay = float(getattr(config, "LIQUIDITY_RETRY_DELAY_SECONDS", 3.0))
@@ -1905,9 +1975,32 @@ class ExecutionManager:
         self._cancel_sem = None
         self._semaphores_initialized = False
 
-        # Idempotency + active order guards (symbol, side)
-        self._active_symbol_side_orders = set()
-        self._seen_client_order_ids: Dict[str, float] = {}
+        # ============================================================
+        # 🎯 BEST PRACTICE IDEMPOTENCY CONFIGURATION
+        # ============================================================
+        # Core principle: TRACK ACTIVE ORDERS, DON'T PENALIZE REJECTIONS
+        # 
+        # Recommended configuration for production stability:
+        # - idempotent_window: 8 seconds (short, prevents false duplicates)
+        # - rejection_threshold: 5 (only lock after 5+ genuine rejections)
+        # - rejection_reset: 60 seconds (auto-clear failed attempts)
+        # - duplicate_rejection_penalty: 0 (IDEMPOTENT doesn't count toward lock)
+        # - bootstrap_override: Always allowed (trades must bootstrap)
+        # ============================================================
+        
+        # Idempotency + active order guards (symbol, side) with time-scoped tracking
+        self._active_symbol_side_orders: Dict[tuple, float] = {}  # (symbol, side) -> timestamp
+        self._active_order_timeout_s = 8.0  # 🎯 SHORT WINDOW: 8 seconds for production stability
+        self._seen_client_order_ids: Dict[str, float] = {}  # client_id -> timestamp
+        self._client_order_id_timeout_s = 8.0  # 🎯 Matches symbol/side window for consistency
+        
+        # 🎯 Rejection counter handling: IDEMPOTENT rejections don't count toward lock
+        self._ignore_idempotent_in_rejection_count = True  # Never penalize IDEMPOTENT
+        self._rejection_exempt_reasons = {"IDEMPOTENT", "ACTIVE_ORDER"}  # Don't count these
+        
+        # 🎯 Auto-reset mechanism: Clear stale rejection counters
+        self._rejection_reset_window_s = 60.0  # Reset counters older than 60s
+        self._last_rejection_reset_check_ts: Dict[str, float] = {}  # sym -> last_check_ts
         # SELL close-finalization runtime invariant tracker.
         self._sell_finalize_state: Dict[str, Dict[str, Any]] = {}
         self._sell_finalize_stats: Dict[str, int] = {
@@ -2549,11 +2642,19 @@ class ExecutionManager:
             hb_ok = self._heartbeat_task is not None and not self._heartbeat_task.done()
         except Exception:
             hb_ok = False
+        
+        # Handle both old (set) and new (dict) formats for _active_symbol_side_orders
+        active_orders = getattr(self, "_active_symbol_side_orders", {})
+        if isinstance(active_orders, set):
+            active_orders_count = len(active_orders)
+        else:
+            active_orders_count = len(active_orders) if isinstance(active_orders, dict) else 0
+        
         return {
             "component": "ExecutionManager",
             "status": "Healthy",
             "heartbeat": "running" if hb_ok else "stopped",
-            "active_symbol_side_orders": len(getattr(self, "_active_symbol_side_orders", set()) or set()),
+            "active_symbol_side_orders": active_orders_count,
             "seen_client_order_ids": len(getattr(self, "_seen_client_order_ids", {}) or {}),
             "sell_finalize_fills_seen": int(getattr(self, "_sell_finalize_stats", {}).get("fills_seen", 0) or 0),
             "sell_finalize_finalized": int(getattr(self, "_sell_finalize_stats", {}).get("finalized", 0) or 0),
@@ -2577,11 +2678,20 @@ class ExecutionManager:
 
             active_sells = 0
             with contextlib.suppress(Exception):
-                active_sells = sum(
-                    1
-                    for item in (getattr(self, "_active_symbol_side_orders", set()) or set())
-                    if isinstance(item, tuple) and len(item) >= 2 and str(item[1]).upper() == "SELL"
-                )
+                active_orders = getattr(self, "_active_symbol_side_orders", {})
+                if isinstance(active_orders, dict):
+                    active_sells = sum(
+                        1
+                        for item, _ts in active_orders.items()
+                        if isinstance(item, tuple) and len(item) >= 2 and str(item[1]).upper() == "SELL"
+                    )
+                else:
+                    # Fallback for old set-based format
+                    active_sells = sum(
+                        1
+                        for item in (active_orders or set())
+                        if isinstance(item, tuple) and len(item) >= 2 and str(item[1]).upper() == "SELL"
+                    )
 
             recovery_pending = 0
             with contextlib.suppress(Exception):
@@ -3354,10 +3464,14 @@ class ExecutionManager:
         state["count"] = int(state.get("count", 0)) + 1
         state["last_available"] = float(available_quote or 0.0)
         if state["count"] >= self.exec_block_max_retries:
-            state["blocked_until"] = time.time() + float(self.exec_block_cooldown_sec)
+            # 🎯 BOOTSTRAP FIX: REDUCE cooldown from 600s to 30s for faster recovery
+            # During bootstrap, capital is dynamic and may be freed up quickly
+            # A 10-minute cooldown is too aggressive and prevents legitimate trading
+            effective_cooldown_sec = max(30, int(self.exec_block_cooldown_sec / 20))  # ~30s cooldown minimum
+            state["blocked_until"] = time.time() + float(effective_cooldown_sec)
             self.logger.warning(
-                "[ExecutionManager] BUY cooldown engaged: symbol=%s attempts=%d cooldown=%ds",
-                symbol, state["count"], self.exec_block_cooldown_sec
+                "[ExecutionManager] BUY cooldown engaged: symbol=%s attempts=%d cooldown=%ds (reduced from %ds for bootstrap tolerance)",
+                symbol, state["count"], effective_cooldown_sec, self.exec_block_cooldown_sec
             )
 
     async def _log_execution_event(self, event_type: str, symbol: str, details: Dict[str, Any]):
@@ -4273,17 +4387,68 @@ class ExecutionManager:
         except Exception:
             self.logger.debug("end_execution_order_scope failed", exc_info=True)
 
+    async def _maybe_auto_reset_rejections(self, symbol: str, side: str) -> None:
+        """
+        🎯 BEST PRACTICE #4: Auto-reset rejection counters after 60 seconds of inactivity.
+        
+        This prevents stale rejection counts from permanently blocking a symbol/side pair.
+        Once the 60-second window passes without new rejections, the counter automatically
+        resets, allowing the bot to make fresh trading attempts.
+        
+        Called opportunistically during order placement to maintain freshness.
+        """
+        if not self.shared_state:
+            return
+        
+        sym = symbol.upper()
+        side_upper = side.upper()
+        key = f"{sym}:{side_upper}"
+        now = time.time()
+        
+        # Check if we've already checked this symbol/side recently
+        last_check = self._last_rejection_reset_check_ts.get(key, 0.0)
+        if now - last_check < 10.0:  # Only check every 10 seconds max
+            return
+        
+        self._last_rejection_reset_check_ts[key] = now
+        
+        # Get the rejection tracker timestamp if available
+        if hasattr(self.shared_state, "get_rejection_timestamp"):
+            try:
+                last_rejection_ts = self.shared_state.get_rejection_timestamp(sym, side_upper)
+                if last_rejection_ts and (now - last_rejection_ts) > self._rejection_reset_window_s:
+                    # No rejections in the last 60 seconds — clear the counter
+                    if hasattr(self.shared_state, "clear_rejections"):
+                        await maybe_call(self.shared_state, "clear_rejections", sym, side_upper)
+                        self.logger.info(
+                            "[EM:REJECTION_RESET] Auto-reset rejection counter for %s %s "
+                            "(no rejections for %.0fs)",
+                            sym, side_upper, self._rejection_reset_window_s
+                        )
+            except Exception as e:
+                self.logger.debug(f"[EM:REJECTION_RESET] Failed to check timestamp: {e}")
+
     def _build_client_order_id(self, symbol: str, side: str, decision_id: str) -> str:
         return f"{symbol}:{side}:{decision_id}"
 
     def _is_duplicate_client_order_id(self, client_id: str) -> bool:
+        """
+        Check if client_order_id is a duplicate within the SHORT idempotency window.
+        
+        🎯 BEST PRACTICE #1: Short idempotency window (8 seconds)
+        - Prevents false positive duplicates from stale retries
+        - Allows rapid recovery from network glitches
+        - Aligns with symbol/side active order tracking
+        
+        🧹 HARDENING: Garbage collect old entries to prevent memory leaks.
+        """
         now = time.time()
         seen = self._seen_client_order_ids
-        if client_id in seen:
-            return True
-        # Evict stale entries before adding so the new key is eligible for future pruning
-        if len(seen) > 500:
-            cutoff = now - 3600  # Keep only 1 hour of history
+        
+        # 🧹 HARDENING: Garbage collect if cache grows too large
+        # Prevent memory leak after millions of orders
+        if len(seen) > 5000:
+            cutoff = now - 30.0  # Keep only 30s of history (4x the window)
             removed = 0
             for key, ts in list(seen.items()):
                 if ts < cutoff:
@@ -4291,11 +4456,35 @@ class ExecutionManager:
                     removed += 1
             if removed > 0:
                 self.logger.debug(
-                    "[EM:DupIdCleanup] Cleaned %d stale client_order_ids, dict_size=%d",
+                    "[EM:DupIdGC] Garbage collected %d stale client_order_ids, dict_size=%d",
                     removed, len(seen)
                 )
+        
+        # 🎯 BEST PRACTICE #1: Check if this ID was seen RECENTLY (< 8s window)
+        is_duplicate = False
+        if client_id in seen:
+            last_seen = seen[client_id]
+            elapsed = now - last_seen
+            
+            # If < 8s ago, it's a genuine duplicate within the idempotency window
+            if elapsed < self._client_order_id_timeout_s:
+                self.logger.debug(
+                    "[EM:DupClientId] Duplicate client_order_id %s (%.1fs ago); blocking.",
+                    client_id, elapsed
+                )
+                is_duplicate = True
+            else:
+                # Outside window (>8s) — allow retry, it's a fresh attempt
+                self.logger.debug(
+                    "[EM:DupClientIdFresh] Client order ID seen %.1fs ago; allowing fresh attempt.",
+                    elapsed
+                )
+                is_duplicate = False
+        
+        # ✅ HARDENING: Always update timestamp, every code path
+        # This ensures retries are properly tracked
         seen[client_id] = now
-        return False
+        return is_duplicate
 
     async def _validate_order_request_contract(self, **kwargs) -> Tuple[bool, float, float, str]:
         """
@@ -4427,10 +4616,25 @@ class ExecutionManager:
             # For dust healing/recovery, only validate step_size, min_notional, available balance
             # Skip all other guards: min_econ_trade, profitability, micro_trade_kill_switch, fee_floor
             skip_micro_trade_kill_switch = True
+        
+        # --- CRITICAL: MetaController Decision Override ---
+        # If MetaController has made an explicit planning decision with planned_quote,
+        # bypass micro gates (sideways, EV, etc) that would reject valid decisions
+        has_meta_planned_quote = qa is not None and float(qa) > 0
+        if has_meta_planned_quote and policy_ctx.get("decision_id"):
+            # MetaController has validated this trade through its own gates
+            # Trust the decision and skip redundant micro-level gates
+            skip_micro_trade_kill_switch = True
+            self.logger.info(
+                "[EM:MetaOverride] Bypassing micro gates for %s (MetaController planned_quote=%.2f decision_id=%s)",
+                symbol, float(qa), policy_ctx.get("decision_id")
+            )
+        
         self.logger.warning(
             f"[EXEC_TRACE] received bootstrap_bypass={policy_ctx.get('bootstrap_bypass', False)} "
             f"bootstrap_mode={policy_ctx.get('bootstrap_mode', False)} "
-            f"skip_micro_gate={skip_micro_trade_kill_switch}"
+            f"skip_micro_gate={skip_micro_trade_kill_switch} "
+            f"has_meta_planned_quote={has_meta_planned_quote}"
         )
         try:
             if qa is None or float(qa) <= 0:
@@ -4537,8 +4741,10 @@ class ExecutionManager:
                     vol_regime = ""
 
             # Sideways (low-vol) regime trading is disabled by default (noise protection).
+            # CRITICAL: If MetaController has sent an explicit override, bypass this gate
+            bootstrap_override = bool(policy_ctx.get("_bootstrap_override", False))
             if not skip_micro_trade_kill_switch and bool(self._cfg("DISABLE_SIDEWAYS_REGIME_TRADING", True)):
-                if trade_regime == "sideways" or vol_regime == "low":
+                if (trade_regime == "sideways" or vol_regime == "low") and not bootstrap_override:
                     self.logger.info(
                         "[EM:SidewaysDisabled] Blocked BUY %s (trade_regime=%s vol_regime=%s)",
                         sym,
@@ -4620,7 +4826,8 @@ class ExecutionManager:
 
                 atr_ref_pct = float(expected_move_floor_pct or 0.0)
                 required_move_pct = round_trip_cost_pct * float(mult)
-                if float(expected_move_used_pct) <= float(required_move_pct):
+                # CRITICAL: If MetaController has sent an explicit override, bypass this gate
+                if float(expected_move_used_pct) <= float(required_move_pct) and not bootstrap_override:
                     self.logger.warning(
                         "[EM:EV_HARD_GATE] Blocked BUY %s: expected_move=%.4f%% (raw=%.4f%% key=%s floor=%.4f%%) <= required=%.4f%% "
                         "(round_trip=%.4f%% mult=%.2f vol_regime=%s trade_regime=%s atr_ref=%.4f%%)",
@@ -4661,7 +4868,8 @@ class ExecutionManager:
                     return (False, Decimal("0"), "EXPECTED_MOVE_LT_ROUND_TRIP_COST")
 
             feasible, feas_detail = self._entry_profitability_feasible(sym, price=price, atr_pct=atr_pct)
-            if not feasible and not is_dust_operation:
+            # CRITICAL: If MetaController has sent an explicit override, bypass this gate
+            if not feasible and not is_dust_operation and not bootstrap_override:
                 payload = {
                     "reason": "INFEASIBLE_PROFITABILITY",
                     "symbol": sym,
@@ -5038,15 +5246,18 @@ class ExecutionManager:
             "reason": reason_text,
             "liquidation_reason": reason_text,
         }
-        res = await self.execute_trade(
+        # Create a TradeIntent for the canonical execute_trade API
+        from core.stubs import TradeIntent
+        trade_intent = TradeIntent(
             symbol=symbol,
-            side="sell",
+            side="SELL",
             quantity=None,
             planned_quote=None,
             tag=tag,
             is_liquidation=True,
             policy_context=policy_context,
         )
+        res = await self.execute_trade(trade_intent)
         try:
             if isinstance(res, dict):
                 self.logger.info(
@@ -5103,6 +5314,23 @@ class ExecutionManager:
                     if force_finalize:
                         await self._force_finalize_position(sym, reason_text)
                         self.logger.info("[EM:CLOSE_FINALIZE] symbol=%s applied=True reason=%s", sym, reason_text)
+                    
+                    # ✅ HYDRATION FIX: Refresh wallet state after successful trade
+                    # This keeps SharedState synchronized with Binance and allows
+                    # the system to recalculate NAV and execute new trades
+                    try:
+                        if self.shared_state:
+                            await self.shared_state.hydrate_balances_from_exchange()
+                            await self.shared_state.hydrate_positions_from_balances()
+                            self.logger.info(
+                                "[EM:HYDRATE] symbol=%s post-fill balance refresh completed",
+                                sym
+                            )
+                    except Exception as e:
+                        self.logger.warning(
+                            "[EM:HYDRATE] symbol=%s post-fill balance refresh failed: %s",
+                            sym, str(e)
+                        )
                 else:
                     self.logger.warning(
                         "[EM:CLOSE_FINALIZE] symbol=%s applied=False status=%s exec_qty=%.8f reason=%s",
@@ -5139,20 +5367,74 @@ class ExecutionManager:
         except Exception:
             pass
 
-    async def execute_trade(
-        self,
-        symbol: str,
-        side: str,
-        quantity: Optional[float] = None,
-        planned_quote: Optional[float] = None,
-        tag: str = "meta/Agent",
-        trace_id: Optional[str] = None,
-        tier: Optional[str] = None,
-        is_liquidation: bool = False,
-        policy_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    async def _persist_trade_intent(self, intent: TradeIntent) -> Optional[int]:
+        """
+        PHASE 5: Persist TradeIntent to EventStore before execution.
+        
+        Event sourcing ensures complete audit trail:
+        - Every trading decision is immutable
+        - Complete history for compliance
+        - Recovery point for replays
+        
+        Returns: event sequence number if persisted, None if EventStore unavailable
+        """
+        if not self.event_store or not EventStore or not EventType:
+            return None
+        
+        try:
+            from core.event_store import Event
+            
+            # Create event from TradeIntent
+            event = Event(
+                event_type=EventType.TRADE_EXECUTED,  # Persisted before actual execution
+                component="execution_manager",
+                symbol=intent.symbol,
+                timestamp=intent.timestamp or time.time(),
+                data={
+                    "side": intent.side.upper(),
+                    "quantity": intent.quantity,
+                    "planned_quote": intent.planned_quote,
+                    "confidence": intent.confidence,
+                    "trace_id": intent.trace_id,
+                    "tier": intent.tier,
+                    "is_liquidation": intent.is_liquidation,
+                    "tag": intent.tag,
+                    "agent": intent.agent,
+                    "execution_mode": intent.execution_mode,
+                    "policy_context": intent.policy_context or {},
+                },
+                tags=["canonical_intent", intent.execution_mode],
+            )
+            
+            # Persist atomically
+            sequence = await self.event_store.append(event)
+            self.logger.debug(
+                "[EM:EventSource] Persisted TradeIntent: symbol=%s side=%s "
+                "confidence=%.2f trace_id=%s (seq=%d)",
+                intent.symbol, intent.side, intent.confidence, intent.trace_id, sequence
+            )
+            return sequence
+        
+        except Exception as e:
+            self.logger.warning(
+                "[EM:EventSource] Failed to persist TradeIntent: %s (non-blocking)", str(e)
+            )
+            return None
+
+    async def execute_trade(self, intent: TradeIntent) -> Dict[str, Any]:
         """
         Tier-aware execution (Phase A Frequency Engineering).
+
+        CANONICAL INTERFACE (Phase 4):
+        All trade execution flows through TradeIntent objects.
+        No loose parameters. Single source of truth.
+
+           await executor.execute_trade(intent=trade_intent)
+
+        PHASE 5: EVENT SOURCING
+        - TradeIntent persisted to EventStore before execution
+        - Complete audit trail for compliance
+        - Immutable history for recovery and replays
 
         ExecutionManager answers: "Given this allowed intent, what is the maximum safe executable order?"
 
@@ -5177,6 +5459,59 @@ class ExecutionManager:
 
         Returns normalized contract:
         { ok, status, executedQty, avgPrice, cummulativeQuoteQty, orderId, reason, error_code?, tier? }
+        """
+        # ✅ GLOBAL EXECUTION LOCK: Only allow trading in live mode
+        # This is a critical safety mechanism to prevent accidental executions
+        # in test/paper/simulation environments
+        import os
+        mode = os.getenv("TRADING_MODE", "live").lower()
+        if mode != "live":
+            self.logger.warning(
+                "[EXECUTION BLOCKED] mode=%s symbol=%s side=%s",
+                mode,
+                intent.symbol,
+                intent.side
+            )
+            return {
+                "status": "shadow_blocked",
+                "symbol": intent.symbol,
+                "side": intent.side,
+                "reason": f"Execution blocked in {mode} mode"
+            }
+        
+        # PHASE 5: Persist intent before execution (event sourcing)
+        await self._persist_trade_intent(intent)
+        
+        # Delegate to implementation
+        return await self._execute_trade_impl(
+            symbol=intent.symbol,
+            side=intent.side,
+            quantity=intent.quantity,
+            planned_quote=intent.planned_quote,
+            tag=intent.tag,
+            trace_id=intent.trace_id,
+            tier=intent.tier,
+            is_liquidation=intent.is_liquidation,
+            policy_context=intent.policy_context,
+            confidence=intent.confidence,
+        )
+    
+    async def _execute_trade_impl(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Optional[float] = None,
+        planned_quote: Optional[float] = None,
+        tag: str = "meta/Agent",
+        trace_id: Optional[str] = None,
+        tier: Optional[str] = None,
+        is_liquidation: bool = False,
+        policy_context: Optional[Dict[str, Any]] = None,
+        confidence: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Internal implementation of trade execution.
+        Use execute_trade() public API instead.
         """
         self._ensure_heartbeat()
         side = (side or "").lower()
@@ -5240,12 +5575,46 @@ class ExecutionManager:
 
         # 🛡️ P9 SOP GOVERNANCE: Last line of defense (unless full liquidation bypass)
         # Exits/Liquidation are usually allowed even in safety modes to protect capital.
-        is_liq_full = is_liquidation or any(x in tag_lower for x in ("tp_sl", "balancer", "meta_exit"))
+        #
+        # EXIT PRIORITY HIERARCHY (best practice):
+        # Risk exits MUST bypass all strategy/entry guards.
+        # _forced_exit=True signals (concentration, starvation, rotation, rebalance exits)
+        # are risk-management decisions — they must never be blocked by profit gates,
+        # scaling rules, or capital allocation checks that apply only to entries.
+        is_liq_full = (
+            is_liquidation
+            or any(x in tag_lower for x in ("tp_sl", "balancer", "meta_exit"))
+            or (side == "sell" and bool(policy_ctx.get("_forced_exit")))
+        )
+
+        # ===== CAPITAL ESCAPE HATCH =====
+        # When portfolio concentration exceeds 85% NAV AND a forced exit is attempted,
+        # bypass all execution checks to ensure the system can always escape deadlock.
+        # This is the final backstop against execution paralysis under concentration stress.
+        bypass_checks = False
+        if side == "sell" and bool(policy_ctx.get("_forced_exit")):
+            try:
+                nav = float(await self._get_total_equity() or 0.0)
+                position_value = float(policy_ctx.get("position_value", 0.0))
+                
+                if nav > 0 and position_value > 0:
+                    concentration = position_value / nav
+                    
+                    if concentration >= 0.85:
+                        self.logger.warning(
+                            "[EscapeHatch] CAPITAL_ESCAPE_HATCH activated for %s (%.1f%% NAV concentration) - bypassing all execution checks",
+                            sym,
+                            concentration * 100
+                        )
+                        bypass_checks = True
+                        is_liq_full = True  # Force liquidation priority for high concentration exits
+            except Exception as e:
+                self.logger.debug(f"[EscapeHatch] Error checking concentration: {e}")
 
         # Global SELL guard (real capital only): allow only TP/SL (liquidation) or explicit EMERGENCY exits.
         # This prevents state/rotation/recovery SELLs from fragmenting compounding on live capital.
         is_real_mode = bool(self._cfg("LIVE_MODE", False)) and not bool(self._cfg("SIMULATION_MODE", False)) and not bool(self._cfg("PAPER_MODE", False)) and not bool(self._cfg("TESTNET_MODE", False))
-        if side == "sell" and is_real_mode and not is_liq_full:
+        if side == "sell" and is_real_mode and not is_liq_full and not bypass_checks:
             reason_text = " ".join([
                 str(policy_ctx.get("reason") or ""),
                 str(policy_ctx.get("exit_reason") or ""),
@@ -5267,7 +5636,7 @@ class ExecutionManager:
                     "error_code": "SELL_GUARD",
                 }
         
-        if not is_liq_full:
+        if not is_liq_full and not bypass_checks:
             mode = str((getattr(self.shared_state, "metrics", None) or {}).get("current_mode", "NORMAL")).upper()
             if mode == "PAUSED":
                 self.logger.warning(f"[EM:GovBlock] Blocked {side.upper()} {sym}: System is PAUSED.")
@@ -5693,8 +6062,11 @@ class ExecutionManager:
         raw: Dict[str, Any] = {}
         try:
             # ---- Safety Check: Circuit Breaker & Health (Invariant 2) ----
-            if hasattr(self.shared_state, "is_circuit_breaker_open") and await self.shared_state.is_circuit_breaker_open():
-                self.logger.warning(f"[EXEC] 🛑 Circuit Breaker OPEN. Blocking trade for {sym}.")
+            # EXIT PRIORITY: Circuit breaker is an entry guard only.
+            # SELL exits must never be blocked — an open CB means we stop buying,
+            # not that we trap capital in existing positions.
+            if side != "sell" and hasattr(self.shared_state, "is_circuit_breaker_open") and await self.shared_state.is_circuit_breaker_open():
+                self.logger.warning(f"[EXEC] 🛑 Circuit Breaker OPEN. Blocking BUY for {sym} (SELL exits always pass).")
                 return {"ok": False, "status": "blocked", "reason": "CB_OPEN", "error_code": "CB_OPEN"}
 
             # Health: we’re about to execute
@@ -5703,8 +6075,12 @@ class ExecutionManager:
             async with self._small_nav_guard():
                 if side == "buy":
                     if planned_quote and planned_quote > 0:
-                        # Cooldown: suppress repeated execution-blocked BUYs
-                        if policy_ctx.get("_no_downscale_planned_quote"):
+                        # 🎯 BOOTSTRAP FIX: SKIP cooldown check during bootstrap mode
+                        # Cooldown is too aggressive when capital is dynamic and prices are volatile
+                        is_bootstrap_now = bool(policy_ctx.get("bootstrap_mode", False)) if policy_ctx else False
+                        
+                        # Cooldown: suppress repeated execution-blocked BUYs (SKIP during bootstrap)
+                        if not is_bootstrap_now and policy_ctx.get("_no_downscale_planned_quote"):
                             blocked, remaining = await self._is_buy_blocked(sym)
                             if blocked:
                                 self.logger.warning(
@@ -5774,7 +6150,9 @@ class ExecutionManager:
                             # Mandatory explicit failure for authoritative planned quotes
                             # BOOTSTRAP FIX: Skip this block during bootstrap as we've already verified spendable balance
                             min_required_quote = await self._get_min_entry_quote(sym, policy_context=policy_context)
-                            if policy_ctx.get("_no_downscale_planned_quote") and planned_quote >= min_required_quote and not bootstrap_bypass:
+                            # CRITICAL FIX: Only raise INSUFFICIENT_QUOTE if we're below the minimum requirement
+                            # AND the reason is actually about insufficient capital (not other reasons like downscaling)
+                            if policy_ctx.get("_no_downscale_planned_quote") and not bootstrap_bypass and reason == "INSUFFICIENT_QUOTE":
                                 available = await self._get_available_quote(sym)
                                 self.logger.error(
                                     "[ExecutionManager] BLOCKED: INSUFFICIENT_QUOTE\nplanned=%.2f available=%.2f",
@@ -6022,6 +6400,15 @@ class ExecutionManager:
                                 self.logger.info(f"[EXEC_REJECT] symbol={sym} side=SELL reason=NO_POSITION_QUANTITY count={rej_count} action=SKIP")
                                 await self._log_execution_event("sell_block_no_qty", sym, {"reason": "no_position_quantity"})
                                 return {"ok": False, "status": "skipped", "reason": "no_position_quantity", "error_code": "NoPosition"}
+                            
+                            # ✅ TARGET_FRACTION: Compute partial quantity if target_fraction is present
+                            target_fraction = float(policy_ctx.get("target_fraction", 1.0) or 1.0)
+                            if target_fraction > 0 and target_fraction < 1.0:
+                                qty = qty * target_fraction
+                                self.logger.info(
+                                    "[EM:TargetFraction] SELL %s: full_qty=%.6f, target_fraction=%.2f, computed_qty=%.6f",
+                                    sym, float(qty / target_fraction), target_fraction, qty
+                                )
                         quantity = qty
                         raw = await self._place_market_order_qty(
                             sym,
@@ -6205,6 +6592,23 @@ class ExecutionManager:
                 except Exception:
                     self.logger.error("[ACCOUNTING_AUDIT_CRASH] %s %s audit failed", sym, side, exc_info=True)
                     raise
+
+                # ✅ HYDRATION FIX: Refresh wallet state after successful trade
+                # This keeps SharedState synchronized with Binance and allows
+                # the system to recalculate NAV and execute new trades
+                try:
+                    if self.shared_state and exec_qty > 0:
+                        await self.shared_state.hydrate_balances_from_exchange()
+                        await self.shared_state.hydrate_positions_from_balances()
+                        self.logger.info(
+                            "[EM:HYDRATE] symbol=%s side=%s post-fill balance refresh completed",
+                            sym, side.upper()
+                        )
+                except Exception as e:
+                    self.logger.warning(
+                        "[EM:HYDRATE] symbol=%s side=%s post-fill balance refresh failed: %s",
+                        sym, side.upper(), str(e)
+                    )
 
                 result = {
                     "ok": True,
@@ -7011,6 +7415,50 @@ class ExecutionManager:
             decision_id,
         )
 
+    async def _decide_execution_method(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        current_price: float,
+        planned_quote: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Decide whether to use maker-biased execution (limit order) vs market order.
+        
+        Returns: (use_maker, reason)
+        - use_maker: True if should try maker limit order first
+        - reason: Description of why this decision was made
+        """
+        # Get current NAV for micro-account detection
+        try:
+            nav_quote = self.shared_state.get_nav_quote()
+        except Exception:
+            nav_quote = None
+        
+        # Check if maker orders are enabled and NAV is below threshold
+        if not self.maker_executor.should_use_maker_orders(nav_quote):
+            return False, f"nav_above_threshold(nav={nav_quote})"
+        
+        # Check if spread quality is acceptable (evaluate_spread_quality checks spread_pct)
+        try:
+            acceptable, spread_pct, quality_reason = await self.maker_executor.evaluate_spread_quality(
+                symbol=symbol,
+                side=side,
+                current_price=current_price,
+            )
+            if not acceptable:
+                return False, f"spread_too_wide({quality_reason}, spread={spread_pct*100:.3f}%)"
+        except Exception as e:
+            self.logger.debug(f"[MakerExec] evaluate_spread_quality failed: {e}; falling back to market")
+            return False, f"spread_eval_error({str(e)})"
+        
+        # Only use maker for BUY orders (more likely to fill, easier to handle)
+        if side.upper() != "BUY":
+            return False, "sell_orders_use_market_only"
+        
+        return True, "maker_conditions_met"
+
     async def _place_market_order_core(
         self,
         symbol: str,
@@ -7046,6 +7494,25 @@ class ExecutionManager:
         if step_size <= 0 or min_notional <= 0:
             return None
 
+        # ✅ BEST PRACTICE: Normalize quantity to step_size before submission
+        # This ensures the order respects exchange precision requirements.
+        # For SELL orders, preserve the raw quantity so the dust-prevention round-up
+        # logic later can see the true remainder before deciding to round down or up.
+        _raw_quantity = float(quantity or 0.0)
+        quantity = self._normalize_quantity(quantity, step_size)
+        if quantity <= 0:
+            self.logger.warning(
+                "[EM:NormalizeQty] %s %s quantity=%.8f normalized to 0 (step_size=%.8f); rejecting order",
+                symbol, side.upper(), float(quantity or 0.0), step_size
+            )
+            return self._canonical_exec_result(
+                symbol=symbol,
+                side=side,
+                raw_order=None,
+                default_status="REJECTED",
+                default_reason="qty_invalid_after_normalization",
+            )
+
         safe_tag = self._sanitize_tag(comment)
         decision_id = decision_id or self._resolve_decision_id(getattr(self, "_current_policy_context", None))
         client_id = self._build_client_order_id(symbol, side.upper(), decision_id)
@@ -7068,11 +7535,45 @@ class ExecutionManager:
                 self.logger.debug("[EM] Duplicate client_order_id for %s %s; skipping.", symbol, side.upper())
                 return {"status": "SKIPPED", "reason": "IDEMPOTENT"}
 
+        # 🎯 BEST PRACTICE #4: Opportunistically auto-reset stale rejection counters
+        # This runs in the background and clears counters older than 60 seconds
+        try:
+            await self._maybe_auto_reset_rejections(symbol, side)
+        except Exception as e:
+            self.logger.debug(f"[EM:REJECTION_RESET] Auto-reset failed: {e}")
+
         order_key = (symbol, side.upper())
+        now = time.time()
+        
+        # 🎯 BOOTSTRAP FIX: SMART IDEMPOTENT WINDOW
+        # During bootstrap, use SHORTER windows (2s instead of 8s) to allow faster retries
+        # This is safe because bootstrap phase is inherently high-retry due to capital constraints
+        is_bootstrap_mode = bool(getattr(self, "_current_policy_context", {}).get("bootstrap_mode", False))
+        active_order_timeout = 2.0 if is_bootstrap_mode else self._active_order_timeout_s
+        
+        # 🎯 BEST PRACTICE #2: Track active orders with SHORT 8-second window
+        # This prevents duplicates while allowing rapid recovery from network issues
         if order_key in self._active_symbol_side_orders:
-            self.logger.debug("[EM] Active order exists for %s %s; skipping.", symbol, side.upper())
-            return {"status": "SKIPPED", "reason": "ACTIVE_ORDER"}
-        self._active_symbol_side_orders.add(order_key)
+            last_attempt = self._active_symbol_side_orders[order_key]
+            time_since_last = now - last_attempt
+            
+            if time_since_last < active_order_timeout:
+                # Still within the window — genuine duplicate in flight
+                self.logger.debug(
+                    "[EM:ACTIVE_ORDER] Order in flight for %s %s (%.1fs ago); skipping. (timeout=%.1fs, bootstrap=%s)",
+                    symbol, side.upper(), time_since_last, active_order_timeout, is_bootstrap_mode
+                )
+                return {"status": "SKIPPED", "reason": "ACTIVE_ORDER"}
+            else:
+                # Outside window — forcibly clear and allow fresh attempt
+                self.logger.info(
+                    "[EM:RETRY_ALLOWED] Previous attempt for %s %s timed out (%.1fs); allowing fresh retry. (timeout=%.1fs, bootstrap=%s)",
+                    symbol, side.upper(), time_since_last, active_order_timeout, is_bootstrap_mode
+                )
+                del self._active_symbol_side_orders[order_key]
+        
+        # Record this attempt with current timestamp
+        self._active_symbol_side_orders[order_key] = now
 
         sem_acquired = False
         try:
@@ -7104,6 +7605,9 @@ class ExecutionManager:
             # Use quote-amount path whenever BUY + planned_quote is given
 
             if side.upper() == "BUY" and planned_quote and planned_quote > 0:
+                    # Initialize spend from the planned quote
+                    spend = float(planned_quote)
+                    
                     # Bootstrap/dust bypass modes intentionally skip this internal floor and rely on
                     # executable-qty + exchange min_notional checks downstream.
                     min_entry = await self._get_min_entry_quote(symbol, price=current_price, min_notional=min_notional)
@@ -7280,78 +7784,38 @@ class ExecutionManager:
                         except Exception as e:
                             self.logger.warning(f"[EM:BOOTSTRAP] Quote-based order failed: {e}, falling back to quantity-based")
                     
-                    # Standard quantity-based execution path
-                    ok, qty, adjusted_quote, _ = await self._validate_order_request_contract(
-                        side="BUY", qty=0, price=current_price, filters=filters_obj,
-                        taker_fee_bps=self._cfg("TAKER_FEE_BPS", 10), use_quote_amount=spend
+                    # CRITICAL FIX: When planned_quote is provided, use quoteOrderQty instead of quantity
+                    # This ensures execution respects the decision quote, not the wallet balance
+                    # Use quoteOrderQty parameter (Binance native) instead of converting to quantity
+                    self.logger.critical(
+                        "[EM:QUOTE_PATH] Using quoteOrderQty=%.2f for %s BUY (planned_quote path, not quantity-based)",
+                        float(spend), symbol
                     )
-                    if not ok:
-                        return None
-                    
-                    # Use the quantity calculated by validate_order_request to ensure 
-                    # quantity-based execution (avoiding Binance quoteOrderQty rejections).
-                    final_qty = float(qty)
-
-                    if self.max_spend_per_trade > 0:
-                        est_spend = final_qty * current_price
-                        if est_spend > self.max_spend_per_trade:
-                            final_qty = round_step(self.max_spend_per_trade / current_price, step_size)
-
-                    # --- Maker-first path (if supported and configured) ---
-                    if self.maker_grace_s > 0 and hasattr(self.exchange_client, 'place_limit_post_only'):
-                        try:
-                            px = float(current_price) * (1.0 - 0.0001)  # ~1bp better for BUY
-                            lim = await self.exchange_client.place_limit_post_only(
-                                symbol=symbol, side='BUY', quantity=final_qty, price=px, tag=safe_tag, clientOrderId=client_id
-                            )
-                            await self._log_execution_event('maker_order_placed', symbol, {
-                                'side': 'BUY', 'price': px, 'client_id': client_id, 'grace_s': self.maker_grace_s
-                            })
-                            await asyncio.sleep(self.maker_grace_s)
-                            status = None
-                            if hasattr(self.exchange_client, 'get_order_status'):
-                                with contextlib.suppress(Exception):
-                                    status = await self.exchange_client.get_order_status(symbol=symbol, clientOrderId=client_id)
-                            filled = bool(status and str(status.get('status', '')).upper() in ('FILLED', 'PARTIALLY_FILLED'))
-                            if status is None:
-                                filled = False  # unknown → treat as not filled
-                            if filled:
-                                await self._log_execution_event("order_placed", symbol, {
-                                    "type": "LIMIT_POST_ONLY", "side": "BUY", "tag": safe_tag,
-                                    "client_id": client_id, "using": "qty"
-                                })
-                                lim = await self._reconcile_delayed_fill(
-                                    symbol=symbol,
-                                    side="BUY",
-                                    order=lim,
-                                    tag=safe_tag,
-                                    tier=None,
-                                    client_order_id_hint=client_id,
-                                )
-                                return lim
-                            # cancel and consider taker fallback
-                            with contextlib.suppress(Exception):
-                                if hasattr(self.exchange_client, 'cancel_order'):
-                                    await self.exchange_client.cancel_order(symbol=symbol, clientOrderId=client_id)
-                            cur_px = float(current_price)
-                            bps = abs(cur_px - px) / max(1e-9, cur_px) * 10000.0
-                            if self.allow_taker_if_within_bps > 0 and bps <= self.allow_taker_if_within_bps:
-                                await self._log_execution_event('maker_fallback_to_taker', symbol, {'bps': bps, 'limit_px': px, 'cur_px': cur_px})
-                            else:
-                                await self._log_execution_event('order_skip', symbol, {'side': 'BUY', 'reason': 'maker_not_filled_and_bps_too_wide', 'bps': bps})
-                                return None
-                        except Exception:
-                            # fall back to market path if maker path errors
-                            pass
-
                     self._journal("ORDER_SUBMITTED", {
-                        "symbol": symbol, "side": "BUY", "qty": final_qty,
-                        "price": current_price, "quote": final_qty * current_price,
+                        "symbol": symbol, "side": "BUY", "qty": 0,
+                        "price": current_price, "quote": float(spend),
                         "tag": safe_tag, "client_order_id": client_id,
                     })
-                    order = await self._place_with_client_id(
-                        symbol=symbol, side="BUY", quantity=final_qty, tag=safe_tag, clientOrderId=client_id
-                    )
+                    
+                    # ⚠️ SHADOW MODE PROTECTION: Check before placing real orders
+                    if getattr(self.shared_state, "is_shadow", False):
+                        self.logger.warning(
+                            "[SHADOW_MODE] Simulated BUY %s quote=%.2f (no real order placed)",
+                            symbol, float(spend),
+                        )
+                        order = {
+                            "status": "SHADOW_FILLED",
+                            "symbol": symbol,
+                            "side": "BUY",
+                            "quote": float(spend),
+                            "price": current_price,
+                            "executedQty": "0",
+                            "cummulativeQuoteQty": str(float(spend)),
+                        }
+                    else:
+                        order = await self._place_with_client_id(
+                            symbol=symbol, side="BUY", quote_order_qty=float(spend), tag=safe_tag, clientOrderId=client_id
+                        )
                     if isinstance(order, dict) and not bool(order.get("_submission_unknown")):
                         await self._log_execution_event("order_placed", symbol, {
                             "type": "MARKET", "side": "BUY", "tag": safe_tag,
@@ -7388,6 +7852,20 @@ class ExecutionManager:
 
             # else: qty path (BUY without planned_quote, or SELL)
             qty = round_step(quantity, step_size)
+            # For SELL orders: if the remainder after ROUND_DOWN is below min_qty, round UP instead.
+            # This prevents perpetual dust: e.g. position=0.001234, step=0.001 → ROUND_DOWN sells
+            # 0.001 and leaves 0.000234 stranded forever. Round UP to 0.002 only when remainder < min_qty.
+            if side.upper() == "SELL" and step_size > 0:
+                remainder = _raw_quantity - float(qty)
+                if remainder > 0 and remainder < max(float(min_qty), float(step_size)):
+                    qty_up = float(qty) + float(step_size)
+                    # Only round up if the position actually has that much (don't oversell)
+                    if qty_up <= _raw_quantity + float(step_size) * 0.01:
+                        self.logger.info(
+                            "[EM:SellRoundUp] %s: qty ROUND_UP %.8f→%.8f to avoid dust remainder=%.8f (min_qty=%.8f step=%.8f)",
+                            symbol, float(qty), float(qty_up), float(remainder), float(min_qty), float(step_size),
+                        )
+                        qty = qty_up
             if max_qty > 0 and qty > max_qty:
                 qty = round_step(max_qty, step_size)
             
@@ -7484,8 +7962,10 @@ class ExecutionManager:
                     })
                     return None
 
-                # 🔥 CRITICAL: Profit gate at execution layer (CANNOT be bypassed)
-                if not await self._passes_profit_gate(symbol, side, final_qty, current_price):
+                # Profit gate: entry-only protection — does not apply to risk/liquidation exits.
+                # is_liquidation=True means this SELL is a risk-management exit (TP/SL, forced),
+                # and must not be blocked by a profit constraint that only makes sense for entries.
+                if not is_liquidation and not await self._passes_profit_gate(symbol, side, final_qty, current_price):
                     self.logger.warning(f"🚫 SELL blocked at Execution layer by profit gate for {symbol}")
                     return None
 
@@ -7495,9 +7975,47 @@ class ExecutionManager:
                     "tag": safe_tag, "client_order_id": client_id,
                     "timestamp": time.time(),
                 })
-                order = await self._place_with_client_id(
-                    symbol=symbol, side=side.upper(), quantity=final_qty, tag=safe_tag, clientOrderId=client_id
+                
+                # ========== MAKER-BIASED EXECUTION DECISION ==========
+                # Decide whether to use maker limit order (inside spread) or market order
+                use_maker, decision_reason = await self._decide_execution_method(
+                    symbol=symbol,
+                    side=side.upper(),
+                    quantity=final_qty,
+                    current_price=current_price,
+                    planned_quote=planned_quote,
                 )
+                
+                if use_maker:
+                    self.logger.info(
+                        f"[MakerExec] {symbol} {side.upper()} qty={final_qty:.8f} "
+                        f"price={current_price:.8f}: {decision_reason}"
+                    )
+                else:
+                    self.logger.info(
+                        f"[MarketExec] {symbol} {side.upper()} qty={final_qty:.8f} "
+                        f"price={current_price:.8f}: {decision_reason}"
+                    )
+                
+                # ⚠️ SHADOW MODE PROTECTION: Check before placing real orders
+                if getattr(self.shared_state, "is_shadow", False):
+                    self.logger.warning(
+                        "[SHADOW_MODE] Simulated %s %s qty=%.8f (no real order placed)",
+                        symbol, side.upper(), final_qty,
+                    )
+                    order = {
+                        "status": "SHADOW_FILLED",
+                        "symbol": symbol,
+                        "side": side.upper(),
+                        "quantity": final_qty,
+                        "price": current_price,
+                        "executedQty": str(final_qty),
+                        "cummulativeQuoteQty": str(final_qty * current_price),
+                    }
+                else:
+                    order = await self._place_with_client_id(
+                        symbol=symbol, side=side.upper(), quantity=final_qty, tag=safe_tag, clientOrderId=client_id
+                    )
                 if isinstance(order, dict) and not bool(order.get("_submission_unknown")):
                     await self._log_execution_event("order_placed", symbol, {
                         "type": "MARKET", "side": side.upper(), "tag": safe_tag,
@@ -7571,7 +8089,8 @@ class ExecutionManager:
                     self._concurrent_orders_sem.release()
                 except Exception:
                     pass
-            self._active_symbol_side_orders.discard(order_key)
+            # Clear the active order entry (always, to prevent stale entries)
+            self._active_symbol_side_orders.pop(order_key, None)
 
     async def _place_with_client_id(self, **kwargs) -> Any:
         """
@@ -7596,6 +8115,18 @@ class ExecutionManager:
         retries = max(1, min(retries, 20))
         delay_s = float(self._cfg("ORDER_RECOVERY_RETRY_DELAY_S", 0.2) or 0.2)
         delay_s = min(max(delay_s, 0.05), 1.0)
+
+        # CRITICAL DEBUG: Log what we're sending to the exchange
+        if request_kwargs.get("quote_order_qty"):
+            self.logger.info(
+                "[EM:SEND_ORDER] %s %s quote_order_qty=%.2f (NOT quantity-based)",
+                symbol, side, float(request_kwargs.get("quote_order_qty", 0))
+            )
+        elif request_kwargs.get("quantity"):
+            self.logger.info(
+                "[EM:SEND_ORDER] %s %s quantity=%.8f",
+                symbol, side, float(request_kwargs.get("quantity", 0))
+            )
 
         scope_token = self._enter_exchange_order_scope()
         try:
@@ -7968,6 +8499,30 @@ class ExecutionManager:
         )
 
         return step_size, min_qty, min_notional
+
+    def reset_idempotent_cache(self):
+        """
+        🔧 FIX 2: Reset idempotent protection caches.
+        
+        Clears the SELL finalization cache to allow re-execution of orders.
+        This unblocks deduplication logic that was preventing signal retries.
+        
+        Safe to call multiple times and between trading cycles.
+        """
+        try:
+            # Clear the finalization result cache entirely
+            self._sell_finalize_result_cache.clear()
+            self._sell_finalize_result_cache_ts.clear()
+            
+            self.logger.warning(
+                "[EXEC:IDEMPOTENT_RESET] ✅ Cleared SELL finalization cache (entries cleared: finalize_cache)"
+            )
+        except Exception as e:
+            self.logger.warning(
+                "[EXEC:IDEMPOTENT_RESET] Failed to reset idempotent cache: %s",
+                e,
+                exc_info=True
+            )
 
     async def start(self):
         """
