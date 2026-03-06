@@ -592,12 +592,12 @@ class UniverseRotationEngine:
                     score = self.ss.get_unified_score(symbol)
                     scores[symbol] = score
                 except Exception as score_err:
-                    self.logger.debug(f"[UURE] Failed to score {symbol}: {score_err}")
+                    self.logger.warning(f"[UURE] Failed to score {symbol}: {score_err}")
                     # Continue with next candidate
                     continue
 
             if scores:
-                self.logger.debug(
+                self.logger.info(
                     f"[UURE] Scored {len(scores)} candidates. "
                     f"Mean: {sum(scores.values())/len(scores):.3f}"
                 )
