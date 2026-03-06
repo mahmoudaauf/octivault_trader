@@ -1898,14 +1898,33 @@ class SharedState:
         
         # Factor 4: Liquidity (Volume + Spread) - 20%
         # ⚡ ARCHITECT REFINEMENT #2: Include volume in scoring, not rejection
-        price_info = self.latest_prices.get(symbol, {})
-        quote_volume = float(price_info.get("quote_volume", 0))
-        spread = float(price_info.get("spread", 0.01))
-        
-        # Liquidity scoring: normalized volume * inverse spread
-        # Higher volume (normalized to 100k) = higher score
-        # Tighter spread (< 1%) = higher score
-        liquidity_score = min(quote_volume / 100000, 1.0) * max(0, 1.0 - min(spread, 0.05))
+        # FIX: latest_prices is Dict[str, float], not Dict[str, Dict]
+        # Use accepted_symbols for volume/liquidity data if available
+        # NOTE: Some discovery agents populate with minimal metadata (just status/notional)
+        # This is OK - we gracefully degrade to neutral liquidity score
+        liquidity_score = 0.5  # Default neutral liquidity
+        try:
+            symbol_info = self.accepted_symbols.get(symbol, {})
+            if isinstance(symbol_info, dict):
+                # Try to extract liquidity metrics from symbol info
+                # Try multiple key names for compatibility with different data sources
+                quote_volume = float(
+                    symbol_info.get("quote_volume") 
+                    or symbol_info.get("volume") 
+                    or symbol_info.get("24h_volume")
+                    or symbol_info.get("quote_volume_usd", 0) 
+                    or 0
+                )
+                spread = float(symbol_info.get("spread") or symbol_info.get("bid_ask_spread", 0.01) or 0.01)
+                
+                # Only compute liquidity score if we have meaningful volume
+                # If volume is 0 (missing metadata), keep neutral 0.5
+                if quote_volume > 0:
+                    liquidity_score = min(quote_volume / 100000, 1.0) * max(0, 1.0 - min(spread, 0.05))
+                # else: keep liquidity_score = 0.5 (neutral)
+        except (TypeError, ValueError, AttributeError):
+            # Fall back to neutral liquidity if any error (type mismatch, conversion error, etc.)
+            liquidity_score = 0.5
         
         # Professional multi-factor composite
         # This is the approach used by hedge funds and market makers
@@ -5796,6 +5815,46 @@ class SharedState:
             "is_bootstrap": self.is_bootstrap_mode(),
         }
 
+    def mark_bootstrap_signal_validated(self) -> None:
+        """
+        🔧 BOOTSTRAP COMPLETION FIX: Mark bootstrap complete when first signal is validated
+        
+        CRITICAL: Bootstrap should complete on SIGNAL VALIDATION, not trade execution.
+        
+        Problem:
+        - In shadow mode, signals are validated but NO trade is executed
+        - If bootstrap only completes on trade execution, shadow mode DEADLOCKS forever
+        - System waits for first trade, but shadow mode has no orders to fill
+        
+        Solution:
+        - Complete bootstrap when MetaController validates the first signal
+        - Set first_signal_validated_at timestamp
+        - Prevent bootstrap logic from re-firing on subsequent validations
+        
+        Usage:
+        - Called by MetaController.propose_exposure_directive() after signal validation passes
+        - Called BEFORE execution (so shadow mode works too)
+        - Idempotent: safe to call multiple times
+        """
+        if self.metrics.get("first_signal_validated_at") is not None:
+            # Already marked, skip (idempotent)
+            return
+        
+        now = time.time()
+        self.metrics["first_signal_validated_at"] = now
+        self.metrics["bootstrap_completed"] = True
+        
+        # Also persist to bootstrap_metrics for restart safety
+        self.bootstrap_metrics._cached_metrics["first_signal_validated_at"] = now
+        self.bootstrap_metrics._cached_metrics["bootstrap_completed"] = True
+        self.bootstrap_metrics._write(self.bootstrap_metrics._cached_metrics)
+        
+        self.logger.warning(
+            "[BOOTSTRAP] ✅ Bootstrap completed by first signal validation at %.1f "
+            "(not waiting for trade execution). Shadow mode deadlock prevented.",
+            now
+        )
+
     def is_cold_bootstrap(self) -> bool:
         """
         Returns True ONLY when ALL of these conditions are met:
@@ -5810,16 +5869,22 @@ class SharedState:
         This prevents bootstrap logic (forced seed trades, sell blocks, confidence
         overrides) from firing on restarts, when a DB exists, or in live trading.
         Startup must be pure reconciliation — no forced action.
+        
+        🔧 BOOTSTRAP FIX: Also checks for first signal validation.
+        If any signal has been validated (even without trade execution),
+        bootstrap is considered complete. This prevents shadow mode deadlock.
         """
         # Condition 1: Zero historical trades [NOW PERSISTED]
         # Phase 2: Check both in-memory and persisted metrics
-        has_trade_history = (
+        # 🔧 BOOTSTRAP FIX: Also check for signal validation (not just trade execution)
+        has_signal_or_trade_history = (
             self.metrics.get("first_trade_at") is not None
+            or self.metrics.get("first_signal_validated_at") is not None
             or self.metrics.get("total_trades_executed", 0) > 0
             or self.bootstrap_metrics.get_first_trade_at() is not None
             or self.bootstrap_metrics.get_total_trades_executed() > 0
         )
-        if has_trade_history:
+        if has_signal_or_trade_history:
             return False
 
         # Condition 2: No persistent state (DB file / snapshot) exists
