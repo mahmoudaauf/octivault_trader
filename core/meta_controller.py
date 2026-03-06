@@ -3590,6 +3590,15 @@ class MetaController:
                 action, symbol, amount, trace_id
             )
 
+            # 🔧 BOOTSTRAP FIX: Mark bootstrap complete on first signal validation
+            # This prevents shadow mode deadlock (bootstrap was waiting for trade execution)
+            try:
+                self.shared_state.mark_bootstrap_signal_validated()
+            except Exception as e:
+                self.logger.warning(
+                    "[Meta:Directive] Failed to mark bootstrap signal validated: %s", e
+                )
+
             # Store directive in audit trail
             if not hasattr(self, "_directive_audit_log"):
                 self._directive_audit_log = []
@@ -9899,37 +9908,59 @@ class MetaController:
                     existing_qty = float(self.shared_state.get_position_qty(sym) or 0.0)
                     
                     # ═══════════════════════════════════════════════════════════════════════════════
-                    # 🚫 CRITICAL FIX: ONE_POSITION_PER_SYMBOL ENFORCEMENT
+                    # ✅ DUST-AWARE: ONE_POSITION_PER_SYMBOL ENFORCEMENT
                     # ═══════════════════════════════════════════════════════════════════════════════
-                    # Professional rule: If position exists for symbol, REJECT all new BUY signals
-                    # INVARIANT: max_exposure_per_symbol = 1 position (no stacking, no scaling, no accumulation)
+                    # Intelligent position locking rule:
+                    # - Significant positions BLOCK new BUY signals (prevent risk doubling)
+                    # - Dust positions ALLOW new BUY signals (enable dust promotion/reuse)
+                    # - Unhealable dust ALLOWS new BUY (prevents deadlock)
                     #
-                    # This prevents risk doubling and enforces strict position isolation.
+                    # This enables:
+                    # 1. P0 DUST PROMOTION (scale dust with freed capital)
+                    # 2. Dust recovery (dust → viable when signal appears)
+                    # 3. Normal position isolation (significant blocks entry)
                     # ═══════════════════════════════════════════════════════════════════════════════
                     
                     if existing_qty > 0:
-                        # Position exists - REJECT BUY signal regardless of any flag/exception
-                        self.logger.info(
-                            "[Meta:ONE_POSITION_GATE] 🚫 Skipping %s BUY: existing position blocks entry "
-                            "(qty=%.6f, ONE_POSITION_PER_SYMBOL rule enforced)",
-                            sym, existing_qty
-                        )
-                        self.logger.warning(
-                            "[Meta:GATE_DROP_ONE_POSITION] %s BUY dropped at ONE_POSITION_PER_SYMBOL gate (qty=%.6f)",
-                            sym, existing_qty
-                        )
-                        self.logger.warning(
-                            "[WHY_NO_TRADE] symbol=%s reason=POSITION_ALREADY_OPEN details=ONE_POSITION_PER_SYMBOL "
-                            "qty=%.6f", sym, existing_qty
-                        )
-                        await self._record_why_no_trade(
-                            sym,
-                            "POSITION_ALREADY_OPEN",
-                            f"ONE_POSITION_PER_SYMBOL qty={existing_qty:.6f}",
-                            side="BUY",
-                            signal=sig,
-                        )
-                        continue
+                        # ✅ FIXED: Use dust-aware blocking logic instead of crude qty check
+                        blocks, pos_value, sig_floor, reason = await self._position_blocks_new_buy(sym, existing_qty)
+                        
+                        if blocks:
+                            # Position is SIGNIFICANT (value >= floor) - blocks entry
+                            self.logger.info(
+                                "[Meta:ONE_POSITION_GATE] 🚫 Skipping %s BUY: existing SIGNIFICANT position blocks entry "
+                                "(value=%.2f >= floor=%.2f, reason=%s, ONE_POSITION_PER_SYMBOL enforced)",
+                                sym, pos_value, sig_floor, reason
+                            )
+                            self.logger.warning(
+                                "[Meta:GATE_DROP_ONE_POSITION] %s BUY dropped at ONE_POSITION_PER_SYMBOL gate "
+                                "(value=%.2f, reason=%s)",
+                                sym, pos_value, reason
+                            )
+                            self.logger.warning(
+                                "[WHY_NO_TRADE] symbol=%s reason=POSITION_ALREADY_OPEN details=ONE_POSITION_PER_SYMBOL "
+                                "value=%.2f reason=%s", sym, pos_value, reason
+                            )
+                            await self._record_why_no_trade(
+                                sym,
+                                "POSITION_ALREADY_OPEN",
+                                f"Significant position blocks entry (value=${pos_value:.2f}, reason={reason})",
+                                side="BUY",
+                                signal=sig,
+                            )
+                            continue
+                        else:
+                            # Position is DUST or UNHEALABLE_DUST - ALLOW signal through
+                            # This enables:
+                            # - P0 DUST PROMOTION when strong signals exist
+                            # - Dust recovery (reuse dust with new capital)
+                            # - Bootstrap entry (dust doesn't block new entries)
+                            self.logger.info(
+                                "[Meta:DUST_REENTRY_ALLOWED] ✅ Allowing %s BUY: existing dust position permits entry "
+                                "(value=%.2f < floor=%.2f, reason=%s)",
+                                sym, pos_value, sig_floor, reason
+                            )
+                            # Continue processing signal - don't skip
                     
                     # No existing position - allow BUY signal to proceed through normal gates
                     allow_reentry = False  # Placeholder for gate chain

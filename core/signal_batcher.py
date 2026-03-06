@@ -83,6 +83,7 @@ class SignalBatcher:
     ):
         self.batch_window_sec = batch_window_sec
         self.max_batch_size = max_batch_size
+        self.max_batch_age_sec = 30.0  # 🔧 SAFETY: Force-flush after 30s even if micro-NAV threshold not met
         self.logger = logger or logging.getLogger("SignalBatcher")
         self.shared_state = shared_state
         
@@ -274,7 +275,8 @@ class SignalBatcher:
         Triggers when:
         1. Window elapsed (5 seconds), OR
         2. Batch is full (10 signals), OR
-        3. Critical signal detected (SELL, LIQUIDATION, ROTATION)
+        3. Batch is too old (30+ seconds, safety timeout), OR
+        4. Critical signal detected (SELL, LIQUIDATION, ROTATION)
         
         NOTE: Micro-NAV threshold checks are done in flush() via async context
         """
@@ -295,17 +297,29 @@ class SignalBatcher:
         # Flush if:
         # 1. Window expired
         # 2. Batch full
-        # 3. Critical signal present (exit immediately)
+        # 3. Batch too old (safety timeout)
+        # 4. Critical signal present (exit immediately)
         should_flush = (
             elapsed >= self.batch_window_sec or
             len(self._pending_signals) >= self.max_batch_size or
+            elapsed >= self.max_batch_age_sec or  # 🔧 SAFETY: Max age timeout
             (has_critical and len(self._pending_signals) >= 1)
         )
         
         if should_flush:
+            reason = ""
+            if elapsed >= self.max_batch_age_sec:
+                reason = f"age timeout (elapsed={elapsed:.1f}s >= max={self.max_batch_age_sec}s)"
+            elif elapsed >= self.batch_window_sec:
+                reason = f"window expired (elapsed={elapsed:.1f}s)"
+            elif len(self._pending_signals) >= self.max_batch_size:
+                reason = f"batch full (size={len(self._pending_signals)})"
+            elif has_critical:
+                reason = "critical signal present"
+            
             self.logger.info(
-                "[Batcher:Flush] Flushing batch: size=%d, elapsed=%.1fs, has_critical=%s",
-                len(self._pending_signals), elapsed, has_critical
+                "[Batcher:Flush] Flushing batch: size=%d, elapsed=%.1fs, reason=%s",
+                len(self._pending_signals), elapsed, reason
             )
         
         return should_flush
@@ -333,11 +347,16 @@ class SignalBatcher:
         if len(self._pending_signals) == 0:
             return []
         
+        # 🔧 SAFETY CHECK: Maximum batch age (prevents indefinite holding in micro-NAV mode)
+        now = time.time()
+        batch_age = now - self._batch_start_time
+        batch_too_old = batch_age >= self.max_batch_age_sec
+        
         # ===== MICRO-NAV CHECK: Don't flush small batches unless critical =====
         try:
             await self._update_micro_nav_mode()
             
-            if self._micro_nav_mode_active:
+            if self._micro_nav_mode_active and not batch_too_old:  # 🔧 Only hold if batch is still young
                 # Check if we have critical signals that bypass batching
                 has_critical = any(
                     sig.side in ("SELL", "LIQUIDATION") or 
@@ -354,11 +373,18 @@ class SignalBatcher:
                         # Don't flush yet; continue accumulating
                         self.logger.debug(
                             "[Batcher:MicroNAV] Holding batch: accumulated=%.2f < threshold, "
+                            "batch_age=%.1fs (max=%.1fs), "
                             "waiting for more signals or critical event",
-                            accumulated
+                            accumulated, batch_age, self.max_batch_age_sec
                         )
                         return []  # Return empty; batch continues
                     # else: meets_threshold = True, continue to flush
+            elif batch_too_old:
+                # 🔧 SAFETY: Batch has been held too long, force-flush despite micro-NAV
+                self.logger.warning(
+                    "[Batcher:MicroNAV] Forcing flush: batch_age=%.1fs >= max=%.1fs (safety timeout)",
+                    batch_age, self.max_batch_age_sec
+                )
         except Exception as e:
             self.logger.debug("[Batcher:MicroNAV] Micro-NAV check failed: %s, continuing with flush", e)
         
