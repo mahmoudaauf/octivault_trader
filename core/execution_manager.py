@@ -80,8 +80,8 @@ async def validate_order_request(*, side: str, qty: float, price: float,
     if use_quote_amount is not None:
         # INSTITUTIONAL FIX: Round UP to satisfy min_notional, not down
         min_required_notional = max(filters.min_notional, filters.min_entry_quote or 0.0)
-        if use_quote_amount < min_required_notional:
-            return False, 0.0, 0.0, "QUOTE_LT_MIN_NOTIONAL"
+        # QUOTE UPGRADE: Instead of rejecting, upgrade the quote to meet minimum
+        use_quote_amount = max(use_quote_amount, min_required_notional)
 
         step = float(filters.step_size or 0.0)
         price_safe = price if price > 0 else 1.0
@@ -4661,9 +4661,13 @@ class ExecutionManager:
                 except Exception:
                     dynamic_min_econ = Decimal("0")
             min_econ_trade = max(nav_tier_min_econ, dynamic_min_econ)
+            # QUOTE UPGRADE: Instead of rejecting, upgrade the quote to meet minimum
             if min_econ_trade > 0 and qa < min_econ_trade and not is_dust_operation:
-                gap = (min_econ_trade - qa).max(Decimal("0"))
-                return (False, gap, "QUOTE_LT_MIN_ECONOMIC")
+                qa = max(qa, min_econ_trade)  # Upgrade quote to meet minimum economic threshold
+                self.logger.info(
+                    f"[EM:QUOTE_UPGRADE] {symbol} BUY: Upgraded quote to minimum economic amount "
+                    f"upgraded_quote={float(qa):.2f} USDT, min_econ={float(min_econ_trade):.2f} USDT"
+                )
 
             sym = self._norm_symbol(symbol)
             eps = Decimal("1e-9")
@@ -4939,9 +4943,13 @@ class ExecutionManager:
             round_trip_fee_rate = Decimal(str(self.trade_fee_pct)) * Decimal("2")
             if round_trip_fee_rate > 0 and fee_mult > 0 and not is_dust_operation:
                 planned_fee_floor = min_required * round_trip_fee_rate * fee_mult
+                # QUOTE UPGRADE: Instead of rejecting, upgrade the quote to cover fees
                 if qa < planned_fee_floor - eps:
-                    gap = (planned_fee_floor - qa).max(Decimal("0"))
-                    return (False, gap, "QUOTE_LT_FEE_FLOOR")
+                    qa = max(qa, planned_fee_floor)
+                    self.logger.info(
+                        f"[EM:QUOTE_UPGRADE] {sym} BUY: Upgraded quote to cover round-trip fees "
+                        f"upgraded_quote={float(qa):.2f} USDT, fee_floor={float(planned_fee_floor):.2f} USDT"
+                    )
 
             # 3. Determine spendable (Strict Mode: Fresh from SharedState)
             taker_fee = Decimal(str(self.trade_fee_pct))
@@ -4991,9 +4999,14 @@ class ExecutionManager:
                     if spendable_dec > 0 and (qa <= spendable_dec + eps) and (spendable_dec + acc_val < min_required - eps):
                         gap = (min_required - (spendable_dec + acc_val)).max(Decimal("0"))
                         return (False, gap, "INSUFFICIENT_QUOTE")
-                    # Otherwise, the caller asked below the floor while having enough NAV.
-                    gap = (min_required - effective_qa).max(Decimal("0"))
-                    return (False, gap, "QUOTE_LT_MIN_NOTIONAL")
+                    # QUOTE UPGRADE: Instead of rejecting, upgrade the quote to meet minimum
+                    # The caller asked below the floor but has enough NAV.
+                    effective_qa = max(effective_qa, min_required)
+                    qa = max(qa, min_required)
+                    self.logger.info(
+                        f"[EM:QUOTE_UPGRADE] {sym} BUY: Upgraded quote to minimum allocation "
+                        f"upgraded_quote={float(qa):.2f} USDT, min_required={float(min_required):.2f} USDT"
+                    )
             else:
                 # BOOTSTRAP: Bypass min_notional for first trade execution
                 if effective_qa < min_required - eps:
@@ -5071,8 +5084,14 @@ class ExecutionManager:
             # Check if this executable chunk meets minNotional (SKIP in bootstrap/accumulate modes, but NEVER for dust healing)
             exchange_floor = float(min_notional)  # NOT min_required
             if not bypass_min_notional and est_notional < exchange_floor:
-                gap = Decimal(str(exchange_floor)) - Decimal(str(est_notional))
-                return (False, gap.max(Decimal("0")), "QUOTE_LT_MIN_NOTIONAL")
+                # QUOTE UPGRADE: Instead of rejecting, upgrade the quantity to meet minimum notional
+                min_units_for_floor = Decimal(str(exchange_floor)) / Decimal(str(price_f))
+                est_units = max(est_units, float(min_units_for_floor))
+                est_notional = est_units * price_f
+                self.logger.info(
+                    f"[EM:QUOTE_UPGRADE] {sym} BUY: Upgraded quantity to meet exchange minimum "
+                    f"upgraded_qty={est_units:.8f}, exchange_floor={exchange_floor:.2f} USDT"
+                )
             elif bypass_min_notional and est_notional < exchange_floor and not is_dust_operation:
                 # Log bypass for accumulate execution, but not for dust healing
                 self.logger.warning(
@@ -5084,14 +5103,14 @@ class ExecutionManager:
                 gap = Decimal(str(exchange_floor)) - Decimal(str(est_notional))
                 return (False, gap.max(Decimal("0")), "DUST_OPERATION_LT_MIN_NOTIONAL")
 
+
             gross_needed = qa * (Decimal("1") + taker_fee) * headroom
             if spendable_dec < gross_needed - eps:
                 # Point 3: Dynamic Resizing (Downscaling)
                 # If we have less than planned, but enough for minNotional, we downscale.
                 max_qa = spendable_dec / ((Decimal("1") + taker_fee) * headroom)
-                if no_downscale_planned_quote:
-                    gap = (qa - max_qa).max(Decimal("0"))
-                    return (False, gap, "INSUFFICIENT_QUOTE")
+                # QUOTE UPGRADE: Instead of rejecting, allow downscaling to what we can afford
+                # (Previously: if no_downscale_planned_quote=True, would reject)
                 if max_qa >= Decimal(str(exchange_floor)) or bypass_min_notional:
                     self.logger.info(f"[EM] Dynamic Resizing: Downscaling {qa} -> {max_qa:.2f} to fit spendable {spendable_dec:.2f}")
                     return (True, max_qa, "OK_DOWNSCALED")
@@ -5100,6 +5119,7 @@ class ExecutionManager:
                     # No enough for minNotional even with all cash.
                     gap = Decimal(str(exchange_floor)) - max_qa
                     return (False, gap.max(Decimal("0")), "INSUFFICIENT_QUOTE_FOR_ACCUMULATION")
+
 
             if price <= 0:
                 self.logger.warning("[EM] ExecutionProbe = FAIL (Reason: Market Price 0). Readiness = FALSE.")
@@ -7193,6 +7213,67 @@ class ExecutionManager:
                 default_status="REJECTED",
                 default_reason="no_price",
             )
+        
+        # ════════════════════════════════════════════════════════════════════
+        # BOOTSTRAP MINIMUM ALLOCATION ENFORCEMENT
+        # ════════════════════════════════════════════════════════════════════
+        # During bootstrap execution, enforce minimum allocation to guarantee
+        # orders pass exchange minNotional requirements.
+        #
+        # Formula: allocation = max(capital * risk_fraction, min_notional * 1.1)
+        # Example:
+        #   capital = 91 USDT
+        #   risk_fraction = 0.1
+        #   normal = 91 * 0.1 = 9.1
+        #   min_notional = 10
+        #   allocation = max(9.1, 10 * 1.1) = max(9.1, 11) = 11 USDT ✓ Passes
+        # ════════════════════════════════════════════════════════════════════
+        
+        is_bootstrap = bool(
+            bypass_min_notional or 
+            (tag and "bootstrap" in str(tag).lower()) or
+            (decision_id and "bootstrap" in str(decision_id).lower())
+        )
+        
+        if is_bootstrap and side.upper() == "BUY" and quote > 0:
+            try:
+                # Get min_notional requirement from exchange
+                min_notional = 10.0  # Default minimum
+                try:
+                    if hasattr(self.exchange_client, "get_symbol_info"):
+                        info = await self.exchange_client.get_symbol_info(symbol)
+                        if info and isinstance(info, dict):
+                            filters = info.get("filters", [])
+                            for f in filters:
+                                if f.get("filterType") == "MIN_NOTIONAL" or f.get("filterType") == "NOTIONAL":
+                                    min_notional = float(f.get("minNotional", f.get("minValue", 10.0)))
+                                    break
+                except Exception:
+                    min_notional = float(getattr(self.config, "MIN_NOTIONAL_USDT", 10.0))
+                
+                # Enforce minimum: allocation must be >= min_notional * 1.1
+                minimum_allocation = min_notional * 1.1
+                original_quote = quote
+                
+                if quote < minimum_allocation:
+                    quote = minimum_allocation
+                    self.logger.info(
+                        "[EM:BOOTSTRAP_ALLOC] 🚀 MINIMUM ALLOCATION ENFORCED:\n"
+                        "  Original: %.2f USDT\n"
+                        "  MinNotional: %.2f USDT\n"
+                        "  Required: %.2f USDT (min_notional * 1.1)\n"
+                        "  Adjusted: %.2f USDT ✓ Now passes minimum",
+                        original_quote, min_notional, minimum_allocation, quote
+                    )
+                else:
+                    self.logger.debug(
+                        "[EM:BOOTSTRAP_ALLOC] ✓ Allocation already meets minimum:\n"
+                        "  Quote: %.2f USDT >= Required: %.2f USDT",
+                        quote, minimum_allocation
+                    )
+            except Exception as e:
+                self.logger.warning("[EM:BOOTSTRAP_ALLOC] Error enforcing minimum allocation: %s", e)
+                # Continue with original quote if enforcement fails
 
         # For SELL orders, skip affordability check (they use position quantity, not capital)
         if side.upper() == "BUY" and not policy_validated:

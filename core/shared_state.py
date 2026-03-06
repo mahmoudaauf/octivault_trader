@@ -5817,24 +5817,37 @@ class SharedState:
 
     def mark_bootstrap_signal_validated(self) -> None:
         """
-        🔧 BOOTSTRAP COMPLETION FIX: Mark bootstrap complete when first signal is validated
+        🔧 BOOTSTRAP COMPLETION FIX: Mark bootstrap complete when first DECISION is issued
         
-        CRITICAL: Bootstrap should complete on SIGNAL VALIDATION, not trade execution.
+        CRITICAL: Bootstrap should complete on FIRST DECISION ISSUED, not trade execution.
         
-        Problem:
-        - In shadow mode, signals are validated but NO trade is executed
-        - If bootstrap only completes on trade execution, shadow mode DEADLOCKS forever
-        - System waits for first trade, but shadow mode has no orders to fill
+        Why this matters:
+        Execution might be:
+          - Shadow (virtual, no real orders)
+          - Dry-run (no execution, test only)
+          - Rejected (decision made but not executed)
+          - Delayed (queued but not yet filled)
         
-        Solution:
-        - Complete bootstrap when MetaController validates the first signal
-        - Set first_signal_validated_at timestamp
-        - Prevent bootstrap logic from re-firing on subsequent validations
+        A decision is "issued" when MetaController validates a signal and approves it for execution.
+        This happens BEFORE execution, so it works in ALL modes:
+          ✅ Shadow mode (no actual execution)
+          ✅ Dry-run mode (no execution, test only)
+          ✅ Paper trading (virtual execution)
+          ✅ Live trading (real execution)
+        
+        Problem (Old Logic):
+        - Bootstrap waits for metrics["first_trade_at"] (actual execution)
+        - In shadow mode: no trades execute → first_trade_at never set → bootstrap deadlocks
+        
+        Solution (New Logic):
+        - Bootstrap completes on first DECISION ISSUED (signal validation)
+        - Set first_signal_validated_at timestamp when decision issued
+        - Prevent bootstrap logic from re-firing on subsequent decisions
         
         Usage:
         - Called by MetaController.propose_exposure_directive() after signal validation passes
-        - Called BEFORE execution (so shadow mode works too)
-        - Idempotent: safe to call multiple times
+        - Called BEFORE execution begins (decision issued)
+        - Idempotent: safe to call multiple times (only first call has effect)
         """
         if self.metrics.get("first_signal_validated_at") is not None:
             # Already marked, skip (idempotent)
@@ -5850,8 +5863,9 @@ class SharedState:
         self.bootstrap_metrics._write(self.bootstrap_metrics._cached_metrics)
         
         self.logger.warning(
-            "[BOOTSTRAP] ✅ Bootstrap completed by first signal validation at %.1f "
-            "(not waiting for trade execution). Shadow mode deadlock prevented.",
+            "[BOOTSTRAP] ✅ Bootstrap completed by first DECISION ISSUED at %.1f "
+            "(signal approved after validation gates, execution mode: any). "
+            "Deadlock prevented: decision ≠ execution.",
             now
         )
 

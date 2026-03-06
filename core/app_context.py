@@ -1818,6 +1818,29 @@ class AppContext:
                 self._start_affordability_scout()
             except Exception:
                 self.logger.debug("failed to start affordability scout after gates clear", exc_info=True)
+            
+            # 🔥 FIX: Seed initial symbols for UURE before loop starts
+            # UURE needs candidates to score, but discovery may be slow at startup
+            # This prevents the pre-scoring gate from failing on first cycle
+            try:
+                if self.shared_state:
+                    current = await self.shared_state.get_accepted_symbols()
+                    if not current or len(current) < 3:
+                        self.logger.info("[Init] Seeding initial universe for UURE (discovery in progress)...")
+                        
+                        seed_symbols = {
+                            "BTCUSDT": {"status": "TRADING", "notional": 10},
+                            "ETHUSDT": {"status": "TRADING", "notional": 10},
+                            "BNBUSDT": {"status": "TRADING", "notional": 10},
+                            "SOLUSDT": {"status": "TRADING", "notional": 10},
+                            "ADAUSDT": {"status": "TRADING", "notional": 10},
+                        }
+                        
+                        await self.shared_state.set_accepted_symbols(seed_symbols)
+                        self.logger.info(f"[Init] Seeded {len(seed_symbols)} symbols for UURE startup")
+            except Exception:
+                self.logger.debug("failed to seed UURE symbols", exc_info=True)
+            
             # Start the background UURE loop now that gates are clear
             try:
                 self._start_uure_loop()
