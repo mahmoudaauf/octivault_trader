@@ -2243,16 +2243,22 @@ class AppContext:
         - Calls stop()/shutdown()/close() on known components if present.
         - Optionally asks SharedState/RecoveryEngine to persist a snapshot.
         Never raises; logs errors at DEBUG to keep shutdown robust.
+        
+        Enhanced with timeout protection to prevent hangs during cleanup.
         """
-        # Stop background scout
+        # Stop background scout with timeout
         try:
-            await self._stop_affordability_scout()
+            await asyncio.wait_for(self._stop_affordability_scout(), timeout=5.0)
+        except asyncio.TimeoutError:
+            self.logger.debug("shutdown: affordability scout stop timed out")
         except Exception:
             self.logger.debug("shutdown: stop scout failed", exc_info=True)
 
-        # Stop background UURE loop
+        # Stop background UURE loop with timeout
         try:
-            await self._stop_uure_loop()
+            await asyncio.wait_for(self._stop_uure_loop(), timeout=5.0)
+        except asyncio.TimeoutError:
+            self.logger.debug("shutdown: UURE loop stop timed out")
         except Exception:
             self.logger.debug("shutdown: stop UURE loop failed", exc_info=True)
 
@@ -2262,15 +2268,25 @@ class AppContext:
             if not c:
                 continue
             try:
-                await self._try_call_async(c, ("stop", "shutdown", "close"))
+                await asyncio.wait_for(
+                    self._try_call_async(c, ("stop", "shutdown", "close")),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                self.logger.debug("shutdown: component stop timed out for %r", c)
             except Exception:
                 self.logger.debug("shutdown: component stop failed for %r", c, exc_info=True)
 
-        # Exchange client last (network connections)
+        # Exchange client last (network connections) with longer timeout
         try:
             ec = getattr(self, "exchange_client", None)
             if ec:
-                await self._try_call_async(ec, ("stop", "shutdown", "close"))
+                await asyncio.wait_for(
+                    self._try_call_async(ec, ("stop", "shutdown", "close")),
+                    timeout=10.0
+                )
+        except asyncio.TimeoutError:
+            self.logger.debug("shutdown: exchange client stop timed out")
         except Exception:
             self.logger.debug("shutdown: exchange client stop failed", exc_info=True)
 
@@ -2280,11 +2296,13 @@ class AppContext:
                 if self.shared_state and hasattr(self.shared_state, "save_snapshot"):
                     v = self.shared_state.save_snapshot()
                     if asyncio.iscoroutine(v):
-                        await v
+                        await asyncio.wait_for(v, timeout=5.0)
                 elif self.recovery_engine and hasattr(self.recovery_engine, "save_snapshot"):
                     v = self.recovery_engine.save_snapshot()
                     if asyncio.iscoroutine(v):
-                        await v
+                        await asyncio.wait_for(v, timeout=5.0)
+            except asyncio.TimeoutError:
+                self.logger.debug("shutdown: snapshot operation timed out")
             except Exception:
                 self.logger.debug("shutdown: snapshot failed", exc_info=True)
 
@@ -2293,9 +2311,14 @@ class AppContext:
             for t in list(self._tasks or []):
                 if t and not t.done():
                     t.cancel()
-            # Best-effort join
+            # Best-effort join with timeout
             with contextlib.suppress(Exception):
-                await asyncio.gather(*[t for t in self._tasks if t], return_exceptions=True)
+                await asyncio.wait_for(
+                    asyncio.gather(*[t for t in self._tasks if t], return_exceptions=True),
+                    timeout=5.0
+                )
+        except asyncio.TimeoutError:
+            self.logger.debug("shutdown: task gathering timed out")
         except Exception:
             self.logger.debug("shutdown: tasks join failed", exc_info=True)
 
