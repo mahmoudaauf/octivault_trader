@@ -3482,7 +3482,8 @@ class ExecutionManager:
 
     def _is_live_trading_mode(self) -> bool:
         return bool(self._cfg("LIVE_MODE", False)) and not bool(self._cfg("SIMULATION_MODE", False)) \
-            and not bool(self._cfg("PAPER_MODE", False)) and not bool(self._cfg("TESTNET_MODE", False))
+            and not bool(self._cfg("PAPER_MODE", False)) and not bool(self._cfg("TESTNET_MODE", False)) \
+            and not bool(self._cfg("BINANCE_TESTNET", False))
 
     def _ensure_trade_journal_ready(self, *, reason: str = "runtime") -> bool:
         tj = getattr(self, "trade_journal", None)

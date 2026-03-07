@@ -3341,9 +3341,20 @@ class AppContext:
             return [name for name, value in deps.items() if value is None]
 
         # ExchangeClient (before others that depend on it)
-        # Load API keys from environment
-        BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
-        BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET')
+        # Auto-select API keys based on BINANCE_TESTNET flag
+        def _is_testnet_env() -> bool:
+            for key in ("BINANCE_TESTNET", "TESTNET_MODE"):
+                v = os.environ.get(key, "").strip().lower()
+                if v in ("1", "true", "yes", "on"):
+                    return True
+            return False
+
+        if _is_testnet_env():
+            BINANCE_API_KEY = os.environ.get('BINANCE_TESTNET_API_KEY') or os.environ.get('BINANCE_API_KEY')
+            BINANCE_API_SECRET = os.environ.get('BINANCE_TESTNET_API_SECRET') or os.environ.get('BINANCE_API_SECRET')
+        else:
+            BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
+            BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET')
 
         if self.exchange_client is None:
             ExchangeClient = _get_cls(_exchange_mod, "ExchangeClient")
