@@ -546,21 +546,16 @@ class ExchangeClient:
             self.logger.info("Paper trading mode is enabled. No real orders will be placed.")
 
         # === API KEY SELECTION LOGIC ===
-        # Determine if using testnet based on BINANCE_TESTNET environment variable
-        use_testnet = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
+        testnet = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
         
-        if use_testnet:
-            # Load testnet API credentials (https://testnet.binance.vision)
-            api_key = api_key or _cfg("BINANCE_TESTNET_API_KEY")
-            api_secret = api_secret or _cfg("BINANCE_TESTNET_API_SECRET")
+        if testnet:
+            api_key = os.getenv("BINANCE_TESTNET_API_KEY")
+            api_secret = os.getenv("BINANCE_TESTNET_API_SECRET")
             base_url = "https://testnet.binance.vision"
-            self.logger.info("[EC] Testnet mode enabled: using testnet API keys (https://testnet.binance.vision)")
         else:
-            # Load live API credentials (https://api.binance.com)
-            api_key = api_key or _cfg("BINANCE_API_KEY") or _cfg("API_KEY")
-            api_secret = api_secret or _cfg("BINANCE_API_SECRET") or _cfg("API_SECRET")
+            api_key = os.getenv("BINANCE_API_KEY")
+            api_secret = os.getenv("BINANCE_API_SECRET")
             base_url = "https://api.binance.com"
-            self.logger.info("[EC] Live mode: using live API keys (https://api.binance.com)")
         
         self.api_key = api_key
         self.api_secret = api_secret
