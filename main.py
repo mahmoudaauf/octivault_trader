@@ -447,21 +447,58 @@ class AppContext:
 
     async def shutdown(self):
         logger.info("Shutting down application context.")
+        
+        # Cancel all active tasks with timeout
         for task in self.active_tasks.values():
             task.cancel()
-        await asyncio.gather(*self.active_tasks.values(), return_exceptions=True)
+        
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self.active_tasks.values(), return_exceptions=True),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[AppContext] Timeout waiting for active tasks to complete")
+        except Exception as e:
+            logger.error(f"[AppContext] Error gathering tasks: {e}")
 
+        # Close exchange client with timeout
         if self.exchange_client:
-            await self.exchange_client.close()
+            try:
+                await asyncio.wait_for(
+                    self.exchange_client.close(),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.error("[AppContext] Timeout closing exchange client")
+            except Exception as e:
+                logger.error(f"[AppContext] Error closing exchange client: {e}")
+        
+        # Close database manager with timeout
         if self.database_manager:
-            await self.database_manager.close()
+            try:
+                await asyncio.wait_for(
+                    self.database_manager.close(),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[AppContext] Timeout closing database")
+            except Exception as e:
+                logger.error(f"[AppContext] Error closing database: {e}")
+        
+        # Close notification manager
         if self.notification_manager:
-            await self.notification_manager.close()
+            try:
+                await self.notification_manager.close()
+            except Exception as e:
+                logger.error(f"[AppContext] Error closing notification manager: {e}")
 
+        # Release PID lock
         if self.pid_manager and self.pid_manager.is_locked():
             self.pid_manager.remove_pid_file()
 
-        logger.info("AppContext shutdown complete.")
+        logger.info("[AppContext] Shutdown complete.")
+
 
 
 async def main():

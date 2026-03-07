@@ -2245,16 +2245,48 @@ class ExchangeClient:
         """Canonical lifecycle exit (AppContext calls this on shutdown)."""
         try:
             with contextlib.suppress(Exception):
-                await self.stop_user_data_stream(close_listen_key=True)
+                try:
+                    await asyncio.wait_for(
+                        self.stop_user_data_stream(close_listen_key=True),
+                        timeout=5.0
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass
             if self.client:
-                await self.client.close_connection()
+                try:
+                    await asyncio.wait_for(
+                        self.client.close_connection(),
+                        timeout=5.0
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass
         finally:
             if self.session and not self.session.closed:
-                await self.session.close()
+                try:
+                    await asyncio.wait_for(
+                        self.session.close(),
+                        timeout=5.0
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass
         self.client = None
         self.session = None
         self._ready = False
         self.logger.info("Exchange client disconnected.")
+
+    async def __aenter__(self):
+        """Context manager entry - allows async with ExchangeClient usage."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup happens even on exceptions."""
+        try:
+            await asyncio.wait_for(self.close(), timeout=10.0)
+        except asyncio.TimeoutError:
+            self.logger.error("[EC] Close operation timed out")
+        except Exception as e:
+            self.logger.error(f"[EC] Error during close: {e}")
+        return False  # Don't suppress exceptions
 
     @property
     def is_ready(self) -> bool:
