@@ -412,12 +412,16 @@ class AgentManager:
                 "_atr_pct",
                 "atr_pct",
             ]
-            for k in passthrough_keys:
-                if k in s:
-                    intent[k] = s[k]
-            # If agent already built a policy_context, keep it
+            # Build policy_context with passthrough keys (NOT at top level)
+            policy_ctx = {}
             if isinstance(s.get("policy_context"), dict):
-                intent["policy_context"] = dict(s["policy_context"])
+                policy_ctx.update(s["policy_context"])
+            for k in passthrough_keys:
+                if k in s and k not in policy_ctx:
+                    policy_ctx[k] = s[k]
+            # Store policy_context as a nested dict, not at top level
+            if policy_ctx:
+                intent["policy_context"] = policy_ctx
             intents.append(intent)
         if raw and not intents:
             self.logger.warning(
@@ -623,6 +627,17 @@ class AgentManager:
             "database_manager": self.database_manager,
             "agent_schedule": self.agent_schedule,
         }
+        
+        # Debug: Log dependency availability
+        self.logger.debug(
+            "[AgentManager] Dependency check: model_manager=%s (is None: %s), "
+            "meta_controller=%s, symbol_manager=%s, market_data_feed=%s",
+            type(self.model_manager).__name__ if self.model_manager else "None",
+            self.model_manager is None,
+            type(self.meta_controller).__name__ if self.meta_controller else "None",
+            type(self.symbol_manager).__name__ if self.symbol_manager else "None",
+            type(self.market_data_feed).__name__ if self.market_data_feed else "None",
+        )
 
         registered = 0
         failures = 0
@@ -638,6 +653,14 @@ class AgentManager:
                 sig = inspect.signature(agent_class.__init__)
                 accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
                 accepted_params = set(sig.parameters.keys()) - {"self"}
+                
+                # Debug: Log the signature analysis
+                if agent_name == "MLForecaster":
+                    self.logger.debug(
+                        f"[DEBUG] MLForecaster signature analysis: "
+                        f"accepts_kwargs={accepts_kwargs}, "
+                        f"params={accepted_params}"
+                    )
 
                 for name in accepted_params:
                     if name in all_dependencies:
@@ -652,7 +675,21 @@ class AgentManager:
                     symbol_list = await self._get_accepted_symbols_list()
                     injected_args["symbols"] = symbol_list
                     self.logger.info(f"[AgentManager] Preparing to register agent '{agent_name}' with {len(symbol_list)} symbols")
-                self.logger.info(f"🚧 Instantiating {agent_name} with args: {sorted(list(injected_args.keys()))}")
+                
+                # Enhanced logging for debugging
+                has_model_mgr = "model_manager" in injected_args
+                self.logger.info(
+                    f"🚧 Instantiating {agent_name} with args: {sorted(list(injected_args.keys()))}"
+                )
+                if agent_name == "MLForecaster":
+                    self.logger.info(
+                        f"   [MLForecaster injection details] "
+                        f"has_model_manager={has_model_mgr}, "
+                        f"model_manager_value={injected_args.get('model_manager')}, "
+                        f"accepts_kwargs={accepts_kwargs}, "
+                        f"accepted_params={accepted_params}"
+                    )
+                
                 agent = agent_class(**injected_args)
                 self.logger.info(f"✅ Instantiated agent: {agent_name}")
 
@@ -677,7 +714,12 @@ class AgentManager:
 
                 self.register_agent(agent)
                 num_symbols = len(getattr(agent, 'symbols', []) or [])
-                self.logger.info(f"📦 Registered agent {agent_name} with {num_symbols} symbols")
+                if num_symbols == 0 and getattr(agent_class, "agent_type", "") == "strategy":
+                    self.logger.warning(f"⚠️ CRITICAL: Strategy agent '{agent_name}' registered with 0 symbols! " 
+                                       f"It will not trade until tick_all_once() populates the symbol cache.")
+                    self.logger.warning(f"   This usually means discovery hasn't finalized symbols yet.")
+                else:
+                    self.logger.info(f"📦 Registered agent {agent_name} with {num_symbols} symbols")
                 registered += 1
 
             except Exception as e:
@@ -902,12 +944,19 @@ class AgentManager:
             if (now - self._last_symbols_refresh_t) > 60.0:
                 snap_list = await self._get_accepted_symbols_list()
                 snap_list = sorted(list(set(snap_list)))  # De-duplicate and sort
-                if snap_list != self._accepted_symbols_cache:
-                    self.logger.info("🔄 Symbol universe changed: %d -> %d symbols. Notifying agents.",
-                                     len(self._accepted_symbols_cache), len(snap_list))
+                # CRITICAL FIX: Update if changed OR if cache is empty (initial bootstrap)
+                if snap_list != self._accepted_symbols_cache or not self._accepted_symbols_cache:
+                    if snap_list and snap_list != self._accepted_symbols_cache:
+                        self.logger.info("🔄 Symbol universe changed: %d -> %d symbols. Notifying agents.",
+                                         len(self._accepted_symbols_cache), len(snap_list))
+                    elif snap_list and not self._accepted_symbols_cache:
+                        self.logger.info("🔄 ⚡ INITIAL symbol cache population: %d symbols now available.",
+                                         len(snap_list))
+                    
                     self._accepted_symbols_cache = snap_list
                     self._last_symbols_refresh_t = now
-                    # FIX 3: FORCE symbol refresh into ALL agents
+                    
+                    # CRITICAL FIX: FORCE symbol refresh into ALL agents (especially on first non-empty set)
                     for agent_obj in self.agents.values():
                         if hasattr(agent_obj, "load_symbols") and _asyncio.iscoroutinefunction(agent_obj.load_symbols):
                             await agent_obj.load_symbols(self._accepted_symbols_cache)
