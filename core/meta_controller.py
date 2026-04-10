@@ -3299,15 +3299,46 @@ class MetaController:
         sig = signal or {}
         if any(bool(sig.get(k)) for k in ("allow_partial", "partial_exit", "scaling_out", "_partial_pct", "_is_partial_exit")):
             return False
+        handler = get_error_handler()
         try:
             pos_qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
-        except Exception:
+        except TypeMismatchError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_position_qty",
+                    "component": "PositionTracking",
+                    "symbol": symbol
+                }
+            )
+            self.logger.debug("[Meta:ExitDetect] Failed to get position qty for %s: %s", symbol, e.context.message)
+            pos_qty = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            pos_qty = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:ExitDetect] Unexpected error getting position qty: %s", type(e).__name__)
             pos_qty = 0.0
         if pos_qty <= 0:
             return False
+        handler = get_error_handler()
         try:
             req_qty = float(qty or 0.0)
-        except Exception:
+        except TypeMismatchError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "parse_quantity",
+                    "component": "QuantityParsing"
+                }
+            )
+            self.logger.debug("[Meta:ExitDetect] Failed to parse quantity: %s", e.context.message)
+            req_qty = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            req_qty = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:ExitDetect] Unexpected error parsing quantity: %s", type(e).__name__)
             req_qty = 0.0
         if req_qty <= 0:
             return True
@@ -3465,24 +3496,72 @@ class MetaController:
 
         # Resolve entry price
         entry_price = 0.0
+        handler = get_error_handler()
         try:
             ot = getattr(self.shared_state, "open_trades", {}).get(symbol, {})
             entry_price = float(ot.get("entry_price", 0.0) or 0.0)
-        except Exception:
+        except StateError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_open_trades",
+                    "component": "PositionTracking",
+                    "symbol": symbol
+                }
+            )
+            self.logger.debug("[Meta:ProfitGate] Failed to get open trades entry price: %s", e.context.message)
+            entry_price = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            entry_price = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:ProfitGate] Unexpected error getting entry price from open trades: %s", type(e).__name__)
             entry_price = 0.0
         if not entry_price:
+            handler = get_error_handler()
             try:
                 pos = getattr(self.shared_state, "positions", {}).get(symbol, {})
                 entry_price = float(pos.get("avg_price", 0.0) or pos.get("entry_price", 0.0) or 0.0)
-            except Exception:
+            except StateError as e:
+                classification = handler.handle_exception(
+                    e,
+                    additional_context={
+                        "operation": "get_positions",
+                        "component": "PositionTracking",
+                        "symbol": symbol
+                    }
+                )
+                self.logger.debug("[Meta:ProfitGate] Failed to get positions entry price: %s", e.context.message)
+                entry_price = 0.0
+            except TraderException as e:
+                classification = handler.handle_exception(e)
+                entry_price = 0.0
+            except Exception as e:
+                self.logger.debug("[Meta:ProfitGate] Unexpected error getting entry price from positions: %s", type(e).__name__)
                 entry_price = 0.0
 
         # Resolve current price
         cur_price = 0.0
+        handler = get_error_handler()
         try:
             if hasattr(self.shared_state, "safe_price"):
                 cur_price = float(await _safe_await(self.shared_state.safe_price(symbol)) or 0.0)
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "safe_price",
+                    "component": "PriceFetch",
+                    "symbol": symbol
+                }
+            )
+            self.logger.debug("[Meta:ProfitGate] Failed to get safe price: %s", e.context.message)
+            cur_price = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            cur_price = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:ProfitGate] Unexpected error getting safe price: %s", type(e).__name__)
             cur_price = 0.0
         if cur_price <= 0:
             cur_price = float(getattr(self.shared_state, "latest_prices", {}).get(symbol, 0.0) or 0.0)
