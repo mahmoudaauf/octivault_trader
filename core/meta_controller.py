@@ -71,6 +71,82 @@ except ImportError as e:
     _phase_2c_import_warning = f"Phase 2c modules not available: {e}"
 
 # ==============================================================================
+# PHASE 2D STEP 2: Error Handling Framework Imports
+# ==============================================================================
+# Import the typed error handling framework for replacing broad exceptions
+# with specific, recovery-aware error types and automatic retry logic.
+try:
+    from core.error_types import (
+        # Base exception
+        TraderException,
+        # Bootstrap errors
+        BootstrapError,
+        BootstrapTimeoutError,
+        BootstrapValidationError,
+        BootstrapResourceError,
+        # Arbitration errors
+        ArbitrationError,
+        GateValidationError,
+        SignalValidationError,
+        ConfidenceThresholdError,
+        # Lifecycle errors
+        LifecycleError,
+        StateTransitionError,
+        SymbolNotReadyError,
+        SymbolLockError,
+        # Execution errors
+        ExecutionError as TypedExecutionError,
+        OrderPlacementError,
+        BalanceError,
+        NotionalError,
+        ExecutionValidationError,
+        DuplicateOrderError,
+        # Exchange errors
+        ExchangeError,
+        ExchangeAPIError,
+        ExchangeRateLimitError,
+        ExchangeAuthError,
+        InvalidPairError,
+        LiquidityError,
+        # State errors
+        StateError,
+        StateSyncError,
+        StateLockError,
+        StateCorruptionError,
+        StateConsistencyError,
+        # Network errors
+        NetworkError,
+        NetworkTimeoutError,
+        ConnectionRefusedError,
+        ConnectionResetError,
+        DNSError,
+        # Validation errors
+        ValidationError as TypedValidationError,
+        InvalidParameterError,
+        MissingFieldError,
+        TypeMismatchError,
+        RangeError,
+        # Configuration & Resource errors
+        ConfigurationError,
+        ConfigurationInvalidError,
+        ConfigurationMissingError,
+        ResourceError,
+        ResourceLimitError,
+        # Error context & enums
+        ErrorContext,
+        ErrorCategory,
+        ErrorSeverity,
+        ErrorRecovery,
+        create_error_context,
+    )
+    from core.error_handler import (
+        get_error_handler,
+        ErrorClassification,
+    )
+except ImportError as e:
+    _error_framework_import_warning = f"Error framework not available: {e}"
+
+# ==============================================================================
 # INLINE DEFINITIONS: Essential classes from meta_libs (avoiding external dependency)
 # ==============================================================================
 # These were refactored into core/meta_libs/ locally, but meta_libs doesn't exist
@@ -557,6 +633,7 @@ class MetaController:
         Returns:
             int: Number of symbols with dust state cleaned
         """
+        handler = get_error_handler()
         try:
             cleaned_count = 0
             for symbol in list(self._symbol_dust_state.keys()):
@@ -564,8 +641,22 @@ class MetaController:
                     cleaned_count += 1
             
             return cleaned_count
+        except LifecycleError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "cleanup_all_symbol_dust_state",
+                    "component": "DustManagement"
+                }
+            )
+            self.logger.error("[Meta:DustCleanup] Lifecycle error during cleanup: %s", e.context.message)
+            return 0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            self.logger.error("[Meta:DustCleanup] Error cleaning up symbol dust state: %s", e.context.message)
+            return 0
         except Exception as e:
-            self.logger.error("[Meta:DustCleanup] Error cleaning up symbol dust state: %s", e)
+            self.logger.exception("[Meta:DustCleanup] Unexpected error during cleanup: %s", type(e).__name__)
             return 0
 
     async def _reset_dust_flags_after_24h(self) -> int:
@@ -581,6 +672,7 @@ class MetaController:
         Returns:
             int: Total count of flags reset (bypass + consolidated)
         """
+        handler = get_error_handler()
         try:
             current_time = time.time()
             timeout_24h = 86400.0  # 24 hours in seconds
@@ -630,8 +722,15 @@ class MetaController:
             
             return reset_count
             
+        except StateError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={"operation": "reset_dust_flags_after_24h"}
+            )
+            self.logger.debug("[Meta:DustReset] State error during flag reset: %s", e.context.message)
+            return 0
         except Exception as e:
-            self.logger.debug("[Meta:DustReset] Error in 24h dust flag auto-reset: %s", e)
+            self.logger.exception("[Meta:DustReset] Unexpected error in 24h dust flag reset: %s", type(e).__name__)
             return 0
 
     def _is_bootstrap_mode(self) -> bool:
