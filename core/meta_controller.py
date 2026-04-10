@@ -4114,14 +4114,29 @@ class MetaController:
             # ═══════════════════════════════════════════════════════════════════════
             # STEP 5: Check balance availability
             # ═══════════════════════════════════════════════════════════════════════
+            handler = get_error_handler()
             try:
                 balance_info = await _safe_await(self.shared_state.get_balance("USDT"))
                 if isinstance(balance_info, dict):
                     balance_usdt = float(balance_info.get("free", 0.0))
                 else:
                     balance_usdt = float(balance_info or 0.0)
+            except ExchangeError as e:
+                classification = handler.handle_exception(
+                    e,
+                    additional_context={
+                        "operation": "get_balance_step5",
+                        "component": "BalanceFetch",
+                        "currency": "USDT"
+                    }
+                )
+                self.logger.debug("[Meta:BuyGate] Failed to get USDT balance: %s", e.context.message)
+                balance_usdt = 0.0
+            except TraderException as e:
+                classification = handler.handle_exception(e)
+                balance_usdt = 0.0
             except Exception as e:
-                self.logger.debug(f"[Meta:BuyGate] Failed to get USDT balance: {e}")
+                self.logger.debug("[Meta:BuyGate] Unexpected error getting USDT balance: %s", type(e).__name__)
                 balance_usdt = 0.0
             
             if balance_usdt < planned_quote:
@@ -4136,16 +4151,35 @@ class MetaController:
             # STEP 6: All checks passed - BUY is safe
             # ═══════════════════════════════════════════════════════════════════════
             self.logger.info(
-                f"[Meta:BuyGate] ✅ NO_DUST_BUY PASSED for {symbol}:\n"
-                f"  total_notional={float(total_notional_after_buy):.2f} USDT\n"
-                f"  >= exchange_min={exchange_min_trade_quote:.2f} USDT\n"
-                f"  balance=${balance_usdt:.2f} available\n"
-                f"  → BUY APPROVED (immediately sellable)"
+                "[Meta:BuyGate] ✅ NO_DUST_BUY PASSED for %s:\n"
+                "  total_notional=%.2f USDT\n"
+                "  >= exchange_min=%.2f USDT\n"
+                "  balance=$%.2f available\n"
+                "  → BUY APPROVED (immediately sellable)",
+                symbol, float(total_notional_after_buy), exchange_min_trade_quote, balance_usdt
             )
             return True  # ✅ ALLOW: Safe to place BUY
             
+        except ExecutionError as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "should_place_buy",
+                    "component": "BuyGating",
+                    "symbol": symbol
+                }
+            )
+            self.logger.warning("[Meta:BuyGate] Execution error evaluating BUY for %s: %s", symbol, e.context.message)
+            # Fail-safe: block if uncertain (prefer safety over execution)
+            return False
+        except TraderException as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(e)
+            self.logger.warning("[Meta:BuyGate] Trader error evaluating BUY for %s", symbol)
+            return False
         except Exception as e:
-            self.logger.warning(f"[Meta:BuyGate] Error evaluating BUY for {symbol}: {e}")
+            self.logger.warning("[Meta:BuyGate] Unexpected error evaluating BUY for %s: %s", symbol, type(e).__name__)
             # Fail-safe: block if uncertain (prefer safety over execution)
             return False
 
@@ -4259,11 +4293,25 @@ class MetaController:
             # Still accumulating, not yet resolved
             return None
             
-        except Exception as e:
-            self.logger.warning(
-                "[INVARIANT:Accumulation] Error processing accumulation for %s: %s",
-                symbol, e
+        except ExecutionError as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "accumulation_resolution_check",
+                    "component": "PositionAccumulation",
+                    "symbol": symbol
+                }
             )
+            self.logger.warning("[INVARIANT:Accumulation] Execution error processing accumulation for %s: %s", symbol, e.context.message)
+            return None
+        except TraderException as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(e)
+            self.logger.warning("[INVARIANT:Accumulation] Trader error processing accumulation for %s", symbol)
+            return None
+        except Exception as e:
+            self.logger.warning("[INVARIANT:Accumulation] Unexpected error processing accumulation for %s: %s", symbol, type(e).__name__)
             return None
     
     
