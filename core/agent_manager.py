@@ -87,6 +87,13 @@ class AgentManager:
                 # Do NOT set _started — allow the caller to retry start().
                 return
 
+        # ✅ BOOTSTRAP: Run discovery agents once to populate symbol universe
+        try:
+            await self.bootstrap_symbol_universe()
+        except Exception as e:
+            self.logger.warning("[Bootstrap] Symbol universe population failed: %s", e, exc_info=True)
+            # Continue anyway - lazy loading in strategy agents will retry
+
         # Only mark started after registration has succeeded so retry is possible.
         self._started = True
 
@@ -94,6 +101,61 @@ class AgentManager:
             _asyncio.create_task(self.run_loop(), name="AgentManager:run_loop")
         elif hasattr(self, "run"):
             _asyncio.create_task(self.run(), name="AgentManager:run")
+
+    async def bootstrap_symbol_universe(self):
+        """
+        Run discovery agents ONCE to populate the initial symbol universe.
+        This ensures strategy agents can access symbols when they call generate_signals().
+        
+        ✅ Fixes: SwingTradeHunter, TrendHunter, DipSniper 0 symbols issue
+        ✅ Timing: Called during startup BEFORE strategy agents run
+        """
+        self.logger.info("[Bootstrap] Populating symbol universe from discovery agents...")
+        
+        populated = False
+        discovery_count = 0
+        
+        # Get discovery agents
+        discovery_agent_instances = [a for a in self.agents.values() if getattr(a, 'agent_type', None) == 'discovery']
+        
+        if not discovery_agent_instances:
+            self.logger.debug("[Bootstrap] No discovery agents registered")
+            return
+        
+        # Run each discovery agent once
+        for agent in discovery_agent_instances:
+            agent_name = getattr(agent, 'name', agent.__class__.__name__)
+            if not hasattr(agent, 'run_once'):
+                self.logger.debug(f"[Bootstrap] Agent {agent_name} has no run_once() method")
+                continue
+            
+            try:
+                self.logger.info(f"[Bootstrap] Running discovery: {agent_name}")
+                result = agent.run_once()
+                if inspect.iscoroutine(result):
+                    await result
+                self.logger.info(f"[Bootstrap] ✅ {agent_name} completed discovery")
+                populated = True
+                discovery_count += 1
+            except Exception as e:
+                self.logger.warning(f"[Bootstrap] Discovery failed for {agent_name}: {e}", exc_info=True)
+                continue
+        
+        # Verify symbols were populated
+        try:
+            syms = self.shared_state.get_accepted_symbols()
+            if inspect.iscoroutine(syms):
+                syms = await syms
+            
+            if isinstance(syms, dict):
+                sym_count = len(syms)
+            else:
+                sym_count = len(list(syms or []))
+            
+            self.logger.info(f"[Bootstrap] ✅ Symbol universe populated: {sym_count} symbols from {discovery_count} agents")
+        except Exception as e:
+            self.logger.warning(f"[Bootstrap] Could not verify symbols: {e}")
+    
     def __init__(
         self,
         shared_state,
@@ -338,14 +400,26 @@ class AgentManager:
     # NEW: normalize any agent-returned signals into TradeIntents
     def _normalize_to_intents(self, agent_name: str, raw: Any) -> list:
         intents = []
-        if not raw:
-            self.logger.warning("[AgentManager:NORMALIZE] Empty/None raw signals from %s", agent_name)
+        # Distinguish "agent returned nothing" from "agent returned an empty list".
+        # `None` usually indicates an error path or a contract violation; empty collections
+        # are normal when no setups are present.
+        if raw is None:
+            self.logger.warning("[AgentManager:NORMALIZE] None raw signals from %s", agent_name)
+            return intents
+        if isinstance(raw, (list, tuple, set)) and len(raw) == 0:
+            self.logger.debug("[AgentManager:NORMALIZE] 0 raw signals from %s", agent_name)
+            return intents
+        if raw == {}:
+            self.logger.debug("[AgentManager:NORMALIZE] 0 raw signals from %s (empty dict)", agent_name)
+            return intents
+        if raw is False or raw == 0 or raw == "":
+            self.logger.debug("[AgentManager:NORMALIZE] 0 raw signals from %s (falsey=%r)", agent_name, raw)
             return intents
         if isinstance(raw, dict):
             raw = [raw]
         elif not isinstance(raw, (list, tuple, set)):
             raw = [raw]
-        self.logger.warning("[AgentManager:NORMALIZE] Normalizing %d raw signals from %s", len(raw), agent_name)
+        self.logger.debug("[AgentManager:NORMALIZE] Normalizing %d raw signals from %s", len(raw), agent_name)
         for s in raw:
             # Handle canonical TradeIntent objects directly (previously dropped silently).
             if isinstance(TradeIntent, type) and isinstance(s, TradeIntent):
@@ -429,7 +503,7 @@ class AgentManager:
                 agent_name, len(raw), raw[0] if raw else "N/A",
             )
         if intents:
-            self.logger.warning("[AgentManager:NORMALIZE] ✓ Successfully normalized %d intents from %s", len(intents), agent_name)
+            self.logger.info("[AgentManager:NORMALIZE] ✓ Normalized %d intents from %s", len(intents), agent_name)
         return intents
 
     async def collect_and_forward_signals(self):

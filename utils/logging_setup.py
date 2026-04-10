@@ -5,13 +5,13 @@ import logging
 import sys
 from datetime import datetime
 
-def setup_logging(log_file=None, level=logging.INFO):
+def setup_logging(log_file=None, level=logging.DEBUG):
     """
     Setup basic logging configuration.
     
     Args:
         log_file: Optional log file path
-        level: Logging level (default: INFO)
+        level: Logging level (default: DEBUG)
     
     Returns:
         Logger instance

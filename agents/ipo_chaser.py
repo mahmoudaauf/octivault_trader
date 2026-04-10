@@ -175,13 +175,61 @@ class IPOChaser:
                 self._running = False
 
     async def run_loop(self):
-        logger.info(f"🚀 [{self.name}] run_loop started. Interval: {self.interval}s")
+        logger.info(f"🚀 [{self.name}] run_loop started. Base interval: {self.interval}s")
         while not self._stop_event.is_set():
             try:
                 await self.run_once()
             except Exception as e:
                 logger.error(f"[{self.name}] discovery error: {e}", exc_info=True)
-            await asyncio.sleep(self.interval + min(1.0, 0.05 * self.interval))  # mild jitter
+            
+            # ✅ PHASE 2a: ADAPTIVE INTERVALS based on volatility
+            wait_time = await self._get_adaptive_interval()
+            await asyncio.sleep(wait_time)
+
+    async def _get_adaptive_interval(self) -> float:
+        """
+        Adjust scan interval based on market volatility regime.
+        
+        Strategy:
+          - High volatility: scan more frequently (faster response to IPOs)
+          - Normal volatility: use base interval
+          - Low volatility: scan less frequently (no IPOs expected)
+        
+        Returns: seconds to wait before next scan
+        """
+        try:
+            # Get global market volatility regime
+            if hasattr(self.shared_state, "get_volatility_regime"):
+                try:
+                    regime_result = self.shared_state.get_volatility_regime(
+                        "GLOBAL", timeframe="1h", max_age_seconds=300
+                    )
+                    regime_result = await regime_result if asyncio.iscoroutine(regime_result) else regime_result
+                    
+                    if isinstance(regime_result, dict):
+                        regime = str(regime_result.get("regime", "normal")).lower()
+                        
+                        # Adjust interval based on regime
+                        if regime == "high":
+                            # High volatility: scan 2x more frequently
+                            adjusted = self.interval / 2.0
+                            logger.debug(f"[{self.name}] High volatility regime: scanning every {adjusted:.0f}s")
+                            return adjusted + 0.1  # Slight jitter
+                        elif regime == "low":
+                            # Low volatility: scan 2x less frequently
+                            adjusted = self.interval * 2.0
+                            logger.debug(f"[{self.name}] Low volatility regime: scanning every {adjusted:.0f}s")
+                            return adjusted + 0.1
+                        # else: normal, use base interval
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Volatility regime check failed: {e}")
+            
+            # Fallback: use base interval with mild jitter
+            return self.interval + min(1.0, 0.05 * self.interval)
+        
+        except Exception as e:
+            logger.debug(f"[{self.name}] Unexpected error in _get_adaptive_interval: {e}")
+            return self.interval + 0.1  # Safe default
 
     async def run_discovery(self):
         """Alias so AgentManager can call a one-shot discovery in Phase-3."""
@@ -395,17 +443,5 @@ class IPOChaser:
             return 0.0
 
     async def _emit_signal(self, symbol: str, signal: Dict[str, Any]) -> None:
-        # Mandatory P9 Signal Contract: Emit to Signal Bus
-        if hasattr(self.shared_state, "add_agent_signal"):
-            try:
-                await self.shared_state.add_agent_signal(
-                    symbol=symbol,
-                    agent=self.name,
-                    side=signal.get("action", "hold").upper(),
-                    confidence=float(signal.get("confidence", 0.0)),
-                    ttl_sec=300,
-                    tier="B",
-                    rationale=signal.get("reason", "IPO Chaser ML prediction")
-                )
-            except Exception as e:
-                logger.warning(f"[{self.name}] Failed to emit to signal bus: {e}")
+        # Event bus publishing happens in _publish_trade_intent
+        pass

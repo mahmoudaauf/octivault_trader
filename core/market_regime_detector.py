@@ -223,9 +223,43 @@ class MarketRegimeDetector:
         
         try:
             # Extract price data
-            closes = [c.get("close", 0.0) for c in ohlcv[-self.sample_size:]]
-            highs = [c.get("high", 0.0) for c in ohlcv[-self.sample_size:]]
-            lows = [c.get("low", 0.0) for c in ohlcv[-self.sample_size:]]
+            # Support both normalized format ("c"/"h"/"l") and full names ("close"/"high"/"low")
+            # CRITICAL: Use 'in' check instead of 'or' to avoid treating 0.0 as falsy
+            sample = ohlcv[-self.sample_size:]
+            
+            # Try normalized keys first ("c", "h", "l"), then full names ("close", "high", "low")
+            closes = []
+            highs = []
+            lows = []
+            
+            for c in sample:
+                # Extract close: try "c" first, then "close"
+                close_val = c.get("c") if "c" in c else c.get("close", 0.0)
+                closes.append(float(close_val) if close_val is not None else 0.0)
+                
+                # Extract high: try "h" first, then "high"
+                high_val = c.get("h") if "h" in c else c.get("high", 0.0)
+                highs.append(float(high_val) if high_val is not None else 0.0)
+                
+                # Extract low: try "l" first, then "low"
+                low_val = c.get("l") if "l" in c else c.get("low", 0.0)
+                lows.append(float(low_val) if low_val is not None else 0.0)
+            
+            # Validate that we actually have data
+            valid_closes = [c for c in closes if c and c > 0.0]
+            if not valid_closes:
+                self.logger.error(
+                    f"[RegimeDetector] ZERO PRICES EXTRACTED for {symbol}! "
+                    f"Sample size={len(sample)}, closes={closes[:3]}... "
+                    f"OHLCV format check: first bar keys={list(sample[0].keys()) if sample else 'EMPTY'} "
+                    f"first bar data={sample[0] if sample else 'N/A'}"
+                )
+                return RegimeMetrics(
+                    regime=MarketRegime.UNKNOWN,
+                    adx=0.0, atr_pct=0.0, rsi=0.0, spread_pct=0.0,
+                    volatility=0.0, trend_strength=0.0, momentum=0.0, confidence=0.0,
+                    timestamp=time.time(), symbol=symbol,
+                )
             
             # Calculate indicators
             adx = self._calculate_adx(highs, lows, closes)
@@ -288,6 +322,13 @@ class MarketRegimeDetector:
             # Cache for reuse
             self._metrics_cache[symbol] = metrics
             self._last_update[symbol] = time.time()
+            
+            # Log successful detection
+            self.logger.info(
+                f"[RegimeDetector] SUCCESS {symbol}: regime={regime.value} "
+                f"adx={adx:.1f} atr_pct={atr_pct:.4f} spread={spread_pct:.6f} "
+                f"confidence={confidence:.2f}"
+            )
             
             return metrics
         

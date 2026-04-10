@@ -48,7 +48,7 @@ class Config:
     # Symbol screener targets (Phase 1 implementation)
     SCREENER_MIN_PROPOSALS = 20   # Minimum candidates to propose
     SCREENER_MAX_PROPOSALS = 30   # Maximum candidates to propose
-    SCREENER_MIN_VOLUME = 1000000 # $1M minimum 24h volume
+    SCREENER_MIN_VOLUME = 100000  # $100k minimum 24h volume (lowered from 1M for better discovery)
     SCREENER_MIN_PRICE = 0.01     # Filter dust coins
 
     # ---------- Volatility regime (ATR%) ----------
@@ -153,7 +153,11 @@ class Config:
     MIN_POSITION_USDT = 24.0
     MIN_POSITION_MIN_NOTIONAL_MULT = 2.0
     MIN_ENTRY_USDT = 24.0
-    MIN_ENTRY_QUOTE_USDT = 15.0
+    # Reduced from 15.0 to 10.0 to allow larger discovery universe on small accounts
+    # UURE smart cap = floor(equity × exposure / min_entry)
+    # Example: $200 × 0.6 / 10 = 12 symbols (vs. 4 with 25)
+    # With env override via MIN_ENTRY_QUOTE_USDT, can be tuned per account
+    MIN_ENTRY_QUOTE_USDT = 10.0
     DEFAULT_PLANNED_QUOTE = 24.0
     EMIT_BUY_QUOTE = 24.0
     MIN_TRADE_QUOTE = 12.0
@@ -168,6 +172,10 @@ class Config:
     DUST_MIN_QUOTE_USDT = 5.0
     DUST_POSITION_QTY = 0.0001
     PERMANENT_DUST_USDT_THRESHOLD = 1.0
+    # Dust priority system thresholds (Reuse > Aggregate > Cleanup)
+    DUST_AGGREGATE_THRESHOLD_HOURS = 4.0   # hold dust this long before triggering cleanup
+    DUST_STALL_THRESHOLD_HOURS = 4.0       # used by DustMonitor to classify STALLED status
+    DUST_CRITICAL_THRESHOLD_HOURS = 8.0   # used by DustMonitor to classify CRITICAL status
     STRICT_ACCOUNTING_INTEGRITY = False
     STRICT_OBSERVABILITY_EVENTS = False
     CAPITAL_ALLOCATOR_SHARED_WALLET = True
@@ -555,6 +563,15 @@ class Config:
     ENABLE_COT_VALIDATION = True  # keep CoT guard path enabled
     DEFAULT_AGENT_DIRECT_EXECUTION = False  # global safe default; agents read AGENT_EXECUTION
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # CAPITAL VELOCITY OPTIMIZER CONFIGURATION
+    # ═══════════════════════════════════════════════════════════════════════════════
+    ENABLE_CAPITAL_VELOCITY_OPTIMIZATION = True     # Master switch
+    VELOCITY_GAP_THRESHOLD_PCT = 0.5                # Min % per hour to consider rotating
+    VELOCITY_MIN_POSITION_AGE_HOURS = 0.25          # Min hold time (15 min)
+    VELOCITY_HOLDING_COST_FEE_BPS = 10.0            # Estimated round-trip fee in basis points
+    VELOCITY_CONFIDENCE_MIN = 0.55                  # Min ML confidence to estimate velocity
+
     # ----- helper -----
     @staticmethod
     def _mask(s: str, head: int = 4, tail: int = 2) -> str:
@@ -697,7 +714,7 @@ class Config:
             os.getenv("SCREENER_MAX_PROPOSALS", "30")
         )
         self.SCREENER_MIN_VOLUME = float(
-            os.getenv("SCREENER_MIN_VOLUME", "1000000")
+            os.getenv("SCREENER_MIN_VOLUME", "100000")
         )
         self.SCREENER_MIN_PRICE = float(
             os.getenv("SCREENER_MIN_PRICE", "0.01")
@@ -726,8 +743,10 @@ class Config:
         # ---------- Modes, region/type, keys, endpoints ... (unchanged)
 
         # ---------- Trading Capital / KPI ----------
-        self.BASE_CAPITAL = float(os.getenv("BASE_CAPITAL", 400.0))
+        base_cap_str = os.getenv("BASE_CAPITAL", "")
+        self.BASE_CAPITAL = float(base_cap_str) if base_cap_str else None
         self.BASE_TARGET_PER_HOUR = float(os.getenv("BASE_TARGET_PER_HOUR", 20.0))
+
 
         # ---------- Equity-tier scaling ----------
         self.EQUITY_TIER_BLOCK_ON_RECOVERY = os.getenv(
@@ -1044,7 +1063,7 @@ class Config:
         _small_cap_on = (
             (_small_cap_env or "").lower() == "true"
             if _small_cap_env is not None
-            else self.BASE_CAPITAL <= 250.0
+            else (self.BASE_CAPITAL is not None and self.BASE_CAPITAL <= 250.0)
         )
         self.SMALL_CAP_PROFILE = _small_cap_on
         if _small_cap_on:
@@ -1172,6 +1191,10 @@ class Config:
         self.DUST_MIN_QUOTE_USDT = float(os.getenv("DUST_MIN_QUOTE_USDT", str(Config.DUST_MIN_QUOTE_USDT)))
         self.DUST_POSITION_QTY = float(os.getenv("DUST_POSITION_QTY", str(Config.DUST_POSITION_QTY)))
         self.PERMANENT_DUST_USDT_THRESHOLD = float(os.getenv("PERMANENT_DUST_USDT_THRESHOLD", str(Config.PERMANENT_DUST_USDT_THRESHOLD)))
+        # Dust priority system: Reuse > Aggregate > Cleanup
+        self.DUST_AGGREGATE_THRESHOLD_HOURS = float(os.getenv("DUST_AGGREGATE_THRESHOLD_HOURS", str(Config.DUST_AGGREGATE_THRESHOLD_HOURS)))
+        self.DUST_STALL_THRESHOLD_HOURS = float(os.getenv("DUST_STALL_THRESHOLD_HOURS", str(Config.DUST_STALL_THRESHOLD_HOURS)))
+        self.DUST_CRITICAL_THRESHOLD_HOURS = float(os.getenv("DUST_CRITICAL_THRESHOLD_HOURS", str(Config.DUST_CRITICAL_THRESHOLD_HOURS)))
 
         # Ensure dust controls exist (some logs assume these attributes)
         self.DUST_LIQUIDATION_ENABLED = os.getenv("DUST_LIQUIDATION_ENABLED", "false").lower() == "true"

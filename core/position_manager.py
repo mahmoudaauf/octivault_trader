@@ -559,7 +559,13 @@ class PositionManager:
 
                 # mark price & notional
                 mark_price = await _get_mark_price(sym)
-                notional = abs(qty) * (mark_price if mark_price > 0 else 0.0)
+                
+                # WALLET ENTRY PRICE RECONSTRUCTION: If entry_price is missing or 0, fallback to mark_price
+                # This prevents crashes when avg_price is None. The execution layer can refine it later.
+                if avg_price is None and mark_price > 0:
+                    avg_price = float(mark_price)
+                
+                notional = abs(qty) * (mark_price if mark_price > 0 else avg_price if avg_price > 0 else 0.0)
 
                 out[sym] = {
                     "symbol": sym,
@@ -569,6 +575,11 @@ class PositionManager:
                     "entry_ts": entry_ts,
                     "mark_price": float(mark_price) if mark_price > 0 else None,
                     "notional": float(notional),
+                    # PHASE 2: Origin tracking for positions from exchange
+                    "classification": "BOT_POSITION",  # Positions from exchange_open_positions are bot trades
+                    "origin": "exchange_open_positions",  # Origin source for position tracking
+                    "created_at": entry_ts or time.time(),  # Position creation timestamp
+                    "created_by_agent": "PositionManager",  # Agent that registered this position
                 }
             except Exception:
                 # Skip malformed records rather than failing the whole tick

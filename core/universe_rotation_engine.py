@@ -97,7 +97,9 @@ class UniverseRotationEngine:
         # Config extraction
         self.min_entry_quote = float(self._cfg("MIN_ENTRY_QUOTE_USDT", 20.0))
         self.max_symbol_limit = int(self._cfg("MAX_SYMBOL_LIMIT", 30))
-        self.max_exposure = float(self._cfg("MAX_EXPOSURE_RATIO", 0.8))
+        # Use MAX_TOTAL_EXPOSURE_PCT from Config (default 0.6), not hardcoded 0.8
+        # This ensures universe cap respects actual portfolio allocation settings
+        self.max_exposure = float(self._cfg("MAX_TOTAL_EXPOSURE_PCT", 0.6))
 
     def wire_runtime_dependencies(
         self,
@@ -113,6 +115,78 @@ class UniverseRotationEngine:
             self.exec = execution_manager
         if meta_controller is not None:
             self.mc = meta_controller
+
+    # ============================================================================
+    # PHASE 1: EV ALIGNMENT METHODS
+    # ============================================================================
+    # Expose EV calculation methods for validation and alignment with ExecutionManager
+    
+    def get_round_trip_cost_pct(self) -> float:
+        """
+        PHASE 1: PUBLIC API for round-trip cost calculation.
+        
+        This method should return EXACTLY the same value as ExecutionManager.
+        Used for EV alignment validation.
+        
+        Returns:
+            Round-trip cost as decimal (e.g., 0.0035 = 0.35%)
+        """
+        return self._round_trip_cost_pct()
+    
+    def get_ev_multiplier_for_regime(self, regime: str) -> float:
+        """
+        PHASE 1: PUBLIC API for EV multiplier by regime.
+        
+        This method should return the same multiplier as ExecutionManager would use
+        for the same regime. Used for alignment validation.
+        
+        Args:
+            regime: Market volatility regime ('normal', 'bull', 'other', etc.)
+        
+        Returns:
+            EV multiplier (e.g., 1.3 means required_edge = 0.35% × 1.3 = 0.455%)
+        """
+        return self._ev_multiplier_for_regime(regime)
+    
+    def get_required_edge_for_regime(self, regime: str) -> float:
+        """
+        PHASE 1: PUBLIC API for required minimum edge by regime.
+        
+        This is the minimum edge (expressed as decimal) that must be present
+        for a symbol to be admitted to the universe. Same formula as ExecutionManager uses.
+        
+        Args:
+            regime: Market regime
+        
+        Returns:
+            Required edge as decimal (e.g., 0.00455 = 0.455%)
+        """
+        round_trip = self.get_round_trip_cost_pct()
+        multiplier = self.get_ev_multiplier_for_regime(regime)
+        return round_trip * multiplier
+    
+    def get_ev_config_summary(self) -> Dict[str, Any]:
+        """
+        PHASE 1: Export EV configuration for alignment audit.
+        
+        Returns a dict summarizing current EV settings used by UURE.
+        Compare this with ExecutionManager's settings to verify alignment.
+        
+        Returns:
+            Dictionary with EV configuration details
+        """
+        spot_mode = bool(self._cfg("UURE_SPOT_MODE", False))
+        return {
+            "round_trip_cost_pct": self.get_round_trip_cost_pct(),
+            "ev_mult_normal": self.get_ev_multiplier_for_regime("normal"),
+            "ev_mult_bull": self.get_ev_multiplier_for_regime("bull"),
+            "ev_mult_other": self.get_ev_multiplier_for_regime("other"),
+            "spot_mode_enabled": spot_mode,
+            "required_edge_normal": self.get_required_edge_for_regime("normal"),
+            "required_edge_bull": self.get_required_edge_for_regime("bull"),
+            "required_edge_other": self.get_required_edge_for_regime("other"),
+            "source": "UniverseRotationEngine (PHASE 1 EV ALIGNMENT)",
+        }
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         """Config getter that supports dict or attribute configs."""
@@ -152,7 +226,17 @@ class UniverseRotationEngine:
         """
         Best-effort round-trip cost as a ratio (e.g. 0.0025 = 0.25%).
         Mirrors ExecutionManager EV hard-gate cost composition: fees (round-trip) + slippage + buffer.
+        
+        Can be overridden by UURE_ROUND_TRIP_COST_PCT for spot trading tuning.
         """
+        # Check for explicit override (useful for spot trading tuning)
+        override = self._cfg("UURE_ROUND_TRIP_COST_PCT", None)
+        if override is not None:
+            try:
+                return max(0.0, float(override))
+            except Exception:
+                pass
+        
         fee_pct = 0.0
         try:
             if self.exec is not None and getattr(self.exec, "trade_fee_pct", None) is not None:
@@ -418,13 +502,40 @@ class UniverseRotationEngine:
             return None
 
     def _ev_multiplier_for_regime(self, regime: str) -> float:
+        """
+        Get EV multiplier for a given regime.
+        
+        Controls required edge threshold:
+          required_edge = round_trip_cost × multiplier
+        
+        Lower multiplier = lower barrier to entry (good for spot trading).
+        
+        Configs:
+          UURE_SOFT_EV_MULTIPLIER: Override all regimes (e.g., 0.8 for loose spot)
+          UURE_EV_MULT_NORMAL: Normal regime (default 1.3, for spot try 0.9-1.0)
+          UURE_EV_MULT_BULL: Bull regime (default 1.8, for spot try 1.2-1.3)
+          UURE_EV_MULT_OTHER: Other regimes (default 2.0, for spot try 1.5-1.8)
+          UURE_SPOT_MODE: If True, use relaxed spot-trading multipliers (0.7, 1.0, 1.4)
+        """
         rg = str(regime or "").strip().lower()
+        
+        # Check for global override
         override = self._cfg("UURE_SOFT_EV_MULTIPLIER", None)
         if override is not None:
             try:
                 return max(0.5, float(override))
             except Exception:
                 pass
+        
+        # Check for spot mode (all regimes use relaxed thresholds)
+        spot_mode = bool(self._cfg("UURE_SPOT_MODE", False))
+        if spot_mode:
+            if rg == "normal":
+                return max(0.5, float(self._cfg("UURE_EV_MULT_SPOT_NORMAL", 0.7)))
+            elif rg == "bull":
+                return max(0.5, float(self._cfg("UURE_EV_MULT_SPOT_BULL", 1.0)))
+            else:
+                return max(0.5, float(self._cfg("UURE_EV_MULT_SPOT_OTHER", 1.4)))
         
         # Use dynamic profile if available
         profile = self._get_dynamic_profile()
@@ -436,7 +547,7 @@ class UniverseRotationEngine:
             else:
                 return max(0.5, float(profile.get("ev_mult_other", 2.0)))
         
-        # Fallback to legacy config
+        # Fallback to regime-specific config
         if rg == "normal":
             default = 1.3
             key = "UURE_EV_MULT_NORMAL"
@@ -538,36 +649,245 @@ class UniverseRotationEngine:
             result["error"] = str(e)
             return result
 
+    async def _is_dust_position(self, symbol: str) -> bool:
+        """
+        Check if a position is dust (value below minimum tradable notional).
+        
+        Returns True if position value is:
+        - Less than dust_min_quote_usdt, OR
+        - Less than MIN_POSITION_VALUE_USDT, OR
+        - Less than symbol's exchange minNotional
+        
+        This prevents scoring and rotating dust positions.
+        """
+        try:
+            # Get position from shared_state
+            positions = await self._maybe_await(self.ss.get_positions_snapshot())
+            if symbol not in positions:
+                return False
+            
+            pos = positions[symbol]
+            qty = float(pos.get("quantity", 0.0) or 0.0)
+            
+            # Zero qty = dust (closed position)
+            if qty <= 0:
+                return True
+            
+            # Get price
+            price = await self._safe_price(symbol)
+            if price <= 0:
+                return True  # No price = can't trade = dust
+            
+            # Calculate notional value
+            notional = qty * price
+            
+            # Get thresholds
+            dust_floor = float(self._cfg("dust_min_quote_usdt", 5.0))
+            min_position_value = float(self._cfg("MIN_POSITION_VALUE_USDT", 10.0))
+            
+            # Try to get exchange minNotional
+            try:
+                filters = await self.ss.get_symbol_filters_cached(symbol) if hasattr(self.ss, "get_symbol_filters_cached") else None
+                min_notional = float(filters.get("minNotional", 10.0) or 10.0) if filters else 10.0
+            except Exception:
+                min_notional = 10.0
+            
+            # Use highest threshold as the barrier
+            threshold = max(dust_floor, min_position_value, min_notional)
+            is_dust = notional < threshold
+            
+            if is_dust:
+                self.logger.debug(
+                    f"[UURE:DustFilter] {symbol}: notional=${notional:.2f} < threshold=${threshold:.2f} "
+                    f"(dust_floor=${dust_floor:.2f}, min_pos=${min_position_value:.2f}, min_notional=${min_notional:.2f})"
+                )
+            
+            return is_dust
+        
+        except Exception as e:
+            self.logger.debug(f"[UURE:DustFilter] Error checking dust for {symbol}: {e}")
+            return False  # Treat unknown as non-dust (safe default)
+
     async def _collect_candidates(self) -> List[str]:
-        """Step 1: Collect all candidate symbols from discovery & current positions."""
+        """Step 1: Collect all candidate symbols from discovery & current positions.
+
+        ARCHITECTURE (Professional Standard):
+          Trading Universe != Wallet Assets.
+
+          Three distinct sources are combined here:
+            1. accepted_syms  — symbols currently in the accepted universe
+            2. position_syms  — positions the BOT placed (NOT wallet-only mirrors)
+            3. discovery_syms — proposals from discovery agents (SymbolScreener, etc.)
+
+          Wallet-hydrated positions (_mirrored=True) are deliberately excluded.
+          The wallet is a STATE RECONCILIATION source, not a discovery source.
+          Symbols enter the universe only through proposers -> filters -> UURE.
+        """
         try:
             # Get symbols from accepted set
             accepted = await self._maybe_await(self.ss.get_accepted_symbols())
             accepted_syms = set(accepted.keys())
 
-            # Get symbols from positions
+            # Get BOT-MANAGED positions only — exclude wallet-mirror positions.
+            # hydrate_positions_from_balances() tags wallet-reconstructed positions
+            # with _mirrored=True. We must NOT feed those back into the universe:
+            # that would let arbitrary wallet assets (GAS, NEO, TRX...) contaminate
+            # the trading universe. The wallet is for reconciliation, not discovery.
             positions = await self._maybe_await(self.ss.get_positions_snapshot())
-            position_syms = set(positions.keys())
-
-            # Union of both (all candidates)
-            all_syms = accepted_syms | position_syms
-
-            self.logger.debug(
-                f"[UURE] Candidates: {len(accepted_syms)} accepted, "
-                f"{len(position_syms)} positions, {len(all_syms)} total"
+            position_syms = set(
+                sym
+                for sym, pos in positions.items()
+                if not pos.get("_mirrored", False)
             )
-            return list(all_syms)
+            wallet_only_count = len(positions) - len(position_syms)
+
+            # ✅ PHASE 2c: DISCOVERY PROPOSALS - Wire discovery proposals into UURE
+            # This is the KEY CHANGE that enables 10x candidate expansion
+            discovery_syms = await self._collect_discovery_proposals()
+
+            # Union of all sources (accepted + bot-managed positions + discovery)
+            all_syms = accepted_syms | position_syms | discovery_syms
+
+            # ✅ DUST FILTER: Exclude dust positions from rotation cycle
+            non_dust_syms = []
+            dust_count = 0
+            for sym in all_syms:
+                if await self._is_dust_position(sym):
+                    dust_count += 1
+                else:
+                    non_dust_syms.append(sym)
+
+            self.logger.info(
+                f"[UURE] Candidates: {len(accepted_syms)} accepted, "
+                f"{len(position_syms)} bot-positions "
+                f"({wallet_only_count} wallet-only excluded), "
+                f"{len(discovery_syms)} discovery, "
+                f"{len(all_syms)} total, filtered {dust_count} dust → {len(non_dust_syms)} viable"
+            )
+            return non_dust_syms
 
         except Exception as e:
             self.logger.error(f"[UURE] Error collecting candidates: {e}")
             return []
 
+    async def _collect_discovery_proposals(self) -> Set[str]:
+        """
+        ✅ PHASE 2c: Collect discovery proposals from DiscoveryCoordinator.
+
+        This is the KEY INTEGRATION POINT that expands UURE's candidate pool
+        from 2-5 symbols to 20-30+ symbols by pulling from discovery agents.
+
+        Reads from TWO stores (union):
+          1. ss.discovery_proposals  — written by DiscoveryCoordinator (if wired)
+          2. ss.symbol_proposals     — written directly by SymbolScreener, IPOChaser,
+                                       TrendHunter, WalletScannerAgent as fallback
+
+        Returns:
+            Set of symbol strings proposed by discovery agents
+        """
+        try:
+            # Primary store (DiscoveryCoordinator output)
+            proposals = getattr(self.ss, "discovery_proposals", None) or {}
+            # Fallback store (direct agent writes — always present even without DiscoveryCoordinator)
+            symbol_proposals = getattr(self.ss, "symbol_proposals", None) or {}
+
+            if not proposals and not symbol_proposals:
+                self.logger.debug("[UURE] No discovery proposals available this cycle")
+                return set()
+
+            # Extract symbols from both stores
+            discovery_syms: Set[str] = set()
+
+            for source_store in (proposals, symbol_proposals):
+                for symbol, prop in source_store.items():
+                    if isinstance(prop, dict):
+                        sym = str(prop.get("symbol", symbol)).upper()
+                    else:
+                        sym = str(symbol).upper()
+                    if sym:
+                        discovery_syms.add(sym)
+
+            self.logger.info(
+                f"[UURE] Collected {len(discovery_syms)} discovery proposals "
+                f"({len(proposals)} from discovery_proposals, "
+                f"{len(symbol_proposals)} from symbol_proposals): "
+                f"{list(discovery_syms)[:8]}..."
+            )
+            
+            # ✅ FIX #8 PART 2: Clear proposals after collection to prevent accumulation
+            # Each UURE cycle should see fresh discoveries from the last agent run
+            self.ss.discovery_proposals.clear()
+            self.ss.symbol_proposals.clear()
+            self.logger.debug("[UURE] Cleared discovery_proposals and symbol_proposals for next cycle")
+            
+            return discovery_syms
+
+        except Exception as e:
+            self.logger.error(f"[UURE] Error collecting discovery proposals: {e}")
+            return set()
+
+    async def _collect_discovery_proposals_weighted(self) -> Set[str]:
+        """
+        ✅ PHASE 3: Collect discovery proposals with regime-based weighting.
+        
+        Enhanced version that prefers regime-aligned proposals for better signal quality.
+        
+        Returns:
+            Set of symbol strings, ordered by weighted_score (descending)
+        """
+        try:
+            use_weighting = bool(self._cfg("DISCOVERY_USE_REGIME_WEIGHTING", False))
+            
+            if not use_weighting:
+                # Fall back to Phase 2c behavior (no weighting)
+                return await self._collect_discovery_proposals()
+            
+            # Get weighted proposals (if available)
+            weighted_props = getattr(self.ss, "discovery_proposals_weighted", None) or {}
+            
+            if not weighted_props:
+                self.logger.debug("[UURE] No weighted discovery proposals available")
+                return await self._collect_discovery_proposals()
+            
+            # Extract symbols sorted by weighted_score
+            discovery_syms = []
+            for symbol, prop in sorted(
+                weighted_props.items(),
+                key=lambda x: x[1].get("weighted_score", 0.0) if isinstance(x[1], dict) else 0.0,
+                reverse=True
+            ):
+                if isinstance(prop, dict):
+                    symbol = str(prop.get("symbol", symbol)).upper()
+                    weighted_score = float(prop.get("weighted_score", 0.0))
+                else:
+                    symbol = str(symbol).upper()
+                    weighted_score = 0.0
+                
+                if symbol:
+                    discovery_syms.append((symbol, weighted_score))
+            
+            # Extract just symbols
+            syms = set(s[0] for s in discovery_syms)
+            
+            self.logger.debug(
+                f"[UURE] Collected {len(syms)} weighted discovery proposals, "
+                f"top scores: {discovery_syms[:3]}"
+            )
+            
+            return syms
+        
+        except Exception as e:
+            self.logger.error(f"[UURE] Error collecting weighted proposals: {e}")
+            # Fall back to unweighted
+            return await self._collect_discovery_proposals()
+
     async def _score_all(
         self, candidates: List[str]
     ) -> Dict[str, float]:
-        """Step 2: Unified score for all candidates."""
+        """Step 2: Unified score for all candidates (dust already pre-filtered)."""
         try:
             scores = {}
+            skipped = []
             for candidate in candidates:
                 # FIX #2: Safe handling of mixed candidate types
                 # Handle string candidates, dict candidates, and float/invalid candidates
@@ -592,14 +912,15 @@ class UniverseRotationEngine:
                     score = self.ss.get_unified_score(symbol)
                     scores[symbol] = score
                 except Exception as score_err:
-                    self.logger.warning(f"[UURE] Failed to score {symbol}: {score_err}")
-                    # Continue with next candidate
+                    self.logger.debug(f"[UURE] Failed to score {symbol}: {score_err}")
+                    skipped.append(symbol)
                     continue
 
             if scores:
                 self.logger.info(
                     f"[UURE] Scored {len(scores)} candidates. "
-                    f"Mean: {sum(scores.values())/len(scores):.3f}"
+                    f"Mean: {sum(scores.values())/len(scores):.3f}, "
+                    f"skipped: {len(skipped)}"
                 )
             else:
                 self.logger.warning(f"[UURE] No candidates scored (processed {len(candidates)} inputs)")
@@ -645,13 +966,24 @@ class UniverseRotationEngine:
         """
         Step 4.5: Soft profitability filter for candidate admission.
 
-        Admission rule:
-          expected_move >= round_trip_cost × regime_multiplier
-
-        Default regime multipliers:
-          - normal: 1.3
-          - bull:   1.8
-          - other:  2.0
+        NEW STRATEGY (2024-03-07): Top-N ranking instead of hard threshold
+        
+        Problem with hard threshold:
+          - Too aggressive: filters 30 → 1 symbols
+          - No diversification
+          - Fewer trading signals
+        
+        Solution: Keep top N candidates ranked by profitability score
+        
+        Algorithm:
+          1. Score each candidate by: expected_move_pct - (required_move_pct × edge_penalty)
+          2. Rank by score (descending)
+          3. Keep top N (configurable, default: 20)
+          4. Also apply regime filter if enabled (low/sideways rejection)
+        
+        Config:
+          UURE_KEEP_TOP_PROFITABLE: How many top candidates to keep (default: 20)
+          UURE_DISABLE_SIDEWAYS_REGIME_TRADING: Reject low/sideways (default: False)
         """
         try:
             if not candidates:
@@ -659,8 +991,10 @@ class UniverseRotationEngine:
 
             round_trip_cost_pct = float(self._round_trip_cost_pct())
             disable_sideways = self._disable_sideways_in_uure()
+            keep_top = int(self._cfg("UURE_KEEP_TOP_PROFITABLE", 20) or 20)
 
-            profitable: List[str] = []
+            # Score each candidate
+            scored_candidates: List[Tuple[str, float]] = []
             filtered_out: List[str] = []
 
             for sym in candidates:
@@ -668,47 +1002,72 @@ class UniverseRotationEngine:
                 try:
                     regime = await self._volatility_regime_1h(sym_u)
                     regime = regime or "normal"
+                    
+                    # Reject low/sideways if configured
                     if disable_sideways:
                         if regime in ("low", "sideways"):
                             filtered_out.append(sym_u)
+                            self.logger.debug(
+                                "[UURE] %s rejected (sideways regime disabled)", sym_u
+                            )
                             continue
 
                     price = float(await self._safe_price(sym_u) or 0.0)
                     if price <= 0:
-                        filtered_out.append(sym_u)
+                        # No price yet: assign a neutral score so the symbol is ranked
+                        # but not favoured over priced symbols. Do NOT hard-reject —
+                        # prices may arrive before the next candle.
+                        multiplier = float(self._ev_multiplier_for_regime(regime))
+                        required_move_pct = float(round_trip_cost_pct) * float(multiplier)
+                        edge_pct = -required_move_pct  # neutral penalty
+                        scored_candidates.append((sym_u, edge_pct))
+                        self.logger.debug("[UURE] %s has no price yet; using neutral score %.6f", sym_u, edge_pct)
                         continue
 
+                    # Calculate expected move and required threshold
                     expected_move_pct = float(await self._expected_move_pct_1h(sym_u, price) or 0.0)
                     multiplier = float(self._ev_multiplier_for_regime(regime))
                     required_move_pct = float(round_trip_cost_pct) * float(multiplier)
-                    if expected_move_pct >= required_move_pct:
-                        profitable.append(sym_u)
-                    else:
-                        filtered_out.append(sym_u)
-                        self.logger.debug(
-                            "[UURE] %s filtered: expected=%.6f required=%.6f regime=%s mult=%.2f",
-                            sym_u,
-                            expected_move_pct,
-                            required_move_pct,
-                            regime,
-                            multiplier,
-                        )
-                except Exception:
-                    # Safe default: keep symbol on unexpected errors (avoid freezing rotation loop).
-                    profitable.append(sym_u)
+
+                    # Profitability score = expected_move - required_move (can be negative)
+                    # This allows exploration of symbols with slightly negative edge
+                    edge_pct = expected_move_pct - required_move_pct
+
+                    scored_candidates.append((sym_u, edge_pct))
+                    
+                    self.logger.debug(
+                        "[UURE] %s scored: expected=%.6f required=%.6f edge=%.6f regime=%s",
+                        sym_u,
+                        expected_move_pct,
+                        required_move_pct,
+                        edge_pct,
+                        regime,
+                    )
+                except Exception as e:
+                    # Safe default: keep symbol on unexpected errors
+                    self.logger.debug("[UURE] %s error during scoring: %s", sym, str(e))
+                    scored_candidates.append((str(sym or "").replace("/", "").upper(), 0.0))
             
-            # If no symbols pass filter, keep current universe (rotation blocked)
+            # Sort by edge (descending) and keep top N
+            scored_candidates.sort(key=lambda x: x[1], reverse=True)
+            profitable = [sym for sym, _ in scored_candidates[:max(1, keep_top)]]
+            
+            # If we have fewer candidates than keep_top, return all
+            if len(scored_candidates) <= keep_top:
+                profitable = [sym for sym, _ in scored_candidates]
+            
+            # Sanity check: if somehow we have no profitable candidates
             if not profitable:
                 current = self.ss.get_accepted_symbol_list()
                 self.logger.warning(
-                    f"[UURE] No candidates met profitability threshold. "
+                    f"[UURE] No candidates passed basic checks. "
                     f"Keeping current universe: {current}"
                 )
                 return current
             
             self.logger.info(
-                f"[UURE] Profitability filter: {len(candidates)} → {len(profitable)} symbols "
-                f"({len(filtered_out)} filtered)"
+                f"[UURE] Profitability filter (keep_top={keep_top}): {len(candidates)} → {len(profitable)} symbols "
+                f"({len(filtered_out)} regime-filtered, top edge=+{scored_candidates[0][1]:.6f}%)"
             )
             return profitable
         
@@ -720,23 +1079,43 @@ class UniverseRotationEngine:
         self, new_candidates: List[str], current_universe: List[str]
     ) -> List[str]:
         """
-        Step 4.6: Relative Replacement Rule
+        Step 4.6: Relative Replacement Rule with Adaptive Thresholds
         
-        Only allows rotation OUT of a symbol if incoming candidates
-        have superior edge vs the weakest active symbol.
+        Controls whether incoming candidates can rotate OUT existing symbols.
+        Supports both:
+          A) Relative mode: incoming > weakest × factor (conservative, prevents downside rotation)
+          B) Absolute minimum mode: incoming > min_edge_pct (spot-friendly, simpler threshold)
         
-        Rule: incoming_edge > weakest_active_edge × ROTATION_SUPERIORITY_FACTOR
-              if weakest_active_edge <= 0, allow free rotation
+        Rule (default):
+          incoming_edge > weakest_active_edge × ROTATION_SUPERIORITY_FACTOR
+          if weakest_active_edge <= 0, allow free rotation
         
-        Default ROTATION_SUPERIORITY_FACTOR = 1.25 (25% edge premium required)
+        Spot trading mode (UURE_MINIMUM_EDGE_PCT set):
+          incoming_edge > UURE_MINIMUM_EDGE_PCT
+          Simpler, more permissive threshold ideal for 0.05%-0.15% edge strategies
         
-        This prevents rotating out of proven winners into marginal candidates.
+        Configs:
+          ROTATION_SUPERIORITY_FACTOR: Relative multiplier (default 1.25, try 1.1-1.2 for spot)
+          UURE_MINIMUM_EDGE_PCT: Absolute edge floor as decimal (e.g., 0.001 = 0.1%)
+          UURE_SPOT_MODE: If True, prefer MINIMUM_EDGE_PCT over superiority factor
+          UURE_RELATIVE_REPLACE_DISABLED: If True, disable rule entirely (discovery-first mode)
         """
         try:
-            # Get config
+            # ✅ FIX #7B: Discovery-first mode - accept all candidates without relative gating
+            disable_relative = bool(self._cfg("UURE_RELATIVE_REPLACE_DISABLED", True))
+            if disable_relative:
+                self.logger.info(
+                    "[UURE] Relative rule DISABLED (discovery-first mode) — accepting all %d candidates",
+                    len(new_candidates)
+                )
+                return new_candidates
+            
+            # Get config options
             superiority_factor = float(
                 self._cfg("ROTATION_SUPERIORITY_FACTOR", 1.25)
             )
+            minimum_edge_pct = self._cfg("UURE_MINIMUM_EDGE_PCT", None)
+            spot_mode = bool(self._cfg("UURE_SPOT_MODE", False))
             
             # No current universe = fresh start, allow all
             if not current_universe:
@@ -766,27 +1145,53 @@ class UniverseRotationEngine:
                     incumbent_edges[sym_u] = float(exp_move - required_move_pct)
                 except Exception:
                     continue
+            
             weakest_edge = min(incumbent_edges.values()) if incumbent_edges else 0.0
-            free_rotation_mode = float(weakest_edge) <= 0.0
-            required_edge = (
-                0.0 if free_rotation_mode else float(weakest_edge) * float(superiority_factor)
+            
+            # Determine threshold strategy
+            use_minimum_mode = (
+                spot_mode and minimum_edge_pct is not None
+            ) or (
+                minimum_edge_pct is not None and 
+                self._cfg("UURE_PREFER_MINIMUM_EDGE", False)
             )
+            
+            if use_minimum_mode:
+                # Absolute minimum edge mode (spot-friendly)
+                try:
+                    threshold = max(0.0, float(minimum_edge_pct))
+                except Exception:
+                    threshold = 0.001  # Fallback: 0.1%
+                
+                self.logger.info(
+                    "[UURE] Relative rule (MINIMUM_EDGE mode): threshold=%.6f (%.4f%%) weakest_active=%.6f",
+                    float(threshold),
+                    float(threshold) * 100.0,
+                    float(weakest_edge),
+                )
+            else:
+                # Relative superiority mode (conservative)
+                free_rotation_mode = float(weakest_edge) <= 0.0
+                threshold = (
+                    0.0 if free_rotation_mode else float(weakest_edge) * float(superiority_factor)
+                )
+                
+                self.logger.info(
+                    "[UURE] Relative rule (SUPERIORITY mode): weakest_active_net_edge=%.6f threshold=%.6f (factor=%.2f free_mode=%s)",
+                    float(weakest_edge),
+                    float(threshold),
+                    float(superiority_factor),
+                    str(free_rotation_mode),
+                )
 
-            self.logger.info(
-                "[UURE] Relative replacement rule: weakest_active_net_edge=%.6f required_net_edge=%.6f (factor=%.2f free_mode=%s)",
-                float(weakest_edge),
-                float(required_edge),
-                float(superiority_factor),
-                str(free_rotation_mode),
-            )
-
-            # Accept new candidates only if they clear the superiority threshold.
+            # Accept new candidates only if they clear the threshold.
             current_set = {str(s or "").replace("/", "").upper() for s in current_universe}
             accepted: List[str] = []
             rejected: List[str] = []
             for sym in new_candidates:
                 sym_u = str(sym or "").replace("/", "").upper()
                 if sym_u in current_set:
+                    # Incumbents stay by default
                     accepted.append(sym_u)
                     continue
                 try:
@@ -796,14 +1201,13 @@ class UniverseRotationEngine:
                         if regime in ("low", "sideways"):
                             rejected.append(sym_u)
                             continue
-                    if free_rotation_mode:
-                        accepted.append(sym_u)
-                        continue
+                    
                     price = float(await self._safe_price(sym_u) or 0.0)
                     exp_move = float(await self._expected_move_pct_1h(sym_u, price) or 0.0) if price > 0 else 0.0
                     required_move_pct = float(round_trip_cost_pct) * float(self._ev_multiplier_for_regime(regime))
                     net_edge = float(exp_move - required_move_pct)
-                    if net_edge > float(required_edge):
+                    
+                    if net_edge > float(threshold):
                         accepted.append(sym_u)
                     else:
                         rejected.append(sym_u)
@@ -845,12 +1249,14 @@ class UniverseRotationEngine:
         """
         Compute dynamic cap based on:
           • Governor calculation
-          • Available capital
+          • Available capital (total equity)
           • Min entry size
           • Max symbol limit
         
         Formula:
-          dynamic_cap = floor((NAV * exposure) / min_entry_quote)
+          equity = await shared_state.get_total_equity()  # Professional standard NAV
+          deployable = equity * exposure
+          dynamic_cap = floor(deployable / min_entry_quote)
           cap = min(dynamic_cap, MAX_SYMBOL_LIMIT)
           cap = max(cap, 1)  # Always at least 1
         """
@@ -862,34 +1268,41 @@ class UniverseRotationEngine:
             if governor_cap is None:
                 governor_cap = self.max_symbol_limit
 
-            # Get capital metrics
-            nav = self.ss.get_nav_quote()
-            if nav is None or nav <= 0:
+            # Get total equity using professional standard calculation
+            # This ensures NAV is calculated from shared_state, not raw wallet positions
+            equity = await self.ss.get_total_equity()
+            if equity is None or equity <= 0:
                 self.logger.warning(
-                    "[UURE] NAV unavailable, using governor cap"
+                    "[UURE] Total equity unavailable, using governor cap"
                 )
                 return governor_cap
 
             # Compute dynamic cap
-            deployable = nav * self.max_exposure
+            deployable = equity * self.max_exposure
             dynamic_cap = int(deployable / self.min_entry_quote)
 
             # Apply limits
             final_cap = min(dynamic_cap, self.max_symbol_limit)
             final_cap = max(final_cap, 1)
 
-            # But don't exceed governor cap
-            final_cap = min(final_cap, governor_cap)
+            # NOTE: Governor cap is informational but not limiting for smart cap
+            # The dynamic formula already respects capital constraints via exposure + min_entry
+            # Applying governor_cap here would double-constrain and prevent universe growth
+            # Keep for reference but don't apply as hard ceiling
+            if governor_cap is not None:
+                self.logger.debug(
+                    f"[UURE] Governor cap available: {governor_cap} (not applied to smart cap)"
+                )
 
             self.logger.info(
-                f"[UURE] Smart cap: NAV={nav:.2f}, exposure={self.max_exposure}, "
+                f"[UURE] Smart cap: equity={equity:.2f}, exposure={self.max_exposure}, "
                 f"dynamic={dynamic_cap}, final={final_cap}"
             )
             return final_cap
 
         except Exception as e:
             self.logger.error(f"[UURE] Error computing smart cap: {e}")
-            return 2  # Default to 2 if error
+            return self.max_symbol_limit  # Safe fallback — don't collapse universe to 2
 
     async def _identify_rotation(
         self, new_universe: List[str]
@@ -918,30 +1331,59 @@ class UniverseRotationEngine:
             return {"added": [], "removed": [], "kept": []}
 
     async def _hard_replace_universe(self, new_universe: List[str]) -> None:
-        """Step 6: Hard replace accepted symbols with new universe."""
+        """Step 6: Merge new universe with existing accepted symbols (union, not replace).
+        
+        CRITICAL FIX: Use union instead of hard replace.
+        
+        Why this matters:
+          - Hard replace kills symbols that discovery just added
+          - Union preserves discovery additions while enabling rotation
+          - Discovery flow: SymbolScreener proposes → UURE ranks → union preserves all
+          
+        Architecture:
+          new_universe = top-ranked candidates for this cycle
+          current = symbols already accepted (from previous cycles + discovery)
+          result = current ∪ new_universe (keeps all, rotation by score)
+        """
         try:
-            # Build metadata for new universe
+            # Get current accepted symbols
+            current_accepted = set()
+            try:
+                current = await self._maybe_await(self.ss.get_accepted_symbols())
+                if isinstance(current, dict):
+                    current_accepted = set(current.keys())
+                elif isinstance(current, (list, set)):
+                    current_accepted = set(current)
+            except Exception:
+                pass
+
+            # Union: keep current symbols + add new ranked symbols
+            # This prevents killing discovery proposals
+            merged_symbols = current_accepted.union(set(new_universe))
+            
+            # Build metadata for merged universe
             symbols_with_meta = {}
-            for sym in new_universe:
+            for sym in merged_symbols:
                 symbols_with_meta[sym] = {
                     "symbol": sym,
                     "source": "UniverseRotationEngine",
                     "rotation_cycle": self._get_cycle_timestamp(),
                 }
 
-            # Hard replace (allow_shrink=True since we control the replacement)
+            # Update symbols using union (NOT hard replace with allow_shrink=True)
             await self.ss.set_accepted_symbols(
                 symbols_with_meta,
-                allow_shrink=True,
+                allow_shrink=False,  # ✅ FIXED: Use union instead of destructive replace
                 source="UniverseRotationEngine"
             )
 
             self.logger.info(
-                f"[UURE] Hard-replaced universe: {len(new_universe)} symbols"
+                f"[UURE] Merged universe: {len(current_accepted)} existing + "
+                f"{len(new_universe)} new ranked = {len(merged_symbols)} total"
             )
 
         except Exception as e:
-            self.logger.error(f"[UURE] Error hard-replacing universe: {e}")
+            self.logger.error(f"[UURE] Error merging universe: {e}")
 
     async def _trigger_liquidation(self, symbols_to_remove: List[str]) -> None:
         """Step 7: Trigger liquidation of removed symbols."""

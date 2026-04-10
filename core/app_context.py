@@ -85,6 +85,7 @@ _comp_mod           = _import_optional("core.compounding_engine")
 _vol_mod            = _import_optional("core.volatility_regime")
 _portfolio_mod      = _import_optional("portfolio.balancer")
 _pnl_mod            = _import_optional("utils.pnl_calculator")
+_model_mgr_mod      = _import_optional("core.model_manager")
 _perf_eval_mod      = _import_optional("core.performance_evaluator")
 _liq_orch_mod       = _import_optional("core.liquidation_orchestrator")
 _cash_router_mod    = _import_optional("core.cash_router")
@@ -96,6 +97,12 @@ _wallet_scanner_mod = _import_optional("agents.wallet_scanner_agent")
 _dashboard_mod      = _import_optional("dashboard_server")
 _cap_alloc_mod      = _import_optional("core.capital_allocator")
 _ptg_mod            = _import_optional("core.profit_target_engine")
+_position_merger_mod = _import_optional("core.position_merger_enhanced")
+_rebalancing_mod     = _import_optional("core.rebalancing_engine")
+
+# 🧠 Decision Governance Layer (NEW - P3 integration)
+_action_router_mod          = _import_optional("core.action_router")
+_external_adoption_mod      = _import_optional("core.external_adoption_engine")
 
 #
 # === SECTION: Small Utilities ===
@@ -192,6 +199,13 @@ def _try_construct(cls: Optional[type], **candidate_kwargs) -> Optional[Any]:
     """
     if not cls:
         return None
+    
+    logger = candidate_kwargs.get("logger")
+    cls_name = getattr(cls, "__name__", str(cls))
+    
+    # Critical components that should log errors
+    critical_components = {"MarketDataFeed", "ExchangeClient", "SharedState", "ExecutionManager"}
+    is_critical = cls_name in critical_components
         
     # Primary attempt: signature-aware filtering
     try:
@@ -201,6 +215,9 @@ def _try_construct(cls: Optional[type], **candidate_kwargs) -> Optional[Any]:
         instance = cls(**kwargs)
         return instance
     except Exception as e_primary:
+        # Log critical component failures
+        if is_critical and logger:
+            logger.error(f"[CRITICAL] Failed to construct {cls_name}: {type(e_primary).__name__}: {e_primary}")
         # Silently continue to fallbacks (optional components)
         pass
     # Fallback attempts with common kwarg subsets
@@ -217,7 +234,13 @@ def _try_construct(cls: Optional[type], **candidate_kwargs) -> Optional[Any]:
             instance = cls(**kwargs)
             return instance
         except Exception as e_fallback:
+            if is_critical and logger:
+                logger.debug(f"[DEBUG] {cls_name} fallback attempt failed: {type(e_fallback).__name__}: {e_fallback}")
             continue
+    
+    # Log failure for critical components
+    if is_critical and logger:
+        logger.error(f"[CRITICAL] Could not construct {cls_name} with any fallback combination")
     
     # Silent failure: optional components are skipped without fanfare
     return None
@@ -996,6 +1019,7 @@ class AppContext:
         self.capital_symbol_governor: Optional[Any] = None
         self.universe_rotation_engine: Optional[Any] = None
         self.market_data_feed: Optional[Any] = None
+        self.polling_coordinator: Optional[Any] = None  # ← NEW: Staggered polling
         self.agent_manager: Optional[Any] = None
         self.risk_manager: Optional[Any] = None
         self.execution_manager: Optional[Any] = None
@@ -1020,11 +1044,17 @@ class AppContext:
         self.dust_monitor: Optional[Any] = None  # Phase G: Real-time dust monitoring
         self.adaptive_capital_engine: Optional[Any] = None  # Adaptive sizing engine
         self.exchange_truth_auditor: Optional[Any] = None  # P3 exchange truth reconciliation
+        self.model_manager: Optional[Any] = None  # ✅ NEW: ModelManager for ML/training
+        self.position_merger: Optional[Any] = None  # Phase 6: Position consolidation engine
+        self.rebalancing_engine: Optional[Any] = None  # Phase 6: Portfolio rebalancing engine
+        self.action_router: Optional[Any] = None  # 🧠 P3: Decision Governance Layer - ActionRouter (the brain)
+        self.external_adoption_engine: Optional[Any] = None  # 🛡️ P3: Decision Governance Layer - ExternalAdoptionEngine
 
         # Persistent execution journal (crash-safe JSONL)
         from core.trade_journal import TradeJournal
         self.trade_journal: TradeJournal = TradeJournal()
         self.session_id: str = datetime.now(timezone.utc).isoformat()
+
 
         # Back-compat aliases removed.
 
@@ -1822,11 +1852,12 @@ class AppContext:
             # 🔥 FIX: Seed initial symbols for UURE before loop starts
             # UURE needs candidates to score, but discovery may be slow at startup
             # This prevents the pre-scoring gate from failing on first cycle
+            # ✅ CRITICAL: Use merge mode to PRESERVE any symbols discovered by agents, not replace them!
             try:
                 if self.shared_state:
                     current = await self.shared_state.get_accepted_symbols()
                     if not current or len(current) < 3:
-                        self.logger.info("[Init] Seeding initial universe for UURE (discovery in progress)...")
+                        self.logger.info("[Init] Seeding initial universe for UURE (discovery in progress, MERGE mode)...")
                         
                         seed_symbols = {
                             "BTCUSDT": {"status": "TRADING", "notional": 10},
@@ -1836,8 +1867,10 @@ class AppContext:
                             "ADAUSDT": {"status": "TRADING", "notional": 10},
                         }
                         
-                        await self.shared_state.set_accepted_symbols(seed_symbols)
-                        self.logger.info(f"[Init] Seeded {len(seed_symbols)} symbols for UURE startup")
+                        # ✅ Use merge mode: adds to existing symbols instead of replacing
+                        # This allows discovery agents to keep their found symbols while ensuring minimum coverage
+                        await self.shared_state.set_accepted_symbols(seed_symbols, merge_mode=True)
+                        self.logger.info(f"[Init] Seeded {len(seed_symbols)} symbols for UURE startup (merge mode = discovery preserved)")
             except Exception:
                 self.logger.debug("failed to seed UURE symbols", exc_info=True)
             
@@ -2261,6 +2294,17 @@ class AppContext:
             self.logger.debug("shutdown: UURE loop stop timed out")
         except Exception:
             self.logger.debug("shutdown: stop UURE loop failed", exc_info=True)
+
+        # Stop PollingCoordinator with timeout (before other components)
+        try:
+            polling_coord = getattr(self, "polling_coordinator", None)
+            if polling_coord and hasattr(polling_coord, "stop"):
+                await asyncio.wait_for(polling_coord.stop(), timeout=10.0)
+                self.logger.info("shutdown: PollingCoordinator stopped")
+        except asyncio.TimeoutError:
+            self.logger.debug("shutdown: PollingCoordinator stop timed out")
+        except Exception:
+            self.logger.debug("shutdown: PollingCoordinator stop failed", exc_info=True)
 
         # Ordered stop: higher-level controllers first
         comps = self._components_for_shutdown()
@@ -2707,7 +2751,16 @@ class AppContext:
 
             # Fallback to ExecutionManager probe
             if self.execution_manager and hasattr(self.execution_manager, "can_afford_market_buy"):
-                res = self.execution_manager.can_afford_market_buy(symbol, planned_quote)
+                probe_policy_ctx = {
+                    "authority": "app_context_probe",
+                    "affordability_probe": True,
+                    "probe_source": "dry_probe_execution",
+                }
+                res = self.execution_manager.can_afford_market_buy(
+                    symbol,
+                    planned_quote,
+                    policy_context=probe_policy_ctx,
+                )
                 res = await res if asyncio.iscoroutine(res) else res
                 try:
                     ok, amt, code = res
@@ -2811,7 +2864,16 @@ class AppContext:
                     free_now = 0.0
 
                 # Probe execution path
-                res = self.execution_manager.can_afford_market_buy(symbol, planned_quote)
+                probe_policy_ctx = {
+                    "authority": "app_context_probe",
+                    "affordability_probe": True,
+                    "probe_source": "affordability_scout",
+                }
+                res = self.execution_manager.can_afford_market_buy(
+                    symbol,
+                    planned_quote,
+                    policy_context=probe_policy_ctx,
+                )
                 res = await res if asyncio.iscoroutine(res) else res
                 try:
                     ok, amt, code = res
@@ -3165,7 +3227,16 @@ class AppContext:
             # Path B: ExecutionManager.can_afford_market_buy() fallback
             if not used_snapshot and symbol and self.execution_manager and hasattr(self.execution_manager, "can_afford_market_buy"):
                 try:
-                    res = self.execution_manager.can_afford_market_buy(symbol, planned_quote)
+                    probe_policy_ctx = {
+                        "authority": "app_context_probe",
+                        "affordability_probe": True,
+                        "probe_source": "readiness_detail",
+                    }
+                    res = self.execution_manager.can_afford_market_buy(
+                        symbol,
+                        planned_quote,
+                        policy_context=probe_policy_ctx,
+                    )
                     res = await res if asyncio.iscoroutine(res) else res
                     try:
                         ok, amount, code = res
@@ -3522,7 +3593,7 @@ class AppContext:
             "shared_state": self.shared_state,
             "exchange_client": self.exchange_client,
             "market_data_feed": self.market_data_feed,
-            "market_data": self.market_data_feed,  # some expect market_data
+            "market_data": self.shared_state,  # agents use get_market_data() which is on SharedState, not MarketDataFeed
             "execution_manager": self.execution_manager,
             "symbol_manager": self.symbol_manager,
             "risk_manager": self.risk_manager,
@@ -3532,6 +3603,7 @@ class AppContext:
             "database_manager": self.database_manager,
             "pnl_calculator": self.pnl_calculator,
             "performance_evaluator": self.performance_evaluator,
+            "model_manager": self.model_manager,
         }
 
         # (Optional) Cash Router
@@ -3573,7 +3645,41 @@ class AppContext:
         # MarketDataFeed
         if self.market_data_feed is None:
             MarketDataFeed = _get_cls(_market_data_mod, "MarketDataFeed")
-            self.market_data_feed = _try_construct(MarketDataFeed, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, exchange_client=self.exchange_client)
+            if MarketDataFeed is None:
+                self.logger.error("[Bootstrap] MarketDataFeed class not found in market_data module")
+            else:
+                self.market_data_feed = _try_construct(MarketDataFeed, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, exchange_client=self.exchange_client)
+                if self.market_data_feed is None:
+                    # Detailed diagnostics for MarketDataFeed construction failure
+                    missing_deps = []
+                    if self.shared_state is None:
+                        missing_deps.append("shared_state")
+                    if self.exchange_client is None:
+                        missing_deps.append("exchange_client")
+                    if missing_deps:
+                        self.logger.error(
+                            "[Bootstrap] MarketDataFeed construction failed: missing required dependencies (%s)",
+                            ", ".join(missing_deps),
+                        )
+                    else:
+                        # All required deps are present, try direct construction to get the actual error
+                        try:
+                            self.logger.warning(
+                                "[Bootstrap] MarketDataFeed _try_construct returned None; attempting direct construction for error details..."
+                            )
+                            self.market_data_feed = MarketDataFeed(
+                                shared_state=self.shared_state,
+                                exchange_client=self.exchange_client,
+                                config=self.config,
+                                logger=self.logger,
+                            )
+                        except Exception as e_direct:
+                            self.logger.error(
+                                "[Bootstrap] MarketDataFeed direct construction failed: %s: %s",
+                                type(e_direct).__name__,
+                                e_direct,
+                                exc_info=True,
+                            )
 
         # ExecutionManager
         if self.execution_manager is None:
@@ -3693,15 +3799,38 @@ class AppContext:
             StrategyManager = _get_cls(_strategy_mgr_mod, "StrategyManager")
             self.strategy_manager = _try_construct(StrategyManager, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, exchange_client=self.exchange_client)
 
+        # ModelManager (needed by agents for ML model persistence)
+        if self.model_manager is None and _model_mgr_mod:
+            ModelManager = _get_cls(_model_mgr_mod, "ModelManager")
+            self.model_manager = _try_construct(ModelManager, config=self.config, logger=self.logger, app=self)
+            if self.model_manager is None and ModelManager is not None:
+                try:
+                    self.logger.warning("[Bootstrap] ModelManager _try_construct returned None; attempting direct construction...")
+                    self.model_manager = ModelManager(config=self.config)
+                    self.logger.info("[Bootstrap] ✅ ModelManager created (direct construction)")
+                except Exception as e_direct:
+                    self.logger.error("[Bootstrap] ModelManager direct construction failed: %s: %s", type(e_direct).__name__, e_direct, exc_info=True)
+            else:
+                if self.model_manager:
+                    self.logger.info("[Bootstrap] ✅ ModelManager created successfully")
+
         if self.agent_manager is None:
             AgentManager = _get_cls(_agent_mgr_mod, "AgentManager")
-            self.agent_manager = _try_construct(AgentManager, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, execution_manager=self.execution_manager, exchange_client=self.exchange_client, market_data=self.market_data_feed, symbol_manager=self.symbol_manager, meta_controller=self.meta_controller)
+            self.agent_manager = _try_construct(AgentManager, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, execution_manager=self.execution_manager, exchange_client=self.exchange_client, market_data=self.shared_state, symbol_manager=self.symbol_manager, meta_controller=self.meta_controller)
         
         # 🔥 CRITICAL FIX: Ensure MetaController is injected into AgentManager
         # This was missing, causing signals to never reach the decision pipeline
         if self.agent_manager and self.meta_controller:
             self.agent_manager.meta_controller = self.meta_controller
             self.logger.info("[Bootstrap] ✅ Injected MetaController into AgentManager - signal pipeline connected!")
+
+        # 🔥 CRITICAL FIX: Wire AgentManager back into MetaController
+        # Without this, MetaController.agent_manager is None and the forced signal collection
+        # at meta_controller.py _build_decisions (line ~6046) is always skipped, causing
+        # MetaController to miss fresh agent signals before each decision cycle.
+        if self.meta_controller and self.agent_manager:
+            self.meta_controller.agent_manager = self.agent_manager
+            self.logger.info("[Bootstrap] ✅ Injected AgentManager into MetaController - forced pre-decision signal sync enabled!")
 
         # 🔥 CRITICAL FIX: Register discovery agents with AgentManager
         # This was missing, preventing discovery agents (IPOChaser, WalletScanner, etc.) from running
@@ -3712,9 +3841,14 @@ class AppContext:
                     from core.agent_registry import register_all_discovery_agents as _reg_discovery, register_all_strategy_agents as _reg_strategy
                     _reg_discovery(self.agent_manager, self)
                     _reg_strategy(self.agent_manager, self)
-                except ImportError:
+                except (ImportError, ModuleNotFoundError) as import_err:
                     # Fall back to local implementations if import fails
-                    self.logger.warning("[Bootstrap] ⚠️ core.agent_registry import failed, using local agent registration functions")
+                    self.logger.warning("[Bootstrap] ⚠️ core.agent_registry import failed (%s), using local agent registration functions", import_err)
+                    register_all_discovery_agents(self.agent_manager, self)
+                    register_all_strategy_agents(self.agent_manager, self)
+                except Exception as exec_err:
+                    # If execution of registry functions fails, log and fall back
+                    self.logger.warning("[Bootstrap] ⚠️ core.agent_registry execution failed (%s), using local agent registration functions", exec_err)
                     register_all_discovery_agents(self.agent_manager, self)
                     register_all_strategy_agents(self.agent_manager, self)
                 
@@ -3905,9 +4039,87 @@ class AppContext:
             DustMonitor = _get_cls(_dust_monitor_mod, "DustMonitor")
             self.dust_monitor = _try_construct(DustMonitor, shared_state=self.shared_state, config=self.config, logger=self.logger)
 
+        # Phase 6: Position Merger & Rebalancing Engines
+        if self.position_merger is None:
+            PositionMergerEnhanced = _get_cls(_position_merger_mod, "PositionMergerEnhanced")
+            self.position_merger = _try_construct(
+                PositionMergerEnhanced,
+                config=self.config,
+                logger=self.logger,
+                shared_state=self.shared_state,
+                market_data_feed=self.market_data_feed
+            )
+
+        if self.rebalancing_engine is None:
+            RebalancingEngine = _get_cls(_rebalancing_mod, "RebalancingEngine")
+            self.rebalancing_engine = _try_construct(
+                RebalancingEngine,
+                config=self.config,
+                logger=self.logger,
+                shared_state=self.shared_state,
+                execution_manager=self.execution_manager,
+                market_data_feed=self.market_data_feed
+            )
+
+        # 🧠 P3: Decision Governance Layer - ActionRouter (the brain)
+        if self.action_router is None:
+            ActionRouter = _get_cls(_action_router_mod, "ActionRouter")
+            if ActionRouter:
+                self.action_router = _try_construct(
+                    ActionRouter,
+                    shared_state=self.shared_state,
+                    execution_manager=self.execution_manager,
+                    logger=self.logger,
+                    config=self.config,
+                )
+                if self.action_router is None:
+                    try:
+                        self.logger.warning("[Bootstrap] ActionRouter _try_construct returned None; attempting direct construction")
+                        self.action_router = ActionRouter(
+                            shared_state=self.shared_state,
+                            execution_manager=self.execution_manager,
+                        )
+                    except Exception as e_direct:
+                        self.logger.error(
+                            "[Bootstrap] ActionRouter direct construction failed: %s: %s",
+                            type(e_direct).__name__,
+                            e_direct,
+                            exc_info=True,
+                        )
+
+        # 🛡️ P3: Decision Governance Layer - ExternalAdoptionEngine (smart asset handling)
+        if self.external_adoption_engine is None:
+            ExternalAdoptionEngine = _get_cls(_external_adoption_mod, "ExternalAdoptionEngine")
+            if ExternalAdoptionEngine:
+                self.external_adoption_engine = _try_construct(
+                    ExternalAdoptionEngine,
+                    shared_state=self.shared_state,
+                    risk_manager=self.risk_manager,
+                    execution_manager=self.execution_manager,
+                    config=self.config,
+                    logger=self.logger,
+                )
+                if self.external_adoption_engine is None:
+                    try:
+                        self.logger.warning("[Bootstrap] ExternalAdoptionEngine _try_construct returned None; attempting direct construction")
+                        self.external_adoption_engine = ExternalAdoptionEngine(
+                            shared_state=self.shared_state,
+                            risk_manager=self.risk_manager,
+                            execution_manager=self.execution_manager,
+                            config=self.config,
+                        )
+                    except Exception as e_direct:
+                        self.logger.error(
+                            "[Bootstrap] ExternalAdoptionEngine direct construction failed: %s: %s",
+                            type(e_direct).__name__,
+                            e_direct,
+                            exc_info=True,
+                        )
+
         # Maintain back-compat aliases
         self.liq_agent = self.liquidation_agent
         self.liq_orch = self.liquidation_orchestrator
+
 
         if self.meta_controller and self.liquidation_orchestrator:
             # P9: Wire orchestration for opportunistic liquidations
@@ -3919,6 +4131,26 @@ class AppContext:
             if hasattr(self.meta_controller, "set_compounding_engine"):
                 self.meta_controller.set_compounding_engine(self.compounding_engine)
 
+        # Phase 6: Wire Position Merger and Rebalancing Engines to MetaController
+        if self.meta_controller and self.position_merger:
+            if hasattr(self.meta_controller, "set_position_merger"):
+                self.meta_controller.set_position_merger(self.position_merger)
+
+        if self.meta_controller and self.rebalancing_engine:
+            if hasattr(self.meta_controller, "set_rebalancing_engine"):
+                self.meta_controller.set_rebalancing_engine(self.rebalancing_engine)
+
+        # 🧠 P3: Wire Decision Governance Layer to MetaController
+        if self.meta_controller and self.action_router:
+            if hasattr(self.meta_controller, "set_action_router"):
+                self.meta_controller.set_action_router(self.action_router)
+            self.logger.info("[Bootstrap] ActionRouter wired to MetaController")
+
+        if self.meta_controller and self.external_adoption_engine:
+            if hasattr(self.meta_controller, "set_external_adoption_engine"):
+                self.meta_controller.set_external_adoption_engine(self.external_adoption_engine)
+            self.logger.info("[Bootstrap] ExternalAdoptionEngine wired to MetaController")
+
         # Enforce single SharedState identity across core execution components.
         try:
             self._enforce_shared_state_identity(emit_summary=True)
@@ -3927,11 +4159,12 @@ class AppContext:
 
         dust_metrics = self._dust_metrics_snapshot()
 
-        self.logger.info("[BootInventory] built: exch=%s shared=%s mdf=%s exec=%s meta=%s agents=%s risk=%s dashboard=%s cap_alloc=%s dust_monitor=%s",
+        self.logger.info("[BootInventory] built: exch=%s shared=%s mdf=%s exec=%s meta=%s agents=%s risk=%s dashboard=%s cap_alloc=%s dust_monitor=%s action_router=%s external_adoption=%s",
                          bool(self.exchange_client), bool(self.shared_state), bool(self.market_data_feed),
                          bool(self.execution_manager), bool(self.meta_controller),
                          bool(self.agent_manager), bool(self.risk_manager), bool(self.dashboard_server),
-                         bool(self.capital_allocator), bool(self.dust_monitor))
+                         bool(self.capital_allocator), bool(self.dust_monitor),
+                         bool(self.action_router), bool(self.external_adoption_engine))
         self._summary_ff(
             "BOOT_INVENTORY",
             exch=bool(self.exchange_client),
@@ -4233,12 +4466,76 @@ class AppContext:
             except Exception:
                 self.logger.debug("wallet scan bootstrap failed", exc_info=True)
 
+            # P3.8: 🛡️ External Adoption Engine - Evaluate external positions
+            try:
+                if self.external_adoption_engine and self.shared_state:
+                    # Get current wallet balances
+                    try:
+                        balances = await self.shared_state.get_balances() if hasattr(self.shared_state, "get_balances") else {}
+                        if asyncio.iscoroutine(balances):
+                            balances = await balances
+                    except Exception as e:
+                        self.logger.debug("[P3.8] Failed to get balances for external adoption: %s", e)
+                        balances = {}
+                    
+                    # Convert to ExternalPosition format
+                    external_positions = {}
+                    for symbol, data in balances.items():
+                        if isinstance(data, dict):
+                            try:
+                                # Extract fields from balance data
+                                qty = float(data.get("free", 0)) + float(data.get("locked", 0))
+                                if qty > 0:
+                                    # Try to get entry price from shared_state position data
+                                    entry_price = float(data.get("entry_price", 0)) or 1.0
+                                    current_price = float(data.get("current_price", 1.0))
+                                    value_usdt = qty * current_price
+                                    
+                                    from core.external_adoption_engine import ExternalPosition
+                                    external_positions[symbol] = ExternalPosition(
+                                        symbol=symbol,
+                                        quantity=qty,
+                                        entry_price=entry_price,
+                                        current_price=current_price,
+                                        value_usdt=value_usdt,
+                                    )
+                            except Exception as e:
+                                self.logger.debug("[P3.8] Failed to create ExternalPosition for %s: %s", symbol, e)
+                    
+                    if external_positions:
+                        self.logger.info("[P3.8] Evaluating %d external positions", len(external_positions))
+                        try:
+                            results = await self.external_adoption_engine.evaluate_external_positions(external_positions)
+                            adopted_count = sum(1 for r in results if r.decision.value == "adopted")
+                            liquidated_count = sum(1 for r in results if r.decision.value == "liquidated")
+                            hedging_count = sum(1 for r in results if r.decision.value == "hedging")
+                            
+                            self.logger.info(
+                                "[P3.8] External adoption results: adopted=%d liquidated=%d hedging=%d",
+                                adopted_count, liquidated_count, hedging_count
+                            )
+                            
+                            await self._emit_summary(
+                                "P3_EXTERNAL_ADOPTION_EVALUATED",
+                                external_positions_count=len(external_positions),
+                                adopted=adopted_count,
+                                liquidated=liquidated_count,
+                                hedging=hedging_count,
+                            )
+                        except Exception as e:
+                            self.logger.error("[P3.8] External adoption evaluation failed: %s", e, exc_info=True)
+                    else:
+                        self.logger.info("[P3.8] No external positions to evaluate")
+            except Exception:
+                self.logger.debug("external adoption engine bootstrap failed (non-fatal)", exc_info=True)
+
             # P3.9: (kept for clarity; idempotent)
             try:
                 await self._ensure_exchange_public_ready()
                 self._propagate_exchange_client()
             except Exception:
                 self.logger.debug("P3.9 ensure_exchange_public_ready failed (non-fatal)", exc_info=True)
+
 
             # P3.92: Attempt to elevate to signed mode (so P4+ can proceed). Non-fatal if keys are absent.
             try:
@@ -4335,6 +4632,66 @@ class AppContext:
                     await self._emit_summary("INIT_EXCEPTION", error=str(e))
                 except Exception:
                     pass
+
+            # P4.5: Polling Coordinator (staggered open orders/balance/positions polling)
+            try:
+                if up_to_phase >= 4 and self.shared_state and self.exchange_client:
+                    from core.polling_coordinator import PollingCoordinator, PollingConfig
+                    
+                    self.logger.info("[AppContext] Initializing PollingCoordinator (Phase 4.5)...")
+                    
+                    polling_config = PollingConfig(
+                        open_orders_interval_sec=float(self._cfg("POLLING_OPEN_ORDERS_INTERVAL_SEC", 25.0)),
+                        balance_interval_sec=float(self._cfg("POLLING_BALANCE_INTERVAL_SEC", 40.0)),
+                        position_interval_sec=float(self._cfg("POLLING_POSITION_INTERVAL_SEC", 25.0)),
+                        enable_active_trades_gate=bool(self._cfg_bool("POLLING_ENABLE_ACTIVE_TRADES_GATE", "true", default=True)),
+                        health_cadence_sec=float(self._cfg("POLLING_HEALTH_CADENCE_SEC", 5.0)),
+                    )
+                    
+                    self.polling_coordinator = PollingCoordinator(
+                        self.shared_state,
+                        self.exchange_client,
+                        polling_config,
+                        self.logger,
+                    )
+                    
+                    await self.polling_coordinator.start()
+                    self.logger.info("✅ PollingCoordinator started (orders=%.0fs, balance=%.0fs, positions=%.0fs)",
+                                   float(polling_config.open_orders_interval_sec or 0.0),
+                                   float(polling_config.balance_interval_sec or 0.0),
+                                   float(polling_config.position_interval_sec or 0.0))
+                    
+                    try:
+                        await self._emit_summary("P4_POLLING_COORDINATOR", status="STARTED",
+                                               orders_interval=polling_config.open_orders_interval_sec,
+                                               balance_interval=polling_config.balance_interval_sec,
+                                               position_interval=polling_config.position_interval_sec)
+                    except Exception:
+                        pass
+                else:
+                    if up_to_phase < 4:
+                        reason = "PhaseDisabled"
+                    elif not self.shared_state:
+                        reason = "SharedStateMissing"
+                    elif not self.exchange_client:
+                        reason = "ExchangeClientMissing"
+                    else:
+                        reason = "Unknown"
+                    
+                    try:
+                        await self._emit_summary("PHASE_SKIP", phase="P4_polling_coordinator", status="SKIPPED", reason=reason)
+                    except Exception:
+                        pass
+                    
+            except Exception as e:
+                self.logger.error("[AppContext] PollingCoordinator initialization failed: %s", e, exc_info=True)
+                log_structured_error(e, context={"where": "initialize_all:P4.5_polling"}, logger=self.logger,
+                                   component="AppContext", phase="INIT", event="polling_coordinator_init_fail")
+                try:
+                    await self._emit_summary("INIT_EXCEPTION", phase="P4_polling_coordinator", error=str(e))
+                except Exception:
+                    pass
+                # Continue (non-fatal failure)
 
             # P5: Execution manager warmup — only proceeds if P4 gate passed
             if not _p4_gate_ok:
@@ -4772,6 +5129,8 @@ def register_all_strategy_agents(agent_manager, app_context):
                     "config": getattr(app_context, "config", None),
                     "tp_sl_engine": getattr(app_context, "tp_sl_engine", None),
                     "model_manager": getattr(app_context, "model_manager", None),
+                    "meta_controller": getattr(app_context, "meta_controller", None),
+                    "symbol_manager": getattr(app_context, "symbol_manager", None),
                 }
                 
                 kwargs = {k: v for k, v in all_kwargs.items() if k in valid_params or len(valid_params) == 0}
@@ -4824,6 +5183,7 @@ def register_all_discovery_agents(agent_manager, app_context):
                     "symbol_manager": getattr(app_context, "symbol_manager", None),
                     "tp_sl_engine": getattr(app_context, "tp_sl_engine", None),
                     "model_manager": getattr(app_context, "model_manager", None),
+                    "meta_controller": getattr(app_context, "meta_controller", None),
                 }
                 
                 kwargs = {k: v for k, v in all_kwargs.items() if k in valid_params or len(valid_params) == 0}

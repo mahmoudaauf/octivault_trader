@@ -42,7 +42,7 @@ from core.stubs import TradeIntent, ExecOrder
 from core.model_manager import load_model as _load_model, build_model_path, safe_load_model
 from core.component_status_logger import log_component_status
 from utils.indicators import compute_ema, compute_macd
-from core.volatility_adjusted_confidence import (
+from utils.volatility_adjusted_confidence import (
     compute_heuristic_confidence,
     categorize_signal,
     get_signal_quality_metrics,
@@ -205,10 +205,13 @@ class TrendHunter:
 
         # Per-agent knobs
 
-        _allowed_regimes = self._cfg("TRENDHUNTER_ALLOWED_REGIMES", ["", "low", "moderate"])
+        # Default now includes "high" since VolatilityRegimeDetector only emits
+        # "low" | "normal" | "high" — excluding "high" caused TrendHunter to
+        # silently skip ALL symbols in volatile crypto markets.
+        _allowed_regimes = self._cfg("TRENDHUNTER_ALLOWED_REGIMES", ["", "low", "moderate", "high"])
         if isinstance(_allowed_regimes, str):
             _allowed_regimes = [r.strip().lower() for r in _allowed_regimes.split(",") if r.strip()]
-        self.allowed_regimes = set([str(r).lower() for r in (_allowed_regimes or ["", "low", "moderate"])])
+        self.allowed_regimes = set([str(r).lower() for r in (_allowed_regimes or ["", "low", "moderate", "high"])])
         # Back-compat: map legacy "moderate" to the current "normal" regime label.
         if "moderate" in self.allowed_regimes and "normal" not in self.allowed_regimes:
             self.allowed_regimes.add("normal")
@@ -230,6 +233,7 @@ class TrendHunter:
         self.win_count = 0
         self.loss_count = 0
         self._collected_signals: List[Dict[str, Any]] = []
+        self._collecting_for_agent_manager = False
 
         log_component_status(self.name, "Initialized")
         logger.info("🚀 %s initialized (timeframe=%s, symbols=%d)", self.name, self.timeframe, len(self.symbols or []))
@@ -338,9 +342,48 @@ class TrendHunter:
     # ------------- lifecycle -------------
     async def generate_signals(self) -> List[Any]:
         self._collected_signals = []
-        await self.load_symbols()
-        await self.run_once()
-        return self._collected_signals
+        self._collecting_for_agent_manager = True
+        try:
+            await self.load_symbols()
+            await self.run_once()
+            return self._collected_signals
+        finally:
+            self._collecting_for_agent_manager = False
+
+    async def _publish_trade_intent(self, payload: Dict[str, Any]) -> bool:
+        """Publish canonical TradeIntent for standalone agent loops."""
+        event_bus = getattr(self.shared_state, "event_bus", None)
+        publish = getattr(event_bus, "publish", None)
+        if callable(publish):
+            try:
+                await publish("events.trade.intent", TradeIntent(**payload))
+                logger.info(
+                    "[%s] Published TradeIntent: %s %s",
+                    self.name,
+                    payload.get("symbol"),
+                    payload.get("side"),
+                )
+                return True
+            except Exception:
+                logger.warning(
+                    "[%s] Failed to publish TradeIntent for %s",
+                    self.name,
+                    payload.get("symbol"),
+                    exc_info=True,
+                )
+        emit_event = getattr(self.shared_state, "emit_event", None)
+        if callable(emit_event):
+            try:
+                await _await_maybe(emit_event("TradeIntent", dict(payload)))
+                return True
+            except Exception:
+                logger.warning(
+                    "[%s] Fallback TradeIntent emit failed for %s",
+                    self.name,
+                    payload.get("symbol"),
+                    exc_info=True,
+                )
+        return False
 
     async def load_symbols(self) -> None:
         """Load accepted symbols from SharedState with a small TTL throttle."""
@@ -777,6 +820,27 @@ class TrendHunter:
             regime_1h if action_upper == "BUY" else "N/A",
             regime_scaling.get("position_size_mult", 1.0) if regime_scaling else 1.0
         )
+        # Always publish TradeIntent to event bus (needed for MetaController drain)
+        intent_payload = {
+            "symbol": str(symbol).replace("/", "").upper(),
+            "side": action_upper,
+            "planned_quote": quote_hint,
+            "quote_hint": quote_hint,
+            "confidence": float(confidence),
+            "agent": self.name,
+            "tag": f"strategy/{self.name}",
+            "reason": str(reason),
+            "rationale": str(reason),
+            "timeframe": self.timeframe,
+            "timestamp": time.time(),
+            "policy_context": {
+                "expected_move_pct": float(expected_move_pct),
+                "edge": float(edge),
+                "_regime": regime_1h if action_upper == "BUY" else "normal",
+                "_regime_scaling": dict(regime_scaling) if regime_scaling else {},
+            },
+        }
+        await self._publish_trade_intent(intent_payload)
 
     async def _generate_signal(self, symbol: str, is_ml_capable: bool = False) -> Tuple[str, float, str]:
         """
@@ -946,6 +1010,14 @@ class TrendHunter:
                 logger.debug("[%s] TP/SL calculation failed for %s: %s", self.name, symbol, e)
                 tp_pct = 0.0
             
+            # CRITICAL FIX: Prevent TP component from collapsing to zero
+            # If TP calculation fails/returns invalid, fallback to ATR-based estimate
+            # This ensures the 40% TP weight contributes meaningfully to expected_move
+            if tp_pct <= 0:
+                # Calculate ATR first to use as reference (computed below)
+                # For now, mark that we need fallback—ATR will be computed next
+                tp_pct = None  # Signal to use ATR fallback after ATR calculation
+            
             # === Component 2: ATR Multiple Volatility ===
             atr_pct = 1.5  # Default conservative move
             try:
@@ -973,6 +1045,14 @@ class TrendHunter:
             except Exception as e:
                 logger.debug("[%s] ATR calculation failed for %s: %s", self.name, symbol, e)
                 atr_pct = 1.5
+            
+            # CRITICAL FIX: Apply TP fallback if it collapsed to zero
+            # Use ATR * 1.2 as conservative estimate for TP distance
+            # This prevents the 40% TP weight from completely collapsing
+            if tp_pct is None or tp_pct <= 0:
+                tp_pct = atr_pct * 1.2
+                logger.warning("[%s] TP calculation invalid for %s; using ATR fallback: %.2f%%", 
+                             self.name, symbol, tp_pct)
             
             # === Component 3: ML Forecast (if available) ===
             ml_pct = 0.0
@@ -1017,25 +1097,31 @@ class TrendHunter:
                 roi_pct = 1.0
             
             # === Aggregate Expected Move ===
-            # Weighted average: TP (40%) + ATR (30%) + ML (15%) + Historical (15%)
+            # Weighted average: TP (40%) + ATR (30%) + ML (15% base, +15% if available) + Historical (15%)
             weights = {
                 "tp": (tp_pct, 0.40),
                 "atr": (atr_pct, 0.30),
-                "ml": (ml_pct, 0.15 + ml_weight),  # Boost ML weight if available
+                "ml": (ml_pct, 0.15 + ml_weight),  # Boost ML weight if available (0.15 or 0.30)
                 "roi": (roi_pct, 0.15),
             }
             
+            # Properly normalize: sum all weights and divide once at the end
             total_weight = sum(w for _, w in weights.values())
             if total_weight == 0:
                 return 1.5  # Fallback
             
-            expected_move = sum(val * (w / total_weight) for val, w in weights.values())
+            # Correct weighted average: sum(component * weight) / total_weight
+            # This ensures consistent results whether ML is available or not
+            weighted_sum = sum(val * w for val, w in weights.values())
+            expected_move = weighted_sum / total_weight
             
-            # Apply EV multiplier (reduced from 2.0 to 1.65 for better frequency)
-            ev_multiplier = float(self._cfg("EV_MULTIPLIER", 1.65))
-            expected_move *= ev_multiplier
+            # CRITICAL FIX #5: Remove redundant EV_MULTIPLIER from TrendHunter
+            # ExecutionManager already applies regime-based multiplier (1.3/1.8/2.0)
+            # Having TWO multipliers creates hidden 2.14x barrier in normal regime
+            # Solution: Let ExecutionManager be the sole EV gate authority
+            # expected_move stays as raw weighted average (no additional scaling)
             
-            logger.info("[%s] Expected move for %s (%s): %.2f%% (TP=%.2f, ATR=%.2f, ML=%.2f, ROI=%.2f)",
+            logger.info("[%s] Expected move for %s (%s): %.2f%% (TP=%.2f, ATR=%.2f, ML=%.2f, ROI=%.2f) [RAW, no EV multiplier applied]",
                        self.name, symbol, action, expected_move, tp_pct, atr_pct, ml_pct, roi_pct)
             
             return max(0.5, expected_move)  # Floor at 0.5%

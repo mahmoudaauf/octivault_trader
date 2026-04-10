@@ -37,14 +37,14 @@ import aiohttp
 from binance.async_client import AsyncClient
 import random
 
-# Ed25519 signing support — cryptography is a transitive dep of python-binance.
+# Ed25519 signing support — using PyNaCl (libsodium) for Binance WS API v3
 # Guarded so the module still loads on stripped deployments (HMAC-only path unaffected).
 try:
-    from cryptography.hazmat.primitives.serialization import load_pem_private_key as _load_pem_private_key
-    _CRYPTOGRAPHY_AVAILABLE = True
+    from nacl.signing import SigningKey as _NaClSigningKey
+    _NACL_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    _load_pem_private_key = None  # type: ignore
-    _CRYPTOGRAPHY_AVAILABLE = False
+    _NaClSigningKey = None  # type: ignore
+    _NACL_AVAILABLE = False
 try:
     from binance.exceptions import BinanceAPIException as _BinanceAPIException  # type: ignore
 
@@ -544,21 +544,28 @@ class ExchangeClient:
         self.paper_trade = bool(paper_trade)
         if self.paper_trade:
             self.logger.info("Paper trading mode is enabled. No real orders will be placed.")
+        
+        # Diagnostic: Log mode configuration
+        self.logger.info(f"[EC:Init] Mode: testnet={self.testnet}, paper_trade={self.paper_trade}")
 
         # === API KEY SELECTION LOGIC ===
-        testnet = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
-        
-        if testnet:
+        # Use self.testnet which was correctly set above (avoiding local variable shadowing)
+        if self.testnet:
             api_key = os.getenv("BINANCE_TESTNET_API_KEY")
-            api_secret = os.getenv("BINANCE_TESTNET_API_SECRET")
+            api_secret_hmac = os.getenv("BINANCE_TESTNET_API_SECRET_HMAC")
+            api_secret_ed25519 = os.getenv("BINANCE_TESTNET_API_SECRET_ED25519")
             base_url = "https://testnet.binance.vision"
         else:
             api_key = os.getenv("BINANCE_API_KEY")
-            api_secret = os.getenv("BINANCE_API_SECRET")
+            api_secret_hmac = os.getenv("BINANCE_API_SECRET_HMAC")
+            api_secret_ed25519 = os.getenv("BINANCE_API_SECRET_ED25519")
             base_url = "https://api.binance.com"
         
         self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_secret_hmac = api_secret_hmac  # For REST signed endpoints
+        self.api_secret_ed25519 = api_secret_ed25519  # For WS API v3 session.logon
+        # Keep api_secret for backward compatibility (use Ed25519 if available)
+        self.api_secret = api_secret_ed25519 or api_secret_hmac
 
         # FIX 1: Validate API keys early before AsyncClient initialization
         if self.paper_trade:
@@ -627,10 +634,21 @@ class ExchangeClient:
         self._weight_counters = defaultdict(lambda: {"ts": 0.0, "w": 0})
         self._weight_window = float(_cfg("WEIGHT_WINDOW_SEC", 1.0))  # seconds
         self._weight_limit = int(_cfg("WEIGHT_LIMIT_PER_WINDOW", 10))    # conservative per second
-        self._path_weight_overrides = dict(_cfg("PATH_WEIGHTS", {"/api/v3/klines": 2}) or {})
+        # Correct Binance endpoint weights (https://binance-docs.github.io/apidocs/spot/en/#limits)
+        _default_path_weights = {
+            "/api/v3/openOrders": 6,   # weight 6 (all symbols); main polling endpoint
+            "/api/v3/account": 20,     # weight 20
+            "/api/v3/allOrders": 10,   # weight 10
+            "/api/v3/klines": 2,
+            "/api/v3/ticker/price": 2,
+        }
+        self._path_weight_overrides = dict(_cfg("PATH_WEIGHTS", _default_path_weights) or _default_path_weights)
+        # Configurable REST polling interval for _user_data_polling_loop (Tier-3 fallback)
+        self._user_data_poll_interval_sec = float(_cfg("USER_DATA_POLL_INTERVAL_SEC", 25.0))
         self._acct_cache = None
         self._acct_cache_ts = 0.0
         self._acct_ttl = float(_cfg("ACCT_CACHE_TTL_SEC", 5.0))  # seconds
+        self._acct_cache_lock = asyncio.Lock()
         self.fee_buffer_bps = int(_cfg("FEE_BUFFER_BPS", 10))
         self._px_ttl = float(_cfg("PRICE_MICROCACHE_TTL", 1.0))
 
@@ -661,9 +679,7 @@ class ExchangeClient:
         # - `last_user_data_event_ts` tracks only user-data stream events.
         # - `last_any_ws_event_ts` can include any websocket traffic.
         # This separation allows feed-specific health decisions.
-        # ⚠️ HARD-DISABLED: WebSocket user data is now FORCE-DISABLED to eliminate 1008/410 noise
-        # Using polling mode instead for deterministic, reliable reconciliation
-        self.user_data_stream_enabled = False  # ✅ FORCE POLLING MODE
+        self.user_data_stream_enabled = bool(_cfg_bool("USER_DATA_STREAM_ENABLED", True))
         self.user_data_ws_timeout_sec = float(_cfg("USER_DATA_WS_TIMEOUT_SEC", 65.0) or 65.0)
         self.user_data_ws_reconnect_backoff_sec = float(
             _cfg("USER_DATA_WS_RECONNECT_BACKOFF_SEC", 3.0) or 3.0
@@ -672,9 +688,9 @@ class ExchangeClient:
         self.user_data_ws_api_request_timeout_sec = float(
             _cfg("USER_DATA_WS_API_REQUEST_TIMEOUT_SEC", 12.0) or 12.0
         )
-        self.user_data_ws_auth_mode = str(_cfg("USER_DATA_WS_AUTH_MODE", "polling") or "polling").strip().lower()
+        self.user_data_ws_auth_mode = str(_cfg("USER_DATA_WS_AUTH_MODE", "auto") or "auto").strip().lower()
         if self.user_data_ws_auth_mode not in {"auto", "session", "signature", "polling"}:
-            self.user_data_ws_auth_mode = "polling"
+            self.user_data_ws_auth_mode = "auto"
 
         # Key-type detection — used both for WS auth routing and signing algorithm.
         # Explicit BINANCE_API_TYPE=ED25519 overrides auto-detection.
@@ -722,6 +738,12 @@ class ExchangeClient:
         self._user_data_stop = asyncio.Event()
         self._user_data_ws_task: Optional[asyncio.Task] = None
         self._user_data_keepalive_task: Optional[asyncio.Task] = None  # legacy placeholder
+
+        # Permanent-unavailability flags: set once when a terminal environment error is detected
+        # (WS API v3 policy-close 1008, listenKey 410 Gone) so the supervisor skips those tiers
+        # on every subsequent reconnect instead of retrying them on every loop iteration.
+        self._ws_v3_unavailable: bool = False
+        self._listen_key_unavailable: bool = False
         self._user_data_ws_conn: Optional[aiohttp.ClientWebSocketResponse] = None
         self._user_data_subscription_id: Optional[int] = None
         self._user_data_auth_mode_active: str = "none"
@@ -993,6 +1015,9 @@ class ExchangeClient:
             "any_ws_gap_sec": (now - any_ts) if any_ts > 0 else -1.0,
             "listenkey_refresh_gap_sec": (now - listen_ts) if listen_ts > 0 else -1.0,
             "force_sync_gap_sec": (now - sync_ts) if sync_ts > 0 else -1.0,
+            # Environment capability flags (set after first terminal failure)
+            "ws_v3_unavailable": bool(getattr(self, "_ws_v3_unavailable", False)),
+            "listen_key_unavailable": bool(getattr(self, "_listen_key_unavailable", False)),
         }
 
     def _user_data_ws_api_url(self) -> str:
@@ -1029,15 +1054,7 @@ class ExchangeClient:
                     self.logger.error("[EC:ListenKey] ❌ Session not available")
                     return None
                 
-                # Build signed request manually to avoid recvWindow
-                params = {"timestamp": int(time.time() * 1000 + self._time_offset_ms)}
-                query_string = urllib.parse.urlencode(params)
-                signature = hmac.new(
-                    self.api_secret.encode("utf-8"),
-                    query_string.encode("utf-8"),
-                    hashlib.sha256,
-                ).hexdigest()
-                params["signature"] = signature
+                # Spot listenKey uses API-key header auth (no timestamp/signature payload).
                 
                 url = f"{self.base_url_spot_api}/api/v3/userDataStream"
                 headers = {
@@ -1045,7 +1062,7 @@ class ExchangeClient:
                     "X-MBX-APIKEY": self.api_key or ""
                 }
                 
-                async with self.session.request("POST", url, headers=headers, params=params) as response:
+                async with self.session.request("POST", url, headers=headers) as response:
                     text = await response.text()
                     if response.status >= 400:
                         try:
@@ -1068,7 +1085,7 @@ class ExchangeClient:
             except Exception as e:
                 error_str = str(e).lower()
                 if "410" in str(e) or "gone" in error_str:
-                    self.logger.error("[EC:ListenKey] ❌ Got 410 Gone; endpoint unavailable for this account/environment. Failing fast.")
+                    self.logger.warning("[EC:ListenKey] Got 410 Gone; listenKey stream unavailable in this environment. Falling back.")
                     return None
                 elif "429" in str(e) or "rate" in error_str:
                     self.logger.warning(f"[EC:ListenKey] ❌ Rate limited, waiting before retry {attempt+1}...")
@@ -1093,10 +1110,19 @@ class ExchangeClient:
         
         try:
             self.logger.debug("[EC:ListenKey] Refreshing...")
-            # PUT /api/v3/userDataStream - use direct REST call instead of AsyncClient
-            await self._request("PUT", "/api/v3/userDataStream", 
-                              api="spot_api", signed=True,
-                              params={"listenKey": listen_key})
+            # Spot listenKey keepalive also uses API-key header auth only.
+            if not self.session or self.session.closed:
+                return False
+            url = f"{self.base_url_spot_api}/api/v3/userDataStream"
+            headers = {
+                "User-Agent": "octivault-trader/2.1",
+                "X-MBX-APIKEY": self.api_key or "",
+            }
+            async with self.session.request("PUT", url, headers=headers, params={"listenKey": listen_key}) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    self.logger.warning("[EC:ListenKey] ❌ Refresh HTTP %s: %s", response.status, text)
+                    return False
             self.logger.debug("[EC:ListenKey] ✅ Refreshed")
             return True
         except Exception as e:
@@ -1121,6 +1147,111 @@ class ExchangeClient:
             return f"{scheme}://stream.binance.com:9443/ws/{listen_key}"
         return f"wss://stream.binance.com:9443/ws/{listen_key}"
 
+    def _sign_ed25519(self, payload: str) -> Optional[str]:
+        """
+        Sign payload with Ed25519 private key for WS API v3 session.logon.
+        
+        Uses PyNaCl (libsodium) for Ed25519 signing.
+        
+        Input Format:
+        - Base64-encoded 32-byte Ed25519 seed (standard)
+        - Base64-encoded 48-byte seed (extended, uses first 32 bytes)
+        - Raw 32-byte seed (not base64-encoded)
+        
+        Returns: Base64-encoded signature, or None if key unavailable.
+        """
+        # Validate payload
+        if not payload:
+            self.logger.error("[EC] Ed25519 signing called with empty payload")
+            return None
+        
+        if payload is None:
+            self.logger.error("[EC] Ed25519 signing called with None payload")
+            return None
+        
+        if not self.api_secret_ed25519:
+            self.logger.warning("[EC] Ed25519 signing requested but api_secret_ed25519 is empty")
+            return None
+        
+        if not _NACL_AVAILABLE:
+            self.logger.error("[EC] PyNaCl library not available for Ed25519 signing")
+            return None
+        
+        try:
+            seed_input = self.api_secret_ed25519.strip()
+            ed25519_seed = None
+            
+            # First, try to treat it as a base64-encoded seed
+            try:
+                seed_bytes = base64.b64decode(seed_input)
+                self.logger.debug("[EC] Decoded base64 seed: %d bytes", len(seed_bytes))
+                
+                # Handle 32-byte (standard) or 48-byte (extended) seeds
+                if len(seed_bytes) == 32:
+                    ed25519_seed = seed_bytes
+                    self.logger.debug("[EC] Using 32-byte Ed25519 seed")
+                elif len(seed_bytes) == 48:
+                    # 48-byte seed - use first 32 bytes as Ed25519 private key
+                    ed25519_seed = seed_bytes[:32]
+                    self.logger.debug("[EC] Using first 32 bytes of 48-byte seed")
+                else:
+                    self.logger.debug(
+                        "[EC] Base64-decoded seed is %d bytes (not 32 or 48), trying as raw seed",
+                        len(seed_bytes)
+                    )
+            except Exception as b64_err:
+                self.logger.debug("[EC] Base64 decode failed: %s, trying as raw bytes", str(b64_err))
+            
+            # If base64 decode didn't yield valid seed, try raw bytes interpretation
+            if ed25519_seed is None:
+                try:
+                    # Try treating the input as raw UTF-8 bytes
+                    raw_bytes = seed_input.encode('utf-8')
+                    if len(raw_bytes) == 32:
+                        ed25519_seed = raw_bytes
+                        self.logger.debug("[EC] Using raw 32-byte seed from UTF-8 encoding")
+                    else:
+                        self.logger.error(
+                            "[EC] Raw UTF-8 seed is %d bytes (not 32), cannot use",
+                            len(raw_bytes)
+                        )
+                except Exception as raw_err:
+                    self.logger.error("[EC] Raw seed interpretation failed: %s", str(raw_err))
+            
+            if ed25519_seed is None or len(ed25519_seed) != 32:
+                self.logger.error(
+                    "[EC] Ed25519 seed must be 32 bytes (after base64 decode or raw interpretation)"
+                )
+                return None
+            
+            # Create signing key from seed
+            try:
+                signing_key = _NaClSigningKey(ed25519_seed)
+            except Exception as sk_err:
+                self.logger.error("[EC] Failed to create SigningKey from seed: %s", str(sk_err))
+                return None
+            
+            # Sign the payload
+            payload_str = str(payload) if payload else ""
+            if not payload_str:
+                self.logger.error("[EC] Payload is empty after conversion to string")
+                return None
+            
+            signed_message = signing_key.sign(payload_str.encode('utf-8'))
+            signature_bytes = signed_message.signature
+            
+            # Base64 encode the signature
+            signature_b64 = base64.b64encode(signature_bytes).decode('utf-8')
+            
+            self.logger.debug("[EC] Ed25519 signature created successfully (len=%d)", len(signature_b64))
+            return signature_b64
+            
+        except Exception as e:
+            self.logger.error("[EC] Ed25519 signing failed: %s", str(e))
+            import traceback
+            self.logger.debug("[EC] Traceback: %s", traceback.format_exc())
+            return None
+
     def _ws_api_signed_params(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         WS API v3 params for session.logon WITH HMAC signature.
@@ -1128,12 +1259,12 @@ class ExchangeClient:
         CRITICAL: Binance WS API v3 REQUIRES HMAC signatures for HMAC-based API keys.
         - Only Ed25519 keys use a different method (not applicable here)
         - For HMAC keys:
-          * Include: apiKey (MUST BE IN PARAMS)
-          * Include: timestamp
-          * Calculate: signature = HMAC-SHA256(query_string, api_secret)
-          * Append signature to params
+        * Include: apiKey (MUST BE IN PARAMS)
+        * Include: timestamp
+        * Calculate: signature = HMAC-SHA256(query_string, api_secret)
+        * Append signature to params
         - Query string format: MUST be ALPHABETICALLY SORTED
-          * Format: "apiKey=...&timestamp=..." (NOT timestamp first)
+        * Format: "apiKey=...&timestamp=..." (NOT timestamp first)
         
         ⚠️ CRITICAL FIXES:
         - DO NOT use urllib.parse.urlencode() (order not guaranteed)
@@ -1152,8 +1283,13 @@ class ExchangeClient:
         )
         
         # Calculate HMAC-SHA256 signature BEFORE adding to params
+        # REST API ALWAYS uses HMAC, never Ed25519
+        if not self.api_secret_hmac:
+            self.logger.warning("[EC] HMAC secret not available for REST signing")
+            return params
+        
         signature = hmac.new(
-            self.api_secret.encode('utf-8'),
+            self.api_secret_hmac.encode('utf-8'),
             query_string.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
@@ -1163,27 +1299,71 @@ class ExchangeClient:
         
         return params
 
+    def _ws_api_session_logon_params(self) -> Dict[str, Any]:
+        """
+        WS API v3 params for session.logon WITH Ed25519 signature.
+        
+        CRITICAL: Binance WS API v3 session.logon REQUIRES Ed25519 signatures.
+        - Include: apiKey
+        - Include: timestamp
+        - Calculate: signature = ED25519_SIGN(private_key, payload)
+        - Signature must be base64-encoded
+        """
+        # Validate prerequisites
+        if not self.api_key:
+            self.logger.error("[EC] api_key is missing, cannot create session.logon params")
+            return {}
+        
+        if not self.api_secret_ed25519:
+            self.logger.error("[EC] api_secret_ed25519 is missing, cannot sign session.logon")
+            return {}
+        
+        params: Dict[str, Any] = {}
+        params["apiKey"] = str(self.api_key)
+        params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
+        
+        # Create payload for signing (apiKey + timestamp, alphabetically sorted)
+        payload = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        
+        if not payload:
+            self.logger.error("[EC] Failed to construct payload for session.logon signing")
+            return {}
+        
+        self.logger.debug("[EC] session.logon payload: %s", payload)
+        
+        # Sign with Ed25519
+        signature = self._sign_ed25519(payload)
+        if signature:
+            params["signature"] = signature
+            self.logger.debug("[EC] session.logon signature created (len=%d)", len(signature))
+        else:
+            self.logger.warning("[EC] Ed25519 signing failed, session.logon will fail")
+        
+        return params
+
     def _ws_api_signature_params(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         WS API v3 params for userDataStream subscription WITH HMAC signature.
         
         CRITICAL: Binance WS API v3 REQUIRES HMAC signatures for HMAC-based API keys.
         - For HMAC keys:
-          * Include: apiKey (MUST BE IN PARAMS)
-          * Include: timestamp
-          * Calculate: signature = HMAC-SHA256(query_string, api_secret)
-          * Append signature to params
+        * Include: apiKey (MUST BE IN PARAMS)
+        * Include: timestamp
+        * Calculate: signature = HMAC-SHA256(query_string, api_secret)
+        * Append signature to params
         - Query string format: "apiKey=...&timestamp=..."
         """
         params: Dict[str, Any] = dict(extra or {})
         params["apiKey"] = str(self.api_key or "")
         params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
-        
-        # Calculate HMAC-SHA256 signature for request
-        # CRITICAL: Must include all params (apiKey, timestamp) before signing
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        params.setdefault("recvWindow", self.recv_window_ms)
+
+        # Deterministic HMAC payload for WS API v3
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        # Use HMAC secret if available (hybrid mode), otherwise use api_secret
+        secret_for_signing = self.api_secret_hmac or self.api_secret
         signature = hmac.new(
-            self.api_secret.encode('utf-8'),
+            secret_for_signing.encode('utf-8'),
             query_string.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
@@ -1256,6 +1436,29 @@ class ExchangeClient:
 
         evt = str(event_payload.get("e") or event_payload.get("eventType") or "UNKNOWN")
         self.mark_user_data_event(evt, event_payload)
+
+        # Route user-data events to the SharedState event bus so downstream
+        # components (PositionManager, ExecutionManager) receive fill/balance
+        # notifications from every WS tier (WS API v3, listenKey, and polling).
+        _ROUTABLE = {
+            "executionReport",
+            "balanceUpdate",
+            "outboundAccountPosition",
+            "listStatus",
+            "listenKeyExpired",
+        }
+        if evt in _ROUTABLE:
+            ss = getattr(self, "shared_state", None)
+            if ss is not None and hasattr(ss, "emit_event"):
+                try:
+                    coro = ss.emit_event(evt, dict(event_payload))
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(coro)
+                except RuntimeError:
+                    pass  # No running event loop (e.g., test context or pre-start)
+                except Exception:
+                    pass
+
         return evt
 
     async def _ws_api_request(
@@ -1345,12 +1548,16 @@ class ExchangeClient:
             ):
                 _close_code = getattr(msg, "data", None)
                 _close_reason = str(getattr(msg, "extra", "") or "")
-                self.logger.error(
-                    "[EC:WS] ❌ SERVER CLOSED CONNECTION during %s request: type=%s code=%s reason=%r",
-                    method, msg.type, _close_code, _close_reason,
-                )
                 if _close_code == 1008:
-                    self.logger.error("[EC:WS] ❌ Code 1008 = POLICY VIOLATION - request format/auth is rejected by server")
+                    self.logger.warning(
+                        "[EC:WS] Policy-close during %s request: type=%s code=%s reason=%r",
+                        method, msg.type, _close_code, _close_reason,
+                    )
+                else:
+                    self.logger.error(
+                        "[EC:WS] ❌ SERVER CLOSED CONNECTION during %s request: type=%s code=%s reason=%r",
+                        method, msg.type, _close_code, _close_reason,
+                    )
                 raise RuntimeError(
                     "USER_DATA_WS_CLOSED:%s ws_code=%s reason=%r" % (msg.type, _close_code, _close_reason)
                 )
@@ -1359,10 +1566,22 @@ class ExchangeClient:
         self, ws: aiohttp.ClientWebSocketResponse
     ) -> Tuple[str, Optional[int]]:
         self.logger.debug("[EC:WS] sending session.logon")
+        
+        # Get Ed25519 session.logon params
+        logon_params = self._ws_api_session_logon_params()
+        
+        # Check if signature was successfully created
+        if "signature" not in logon_params:
+            self.logger.warning(
+                "[EC:WS] Ed25519 signing failed for session.logon - "
+                "falling back to listenKey (Tier 2)"
+            )
+            raise RuntimeError("Ed25519 session.logon unavailable (key or signing failed)")
+        
         await self._ws_api_request(
             ws,
             method="session.logon",
-            params=self._ws_api_signed_params(),
+            params=logon_params,  # Ed25519 signing
         )
         self.last_listenkey_refresh_ts = time.time()
 
@@ -1370,7 +1589,7 @@ class ExchangeClient:
         sub_resp = await self._ws_api_request(
             ws,
             method="userDataStream.subscribe",
-            params=self._ws_api_signed_params(),
+            params=self._ws_api_signature_params(),  # HMAC signing
         )
         self.logger.debug("[EC:WS] subscribe response keys=%s", list(sub_resp.keys()) if isinstance(sub_resp, dict) else sub_resp)
         sub_res = sub_resp.get("result") if isinstance(sub_resp.get("result"), dict) else {}
@@ -1519,7 +1738,7 @@ class ExchangeClient:
                 # Check if this is a fatal listen key error - if so, re-raise to trigger polling fallback
                 error_str = str(e).lower()
                 if "failed to create listenkey" in error_str or "doesn't support" in error_str:
-                    self.logger.error("[EC:ListenKeyWS] Fatal error - listenKey creation permanently failed: %s", e)
+                    self.logger.warning("[EC:ListenKeyWS] listenKey unavailable; handing off to polling fallback: %s", e)
                     raise
                 
                 self.ws_connected = False
@@ -1551,15 +1770,15 @@ class ExchangeClient:
         ✅ POLLING MODE: Deterministic account reconciliation via REST.
         
         Every poll cycle (2.0s):
-          1. Fetch open orders via /api/v3/openOrders
-          2. Fetch account balances via /api/v3/account
-          3. Compare with internal state
-          4. Detect:
-             - Missing fills (orders disappeared)
-             - Partial fills (balances changed unexpectedly)
-             - Closed positions
-             - Trade execution confirmation
-          5. Emit reconciliation events to update position state
+        1. Fetch open orders via /api/v3/openOrders
+        2. Fetch account balances via /api/v3/account
+        3. Compare with internal state
+        4. Detect:
+            - Missing fills (orders disappeared)
+            - Partial fills (balances changed unexpectedly)
+            - Closed positions
+            - Trade execution confirmation
+        5. Emit reconciliation events to update position state
         
         This is more stable than WebSocket because:
         - No authentication state to manage
@@ -1567,7 +1786,7 @@ class ExchangeClient:
         - Easy to test and audit
         - Works reliably under market stress
         """
-        poll_interval = 2.0  # Poll every 2 seconds (configurable, but 2.0s is good)
+        poll_interval = self._user_data_poll_interval_sec  # Default 25s; set USER_DATA_POLL_INTERVAL_SEC to tune
         backoff = max(1.0, float(self.user_data_ws_reconnect_backoff_sec or 3.0))
         max_backoff = max(backoff, float(self.user_data_ws_max_backoff_sec or 30.0))
         
@@ -1603,19 +1822,26 @@ class ExchangeClient:
                         self.logger.debug("[EC:Polling] Starting reconciliation cycle at %.3f", now)
                         
                         # ====== PHASE 1: Fetch Current State ======
-                        # Fetch open orders
-                        try:
-                            open_orders_resp = await self._request(
-                                "GET", "/api/v3/openOrders", 
-                                api="spot_api", signed=True, 
-                                timeout=5.0
-                            )
-                            current_open_orders = {
-                                str(o.get("orderId")): o for o in (open_orders_resp or [])
-                            }
-                        except Exception as e:
-                            self.logger.warning("[EC:Polling] Failed to fetch open orders: %s", e)
-                            current_open_orders = prev_open_orders  # Use previous state
+                        # Fetch open orders — skip when idle to conserve weight (6/call)
+                        _ss = getattr(self, "shared_state", None)
+                        _has_positions = bool(_ss and getattr(_ss, "open_positions_count", lambda: 0)() > 0)
+                        if prev_open_orders or _has_positions:
+                            try:
+                                open_orders_resp = await self._request(
+                                    "GET", "/api/v3/openOrders",
+                                    api="spot_api", signed=True,
+                                    timeout=5.0
+                                )
+                                current_open_orders = {
+                                    str(o.get("orderId")): o for o in (open_orders_resp or [])
+                                }
+                            except Exception as e:
+                                self.logger.warning("[EC:Polling] Failed to fetch open orders: %s", e)
+                                current_open_orders = prev_open_orders  # Use previous state
+                        else:
+                            # No tracked orders and no open positions — skip the call
+                            self.logger.debug("[EC:Polling] Idle — skipping openOrders poll (no active orders/positions)")
+                            current_open_orders = {}
                         
                         # Fetch account balances
                         try:
@@ -1625,10 +1851,23 @@ class ExchangeClient:
                                 timeout=5.0
                             )
                             current_balances = {}
+                            # Get quote asset for tradable pair validation
+                            quote_asset = str(getattr(self.config, "DEFAULT_QUOTE_CURRENCY", "USDT")).upper() if self.config else "USDT"
                             for bal in acct.get("balances", []):
                                 asset = bal.get("asset", "")
                                 free = float(bal.get("free", 0.0))
                                 locked = float(bal.get("locked", 0.0))
+                                
+                                # FILTER: Skip non-tradable assets
+                                # Only include quote asset or assets that form valid trading pairs
+                                a = asset.upper()
+                                if a != quote_asset:
+                                    # For non-quote assets, verify they form tradable pairs
+                                    symbol = f"{a}{quote_asset}"
+                                    if not self.has_symbol(symbol):
+                                        self.logger.debug(f"[EC:Polling] Ignoring non-tradable asset {asset} (symbol {symbol})")
+                                        continue
+                                
                                 current_balances[asset] = {"free": free, "locked": locked}
                         except Exception as e:
                             self.logger.warning("[EC:Polling] Failed to fetch account: %s", e)
@@ -1638,23 +1877,28 @@ class ExchangeClient:
                         self.last_user_data_event_ts = now
                         
                         # ====== PHASE 2: Detect Balance Changes ======
-                        for asset, curr in current_balances.items():
-                            prev = prev_balances.get(asset, {})
-                            if (prev.get("free") != curr["free"] or prev.get("locked") != curr["locked"]):
-                                self.logger.info(
-                                    "[EC:Polling:Balance] %s changed: free=%.8f (was %.8f) locked=%.8f (was %.8f)",
-                                    asset, curr["free"], prev.get("free", 0), 
-                                    curr["locked"], prev.get("locked", 0)
-                                )
-                                # Emit balanceUpdate event
-                                evt_payload = {
-                                    "e": "balanceUpdate",
-                                    "E": int(now * 1000),
-                                    "a": asset,
-                                    "d": curr["free"],
-                                    "l": curr["locked"]
-                                }
-                                self._ingest_user_data_ws_payload(evt_payload)
+                        # Skip logging on first snapshot (prev_balances is empty)
+                        if prev_balances:
+                            for asset, curr in current_balances.items():
+                                prev = prev_balances.get(asset, {})
+                                # Skip logging for zero-balance assets (dust)
+                                if curr["free"] == 0 and curr["locked"] == 0:
+                                    continue
+                                if (prev.get("free") != curr["free"] or prev.get("locked") != curr["locked"]):
+                                    self.logger.info(
+                                        "[EC:Polling:Balance] %s changed: free=%.8f (was %.8f) locked=%.8f (was %.8f)",
+                                        asset, curr["free"], prev.get("free", 0), 
+                                        curr["locked"], prev.get("locked", 0)
+                                    )
+                                    # Emit balanceUpdate event
+                                    evt_payload = {
+                                        "e": "balanceUpdate",
+                                        "E": int(now * 1000),
+                                        "a": asset,
+                                        "d": curr["free"],
+                                        "l": curr["locked"]
+                                    }
+                                    self._ingest_user_data_ws_payload(evt_payload)
                         
                         # ====== PHASE 3: Detect Order Fills (Critical!) ======
                         # Check for orders that disappeared (filled or cancelled)
@@ -1767,8 +2011,17 @@ class ExchangeClient:
                     except asyncio.CancelledError:
                         raise
                     except Exception as poll_err:
-                        self.logger.warning("[EC:Polling] Reconciliation error: %s", poll_err)
-                        await asyncio.sleep(1.0)  # Brief sleep before retry
+                        if self._is_rate_limit_error(poll_err):
+                            # -1003 / 429: back off for 2× the poll interval (capped at 120s)
+                            _rl_sleep = min(120.0, poll_interval * 2)
+                            self.logger.warning(
+                                "[EC:Polling] Rate limit hit, backing off %.1fs before retry: %s",
+                                _rl_sleep, poll_err,
+                            )
+                            await asyncio.sleep(_rl_sleep)
+                        else:
+                            self.logger.warning("[EC:Polling] Reconciliation error: %s", poll_err)
+                            await asyncio.sleep(1.0)
             
             except asyncio.CancelledError:
                 raise
@@ -1824,32 +2077,81 @@ class ExchangeClient:
 
     async def _user_data_ws_loop(self) -> None:
         """
-        ✅ SIMPLIFIED: Hard-disabled WebSocket, always use polling mode.
-        
-        Rationale:
-        - WebSocket API v3 causes repeated 1008 (policy) and 410 (gone) errors
-        - listenKey WebSocket Streams rotation is unreliable under market stress
-        - REST polling with deterministic reconciliation is more stable and testable
-        - Trade execution uses direct REST anyway; user-data monitoring is secondary
-        
-        Tier 1: DISABLED (WS API v3)
-        Tier 2: DISABLED (listenKey WebSocket Streams)
-        Tier 3: ✅ ACTIVE (REST polling with full reconciliation)
+        User-data stream supervisor (WebSocket-first).
+
+        Priority:
+        1) WS API v3 (session/signature auth)
+        2) listenKey WebSocket stream fallback
+        3) REST polling fallback
         """
-        self.logger.info(
-            "[EC:UserDataWS] WebSocket modes disabled by default. "
-            "Using polling mode for deterministic account reconciliation..."
-        )
-        
-        # Bypass Tier 1 and Tier 2, go straight to polling
         while self.is_started and not self._user_data_stop.is_set():
             try:
+                if not bool(getattr(self, "user_data_stream_enabled", True)):
+                    self.logger.info("[EC:UserDataWS] USER_DATA_STREAM_ENABLED=false; using polling mode.")
+                    await self._user_data_polling_loop()
+                    continue
+
+                if not self._has_signed_credentials():
+                    self.logger.warning("[EC:UserDataWS] Signed credentials unavailable; using polling mode.")
+                    await self._user_data_polling_loop()
+                    continue
+
+                # Tier 1: WS API v3
+                if not self._ws_v3_unavailable:
+                    try:
+                        self.logger.info("[EC:UserDataWS] Starting Tier 1 (WS API v3)")
+                        await self._user_data_ws_api_v3_direct()
+                        continue
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as ws_v3_err:
+                        _err_str = str(ws_v3_err)
+                        if "1008" in _err_str or "POLICY" in _err_str.upper():
+                            self._ws_v3_unavailable = True
+                            self.logger.warning(
+                                "[EC:UserDataWS] Tier 1 (WS API v3) permanently unavailable "
+                                "in this environment (policy-close 1008). "
+                                "Skipping on all future reconnects."
+                            )
+                        else:
+                            self.logger.warning("[EC:UserDataWS] Tier 1 failed: %s", ws_v3_err)
+                else:
+                    self.logger.debug(
+                        "[EC:UserDataWS] Tier 1 (WS API v3) skipped — permanently unavailable"
+                    )
+
+                # Tier 2: listenKey WS stream
+                if not self._listen_key_unavailable:
+                    try:
+                        self.logger.info("[EC:UserDataWS] Starting Tier 2 (listenKey stream)")
+                        await self._user_data_listen_key_loop()
+                        continue
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as listen_key_err:
+                        _err_str = str(listen_key_err).lower()
+                        if "410" in _err_str or "gone" in _err_str or "doesn't support" in _err_str:
+                            self._listen_key_unavailable = True
+                            self.logger.warning(
+                                "[EC:UserDataWS] Tier 2 (listenKey) permanently unavailable "
+                                "in this environment (HTTP 410 Gone). "
+                                "Skipping on all future reconnects."
+                            )
+                        else:
+                            self.logger.warning("[EC:UserDataWS] Tier 2 failed: %s", listen_key_err)
+                else:
+                    self.logger.debug(
+                        "[EC:UserDataWS] Tier 2 (listenKey) skipped — permanently unavailable"
+                    )
+
+                # Tier 3: deterministic polling
+                self.logger.warning("[EC:UserDataWS] Falling back to Tier 3 (polling).")
                 await self._user_data_polling_loop()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self.logger.error(
-                    "[EC:UserDataWS:Polling] Polling loop failed: %s. Retrying in 5s...", e
+                    "[EC:UserDataWS] Supervisor loop failed: %s. Retrying in 5s...", e
                 )
                 await asyncio.sleep(5.0)
 
@@ -2180,7 +2482,12 @@ class ExchangeClient:
         from aiohttp import ClientTimeout, TCPConnector
 
         # If already started but we have API keys and the client might be public-only, recreate with signed keys
-        if self.is_started and self.api_key and self.api_secret:
+        _has_real_keys = (
+            self.api_key and self.api_secret
+            and self.api_key != "paper_key"
+            and not self.paper_trade
+        )
+        if self.is_started and _has_real_keys:
             try:
                 if self.client:
                     await self.client.close_connection()
@@ -2200,9 +2507,13 @@ class ExchangeClient:
 
         connector = TCPConnector(limit=50, ttl_dns_cache=300)
         self.session = aiohttp.ClientSession(timeout=ClientTimeout(total=15), connector=connector)
-        # Allow starting in public-only mode if keys are absent; signed endpoints will fail gracefully.
-        if not self.api_key or not self.api_secret:
-            self.logger.warning("ExchangeClient starting without API keys — public endpoints only.")
+        # Allow starting in public-only mode if keys are absent or paper sentinels are set.
+        # Never pass "paper_key"/"paper_secret" to AsyncClient — Binance rejects them with -2014.
+        if not _has_real_keys:
+            if self.paper_trade:
+                self.logger.info("ExchangeClient starting in paper mode — using public-only AsyncClient.")
+            else:
+                self.logger.warning("ExchangeClient starting without API keys — public endpoints only.")
             self.client = await AsyncClient.create(api_key="", api_secret="", testnet=self.testnet)
         else:
             self.client = await AsyncClient.create(self.api_key, self.api_secret, testnet=self.testnet)
@@ -2338,123 +2649,145 @@ class ExchangeClient:
 
     # ------------- unified HTTP wrapper -------------
     async def _request(
-        self, method: str, path: str, params: Optional[Dict[str, Any]] = None, *, signed: bool = False, api: str = "spot_api"
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        signed: bool = False,
+        api: str = "spot_api",
+        timeout: Optional[float] = None,
     ) -> Any:
-        """
-        Unified request wrapper.
-        api: "spot_api" | "spot_sapi" | "um_futures"
-        """
-        # Allow lazy public bootstrap for unsigned/public GETs used during early phases
-        if not self.is_started:
-            if not signed and method.upper() == "GET":
-                await self._ensure_started_public()
+            """
+            Unified request wrapper.
+            api: "spot_api" | "spot_sapi" | "um_futures"
+            """
+            # PAPER MODE: Return mock data for account endpoints
+            if self.paper_trade and signed:
+                if path == "/api/v3/account":
+                    # Return empty balances in paper mode
+                    self.logger.debug("[EC] Paper mode: returning mock account data for /api/v3/account")
+                    return {"balances": [], "permissions": []}
+                elif path.startswith("/api/v3/order") or path == "/api/v3/openOrders":
+                    # Return empty orders in paper mode
+                    self.logger.debug("[EC] Paper mode: returning mock order data for %s", path)
+                    return [] if "openOrders" in path else {}
+            
+            # Allow lazy public bootstrap for unsigned/public GETs used during early phases
+            if not self.is_started:
+                if not signed and method.upper() == "GET":
+                    await self._ensure_started_public()
+                else:
+                    raise RuntimeError("ExchangeClient session not started. Call await start() first.")
+    
+            if api == "spot_api":
+                base = self.base_url_spot_api
+            elif api == "spot_sapi":
+                base = self.base_url_spot_sapi
+            elif api == "um_futures":
+                base = self.base_url_um
             else:
-                raise RuntimeError("ExchangeClient session not started. Call await start() first.")
-
-        if api == "spot_api":
-            base = self.base_url_spot_api
-        elif api == "spot_sapi":
-            base = self.base_url_spot_sapi
-        elif api == "um_futures":
-            base = self.base_url_um
-        else:
-            raise ValueError(f"Unknown api family: {api}")
-
-        url = f"{base}{path}"
-        headers = {"User-Agent": "octivault-trader/2.1"}
-        if self.api_key:
-            headers["X-MBX-APIKEY"] = self.api_key
-        params = params or {}
-
-        # configurable weight guard per path
-        weight = self._path_weight_overrides.get(path, 2 if path.startswith("/api/v3/klines") else 1)
-        now = time.time()
-        # Prune stale buckets to prevent unbounded defaultdict growth
-        if len(self._weight_counters) > 50:
-            stale = [p for p, b in list(self._weight_counters.items()) if now - b["ts"] > 60.0]
-            for p in stale:
-                del self._weight_counters[p]
-        bucket = self._weight_counters[path]
-        if now - bucket["ts"] > self._weight_window:
-            bucket["ts"], bucket["w"] = now, 0
-        if bucket["w"] + weight > self._weight_limit:
-            await asyncio.sleep(max(0.0, self._weight_window - (now - bucket["ts"])))
-            bucket["ts"], bucket["w"] = time.time(), 0
-        bucket["w"] += weight
-
-        if signed:
-            if not (self.api_key and self.api_secret):
-                raise BinanceAPIException(
-                    "Signed endpoint requires API_KEY and API_SECRET (Binance -2015 likely).",
-                    code=-2015
-                )
-            params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
-            params.setdefault("recvWindow", self.recv_window_ms)
-            query_string = urllib.parse.urlencode(params)
-            signature = hmac.new(
-                self.api_secret.encode("utf-8"),
-                query_string.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-            params["signature"] = signature
-
-        # exponential backoff + jitter for transient cases
-        backoffs = [0.2, 0.5, 1.0, 2.0]
-        last_err = None
-        for delay in [0.0, *backoffs]:
-            if delay:
-                await asyncio.sleep(delay + random.uniform(0, delay/4))
-            try:
-                async with self.session.request(method, url, headers=headers, params=params) as response:
-                    text = await response.text()
-                    if response.status >= 400:
-                        # Try parse JSON error and surface native Binance codes
+                raise ValueError(f"Unknown api family: {api}")
+    
+            url = f"{base}{path}"
+            headers = {"User-Agent": "octivault-trader/2.1"}
+            if self.api_key:
+                headers["X-MBX-APIKEY"] = self.api_key
+            params = params or {}
+    
+            # configurable weight guard per path
+            weight = self._path_weight_overrides.get(path, 2 if path.startswith("/api/v3/klines") else 1)
+            now = time.time()
+            # Prune stale buckets to prevent unbounded defaultdict growth
+            if len(self._weight_counters) > 50:
+                stale = [p for p, b in list(self._weight_counters.items()) if now - b["ts"] > 60.0]
+                for p in stale:
+                    del self._weight_counters[p]
+            bucket = self._weight_counters[path]
+            if now - bucket["ts"] > self._weight_window:
+                bucket["ts"], bucket["w"] = now, 0
+            if bucket["w"] + weight > self._weight_limit:
+                await asyncio.sleep(max(0.0, self._weight_window - (now - bucket["ts"])))
+                bucket["ts"], bucket["w"] = time.time(), 0
+            bucket["w"] += weight
+    
+            if signed:
+                if not (self.api_key and self.api_secret_hmac):
+                    raise BinanceAPIException(
+                        "Signed endpoint requires API_KEY and HMAC_SECRET (Binance -2015 likely).",
+                        code=-2015
+                    )
+                params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
+                params.setdefault("recvWindow", self.recv_window_ms)
+                query_string = urllib.parse.urlencode(params)
+                # REST API ALWAYS uses HMAC, never Ed25519
+                signature = hmac.new(
+                    self.api_secret_hmac.encode("utf-8"),
+                    query_string.encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
+                params["signature"] = signature
+    
+            # exponential backoff + jitter for transient cases
+            backoffs = [0.2, 0.5, 1.0, 2.0]
+            last_err = None
+            for delay in [0.0, *backoffs]:
+                if delay:
+                    await asyncio.sleep(delay + random.uniform(0, delay / 4))
+                try:
+                    req_kwargs: Dict[str, Any] = {"headers": headers, "params": params}
+                    if timeout is not None:
+                        req_kwargs["timeout"] = aiohttp.ClientTimeout(total=max(0.1, float(timeout)))
+                    async with self.session.request(method, url, **req_kwargs) as response:
+                        text = await response.text()
+                        if response.status >= 400:
+                            # Try parse JSON error and surface native Binance codes
+                            try:
+                                err = json.loads(text) if text else {}
+                            except Exception:
+                                err = {"msg": text}
+                            code = err.get("code", response.status)
+                            msg = err.get("msg", text)
+                            if code == -2015:
+                                self.logger.error("Binance -2015 on %s %s (api=%s): %s", method, path, api, msg)
+                            # Handle time skew (-1021): resync once and retry on next backoff iteration
+                            if code == -1021:
+                                try:
+                                    await self._resync_time()
+                                except Exception:
+                                    pass
+                                # Continue to next retry iteration
+                                continue
+                            # honor server-suggested retry for RL
+                            if response.status in (418, 429):
+                                try:
+                                    ra = float(response.headers.get("Retry-After", "0"))
+                                    if ra > 0:
+                                        await asyncio.sleep(min(ra, 3.0))
+                                except Exception:
+                                    pass
+                            raise BinanceAPIException(msg, code=code)
+                        return json.loads(text) if text else {}
+                except aiohttp.ClientResponseError as e:
+                    last_err = e
+                    # rate-limit
+                    if e.status in (418, 429):
                         try:
-                            err = json.loads(text) if text else {}
+                            ra = float(e.headers.get("Retry-After", "0"))
+                            if ra > 0:
+                                await asyncio.sleep(min(ra, 2.0))
                         except Exception:
-                            err = {"msg": text}
-                        code = err.get("code", response.status)
-                        msg = err.get("msg", text)
-                        if code == -2015:
-                            self.logger.error("Binance -2015 on %s %s (api=%s): %s", method, path, api, msg)
-                        # Handle time skew (-1021): resync once and retry on next backoff iteration
-                        if code == -1021:
-                            try:
-                                await self._resync_time()
-                            except Exception:
-                                pass
-                            # Continue to next retry iteration
-                            continue
-                        # honor server-suggested retry for RL
-                        if response.status in (418, 429):
-                            try:
-                                ra = float(response.headers.get("Retry-After", "0"))
-                                if ra > 0:
-                                    await asyncio.sleep(min(ra, 3.0))
-                            except Exception:
-                                pass
-                        raise BinanceAPIException(msg, code=code)
-                    return json.loads(text) if text else {}
-            except aiohttp.ClientResponseError as e:
-                last_err = e
-                # rate-limit
-                if e.status in (418, 429):
-                    try:
-                        ra = float(e.headers.get("Retry-After", "0"))
-                        if ra > 0:
-                            await asyncio.sleep(min(ra, 2.0))
-                    except Exception:
-                        pass
+                            pass
+                        continue
+                    if e.status == 400:
+                        raise BinanceAPIException(f"API error: {getattr(e, 'message', str(e))}", code=e.status)
+                    if e.status in (408,) or (500 <= e.status < 600):
+                        continue
+                    raise NetworkException(f"{method} {path} (api={api}) failed: {e}") from e
+                except aiohttp.ClientError as e:
+                    last_err = e
                     continue
-                if e.status == 400:
-                    raise BinanceAPIException(f"API error: {getattr(e, 'message', str(e))}", code=e.status)
-                if e.status in (408,) or (500 <= e.status < 600):
-                    continue
-                raise NetworkException(f"{method} {path} (api={api}) failed: {e}") from e
-            except aiohttp.ClientError as e:
-                last_err = e
-                continue
-        raise NetworkException(f"{method} {path} (api={api}) network error after retries: {last_err}")
+            raise NetworkException(f"{method} {path} (api={api}) network error after retries: {last_err}")
 
     # ------------- market data helpers -------------
     async def get_24hr_tickers(self) -> List[Dict[str, Any]]:
@@ -3085,16 +3418,77 @@ class ExchangeClient:
         return str(order_id)
 
     # ------------- balances -------------
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        code = getattr(exc, "code", None)
+        status_code = getattr(exc, "status_code", None)
+        status = getattr(exc, "status", None)
+        msg = str(exc).lower()
+        return (
+            code in (-1003, -1015, 429)
+            or status_code in (429, -1003, -1015)
+            or status in (429, -1003, -1015)
+            or "apierror(code=-1003)" in msg
+            or "too much request weight" in msg
+            or "request weight used" in msg
+            or "too many requests" in msg
+        )
+
     async def get_spot_balances(self) -> Dict[str, Dict[str, float]]:
-        """Spot balances via /api/v3/account (safe; no SAPI permission required)."""
-        data = await self._request("GET", "/api/v3/account", signed=True, api="spot_api")
-        out = {}
-        for b in data.get("balances", []):
-            free = float(b.get("free", 0))
-            locked = float(b.get("locked", 0))
-            if free or locked:
-                out[b["asset"]] = {"free": free, "locked": locked}
-        return out
+        """Spot balances via /api/v3/account (safe; no SAPI permission required).
+        
+        Returns all non-zero balances including assets that may not be tradable.
+        Filtering of non-tradable pairs should be done at SharedState level.
+        """
+        # Allow balances even in paper/testnet mode
+        # Diagnostic: Log the decision gate
+        self.logger.debug(f"[EC:Balances] paper_trade={self.paper_trade}, testnet={self.testnet}")
+        
+        if self.paper_trade and not self.testnet:
+            self.logger.debug("[EC] Paper simulation: returning empty balances")
+            return {}
+
+        now = time.time()
+        # Shared cache path for full account snapshot.
+        if self._acct_cache and (now - self._acct_cache_ts) < self._acct_ttl:
+            return {
+                k: {"free": float(v.get("free", 0.0)), "locked": float(v.get("locked", 0.0))}
+                for k, v in dict(self._acct_cache).items()
+            }
+
+        async with self._acct_cache_lock:
+            now = time.time()
+            if self._acct_cache and (now - self._acct_cache_ts) < self._acct_ttl:
+                return {
+                    k: {"free": float(v.get("free", 0.0)), "locked": float(v.get("locked", 0.0))}
+                    for k, v in dict(self._acct_cache).items()
+                }
+
+            try:
+                self.logger.debug(f"[EC] Fetching real balances from {'testnet' if self.testnet else 'live'}")
+                data = await self._request("GET", "/api/v3/account", signed=True, api="spot_api")
+                out = {}
+                for b in data.get("balances", []):
+                    free = float(b.get("free", 0))
+                    locked = float(b.get("locked", 0))
+                    if free or locked:
+                        out[b["asset"].upper()] = {"free": free, "locked": locked}
+                self._acct_cache = dict(out)
+                self._acct_cache_ts = time.time()
+                return out
+            except Exception as e:
+                if self._is_rate_limit_error(e):
+                    if self._acct_cache:
+                        self.logger.warning(
+                            "[EC:Balances] Rate limited on /api/v3/account; serving cached balances (age=%.1fs)",
+                            max(0.0, time.time() - self._acct_cache_ts),
+                        )
+                        return {
+                            k: {"free": float(v.get("free", 0.0)), "locked": float(v.get("locked", 0.0))}
+                            for k, v in dict(self._acct_cache).items()
+                        }
+                    self.logger.warning("[EC:Balances] Rate limited and no cache available")
+                raise
 
     async def get_account_balance(self, asset: str) -> dict:
         """

@@ -27,6 +27,12 @@ try:
 except Exception:
     _ensure_ec_public = None
 
+# ── WebSocket market data feed (optional, new hybrid architecture) ────────────
+try:
+    from core.market_data_websocket import MarketDataWebSocket
+except Exception:
+    MarketDataWebSocket = None  # type: ignore
+
 
 API_AUTH_ERR_CODES = {-2015, -2014}        # Invalid key/permissions/signature
 API_RATELIMIT_ERR_CODES = {-1003, -1015, -1021}   # Rate limit, too many requests, time skew
@@ -76,6 +82,11 @@ class MarketDataFeed:
         per_symbol_readiness: bool = True,
         **_,
     ) -> None:
+        # Initialize logger FIRST before any logging calls
+        self._logger = logger or logging.getLogger("MarketDataFeed")
+        if self._logger.level == logging.NOTSET:
+            self._logger.setLevel(logging.INFO)
+        
         self.shared_state = shared_state
         self.exchange_client = exchange_client
         self._ec_public_ok: bool = True  # allow public-only bootstrap for unsigned endpoints
@@ -121,6 +132,16 @@ class MarketDataFeed:
         self.per_symbol_readiness: bool = bool(_cfg("per_symbol_readiness", per_symbol_readiness))
         self._declared_ready: bool = False
 
+        # WebSocket market data feed (NEW: hybrid architecture)
+        self.enable_websocket: bool = bool(_cfg("ENABLE_WEBSOCKET", True))
+        self.websocket_feed: Optional[Any] = None  # MarketDataWebSocket instance
+        self._websocket_task: Optional[asyncio.Task] = None
+        if self.enable_websocket and MarketDataWebSocket:
+            self._logger.info("[MDF] WebSocket support enabled (hybrid mode)")
+        
+        # Helper to access config
+        self._cfg = _cfg
+
         # Internal event to wait for late wiring of the exchange client (AppContext P3.65+)
         self._exch_ready_evt: asyncio.Event = asyncio.Event()
         if self.exchange_client is not None:
@@ -128,9 +149,6 @@ class MarketDataFeed:
 
         self._stop = asyncio.Event()
         self._run_loop_entered = False  # guard against multiple concurrent run() entries
-        self._logger = logger or logging.getLogger("MarketDataFeed")
-        if self._logger.level == logging.NOTSET:
-            self._logger.setLevel(logging.INFO)
 
         self._health_task: Optional[asyncio.Task] = None
         self._last_error_ts: float = 0.0
@@ -139,6 +157,9 @@ class MarketDataFeed:
         self._poll_cycle: int = 0
         self._known_symbols: set[str] = set()
         self._backfill_tasks: Dict[str, asyncio.Task] = {}
+
+        # Initialize symbols dict for WebSocket feed (hybrid mode)
+        self.symbols: Dict[str, Any] = {}  # Will be populated at runtime from _get_accepted_symbols()
 
         # Resolve component and code values (enum if present, else strings)
         self._component_key = getattr(_ComponentEnum, "MARKET_DATA_FEED", "MarketDataFeed")
@@ -158,6 +179,32 @@ class MarketDataFeed:
             return self.exchange_client is not None
         except asyncio.TimeoutError:
             return False
+
+    async def _start_websocket(self) -> None:
+        """
+        Start the WebSocket market data feed for hybrid architecture.
+        Runs in background; initializes WebSocket if enabled and available.
+        Gracefully handles if WebSocket component not available (REST fallback).
+        """
+        if not self.enable_websocket or not MarketDataWebSocket:
+            self._logger.debug("[MDF] WebSocket disabled or unavailable")
+            return
+
+        try:
+            self._logger.info("[MDF] Starting WebSocket feed (hybrid mode)...")
+            self.websocket_feed = MarketDataWebSocket(
+                shared_state=self.shared_state,
+                logger=self._logger,
+                is_testnet=bool(self._cfg("IS_TESTNET", False)),
+            )
+            self._websocket_task = asyncio.create_task(self.websocket_feed.start())
+            self._logger.info("[MDF] WebSocket feed started in background")
+        except Exception as e:
+            self._logger.warning(
+                "[MDF] Failed to start WebSocket feed, falling back to REST: %s", str(e)
+            )
+            self.websocket_feed = None
+            self._websocket_task = None
 
     # -------------------- utils --------------------
 
@@ -276,12 +323,24 @@ class MarketDataFeed:
         """
         Send health via SharedState.set_component_health if available.
         Works with enums or strings; never crashes the caller.
+        Includes WebSocket metrics if available (NEW).
         """
         try:
+            merged_metrics = metrics or {}
+            
+            # ⚡ Include WebSocket metrics if available (NEW)
+            if self.websocket_feed and hasattr(self.websocket_feed, "get_stats"):
+                try:
+                    ws_stats = await self._maybe_await(self.websocket_feed.get_stats())
+                    if isinstance(ws_stats, dict):
+                        merged_metrics["websocket"] = ws_stats
+                except Exception:
+                    pass
+            
             fn = getattr(self.shared_state, "set_component_health", None)
             if not fn:
                 return
-            await self._maybe_await(fn(self._component_key, code, msg, metrics=metrics or {}))
+            await self._maybe_await(fn(self._component_key, code, msg, metrics=merged_metrics))
         except Exception:
             self._logger.debug("set_component_health failed", exc_info=True)
 
@@ -771,6 +830,9 @@ class MarketDataFeed:
             return
         self._run_loop_entered = True
 
+        # ⚡ Start WebSocket feed for hybrid market data (NEW)
+        await self._start_websocket()
+
         self._logger.info("MarketDataFeed run loop entered")
         syms = await self._get_accepted_symbols()
         self._logger.info(f"[MDF] loop started | accepted_symbols={syms}")
@@ -905,9 +967,26 @@ class MarketDataFeed:
             price_updated = False
             bars_added = 0
             try:
-                async def _fetch_price():
-                    return await ec.get_current_price(sym)
-                price = await self._with_retries(_fetch_price, f"poll.get_price[{sym}]")
+                # ⚡ Try WebSocket price first (hybrid mode) - NEW
+                if self.websocket_feed and self.enable_websocket:
+                    try:
+                        # Check if WebSocket has provided this price
+                        norm_fn = getattr(self.shared_state, "_norm_sym", None)
+                        norm_sym = norm_fn(sym) if callable(norm_fn) else str(sym or "").upper()
+                        cache = getattr(self.shared_state, "_price_cache", None)
+                        if isinstance(cache, dict) and norm_sym in cache:
+                            price_tuple = cache.get(norm_sym)
+                            if isinstance(price_tuple, (tuple, list)) and len(price_tuple) >= 1:
+                                price = price_tuple[0]
+                                self._logger.debug("[MDF] using WebSocket price for %s: %.10f", sym, price)
+                    except Exception:
+                        pass
+                
+                # Fall back to REST if WebSocket price not available
+                if price is None:
+                    async def _fetch_price():
+                        return await ec.get_current_price(sym)
+                    price = await self._with_retries(_fetch_price, f"poll.get_price[{sym}]")
             except Exception:
                 price = None
             price_f = self._coerce_positive_price(price)
@@ -966,3 +1045,19 @@ class MarketDataFeed:
     async def stop(self):
         self._stop.set()
         await self._cancel_backfill_tasks()
+        
+        # ⚡ Clean up WebSocket feed (NEW)
+        if self.websocket_feed:
+            try:
+                await self.websocket_feed.stop()
+            except Exception as e:
+                self._logger.debug("[MDF] WebSocket cleanup error: %s", str(e))
+        
+        if self._websocket_task and not self._websocket_task.done():
+            self._websocket_task.cancel()
+            try:
+                await self._websocket_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                self._logger.debug("[MDF] WebSocket task cancel error: %s", str(e))

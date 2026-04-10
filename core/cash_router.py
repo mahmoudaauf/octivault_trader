@@ -142,14 +142,53 @@ class CashRouter:
             spread_bps = None
         return {"bid": bid, "ask": ask, "spread_bps": (float(spread_bps) if spread_bps is not None else None)}
     async def _get_price(self, symbol: str) -> Optional[float]:
+        """
+        Fetch current price using 3-strategy cascade (institutional architecture).
+        
+        Strategy 1: SharedState memory (WebSocket prices, zero latency, zero API calls)
+        Strategy 2: Safe price helper (may use snapshot or other sources)
+        Strategy 3: REST API (only if explicitly configured, minimizes API calls)
+        
+        Returns price as float or None if not available.
+        """
         price = None
+        
+        # ===== STRATEGY 1: SharedState memory (WebSocket-updated prices) =====
         try:
-            if hasattr(self.ex, "get_symbol_price"):
-                r = self.ex.get_symbol_price(symbol)
-                price = await r if asyncio.iscoroutine(r) else r
+            if self.shared_state and hasattr(self.shared_state, "prices") and self.shared_state.prices:
+                prices_dict = self.shared_state.prices
+                if isinstance(prices_dict, dict):
+                    price = prices_dict.get(symbol.upper())
+                    if price:
+                        return float(price)  # ✅ Found in memory, 0 API calls, <1ms latency
         except Exception:
-            price = None
-        return float(price) if price is not None else None
+            self.logger.debug(f"[CashRouter] Strategy 1 (SharedState prices) failed for {symbol}")
+        
+        # ===== STRATEGY 2: Safe price helper (may use snapshot or other sources) =====
+        try:
+            if self.shared_state and hasattr(self.shared_state, "safe_price"):
+                price = await self.shared_state.safe_price(symbol)
+                if price:
+                    return float(price)  # ✅ Found via safe_price helper
+        except Exception:
+            self.logger.debug(f"[CashRouter] Strategy 2 (safe_price) failed for {symbol}")
+        
+        # ===== STRATEGY 3: REST API (only if explicitly configured) =====
+        allow_rest = getattr(self.config, "CR_ALLOW_REST", False)
+        if allow_rest:
+            try:
+                if hasattr(self.ex, "get_symbol_price"):
+                    r = self.ex.get_symbol_price(symbol)
+                    price = await r if asyncio.iscoroutine(r) else r
+                    if price:
+                        return float(price)  # ⚠️ REST call (only if configured)
+            except Exception:
+                self.logger.debug(f"[CashRouter] Strategy 3 (REST) failed for {symbol}")
+        else:
+            # REST not configured - log in debug mode
+            self.logger.debug(f"[CashRouter] CR_ALLOW_REST=False: Skipping REST fallback for {symbol}")
+        
+        return None  # No price available from any strategy
 
     async def _get_filters(self, symbol: str) -> Dict[str, Any]:
         """

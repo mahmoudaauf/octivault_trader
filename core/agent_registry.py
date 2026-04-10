@@ -167,7 +167,25 @@ except Exception as _e:
 # Agents currently disabled (commented out to suppress import overhead).
 # Re-enable by uncommenting both the import and the AGENT_CLASS_MAP entry.
 # ---------------------------------------------------------------------------
-# from agents.swing_trade_hunter import SwingTradeHunter  # disabled: strategy overlap with TrendHunter
+try:
+    from agents.swing_trade_hunter import SwingTradeHunter
+except Exception as _e:
+    class SwingTradeHunter:  # type: ignore
+        """Placeholder — SwingTradeHunter module failed to import."""
+        agent_type = "strategy"
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "SwingTradeHunter import failed: %s"
+                % AGENT_IMPORT_ERRORS.get("SwingTradeHunter", {}).get("error", "unknown")
+            )
+
+    AGENT_IMPORT_ERRORS["SwingTradeHunter"] = {
+        "error": repr(_e),
+        "traceback": traceback.format_exc(),
+    }
+    _logger.warning("SwingTradeHunter import failed; placeholder kept: %s", _e, exc_info=True)
+
 # from agents.news_reactor import NewsReactor              # disabled: news feed not wired
 # from agents.signal_fusion_agent import SignalFusion      # disabled: replaced by SignalManager
 # from agents.arbitrage_hunter_agent import ArbitrageHunter  # disabled: latency constraints
@@ -175,7 +193,7 @@ except Exception as _e:
 AGENT_CLASS_MAP: dict = {
     "IPOChaser": IPOChaser,
     "DipSniper": DipSniper,
-    # "SwingTradeHunter": SwingTradeHunter,
+    "SwingTradeHunter": SwingTradeHunter,
     "TrendHunter": TrendHunter,
     # "NewsReactor": NewsReactor,
     # "SignalFusion": SignalFusion,
@@ -322,10 +340,14 @@ def register_all_strategy_agents(agent_manager, app_context):
         kwargs = {
             "shared_state": getattr(app_context, "shared_state", None),
             "config": getattr(app_context, "config", None),
+            "market_data": getattr(app_context, "market_data_feed", None),
             "exchange_client": getattr(app_context, "exchange_client", None),
             "symbol_manager": getattr(app_context, "symbol_manager", None),
             "execution_manager": getattr(app_context, "execution_manager", None),
             "tp_sl_engine": getattr(app_context, "tp_sl_engine", None),
+            "model_manager": getattr(app_context, "model_manager", None),
+            "meta_controller": getattr(app_context, "meta_controller", None),
+            "market_data_feed": getattr(app_context, "market_data_feed", None),
         }
         try:
             return cls(**{k: v for k, v in kwargs.items() if v is not None})

@@ -26,7 +26,7 @@ class PolicyManager:
             "slippage_bps": float(os.getenv("CR_PRICE_SLIPPAGE_BPS", "15")),  # 0.15% slippage (system default)  
             "buffer_bps": float(getattr(config, "SAFETY_BUFFER_BPS", 5.0)),  # 0.05% safety buffer
             "min_positive_edge_bps": float(getattr(config, "MIN_POSITIVE_EDGE_BPS", 1.0)),  # Lower threshold for bootstrap
-            "fee_expectancy_multiplier": float(os.getenv("FEE_EXPECTANCY_MULTIPLIER", "3.0")), # Profit >= 3x fees
+            "fee_expectancy_multiplier": float(os.getenv("FEE_EXPECTANCY_MULTIPLIER", "1.6")), # Profit >= 1.6x fees (relaxed for more opportunities)
             "fee_floor_usdt": float(os.getenv("FEE_FLOOR_USDT", "0.15")), # 0.15 USDT fee floor
         }
         
@@ -151,7 +151,7 @@ class PolicyManager:
         # expected_alpha is usually something like 0.008 (0.8%)
         expected_profit = planned_quote * expected_alpha
         
-        multiplier = self._economic_guard.get("fee_expectancy_multiplier", 3.0)
+        multiplier = self._economic_guard.get("fee_expectancy_multiplier", 1.6)
         
         if expected_profit < (total_fees * multiplier):
              return False, f"Low expectancy: profit {expected_profit:.2f} < {multiplier}x fees {total_fees:.2f}"

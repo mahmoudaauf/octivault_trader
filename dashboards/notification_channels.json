@@ -1,0 +1,57 @@
+{
+  "apiVersion": 1,
+  "secretsKeyToWrite": {
+    "pagerduty_key": "PAGERDUTY_SERVICE_KEY",
+    "slack_webhook": "SLACK_WEBHOOK_URL",
+    "email_password": "EMAIL_PASSWORD"
+  },
+  "notificationChannels": [
+    {
+      "name": "Trading Safety Alerts - Critical",
+      "type": "pagerduty",
+      "isDefault": false,
+      "settings": {
+        "integrationKey": "${PAGERDUTY_SERVICE_KEY}"
+      },
+      "uid": "critical-alerts",
+      "secureSettings": {
+        "integrationKey": "${PAGERDUTY_SERVICE_KEY}"
+      }
+    },
+    {
+      "name": "Trading Safety Alerts - Warnings",
+      "type": "slack",
+      "isDefault": false,
+      "settings": {
+        "url": "${SLACK_WEBHOOK_URL}",
+        "channel": "#trading-alerts",
+        "username": "Trading Safety Bot",
+        "iconEmoji": "🚨"
+      },
+      "secureSettings": {
+        "url": "${SLACK_WEBHOOK_URL}"
+      },
+      "uid": "warning-alerts"
+    },
+    {
+      "name": "Trading Safety Alerts - Email",
+      "type": "email",
+      "isDefault": false,
+      "settings": {
+        "addresses": "alerts@trading.internal,ops@trading.internal"
+      },
+      "uid": "email-alerts"
+    },
+    {
+      "name": "Trading Safety Alerts - Console",
+      "type": "webhook",
+      "isDefault": false,
+      "settings": {
+        "url": "http://localhost:8080/api/alerts/webhook",
+        "httpMethod": "POST",
+        "contentType": "application/json"
+      },
+      "uid": "console-alerts"
+    }
+  ]
+}
