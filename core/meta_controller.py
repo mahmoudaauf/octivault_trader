@@ -831,13 +831,27 @@ class MetaController:
                 
                 return (passed, reason, blocking_gate)
                 
-            except Exception as e:
+            except ArbitrationError as e:
+                classification = get_error_handler().handle_exception(
+                    e,
+                    additional_context={
+                        "symbol": symbol,
+                        "action": action,
+                        "confidence": confidence
+                    }
+                )
                 self.logger.debug(
-                    f"[Meta:Arbitration] Delegation to ArbitrationEngine failed: {e}"
+                    f"[Meta:Arbitration] Delegation to ArbitrationEngine failed: {e.context.message}"
+                )
+                # Fall through to legacy implementation
+            except Exception as e:
+                self.logger.exception(
+                    f"[Meta:Arbitration] Unexpected error in ArbitrationEngine delegation: {type(e).__name__}"
                 )
                 # Fall through to legacy implementation
         
         # Legacy implementation: Direct regime checks
+        handler = get_error_handler()
         try:
             # Gate 1: Confidence check
             conf_ok, conf_reason = self._regime_check_confidence(confidence)
@@ -859,12 +873,20 @@ class MetaController:
             # All gates passed
             return (True, "All arbitration gates passed", None)
             
+        except TypedValidationError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={"operation": "legacy_arbitration_check"}
+            )
+            self.logger.warning(f"[Meta:Arbitration] Legacy check failed: {e.context.message}")
+            return (False, f"Arbitration check error: {e.context.message}", 'error')
         except Exception as e:
-            self.logger.warning(f"[Meta:Arbitration] Legacy check failed: {e}")
-            return (False, f"Arbitration check error: {e}", 'error')
+            self.logger.exception(f"[Meta:Arbitration] Unexpected error in legacy check: {type(e).__name__}")
+            return (False, f"Arbitration check error: {type(e).__name__}", 'error')
 
     def _rotation_preempt_active(self) -> bool:
         metrics = getattr(self.shared_state, "metrics", {}) or {}
+        handler = get_error_handler()
         try:
             realized = float(metrics.get("realized_pnl", 0.0) or 0.0)
             unrealized = float(metrics.get("unrealized_pnl", 0.0) or 0.0)
@@ -872,7 +894,15 @@ class MetaController:
             nav = float(metrics.get("nav", 0.0) or 0.0)
             base_capital = float(getattr(self.config, "BASE_CAPITAL", 0.0) or 0.0)
             usdt_per_hour = float(metrics.get("usdt_per_hour", 0.0) or 0.0)
+        except TypeMismatchError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={"operation": "_rotation_preempt_active", "component": "MetricsValidation"}
+            )
+            self.logger.debug(f"[Meta:Metrics] Type conversion error: {e.context.message}")
+            return False
         except Exception:
+            self.logger.debug("[Meta:Metrics] Error parsing metrics, returning False")
             return False
 
         capital_falling = bool(
