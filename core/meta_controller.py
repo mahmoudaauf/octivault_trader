@@ -3841,14 +3841,27 @@ class MetaController:
             taker_bps = self._get_fee_bps(self.shared_state, "taker")
             slippage_bps = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 15.0)))
             exit_info = {}
+            handler = get_error_handler()
             try:
                 exit_info = await self.shared_state.compute_symbol_exit_floor(
                     symbol,
                     fee_bps=taker_bps,
                     slippage_bps=slippage_bps,
                 )
+            except ExchangeError as e:
+                classification = handler.handle_exception(
+                    e,
+                    additional_context={
+                        "operation": "compute_symbol_exit_floor",
+                        "component": "ExchangeRules",
+                        "symbol": symbol
+                    }
+                )
+                self.logger.debug("[Meta:BuyGate] Exit floor compute failed for %s: %s", symbol, e.context.message)
+            except TraderException as e:
+                classification = handler.handle_exception(e)
             except Exception as e:
-                self.logger.debug(f"[Meta:BuyGate] Exit floor compute failed for {symbol}: {e}")
+                self.logger.debug("[Meta:BuyGate] Unexpected error computing exit floor: %s", type(e).__name__)
 
             min_notional = float(exit_info.get("min_notional") or 0.0)
             if min_notional <= 0:
@@ -3930,6 +3943,7 @@ class MetaController:
             # ═══════════════════════════════════════════════════════════════════════
             existing_position_notional = 0.0
             is_existing_dust = False
+            handler = get_error_handler()
             try:
                 pos = await _safe_await(self.shared_state.get_position(symbol))
                 if pos:
@@ -4035,14 +4049,29 @@ class MetaController:
 
             # 2. Max Position Cap (prevent over-accumulation)
             # Calculate equity (available balance)
+            handler = get_error_handler()
             try:
                 equity_balance = await _safe_await(self.shared_state.get_balance("USDT"))
                 if isinstance(equity_balance, dict):
                     equity = float(equity_balance.get("free", 0.0))
                 else:
                     equity = float(equity_balance or 0.0)
+            except ExchangeError as e:
+                classification = handler.handle_exception(
+                    e,
+                    additional_context={
+                        "operation": "get_balance",
+                        "component": "BalanceFetch",
+                        "currency": "USDT"
+                    }
+                )
+                self.logger.debug("[Meta:BuyGate] Failed to get equity balance: %s", e.context.message)
+                equity = 0.0
+            except TraderException as e:
+                classification = handler.handle_exception(e)
+                equity = 0.0
             except Exception as e:
-                self.logger.debug(f"[Meta:BuyGate] Failed to get equity balance: {e}")
+                self.logger.debug("[Meta:BuyGate] Unexpected error getting equity balance: %s", type(e).__name__)
                 equity = 0.0
             
             # Extract risk_pct and sl_pct from signal
