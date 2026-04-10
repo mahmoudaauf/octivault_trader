@@ -2070,13 +2070,47 @@ class MetaController:
         self.logger.info("[Meta:Init] NAV Regime Manager initialized (MICRO_SNIPER <1000, STANDARD 1000-5000, MULTI_AGENT >=5000)")
 
         # Profit-locked re-entry (compounding guard)
+        handler = get_error_handler()
         try:
             self._profit_lock_checkpoint = float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
-        except Exception:
+        except TypeMismatchError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "profit_lock_checkpoint_init",
+                    "component": "CapitalManagement"
+                }
+            )
+            self.logger.debug("[Meta:Init] Failed to load profit checkpoint, defaulting to 0.0: %s", e.context.message)
             self._profit_lock_checkpoint = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            self._profit_lock_checkpoint = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:Init] Unexpected error loading profit checkpoint: %s", type(e).__name__)
+            self._profit_lock_checkpoint = 0.0
+        
+        handler = get_error_handler()
         try:
             base_quote = float(self._cfg("PROFIT_LOCK_BASE_QUOTE", self._cfg("DEFAULT_PLANNED_QUOTE", self._min_entry_quote_usdt)))
-        except Exception:
+        except TypeMismatchError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "profit_lock_quote_init",
+                    "component": "CapitalManagement"
+                }
+            )
+            self.logger.debug("[Meta:Init] Failed to load profit lock quote config, using default: %s", e.context.message)
+            base_quote = float(self._min_entry_quote_usdt)
+        except ConfigurationError as e:
+            classification = handler.handle_exception(e)
+            base_quote = float(self._min_entry_quote_usdt)
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            base_quote = float(self._min_entry_quote_usdt)
+        except Exception as e:
+            self.logger.debug("[Meta:Init] Unexpected error loading profit lock quote: %s", type(e).__name__)
             base_quote = float(self._min_entry_quote_usdt)
         self._profit_lock_base_quote = max(float(base_quote or 0.0), float(self._min_entry_quote_usdt or 0.0))
         self.portfolio_authority = PortfolioAuthority(self.logger, self.config, self.shared_state)
@@ -2288,6 +2322,7 @@ class MetaController:
             qty_local = float((pos_obj or {}).get("quantity") or (pos_obj or {}).get("qty") or 0.0)
             return bool(qty_local > 0 and status in {"OPEN", "PARTIALLY_FILLED", "SIGNIFICANT", "ACTIVE", "IN_POSITION", "RUNNING"})
 
+        handler = get_error_handler()
         try:
             if hasattr(self.shared_state, "get_open_positions"):
                 pos_map = await _safe_await(self.shared_state.get_open_positions())
@@ -2296,9 +2331,19 @@ class MetaController:
                     qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
                     if qty > 0 and _is_significant_snapshot(pos):
                         return True, max(qty, 0.0)
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_open_positions",
+                    "component": "PositionTracking",
+                    "symbol": sym
+                }
+            )
+            self.logger.debug("[Meta:Position] Failed to get open positions: %s", e.context.message)
             pass
 
+        handler = get_error_handler()
         try:
             if hasattr(self.shared_state, "get_positions_snapshot"):
                 snap = await _safe_await(self.shared_state.get_positions_snapshot())
@@ -2307,9 +2352,19 @@ class MetaController:
                     qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
                     if qty > 0 and _is_significant_snapshot(pos):
                         return True, max(qty, 0.0)
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_positions_snapshot",
+                    "component": "PositionTracking",
+                    "symbol": sym
+                }
+            )
+            self.logger.debug("[Meta:Position] Failed to get positions snapshot: %s", e.context.message)
             pass
 
+        handler = get_error_handler()
         try:
             pos_map = getattr(self.shared_state, "positions", {}) or {}
             if isinstance(pos_map, dict) and sym in pos_map:
@@ -2317,9 +2372,19 @@ class MetaController:
                 qty = float(pos.get("quantity") or pos.get("qty") or pos.get("current_qty") or 0.0)
                 if qty > 0 and _is_significant_snapshot(pos):
                     return True, max(qty, 0.0)
-        except Exception:
+        except StateError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_positions_map",
+                    "component": "PositionTracking",
+                    "symbol": sym
+                }
+            )
+            self.logger.debug("[Meta:Position] Failed to access positions map: %s", e.context.message)
             pass
 
+        handler = get_error_handler()
         try:
             open_trades = getattr(self.shared_state, "open_trades", {}) or {}
             if isinstance(open_trades, dict) and sym in open_trades:
@@ -2329,18 +2394,28 @@ class MetaController:
                     pos_snapshot = {}
                     try:
                         pos_snapshot = (getattr(self.shared_state, "positions", {}) or {}).get(sym, {}) or {}
-                    except Exception:
+                    except StateError:
                         pos_snapshot = {}
                     gate_ref = pos_snapshot if isinstance(pos_snapshot, dict) and pos_snapshot else tr
                     if _is_significant_snapshot(gate_ref):
                         return True, max(qty, 0.0)
                     try:
                         self.shared_state.open_trades.pop(sym, None)
-                    except Exception:
+                    except StateError:
                         pass
-        except Exception:
+        except StateError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_open_trades",
+                    "component": "PositionTracking",
+                    "symbol": sym
+                }
+            )
+            self.logger.debug("[Meta:Position] Failed to access open trades: %s", e.context.message)
             pass
 
+        handler = get_error_handler()
         try:
             fn = getattr(self.shared_state, "get_position_qty", None) or getattr(self.shared_state, "get_position_quantity", None)
             if callable(fn):
@@ -2350,11 +2425,20 @@ class MetaController:
                     try:
                         if hasattr(self.shared_state, "get_position"):
                             pos = await _safe_await(self.shared_state.get_position(sym)) or {}
-                    except Exception:
+                    except ExchangeError:
                         pos = {}
                     if _is_significant_snapshot(pos):
                         return True, max(qty, 0.0)
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_position_qty",
+                    "component": "PositionTracking",
+                    "symbol": sym
+                }
+            )
+            self.logger.debug("[Meta:Position] Failed to get position quantity: %s", e.context.message)
             pass
 
         return False, 0.0
@@ -2370,20 +2454,40 @@ class MetaController:
             return False, 0.0, 0.0, "no_position"
 
         # Unhealable dust must not deadlock bootstrap/new entries.
+        handler = get_error_handler()
         try:
             dust_unhealable = getattr(self.shared_state, "dust_unhealable", {}) or {}
             if str(dust_unhealable.get(sym, "") or "") == "UNHEALABLE_LT_MIN_NOTIONAL":
                 return False, 0.0, 0.0, "unhealable_dust"
-        except Exception:
+        except StateError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_dust_unhealable_state",
+                    "component": "DustManagement",
+                    "symbol": sym
+                }
+            )
+            self.logger.debug("[Meta:DustCheck] Failed to check unhealable dust: %s", e.context.message)
             pass
 
         significant_floor = await self._canonical_significant_floor(sym)
 
         price = 0.0
+        handler = get_error_handler()
         try:
             if hasattr(self.shared_state, "safe_price"):
                 price = float(await _safe_await(self.shared_state.safe_price(sym)) or 0.0)
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_safe_price",
+                    "component": "PriceFetch",
+                    "symbol": sym
+                }
+            )
+            self.logger.debug("[Meta:Price] Failed to get safe price for %s: %s", sym, e.context.message)
             price = 0.0
         if price <= 0:
             price = float(getattr(self.shared_state, "latest_prices", {}).get(sym, 0.0) or 0.0)
