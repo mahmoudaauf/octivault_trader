@@ -55,6 +55,22 @@ except Exception:
         TradeIntent = None
 
 # ==============================================================================
+# PHASE 2C: Handler Module Imports (Architecture Decomposition)
+# ==============================================================================
+# Import the extracted handler modules for signal processing, state management,
+# and lifecycle tracking. These modules improve testability and maintainability.
+try:
+    from core.bootstrap_manager import BootstrapOrchestrator
+    from core.arbitration_engine import ArbitrationEngine
+    from core.lifecycle_manager import LifecycleManager
+except ImportError as e:
+    # Fallback if modules are not yet available
+    BootstrapOrchestrator = None
+    ArbitrationEngine = None
+    LifecycleManager = None
+    _phase_2c_import_warning = f"Phase 2c modules not available: {e}"
+
+# ==============================================================================
 # INLINE DEFINITIONS: Essential classes from meta_libs (avoiding external dependency)
 # ==============================================================================
 # These were refactored into core/meta_libs/ locally, but meta_libs doesn't exist
@@ -619,6 +635,25 @@ class MetaController:
             return 0
 
     def _is_bootstrap_mode(self) -> bool:
+        """
+        Check if system is currently in bootstrap mode.
+        
+        PHASE 2C: Delegates to BootstrapOrchestrator if available for better
+        testability and maintainability. Falls back to legacy implementation
+        if Phase 2c modules not initialized.
+        
+        Returns:
+            bool: True if bootstrap mode is active, False otherwise
+        """
+        # Delegate to Phase 2c BootstrapOrchestrator if available
+        if hasattr(self, 'bootstrap_orchestrator') and self.bootstrap_orchestrator is not None:
+            try:
+                return self.bootstrap_orchestrator.is_active()
+            except Exception as e:
+                self.logger.debug(f"[Meta:Bootstrap] Delegation to BootstrapOrchestrator failed: {e}")
+                # Fall through to legacy implementation
+        
+        # Legacy implementation: Fall back if Phase 2c not available
         try:
             if hasattr(self.shared_state, "is_bootstrap_mode"):
                 return bool(self.shared_state.is_bootstrap_mode())
@@ -630,6 +665,104 @@ class MetaController:
         except Exception:
             pass
         return False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PHASE 2C: Arbitration Engine Delegation Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def should_signal_pass_arbitration(
+        self,
+        symbol: str,
+        action: str,
+        confidence: float,
+        expected_move: float,
+    ) -> tuple:
+        """
+        PHASE 2C: High-level arbitration gate wrapper.
+        
+        Delegates critical signal evaluation decisions to ArbitrationEngine
+        for testability and maintainability. Returns pass/fail plus reason.
+        
+        This acts as a coordination point between MetaController's signal
+        processing and the extracted ArbitrationEngine module.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'BTCUSDT')
+            action: Trade action ('BUY' or 'SELL')
+            confidence: Signal confidence (0.0 to 1.0)
+            expected_move: Expected move percentage
+            
+        Returns:
+            tuple: (passed: bool, reason: str, blocking_gate: str or None)
+                - passed: Whether signal passes all gates
+                - reason: Human-readable reason for decision
+                - blocking_gate: Which gate blocked (if any)
+        """
+        # Delegate to Phase 2c ArbitrationEngine if available
+        if hasattr(self, 'arbitration_engine') and self.arbitration_engine is not None:
+            try:
+                # Build signal packet for arbitration engine
+                signal_packet = {
+                    'symbol': symbol,
+                    'action': action,
+                    'confidence': confidence,
+                    'expected_move': expected_move,
+                    'timestamp': time.time(),
+                }
+                
+                # Delegate to engine (synchronous wrapper around async)
+                result = self.arbitration_engine.evaluate_gates_sync(
+                    symbol=symbol,
+                    action=action,
+                    confidence=confidence,
+                    expected_move=expected_move,
+                    config=self.config,
+                    regime_manager=self.regime_manager,
+                )
+                
+                # Unpack result
+                passed = result.get('passed', False)
+                reason = result.get('reason', 'No reason provided')
+                blocking_gate = result.get('blocking_gate', None)
+                
+                if not passed:
+                    self.logger.debug(
+                        f"[Meta:Arbitration] Signal BLOCKED at gate '{blocking_gate}': {reason}"
+                    )
+                
+                return (passed, reason, blocking_gate)
+                
+            except Exception as e:
+                self.logger.debug(
+                    f"[Meta:Arbitration] Delegation to ArbitrationEngine failed: {e}"
+                )
+                # Fall through to legacy implementation
+        
+        # Legacy implementation: Direct regime checks
+        try:
+            # Gate 1: Confidence check
+            conf_ok, conf_reason = self._regime_check_confidence(confidence)
+            if not conf_ok:
+                return (False, conf_reason, 'confidence')
+            
+            # Gate 2: Expected move check
+            move_ok, move_reason = self._regime_check_expected_move(expected_move)
+            if not move_ok:
+                return (False, move_reason, 'expected_move')
+            
+            # Gate 3: Position limit check
+            if action == 'BUY':
+                pos_ok = self._regime_check_max_positions()
+                if not pos_ok:
+                    reason = f"Max positions reached for regime"
+                    return (False, reason, 'position_limit')
+            
+            # All gates passed
+            return (True, "All arbitration gates passed", None)
+            
+        except Exception as e:
+            self.logger.warning(f"[Meta:Arbitration] Legacy check failed: {e}")
+            return (False, f"Arbitration check error: {e}", 'error')
 
     def _rotation_preempt_active(self) -> bool:
         metrics = getattr(self.shared_state, "metrics", {}) or {}
@@ -790,6 +923,9 @@ class MetaController:
         """
         Set symbol lifecycle state with automatic timeout tracking.
         
+        PHASE 2C: Now delegates to set_symbol_lifecycle_state() for
+        better separation of concerns and testability.
+        
         Args:
             symbol: Trading pair symbol
             state: New lifecycle state (DUST_HEALING, ROTATION_PENDING, etc.)
@@ -797,26 +933,25 @@ class MetaController:
         Each state automatically expires after LIFECYCLE_TIMEOUT_SEC (600s).
         This prevents indefinite locks from stuck operations.
         """
-        prev = self.symbol_lifecycle.get(symbol)
-        now = time.time()
-        
-        self.symbol_lifecycle[symbol] = state
-        self.symbol_lifecycle_ts[symbol] = now  # Record entry time
-        
-        self.logger.info(
-            f"[LIFECYCLE] {symbol}: {prev or 'NONE'} -> {state} (timeout=600s)"
-        )
+        # Delegate to Phase 2c wrapper for consistency
+        self.set_symbol_lifecycle_state(symbol=symbol, state=state, reason="")
 
     def _get_lifecycle(self, symbol):
         """
         Get current lifecycle state with automatic timeout expiration.
         
+        PHASE 2C: Now delegates to get_symbol_lifecycle_state() for
+        better separation of concerns and testability.
+        
         Returns None if state has timed out (expired).
         """
-        state = self.symbol_lifecycle.get(symbol)
+        # Delegate to Phase 2c wrapper for consistency
+        state = self.get_symbol_lifecycle_state(symbol)
+        
         if state is None:
             return None
         
+        # Check timeout expiration (legacy implementation backup)
         entry_ts = self.symbol_lifecycle_ts.get(symbol, 0)
         now = time.time()
         age_sec = now - entry_ts
@@ -837,6 +972,138 @@ class MetaController:
             return None
         
         return state
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PHASE 2C: Lifecycle Manager Delegation Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def get_symbol_lifecycle_state(self, symbol: str) -> Optional[str]:
+        """
+        PHASE 2C: Get symbol lifecycle state with delegation support.
+        
+        Delegates to LifecycleManager if available for better testability.
+        Falls back to legacy state tracking if Phase 2c not available.
+        
+        Args:
+            symbol: Trading symbol
+            
+        Returns:
+            str: Current lifecycle state or None if no state set
+        """
+        # Delegate to Phase 2c LifecycleManager if available
+        if hasattr(self, 'lifecycle_manager') and self.lifecycle_manager is not None:
+            try:
+                state = self.lifecycle_manager.get_state(symbol)
+                if state is not None:
+                    return state
+                # If LifecycleManager has no state, fall through to legacy
+            except Exception as e:
+                self.logger.debug(f"[Meta:Lifecycle] Delegation to LifecycleManager failed: {e}")
+        
+        # Legacy implementation: Direct dict lookup
+        return self.symbol_lifecycle.get(symbol)
+    
+    def set_symbol_lifecycle_state(
+        self,
+        symbol: str,
+        state: str,
+        reason: str = "",
+    ) -> bool:
+        """
+        PHASE 2C: Set symbol lifecycle state with delegation support.
+        
+        Delegates to LifecycleManager if available for better testability.
+        Falls back to legacy state tracking if Phase 2c not available.
+        
+        Args:
+            symbol: Trading symbol
+            state: New lifecycle state
+            reason: Reason for state change
+            
+        Returns:
+            bool: True if state change successful
+        """
+        # Delegate to Phase 2c LifecycleManager if available
+        if hasattr(self, 'lifecycle_manager') and self.lifecycle_manager is not None:
+            try:
+                success = self.lifecycle_manager.set_state(
+                    symbol=symbol,
+                    new_state=state,
+                    reason=reason,
+                    details={'timestamp': time.time()},
+                )
+                
+                if success:
+                    # Also update legacy storage for backward compatibility
+                    now = time.time()
+                    self.symbol_lifecycle[symbol] = state
+                    self.symbol_lifecycle_ts[symbol] = now
+                    return True
+                    
+            except Exception as e:
+                self.logger.debug(f"[Meta:Lifecycle] Delegation to LifecycleManager failed: {e}")
+                # Fall through to legacy implementation
+        
+        # Legacy implementation: Direct dict update
+        prev = self.symbol_lifecycle.get(symbol)
+        now = time.time()
+        
+        self.symbol_lifecycle[symbol] = state
+        self.symbol_lifecycle_ts[symbol] = now
+        
+        self.logger.info(
+            f"[LIFECYCLE] {symbol}: {prev or 'NONE'} -> {state} (timeout=600s)"
+        )
+        
+        return True
+    
+    def query_symbol_lifecycle_can_act(self, symbol: str, authority: str) -> bool:
+        """
+        PHASE 2C: Check if operation allowed for symbol based on lifecycle state.
+        
+        Delegates to LifecycleManager if available for better testability.
+        Falls back to legacy validation if Phase 2c not available.
+        
+        Args:
+            symbol: Trading symbol
+            authority: Operation type (SELL, ROTATION, DUST_HEALING, etc.)
+            
+        Returns:
+            bool: True if operation allowed, False if blocked by lifecycle state
+        """
+        # Delegate to Phase 2c LifecycleManager if available
+        if hasattr(self, 'lifecycle_manager') and self.lifecycle_manager is not None:
+            try:
+                current_state = self.lifecycle_manager.get_state(symbol)
+                
+                if current_state is not None:
+                    # Apply same conflict rules as legacy implementation
+                    # (Can extend with LifecycleManager-specific rules)
+                    
+                    # DUST_HEALING blocks SELL and ROTATION
+                    if (current_state == self.LIFECYCLE_DUST_HEALING and 
+                        authority in ("SELL", "ROTATION")):
+                        self.logger.info(
+                            f"[LIFECYCLE] {symbol}: {authority} blocked (in DUST_HEALING)"
+                        )
+                        return False
+                    
+                    # ROTATION_PENDING blocks DUST_HEALING
+                    if (current_state == self.LIFECYCLE_ROTATION_PENDING and 
+                        authority == "DUST_HEALING"):
+                        self.logger.info(
+                            f"[LIFECYCLE] {symbol}: DUST_HEALING blocked (in ROTATION_PENDING)"
+                        )
+                        return False
+                
+                return True
+                
+            except Exception as e:
+                self.logger.debug(f"[Meta:Lifecycle] Delegation to LifecycleManager failed: {e}")
+                # Fall through to legacy implementation
+        
+        # Legacy implementation: Direct state checking
+        return self._can_act(symbol, authority)
 
     def _can_act(self, symbol, authority):
         """
@@ -1321,6 +1588,47 @@ class MetaController:
         # Initialize StateManager early since _kpi_metrics delegates to it
         from core.state_manager import StateManager
         self.state_manager = StateManager(self.shared_state, self.config, self.logger, component_name="MetaController")
+        
+        # ═══════════════════════════════════════════════════════════════════════════
+        # PHASE 2C: Initialize Handler Modules (Architecture Decomposition)
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Initialize Phase 2c modules for signal processing, state management,
+        # and lifecycle tracking. These improve testability and maintainability.
+        
+        try:
+            # Bootstrap Manager: Handles dust bypass and bootstrap mode logic
+            bootstrap_budget = float(getattr(config, 'BOOTSTRAP_BUDGET', 1000.0))
+            if BootstrapOrchestrator is not None:
+                self.bootstrap_orchestrator = BootstrapOrchestrator(
+                    initial_budget=bootstrap_budget,
+                    logger=self.logger
+                )
+                self.logger.info(f"[Meta:Init] BootstrapOrchestrator initialized: budget={bootstrap_budget}")
+            else:
+                self.bootstrap_orchestrator = None
+                self.logger.debug("[Meta:Init] BootstrapOrchestrator not available (Phase 2c modules missing)")
+            
+            # Arbitration Engine: 6-layer signal evaluation pipeline
+            if ArbitrationEngine is not None:
+                self.arbitration_engine = ArbitrationEngine()
+                self.logger.info("[Meta:Init] ArbitrationEngine initialized")
+            else:
+                self.arbitration_engine = None
+                self.logger.debug("[Meta:Init] ArbitrationEngine not available (Phase 2c modules missing)")
+            
+            # Lifecycle Manager: Symbol state machine (NEW → ACTIVE → COOLING → EXITING)
+            if LifecycleManager is not None:
+                self.lifecycle_manager = LifecycleManager()
+                self.logger.info("[Meta:Init] LifecycleManager initialized")
+            else:
+                self.lifecycle_manager = None
+                self.logger.debug("[Meta:Init] LifecycleManager not available (Phase 2c modules missing)")
+                
+        except Exception as e:
+            self.logger.warning(f"[Meta:Init] Phase 2c initialization error: {e}", exc_info=True)
+            self.bootstrap_orchestrator = None
+            self.arbitration_engine = None
+            self.lifecycle_manager = None
         
         # ═══════════════════════════════════════════════════════════════════
         # PHASE 1 MODULARIZATION: Use imported BoundedCache directly
