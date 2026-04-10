@@ -1528,11 +1528,19 @@ class MetaController:
             self._bootstrap_seed_used = True
             self._bootstrap_seed_enabled = False
             self.logger.warning("[BOOTSTRAP] Seed trade completed. System unlocked.")
+            handler = get_error_handler()
             try:
                 if hasattr(self, "mode_manager") and self.mode_manager.get_mode().upper() == "BOOTSTRAP":
                     self.mode_manager.set_mode("NORMAL")
-            except Exception:
-                pass
+            except StateError as e:
+                classification = handler.handle_exception(e, 
+                    additional_context={
+                        "operation": "mode_transition",
+                        "component": "BootstrapSellHandler"
+                    })
+                self.logger.debug("[Bootstrap] Mode transition after sell failed: %s", e.context.message)
+            except Exception as e:
+                self.logger.exception("[Bootstrap] Unexpected error in sell execution handler: %s", str(e))
 
     def _is_bot_managed_position(self, position: Dict[str, Any]) -> bool:
         """
@@ -1556,6 +1564,7 @@ class MetaController:
         Returns:
             True if bot-managed, False if system/exit operation
         """
+        handler = get_error_handler()
         try:
             tag = str(position.get("tag", "")).lower()
             
@@ -1573,8 +1582,16 @@ class MetaController:
                 return True
             
             return False
-        except Exception:
-            # On any error, assume NOT bot-managed (conservative)
+        except TypedValidationError as e:
+            classification = handler.handle_exception(e, 
+                additional_context={
+                    "operation": "position_tag_validation",
+                    "component": "PositionClassification"
+                })
+            self.logger.debug("[Meta] Position tag validation failed: %s, assuming NOT bot-managed", e.context.message)
+            return False
+        except Exception as e:
+            self.logger.exception("[Meta] Unexpected error in position management check: %s", str(e))
             return False
 
     def _count_open_positions(self) -> int:
@@ -2312,11 +2329,20 @@ class MetaController:
             return False, 0.0
 
         def _is_significant_snapshot(pos_obj: Dict[str, Any]) -> bool:
+            handler = get_error_handler()
             try:
                 if hasattr(self.shared_state, "classify_position_snapshot"):
                     is_open, _value, _floor = self.shared_state.classify_position_snapshot(sym, pos_obj or {})
                     return bool(is_open)
-            except Exception:
+            except TypedValidationError as e:
+                classification = handler.handle_exception(e, 
+                    additional_context={
+                        "operation": "classify_position_snapshot",
+                        "component": "PositionClassification"
+                    })
+                pass
+            except Exception as e:
+                self.logger.debug("[Meta] Position snapshot classification failed: %s", str(e))
                 pass
             status = str((pos_obj or {}).get("status") or "").upper()
             qty_local = float((pos_obj or {}).get("quantity") or (pos_obj or {}).get("qty") or 0.0)
@@ -2681,8 +2707,30 @@ class MetaController:
                     # Step 4: Release reservation (even on failure)
                     self._reserved_symbols.discard(sym)
                     
+            except ExecutionError as e:
+                handler = get_error_handler()
+                classification = handler.handle_exception(e, 
+                    additional_context={
+                        "operation": "atomic_buy_order",
+                        "component": "AtomicBuy",
+                        "symbol": sym
+                    })
+                self.logger.error(f"[Atomic:BUY] ExecutionError {sym}: {e.context.message}", exc_info=True)
+                self._reserved_symbols.discard(sym)
+                return None
+            except TraderException as e:
+                handler = get_error_handler()
+                classification = handler.handle_exception(e, 
+                    additional_context={
+                        "operation": "atomic_buy_order",
+                        "component": "AtomicBuy",
+                        "symbol": sym
+                    })
+                self.logger.warning(f"[Atomic:BUY] TraderException {sym}: {str(e)}", exc_info=True)
+                self._reserved_symbols.discard(sym)
+                return None
             except Exception as e:
-                self.logger.error(f"[Atomic:BUY] ✗ Exception {sym}: {e}", exc_info=True)
+                self.logger.exception(f"[Atomic:BUY] Unexpected exception {sym}: {str(e)}")
                 self._reserved_symbols.discard(sym)
                 return None
 
@@ -2762,10 +2810,31 @@ class MetaController:
                 finally:
                     self._reserved_symbols.discard(sym)
                     
+            except ExecutionError as e:
+                handler = get_error_handler()
+                classification = handler.handle_exception(e, 
+                    additional_context={
+                        "operation": "atomic_sell_order",
+                        "component": "AtomicSell",
+                        "symbol": sym
+                    })
+                self.logger.error(f"[Atomic:SELL] ExecutionError {sym}: {e.context.message}", exc_info=True)
+                self._reserved_symbols.discard(sym)
+                return None
+            except TraderException as e:
+                handler = get_error_handler()
+                classification = handler.handle_exception(e, 
+                    additional_context={
+                        "operation": "atomic_sell_order",
+                        "component": "AtomicSell",
+                        "symbol": sym
+                    })
+                self.logger.warning(f"[Atomic:SELL] TraderException {sym}: {str(e)}", exc_info=True)
+                self._reserved_symbols.discard(sym)
+                return None
             except Exception as e:
-                self.logger.error(
-                    f"[Atomic:SELL] ✗ Exception {sym}: {e}", 
-                    exc_info=True
+                self.logger.exception(
+                    f"[Atomic:SELL] Unexpected exception {sym}: {str(e)}"
                 )
                 self._reserved_symbols.discard(sym)
                 return None
