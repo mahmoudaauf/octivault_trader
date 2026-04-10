@@ -765,24 +765,50 @@ class MetaController:
         Returns:
             bool: True if bootstrap mode is active, False otherwise
         """
+        handler = get_error_handler()
+        
         # Delegate to Phase 2c BootstrapOrchestrator if available
         if hasattr(self, 'bootstrap_orchestrator') and self.bootstrap_orchestrator is not None:
             try:
                 return self.bootstrap_orchestrator.is_active()
+            except LifecycleError as e:
+                classification = handler.handle_exception(e, 
+                    additional_context={
+                        "operation": "bootstrap_orchestrator_check",
+                        "component": "BootstrapMode"
+                    })
+                self.logger.debug(f"[Meta:Bootstrap] Delegation failed: {e.context.message}")
+                # Fall through to legacy implementation
             except Exception as e:
-                self.logger.debug(f"[Meta:Bootstrap] Delegation to BootstrapOrchestrator failed: {e}")
+                self.logger.debug(f"[Meta:Bootstrap] Unexpected error checking bootstrap mode: {str(e)}")
                 # Fall through to legacy implementation
         
         # Legacy implementation: Fall back if Phase 2c not available
         try:
             if hasattr(self.shared_state, "is_bootstrap_mode"):
                 return bool(self.shared_state.is_bootstrap_mode())
-        except Exception:
+        except StateError as e:
+            classification = handler.handle_exception(e, 
+                additional_context={
+                    "operation": "shared_state_bootstrap_check",
+                    "component": "BootstrapMode"
+                })
+            pass
+        except Exception as e:
+            self.logger.debug("[Meta:Bootstrap] Legacy shared_state check failed: %s", str(e))
             pass
         try:
             if hasattr(self, "mode_manager"):
                 return str(self.mode_manager.get_mode() or "").upper() == "BOOTSTRAP"
-        except Exception:
+        except StateError as e:
+            classification = handler.handle_exception(e, 
+                additional_context={
+                    "operation": "mode_manager_bootstrap_check",
+                    "component": "BootstrapMode"
+                })
+            pass
+        except Exception as e:
+            self.logger.debug("[Meta:Bootstrap] Mode manager check failed: %s", str(e))
             pass
         return False
 
