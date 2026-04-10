@@ -4614,6 +4614,7 @@ class MetaController:
             meta_approved = False
             meta_reason = "uninitialized"
 
+            handler = get_error_handler()
             try:
                 if action == "BUY":
                     # Use MetaController's should_place_buy() for additional validation
@@ -4641,12 +4642,28 @@ class MetaController:
                     "✓ APPROVED" if meta_approved else "❌ REJECTED", action, symbol, meta_reason
                 )
 
-            except Exception as e:
-                self.logger.error(
-                    "[Meta:Directive] MetaController validation failed: %s", e, exc_info=True
+            except ExecutionError as e:
+                classification = handler.handle_exception(
+                    e,
+                    additional_context={
+                        "operation": "directive_meta_validation",
+                        "component": "DirectiveGating",
+                        "symbol": symbol,
+                        "action": action
+                    }
                 )
+                self.logger.error("[Meta:Directive] MetaController validation failed: %s", e.context.message)
                 meta_approved = False
-                meta_reason = f"validation_error: {str(e)}"
+                meta_reason = f"validation_error: {e.context.message}"
+            except TraderException as e:
+                classification = handler.handle_exception(e)
+                self.logger.error("[Meta:Directive] Trader error during directive validation")
+                meta_approved = False
+                meta_reason = "validation_error: trader_exception"
+            except Exception as e:
+                self.logger.error("[Meta:Directive] Unexpected error during directive validation: %s", type(e).__name__)
+                meta_approved = False
+                meta_reason = f"validation_error: {type(e).__name__}"
 
             if not meta_approved:
                 self.logger.warning(
@@ -4673,12 +4690,23 @@ class MetaController:
 
             # 🔧 BOOTSTRAP FIX: Mark bootstrap complete on first signal validation
             # This prevents shadow mode deadlock (bootstrap was waiting for trade execution)
+            handler = get_error_handler()
             try:
                 self.shared_state.mark_bootstrap_signal_validated()
-            except Exception as e:
-                self.logger.warning(
-                    "[Meta:Directive] Failed to mark bootstrap signal validated: %s", e
+            except StateError as e:
+                classification = handler.handle_exception(
+                    e,
+                    additional_context={
+                        "operation": "mark_bootstrap_signal_validated",
+                        "component": "BootstrapTracking"
+                    }
                 )
+                self.logger.warning("[Meta:Directive] Failed to mark bootstrap signal validated: %s", e.context.message)
+            except TraderException as e:
+                classification = handler.handle_exception(e)
+                self.logger.warning("[Meta:Directive] Trader error marking bootstrap signal")
+            except Exception as e:
+                self.logger.warning("[Meta:Directive] Unexpected error marking bootstrap signal: %s", type(e).__name__)
 
             # Store directive in audit trail
             if not hasattr(self, "_directive_audit_log"):
