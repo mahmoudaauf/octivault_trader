@@ -3616,23 +3616,71 @@ class MetaController:
             return True
 
         entry_price = 0.0
+        handler = get_error_handler()
         try:
             ot = getattr(self.shared_state, "open_trades", {}).get(symbol, {})
             entry_price = float(ot.get("entry_price", 0.0) or 0.0)
-        except Exception:
+        except StateError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_open_trades_excursion",
+                    "component": "PositionTracking",
+                    "symbol": symbol
+                }
+            )
+            self.logger.debug("[Meta:ExcursionGate] Failed to get open trades entry price: %s", e.context.message)
+            entry_price = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            entry_price = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:ExcursionGate] Unexpected error getting entry price from open trades: %s", type(e).__name__)
             entry_price = 0.0
         if not entry_price:
+            handler = get_error_handler()
             try:
                 pos = getattr(self.shared_state, "positions", {}).get(symbol, {})
                 entry_price = float(pos.get("avg_price", 0.0) or pos.get("entry_price", 0.0) or 0.0)
-            except Exception:
+            except StateError as e:
+                classification = handler.handle_exception(
+                    e,
+                    additional_context={
+                        "operation": "get_positions_excursion",
+                        "component": "PositionTracking",
+                        "symbol": symbol
+                    }
+                )
+                self.logger.debug("[Meta:ExcursionGate] Failed to get positions entry price: %s", e.context.message)
+                entry_price = 0.0
+            except TraderException as e:
+                classification = handler.handle_exception(e)
+                entry_price = 0.0
+            except Exception as e:
+                self.logger.debug("[Meta:ExcursionGate] Unexpected error getting entry price from positions: %s", type(e).__name__)
                 entry_price = 0.0
 
         cur_price = 0.0
+        handler = get_error_handler()
         try:
             if hasattr(self.shared_state, "safe_price"):
                 cur_price = float(await _safe_await(self.shared_state.safe_price(symbol)) or 0.0)
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "safe_price_excursion",
+                    "component": "PriceFetch",
+                    "symbol": symbol
+                }
+            )
+            self.logger.debug("[Meta:ExcursionGate] Failed to get safe price: %s", e.context.message)
+            cur_price = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            cur_price = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:ExcursionGate] Unexpected error getting safe price: %s", type(e).__name__)
             cur_price = 0.0
         if cur_price <= 0:
             cur_price = float(getattr(self.shared_state, "latest_prices", {}).get(symbol, 0.0) or 0.0)
@@ -3642,33 +3690,81 @@ class MetaController:
             return False
 
         tick_size = 0.0
+        handler = get_error_handler()
         try:
             info = await self._get_symbol_info(symbol)
             if isinstance(info, dict):
                 tick_size = float(info.get("tick_size", 0.0) or 0.0)
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_symbol_info_excursion",
+                    "component": "ExchangeRules",
+                    "symbol": symbol
+                }
+            )
+            self.logger.debug("[Meta:ExcursionGate] Failed to get symbol info: %s", e.context.message)
+            tick_size = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            tick_size = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:ExcursionGate] Unexpected error getting symbol info: %s", type(e).__name__)
             tick_size = 0.0
 
         atr = 0.0
+        handler = get_error_handler()
         try:
             if hasattr(self.shared_state, "calc_atr"):
                 atr = float(await _safe_await(self.shared_state.calc_atr(symbol, "5m", 14)) or 0.0)
                 if atr <= 0:
                     atr = float(await _safe_await(self.shared_state.calc_atr(symbol, "1m", 14)) or 0.0)
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "calc_atr_excursion",
+                    "component": "TechnicalAnalysis",
+                    "symbol": symbol
+                }
+            )
+            self.logger.debug("[Meta:ExcursionGate] Failed to calculate ATR: %s", e.context.message)
+            atr = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            atr = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:ExcursionGate] Unexpected error calculating ATR: %s", type(e).__name__)
             atr = 0.0
         if atr <= 0:
             fallback_pct = float(getattr(self.config, "TPSL_FALLBACK_ATR_PCT", 0.01) or 0.01)
             atr = entry_price * fallback_pct if entry_price > 0 else 0.0
 
         spread = 0.0
+        handler = get_error_handler()
         try:
             ex = getattr(self.shared_state, "exchange_client", None)
             if ex and hasattr(ex, "get_best_bid_ask"):
                 bid, ask = await _safe_await(ex.get_best_bid_ask(symbol))
                 if bid and ask and ask > 0 and bid > 0:
                     spread = abs(float(ask) - float(bid))
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_best_bid_ask_excursion",
+                    "component": "ExchangeData",
+                    "symbol": symbol
+                }
+            )
+            self.logger.debug("[Meta:ExcursionGate] Failed to get bid/ask spread: %s", e.context.message)
+            spread = 0.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            spread = 0.0
+        except Exception as e:
+            self.logger.debug("[Meta:ExcursionGate] Unexpected error getting bid/ask: %s", type(e).__name__)
             spread = 0.0
 
         tick_mult = float(getattr(self.config, "EXIT_EXCURSION_TICK_MULT", 2.0) or 2.0)
