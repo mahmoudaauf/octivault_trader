@@ -10,6 +10,7 @@ from functools import partial
 from utils.indicators import compute_ema, compute_bollinger_bands, compute_atr
 from core.agent_optimizer import load_tuned_params
 from core.component_status_logger import log_component_status
+from core.stubs import TradeIntent
 
 AGENT_NAME = "DipSniper"
 logger = logging.getLogger(AGENT_NAME)
@@ -53,6 +54,7 @@ class DipSniper:
         
         # P9 FIX: Signal collection buffer
         self._collected_signals: List[Dict[str, Any]] = []
+        self._collecting_for_agent_manager = False
         
         # P9 FIX: Use get_accepted_symbols() not direct .symbols access
         self.symbols = symbols if symbols is not None else []
@@ -60,63 +62,227 @@ class DipSniper:
         # IMPROVEMENT: Concurrency control (optional but recommended)
         max_concurrency = int(getattr(config, "DIPSNIPER_MAX_CONCURRENCY", 5))
         self._sem = asyncio.Semaphore(max_concurrency)
+
+        # Diagnostics (rate-limited). Helps explain "0 signals" cases in production logs.
+        self._last_diag_log_ts: float = 0.0
         
-    # P9 Config Tuning (Relaxed Thresholds per User Request)
-    # NOTE: Use _cfg-backed properties to avoid clashing with @property names.
+        # P9 Config Tuning (Relaxed Thresholds per User Request)
+        # NOTE: Use _cfg-backed properties to avoid clashing with @property names.
         
         log_component_status(self.name, "Initialized")
         logger.info(f"🚀 {self.name} initialized (P9-compliant, signal-only, max_concurrency={max_concurrency})")
+
+    @staticmethod
+    async def _await_maybe(coro):
+        """Helper to await if coroutine, else return value."""
+        return await coro if asyncio.iscoroutine(coro) else coro
 
     async def generate_signals(self) -> List[Dict[str, Any]]:
         """
         P9 CONTRACT: Generate signals for ALL symbols.
         Called by AgentManager. Returns signal list.
+        Delegates to run_once() to do the actual work (following TrendHunter pattern).
         """
-        self._collected_signals = []
-        
+        try:
+            self._collected_signals = []
+            self._collecting_for_agent_manager = True
+            try:
+                # CRITICAL FIX: Load symbols first like TrendHunter does!
+                await self._load_symbols()
+                await self.run_once()
+                return self._collected_signals
+            finally:
+                self._collecting_for_agent_manager = False
+        except Exception as e:
+            logger.error(f"[{self.name}] generate_signals EXCEPTION: {e}", exc_info=True)
+            return []  # Return empty list on error instead of None
+
+    async def _publish_trade_intent(self, payload: Dict[str, Any]) -> bool:
+        event_bus = getattr(self.shared_state, "event_bus", None)
+        publish = getattr(event_bus, "publish", None)
+        if callable(publish):
+            try:
+                await publish("events.trade.intent", TradeIntent(**payload))
+                logger.info(
+                    f"[{self.name}] Published TradeIntent: {payload.get('symbol')} {payload.get('side')}"
+                )
+                return True
+            except Exception:
+                logger.warning(
+                    f"[{self.name}] Failed to publish TradeIntent for {payload.get('symbol')}",
+                    exc_info=True,
+                )
+        emit_event = getattr(self.shared_state, "emit_event", None)
+        if callable(emit_event):
+            try:
+                await emit_event("TradeIntent", dict(payload))
+                return True
+            except Exception:
+                logger.warning(
+                    f"[{self.name}] Fallback TradeIntent emit failed for {payload.get('symbol')}",
+                    exc_info=True,
+                )
+        return False
+
+    async def run_once(self):
+        """
+        P9 bridge: Orchestrates signal generation.
+        Called by AgentManager via generate_signals().
+        Generates signals and emits them to MetaController.
+        """
+        logger.info(f"[{self.name}] run_once START")  # DEBUG
         # Refresh symbols from SharedState
         symbols = await self._safe_get_symbols()
         if set(symbols) != set(self.symbols):
             self.symbols = list(symbols)
             logger.info(f"[{self.name}] Updated symbols: {len(self.symbols)}")
-        
+
+        # ✅ FIX: Check market data readiness event before proceeding
+        try:
+            if hasattr(self.shared_state, "is_market_data_ready"):
+                ready = await self._await_maybe(self.shared_state.is_market_data_ready())
+                if not ready:
+                    logger.warning(f"[{self.name}] Market data not ready. Skipping run.")
+                    return
+        except Exception:
+            pass
+
         if not self.symbols:
             logger.warning(f"[{self.name}] No symbols to analyze")
-            return []
-        
+            if hasattr(self.shared_state, "update_component_status"):
+                await self.shared_state.update_component_status(
+                    component=self.name, status="Waiting", detail="No symbols in universe yet"
+                )
+            return
+
+        if hasattr(self.shared_state, "update_component_status"):
+            await self.shared_state.update_component_status(
+                component=self.name,
+                status="Scanning",
+                detail=f"Scanning {len(self.symbols)} symbols for dip conditions",
+            )
+
         # Analyze ALL symbols with concurrency control
         async def _one(sym: str):
             async with self._sem:
-                await self._analyze_symbol(sym)
-        
-        await asyncio.gather(*[_one(s) for s in self.symbols], return_exceptions=True)
-        
-        # Return collected signals
-        signals = self._collected_signals
-        self._collected_signals = []
-        logger.info(f"[{self.name}] Generated {len(signals)} signals across {len(self.symbols)} symbols")
-        return signals
+                return await self._analyze_symbol(sym)
 
-    async def run_once(self):
-        """
-        P9 bridge: allows AgentManager to trigger this strategy.
-        Generates signals and emits them to MetaController.
-        """
+        results = await asyncio.gather(*[_one(s) for s in self.symbols], return_exceptions=True)
+
+        # Log results
+        logger.info(f"[{self.name}] run_once END -> Generated {len(self._collected_signals)} signals across {len(self.symbols)} symbols")
+
+        # If we produced no signals, emit a compact diagnostic summary (rate-limited)
+        # so ops can tell whether this is "no setups" vs "no data".
         try:
-            signals = await self.generate_signals()
+            diag_interval = float(self._cfg("DIPSNIPER_DIAG_INTERVAL_SEC", 300.0) or 300.0)
+            now = time.time()
+            if (len(self._collected_signals) == 0) and (now - float(self._last_diag_log_ts or 0.0) >= diag_interval):
+                self._last_diag_log_ts = now
+                counts: Dict[str, int] = {}
+                best = None
+                best_score = -1.0
 
-            for signal in signals:
-                symbol = signal.get("symbol")
+                for r in results or []:
+                    if isinstance(r, Exception):
+                        key = "exception"
+                        counts[key] = counts.get(key, 0) + 1
+                        continue
+                    if not isinstance(r, dict):
+                        key = "unknown"
+                        counts[key] = counts.get(key, 0) + 1
+                        continue
+                    status = str(r.get("status", "unknown"))
+                    counts[status] = counts.get(status, 0) + 1
 
-                if hasattr(self.shared_state, "submit_agent_signal"):
-                    await self.shared_state.submit_agent_signal(
-                        agent_name=self.name,
-                        symbol=symbol,
-                        signal=signal
+                    # Heuristic: pick "closest to trigger" based on conditions met + dip depth.
+                    if status in ("no_setup", "conf_below_min", "signal"):
+                        met = int(r.get("conds_met", 0) or 0)
+                        dip = float(r.get("dip_percent", 0.0) or 0.0)
+                        score = float(met) * 10.0 + dip
+                        if score > best_score:
+                            best_score = score
+                            best = r
+
+                best_str = ""
+                if isinstance(best, dict):
+                    best_str = (
+                        f" best={best.get('symbol')} met={best.get('conds_met')} "
+                        f"dip={float(best.get('dip_percent', 0.0) or 0.0):.2f}% "
+                        f"bb={bool(best.get('below_bb'))} ema={bool(best.get('below_ema'))} "
+                        f"conf={float(best.get('confidence', 0.0) or 0.0):.2f} "
+                        f"min_conf={float(best.get('min_conf', 0.0) or 0.0):.2f} "
+                        f"bars={int(best.get('bars', 0) or 0)}"
                     )
 
+                logger.info(
+                    "[%s] DIAG no-signals tf=%s symbols=%d counts=%s%s",
+                    self.name,
+                    str(self.timeframe),
+                    len(self.symbols),
+                    counts,
+                    best_str,
+                )
+        except Exception:
+            pass
+
+        if hasattr(self.shared_state, "update_component_status"):
+            if self._collected_signals:
+                detail = f"Found {len(self._collected_signals)} dip signal(s): {[s['symbol'] for s in self._collected_signals]}"
+            else:
+                detail = f"Scanned {len(self.symbols)} symbols — no qualifying dip yet"
+            await self.shared_state.update_component_status(
+                component=self.name, status="Operational", detail=detail
+            )
+
+    async def run_loop(self) -> None:
+        """
+        Continuous loop that calls run_once() at regular intervals.
+        This is what gets scheduled in the background by the framework.
+        """
+        await self._safe_get_symbols()  # Initial symbol load
+        interval = int(self._cfg("AGENT_LOOP_INTERVAL", 60))
+        logger.info(f"[{self.name}] 🔁 Starting run_loop @ {interval}s")
+        try:
+            while True:
+                try:
+                    await self.run_once()
+                except Exception as e:
+                    logger.error(f"[{self.name}] ❌ Error in run_loop: {e}", exc_info=True)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.info(f"[{self.name}] run_loop cancelled; exiting cleanly.")
+            raise
+
+    async def _load_symbols(self) -> None:
+        """Load accepted symbols from SharedState (matching TrendHunter pattern)."""
+        try:
+            getter = getattr(self.shared_state, "get_accepted_symbols", None)
+            if callable(getter):
+                try:
+                    res = getter(full=True)
+                except TypeError:
+                    res = getter()
+                accepted = await res if asyncio.iscoroutine(res) else (res or {})
+            else:
+                accepted = {}
+            
+            if not isinstance(accepted, dict):
+                snap = getattr(self.shared_state, "get_accepted_symbols_snapshot", None)
+                if callable(snap):
+                    r = snap()
+                    accepted = await r if asyncio.iscoroutine(r) else (r or {})
+                if not isinstance(accepted, dict):
+                    accepted = {s: {} for s in (accepted or [])}
+            
+            self.symbols = list(accepted.keys())
+            logger.info(f"[{self.name}] 🔄 Loaded {len(self.symbols)} symbols from SharedState")
         except Exception as e:
-            logger.exception(f"[{self.name}] run_once failed: {e}")
+            logger.error(f"[{self.name}] Failed to load symbols: {e}", exc_info=True)
+            # ✅ FIX: Do NOT wipe symbols on exception - keep existing ones
+            # This prevents: error in loading → self.symbols=[] → loop over zero symbols
+            if not self.symbols:
+                logger.warning(f"[{self.name}] No symbols available to trade; agent will be idle until symbols load")
 
     async def _safe_get_symbols(self) -> List[str]:
         """P9 FIX: Use canonical symbol source."""
@@ -139,6 +305,20 @@ class DipSniper:
         logger.debug(f"[{self.name}] 🔍 Analyzing {symbol}")
         
         try:
+            sym = str(symbol or "").upper()
+            if not sym:
+                return {"symbol": symbol, "status": "invalid_symbol"}
+
+            # ✅ FIX: Check market data readiness event before proceeding
+            try:
+                md_ready_event = getattr(self.shared_state, "market_data_ready_event", None)
+                if md_ready_event and hasattr(md_ready_event, "is_set"):
+                    if not md_ready_event.is_set():
+                        logger.debug(f"[{self.name}] Market data ready event not set for {symbol}. Returning insufficient_data.")
+                        return {"symbol": sym, "status": "market_data_not_ready"}
+            except Exception:
+                pass
+
             # IMPROVEMENT 1: Freshness check (prevent stale data signals)
             if hasattr(self.shared_state, "is_fresh"):
                 try:
@@ -147,7 +327,7 @@ class DipSniper:
                         fresh = await fresh
                     if not fresh:
                         logger.debug(f"[{self.name}] Stale data for {symbol}, skipping")
-                        return
+                        return {"symbol": sym, "status": "stale_data"}
                 except Exception:
                     pass  # If freshness check fails, continue anyway
             
@@ -159,11 +339,39 @@ class DipSniper:
             
             if not isinstance(candles, list) or len(candles) < 50:
                 logger.debug(f"[{self.name}] Insufficient data for {symbol}")
-                return  # P9 FIX: Don't emit HOLD signals
+                return {"symbol": sym, "status": "insufficient_bars", "bars": int(len(candles or []) if isinstance(candles, list) else 0)}
             
             # Create DataFrame
             if isinstance(candles[0], dict):
                 df = await asyncio.to_thread(pd.DataFrame, candles)
+
+                # SharedState OHLCVBar uses {ts,o,h,l,c,v}. Normalize to the
+                # indicator schema expected by this agent. Also handle
+                # capitalized keys like "Open"/"Close".
+                try:
+                    # Normalize all columns to lowercase first.
+                    df.columns = [str(c).strip().lower() for c in df.columns]
+                    lower_to_orig = {str(c).lower(): c for c in df.columns}
+
+                    # Only remap when canonical columns are missing.
+                    if "open" not in lower_to_orig and "o" in lower_to_orig:
+                        ren = {}
+                        for src, dst in {
+                            "ts": "timestamp",
+                            "t": "timestamp",
+                            "time": "timestamp",
+                            "o": "open",
+                            "h": "high",
+                            "l": "low",
+                            "c": "close",
+                            "v": "volume",
+                        }.items():
+                            if src in lower_to_orig and dst not in lower_to_orig:
+                                ren[lower_to_orig[src]] = dst
+                        if ren:
+                            df = df.rename(columns=ren)
+                except Exception:
+                    pass
             else:
                 df = await asyncio.to_thread(
                     pd.DataFrame,
@@ -177,7 +385,7 @@ class DipSniper:
             df.dropna(subset=['close', 'volume'], inplace=True)
             
             if len(df) < 50:
-                return  # Not enough data - don't emit
+                return {"symbol": sym, "status": "insufficient_rows", "rows": int(len(df))}
             
             # Compute indicators
             def compute_indicators_sync(dataframe):
@@ -190,36 +398,63 @@ class DipSniper:
             df = await asyncio.to_thread(compute_indicators_sync, df)
             
             if df.empty or len(df) < 2:
-                return  # Not enough data after indicators
+                return {"symbol": sym, "status": "insufficient_after_indicators", "rows": int(len(df))}
             
             latest = df.iloc[-1]
             previous = df.iloc[-2]
             
             # Check for NaN indicators
             if pd.isna(latest['bb_lower']) or pd.isna(latest['ema20']) or pd.isna(latest['atr']):
-                return  # Invalid indicators - don't emit
+                return {"symbol": sym, "status": "invalid_indicators"}
             
             if latest['atr'] <= 0:
-                return  # Can't compute confidence
+                return {"symbol": sym, "status": "atr_non_positive"}
             
             # Calculate dip metrics
             dip_percent = (previous['close'] - latest['close']) / previous['close'] * 100 if previous['close'] != 0 else 0.0
             volume_avg = df['volume'].rolling(10).mean().iloc[-1]
-            volume_spike = latest['volume'] > volume_avg * self.volume_spike_multiplier
-            
-            # Check dip conditions
-            condition = (
-                latest['close'] < latest['bb_lower'] and
-                latest['close'] < latest['ema20'] and
-                dip_percent > self.dip_threshold_percent and
-                volume_spike
-            )
+            # Guard NaN volume_avg (short history): treat as no spike rather than crashing
+            if pd.isna(volume_avg) or volume_avg <= 0:
+                volume_spike = False
+            else:
+                volume_spike = latest['volume'] > volume_avg * self.volume_spike_multiplier
+
+            # Dip conditions
+            price_below_bb = latest['close'] < latest['bb_lower']
+            price_below_ema = latest['close'] < latest['ema20']
+            dip_thr = float(self.dip_threshold_percent or 0.0)
+            dip_deep_enough = dip_percent > dip_thr
+
+            # SAFETY TUNING (user requested):
+            # - Keep EMA as a useful directional sanity check (default hard gate).
+            # - BB is a soft boost (not mandatory), to prevent total starvation.
+            require_ema = bool(self._cfg("DIPSNIPER_REQUIRE_BELOW_EMA", True))
+            min_score = int(self._cfg("DIPSNIPER_MIN_SCORE", 2) or 2)  # dip + ema, bb is optional boost
+            score = int(dip_deep_enough) + int(price_below_ema) + int(price_below_bb)
+            condition = bool(dip_deep_enough) and (score >= max(1, min_score)) and (price_below_ema if require_ema else True)
             
             # P9 FIX: Only emit BUY signals when conditions met
             if self.enabled and condition:
-                confidence = np.clip(abs((latest['close'] - latest['bb_lower']) / latest['atr']), 0, 1)
+                # Confidence: primarily driven by dip depth; BB breach boosts confidence but isn't required.
+                atr = float(latest['atr'])
+                bb_lower = float(latest['bb_lower'])
+                close = float(latest['close'])
+
+                dip_factor = 0.0
+                if dip_thr > 0:
+                    dip_factor = float(np.clip((dip_percent / dip_thr) / 2.0, 0.0, 1.0))
+
+                bb_factor = 0.0
+                if atr > 0:
+                    bb_factor = float(np.clip((bb_lower - close) / atr, 0.0, 1.0))
+
+                ema_factor = 1.0 if price_below_ema else 0.5
+
+                base_confidence = float(np.clip((0.65 * dip_factor) + (0.35 * bb_factor), 0.0, 1.0) * ema_factor)
+                # Volume spike adds +10% confidence bonus
+                confidence = float(np.clip(base_confidence * (1.1 if volume_spike else 1.0), 0.0, 1.0))
                 
-                # IMPROVEMENT 2: Confidence floor (reduce noise)
+                # Confidence floor (reduce noise)
                 base_min_conf = float(self._cfg("MIN_SIGNAL_CONF", 0.55))
                 
                 # Dynamic Aggression (P9 Loop)
@@ -233,7 +468,17 @@ class DipSniper:
 
                 if confidence < min_conf:
                     logger.debug(f"[{self.name}] {symbol} confidence {confidence:.2f} below dynamic threshold {min_conf:.2f}")
-                    return
+                    return {
+                        "symbol": sym,
+                        "status": "conf_below_min",
+                        "bars": int(len(df)),
+                        "conds_met": int(price_below_bb) + int(price_below_ema) + int(dip_deep_enough),
+                        "dip_percent": float(dip_percent),
+                        "below_bb": bool(price_below_bb),
+                        "below_ema": bool(price_below_ema),
+                        "confidence": float(confidence),
+                        "min_conf": float(min_conf),
+                    }
                 
                 # Soft guard: warn if quote hint is below SAFE_ENTRY_USDT; execution layer enforces floors
                 quote_hint = float(
@@ -254,35 +499,83 @@ class DipSniper:
                     "side": "BUY",
                     "action": "BUY",  # Kept for compatibility
                     "confidence": float(confidence),
-                    "reason": f"DipSniper: dip {dip_percent:.2f}% below BB with volume spike",
+                    "reason": (
+                        f"DipSniper: dip {dip_percent:.2f}% (thr={dip_thr:.2f}%) "
+                        f"{'below_EMA' if price_below_ema else 'above_EMA'} "
+                        f"{'below_BB' if price_below_bb else 'above_BB'} "
+                        f"score={score}/{min_score}"
+                        f"{' + volume spike' if volume_spike else ''}"
+                    ),
                     "agent": self.name,
                     "quote": quote_hint,
                     "horizon_hours": 6.0,
                 }
                 
-                # Mandatory P9 Signal Contract: Emit to Signal Bus
-                if hasattr(self.shared_state, "add_agent_signal"):
-                    try:
-                        await self.shared_state.add_agent_signal(
-                            symbol=symbol,
-                            agent=self.name,
-                            side="BUY",
-                            confidence=float(confidence),
-                            ttl_sec=300,
-                            tier="B",
-                            rationale=f"Dip detected: {dip_percent:.2f}%"
-                        )
-                    except Exception as e:
-                        logger.warning(f"[{self.name}] Failed to emit to signal bus: {e}")
-
+                # Legacy path removed - using TradeIntent publishing only
+                
                 self._collected_signals.append(signal)
                 logger.info(f"[{self.name}] 📤 BUY signal: {symbol} conf={confidence:.2f} dip={dip_percent:.2f}%")
+                # Always publish TradeIntent to event bus (needed for MetaController drain)
+                intent_payload = {
+                    "symbol": str(symbol).replace("/", "").upper(),
+                    "side": "BUY",
+                    "planned_quote": quote_hint,
+                    "quote_hint": quote_hint,
+                    "confidence": float(confidence),
+                    "agent": self.name,
+                    "tag": f"strategy/{self.name}",
+                    "reason": str(signal["reason"]),
+                    "rationale": str(signal["reason"]),
+                    "timeframe": self.timeframe,
+                    "timestamp": time.time(),
+                    "policy_context": {
+                        "dip_percent": float(dip_percent),
+                        "below_bb": bool(price_below_bb),
+                        "below_ema": bool(price_below_ema),
+                        "score": int(score),
+                        "min_score": int(min_score),
+                    },
+                }
+                await self._publish_trade_intent(intent_payload)
+                return {
+                    "symbol": sym,
+                    "status": "signal",
+                    "bars": int(len(df)),
+                    "conds_met": int(price_below_bb) + int(price_below_ema) + int(dip_deep_enough),
+                    "score": int(score),
+                    "min_score": int(min_score),
+                    "require_ema": bool(require_ema),
+                    "dip_percent": float(dip_percent),
+                    "below_bb": bool(price_below_bb),
+                    "below_ema": bool(price_below_ema),
+                    "confidence": float(confidence),
+                    "min_conf": float(min_conf),
+                }
+
+            # No signal (either disabled or no setup)
+            if not self.enabled:
+                return {"symbol": sym, "status": "disabled"}
+            return {
+                "symbol": sym,
+                "status": "no_setup",
+                "bars": int(len(df)),
+                "conds_met": int(price_below_bb) + int(price_below_ema) + int(dip_deep_enough),
+                "score": int(score),
+                "min_score": int(min_score),
+                "require_ema": bool(require_ema),
+                "dip_percent": float(dip_percent),
+                "below_bb": bool(price_below_bb),
+                "below_ema": bool(price_below_ema),
+                "confidence": 0.0,
+                "min_conf": float(self._cfg("MIN_SIGNAL_CONF", 0.55) or 0.55),
+            }
             
             # P9 FIX: No HOLD signals - silence is implicit hold
                 
         except Exception as e:
             logger.error(f"[{self.name}] ❌ Error analyzing {symbol}: {e}", exc_info=True)
             # Don't emit error signals - let it silently fail
+            return {"symbol": str(symbol or "").upper(), "status": "error"}
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         """Get config value with fallback."""
@@ -303,7 +596,9 @@ class DipSniper:
 
     @property
     def dip_threshold_percent(self) -> float:
-        return float(self._cfg("DIP_THRESHOLD_PERCENT", 2.0))
+        # Lowered default from 2.0 to 0.8 — 2% was rarely triggered in stable markets.
+        # Override via config: DIP_THRESHOLD_PERCENT = <value>
+        return float(self._cfg("DIP_THRESHOLD_PERCENT", 0.8))
 
     @property
     def enabled(self) -> bool:

@@ -60,6 +60,10 @@ class RiskManager:
         self._global_freeze: bool = False
         self._global_freeze_reason: Optional[str] = None
 
+        # Phase 3: Balance cache for event-driven updates (0 API calls)
+        self._balance_cache: Dict[str, float] = {}
+        self._last_balance_update: float = 0.0
+
         # time helpers
         self._mono = time.monotonic
         self._epoch = time.time
@@ -302,7 +306,16 @@ class RiskManager:
         return {}
 
     async def _get_free_quote_balance(self) -> float:
+        """Phase 3: 3-strategy cascade for quote balance (memory → fallback → REST optional)."""
         quote = str(getattr(self.config, "QUOTE_ASSET", self.base_currency) or self.base_currency).upper()
+        
+        # Strategy 1: Internal cache (WebSocket-updated, 0 API, <1ms)
+        if quote in self._balance_cache:
+            cached = self._balance_cache[quote]
+            if cached >= 0:
+                return float(cached)
+        
+        # Strategy 2: SharedState balances (in-memory, 0 API, <1ms)
         try:
             getter = getattr(self.shared_state, "get_spendable_balance", None)
             if callable(getter):
@@ -310,9 +323,11 @@ class RiskManager:
                 res = await res if inspect.isawaitable(res) else res
                 free_quote = float(res or 0.0)
                 if free_quote >= 0:
+                    self._balance_cache[quote] = free_quote
                     return free_quote
         except Exception:
             pass
+        
         try:
             getter = getattr(self.shared_state, "get_free_balance", None)
             if callable(getter):
@@ -320,19 +335,63 @@ class RiskManager:
                 res = await res if inspect.isawaitable(res) else res
                 free_quote = float(res or 0.0)
                 if free_quote >= 0:
+                    self._balance_cache[quote] = free_quote
                     return free_quote
         except Exception:
             pass
+        
         try:
             snap_getter = getattr(self.shared_state, "get_balance_snapshot", None)
             if callable(snap_getter):
                 snap = snap_getter()
                 snap = await snap if inspect.isawaitable(snap) else snap
                 if isinstance(snap, dict):
-                    return float(((snap.get(quote) or {}).get("free", 0.0)) or 0.0)
+                    free = float(((snap.get(quote) or {}).get("free", 0.0)) or 0.0)
+                    self._balance_cache[quote] = free
+                    return free
         except Exception:
             pass
-        return 0.0
+        
+        # Strategy 3: REST API (optional, only if RM_ALLOW_REST=True)
+        allow_rest = getattr(self.config, "RM_ALLOW_REST", False)
+        if allow_rest and self.exchange_client:
+            try:
+                if hasattr(self.exchange_client, "get_account_balance"):
+                    bal = await self.exchange_client.get_account_balance(quote)
+                    free = float((bal or {}).get("free", 0.0))
+                    self._balance_cache[quote] = free
+                    return free
+            except Exception:
+                pass
+        
+        # Fallback: Return cached value even if stale
+        return self._balance_cache.get(quote, 0.0)
+
+    async def _sync_balance_cache(self) -> None:
+        """Phase 3: Populate balance cache from SharedState (0 API calls)."""
+        try:
+            if hasattr(self.shared_state, "balances"):
+                balances = self.shared_state.balances
+                if isinstance(balances, dict):
+                    for asset, data in balances.items():
+                        if isinstance(data, dict):
+                            free = data.get("free", 0.0)
+                            if free:
+                                self._balance_cache[asset] = float(free)
+            self.logger.debug(f"Balance cache synced: {len(self._balance_cache)} assets cached")
+        except Exception as e:
+            self.logger.debug(f"Balance cache sync failed: {e}")
+
+    async def _on_balance_updated(self, asset: str, balance_data: Dict[str, float]) -> None:
+        """Phase 3: Handle WebSocket balance update events (0 API calls)."""
+        try:
+            free = balance_data.get("free", 0.0)
+            if free:
+                self._balance_cache[asset] = float(free)
+                self._last_balance_update = time.time()
+                self.logger.debug(f"Balance updated: {asset} = {free}")
+        except Exception as e:
+            self.logger.debug(f"Balance event handler failed: {e}")
 
     async def _projected_buy_exposure_violation(self, symbol: str, quote_qty: float) -> Optional[str]:
         q = float(max(0.0, quote_qty or 0.0))
@@ -968,10 +1027,23 @@ class RiskManager:
         """
         Lightweight start() for P6: emit HealthStatus and schedule periodic checks.
         Idempotent and non-blocking. Safe to call multiple times.
+        
+        Phase 3: Initialize balance cache and subscribe to balance update events.
         """
         if self._running:
             return
         self._running = True
+
+        # Phase 3: Load initial balances from SharedState (0 API calls)
+        await self._sync_balance_cache()
+        
+        # Phase 3: Subscribe to balance update events (WebSocket-driven, 0 API)
+        try:
+            if hasattr(self.shared_state, "subscribe"):
+                self.shared_state.subscribe("balance_updated", self._on_balance_updated)
+                self.logger.debug("✅ Subscribed to balance_updated events")
+        except Exception as e:
+            self.logger.debug(f"Balance event subscription failed: {e}")
 
         # Determine heartbeat interval (default 15s for P6)
         default_beat = 15.0

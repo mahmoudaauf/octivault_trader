@@ -210,8 +210,9 @@ class SymbolManager:
 
         await asyncio.gather(*(_check_one(s, m) for s, m in prelim_map.items()))
 
-        if self._cap and len(validated) > self._cap:
-            validated = self._apply_cap(validated)
+        # ✅ DO NOT apply cap here - canonical governor will enforce in SharedState
+        # We want to evaluate ALL validated symbols, not just top-5
+        # Cap enforcement moved to: SharedState.set_accepted_symbols()
 
         if not validated:
             self.logger.error("❌ No symbols validated after discovery! Universe is empty.")
@@ -580,15 +581,10 @@ class SymbolManager:
             self.logger.info("⚠️ %s already exists; skipping proposal.", symbol)
             return False, "already exists"
 
-        if self._cap and len(snap) >= self._cap:
-            # try immediate prioritized add; if it fails, buffer for later flush
-            self.logger.info("📦 Cap reached; trying prioritized add for %s…", symbol)
-            ok, reason = await self.add_symbol(symbol, source=source, **kwargs)
-            if ok:
-                return True, None
-            self.buffered_symbols.append(_meta_from_kwargs(symbol, source, **kwargs))
-            self.logger.info("⏳ Queued %s (cap reached).", symbol)
-            return False, reason or "cap reached"
+        # ✅ REMOVED: Cap enforcement from propose_symbol()
+        # WHY: Cap should NOT block discovery proposals
+        # Symbols should flow to evaluation layer, cap applied at execution time
+        # This allows full universe to be evaluated before capping trades
 
         return await self.add_symbol(symbol, source=source, **kwargs)
 
@@ -617,13 +613,12 @@ class SymbolManager:
                 self.logger.debug(f"[{source}] Rejected {s_up}: {reason}")
 
         if added_count > 0:
-            # 3. Apply cap if needed
-            if self._cap and len(final_map) > self._cap:
-                final_map = self._apply_cap(final_map)
+            # ✅ DO NOT apply cap here - canonical governor enforces in SharedState
+            # Evaluate ALL symbols, cap is applied at execution layer
+            # This allows proper rotation and opportunity discovery
 
-            # 4. Commit once with merge_mode=True for additive batch proposals
-            # This allows multiple screening passes to accumulate symbols instead of replacing.
-            await self._safe_set_accepted_symbols(final_map, allow_shrink=False, merge_mode=True, source=source)
+            # 4. Commit once with allow_shrink=False to preserve work
+            await self._safe_set_accepted_symbols(final_map, allow_shrink=False, source=source)
             self.logger.info("✅ Batch update complete: +%d symbol(s) from %s.", added_count, source)
         else:
             self.logger.info("ℹ️ No new symbols added from batch.")
@@ -683,9 +678,8 @@ class SymbolManager:
             and e["symbol"] not in effective_blacklist
         ])
 
-        # apply cap
-        if self._cap and len(final_map) > self._cap:
-            final_map = self._apply_cap(final_map)
+        # ✅ DO NOT apply cap here - canonical governor enforces in SharedState
+        # All buffered symbols are validated and added, cap applied at execution layer
 
         # final existence sanitation
         if self.exchange_client and hasattr(self.exchange_client, "symbol_exists_cached"):

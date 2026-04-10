@@ -12,26 +12,15 @@ class SymbolScreener:
         """
         Try SymbolManager.propose_symbol → SharedState.propose_symbol → fallback to stash.
         Always returns a boolean 'accepted' (True/False).
+        
+        ✅ FIX #9: Discovery-first approach
+        - Primary: Write to symbol_proposals (UURE reads these in next rotation)
+        - Secondary: SymbolManager/SharedState proposals (immediate trading if available)
+        - Don't call propose_symbol immediately - let UURE decide via rotation cycle
         """
-        # Prefer SymbolManager API if present
-        if self.symbol_manager and hasattr(self.symbol_manager, "propose_symbol"):
-            res = self.symbol_manager.propose_symbol(symbol, source=source, **(metadata or {}))
-            res = await res if asyncio.iscoroutine(res) else res
-            # Normalize (True|False) or (True/False, reason)
-            if isinstance(res, tuple) and res:
-                return bool(res[0])
-            return bool(res)
-
-        # Fallback to SharedState API if available
-        if self.shared_state and hasattr(self.shared_state, "propose_symbol"):
-            res = self.shared_state.propose_symbol(symbol, source=source, metadata=metadata)
-            res = await res if asyncio.iscoroutine(res) else res
-            if isinstance(res, tuple) and res:
-                return bool(res[0])
-            return bool(res)
-
-        # Last resort: stash into shared_state.symbol_proposals so a later
-        # SymbolManager flush can pick it up
+        # ✅ FIX #8 PART 2: Write to symbol_proposals for UURE discovery integration
+        # This ensures UURE can see discovery candidates during _collect_discovery_proposals()
+        # This is the PRIMARY path - UURE will decide whether to add to accepted_symbols
         if self.shared_state is not None:
             self.shared_state.symbol_proposals = getattr(self.shared_state, "symbol_proposals", {}) or {}
             self.shared_state.symbol_proposals[str(symbol).upper()] = {
@@ -40,10 +29,11 @@ class SymbolScreener:
                 "metadata": dict(metadata or {}),
                 "ts": time.time(),
             }
-            logger.info(f"[SymbolScreener] Buffered proposal for {symbol} (no propose API available).")
-            return False
-
-        logger.warning(f"[SymbolScreener] No proposal path for {symbol}.")
+            logger.info(f"[SymbolScreener] ✅ Proposed {symbol} to symbol_proposals for UURE processing")
+            # Return True to indicate proposal was accepted into the buffer
+            return True
+        
+        logger.warning(f"[SymbolScreener] No proposal store available for {symbol}.")
         return False
 
     async def _prefilter_symbol(self, symbol: str) -> bool:
@@ -145,7 +135,9 @@ class SymbolScreener:
 
     @property
     def min_volume(self) -> float:
-        return float(self._cfg("SYMBOL_MIN_VOLUME", 1_000_000))
+        # Use SCREENER_MIN_VOLUME from Config (default 1M in production, 50k in discovery)
+        # Falls back to MIN_TRADE_VOLUME from DISCOVERY namespace
+        return float(self._cfg("SCREENER_MIN_VOLUME", self._cfg("MIN_TRADE_VOLUME", 50_000)))
 
     @property
     def min_percent_change(self) -> float:
@@ -153,21 +145,26 @@ class SymbolScreener:
 
     @property
     def top_n_symbols(self) -> int:
-        # Legacy compatibility; preferred knob is SYMBOL_CANDIDATE_POOL_SIZE.
-        return int(self._cfg("SYMBOL_TOP_N", self._cfg("SYMBOL_CANDIDATE_POOL_SIZE", 50)))
+        # Fallback chain: SYMBOL_TOP_N → SCREENER_MAX_PROPOSALS → default 30
+        return int(self._cfg("SYMBOL_TOP_N", self._cfg("SCREENER_MAX_PROPOSALS", 30)))
 
     @property
     def candidate_pool_size(self) -> int:
-        return max(1, int(self._cfg("SYMBOL_CANDIDATE_POOL_SIZE", self.top_n_symbols)))
+        # Use SCREENER_MAX_PROPOSALS as the preferred config key (set in Config)
+        return max(1, int(self._cfg("SCREENER_MAX_PROPOSALS", self.top_n_symbols)))
 
     @property
     def top_volume_universe_size(self) -> int:
-        base = max(1, int(self._cfg("SYMBOL_TOP_VOLUME_UNIVERSE", 50)))
+        # Use MAX_UNIVERSE_SYMBOLS as the primary knob for discovery breadth
+        base = max(1, int(self._cfg("MAX_UNIVERSE_SYMBOLS", 30)))
         return max(base, self.candidate_pool_size)
 
     @property
     def min_atr_pct(self) -> float:
-        raw = float(self._cfg("SYMBOL_MIN_ATR_PCT", 0.008) or 0.008)
+        # ✅ LOWERED from 0.8% to 0.3% for better candidate discovery
+        # This allows more symbols with moderate ATR to be proposed
+        # 0.3% is still meaningful volatility (3% daily move on avg)
+        raw = float(self._cfg("SYMBOL_MIN_ATR_PCT", 0.003) or 0.003)
         return (raw / 100.0) if raw > 1.0 else raw
 
     @property
@@ -249,6 +246,20 @@ class SymbolScreener:
 
     async def _build_exclude_set(self) -> set:
         exclude = {self._normalize_symbol(x) for x in self.symbol_exclude_list}
+        
+        # ✅ FIX #10: Exclude accepted_symbols from discovery
+        # Discovery should find NEW symbols, not re-propose existing universe
+        # This prevents SymbolScreener from proposing BTC, ETH, BNB when they're already trading
+        if self.shared_state:
+            try:
+                current_universe = await self.shared_state.get_accepted_symbols() if hasattr(self.shared_state, 'get_accepted_symbols') else {}
+                if not asyncio.iscoroutine(current_universe):
+                    accepted_syms = {self._normalize_symbol(x) for x in current_universe.keys()} if isinstance(current_universe, dict) else set()
+                    exclude.update(accepted_syms)
+                    logger.debug(f"[SymbolScreener] Excluding {len(accepted_syms)} accepted symbols from discovery: {list(accepted_syms)[:5]}...")
+            except Exception as e:
+                logger.debug(f"[SymbolScreener] Failed to get accepted symbols for exclusion: {e}")
+        
         if not self.exchange_client:
             return exclude
         try:
@@ -285,6 +296,57 @@ class SymbolScreener:
             logger.debug("[SymbolScreener] ATR calc failed for %s", symbol, exc_info=True)
         return 0.0
 
+    # ✅ PHASE 2a: NEW METHOD - Regime-aware filtering
+    async def _passes_regime_filter(self, symbol: str) -> bool:
+        """
+        Filter candidates by market regime (regime-aware discovery).
+        
+        ⚠️ DISCOVERY PHILOSOPHY:
+          Discovery should find candidates broadly.
+          Regime filtering is applied at EXECUTION time, not discovery.
+          This allows full universe evaluation before capping trades.
+        
+        Returns True if symbol passes regime filter, False otherwise.
+        """
+        try:
+            # ✅ DISABLED BY DEFAULT: Regime filtering in discovery is too restrictive
+            # It rejects symbols in low/sideways regimes, which limits pool unnecessarily
+            # Execution layer gates trades; discovery gates candidates.
+            enable_regime_filter = bool(self._cfg("SYMBOL_SCREENER_REGIME_FILTER", False))
+            if not enable_regime_filter:
+                return True  # Disabled, allow all
+            
+            # Get volatility regime for the symbol (1h preferred)
+            if hasattr(self.shared_state, "get_volatility_regime"):
+                try:
+                    regime_result = self.shared_state.get_volatility_regime(symbol, timeframe="1h", max_age_seconds=300)
+                    regime_result = await regime_result if asyncio.iscoroutine(regime_result) else regime_result
+                    
+                    if isinstance(regime_result, dict):
+                        regime = str(regime_result.get("regime", "normal")).lower()
+                        confidence = float(regime_result.get("confidence", 0.0))
+                        
+                        # Reject low/sideways unless confidence is very high
+                        if regime in ("low", "sideways"):
+                            if confidence < 0.8:
+                                logger.debug(
+                                    "[SymbolScreener] %s rejected: regime=%s (confidence=%.2f < 0.8)",
+                                    symbol, regime, confidence
+                                )
+                                return False
+                        
+                        return True
+                except Exception as e:
+                    logger.debug(f"[SymbolScreener] Regime check failed for {symbol}: {e}")
+                    return True  # Safe default: allow on error
+            
+            return True  # No regime detector available
+        
+        except Exception as e:
+            logger.debug(f"[SymbolScreener] Unexpected error in regime filter for {symbol}: {e}")
+            return True  # Safe default
+
+
     async def _evaluate_candidate(
         self, symbol: str, quote_volume: float, pct_change: float, last_price: float, sem: asyncio.Semaphore
     ) -> Optional[Dict[str, Any]]:
@@ -292,6 +354,12 @@ class SymbolScreener:
             if not await self._prefilter_symbol(symbol):
                 return None
             atr_pct = float(await self._atr_pct(symbol, last_price) or 0.0)
+            
+            # ✅ PHASE 2a: REGIME FILTERING
+            # Add regime-aware filtering to improve proposal quality
+            if not await self._passes_regime_filter(symbol):
+                return None
+            
             return {
                 "symbol": symbol,
                 "quote_volume": float(quote_volume),

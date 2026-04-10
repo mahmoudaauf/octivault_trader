@@ -113,6 +113,14 @@ class MLForecaster:
         self.database_manager = kwargs.get("database_manager")
         self.agent_schedule = kwargs.get("agent_schedule")
 
+        # Log initialization state
+        self.logger.info(
+            f"[{self.name}] Initialized with: model_manager={'✓' if self.model_manager else '✗ MISSING'}, "
+            f"meta_controller={'✓' if self.meta_controller else '✗'}, "
+            f"symbol_manager={'✓' if self.symbol_manager else '✗'}, "
+            f"market_data_feed={'✓' if self.market_data_feed else '✗'}"
+        )
+
         # Symbols & tf
         self.symbols: List[str] = list(kwargs.get("symbols", []) or [])
         self.timeframe = kwargs.get("timeframe", "5m")
@@ -1240,6 +1248,9 @@ class MLForecaster:
                         except Exception:
                             tuned = {}
                         lookback = self._resolve_lookback(tuned)
+                        if not self.model_manager:
+                            self.logger.warning(f"[{self.name}] model_manager not available for {sym}")
+                            continue
                         model_path = self.model_manager.build_model_path(
                             agent_name=self.name,
                             symbol=sym,
@@ -2719,6 +2730,9 @@ class MLForecaster:
         records: List[Dict[str, Any]] = []
         for sym in syms:
             try:
+                if not self.model_manager:
+                    self.logger.warning(f"[{self.name}] model_manager not available for backtest of {sym}")
+                    continue
                 model_path = self.model_manager.build_model_path(agent_name=self.name, symbol=sym, version=tf)
                 if not self.model_manager.model_exists(model_path):
                     continue
@@ -3069,28 +3083,12 @@ class MLForecaster:
             signal.update(extras)
 
         # Mandatory P9 Signal Contract: Emit to Signal Bus with full signal dict (preserves _expected_move_pct)
+        # PHASE 3 CONSOLIDATION: Use add_strategy_signal path (fallback to add_agent_signal removed)
         if hasattr(self.shared_state, "add_strategy_signal"):
             try:
                 await self.shared_state.add_strategy_signal(symbol, signal)
             except Exception as e:
                 self.logger.warning(f"[{self.name}] Failed to emit strategy signal: {e}")
-        elif hasattr(self.shared_state, "add_agent_signal"):
-            # Fallback for older SharedState implementations
-            try:
-                tier = "A" if confidence >= 0.85 else "B"
-                await self.shared_state.add_agent_signal(
-                    symbol=symbol,
-                    agent=self.name,
-                    side=action.upper(),
-                    confidence=confidence,
-                    ttl_sec=300,
-                    tier=tier,
-                    rationale=reason,
-                    _expected_move_pct=float(expected_move_pct),
-                    expected_edge_bps=float(expected_move_pct) * 10000.0
-                )
-            except Exception as e:
-                self.logger.warning(f"[{self.name}] Failed to emit to signal bus: {e}")
 
         # GAP FIX A: Validate quote against min_notional BEFORE buffering
         # Prevents sub-5 USDT signals from reaching MetaController
@@ -3158,6 +3156,10 @@ class MLForecaster:
         if not is_active:
             self.logger.info(f"⚠️ {self.name} for {cur_sym}@{cur_tf} is deactivated.")
             return {"action": "hold", "confidence": 0.0, "reason": "Deactivated"}
+
+        # Ensure model_manager is available
+        if not self.model_manager:
+            return {"action": "hold", "confidence": 0.0, "reason": "ModelManager not available"}
 
         # Ensure model path
         model_path = self.model_manager.build_model_path(agent_name=self.name, symbol=cur_sym, version=cur_tf)
@@ -3530,7 +3532,17 @@ class MLForecaster:
         if action == "buy":
             try:
                 now = time.time()
-                price_now = self.shared_state.get_price(cur_sym)
+                # Phase 4: Use memory-first pattern for price lookup
+                price_now = None
+                if hasattr(self.shared_state, "prices"):
+                    price_now = self.shared_state.prices.get(cur_sym.upper())
+                if not price_now and hasattr(self.shared_state, "get_price"):
+                    # Fallback to method if available
+                    try:
+                        price_now = self.shared_state.get_price(cur_sym)
+                    except Exception:
+                        price_now = None
+                
                 if hasattr(self.shared_state, "register_signal_outcome"):
                     self.shared_state.register_signal_outcome({
                         "symbol": cur_sym,

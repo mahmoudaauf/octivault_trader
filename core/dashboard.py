@@ -9,6 +9,14 @@ from core.shared_state import SharedState
 from core.performance_monitor import PerformanceMonitor
 from core.capital_allocator import CapitalAllocator
 from core.execution_manager import ExecutionManager
+from core.health_check import (
+    initialize_health_checker,
+    get_health_checker,
+    health_endpoint,
+    ready_endpoint,
+    live_endpoint,
+    deep_status_endpoint,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -45,6 +53,56 @@ def initialize_dashboard(state, perf_monitor, cap_alloc, exec_mgr):
     performance_monitor = perf_monitor
     capital_allocator = cap_alloc
     execution_manager = exec_mgr
+    
+    # Initialize health checker
+    initialize_health_checker()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# P9: HEALTH CHECK ENDPOINTS (Kubernetes-compatible, no auth required)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/health", tags=["health"])
+async def health():
+    """
+    Liveness probe for Kubernetes.
+    Returns 200 if app is running, regardless of state.
+    """
+    return await health_endpoint()
+
+
+@app.get("/ready", tags=["health"])
+async def ready():
+    """
+    Readiness probe for Kubernetes.
+    Returns 200 only if app is ready to receive traffic.
+    Checks: database, market data, dependencies.
+    """
+    return await ready_endpoint()
+
+
+@app.get("/live", tags=["health"])
+async def live():
+    """
+    Live trading probe for Kubernetes.
+    Returns 200 only if trading is processing normally.
+    Checks: recent trades, no stale data.
+    """
+    return await live_endpoint()
+
+
+@app.get("/status", tags=["health"])
+async def full_status():
+    """
+    Full health status endpoint for debugging.
+    Returns detailed information about all system components.
+    """
+    return await deep_status_endpoint()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD ENDPOINTS (Auth required)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/dashboard", dependencies=[Depends(verify_token)])
 async def get_dashboard():

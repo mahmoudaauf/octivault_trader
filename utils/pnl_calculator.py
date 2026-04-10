@@ -25,6 +25,10 @@ class PnLCalculator:
 
         # Rolling realized window cache baseline
         self._last_realized_seen = float(getattr(self.shared_state, "realized_pnl", 0.0))
+        
+        # Phase 5: Price cache from WebSocket events
+        self._price_cache: Dict[str, float] = {}
+        
         # P9 lifecycle
         self._stop_event = asyncio.Event()
         self._task = None
@@ -106,50 +110,59 @@ class PnLCalculator:
 
     async def _get_latest_price(self, symbol: str) -> Optional[float]:
         """
-        Tries several price sources in order:
-          1) shared_state.get_latest_price_safe(symbol)
-          2) shared_state.get_latest_price(symbol)
-          3) shared_state.safe_price(symbol)
-          4) exchange_client.get_current_price(symbol) if available
-          5) last 1m candle close from shared_state.get_market_data(symbol, "1m")
+        Phase 5: Get price from memory-first cascade (0 API calls by default).
+        
+        Strategy 1: Check SharedState.prices (WebSocket, <1ms, 0 API)
+        Strategy 2: Check price cache from events (<1ms, 0 API)
+        Strategy 3: Check fallback methods (<10ms, 0 API)
+        Strategy 4: Optional REST (REST, 100-600ms, 1 API) - if PNL_ALLOW_REST=True
         """
-        # 1
+        # Strategy 1: Memory (WebSocket-updated prices)
+        if hasattr(self.shared_state, "prices"):
+            price = self.shared_state.prices.get(symbol.upper())
+            if price is not None and price > 0:
+                logger.debug(f"[PnLCalculator] Got price {symbol} from memory: {price}")
+                return float(price)
+        
+        # Strategy 2: Check event-based price cache
+        if symbol in self._price_cache:
+            cached_price = self._price_cache[symbol]
+            if cached_price and cached_price > 0:
+                logger.debug(f"[PnLCalculator] Got price {symbol} from event cache: {cached_price}")
+                return float(cached_price)
+        
+        # Strategy 3: Fallback methods (same as before, 0 API)
+        # 3a) get_latest_price_safe
         if hasattr(self.shared_state, "get_latest_price_safe"):
             try:
                 p = await self.shared_state.get_latest_price_safe(symbol)
                 if p and p > 0:
+                    logger.debug(f"[PnLCalculator] Got price {symbol} from safe method: {p}")
                     return float(p)
             except Exception:
                 pass
 
-        # 2
+        # 3b) get_latest_price
         if hasattr(self.shared_state, "get_latest_price"):
             try:
                 p = await self.shared_state.get_latest_price(symbol)
                 if p and p > 0:
+                    logger.debug(f"[PnLCalculator] Got price {symbol} from latest: {p}")
                     return float(p)
             except Exception:
                 pass
 
-        # 3) Try SharedState.safe_price (symbol-scoped) as a light fallback
+        # 3c) safe_price
         if hasattr(self.shared_state, "safe_price"):
             try:
                 p = await self.shared_state.safe_price(symbol, default=0.0)
                 if p and p > 0:
+                    logger.debug(f"[PnLCalculator] Got price {symbol} from safe_price: {p}")
                     return float(p)
             except Exception:
                 pass
 
-        # 4
-        if hasattr(self, "exchange_client") and getattr(self, "exchange_client"):
-            try:
-                p = await self.exchange_client.get_current_price(symbol)
-                if p and p > 0:
-                    return float(p)
-            except Exception:
-                pass
-
-        # 5) Last 1m candle close as a final fallback (async accessor in SharedState)
+        # 3d) get_market_data candle close
         try:
             candles = None
             if hasattr(self.shared_state, "get_market_data"):
@@ -157,17 +170,35 @@ class PnLCalculator:
             if candles:
                 last = candles[-1]
                 if isinstance(last, dict):
-                    # accept either verbose 'close' or canonical short key 'c'
                     val = last.get("close")
                     if val is None:
                         val = last.get("c")
-                    if val is not None:
+                    if val is not None and float(val) > 0:
+                        logger.debug(f"[PnLCalculator] Got price {symbol} from 1m candle: {val}")
                         return float(val)
-                elif isinstance(last, (list, tuple)) and len(last) > 4:
+                elif isinstance(last, (list, tuple)) and len(last) > 4 and float(last[4]) > 0:
+                    logger.debug(f"[PnLCalculator] Got price {symbol} from candle tuple: {last[4]}")
                     return float(last[4])
         except Exception:
             pass
+        
+        # Strategy 4: Optional REST (if allowed by config)
+        allow_rest = bool(getattr(self.config, "PNL_ALLOW_REST", False))
+        if not allow_rest:
+            logger.debug(f"[PnLCalculator] No price for {symbol} - market data not streaming, REST disabled")
+            return None
+        
+        # REST fallback (institutional trading: disabled by default)
+        if hasattr(self, "exchange_client") and getattr(self, "exchange_client"):
+            try:
+                p = await self.exchange_client.get_current_price(symbol)
+                if p and p > 0:
+                    logger.debug(f"[PnLCalculator] Got price {symbol} from REST: {p}")
+                    return float(p)
+            except Exception:
+                pass
 
+        logger.debug(f"[PnLCalculator] Failed to get price for {symbol} from any source")
         return None
 
     def _readiness_snapshot(self) -> Dict[str, bool]:
@@ -289,7 +320,7 @@ class PnLCalculator:
         # - Realized is already reflected in the wallet balance
         # - Unrealized is already embedded in position_market_value (mark-to-market)
         try:
-            total_equity = float(self.shared_state.get_total_equity())
+            total_equity = float(await self.shared_state.get_total_equity())
         except Exception:
             # NAV already reflects wallet + market value
             total_equity = float(getattr(self.shared_state, "total_value", 0.0))
@@ -323,6 +354,43 @@ class PnLCalculator:
         except Exception as e:
             logger.debug(f"[PnLCalculator] Failed to update pnl_realized_60m: {e}")
 
+    async def _on_price_update(self, symbol: str, price: float) -> None:
+        """
+        Phase 5: Called when WebSocket price update arrives.
+        Triggers real-time PnL recalculation.
+        """
+        try:
+            # Update price cache from event
+            if symbol and price and price > 0:
+                self._price_cache[symbol] = float(price)
+                logger.debug(f"[PnLCalculator] Updated price cache for {symbol}: {price}")
+            
+            # Trigger PnL recalculation (only if system is ready)
+            snap = self._readiness_snapshot()
+            if snap.get("market_data_ready", True) and snap.get("balances_ready", True):
+                await self._calculate_unrealized_pnl()
+                await self._calculate_total_portfolio_value()
+                await self._after_valuation_bookkeeping()
+                
+                # Emit updated portfolio snapshot
+                try:
+                    snapshot = {
+                        "total_value": float(getattr(self.shared_state, "total_value", 0.0)),
+                        "realized_pnl": float(getattr(self.shared_state, "realized_pnl", 0.0)),
+                        "unrealized_pnl": float(getattr(self.shared_state, "unrealized_pnl", 0.0)),
+                        "total_equity": float(getattr(self.shared_state, "total_equity", 0.0)),
+                        "symbol_updated": symbol,
+                        "ts": time.time(),
+                    }
+                    if hasattr(self.shared_state, "emit_event"):
+                        await self._maybe_call(self.shared_state, "emit_event", "PortfolioSnapshot", snapshot)
+                except Exception:
+                    pass
+                
+                logger.debug(f"[PnLCalculator] Real-time PnL update triggered by {symbol} price")
+        except Exception as e:
+            logger.debug(f"[PnLCalculator] Error in _on_price_update for {symbol}: {e}")
+
     # ---------- run loops ----------
 
     async def start(self):
@@ -340,6 +408,15 @@ class PnLCalculator:
             await self._maybe_call(self.shared_state, "update_timestamp", "PnLCalculator")
         except Exception:
             pass
+        
+        # Phase 5: Subscribe to price update events
+        try:
+            if hasattr(self.shared_state, "subscribe"):
+                await self.shared_state.subscribe("price_update", self._on_price_update)
+                logger.info("[PnLCalculator] Subscribed to price_update events (Phase 5)")
+        except Exception as e:
+            logger.debug(f"[PnLCalculator] Failed to subscribe to price_update events: {e}")
+        
         ComponentStatusLogger.log_status("PnLCalculator", "Initialized", "OK")
         # Main loop
         self._task = asyncio.create_task(self.run(), name="pnl_calculator.run")

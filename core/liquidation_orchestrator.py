@@ -628,10 +628,16 @@ class LiquidationOrchestrator:
         try:
             positions = {}
             if self.agent and hasattr(self.agent, "shared_state"):
-                positions = self.agent.shared_state.get_positions_snapshot() or {}
-            
+                positions = self.agent.shared_state.get_positions_snapshot(include_wallet_inventory=True) or {}
+
             if not positions:
-                positions = getattr(self.ss, "get_positions_snapshot", lambda: {})() or {}
+                snap_fn = getattr(self.ss, "get_positions_snapshot", None)
+                if snap_fn:
+                    import inspect
+                    try:
+                        positions = snap_fn(include_wallet_inventory=True) or {}
+                    except TypeError:
+                        positions = snap_fn() or {}
 
             for sym, pos in positions.items():
                 qty = float((pos or {}).get("quantity") or (pos or {}).get("qty") or 0.0)

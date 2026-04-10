@@ -338,20 +338,7 @@ class LiquidationAgent:
                 self.logger.warning(f"[{self.name}] Error checking dust executability: {e}")
 
 
-            # Mandatory P9 Signal Contract: Emit to Signal Bus
-            if hasattr(self.shared_state, "add_agent_signal"):
-                try:
-                    await self.shared_state.add_agent_signal(
-                        symbol=symbol,
-                        agent=self.name,
-                        side="SELL",
-                        confidence=0.95,  # High confidence for liquidations
-                        ttl_sec=300,
-                        tier="A",
-                        rationale=reason
-                    )
-                except Exception as e:
-                    self.logger.warning(f"[{self.name}] Failed to emit to signal bus: {e}")
+            # Legacy path removed - using TradeIntent publishing only
 
             # Backward compatibility / specific intent flow
             intent = self._create_intent(symbol, qty, reason, force=False)

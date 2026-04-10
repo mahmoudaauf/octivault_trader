@@ -1,0 +1,354 @@
+{
+  "dashboard": {
+    "title": "Distributed Tracing - Jaeger APM",
+    "description": "Jaeger distributed tracing dashboard for MetaController and safety guards",
+    "tags": ["apm", "jaeger", "tracing", "performance"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Guard Evaluation Traces",
+        "type": "trace",
+        "datasource": "Jaeger",
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 0
+        },
+        "targets": [
+          {
+            "expr": "service=octavault-trader AND operation=balance_guard_evaluation",
+            "refId": "A"
+          },
+          {
+            "expr": "service=octavault-trader AND operation=leverage_guard_evaluation",
+            "refId": "B"
+          },
+          {
+            "expr": "service=octavault-trader AND operation=hours_guard_evaluation",
+            "refId": "C"
+          },
+          {
+            "expr": "service=octavault-trader AND operation=anomaly_guard_evaluation",
+            "refId": "D"
+          },
+          {
+            "expr": "service=octavault-trader AND operation=correlation_guard_evaluation",
+            "refId": "E"
+          }
+        ],
+        "options": {
+          "showLegend": true,
+          "legendDisplayMode": "table",
+          "legendPlacement": "bottom",
+          "legendShowLegend": true,
+          "legendValues": [],
+          "traceIdWidth": 0.5,
+          "spanIdWidth": 0.5,
+          "collapseAll": false,
+          "expandAll": false
+        }
+      },
+      {
+        "id": 2,
+        "title": "Trade Execution Timeline",
+        "type": "trace",
+        "datasource": "Jaeger",
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 8
+        },
+        "targets": [
+          {
+            "expr": "service=octavault-trader AND operation=trade_execution AND duration>1ms",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "traceFormat": "jaeger",
+          "showSpanDetails": true,
+          "showServiceColumn": true,
+          "showProcessColumn": false,
+          "highlightUnfilteredSpans": false
+        }
+      },
+      {
+        "id": 3,
+        "title": "Guard Rejection Reasons (Traces)",
+        "type": "table",
+        "datasource": "Jaeger",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 0,
+          "y": 16
+        },
+        "targets": [
+          {
+            "expr": "service=octavault-trader AND span.status=ERROR",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "sortBy": []
+        },
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {},
+              "indexByName": {},
+              "renameByName": {
+                "guard.name": "Guard",
+                "rejection_reason": "Reason",
+                "duration": "Duration (ms)",
+                "timestamp": "Time"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Trace Error Rate (5min)",
+        "type": "graph",
+        "datasource": "Jaeger",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 12,
+          "y": 16
+        },
+        "targets": [
+          {
+            "expr": "rate(jaeger_traces_errors_total[5m])",
+            "refId": "A",
+            "legendFormat": "Errors/sec"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "showPoints": "auto",
+              "spanNulls": false
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "title": "Main Loop Iteration Latency",
+        "type": "graph",
+        "datasource": "Jaeger",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 0,
+          "y": 22
+        },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(jaeger_trace_duration_milliseconds_bucket{operation=\"evaluate_and_act_iteration\"}[5m]))",
+            "refId": "A",
+            "legendFormat": "p50 (ms)"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(jaeger_trace_duration_milliseconds_bucket{operation=\"evaluate_and_act_iteration\"}[5m]))",
+            "refId": "B",
+            "legendFormat": "p95 (ms)"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(jaeger_trace_duration_milliseconds_bucket{operation=\"evaluate_and_act_iteration\"}[5m]))",
+            "refId": "C",
+            "legendFormat": "p99 (ms)"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "showPoints": "auto"
+            },
+            "unit": "ms"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "title": "Trade Execution Performance",
+        "type": "table",
+        "datasource": "Jaeger",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 12,
+          "y": 22
+        },
+        "targets": [
+          {
+            "expr": "service=octavault-trader AND operation=trade_execution",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "sortBy": [
+            {
+              "displayName": "Duration",
+              "desc": true
+            }
+          ]
+        },
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "renameByName": {
+                "symbol": "Symbol",
+                "side": "Side",
+                "quantity": "Qty",
+                "duration": "Latency (ms)",
+                "status": "Status"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Trace Volume by Operation",
+        "type": "stat",
+        "datasource": "Jaeger",
+        "gridPos": {
+          "h": 4,
+          "w": 24,
+          "x": 0,
+          "y": 28
+        },
+        "targets": [
+          {
+            "expr": "count by (operation) (jaeger_traces_total{service=\"octavault-trader\"})",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "orientation": "auto",
+          "textMode": "value",
+          "colorMode": "value",
+          "graphMode": "area",
+          "justifyMode": "center"
+        }
+      },
+      {
+        "id": 8,
+        "title": "Span Context Propagation",
+        "type": "logs",
+        "datasource": "Loki",
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 32
+        },
+        "targets": [
+          {
+            "expr": "{job=\"octavault-trader\"} | json | trace_id != \"\"",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "showLabels": true,
+          "showTime": true,
+          "wrapLogMessage": false,
+          "sortOrder": "Descending",
+          "dedupStrategy": "none"
+        }
+      }
+    ],
+    "refresh": "30s",
+    "schemaVersion": 36,
+    "style": "dark",
+    "templating": {
+      "list": [
+        {
+          "current": {
+            "selected": false,
+            "text": "octavault-trader",
+            "value": "octavault-trader"
+          },
+          "hide": 0,
+          "includeAll": false,
+          "label": "Service",
+          "multi": false,
+          "name": "service",
+          "options": [
+            {
+              "selected": true,
+              "text": "octavault-trader",
+              "value": "octavault-trader"
+            }
+          ],
+          "query": "label_values(jaeger_traces_total, service)",
+          "refresh": 1,
+          "regex": "",
+          "sort": 0,
+          "tagValuesQuery": "",
+          "tagsQuery": "",
+          "type": "query",
+          "useTags": false
+        },
+        {
+          "current": {
+            "selected": false,
+            "text": "5m",
+            "value": "5m"
+          },
+          "hide": 0,
+          "includeAll": false,
+          "label": "Time Range",
+          "multi": false,
+          "name": "timerange",
+          "options": [
+            {
+              "selected": true,
+              "text": "5m",
+              "value": "5m"
+            },
+            {
+              "selected": false,
+              "text": "15m",
+              "value": "15m"
+            },
+            {
+              "selected": false,
+              "text": "1h",
+              "value": "1h"
+            },
+            {
+              "selected": false,
+              "text": "6h",
+              "value": "6h"
+            },
+            {
+              "selected": false,
+              "text": "24h",
+              "value": "24h"
+            }
+          ],
+          "query": "",
+          "queryValue": "",
+          "sort": 0,
+          "type": "custom"
+        }
+      ]
+    },
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    }
+  }
+}

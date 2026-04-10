@@ -29,6 +29,7 @@ class TradeIntent:
     policy_context: Optional[Dict[str, Any]] = None
     agent: Optional[str] = None
     tag: str = "meta"
+    reason: str = ""  # CRITICAL: Added to support _determine_execution_tier in MetaController
     timestamp: Optional[float] = None
     execution_mode: str = "live"  # "live" or "shadow"
     
@@ -56,11 +57,129 @@ class ExecOrder:
     status: str = "NEW"
     id: Optional[str] = None
 
-import asyncio
+@dataclass
+class MetaDecision:
+    """
+    Typed decision object with full source traceability and audit trail.
+    
+    Replaces the legacy tuple-based decision format (symbol, side, dict).
+    
+    Purpose:
+    - Type-safe decision representation
+    - Full traceability from intent → decision → order
+    - Gate application tracking (which gates filtered, which passed)
+    - Enriched context for execution and audit
+    - Support for decision rejection reasons
+    
+    Usage:
+        decision = MetaDecision(
+            symbol="BTCUSDT",
+            side="BUY",
+            confidence=0.85,
+            planned_quote=100.0,
+            source_intent=trade_intent,
+            trace_id="intent-123-abc",
+            applied_gates=["min_confidence", "concentration"],
+            rejection_reasons=[],
+            execution_tier="immediate",
+            enrichment={"dip_percent": 2.5},
+            timestamp=time.time(),
+            policy_context={"max_position": 1000},
+            rationale="DipSniper: dip 2.5% below EMA",
+        )
+    """
+    # Core decision
+    symbol: str                                    # BTCUSDT
+    side: str                                      # "BUY" or "SELL"
+    confidence: float                              # 0.0-1.0
+    planned_quote: float                           # USDT amount
+    
+    # Source traceability
+    source_intent: 'TradeIntent'                   # Original intent that created this decision
+    trace_id: str                                  # Unique ID for end-to-end tracing
+    
+    # Gate processing
+    applied_gates: list = None                     # ["min_confidence", "concentration", "position_limit"]
+    rejection_reasons: list = None                 # ["confidence_below_min", "position_limit_exceeded"]
+    
+    # Execution context
+    execution_tier: str = "immediate"              # "immediate", "pending", "deferred", "rejected"
+    
+    # Enriched data
+    enrichment: Dict[str, Any] = None              # {"dip_percent": 2.5, "bb_breach": True, ...}
+    
+    # Metadata
+    timestamp: Optional[float] = None              # When decision was made
+    policy_context: Optional[Dict[str, Any]] = None  # Policy parameters that influenced decision
+    rationale: str = ""                            # Human-readable explanation
+    
+    def __post_init__(self):
+        """Initialize defaults and validate."""
+        if self.timestamp is None:
+            self.timestamp = time.time()
+        if self.applied_gates is None:
+            self.applied_gates = []
+        if self.rejection_reasons is None:
+            self.rejection_reasons = []
+        if self.enrichment is None:
+            self.enrichment = {}
+        if self.policy_context is None:
+            self.policy_context = {}
+        
+        # Validation
+        if self.side not in ("BUY", "SELL"):
+            raise ValueError(f"Invalid side: {self.side}")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError(f"Confidence must be 0.0-1.0, got {self.confidence}")
+        if self.execution_tier not in ("immediate", "pending", "deferred", "rejected"):
+            raise ValueError(f"Invalid execution_tier: {self.execution_tier}")
+    
+    @property
+    def is_rejected(self) -> bool:
+        """Check if this decision was rejected."""
+        return self.execution_tier == "rejected"
+    
+    @property
+    def is_approved(self) -> bool:
+        """Check if this decision is approved for execution."""
+        return not self.is_rejected
+    
+    def add_gate(self, gate_name: str) -> None:
+        """Record that a gate was applied."""
+        if gate_name not in self.applied_gates:
+            self.applied_gates.append(gate_name)
+    
+    def add_rejection_reason(self, reason: str) -> None:
+        """Record a rejection reason."""
+        if reason not in self.rejection_reasons:
+            self.rejection_reasons.append(reason)
+        self.execution_tier = "rejected"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "symbol": self.symbol,
+            "side": self.side,
+            "confidence": self.confidence,
+            "planned_quote": self.planned_quote,
+            "source_intent_symbol": self.source_intent.symbol,
+            "source_intent_agent": self.source_intent.agent,
+            "trace_id": self.trace_id,
+            "applied_gates": self.applied_gates,
+            "rejection_reasons": self.rejection_reasons,
+            "execution_tier": self.execution_tier,
+            "enrichment": self.enrichment,
+            "timestamp": self.timestamp,
+            "policy_context": self.policy_context,
+            "rationale": self.rationale,
+        }
+
+
 from typing import Callable
+import inspect as _inspect
 
 async def maybe_await(obj):
-    if asyncio.iscoroutine(obj):
+    if _inspect.isawaitable(obj):
         return await obj
     return obj
 
@@ -71,7 +190,7 @@ async def maybe_call(obj: Any, method_name: str, *args, **kwargs):
     if not callable(fn):
         return None
     res = fn(*args, **kwargs)
-    if asyncio.iscoroutine(res):
+    if _inspect.isawaitable(res):
         return await res
     return res
 
@@ -130,7 +249,6 @@ def resilient_trade(component_name="Component", max_attempts=3):
             raise last_err
         return wrapper
     return decorator
-
 
 
 

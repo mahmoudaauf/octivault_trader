@@ -69,6 +69,17 @@ class ProfitTargetEngine:
             int(self.grace_minutes),
         )
 
+    async def start(self) -> None:
+        """Start the ProfitTargetEngine (P8 phase startup)."""
+        self.logger.info("[PTE] Starting ProfitTargetEngine")
+        # Initialize daily tracking if not already done
+        if self._day_start_ts == 0.0:
+            import datetime as _dt
+            self._day_start_ts = _dt.datetime.utcnow().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp()
+        self.logger.info("[PTE] ProfitTargetEngine started successfully")
+
     # ------------------------------------------------------------------
     # Public API — wired as SharedState profit guard
     # ------------------------------------------------------------------

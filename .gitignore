@@ -1,7 +1,10 @@
 ########################################
 # Virtual environments & secrets
 ########################################
+.venv/
 venv/
+ENV/
+env/
 .env
 .env.*
 *.key
@@ -14,8 +17,14 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.py[cod]
+*$py.class
 .pytest_cache/
 .mypy_cache/
+*.egg-info/
+dist/
+build/
+*.egg
 
 ########################################
 # Logs & runtime outputs
@@ -39,10 +48,8 @@ storage/
 ########################################
 # ML / AI artifacts (DO NOT COMMIT)
 ########################################
-models/
 tuned_params/
 data/
-stream/
 *.h5
 *.keras
 *.pt
@@ -57,6 +64,11 @@ stream/
 *.bak
 *.tmp
 *.swp
+*.swo
+*~
+tmp/
+temp/
+.cache/
 
 ########################################
 # OS / IDE files
@@ -82,6 +94,31 @@ diagnose_report.json
 order_call_scan.txt
 project_structure.txt
 current_scripts_inventory.txt
+validation_outputs/
+artifacts/
+
+########################################
+# Jupyter & notebooks
+########################################
+.ipynb_checkpoints/
+*.ipynb
+
+########################################
+# IDE & Editor specific
+########################################
+.DS_Store
+.idea/
+.vscode/
+*.iml
+*.sublime-project
+*.sublime-workspace
+
+########################################
+# Type checking
+########################################
+.mypy_cache/
+.dmypy.json
+dmypy.json
 
 ########################################
 # Defensive ignores (bad filenames / typos)

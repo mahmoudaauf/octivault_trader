@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 """
-RecoveryEngine (P9‑compliant)
+RecoveryEngine (P9‑compliant, Institutional Architecture)
 
 Purpose
 -------
 Self‑heal boot path that rebuilds in‑memory state after a crash/restart and re‑establishes
 phase readiness before runtime loops start. It DOES NOT place orders.
+
+Institutional Architecture (WebSocket-First)
+---------------------------------------------
+Uses 3-strategy cascade to minimize API calls and maximize reliability:
+  1. SharedState Memory (WebSocket-updated, <1ms latency, zero API calls)
+  2. Database Snapshot (persisted, no API call)
+  3. REST API (only if RECOVERY_ALLOW_REST=True configured, minimizes calls)
+
+This ensures:
+  ✅ Zero polling (event-driven updates from WebSocket)
+  ✅ Minimal REST usage (only for order placement, rare sync checks)
+  ✅ Instant data access (memory-resident prices/balances/positions)
+  ✅ Startup recovery without API calls (use DB snapshot)
 
 Conformance (Spec 2025‑08‑20)
 -----------------------------
@@ -16,15 +29,21 @@ Conformance (Spec 2025‑08‑20)
 - Recomputes unrealized PnL/NAV (pnl_calculator if available, else lightweight calc)
 - Sets phase gates: AcceptedSymbolsReady and MarketDataReady (when conditions allow)
 - Honors RECOVERY.VERIFY_INTEGRITY flag
-- Uses DatabaseManager snapshot first, then falls back to ExchangeClient
+- Uses 3-strategy cascade: SharedState → Database → REST (configured only)
 - Never places orders (ExecutionManager remains the single order path)
+
+Configuration
+--------------
+RECOVERY_ALLOW_REST: bool (default: False)
+  - False: Institutional mode (use memory + DB only, zero REST calls)
+  - True: Allow REST as fallback (for setup/debugging)
 
 Integrations
 ------------
 - shared_state: authoritative memory (balances, positions, accepted_symbols, metrics, events)
 - sstools: event emitter & helpers (emit_event, nav_quote)
-- exchange_client: read‑only balance/position/filter/price queries
-- database_manager: load_last_snapshot() for persisted recovery
+- exchange_client: read‑only price/balance/position queries (REST fallback only)
+- database_manager: load_last_snapshot() for persisted recovery (no API call)
 - pnl_calculator (optional): for unrealized PnL computation
 """
 
@@ -138,8 +157,8 @@ class RecoveryEngine:
             self.logger.setLevel(logging.INFO)
 
         self.rcfg = RecoveryConfig(
-            verify_integrity=bool(rcfg.get("VERIFY_INTEGRITY", True)),
-            min_symbols_for_md_ready=int(rcfg.get("MIN_SYMBOLS_FOR_MD_READY", 1)),
+            verify_integrity=bool(config.get("VERIFY_INTEGRITY", True) if hasattr(config, 'get') else getattr(config, 'VERIFY_INTEGRITY', True)),
+            min_symbols_for_md_ready=int(config.get("MIN_SYMBOLS_FOR_MD_READY", 1) if hasattr(config, 'get') else getattr(config, 'MIN_SYMBOLS_FOR_MD_READY', 1)),
         )
 
     async def run(self, symbols: Optional[List[str]] = None):
@@ -213,30 +232,95 @@ class RecoveryEngine:
         return None
 
     async def _load_live(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Fetch balances and positions live from the exchange client.
+        """
+        Fetch balances and positions using 3-strategy cascade (institutional architecture).
+        
+        Strategy 1: Try SharedState memory (WebSocket-updated, zero latency)
+        Strategy 2: Fall back to DB snapshot (persisted, no API call)
+        Strategy 3: REST API only if explicitly configured (minimize API calls)
+        
         Returns (balances, positions_by_symbol) with light normalization.
         """
         balances: Dict[str, Any] = {}
         positions: Dict[str, Any] = {}
-        # Balances
+        
+        # ========== STRATEGY 1: SharedState Memory (WebSocket-updated) ==========
         try:
-            if hasattr(self.ex, "get_balances"):
-                b = await _with_timeout(self.ex.get_balances())
-                balances = _normalize_balances(b)
+            # Check if SharedState has recent balances from WebSocket
+            if hasattr(self.ss, "balances") and self.ss.balances:
+                memory_balances = self.ss.balances
+                if isinstance(memory_balances, dict) and memory_balances:
+                    balances = _normalize_balances(memory_balances)
+                    self.logger.info("[Recovery] ✅ Strategy 1: Balances loaded from SharedState memory (WebSocket-updated)")
         except Exception:
-            self.logger.warning("[Recovery] Live balances fetch failed", exc_info=True)
-        # Positions
-        try:
-            getter = None
-            if hasattr(self.ex, "get_open_positions"):
-                getter = self.ex.get_open_positions
-            elif hasattr(self.ex, "get_positions"):
-                getter = self.ex.get_positions
-            if getter:
-                p = await _with_timeout(getter())
-                positions = _normalize_positions(p)
-        except Exception:
-            self.logger.warning("[Recovery] Live positions fetch failed", exc_info=True)
+            self.logger.debug("[Recovery] Strategy 1 (SharedState balances) failed", exc_info=True)
+        
+        # Check if SharedState has recent positions from WebSocket
+        if not positions:
+            try:
+                if hasattr(self.ss, "positions") and self.ss.positions:
+                    memory_positions = self.ss.positions
+                    if isinstance(memory_positions, dict) and memory_positions:
+                        positions = _normalize_positions(memory_positions)
+                        self.logger.info("[Recovery] ✅ Strategy 1: Positions loaded from SharedState memory (WebSocket-updated)")
+            except Exception:
+                self.logger.debug("[Recovery] Strategy 1 (SharedState positions) failed", exc_info=True)
+        
+        # ========== STRATEGY 2: Database Snapshot (persisted, no API call) ==========
+        if not balances:
+            try:
+                snapshot = self._load_snapshot()
+                if snapshot:
+                    snapshot_balances = snapshot.get("balances")
+                    if snapshot_balances:
+                        balances = _normalize_balances(snapshot_balances)
+                        self.logger.info("[Recovery] ✅ Strategy 2: Balances loaded from DB snapshot")
+            except Exception:
+                self.logger.debug("[Recovery] Strategy 2 (snapshot balances) failed", exc_info=True)
+        
+        if not positions:
+            try:
+                snapshot = self._load_snapshot()
+                if snapshot:
+                    snapshot_positions = snapshot.get("positions")
+                    if snapshot_positions:
+                        positions = _normalize_positions(snapshot_positions)
+                        self.logger.info("[Recovery] ✅ Strategy 2: Positions loaded from DB snapshot")
+            except Exception:
+                self.logger.debug("[Recovery] Strategy 2 (snapshot positions) failed", exc_info=True)
+        
+        # ========== STRATEGY 3: REST API (only if configured, minimizes API calls) ==========
+        allow_rest = getattr(self.config, "RECOVERY_ALLOW_REST", False)
+        if allow_rest:
+            # Balances via REST (only if configured)
+            if not balances:
+                try:
+                    if hasattr(self.ex, "get_balances"):
+                        b = await _with_timeout(self.ex.get_balances())
+                        balances = _normalize_balances(b)
+                        self.logger.info("[Recovery] ✅ Strategy 3: Balances loaded via REST API (configured)")
+                except Exception:
+                    self.logger.warning("[Recovery] Strategy 3 (REST balances) failed", exc_info=True)
+            
+            # Positions via REST (only if configured)
+            if not positions:
+                try:
+                    getter = None
+                    if hasattr(self.ex, "get_open_positions"):
+                        getter = self.ex.get_open_positions
+                    elif hasattr(self.ex, "get_positions"):
+                        getter = self.ex.get_positions
+                    if getter:
+                        p = await _with_timeout(getter())
+                        positions = _normalize_positions(p)
+                        self.logger.info("[Recovery] ✅ Strategy 3: Positions loaded via REST API (configured)")
+                except Exception:
+                    self.logger.warning("[Recovery] Strategy 3 (REST positions) failed", exc_info=True)
+        else:
+            # REST not configured - log that we're not using it
+            if not balances or not positions:
+                self.logger.info("[Recovery] ⚠️  RECOVERY_ALLOW_REST=False (institutional mode): Skipping REST fallback, using memory+DB only")
+        
         return balances, positions
 
     # ------------------------------ calculators ------------------------------
@@ -276,23 +360,72 @@ class RecoveryEngine:
         return float(unreal)
 
     async def _latest_prices(self, symbols: List[str]) -> Dict[str, float]:
+        """
+        Fetch latest prices using 3-strategy cascade (institutional architecture).
+        
+        Strategy 1: SharedState memory (WebSocket prices, zero latency, zero API calls)
+        Strategy 2: Database snapshot (persisted prices, no API call)
+        Strategy 3: REST API (only if explicitly configured, minimizes API calls)
+        
+        Returns {symbol: price, ...} dict with prices for requested symbols.
+        """
         out: Dict[str, float] = {}
         if not symbols:
             return out
-        async def fetch_sym(s: str):
+        
+        async def fetch_sym_cascading(s: str) -> Tuple[str, Optional[float]]:
+            """Fetch price for symbol using 3-strategy cascade."""
             try:
                 px = None
+                
+                # ===== STRATEGY 1: SharedState memory (WebSocket-updated prices) =====
+                if hasattr(self.ss, "prices") and self.ss.prices:
+                    px = self.ss.prices.get(s.upper())
+                    if px:
+                        return s, float(px)
+                
+                # ===== STRATEGY 2: sstools safe_price (may use snapshot) =====
                 if self.sstools and hasattr(self.sstools, "safe_price"):
                     px = await _maybe_await(self.sstools.safe_price(s))
-                if not px and hasattr(self.ex, "get_current_price"):
-                    px = await _with_timeout(self.ex.get_current_price(s))
-                return s, (float(px) if px else None)
-            except Exception:
+                    if px:
+                        return s, float(px)
+                
+                # ===== STRATEGY 3: Database snapshot (persisted prices) =====
+                if not px:
+                    try:
+                        snapshot = self._load_snapshot()
+                        if snapshot and "prices" in snapshot:
+                            snapshot_prices = snapshot.get("prices", {})
+                            px = snapshot_prices.get(s.upper())
+                            if px:
+                                return s, float(px)
+                    except Exception:
+                        pass
+                
+                # ===== STRATEGY 4: REST API (only if explicitly configured) =====
+                allow_rest = getattr(self.config, "RECOVERY_ALLOW_REST", False)
+                if allow_rest and not px:
+                    if hasattr(self.ex, "get_current_price"):
+                        px = await _with_timeout(self.ex.get_current_price(s))
+                        if px:
+                            return s, float(px)
+                
                 return s, None
-        pairs = await asyncio.gather(*[fetch_sym(s) for s in symbols], return_exceptions=False)
+            except Exception as e:
+                self.logger.debug(f"[Recovery] Price fetch for {s} failed: {e}")
+                return s, None
+        
+        # Fetch all prices in parallel
+        pairs = await asyncio.gather(*[fetch_sym_cascading(s) for s in symbols], return_exceptions=False)
         for s, px in pairs:
             if px:
                 out[s] = px
+        
+        # Log which symbols we couldn't find
+        missing = [s for s in symbols if s not in out]
+        if missing:
+            self.logger.debug(f"[Recovery] Could not get prices for: {missing}")
+        
         return out
 
     # ------------------------------- integrity -------------------------------
@@ -411,7 +544,11 @@ class RecoveryEngine:
             self.logger.debug("[Recovery] apply_symbols_if_missing failed", exc_info=True)
 
     async def _maybe_mark_market_data_ready(self) -> None:
-        """Mark MarketDataReady only if we have prices for at least N accepted symbols; log why if not."""
+        """
+        Mark MarketDataReady only if we have prices for at least N accepted symbols.
+        Uses institutional 3-strategy cascade: memory → DB → REST (configured).
+        Logs why if not ready.
+        """
         try:
             symbols_map = getattr(self.ss, "accepted_symbols", None) or {}
             syms = list(symbols_map.keys())
@@ -422,10 +559,21 @@ class RecoveryEngine:
             have = 0
             for s in syms:
                 px = None
-                if self.sstools and hasattr(self.sstools, "safe_price"):
+                
+                # ===== STRATEGY 1: SharedState memory (WebSocket-updated) =====
+                if hasattr(self.ss, "prices") and self.ss.prices:
+                    px = self.ss.prices.get(s.upper())
+                
+                # ===== STRATEGY 2: sstools safe_price =====
+                if not px and self.sstools and hasattr(self.sstools, "safe_price"):
                     px = await _maybe_await(self.sstools.safe_price(s))
-                elif hasattr(self.ex, "get_current_price"):
-                    px = await _with_timeout(self.ex.get_current_price(s))
+                
+                # ===== STRATEGY 3: REST API (only if configured) =====
+                if not px:
+                    allow_rest = getattr(self.config, "RECOVERY_ALLOW_REST", False)
+                    if allow_rest and hasattr(self.ex, "get_current_price"):
+                        px = await _with_timeout(self.ex.get_current_price(s))
+                
                 if px:
                     have += 1
                 if have >= want:

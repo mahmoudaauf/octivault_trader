@@ -42,6 +42,14 @@ class WalletScannerAgent:
         self.require_trading_status = bool(getattr(config, "REQUIRE_TRADING_STATUS", True))
         self.emit_accept_event = bool(getattr(config, "EMIT_ACCEPTED_SYMBOL_EVENT", True))
 
+        # PROFESSIONAL ARCHITECTURE: Wallet != Trading Universe.
+        # By default this agent is a RECONCILIATION tool only.
+        # It syncs balances and manages dust liquidation, but does NOT propose
+        # wallet assets as trading universe candidates.
+        # Set WALLET_SCANNER_PROPOSE_SYMBOLS=True only if you explicitly want
+        # wallet holdings to feed into symbol discovery (non-standard).
+        self.propose_symbols = bool(getattr(config, "WALLET_SCANNER_PROPOSE_SYMBOLS", False))
+
         self.name = "WalletScannerAgent"
         self.is_discovery_agent = True      # contract flag
         self.last_run: Optional[str] = None
@@ -90,13 +98,61 @@ class WalletScannerAgent:
 
     # ---------------- Public loops -----------------
     async def run_loop(self):
-        logger.info(f"🚀 [{self.name}] Live scan started. Interval: {self.interval}s")
+        logger.info(f"🚀 [{self.name}] Live scan started. Base interval: {self.interval}s")
         while not self._stop_event.is_set():
             try:
                 await self.run_once()
             except Exception as e:
                 logger.exception(f"[{self.name}] Error in run_loop: {e}")
-            await asyncio.sleep(self.interval)
+            
+            # ✅ PHASE 2a: ADAPTIVE INTERVALS based on regime
+            wait_time = await self._get_adaptive_interval()
+            await asyncio.sleep(wait_time)
+
+    async def _get_adaptive_interval(self) -> float:
+        """
+        Adjust scan interval based on market volatility regime.
+        
+        Strategy:
+          - High volatility: scan more frequently (faster wallet response to market moves)
+          - Normal volatility: use base interval
+          - Low volatility: scan less frequently (stable, no urgent changes)
+        
+        Returns: seconds to wait before next scan
+        """
+        try:
+            # Get global market volatility regime
+            if hasattr(self.shared_state, "get_volatility_regime"):
+                try:
+                    regime_result = self.shared_state.get_volatility_regime(
+                        "GLOBAL", timeframe="1h", max_age_seconds=300
+                    )
+                    regime_result = await regime_result if asyncio.iscoroutine(regime_result) else regime_result
+                    
+                    if isinstance(regime_result, dict):
+                        regime = str(regime_result.get("regime", "normal")).lower()
+                        
+                        # Adjust interval based on regime
+                        if regime == "high":
+                            # High volatility: scan 1.5x more frequently
+                            adjusted = self.interval / 1.5
+                            logger.debug(f"[{self.name}] High volatility regime: scanning every {adjusted:.0f}s")
+                            return adjusted
+                        elif regime == "low":
+                            # Low volatility: scan 1.5x less frequently
+                            adjusted = self.interval * 1.5
+                            logger.debug(f"[{self.name}] Low volatility regime: scanning every {adjusted:.0f}s")
+                            return adjusted
+                        # else: normal, use base interval
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Volatility regime check failed: {e}")
+            
+            # Fallback: use base interval
+            return self.interval
+        
+        except Exception as e:
+            logger.debug(f"[{self.name}] Unexpected error in _get_adaptive_interval: {e}")
+            return self.interval  # Safe default
 
     async def scheduler(self):
         # alias used by some managers
@@ -128,22 +184,61 @@ class WalletScannerAgent:
             return False
 
     async def _get_price(self, symbol: str) -> Optional[float]:
+        """
+        Phase 4: Get price from memory-first cascade (0 API calls by default).
+        
+        Strategy 1: Check SharedState.prices (WebSocket, <1ms, 0 API)
+        Strategy 2: Check helpers/cache (Database, <10ms, 0 API)
+        Strategy 3: Optional REST (REST, 100-600ms, 1 API) - if WS_ALLOW_REST=True
+        """
+        # Strategy 1: Memory (WebSocket-updated prices)
+        if hasattr(self.shared_state, "prices"):
+            price = self.shared_state.prices.get(symbol.upper())
+            if price is not None:
+                logger.debug(f"[{self.name}] Got price {symbol} from memory: {price}")
+                return float(price)
+        
+        # Strategy 2: Fallback helpers
         ec = self.exchange_client
+        if ec and hasattr(ec, "get_cached_price"):
+            try:
+                p = ec.get_cached_price(symbol)
+                if asyncio.iscoroutine(p):
+                    p = await p
+                if p is not None:
+                    logger.debug(f"[{self.name}] Got price {symbol} from cache: {p}")
+                    return float(p)
+            except Exception:
+                logger.debug(f"[{self.name}] cached price lookup failed for {symbol}", exc_info=True)
+        
+        # Strategy 3: Optional REST (if allowed by config)
+        allow_rest = bool(getattr(self.config, "WS_ALLOW_REST", False))
+        if not allow_rest:
+            logger.debug(f"[{self.name}] No price for {symbol} - market data not streaming, REST disabled")
+            return None
+        
+        # REST fallback (institutional trading: disabled by default)
         if not ec:
             return None
+        
         try:
             if hasattr(ec, "get_ticker_price"):
                 p = ec.get_ticker_price(symbol)
                 if asyncio.iscoroutine(p):
                     p = await p
-                return float(p) if p is not None else None
+                if p is not None:
+                    logger.debug(f"[{self.name}] Got price {symbol} from REST (ticker): {p}")
+                    return float(p)
             if hasattr(ec, "get_price"):
                 p = ec.get_price(symbol)
                 if asyncio.iscoroutine(p):
                     p = await p
-                return float(p) if p is not None else None
+                if p is not None:
+                    logger.debug(f"[{self.name}] Got price {symbol} from REST: {p}")
+                    return float(p)
         except Exception:
-            logger.debug(f"[{self.name}] price fetch failed for {symbol}", exc_info=True)
+            logger.debug(f"[{self.name}] REST price fetch failed for {symbol}", exc_info=True)
+        
         return None
 
     async def _prefilter_symbol(self, symbol: str) -> bool:
@@ -230,6 +325,91 @@ class WalletScannerAgent:
                 return True
         return False
 
+    async def _classify_and_register_wallet_assets(self, balances: Optional[Dict[str, Any]]) -> None:
+        """
+        PHASE 2: Classify wallet assets with professional metadata.
+        Wallet assets are classified as EXTERNAL_POSITION or STABLE based on asset type.
+        Registers them in SharedState with full origin tracking.
+        """
+        if not balances or not isinstance(balances, dict):
+            return
+        
+        try:
+            # Get stable asset list
+            quote = str(getattr(self.config, "DEFAULT_QUOTE_CURRENCY", "USDT")).upper()
+            known_quotes = set(getattr(self.exchange_client, "_known_quotes", {"USDT", "FDUSD", "USDC", "BUSD", "TUSD", "DAI"}))
+            if self.exchange_client and hasattr(self.exchange_client, "get_known_quotes"):
+                try:
+                    kq = self.exchange_client.get_known_quotes()
+                    if asyncio.iscoroutine(kq):
+                        kq = await kq
+                    if isinstance(kq, (set, list, tuple)):
+                        known_quotes = set([str(x).upper() for x in kq]) or known_quotes
+                except Exception:
+                    pass
+            
+            # Process each balance in wallet
+            for asset, info in balances.items():
+                if not isinstance(info, dict):
+                    continue
+                
+                free = float(info.get("free", 0.0) or 0.0)
+                locked = float(info.get("locked", 0.0) or 0.0)
+                total = free + locked
+                
+                # Skip dust (no quantity)
+                if total <= 0.0:
+                    continue
+                
+                asset_upper = str(asset).upper()
+                
+                # Classify asset
+                if asset_upper == quote or asset_upper in known_quotes:
+                    classification = "STABLE"
+                else:
+                    classification = "EXTERNAL_POSITION"
+                
+                # Try to register with SharedState classification system
+                try:
+                    if hasattr(self.shared_state, "register_position_classified"):
+                        # Get current price if available
+                        price = 1.0
+                        if asset_upper not in known_quotes:
+                            try:
+                                symbol = f"{asset_upper}{quote}"
+                                price = await self._get_price(symbol)
+                                if price is None:
+                                    price = 1.0
+                            except Exception:
+                                price = 1.0
+                        
+                        # Import AssetClassification enum
+                        from core.shared_state import AssetClassification
+                        
+                        # Convert string classification to enum
+                        try:
+                            classification_enum = AssetClassification(classification)
+                        except (ValueError, KeyError):
+                            # Default to EXTERNAL_POSITION if unknown classification
+                            classification_enum = AssetClassification.EXTERNAL_POSITION
+                        
+                        # Register position with classification
+                        await self.shared_state.register_position_classified(
+                            symbol=asset_upper,
+                            quantity=total,
+                            price=float(price),
+                            classification=classification_enum,
+                            origin="wallet_balance_sync",
+                            created_by_agent="WalletScannerAgent",
+                            management_strategy="HOLD" if classification == "STABLE" else "DISCRETIONARY"
+                        )
+                        logger.debug(f"[{self.name}] Classified {asset_upper} as {classification} (qty={total}, price={price})")
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Failed to register classification for {asset_upper}: {e}")
+        
+        except Exception as e:
+            logger.error(f"[{self.name}] Error in _classify_and_register_wallet_assets: {e}", exc_info=True)
+
     async def run_once(self):
         """
         One scan: fetch balances -> build candidate symbols -> propose via SymbolManager.
@@ -258,6 +438,9 @@ class WalletScannerAgent:
                     # FIX: Persist wallet universe immediately so SharedState knows about held assets
                     if balances and hasattr(self.shared_state, "update_balances"):
                         await self.shared_state.update_balances(balances)
+                    
+                    # PHASE 2: Classify wallet assets with professional metadata
+                    await self._classify_and_register_wallet_assets(balances)
                 except Exception as e:
                     logger.error(f"[{self.name}] Failed to fetch balances: {e}", exc_info=True)
                     return
@@ -362,19 +545,26 @@ class WalletScannerAgent:
 
                     candidates.append(symbol)
 
-                # Batch propose
+                # Symbol proposal (disabled by default — wallet != trading universe).
+                # Only propose if WALLET_SCANNER_PROPOSE_SYMBOLS=True is explicitly set.
+                # The canonical discovery path is: SymbolScreener / IPOChaser / DiscoveryCoordinator.
                 proposed_count = 0
-                if candidates and self.symbol_manager:
-                    logger.info(f"[{self.name}] Proposing batch of {len(candidates)} symbol(s)...")
+                if candidates:
+                    logger.info(
+                        f"[{self.name}] Tradable wallet assets found: {candidates} "
+                        f"(propose_symbols={self.propose_symbols})"
+                    )
+                if self.propose_symbols and candidates and self.symbol_manager:
+                    logger.info(f"[{self.name}] Proposing batch of {len(candidates)} symbol(s) to trading universe...")
                     try:
                         accepted_list = await asyncio.wait_for(
                             self.symbol_manager.propose_symbols(candidates, source=self.name),
                             timeout=30
                         )
-                        
+
                         for s in accepted_list:
                             proposed_count += 1
-                            logger.info(f"[{self.name}] ✅ Accepted: {s}")
+                            logger.info(f"[{self.name}] Accepted: {s}")
                             # Emit events for accepted ones
                             if self.emit_accept_event and hasattr(self.shared_state, "emit_event"):
                                 try:
@@ -382,9 +572,18 @@ class WalletScannerAgent:
                                 except Exception: pass
                     except Exception as e:
                         logger.error(f"[{self.name}] Batch proposal failed: {e}")
+                elif candidates and not self.propose_symbols:
+                    logger.debug(
+                        f"[{self.name}] Skipping symbol proposal for {len(candidates)} wallet assets "
+                        f"(WALLET_SCANNER_PROPOSE_SYMBOLS=False — wallet is reconciliation only)"
+                    )
 
                 self.last_run = datetime.utcnow().isoformat()
-                logger.info(f"[{self.name}] Done. Proposed/accepted={proposed_count}")
+                logger.info(
+                    f"[{self.name}] Done. "
+                    f"tradable_wallet_assets={len(candidates)}, proposed={proposed_count} "
+                    f"(propose_mode={'ON' if self.propose_symbols else 'OFF — reconciliation only'})"
+                )
             finally:
                 await asyncio.sleep(0)
                 self._running = False

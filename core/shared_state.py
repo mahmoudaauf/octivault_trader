@@ -38,7 +38,7 @@ __version__ = "2.0.1"
 __component__ = "core.shared_state"
 __contract_id__ = "core:SharedState:v2.0.0"
 
-__all__ = ["SharedState", "SharedStateConfig", "HealthCode", "Component", "SharedStateError", "ErrorCode", "CircuitBreaker", "CircuitBreakerState", "PortfolioState", "BootstrapMetrics", "DustPosition", "DustRegistry", "MergeOperation", "MergeImpact", "PositionMerger", "TradeExecution", "TradingCoordinator", "OHLCVBar", "SellableLine"]
+__all__ = ["SharedState", "SharedStateConfig", "HealthCode", "Component", "AssetClassification", "SharedStateError", "ErrorCode", "CircuitBreaker", "CircuitBreakerState", "PortfolioState", "BootstrapMetrics", "DustPosition", "DustRegistry", "MergeOperation", "MergeImpact", "PositionMerger", "TradeExecution", "TradingCoordinator", "OHLCVBar", "SellableLine"]
 
 # ---- Decimal Precision ----
 getcontext().prec = 28
@@ -72,6 +72,19 @@ class Component(Enum):
     PNL_CALCULATOR   = "PnLCalculator"
     PERFORMANCE_MON  = "PerformanceEvaluator"
     APP_CONTEXT      = "AppContext"
+
+class AssetClassification(Enum):
+    """
+    Professional asset classification for three-layer capital accounting.
+    
+    Every position in the portfolio must be classified to enable proper
+    management, risk assessment, and regulatory compliance.
+    """
+    BOT_POSITION = "BOT_POSITION"           # Created by trading strategy
+    EXTERNAL_POSITION = "EXTERNAL_POSITION" # Pre-existing / external deposit
+    DUST = "DUST"                           # Below MIN_ECONOMIC_TRADE_USDT
+    STABLE = "STABLE"                       # Stablecoins (USDT, FDUSD, etc.)
+    RECOVERY = "RECOVERY"                   # From previous run restart
 
 class OHLCVBar(TypedDict):
     ts: float
@@ -109,6 +122,60 @@ class PendingPositionIntent:
     def __post_init__(self):
         if not self.created_at:
             self.created_at = time.time()
+
+
+@dataclass
+class ClassifiedPosition:
+    """
+    Professional position record with full classification metadata.
+    
+    Enables three-layer capital accounting:
+    1. Origin tracking (wallet, trade, recovery)
+    2. Classification (external, bot, dust, stable)
+    3. Management strategy (hold, trade, liquidate)
+    """
+    symbol: str
+    quantity: float
+    price: float
+    classification: AssetClassification
+    origin: str  # wallet_bootstrap, trade_execution, recovery, exchange_verified
+    created_at: float = None
+    created_by_agent: Optional[str] = None
+    management_strategy: str = "HOLD"
+    dust_reason: Optional[str] = None
+    
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = time.time()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to JSON-serializable dictionary"""
+        return {
+            "symbol": self.symbol,
+            "quantity": float(self.quantity),
+            "price": float(self.price),
+            "classification": self.classification.value,
+            "origin": self.origin,
+            "created_at": self.created_at,
+            "created_by_agent": self.created_by_agent,
+            "management_strategy": self.management_strategy,
+            "dust_reason": self.dust_reason,
+        }
+    
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "ClassifiedPosition":
+        """Create ClassifiedPosition from dictionary (e.g., from JSON storage)"""
+        return ClassifiedPosition(
+            symbol=data["symbol"],
+            quantity=float(data["quantity"]),
+            price=float(data["price"]),
+            classification=AssetClassification(data["classification"]),
+            origin=data["origin"],
+            created_at=data.get("created_at", time.time()),
+            created_by_agent=data.get("created_by_agent"),
+            management_strategy=data.get("management_strategy", "HOLD"),
+            dust_reason=data.get("dust_reason")
+        )
 
 @dataclass
 class SharedStateConfig:
@@ -731,312 +798,8 @@ class MergeImpact:
         }
 
 
-class PositionMerger:
-    """
-    Phase 4: Position consolidation and merging.
-    
-    Analyzes fragmented positions and consolidates them to reduce complexity,
-    lower trading costs, and improve capital efficiency.
-    
-    Prevents the dust loop by automatically merging dust fragments into
-    consolidated positions before trading.
-    """
-    
-    def __init__(self):
-        """Initialize position merger."""
-        self.logger = logging.getLogger(__name__)
-        self.merge_history: List[MergeOperation] = []
-        self.merge_threshold_usd = 1.0  # Minimum notional for merge
-        self.max_entry_price_deviation = 0.05  # 5% max deviation
-    
-    def identify_merge_candidates(self, positions: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
-        """
-        Identify positions that are candidates for merging.
-        
-        Groups positions by symbol and returns symbols with multiple positions.
-        
-        Args:
-            positions: Dict of symbol -> position details
-            
-        Returns:
-            Dict mapping symbol -> list of position IDs that can be merged
-        """
-        candidates = {}
-        
-        # Group by symbol
-        symbols_with_multiples = {}
-        for pos_id, pos_data in positions.items():
-            symbol = pos_data.get("symbol", "")
-            if symbol:
-                if symbol not in symbols_with_multiples:
-                    symbols_with_multiples[symbol] = []
-                symbols_with_multiples[symbol].append(pos_id)
-        
-        # Find symbols with multiple positions
-        for symbol, pos_ids in symbols_with_multiples.items():
-            if len(pos_ids) > 1:
-                candidates[symbol] = pos_ids
-        
-        return candidates
-    
-    def calculate_weighted_entry_price(self, positions: List[Dict[str, Any]]) -> float:
-        """
-        Calculate volume-weighted average entry price for positions.
-        
-        Args:
-            positions: List of position dicts with quantity and entry_price
-            
-        Returns:
-            Weighted average entry price
-        """
-        total_notional = 0.0
-        total_quantity = 0.0
-        
-        for pos in positions:
-            qty = abs(pos.get("quantity", 0.0))
-            entry = pos.get("entry_price", 0.0)
-            notional = qty * entry
-            total_notional += notional
-            total_quantity += qty
-        
-        if total_quantity == 0:
-            return 0.0
-        
-        return total_notional / total_quantity
-    
-    def calculate_merge_impact(self, symbol: str, positions: List[Dict[str, Any]]) -> MergeImpact:
-        """
-        Calculate the impact of merging positions.
-        
-        Args:
-            symbol: Trading symbol
-            positions: List of positions to merge
-            
-        Returns:
-            MergeImpact with analysis
-        """
-        if not positions:
-            return MergeImpact(
-                symbol=symbol,
-                cost_basis_change=0.0,
-                new_average_entry=0.0,
-                quantity_change=0.0,
-                order_count_reduction=0
-            )
-        
-        # Calculate merged quantity and entry
-        total_quantity = sum(abs(p.get("quantity", 0.0)) for p in positions)
-        current_avg_entry = self.calculate_weighted_entry_price(positions)
-        
-        # Calculate cost basis change
-        original_cost = sum(abs(p.get("quantity", 0.0)) * p.get("entry_price", 0.0) for p in positions)
-        merged_cost = total_quantity * current_avg_entry
-        cost_basis_change = merged_cost - original_cost
-        
-        # Order reduction
-        order_count_reduction = len(positions) - 1
-        
-        # Estimate slippage as percentage of notional (assume 0.1% per order merged)
-        # So for 2 orders, slippage = 0.1% total, for 3 orders = 0.2%, etc.
-        slippage_percentage = order_count_reduction * 0.001
-        estimated_slippage = (total_quantity * current_avg_entry) * slippage_percentage
-        
-        # Feasibility score (0-1): higher is better
-        # Based on: position count, total quantity, deviation consistency
-        position_score = min(len(positions) / 5.0, 1.0)  # More positions = higher score
-        # Use 1.0 as base quantity threshold (1 unit or more is good)
-        quantity_score = min(total_quantity / 1.0, 1.0) if total_quantity > 0 else 0.0
-        
-        # Check entry price consistency
-        entry_prices = [p.get("entry_price", 0.0) for p in positions]
-        max_price = max(entry_prices) if entry_prices else 0.0
-        min_price = min(entry_prices) if entry_prices else 0.0
-        
-        if max_price > 0:
-            deviation = (max_price - min_price) / max_price
-            consistency_score = max(0.0, 1.0 - deviation)
-        else:
-            consistency_score = 1.0
-        
-        feasibility_score = (position_score + quantity_score + consistency_score) / 3.0
-        
-        return MergeImpact(
-            symbol=symbol,
-            cost_basis_change=cost_basis_change,
-            new_average_entry=current_avg_entry,
-            quantity_change=total_quantity,
-            order_count_reduction=order_count_reduction,
-            estimated_slippage=estimated_slippage,
-            feasibility_score=feasibility_score
-        )
-    
-    def validate_merge(self, position1: Dict[str, Any], position2: Dict[str, Any]) -> bool:
-        """
-        Validate that two positions can be safely merged.
-        
-        Args:
-            position1: First position
-            position2: Second position
-            
-        Returns:
-            True if merge is valid, False otherwise
-        """
-        # Check symbols match
-        if position1.get("symbol") != position2.get("symbol"):
-            return False
-        
-        # Check entry prices are compatible
-        entry1 = position1.get("entry_price", 0.0)
-        entry2 = position2.get("entry_price", 0.0)
-        
-        if entry1 == 0 or entry2 == 0:
-            return False
-        
-        deviation = abs(entry1 - entry2) / max(entry1, entry2)
-        if deviation > self.max_entry_price_deviation:
-            self.logger.warning(f"[PositionMerger] Entry price deviation too high: {deviation:.2%}")
-            return False
-        
-        # Both must have valid quantities
-        qty1 = position1.get("quantity", 0.0)
-        qty2 = position2.get("quantity", 0.0)
-        if qty1 == 0 or qty2 == 0:
-            return False
-        
-        return True
-    
-    def merge_positions(self, symbol: str, positions: List[Dict[str, Any]]) -> Optional[MergeOperation]:
-        """
-        Merge multiple positions into a single consolidated position.
-        
-        Args:
-            symbol: Trading symbol
-            positions: List of positions to merge
-            
-        Returns:
-            MergeOperation if successful, None otherwise
-        """
-        if len(positions) < 2:
-            return None
-        
-        # Validate all positions can be merged
-        for i in range(len(positions) - 1):
-            if not self.validate_merge(positions[i], positions[i + 1]):
-                self.logger.warning(f"[PositionMerger] Cannot merge {symbol}: validation failed")
-                return None
-        
-        # Calculate merged position
-        source_qty = positions[0].get("quantity", 0.0)
-        source_price = positions[0].get("entry_price", 0.0)
-        
-        total_qty = sum(abs(p.get("quantity", 0.0)) for p in positions)
-        merged_price = self.calculate_weighted_entry_price(positions)
-        
-        # Create merge operation
-        operation = MergeOperation(
-            symbol=symbol,
-            source_quantity=source_qty,
-            target_quantity=sum(abs(p.get("quantity", 0.0)) for p in positions[1:]),
-            source_entry_price=source_price,
-            target_entry_price=positions[1].get("entry_price", 0.0),
-            merged_quantity=total_qty,
-            merged_entry_price=merged_price,
-            merge_type="POSITION_MERGE"
-        )
-        
-        # Track operation
-        self.merge_history.append(operation)
-        self.logger.info(f"[PositionMerger] Merged {len(positions)} positions for {symbol}: "
-                        f"{total_qty} @ {merged_price:.2f}")
-        
-        return operation
-    
-    def should_merge(self, symbol: str, positions: List[Dict[str, Any]]) -> bool:
-        """
-        Determine if positions should be merged.
-        
-        Args:
-            symbol: Trading symbol
-            positions: List of positions
-            
-        Returns:
-            True if positions should be merged
-        """
-        if len(positions) < 2:
-            return False
-        
-        # Calculate impact
-        impact = self.calculate_merge_impact(symbol, positions)
-        
-        # Merge if:
-        # 1. Feasibility score > 0.6
-        # 2. Cost basis change < 1% of position notional
-        # 3. Slippage < 0.5% of position notional
-        if impact.feasibility_score < 0.6:
-            return False
-        
-        total_notional = impact.quantity_change * impact.new_average_entry
-        if total_notional > 0:
-            cost_pct = abs(impact.cost_basis_change) / total_notional
-            if cost_pct > 0.01:
-                return False
-            
-            slippage_pct = impact.estimated_slippage / total_notional
-            if slippage_pct > 0.005:
-                return False
-        
-        return True
-    
-    def consolidate_dust(self, symbol: str, positions: List[Dict[str, Any]], 
-                        dust_threshold: float = 1.0) -> Optional[MergeOperation]:
-        """
-        Consolidate dust positions (small positions) into a single position.
-        
-        Args:
-            symbol: Trading symbol
-            positions: List of positions for this symbol
-            dust_threshold: Notional value threshold for dust ($)
-            
-        Returns:
-            MergeOperation if successful
-        """
-        dust_positions = []
-        
-        for pos in positions:
-            qty = abs(pos.get("quantity", 0.0))
-            entry = pos.get("entry_price", 0.0)
-            notional = qty * entry
-            
-            if notional < dust_threshold:
-                dust_positions.append(pos)
-        
-        if len(dust_positions) < 2:
-            return None
-        
-        return self.merge_positions(symbol, dust_positions)
-    
-    def get_merge_summary(self) -> Dict[str, Any]:
-        """Get summary of all merge operations."""
-        if not self.merge_history:
-            return {
-                "total_merges": 0,
-                "symbols_merged": 0,
-                "total_quantity_consolidated": 0.0,
-                "orders_eliminated": 0,
-            }
-        
-        return {
-            "total_merges": len(self.merge_history),
-            "symbols_merged": len(set(m.symbol for m in self.merge_history)),
-            "total_quantity_consolidated": sum(m.merged_quantity for m in self.merge_history),
-            "orders_eliminated": sum(m.merged_quantity for m in self.merge_history),
-            "last_merge": self.merge_history[-1].to_dict(),
-        }
-    
-    def reset_history(self) -> None:
-        """Clear merge history."""
-        self.merge_history.clear()
-        self.logger.info("[PositionMerger] History cleared")
+# [DEPRECATED: Phase 4 PositionMerger replaced by Phase 6 PositionMergerEnhanced]
+# See core/position_merger_enhanced.py for professional implementation with strategies
 
 @dataclass
 class CircuitBreaker:
@@ -1360,6 +1123,13 @@ class SharedState:
             "current_mode": "BOOTSTRAP",
             "governance_decision": {},
         }
+        # Legacy/public NAV mirrors expected by multiple runtime consumers.
+        self.nav = 0.0
+        self.portfolio_nav = 0.0
+        self.total_equity = 0.0
+        self.total_equity_usdt = 0.0
+        self.free_quote = 0.0
+        self.invested_capital = 0.0
         
         # Phase 2: Persistent Bootstrap Metrics
         # Initialize persistent storage for bootstrap history
@@ -1377,9 +1147,9 @@ class SharedState:
         # Initialize persistent storage for dust position tracking
         self.dust_lifecycle_registry = DustRegistry(db_path=db_path)
         
-        # Phase 4: Position Merger & Consolidation
-        # Initialize position merger for consolidating fragmented positions
-        self.position_merger = PositionMerger()
+        # Phase 4: Position Merger (DEPRECATED - moved to Phase 6)
+        # See phase 6: PositionMergerEnhanced in core/position_merger_enhanced.py
+        # Will be initialized from MetaController/AppContext
         
         # Phase 5: Trading Coordinator Integration
         # Initialize trading coordinator for unified trade execution
@@ -1409,6 +1179,7 @@ class SharedState:
         self.open_trades: Dict[str, Dict[str, Any]] = {}
         self.positions: Dict[str, Dict[str, Any]] = {}
         self.balances: Dict[str, Dict[str, float]] = {}
+        self._positions_classified: Dict[str, ClassifiedPosition] = {}  # PHASE 1: Professional asset classification
         self.trade_history: deque = deque(maxlen=self.config.max_trade_history_size)
         self._realized_pnl: deque = deque(maxlen=4096)
         self.trade_count: int = 0
@@ -1529,6 +1300,15 @@ class SharedState:
         self.alerts = deque(maxlen=1000)
         self._pending_reservation_requests = [] # Pending P9 meta-healing requests
 
+        # ✅ FIX #8: DISCOVERY PROPOSALS (UURE integration)
+        # Initialized here to ensure persistence across agent runs
+        # SymbolScreener, IPOChaser, and other discovery agents write to these
+        # UURE reads them in _collect_candidates() → _collect_discovery_proposals()
+        self.symbol_proposals: Dict[str, Dict[str, Any]] = {}  # Direct agent proposals (fallback store)
+        self.discovery_proposals: Dict[str, Dict[str, Any]] = {}  # DiscoveryCoordinator output (primary)
+        self.discovery_proposals_weighted: Dict[str, Dict[str, Any]] = {}  # Phase 3: Regime-weighted proposals
+        self.logger.info("[SS:Init] Discovery proposal stores initialized (symbol_proposals, discovery_proposals, discovery_proposals_weighted)")
+
         # 🔄 LIGHTWEIGHT SIGNAL OUTCOME TRACKING
         self._signal_outcomes = []  # List of signal outcome records for periodic evaluation
 
@@ -1585,6 +1365,18 @@ class SharedState:
         self.dust_retirement_rejection_threshold: int = 3  # After N rejections, dust is PERMANENT
         self.dust_unhealable: Dict[str, str] = {}  # symbol -> reason; positions excluded from dust healing
         self._price_history: Dict[str, Any] = {}  # symbol -> deque/list of recent prices (used by get_market_state)
+        
+        # ===== WALLET HYDRATION DEDUPLICATION (ISSUE 1 FIX) =====
+        # Prevent log flood from repeated wallet reconstructions
+        # Track the last known wallet state to skip hydration if balances haven't changed
+        self._last_hydration_balances_hash: Optional[str] = None  # Hash of last hydrated balances
+        self._hydration_reconstructed_symbols: Set[str] = set()  # Symbols that have been reconstructed once
+        # Global guardrails for authoritative balance sync (prevents force=True thundering herd)
+        self._balance_sync_api_lock = asyncio.Lock()
+        self._balance_sync_failures = 0
+        self._balance_sync_next_allowed_ts = 0.0
+        self._balance_sync_last_attempt_ts = 0.0
+        self._balance_sync_last_backoff_log_ts = 0.0
 
     @property
     def avg_holding_time_sec(self) -> float:
@@ -1978,6 +1770,110 @@ class SharedState:
         """Return a shallow copy of all balances."""
         return dict(self.balances)
 
+    async def rebuild_nav_from_state(self, source: str = "state_rebuild") -> Dict[str, float]:
+        """
+        Recompute and publish NAV-related fields from current in-memory state.
+
+        This is used during startup recovery so consumers that still read legacy
+        attributes (`nav`, `portfolio_nav`, `total_equity_usdt`, `metrics["nav"]`)
+        see a coherent value immediately after balances/positions are rebuilt.
+        """
+        quote_assets = getattr(self, "quote_assets", None)
+        if not quote_assets:
+            quote_assets = [getattr(self, "quote_asset", "USDT").upper()]
+        else:
+            quote_assets = [q.upper() for q in (quote_assets if isinstance(quote_assets, list) else [quote_assets])]
+
+        primary_quote = quote_assets[0]
+        dust_threshold = float(getattr(self, "dust_min_quote_usdt", 5.0) or 5.0)
+
+        quote_free_total = 0.0
+        quote_locked_total = 0.0
+        primary_quote_free = 0.0
+
+        for asset, bal in (self.balances or {}).items():
+            asset_upper = str(asset).upper()
+            if asset_upper not in quote_assets:
+                continue
+            free = float((bal or {}).get("free", 0.0) or 0.0)
+            locked = float((bal or {}).get("locked", 0.0) or 0.0)
+            quote_free_total += free
+            quote_locked_total += locked
+            if asset_upper == primary_quote:
+                primary_quote_free = free
+
+        invested_capital = 0.0
+        unrealized_pnl = 0.0
+        included_positions = 0
+
+        if getattr(self, "_shadow_mode", False):
+            nav = quote_free_total + quote_locked_total
+        else:
+            nav = quote_free_total + quote_locked_total
+            for sym, pos in (self.positions or {}).items():
+                qty = float((pos or {}).get("quantity", 0.0) or 0.0)
+                if qty <= 0:
+                    continue
+                if bool((pos or {}).get("_mirrored", False)):
+                    continue
+
+                px = float(
+                    self.latest_prices.get(sym)
+                    or (pos or {}).get("mark_price")
+                    or (pos or {}).get("current_price")
+                    or 0.0
+                )
+                if px <= 0:
+                    continue
+
+                pos_value = qty * px
+                if pos_value < dust_threshold:
+                    continue
+
+                nav += pos_value
+                invested_capital += pos_value
+                included_positions += 1
+
+                avg = float((pos or {}).get("avg_price") or (pos or {}).get("entry_price") or 0.0)
+                if avg > 0:
+                    unrealized_pnl += (px - avg) * qty
+
+        self.nav = float(nav)
+        self.portfolio_nav = float(nav)
+        self.total_equity = float(nav)
+        self.total_equity_usdt = float(nav)
+        self.free_quote = float(primary_quote_free)
+        self.invested_capital = float(invested_capital)
+
+        if isinstance(self.metrics, dict):
+            self.metrics["nav"] = float(nav)
+            self.metrics["total_equity"] = float(nav)
+            self.metrics["capital_free"] = float(primary_quote_free)
+            self.metrics["invested_capital"] = float(invested_capital)
+            self.metrics["unrealized_pnl"] = float(unrealized_pnl)
+            self.metrics["nav_ready"] = True
+
+        if not self.nav_ready_event.is_set():
+            self.nav_ready_event.set()
+            await self.emit_event("NavReady", {"ts": time.time(), "source": source})
+
+        self.logger.info(
+            "[NAV:Rebuild] source=%s nav=%.2f free_%s=%.2f invested=%.2f positions=%d",
+            source,
+            float(nav),
+            primary_quote,
+            float(primary_quote_free),
+            float(invested_capital),
+            included_positions,
+        )
+
+        return {
+            "nav": float(nav),
+            "free_quote": float(primary_quote_free),
+            "invested_capital": float(invested_capital),
+            "unrealized_pnl": float(unrealized_pnl),
+        }
+
     def get_nav_quote(self) -> float:
         """Return the current NAV in quote asset (USDT).
         
@@ -2032,17 +1928,64 @@ class SharedState:
             )
             return nav
         
-        # Add ALL position values (no filtering by trade floor or position size)
-        # This is required so NAV accurately reflects total portfolio value
+        # PROFESSIONAL STANDARD: Add position values with professional filtering
+        # Formula: NAV = USDT_balance + Σ(position_qty × current_market_price)
+        # Rules:
+        #  1. Use current price (NOT entry price) - professional requirement
+        #  2. Exclude dust positions below threshold - professional requirement
+        #  3. Exclude assets with no price feed - professional requirement
+        
+        dust_threshold = getattr(self, "dust_min_quote_usdt", 5.0)
+        
         has_positions = False
+        positions_excluded_dust = 0
+        positions_excluded_no_price = 0
+        
         for sym, pos in self.positions.items():
             qty = float(pos.get("quantity", 0.0))
             if qty <= 0: 
                 continue
+            # Wallet-mirrored positions are already represented by balance hydration
+            # and must not be counted again in the published trading NAV.
+            if bool(pos.get("_mirrored", False)):
+                self.logger.debug(
+                    f"[NAV] Skipping mirrored position {sym}: already represented by wallet state"
+                )
+                continue
+            
+            # PROFESSIONAL STANDARD RULE #1: Use current price ONLY
+            # Never use entry price - it's historical, not current market value
+            # Try latest_prices first, then mark_price (updated at trade time)
+            px = float(self.latest_prices.get(sym) or pos.get("mark_price") or 0.0)
+            
+            # PROFESSIONAL STANDARD RULE #3: Exclude positions with no price feed
+            if px <= 0:
+                self.logger.debug(
+                    f"[NAV] Excluding {sym}: no current price feed "
+                    f"(qty={qty:.8f}, entry_price={pos.get('entry_price', 'N/A')})"
+                )
+                positions_excluded_no_price += 1
+                continue
+            
+            # Calculate position value at market price
+            pos_value = qty * px
+            
+            # PROFESSIONAL STANDARD RULE #2: Exclude dust positions below threshold
+            if pos_value < dust_threshold:
+                self.logger.debug(
+                    f"[NAV] Excluding dust {sym}: "
+                    f"value={pos_value:.2f} < threshold={dust_threshold:.2f} "
+                    f"(qty={qty:.8f} × px={px:.2f})"
+                )
+                positions_excluded_dust += 1
+                continue
+            
+            # Include position in NAV (professional standard compliant)
             has_positions = True
-            px = float(self.latest_prices.get(sym) or pos.get("mark_price") or pos.get("entry_price") or 0.0)
-            if px > 0:
-                nav += qty * px  # Include ALL positions, even if below MIN_ECONOMIC_TRADE_USDT
+            nav += pos_value
+            self.logger.debug(
+                f"[NAV] Including {sym}: qty={qty:.8f} × price={px:.2f} = {pos_value:.2f}"
+            )
         
         # FIX #3: BOOTSTRAP FIX - If NAV is 0 but we have free quote, use it as bootstrap NAV
         if nav <= 0 and free_total > 0 and not has_positions:
@@ -2052,7 +1995,9 @@ class SharedState:
         self.logger.debug(
             f"[NAV] Total: {nav:.2f} | "
             f"Quotes: {quote_balances} | "
-            f"Positions: {len(self.positions)} | "
+            f"Positions included: {len([p for p in self.positions.values() if float(p.get('quantity', 0.0)) > 0])} | "
+            f"Dust excluded: {positions_excluded_dust} | "
+            f"No-price excluded: {positions_excluded_no_price} | "
             f"Assets: {len(self.balances)}"
         )
         return nav
@@ -2062,6 +2007,39 @@ class SharedState:
         try:
             return float(self.get_nav_quote())
         except Exception:
+            return 0.0
+
+    async def get_total_equity(self) -> float:
+        """
+        Get total equity (professional standard NAV).
+        
+        RECOMMENDED APPROACH (per professional standards):
+        Use this method for all portfolio valuation in critical systems.
+        This ensures consistent, auditable equity calculations.
+        
+        Formula: Equity = USDT_balance + Σ(position_qty × current_market_price)
+        
+        Returns the same value as get_nav_quote() but:
+        - Async for compatibility with async contexts
+        - Consistent naming for "total equity" concept
+        - Clear indication this is the authoritative equity figure
+        - Suitable for risk calculations, capital allocation, etc.
+        """
+        try:
+            # Use get_nav_quote() which implements professional standards:
+            # 1. Uses current price (not entry price)
+            # 2. Ignores dust positions (< $5 threshold)
+            # 3. Excludes assets with no price feed
+            equity = float(self.get_nav_quote())
+            
+            # Update total_equity attribute for legacy code
+            self.total_equity = equity
+            
+            self.logger.debug(f"[EQUITY] Total equity: {equity:.2f} USDT")
+            return equity
+            
+        except Exception as e:
+            self.logger.error(f"[EQUITY] Error computing total equity: {e}")
             return 0.0
 
     def get_active_allocation_plan(self) -> Dict[str, Any]:
@@ -2447,6 +2425,7 @@ class SharedState:
         invested_capital = 0.0
         unrealized_pnl = 0.0
         rebuilt_positions: Dict[str, Dict[str, Any]] = {}
+        skipped_non_tradable = []
 
         for asset, data in balances_snapshot.items():
             a = asset.upper()
@@ -2458,6 +2437,9 @@ class SharedState:
 
             sym = f"{a}{quote_asset}"
             if hasattr(self._exchange_client, "has_symbol") and not self._exchange_client.has_symbol(sym):
+                skipped_non_tradable.append(sym)
+                self.logger.debug(f"[SS:AuthoritativeSync] Ignoring non-tradable asset {a} (symbol {sym})")
+
                 continue
 
             price = 0.0
@@ -2469,7 +2451,11 @@ class SharedState:
             except Exception:
                 price = 0.0
 
+            # PROFESSIONAL STANDARD: If no price available, position value is unknown but
+            # we still reconstruct the position. avg_price and entry_price fall back to
+            # current mark price — treat as "just acquired at market" (standard quant practice).
             avg_price = price if price > 0 else 0.0
+            entry_price = avg_price  # For wallet-reconstructed positions, entry == current mark
             position_value = qty * avg_price if avg_price > 0 else 0.0
             significant_floor = float(await self.get_significant_position_floor(sym) or 0.0)
             is_significant = bool(position_value >= significant_floor and position_value > 0.0)
@@ -2478,6 +2464,7 @@ class SharedState:
             rebuilt_positions[sym] = {
                 "quantity": qty,
                 "avg_price": avg_price,
+                "entry_price": entry_price,  # Normalized: never zero when price is available
                 "mark_price": price,
                 "value_usdt": float(position_value),
                 "significant_floor_usdt": float(significant_floor),
@@ -2492,7 +2479,38 @@ class SharedState:
             if price > 0:
                 self.latest_prices[sym] = price
 
-        # Apply rebuilt positions
+        # Recompute free capital from quote balance
+        quote_bal = balances_snapshot.get(quote_asset, {})
+        quote_total = float(quote_bal.get("free", 0.0)) + float(quote_bal.get("locked", 0.0))
+        free_capital = max(0.0, quote_total - invested_capital)
+
+        # 🔴 CRITICAL FIX: If we have many positions but zero capital, wallets are empty
+        # This indicates positions are STALE and should be cleared (emergency cleanup)
+        if len(rebuilt_positions) > 50 and free_capital < 1.0:
+            cleared_count = len(rebuilt_positions)
+            self.logger.error(
+                "[SS:AuthoritativeSync] 🔴 CRITICAL: %d positions detected but free_capital=%.2f! "
+                "EMERGENCY CLEANUP ACTIVATED: Clearing stale positions.",
+                len(rebuilt_positions), free_capital
+            )
+            # Clear both the pending rebuild snapshot and any in-memory mirrors to
+            # prevent phantom positions from surviving this emergency branch.
+            rebuilt_positions.clear()
+            async with self._lock_context("positions"):
+                self.positions.clear()
+            async with self._lock_context("global"):
+                self.open_trades.clear()
+                self.dust_registry.clear()
+            self.metrics["dust_registry_size"] = 0
+            invested_capital = 0.0
+            free_capital = quote_total  # All quote asset is available
+            self.logger.error(
+                "[SS:AuthoritativeSync] 🔴 EMERGENCY: Cleared %d stale positions. "
+                "Wallet is now CLEAN. Restart bot trading cycle.",
+                cleared_count
+            )
+
+        # Apply rebuilt positions only after the emergency stale-wallet check passes.
         for sym, pos in rebuilt_positions.items():
             await self.update_position(sym, pos)
             if not bool(pos.get("is_significant", False)):
@@ -2510,11 +2528,6 @@ class SharedState:
             else:
                 self.dust_registry.pop(sym, None)
 
-        # Recompute free capital from quote balance
-        quote_bal = balances_snapshot.get(quote_asset, {})
-        quote_total = float(quote_bal.get("free", 0.0)) + float(quote_bal.get("locked", 0.0))
-        free_capital = max(0.0, quote_total - invested_capital)
-
         # Unrealized PnL from price vs avg_price
         for sym, pos in rebuilt_positions.items():
             avg = float(pos.get("avg_price", 0.0))
@@ -2528,10 +2541,15 @@ class SharedState:
             self.metrics["capital_free"] = float(free_capital)
             self.metrics["unrealized_pnl"] = float(unrealized_pnl)
 
-        self.logger.warning(
-            "[SS:AuthoritativeSync] Done | positions=%d invested=%.2f free=%.2f quote=%s",
-            len(rebuilt_positions), invested_capital, free_capital, quote_asset
-        )
+        try:
+            await self.rebuild_nav_from_state(source="authoritative_wallet_sync")
+        except Exception as e:
+            self.logger.warning("[SS:AuthoritativeSync] NAV rebuild failed: %s", e)
+
+        log_msg = f"[SS:AuthoritativeSync] Done | positions={len(rebuilt_positions)} invested={invested_capital:.2f} free={free_capital:.2f} quote={quote_asset}"
+        if skipped_non_tradable:
+            log_msg += f" | skipped_non_tradable={len(skipped_non_tradable)} ({','.join(skipped_non_tradable[:5])}{'...' if len(skipped_non_tradable) > 5 else ''})"
+        self.logger.warning(log_msg)
 
         return {
             "balances": balances_snapshot,
@@ -3097,23 +3115,12 @@ class SharedState:
                     f"[SS] 🔄 REPLACE MODE: {current_count} → {final_count} symbols (source={source})"
                 )
             
-            # === CANONICAL GOVERNOR ENFORCEMENT ===
-            # Apply governor cap at the authoritative store (SharedState)
-            # This ensures NO component can bypass the cap, regardless of code path
-            try:
-                if hasattr(self, '_app') and self._app and hasattr(self._app, 'capital_symbol_governor'):
-                    governor = self._app.capital_symbol_governor
-                    if governor:
-                        cap = await governor.compute_symbol_cap()
-                        
-                        if cap is not None and len(working_symbols) > cap:
-                            self.logger.info(
-                                f"🎛️ CANONICAL GOVERNOR: {len(working_symbols)} → {cap} symbols (at SharedState)"
-                            )
-                            symbol_items = list(working_symbols.items())
-                            working_symbols = dict(symbol_items[:cap])
-            except Exception as e:
-                self.logger.warning(f"⚠️ Canonical governor enforcement failed: {e}")
+            # ✅ REMOVED: Canonical governor cap enforcement from SharedState
+            # WHY: Governor cap should limit EXECUTION, not EVALUATION universe
+            # BEFORE (WRONG): accepted_symbols = top-4 (cap applied here)
+            # AFTER (CORRECT): accepted_symbols = all 30 (full eval universe)
+            # The cap is now applied at execution time in MetaController._execute_decision()
+            # This allows full symbol universe to flow through _build_decisions() for evaluation
             
             # === BUILD FINAL SYMBOL SET ===
             # In replace mode, we remove symbols not in the incoming set (but protect wallet_force)
@@ -3260,20 +3267,28 @@ class SharedState:
             self.logger.warning(f"[SS] Error calculating dynamic significant floor: {e}, using base 25.0")
             return 25.0
 
-    def calculate_capital_floor(self, nav: float = 0.0, trade_size: float = 0.0) -> float:
+    def calculate_capital_floor(self, nav: float = 0.0, trade_size: float = 0.0, dynamic_ratio: Optional[float] = None) -> float:
         """
-        Calculate dynamic capital floor based on NAV and trade size.
+        Calculate dynamic capital floor based on NAV, trade size, and volatility-adjusted ratio.
         
-        Formula: capital_floor = max(8, NAV * 0.12, trade_size * 0.5)
+        Formula: capital_floor = max(8, NAV * dynamic_ratio, trade_size * 0.5)
+        
+        Where dynamic_ratio is (production-grade, hard-capped at 12%):
+        - 0.12 (12%) in very low volatility (≤1.5% ATR) — growth-oriented
+        - 0.08 (8%)  in low-mid volatility (≤3.0% ATR) — balanced
+        - 0.05 (5%)  in high volatility (>3.0% ATR) — agility-focused
+        - HARD CAP: ratio never exceeds 0.12 (professional best-practice)
         
         This ensures:
         - Absolute minimum of $8 (maintenance buffer)
-        - At least 12% of NAV reserved (NAV-based safety)
+        - NAV-proportional reserve with volatility adjustment
         - At least 50% of typical trade size reserved (trade viability)
+        - Conservative enough to protect capital, aggressive enough to trade profitably
         
         Args:
             nav: Net Asset Value in USDT (uses self.nav if not provided)
             trade_size: Typical trade size in USDT (uses configured trade amount if not provided)
+            dynamic_ratio: Override ratio (uses 0.12 if not provided, hard-capped at 0.12)
             
         Returns:
             Capital floor in USDT
@@ -3287,9 +3302,17 @@ class SharedState:
             if trade_size <= 0:
                 trade_size = float(self._cfg("TRADE_AMOUNT_USDT", self._cfg("DEFAULT_PLANNED_QUOTE", 30.0)) or 30.0)
             
+            # Use provided dynamic_ratio or default to 0.12 (baseline)
+            if dynamic_ratio is None:
+                dynamic_ratio = 0.12
+            
+            # HARD CAP: Enforce professional best-practice limit (never exceed 12%)
+            # This prevents volatility classifiers from being too conservative
+            dynamic_ratio = min(dynamic_ratio, 0.12)
+            
             # Calculate three floor candidates
             absolute_min = 8.0
-            nav_based = nav * 0.12
+            nav_based = nav * dynamic_ratio
             trade_based = trade_size * 0.5
             
             # Capital floor is the maximum of all three components
@@ -3767,6 +3790,17 @@ class SharedState:
         # Do not set MarketDataReady here; rely on coverage check
         await self._maybe_set_market_data_ready()
 
+    def get_market_data_sync(self, symbol: str, timeframe: str) -> Optional[List[OHLCVBar]]:
+        """Synchronous access to market data (for blocking contexts)."""
+        sym = self._norm_sym(symbol)
+        tf = self._norm_tf(timeframe)
+        rows = self.market_data.get((sym, tf))
+        if rows is None:
+            rows = self.market_data.get((sym, str(timeframe or "").strip()))
+        if rows is None:
+            rows = self.market_data.get((symbol, timeframe))
+        return rows
+
     async def get_market_data(self, symbol: str, timeframe: str) -> Optional[List[OHLCVBar]]:
         sym = self._norm_sym(symbol)
         tf = self._norm_tf(timeframe)
@@ -3825,6 +3859,7 @@ class SharedState:
         """Update balances with change detection and reservation reconciliation.
         
         FIX #2: Reconciliation logic prevents phantom capital loss on sync
+        FIX: Filter out non-tradable assets (assets without valid trading pairs)
         """
         if not isinstance(balances, dict):
             raise SharedStateError("balances must be a dictionary", ErrorCode.CONFIGURATION_ERROR)
@@ -3834,6 +3869,41 @@ class SharedState:
                 if not isinstance(data, dict):
                     continue
                 a = asset.upper()
+                
+                # FILTER: Skip assets that are not tradable pairs
+                # An asset is tradable if it forms a valid symbol with the quote asset
+                quote = self.quote_asset.upper()
+                sym = f"{a}{quote}"
+                
+                # Skip quote asset itself (it's handled separately)
+                if a == quote:
+                    new_free = max(0.0, float(data.get("free", 0.0)))
+                    new_locked = max(0.0, float(data.get("locked", 0.0)))
+                    prev = self.balances.get(a)
+                    prev_free = float(prev.get("free", 0.0)) if prev else 0.0
+                    prev_locked = float(prev.get("locked", 0.0)) if prev else 0.0
+                    if prev and (prev_free == new_free and prev_locked == new_locked):
+                        continue
+                    changed_assets.append(a)
+                    if prev:
+                        prev.update({"free": new_free, "locked": new_locked})
+                        self.balances[a] = prev
+                    else:
+                        self.balances[a] = {"free": new_free, "locked": new_locked}
+                    self.logger.debug(f"[SS:BalanceUpdate] {a}: free={new_free}, locked={new_locked}")
+                    continue
+                
+                # For non-quote assets, verify they're tradable pairs
+                is_tradable = False
+                if self._exchange_client and hasattr(self._exchange_client, "has_symbol"):
+                    is_tradable = self._exchange_client.has_symbol(sym)
+                elif sym in self.symbols or sym in self.accepted_symbols:
+                    is_tradable = True
+                
+                if not is_tradable:
+                    self.logger.debug(f"[SS:BalanceUpdate] Skipping non-tradable asset {a} (symbol {sym} not tradable)")
+                    continue
+                
                 new_free = max(0.0, float(data.get("free", 0.0)))
                 new_locked = max(0.0, float(data.get("locked", 0.0)))
                 
@@ -3904,7 +3974,24 @@ class SharedState:
         # but for Meta tick performance we rely on the background syncer.
         return self.balances.get(a, {"free": 0.0, "locked": 0.0})
 
-    async def sync_authoritative_balance(self, force: bool = False) -> None:
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """Best-effort Binance rate-limit detection across wrapper variants."""
+        code = getattr(exc, "code", None)
+        status_code = getattr(exc, "status_code", None)
+        status = getattr(exc, "status", None)
+        msg = str(exc).lower()
+        return (
+            code in (-1003, -1015, 429)
+            or status_code in (429, -1003, -1015)
+            or status in (429, -1003, -1015)
+            or "apierror(code=-1003)" in msg
+            or "too much request weight" in msg
+            or "request weight used" in msg
+            or "too many requests" in msg
+        )
+
+    async def sync_authoritative_balance(self, force: bool = False) -> bool:
         """
         P9: Force a hard sync of balances from the exchange to prevent phantom capital.
         
@@ -3915,7 +4002,37 @@ class SharedState:
         Never overwrite self.balances in shadow mode - all trading must use virtual ledgers.
         This prevents exchange corrections from wiping out shadow positions.
         """
-        if self._exchange_client and hasattr(self._exchange_client, "get_spot_balances"):
+        # TTL throttle for non-forced calls.
+        if not force:
+            last_sync = getattr(self, "last_balance_sync", 0.0)
+            if time.time() - last_sync < 300.0:
+                return True
+
+        if not (self._exchange_client and hasattr(self._exchange_client, "get_spot_balances")):
+            return False
+
+        # Coalesce bursts from multiple call sites (especially force=True storms).
+        min_spacing = float(self._cfg("BALANCE_SYNC_MIN_SPACING_SEC", 1.0) or 1.0)
+        backoff_max = float(self._cfg("BALANCE_SYNC_BACKOFF_MAX_SEC", 30.0) or 30.0)
+        now = time.time()
+        if now < float(getattr(self, "_balance_sync_next_allowed_ts", 0.0) or 0.0):
+            if force and (now - float(getattr(self, "_balance_sync_last_backoff_log_ts", 0.0) or 0.0) > 5.0):
+                wait = max(0.0, float(self._balance_sync_next_allowed_ts) - now)
+                self._balance_sync_last_backoff_log_ts = now
+                self.logger.warning(
+                    "[SS] Skipping forced balance sync due to active rate-limit backoff (%.1fs remaining)",
+                    wait,
+                )
+            return False
+
+        async with self._balance_sync_api_lock:
+            now = time.time()
+            if now < float(getattr(self, "_balance_sync_next_allowed_ts", 0.0) or 0.0):
+                return False
+            if now - float(getattr(self, "_balance_sync_last_attempt_ts", 0.0) or 0.0) < min_spacing:
+                return True
+            self._balance_sync_last_attempt_ts = now
+
             try:
                 new_bals = await self._exchange_client.get_spot_balances()
                 if new_bals:
@@ -3933,6 +4050,8 @@ class SharedState:
                                     self.balances[a] = data
                         # Always update last sync timestamp (even in shadow mode)
                         self.last_balance_sync = time.time()
+                        self._balance_sync_failures = 0
+                        self._balance_sync_next_allowed_ts = 0.0
                         # FIX #2: Ensure balances_ready_event is set, even if sync_authoritative_balance called directly
                         # Problem: Only update_balances() was setting the ready event, not sync_authoritative_balance()
                         # This caused MetaController to block indefinitely waiting for balances to be marked ready
@@ -3947,8 +4066,24 @@ class SharedState:
                         self.logger.warning(msg)
                     else:
                         self.logger.info(msg)
+                    return True
+                return False
             except Exception as e:
-                self.logger.error(f"[SS] Failed to sync authoritative balance: {e}")
+                if self._is_rate_limit_error(e):
+                    self._balance_sync_failures = int(getattr(self, "_balance_sync_failures", 0) or 0) + 1
+                    backoff_sec = min(backoff_max, float(2 ** max(0, self._balance_sync_failures - 1)))
+                    self._balance_sync_next_allowed_ts = time.time() + backoff_sec
+                    self.logger.warning(
+                        "[SS] Rate-limited during authoritative balance sync; backing off %.1fs (failures=%d): %s",
+                        backoff_sec,
+                        self._balance_sync_failures,
+                        e,
+                    )
+                else:
+                    self._balance_sync_failures = 0
+                    self._balance_sync_next_allowed_ts = 0.0
+                    self.logger.error(f"[SS] Failed to sync authoritative balance: {e}")
+                return False
 
     async def init_virtual_portfolio_from_real_snapshot(self) -> None:
         """
@@ -4511,10 +4646,17 @@ class SharedState:
                     )
                     continue
                 
-                # Check age (must be old enough to be dust)
+                # Check age using priority action: AGGREGATE-phase dust is held, not cleaned up
                 first_seen = self._dust_first_seen.get(symbol, now)
                 age_sec = now - first_seen
                 if age_sec < min_age_sec:
+                    continue
+                action, _ = self.get_dust_priority_action(symbol)
+                if action == "AGGREGATE":
+                    self.logger.debug(
+                        "[Phase3:Dust] %s is AGGREGATE-phase (age=%.1fh < threshold) — skipping cleanup",
+                        symbol, age_sec / 3600.0,
+                    )
                     continue
                 
                 # Check cooldown from last attempt
@@ -4545,6 +4687,41 @@ class SharedState:
         
         return candidates
 
+
+    def get_dust_priority_action(
+        self,
+        symbol: str,
+        aggregate_threshold_hours: float = 4.0,
+    ) -> Tuple[str, float]:
+        """
+        Priority-based dust resolution decision (institutional quant standard).
+
+        Priority order: Reuse > Aggregate > Cleanup
+
+        Returns (action, dust_qty) where action is:
+          "AGGREGATE" – dust is young (age < aggregate_threshold_hours), hold and accumulate
+          "CLEANUP"   – dust is stale (age >= aggregate_threshold_hours), trigger cleanup sell
+          "NONE"      – no dust position for this symbol
+
+        Note: "REUSE" is decided by the caller (ExecutionManager) when a same-symbol
+        BUY is incoming — this method only classifies AGGREGATE vs CLEANUP.
+        """
+        sym = self._norm_sym(symbol)
+        entry = self.dust_registry.get(sym)
+        if not entry:
+            return ("NONE", 0.0)
+
+        dust_qty = float(entry.get("qty", 0.0))
+        if dust_qty <= 0.0:
+            return ("NONE", 0.0)
+
+        threshold = float(getattr(self.config, "DUST_AGGREGATE_THRESHOLD_HOURS", aggregate_threshold_hours))
+        first_seen = float(entry.get("first_seen") or entry.get("timestamp") or time.time())
+        age_hours = (time.time() - first_seen) / 3600.0
+
+        if age_hours < threshold:
+            return ("AGGREGATE", dust_qty)
+        return ("CLEANUP", dust_qty)
 
     async def mark_dust_cleanup_attempted(self, symbol: str) -> None:
         """
@@ -4605,10 +4782,26 @@ class SharedState:
         Mirror non-quote wallet balances into spot positions using the configured quote asset.
         If a symbol like BASE+QUOTE (e.g., BTCUSDT) exists in `self.symbols` or `self.accepted_symbols`,
         create/update a position entry with quantity equal to wallet free amount (do not touch avg_price).
+        
+        OPTIMIZATION (ISSUE 1 FIX): 
+        Skip hydration if balances haven't changed since last run (prevents log flood).
         """
+        import hashlib
+        
         quote = self.quote_asset.upper()
         # Snapshot balances to avoid holding the balances lock while touching positions
         snapshot = dict(self.balances)
+        
+        # ===== DEDUPLICATION: Skip if balances haven't changed =====
+        # Create a simple hash of the balances to detect changes
+        snapshot_str = str(sorted((k, v.get("free", 0.0)) for k, v in snapshot.items()))
+        snapshot_hash = hashlib.md5(snapshot_str.encode()).hexdigest()
+        
+        if self._last_hydration_balances_hash == snapshot_hash:
+            # Balances are identical to last hydration → skip
+            return
+        
+        self._last_hydration_balances_hash = snapshot_hash
         changed: list[str] = []
         for asset, data in snapshot.items():
             a = asset.upper()
@@ -4629,8 +4822,18 @@ class SharedState:
                     changed.append(sym)
                 continue
             sym = f"{a}{quote}"
-            if sym not in self.symbols and sym not in self.accepted_symbols:
-                # Skip unknown trading pairs
+            
+            # FILTER: Verify the symbol is tradable
+            # Check against known symbols first, then verify with exchange if available
+            is_known_symbol = sym in self.symbols or sym in self.accepted_symbols
+            is_exchange_tradable = True
+            
+            if self._exchange_client and hasattr(self._exchange_client, "has_symbol"):
+                is_exchange_tradable = self._exchange_client.has_symbol(sym)
+            
+            if not is_known_symbol and not is_exchange_tradable:
+                # Skip non-tradable pairs
+                self.logger.debug(f"[SS:HydratePosFromBal] Skipping non-tradable symbol {sym} for asset {a}")
                 continue
             prev = self.positions.get(sym, {})
             if float(prev.get("quantity", 0.0)) != free_qty or not prev.get("_mirrored"):
@@ -4649,29 +4852,49 @@ class SharedState:
                 significant_floor = float(await self.get_significant_position_floor(sym) or 0.0)
                 is_significant = bool(position_value >= significant_floor and position_value > 0.0)
                 
-                # ===== BEST PRACTICE: ENTRY PRICE IMMUTABILITY =====
+                # ===== BEST PRACTICE: ENTRY PRICE IMMUTABILITY + ZERO NORMALIZATION =====
                 # Entry price is the original trade price and MUST NEVER CHANGE.
                 # Only avg_price can change during scaling.
                 # Strategy: Use existing entry_price if available, fallback to avg_price ONLY if missing.
                 reconstructed_entry_price = pos.get("entry_price")
-                
+
                 if reconstructed_entry_price is None:
                     reconstructed_entry_price = pos.get("avg_price")
-                
+
                 # LAST RESORT ONLY: Use current price if no historical data
                 if reconstructed_entry_price is None:
                     reconstructed_entry_price = price
-                
+
                 reconstructed_entry_price = float(reconstructed_entry_price or 0.0)
-                
+
+                # PROFESSIONAL STANDARD: If entry_price is still 0 after all fallbacks,
+                # normalize to current mark price. A zero entry_price causes division-by-zero
+                # in PnL/TP-SL calculations. Treating the position as "just acquired at market"
+                # is the correct approach used by quant desks and prop firms.
+                if reconstructed_entry_price <= 0:
+                    if price > 0:
+                        reconstructed_entry_price = price
+                        self.logger.warning(
+                            "[SS:HydratePosFromBal] %s: entry_price is zero, normalizing to mark_price=%.6f",
+                            sym, price,
+                        )
+                    else:
+                        # Cannot set entry_price if price is also unavailable
+                        # Mark as wallet inventory (no entry_price) to suppress PositionInvariant warning
+                        reconstructed_entry_price = 0.0
+
                 # ===== avg_price: Can change during scaling =====
                 # Prefer existing avg_price, fallback to reconstructed_entry_price
                 avg_price = pos.get("avg_price")
-                
+
                 if avg_price is None:
                     avg_price = reconstructed_entry_price
-                
+
                 avg_price = float(avg_price or 0.0)
+
+                # Normalize avg_price to mark_price if also zero
+                if avg_price <= 0 and price > 0:
+                    avg_price = price
                 
                 pos.update({
                     "quantity": free_qty,
@@ -4830,34 +5053,79 @@ class SharedState:
             logging.getLogger("SharedState").warning(f"Failed to reconcile open_trades: {e}")
         
         # 3. REFRESH positions by querying Binance (authoritative)
+        # 🔴 FIX: Don't CLEAR all positions (destructive) - instead RECONCILE with balances
+        # This preserves trade positions and only marks balance-backed positions as mirrored
         try:
-            # Clear positions and rebuild from actual Binance balances
-            self.positions = {}
+            positions_to_add: Dict[str, Dict] = {}
+            
             for asset, bal in self.balances.items():
                 if asset.upper() == self.quote_asset.upper():
                     continue  # Skip USDT, add it later
                 qty = float(bal.get("free", 0.0)) + float(bal.get("locked", 0.0))
                 if qty > 0:
                     sym = f"{asset}USDT"
+                    
                     # Get live price for this symbol
+                    price = 0.0
                     try:
-                        if hasattr(self._exchange_client, "get_current_price"):
+                        if self._exchange_client and hasattr(self._exchange_client, "get_current_price"):
                             price = await self._exchange_client.get_current_price(sym)
                         else:
                             price = self.latest_prices.get(sym, 0.0)
-                        if price:
-                            self.positions[sym] = {
-                                "symbol": sym,
-                                "quantity": qty,
-                                "current_price": float(price),
-                                "mark_price": float(price),
-                                "entry_price": float(price),
-                                "avg_price": float(price),  # Use current price (safer)
-                            }
                     except Exception:
-                        pass
+                        # Fallback to cached price on error
+                        price = self.latest_prices.get(sym, 0.0)
+                    
+                    if price > 0:  # Only create position if we have a price
+                        # Check if position already exists (from trade)
+                        existing_pos = self.positions.get(sym, {})
+                        
+                        # Use existing entry_price/avg_price if available (preserve trade history)
+                        # Otherwise use current price
+                        entry_price = float(existing_pos.get("entry_price") or price)
+                        avg_price = float(existing_pos.get("avg_price") or entry_price)
+                        
+                        # Only mark as mirrored if it's a balance-only position
+                        # (doesn't have trade metadata like status=ACTIVE, OPEN, FILLED)
+                        is_mirrored = not bool(existing_pos.get("status") in ("ACTIVE", "OPEN", "FILLED"))
+                        
+                        positions_to_add[sym] = {
+                            "symbol": sym,
+                            "quantity": qty,
+                            "current_price": float(price),
+                            "mark_price": float(price),
+                            "entry_price": entry_price,
+                            "avg_price": avg_price,
+                            "_mirrored": is_mirrored,
+                            # Preserve other metadata if position exists
+                            **(dict(existing_pos) if existing_pos else {})
+                        }
+            
+            # Now merge positions_to_add with existing positions
+            # (this preserves non-balance-backed positions)
+            for sym, pos_data in positions_to_add.items():
+                self.positions[sym] = pos_data
+            
+            # Optionally: Remove balance-backed positions that no longer have balance
+            # (This is what the old code tried to do by clearing everything)
+            assets_in_balance = {a.upper() for a in self.balances.keys()}
+            quote_upper = self.quote_asset.upper()
+            
+            for sym in list(self.positions.keys()):
+                if sym.endswith("USDT"):  # Assume USDT quote for now
+                    base_asset = sym.replace("USDT", "").upper()
+                    if base_asset not in assets_in_balance and base_asset != quote_upper:
+                        # This position has no matching balance - remove it
+                        # (unless it's a trade position, which would have status=ACTIVE, etc.)
+                        pos = self.positions[sym]
+                        if pos.get("_mirrored", False):
+                            # Safe to remove - it was only mirrored from balance
+                            self.positions.pop(sym, None)
+                            logging.getLogger("SharedState").debug(f"Removed balance-less mirrored position: {sym}")
+                        # else: keep it, it's a trade position even though no current balance
+                            
         except Exception as e:
-            logging.getLogger("SharedState").warning(f"Failed to rebuild positions: {e}")
+            logging.getLogger("SharedState").warning(f"Failed to reconcile positions: {e}")
         
         # 4. GET LIVE PRICES (fresh from exchange_client if possible)
         prices = await self.get_all_prices()
@@ -4884,6 +5152,16 @@ class SharedState:
         
         # Add crypto positions at LIVE prices
         for sym, pos in self.positions.items():
+            # 🔴 FIX: DOUBLE-COUNT PREVENTION
+            # Skip mirrored positions (created from wallet balances by hydrate_positions_from_balances)
+            # These are already counted via self.balances, so adding them again would double-count
+            if pos.get("_mirrored", False):
+                self.logger.debug(
+                    f"[NAV:DoubleCountFix] Skipping mirrored position {sym} "
+                    f"(qty={pos.get('quantity', 0.0):.8f}) - already counted in balance"
+                )
+                continue
+            
             qty = float(pos.get("quantity", 0.0))
             if qty <= 0: continue
             
@@ -4938,6 +5216,16 @@ class SharedState:
         
         # Add virtual crypto positions at LIVE prices
         for sym, pos in self.virtual_positions.items():
+            # 🔴 FIX: DOUBLE-COUNT PREVENTION (SHADOW MODE)
+            # Skip mirrored positions (created from virtual_balances by hydration)
+            # These are already counted via self.virtual_balances
+            if pos.get("_mirrored", False):
+                self.logger.debug(
+                    f"[NAV:ShadowDoubleCountFix] Skipping mirrored virtual position {sym} "
+                    f"(qty={pos.get('quantity', 0.0):.8f}) - already counted in virtual_balance"
+                )
+                continue
+            
             qty = float(pos.get("quantity", 0.0))
             if qty <= 0:
                 continue
@@ -5346,34 +5634,33 @@ class SharedState:
                     position_data["state"] = PositionState.DUST_LOCKED.value
             
             # ===== POSITION INVARIANT ENFORCEMENT =====
-            # CRITICAL ARCHITECTURE: Enforce the global invariant:
-            # quantity > 0 → entry_price > 0
+            # CRITICAL ARCHITECTURE: Handle two distinct cases:
+            # 1. qty > 0 AND entry_price > 0 → Trading position (created/updated normally)
+            # 2. qty > 0 AND entry_price <= 0 → Wallet inventory (allow without error)
             # This protects ALL downstream modules (ExecutionManager, RiskManager, RotationExitAuthority,
-            # ProfitGate, ScalingEngine, etc.) from deadlock due to missing entry_price.
+            # ProfitGate, ScalingEngine, etc.) from deadlock by properly classifying wallet assets.
             qty = float(position_data.get("quantity", 0.0) or 0.0)
             if qty > 0:
                 entry = position_data.get("entry_price")
                 avg = position_data.get("avg_price")
                 mark = position_data.get("mark_price")
                 
-                if not entry or entry <= 0:
-                    # Reconstruct entry_price from available sources
-                    position_data["entry_price"] = float(avg or mark or 0.0)
+                # Only attempt reconstruction if we have alternate pricing data
+                if (not entry or entry <= 0) and (avg or mark):
+                    # Check if entry_price was previously missing too (avoid log flood during repeated hydrations)
+                    prev_entry = self.positions.get(sym, {}).get("entry_price")
+                    already_reconstructed = bool(prev_entry and prev_entry > 0)
                     
-                    # Diagnostic warning so bugs never hide silently
-                    self.logger.warning(
-                        "[PositionInvariant] entry_price missing for %s — reconstructed from avg_price/mark_price",
-                        sym
-                    )
-                
-                # ===== ULTIMATE GUARD: Fail loudly if entry_price is still invalid =====
-                # This is the strongest possible check - prevents corrupt state from propagating.
-                final_entry = position_data.get("entry_price")
-                if not final_entry or final_entry <= 0:
-                    raise ValueError(
-                        f"[CRITICAL INVARIANT] Cannot create/update position {sym} with qty={qty} "
-                        f"but entry_price={final_entry}. Entry price MUST be > 0 for open positions."
-                    )
+                    # Reconstruct entry_price from available sources
+                    reconstructed = float(avg or mark or 0.0)
+                    position_data["entry_price"] = reconstructed
+                    
+                    # Diagnostic warning only on FIRST reconstruction (avoid log flood)
+                    if reconstructed > 0 and not already_reconstructed:
+                        self.logger.warning(
+                            "[PositionInvariant] entry_price missing for %s — reconstructed from avg_price/mark_price",
+                            sym
+                        )
             
             # ARCHITECTURE FIX: In shadow mode, update virtual_positions instead of positions
             if self.trading_mode == "shadow":
@@ -5506,6 +5793,152 @@ class SharedState:
         qty = float(p.get("quantity", 0.0))
         fee_base = float(p.get("buy_fee_base", 0.0) or 0.0)
         return max(0.0, qty - fee_base)
+
+    # -------- PROFESSIONAL ASSET CLASSIFICATION --------
+    # Three-layer capital accounting: position classification and origin tracking
+    
+    async def register_position_classified(self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        classification: AssetClassification,
+        origin: str,
+        created_by_agent: Optional[str] = None,
+        management_strategy: str = "HOLD",
+        dust_reason: Optional[str] = None
+    ) -> bool:
+        """
+        Register a position with full professional classification.
+        
+        Args:
+            symbol: e.g., "BTCUSDT"
+            quantity: Amount held
+            price: Current price
+            classification: AssetClassification enum value (or string for backward compatibility)
+            origin: Where it came from (wallet_bootstrap, trade_execution, etc.)
+            created_by_agent: Which agent created it (optional)
+            management_strategy: HOLD, TRADE, LIQUIDATE
+            dust_reason: Why it's dust (if classified as DUST)
+        
+        Returns:
+            True if registered successfully
+        """
+        try:
+            # Handle backward compatibility: convert string to enum if needed
+            if isinstance(classification, str):
+                try:
+                    classification = AssetClassification(classification)
+                except (ValueError, KeyError):
+                    self.logger.error(f"Invalid classification string: {classification}, defaulting to BOT_POSITION")
+                    classification = AssetClassification.BOT_POSITION
+            
+            pos = ClassifiedPosition(
+                symbol=symbol,
+                quantity=float(quantity),
+                price=float(price),
+                classification=classification,
+                origin=origin,
+                created_by_agent=created_by_agent,
+                management_strategy=management_strategy,
+                dust_reason=dust_reason
+            )
+            
+            # Store in positions dict
+            if not hasattr(self, '_positions_classified'):
+                self._positions_classified = {}
+            
+            self._positions_classified[symbol] = pos
+            
+            # Emit event for observability
+            await self.emit_event("PositionClassified", {
+                "symbol": symbol,
+                "classification": classification.value,
+                "origin": origin,
+                "qty": quantity,
+                "timestamp": time.time()
+            })
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to register classified position {symbol}: {e}")
+            return False
+
+    async def get_position_classification(self, symbol: str) -> Optional[str]:
+        """Get classification of a position"""
+        if not hasattr(self, '_positions_classified'):
+            return None
+        pos = self._positions_classified.get(symbol)
+        return pos.classification.value if pos else None
+
+    async def get_positions_by_classification(self, classification: str) -> Dict[str, Any]:
+        """Get all positions matching a classification"""
+        if not hasattr(self, '_positions_classified'):
+            return {}
+        
+        result = {}
+        for symbol, pos in self._positions_classified.items():
+            if pos.classification.value == classification:
+                result[symbol] = pos.to_dict()
+        
+        return result
+
+    async def classify_positions_on_restart(self, exchange_client: Optional[Any] = None) -> Dict[str, Any]:
+        """
+        PHASE 5: Intelligently classify positions on system restart.
+        
+        Uses RestartPositionClassifier to:
+        - Distinguish BOT_POSITION from EXTERNAL_POSITION based on trade history
+        - Mark uncertain positions for human review
+        - Enable graceful recovery from unexpected shutdowns
+        
+        Args:
+            exchange_client: Optional exchange client for additional validation
+        
+        Returns:
+            Classification results dictionary
+        """
+        try:
+            from core.restart_position_classifier import RestartPositionClassifier
+            
+            self.logger.info("🔄 [PHASE 5] Starting restart position classifier")
+            
+            classifier = RestartPositionClassifier(
+                shared_state=self,
+                config=self.config,
+                exchange_client=exchange_client
+            )
+            
+            # Run classification
+            classifications = await classifier.classify_all_positions()
+            
+            # Log uncertain positions for review
+            uncertain = classifier.get_uncertain_symbols()
+            if uncertain:
+                self.logger.warning(
+                    f"⚠️  {len(uncertain)} position(s) require manual review:"
+                )
+                for symbol, confidence, reason in uncertain:
+                    self.logger.warning(
+                        f"    {symbol}: {reason} (confidence: {confidence:.2%})"
+                    )
+            
+            # Store summary in metrics
+            summary = classifier.get_classification_summary()
+            self.metrics["restart_classification_summary"] = summary
+            self.logger.info(
+                f"✅ Position classification complete: "
+                f"{summary['total_symbols']} symbols, "
+                f"{summary['uncertain_symbols']} uncertain"
+            )
+            
+            return classifications
+        
+        except Exception as e:
+            self.logger.error(
+                f"Error in restart position classifier: {e}",
+                exc_info=True
+            )
+            return {}
 
     # -------- Sentiment/Signals/Regimes --------
     async def set_volatility_regime(self, symbol: str, timeframe: str, regime: str, atrp: Optional[float] = None) -> None:
@@ -6271,6 +6704,32 @@ class SharedState:
                 break
             except Exception as e:
                 self.logger.error(f"Memory optimization failed: {e}")
+    async def _auto_queue_dust_liquidations(self) -> None:
+        """Periodically queue stale dust positions for liquidation.
+
+        Runs inside _optimize_memory so it fires every memory_optimization_interval seconds
+        (default 300s). Only queues candidates that are old enough and haven't exceeded
+        the max attempt count, preventing hot-loop re-queuing.
+        """
+        if not getattr(self.config, "dust_liquidation_enabled", True):
+            return
+        try:
+            candidates = await self.get_dust_cleanup_candidates(
+                min_age_sec=300,
+                max_attempts=self.dust_cleanup_max_attempts,
+                attempt_cooldown_sec=self.dust_cleanup_retry_cooldown_sec,
+            )
+            for c in candidates:
+                sym = c["symbol"]
+                if sym not in self.active_liquidations:
+                    await self.request_liquidation(sym, reason="auto_dust_cleanup")
+                    self.logger.info(
+                        "[SS:DustAuto] Queued %s for cleanup (value=%.2f, age=%.0fs, attempts=%d)",
+                        sym, c["est_quote_value"], c["age_sec"], c["attempt_count"],
+                    )
+        except Exception as e:
+            self.logger.warning(f"[SS:DustAuto] Error in auto dust queue: {e}")
+
     async def _optimize_memory(self) -> None:
         now = time.time()
         # P9 Phase 4: Intent-level accumulation cleanup
@@ -6283,6 +6742,8 @@ class SharedState:
             valid = [r for r in arr if r.get("expires_at", 0) > now]
             if valid: self._quote_reservations[asset] = valid
             else: self._quote_reservations.pop(asset, None)
+        # Auto-queue stale wallet dust for liquidation
+        await self._auto_queue_dust_liquidations()
 
     # -------- Shutdown --------
     async def shutdown(self) -> None:
@@ -6314,11 +6775,44 @@ class SharedState:
         """Return a shallow copy of symbol filters for symbol (if any)."""
         return dict(self.symbol_filters.get(self._norm_sym(symbol), {}))
 
-    def get_positions_snapshot(self) -> Dict[str, Dict[str, Any]]:
-        """Return a shallow copy of all positions, branching by trading mode."""
+    def get_positions_snapshot(self, *, include_wallet_inventory: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Return a shallow copy of positions, branching by trading mode.
+
+        Args:
+            include_wallet_inventory: If True, include wallet-mirrored positions
+                (_mirrored=True). Default False — strategies, UURE, and routing
+                should never see wallet inventory mixed with bot-managed positions.
+                Pass True only for inventory/liquidation callers that explicitly
+                need to act on all held assets.
+        """
         if self.trading_mode == "shadow":
             return dict(self.virtual_positions)
-        return dict(self.positions)
+        if include_wallet_inventory:
+            return dict(self.positions)
+        return {k: dict(v) for k, v in self.positions.items() if not v.get("_mirrored", False)}
+
+    @property
+    def wallet_inventory(self) -> Dict[str, Dict[str, Any]]:
+        """Read-only view of wallet-reconciled positions (_mirrored=True).
+
+        These are exchange balances mirrored by hydrate_positions_from_balances().
+        They represent what is held in the wallet but were NOT opened by bot logic.
+
+        Rules:
+        - NEVER feed into strategy loops or UURE candidate collection.
+        - USE for liquidation, sell-inventory, and dust-cleanup workflows.
+        - READ-ONLY: mutate via update_position() / record_fill(), not directly.
+        """
+        return {k: v for k, v in self.positions.items() if v.get("_mirrored", False)}
+
+    @property
+    def trading_positions(self) -> Dict[str, Dict[str, Any]]:
+        """Read-only view of bot-managed positions only (excludes wallet inventory).
+
+        Only positions opened by the bot's own execution logic are included here.
+        Safe to iterate in strategy loops, UURE, capital accounting, and routing.
+        """
+        return {k: v for k, v in self.positions.items() if not v.get("_mirrored", False)}
 
     def is_ops_plane_ready(self) -> bool:
         """
@@ -6395,6 +6889,8 @@ class SharedState:
         Side effect: heals stale position states (dust mis-classified as significant).
         
         ARCHITECTURE FIX: Branches by trading_mode to return correct positions source.
+        CRITICAL FIX: Use position quantity as source of truth instead of unreliable open_position flag
+        which depends on price data that may not be available synchronously.
         """
         self._sync_heal_position_states()
         result = {}
@@ -6405,11 +6901,21 @@ class SharedState:
         for sym, pos_data in list(positions_source.items()):
             if not isinstance(pos_data, dict):
                 continue
+            # Exclude wallet-mirrored inventory — those are reconciliation state,
+            # not bot-opened positions and must not inflate open-position counts.
+            if pos_data.get("_mirrored", False):
+                continue
             qty = float(pos_data.get("quantity", 0.0) or pos_data.get("qty", 0.0) or 0.0)
             if qty <= 0:
                 continue
-            if pos_data.get("is_significant", False) and pos_data.get("open_position", False):
+            
+            # 🔴 CRITICAL FIX: Use quantity as source of truth, not open_position flag
+            # The flag may not be set if price data isn't available for value estimation
+            # But if qty > 0 and not mirrored, it's definitely an open position
+            is_sig = pos_data.get("is_significant", False)
+            if is_sig:
                 result[sym] = pos_data
+        
         return result
 
     def get_position_qty(self, symbol: str) -> float:
@@ -6471,11 +6977,15 @@ class SharedState:
     def get_active_symbols(self, *, limit: Optional[int] = None) -> List[str]:
         """
         Return a prioritized list of symbols for agents:
-        1) accepted_symbols (wallet-forced + normal)
-        2) positions we currently hold (so liquidation/management never misses them)
-        3) any other known symbols cached in self.symbols
+        1) accepted_symbols (the canonical trading universe)
+        2) bot-managed positions (NOT wallet-mirrored inventory)
         The list is de-duplicated while preserving the above priority order.
         If `limit` is provided or `config.active_symbols_default_limit > 0`, the result is truncated.
+
+        Wallet inventory (_mirrored=True) is intentionally excluded. Those positions
+        are reconciliation state only — exposing them to strategies causes noisy signals,
+        wasted compute, and accidental trade proposals on non-universe assets.
+        Use get_dust_registry_snapshot() or get_sellable_inventory() for wallet inventory.
         """
         # Keep internal caches consistent so agents always see the full list
         try:
@@ -6485,40 +6995,25 @@ class SharedState:
         seen: Set[str] = set()
         out: List[str] = []
 
-        # 1) Accepted symbols first
+        # 1) Accepted symbols first (canonical trading universe)
         for s in self.accepted_symbols.keys():
             ss = self._norm_sym(s)
             if ss not in seen:
                 out.append(ss)
                 seen.add(ss)
 
-        # 2) Fallback to open positions (ensures agents see all held inventory)
+        # 2) Bot-managed positions only — exclude wallet-mirrored inventory.
+        # hydrate_positions_from_balances() tags wallet-reconstructed positions with
+        # _mirrored=True. Those must not appear here: wallet is reconciliation state,
+        # not a source of trading decisions.
         if getattr(self.config, "active_symbols_fallback_from_positions", True):
-            for s in self.positions.keys():
+            for s, pos in self.positions.items():
+                if pos.get("_mirrored", False):
+                    continue
                 ss = self._norm_sym(s)
                 if ss not in seen:
                     out.append(ss)
                     seen.add(ss)
-
-        # 3) Wallet assets direct (Ensures symbols we hold are always visible even if not in accepted/symbol sets)
-        try:
-            quote_asset = getattr(self.config, "quote_asset", "USDT")
-            for asset in self.balances.keys():
-                if asset.upper() == quote_asset.upper(): continue
-                sym = f"{asset.upper()}{quote_asset.upper()}"
-                ss = self._norm_sym(sym)
-                if ss not in seen:
-                    out.append(ss)
-                    seen.add(ss)
-        except Exception:
-            pass
-
-        # 4) Finally any other known symbols (cache)
-        for s in self.symbols.keys():
-            ss = self._norm_sym(s)
-            if ss not in seen:
-                out.append(ss)
-                seen.add(ss)
 
         # Optional truncation
         if limit is None:
@@ -6771,4 +7266,3 @@ class SharedState:
             },
             "timestamp": time.time(),
         }
-

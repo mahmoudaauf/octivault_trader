@@ -31,10 +31,20 @@ class ThreadSafeIntentSink:
     def extend(self, intents: List["TradeIntent"]) -> None:
         self._intents.extend(intents)
     
-    def drain(self) -> List["TradeIntent"]:
-        intents = list(self._intents)
-        self._intents.clear()
-        return intents
+    def drain(self, max_items: Optional[int] = None) -> List["TradeIntent"]:
+        if max_items is None or int(max_items) <= 0:
+            intents = list(self._intents)
+            self._intents.clear()
+            return intents
+
+        drained: List["TradeIntent"] = []
+        limit = max(0, int(max_items))
+        for _ in range(limit):
+            try:
+                drained.append(self._intents.popleft())
+            except IndexError:
+                break
+        return drained
 
 class IntentManager:
     def __init__(self, config, logger, event_store: Optional[Any] = None):
@@ -75,8 +85,8 @@ class IntentManager:
         if len(intents) > 0:
             self.logger.debug("[IntentManager] Received %d intents", len(intents))
     
-    def drain_intents(self):
-        drained = self.intent_sink.drain()
+    def drain_intents(self, max_items: Optional[int] = None):
+        drained = self.intent_sink.drain(max_items=max_items)
         for intent in drained:
             symbol = getattr(intent, 'symbol', None) or intent.get('symbol')
             if symbol and symbol in self.signal_cache:

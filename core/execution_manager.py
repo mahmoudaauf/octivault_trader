@@ -2073,6 +2073,121 @@ class ExecutionManager:
             default = cur if cur is not None else default
         return cur if cur is not None else default
 
+    # ============================================================================
+    # PHASE 1: EV ALIGNMENT PUBLIC API
+    # ============================================================================
+    # Expose EV calculation methods for validation and alignment with UURE
+    
+    def get_round_trip_cost_pct(self) -> float:
+        """
+        PHASE 1: PUBLIC API for round-trip cost calculation.
+        
+        This method returns the total cost (fees + slippage + buffer) as a ratio.
+        Must return EXACTLY the same value as UURE's get_round_trip_cost_pct().
+        
+        Used for EV alignment validation.
+        
+        Returns:
+            Round-trip cost as decimal (e.g., 0.0035 = 0.35%)
+        """
+        slippage_bps = float(
+            self._cfg("EXIT_SLIPPAGE_BPS", self._cfg("CR_PRICE_SLIPPAGE_BPS", 15.0)) or 0.0
+        )
+        buffer_bps = float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0)
+        round_trip_cost_pct = (float(self.trade_fee_pct or 0.0) * 2.0) + (
+            (slippage_bps + buffer_bps) / 10000.0
+        )
+        return round_trip_cost_pct
+    
+    def get_ev_multiplier_for_regime(self, regime: str) -> float:
+        """
+        PHASE 1: PUBLIC API for EV multiplier by regime.
+        
+        This method returns the multiplier used to calculate required edge.
+        Must return EXACTLY the same multiplier as UURE would use for this regime.
+        
+        Args:
+            regime: Market volatility regime ('normal', 'bull', 'other', 'low', 'high', 'extreme')
+        
+        Returns:
+            EV multiplier (e.g., 1.3 means required_edge = round_trip × 1.3)
+        """
+        rg = str(regime or "").strip().lower()
+        
+        # Check for global override
+        override = self._cfg("UURE_SOFT_EV_MULTIPLIER", None)
+        if override is not None:
+            try:
+                return max(0.5, float(override))
+            except Exception:
+                pass
+        
+        # Check for spot mode (lower thresholds)
+        spot_mode = bool(self._cfg("UURE_SPOT_MODE", False))
+        if spot_mode:
+            if rg == "normal":
+                return max(0.5, float(self._cfg("UURE_EV_MULT_SPOT_NORMAL", 0.7)))
+            elif rg == "bull":
+                return max(0.5, float(self._cfg("UURE_EV_MULT_SPOT_BULL", 1.0)))
+            else:
+                return max(0.5, float(self._cfg("UURE_EV_MULT_SPOT_OTHER", 1.4)))
+        
+        # Standard regime multipliers
+        if rg == "normal":
+            default = 1.3
+            key = "UURE_EV_MULT_NORMAL"
+        elif rg == "bull":
+            default = 1.8
+            key = "UURE_EV_MULT_BULL"
+        else:
+            default = 2.0
+            key = "UURE_EV_MULT_OTHER"
+        
+        try:
+            return max(0.5, float(self._cfg(key, default) or default))
+        except Exception:
+            return default
+    
+    def get_required_edge_for_regime(self, regime: str) -> float:
+        """
+        PHASE 1: PUBLIC API for required minimum edge by regime.
+        
+        This is the minimum edge (as decimal) that must be present for entry.
+        Same formula as UURE uses: required_edge = round_trip × multiplier.
+        
+        Args:
+            regime: Market regime
+        
+        Returns:
+            Required edge as decimal (e.g., 0.00455 = 0.455%)
+        """
+        round_trip = self.get_round_trip_cost_pct()
+        multiplier = self.get_ev_multiplier_for_regime(regime)
+        return round_trip * multiplier
+    
+    def get_ev_config_summary(self) -> Dict[str, Any]:
+        """
+        PHASE 1: Export EV configuration for alignment audit.
+        
+        Returns a dict summarizing current EV settings used by ExecutionManager.
+        Compare this with UURE's settings to verify alignment.
+        
+        Returns:
+            Dictionary with EV configuration details
+        """
+        spot_mode = bool(self._cfg("UURE_SPOT_MODE", False))
+        return {
+            "round_trip_cost_pct": self.get_round_trip_cost_pct(),
+            "ev_mult_normal": self.get_ev_multiplier_for_regime("normal"),
+            "ev_mult_bull": self.get_ev_multiplier_for_regime("bull"),
+            "ev_mult_other": self.get_ev_multiplier_for_regime("other"),
+            "spot_mode_enabled": spot_mode,
+            "required_edge_normal": self.get_required_edge_for_regime("normal"),
+            "required_edge_bull": self.get_required_edge_for_regime("bull"),
+            "required_edge_other": self.get_required_edge_for_regime("other"),
+            "source": "ExecutionManager (PHASE 1 EV ALIGNMENT)",
+        }
+
     # ========== BOOTSTRAP PHASE MANAGEMENT ==========
     def _get_current_nav(self) -> float:
         """Get current portfolio NAV in USDT."""
@@ -2184,45 +2299,133 @@ class ExecutionManager:
         return {"min_exit_quote": 0.0, "min_notional": 0.0}
 
     async def _get_total_equity(self) -> float:
-        """Best-effort total equity (USDT) from SharedState across sync/async variants."""
+        """Best-effort total equity (USDT) from SharedState across sync/async variants.
+        
+        Tries multiple sources in priority order:
+        1. Synchronous get_nav_quote() - PRIMARY (fast, reliable)
+        2. Async get_total_equity() method
+        3. Async get_nav() method
+        4. Direct .total_equity attribute
+        5. Bootstrap: free balance in quote asset
+        6. Metrics dict cache
+        
+        Returns 0.0 only if ALL sources exhausted.
+        """
+        # ✅ PRIMARY: get_nav_quote() is SYNCHRONOUS, do NOT await
+        # This is the most reliable source during bootstrap and normal operation
+        try:
+            if hasattr(self.shared_state, "get_nav_quote") and callable(getattr(self.shared_state, "get_nav_quote")):
+                val = self.shared_state.get_nav_quote()
+                if val is not None:
+                    num = float(val)
+                    if num > 0:
+                        self.logger.debug(f"[NAV] get_nav_quote() returned {num:.2f} USDT")
+                        return num
+        except Exception as e:
+            self.logger.debug(f"[NAV] get_nav_quote() failed: {e}")
+        
+        # Try async methods next
         try:
             val = await maybe_call(self.shared_state, "get_total_equity")
             if val is not None:
                 num = float(val)
                 if num > 0:
+                    self.logger.debug(f"[NAV] get_total_equity() returned {num:.2f} USDT")
                     return num
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"[NAV] get_total_equity() failed: {e}")
+        
         try:
             val = await maybe_call(self.shared_state, "get_nav")
             if val is not None:
                 num = float(val)
                 if num > 0:
+                    self.logger.debug(f"[NAV] get_nav() returned {num:.2f} USDT")
                     return num
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"[NAV] get_nav() failed: {e}")
+        
+        # ✅ BOOTSTRAP: Check free balance as fallback
         try:
-            val = await maybe_call(self.shared_state, "get_nav_quote")
-            if val is not None:
-                num = float(val)
+            free = await maybe_call(self.shared_state, "get_free_balance", self.base_ccy)
+            if free is not None:
+                num = float(free)
                 if num > 0:
+                    self.logger.info(f"[NAV BOOTSTRAP] Using free {self.base_ccy} balance: {num:.2f} USDT")
                     return num
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"[NAV] get_free_balance({self.base_ccy}) failed: {e}")
+        
+        # Check attribute
         try:
             num = float(getattr(self.shared_state, "total_equity", 0.0) or 0.0)
             if num > 0:
+                self.logger.debug(f"[NAV] .total_equity attribute: {num:.2f} USDT")
                 return num
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"[NAV] .total_equity attribute failed: {e}")
+        
+        # Last resort: metrics cache
         try:
             metrics = getattr(self.shared_state, "metrics", {}) or {}
             num = float(metrics.get("nav", 0.0) or metrics.get("total_equity", 0.0) or 0.0)
             if num > 0:
+                self.logger.debug(f"[NAV] metrics cache: {num:.2f} USDT")
                 return num
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"[NAV] metrics cache failed: {e}")
+        
+        # All sources exhausted
+        self.logger.warning("[NAV] All equity sources returned 0 or None. Account may be in cold-start state.")
         return 0.0
+
+    async def get_tradable_nav(self) -> float:
+        """Get NAV capped at BASE_CAPITAL (max tradable amount).
+        
+        Returns the minimum of:
+        - Actual total equity (from _get_total_equity)
+        - BASE_CAPITAL config setting
+        
+        This prevents over-leverage when wallet grows beyond initial capital.
+        If BASE_CAPITAL is not configured or <= 0, returns actual equity.
+        
+        DEBUG: Logs when NAV calculation changes or caps are applied.
+        """
+        try:
+            total_equity = await self._get_total_equity()
+            base_capital = self._cfg("BASE_CAPITAL", None)
+            
+            if base_capital is None or base_capital <= 0:
+                # No cap configured, return actual equity
+                nav = float(total_equity or 0.0)
+                if nav == 0.0:
+                    self.logger.warning("[NAV] get_tradable_nav() returning 0.0 - account may need bootstrap liquidity")
+                return nav
+            
+            base_capital = float(base_capital)
+            total_equity = float(total_equity or 0.0)
+            capped_nav = min(total_equity, base_capital)
+            
+            # Log when NAV is capped
+            if capped_nav < total_equity:
+                self.logger.info(
+                    f"[NAV] Capped at BASE_CAPITAL: actual={total_equity:.2f} USDT, "
+                    f"base_capital={base_capital:.2f} USDT, tradable_nav={capped_nav:.2f} USDT"
+                )
+            elif capped_nav == 0.0:
+                self.logger.warning("[NAV] get_tradable_nav() = 0.0 - check equity sources")
+            else:
+                self.logger.debug(
+                    f"[NAV] tradable_nav={capped_nav:.2f} USDT (within BASE_CAPITAL={base_capital:.2f})"
+                )
+            
+            return capped_nav
+        except Exception as e:
+            self.logger.error(f"[NAV] Error in get_tradable_nav(): {e}", exc_info=True)
+            # Fallback to uncapped equity on error
+            fallback = await self._get_total_equity()
+            self.logger.warning(f"[NAV] Using fallback equity: {fallback:.2f} USDT")
+            return fallback
 
     async def _resolve_nav_tier_economic_floor(
         self,
@@ -2230,10 +2433,18 @@ class ExecutionManager:
         min_notional: Optional[float] = None,
     ) -> float:
         """
-        NAV-tiered economic floor:
-        - nav < 500: max(min_notional, 10)
-        - 500 <= nav < 2000: nav * 0.08
-        - nav >= 2000: nav * 0.05
+        Resolve a sane minimum economic trade floor.
+
+        This is an execution FLOOR, not a position-sizing target. It must stay in the
+        same order of magnitude as configured trade sizes, otherwise affordability
+        checks become unusable. Legacy NAV-percentage logic here incorrectly turned
+        large account NAV into absurd per-trade minimums (for example ~5% of NAV).
+
+        Resolution:
+        - Always respect exchange min_notional.
+        - Use MIN_ECONOMIC_TRADE_USDT / MIN_ECONOMIC_TRADE_USD as the base floor.
+        - Allow an optional NAV-based add-on only when explicitly configured.
+        - Never exceed MAX_SPEND_PER_TRADE_USDT when that cap is configured.
         """
         sym = self._norm_symbol(symbol or "")
         min_notional_val = float(min_notional or 0.0)
@@ -2244,24 +2455,30 @@ class ExecutionManager:
             except Exception:
                 min_notional_val = 0.0
 
-        nav = float(await self._get_total_equity() or 0.0)
-        if nav <= 0:
-            # Safety fallback if NAV is temporarily unavailable.
-            legacy_floor = float(
-                self._cfg(
-                    "MIN_ECONOMIC_TRADE_USDT",
-                    self._cfg("MIN_ECONOMIC_TRADE_USD", 10.0),
-                )
-                or 10.0
+        nav = float(await self.get_tradable_nav() or 0.0)
+        base_floor = float(
+            self._cfg(
+                "MIN_ECONOMIC_TRADE_USDT",
+                self._cfg("MIN_ECONOMIC_TRADE_USD", 10.0),
             )
-            return max(min_notional_val, legacy_floor, 10.0)
+            or 10.0
+        )
+        base_floor = max(base_floor, 10.0, min_notional_val)
 
-        if nav < 500.0:
-            floor = max(min_notional_val, 10.0)
-        elif nav < 2000.0:
-            floor = nav * 0.08
-        else:
-            floor = nav * 0.05
+        nav_floor_pct = float(self._cfg("NAV_TIER_MIN_ECON_FLOOR_PCT", 0.0) or 0.0)
+        nav_floor_cap = float(self._cfg("NAV_TIER_MIN_ECON_FLOOR_CAP_USDT", 0.0) or 0.0)
+        max_spend_cap = float(self._cfg("MAX_SPEND_PER_TRADE_USDT", 0.0) or 0.0)
+
+        nav_floor = 0.0
+        if nav > 0.0 and nav_floor_pct > 0.0:
+            nav_floor = nav * nav_floor_pct
+            if nav_floor_cap > 0.0:
+                nav_floor = min(nav_floor, nav_floor_cap)
+
+        floor = max(base_floor, nav_floor)
+        if max_spend_cap > 0.0:
+            floor = min(floor, max_spend_cap)
+
         return max(float(floor), min_notional_val)
 
     async def _resolve_nav_tier_profit_target(self) -> float:
@@ -2270,7 +2487,7 @@ class ExecutionManager:
         Replaces static PROFIT_TARGET_BASE_USD_PER_HOUR.
         """
         try:
-            nav = float(await self._get_total_equity() or 0.0)
+            nav = float(await self.get_tradable_nav() or 0.0)
         except Exception:
             nav = 0.0
 
@@ -2357,7 +2574,7 @@ class ExecutionManager:
             confidence_adjustment = 1.3  # 30% premium for low confidence
 
         # 4. NAV Risk Profile
-        nav = float(await self._get_total_equity() or 0.0)
+        nav = float(await self.get_tradable_nav() or 0.0)
         if nav <= 0:
             nav_risk_profile = 1.5  # Conservative when NAV unknown
         elif nav < 100:
@@ -2397,8 +2614,9 @@ class ExecutionManager:
         current_market_edge = atr_pct
 
         # Decision Logic
-        can_execute = current_market_edge >= final_required_edge
+        # Relaxed threshold: only block if ratio < 0.50 (was < 1.0, i.e., current < required)
         edge_sufficiency_ratio = current_market_edge / final_required_edge if final_required_edge > 0 else 0
+        can_execute = edge_sufficiency_ratio >= 0.50
 
         return {
             "can_execute": can_execute,
@@ -4593,6 +4811,11 @@ class ExecutionManager:
         policy_ctx = policy_context or {}  # Ensure it's never None
         bootstrap_mode_active = bool(policy_ctx.get("bootstrap_mode", False))
         bootstrap_bypass = bool(policy_ctx.get("bootstrap_bypass", False))
+        affordability_probe = bool(
+            policy_ctx.get("affordability_probe")
+            or policy_ctx.get("probe_only")
+        )
+        probe_source = str(policy_ctx.get("probe_source") or "").strip()
         if not bootstrap_mode_active:
             try:
                 if hasattr(self.shared_state, "is_bootstrap_mode"):
@@ -4617,25 +4840,48 @@ class ExecutionManager:
             # For dust healing/recovery, only validate step_size, min_notional, available balance
             # Skip all other guards: min_econ_trade, profitability, micro_trade_kill_switch, fee_floor
             skip_micro_trade_kill_switch = True
+        if affordability_probe:
+            # AppContext probes should test sizing/funds only, not emit misleading EV gate noise.
+            skip_micro_trade_kill_switch = True
         
         # --- CRITICAL: MetaController Decision Override ---
         # If MetaController has made an explicit planning decision with planned_quote,
-        # bypass micro gates (sideways, EV, etc) that would reject valid decisions
+        # bypass micro gates (sideways, EV, etc) that would reject valid decisions.
+        # Some Meta paths may not carry a decision_id, so also trust canonical authority markers.
         has_meta_planned_quote = qa is not None and float(qa) > 0
-        if has_meta_planned_quote and policy_ctx.get("decision_id"):
+        policy_authority = str(
+            policy_ctx.get("authority") or policy_ctx.get("policy_authority") or ""
+        ).strip().lower()
+        meta_validated = bool(
+            policy_ctx.get("decision_id")
+            or policy_ctx.get("trace_id")
+            or policy_authority == "metacontroller"
+            or policy_ctx.get("tradeability_gate_checked")
+        )
+        if has_meta_planned_quote and meta_validated:
             # MetaController has validated this trade through its own gates
             # Trust the decision and skip redundant micro-level gates
             skip_micro_trade_kill_switch = True
             self.logger.info(
-                "[EM:MetaOverride] Bypassing micro gates for %s (MetaController planned_quote=%.2f decision_id=%s)",
-                symbol, float(qa), policy_ctx.get("decision_id")
+                "[EM:MetaOverride] Bypassing micro gates for %s (planned_quote=%.2f decision_id=%s authority=%s tradeability_gate_checked=%s)",
+                symbol,
+                float(qa),
+                policy_ctx.get("decision_id") or policy_ctx.get("trace_id"),
+                policy_authority or "unknown",
+                bool(policy_ctx.get("tradeability_gate_checked")),
             )
         
         self.logger.warning(
             f"[EXEC_TRACE] received bootstrap_bypass={policy_ctx.get('bootstrap_bypass', False)} "
             f"bootstrap_mode={policy_ctx.get('bootstrap_mode', False)} "
             f"skip_micro_gate={skip_micro_trade_kill_switch} "
-            f"has_meta_planned_quote={has_meta_planned_quote}"
+            f"has_meta_planned_quote={has_meta_planned_quote} "
+            f"authority={policy_authority or 'unknown'} "
+            f"meta_validated={meta_validated} "
+            f"decision_marker={bool(policy_ctx.get('decision_id') or policy_ctx.get('trace_id'))} "
+            f"tradeability_gate_checked={bool(policy_ctx.get('tradeability_gate_checked'))} "
+            f"affordability_probe={affordability_probe} "
+            f"probe_source={probe_source or 'n/a'}"
         )
         try:
             if qa is None or float(qa) <= 0:
@@ -4806,9 +5052,53 @@ class ExecutionManager:
                 round_trip_cost_pct = (float(self.trade_fee_pct or 0.0) * 2.0) + (
                     (slippage_bps + buffer_bps) / 10000.0
                 )
-                base_mult = float(self._cfg("EV_HARD_SAFETY_MULT", 2.0) or 2.0)
-                # Strict hard-gate: trades require expected_move >= 2x round-trip costs.
-                mult = max(2.0, float(base_mult))
+                base_mult = float(self._cfg("EV_HARD_SAFETY_MULT", 1.2) or 1.2)
+                
+                # ADAPTIVE: Read regime from signal context (MetaController)
+                regime = str(trade_regime or "unknown").strip().lower()
+                
+                # FALLBACK: If regime not in policy_ctx, query MetaController directly
+                if not trade_regime or regime == "unknown":
+                    try:
+                        if hasattr(self.shared_state, "get_current_regime"):
+                            mc_regime = await maybe_call(self.shared_state, "get_current_regime", sym)
+                            if mc_regime:
+                                regime = str(mc_regime).strip().lower()
+                                self.logger.debug("[EM:EV_HARD_GATE] Fetched regime from MetaController: %s", regime)
+                    except Exception as e:
+                        self.logger.debug("[EM:EV_HARD_GATE] Failed to fetch regime from MetaController: %s", e)
+                
+                # ADAPTIVE: Regime-aware multiplier scaling
+                regime_multipliers = {
+                    "trend": 1.4,          # Higher threshold for trend confirmation
+                    "volatile": 1.2,       # Standard for volatility
+                    "sideways": 1.0,       # Lower threshold in chop (matches MetaController)
+                    "chop": 1.0,           # Alias
+                    "range": 1.0,          # Alias
+                    "low": 1.0,            # Alias
+                    "flat": 1.0,           # Alias
+                    "unknown": 1.2,        # Conservative default
+                }
+                regime_mult = float(regime_multipliers.get(regime, 1.2))
+                
+                # ADAPTIVE: ATR-based scaling
+                if atr_pct is not None and float(atr_pct) > 0:
+                    atr_pct_val = float(atr_pct)
+                    if atr_pct_val < 0.0015:        # <0.15% ATR
+                        regime_mult *= 0.85         # 15% relief
+                    elif atr_pct_val < 0.003:      # <0.30% ATR
+                        regime_mult *= 0.90         # 10% relief
+                    elif atr_pct_val > 0.01:       # >1.0% ATR
+                        regime_mult *= 1.1          # 10% stricter
+                
+                # ADAPTIVE: Bootstrap override (easier during Phase 1)
+                if bootstrap_override:
+                    regime_mult *= 0.75
+                
+                # CRITICAL FIX: Use soft floor, not hard override
+                # Config sets safety floor (e.g., 0.85), not a hard ceiling
+                min_safe_mult = float(self._cfg("EV_HARD_MIN_MULT", 0.85) or 0.85)
+                mult = max(float(min_safe_mult), regime_mult)  # ← Adaptive intelligence wins, safety floor wins vs 1.0x
 
                 # Expected-move calibration (ATR floor). If upstream doesn't provide an expected-move,
                 # we still enforce the gate using an ATR-based proxy (1h preferred).
@@ -4831,11 +5121,23 @@ class ExecutionManager:
 
                 atr_ref_pct = float(expected_move_floor_pct or 0.0)
                 required_move_pct = round_trip_cost_pct * float(mult)
+                
+                # CRITICAL GUARD: Prevent dead gate (expected_move=0)
+                # If all sources failed, fall back to minimum viable expected move
+                if float(expected_move_used_pct) <= 0.0:
+                    min_expected_move = max(float(atr_pct or 0.0), 0.0025)  # Min 0.25% or ATR
+                    expected_move_used_pct = min_expected_move
+                    expected_move_key = "emergency_fallback"
+                    self.logger.debug(
+                        "[EM:EV_HARD_GATE] No expected_move available; using emergency fallback: %.4f%%",
+                        float(expected_move_used_pct) * 100.0
+                    )
+                
                 # CRITICAL: If MetaController has sent an explicit override, bypass this gate
                 if float(expected_move_used_pct) <= float(required_move_pct) and not bootstrap_override:
                     self.logger.warning(
                         "[EM:EV_HARD_GATE] Blocked BUY %s: expected_move=%.4f%% (raw=%.4f%% key=%s floor=%.4f%%) <= required=%.4f%% "
-                        "(round_trip=%.4f%% mult=%.2f vol_regime=%s trade_regime=%s atr_ref=%.4f%%)",
+                        "(round_trip=%.4f%% mult=%.2f regime_mult=%.2f regime=%s atr_adj=%.4f%% vol_regime=%s base_mult=%.2f)",
                         sym,
                         float(expected_move_used_pct) * 100.0,
                         float(expected_move_raw_pct) * 100.0,
@@ -4844,9 +5146,11 @@ class ExecutionManager:
                         float(required_move_pct) * 100.0,
                         float(round_trip_cost_pct) * 100.0,
                         float(mult),
+                        float(regime_mult),
+                        regime or "unknown",
+                        float(atr_pct or 0.0) * 100.0,
                         vol_regime or "unknown",
-                        trade_regime or "unknown",
-                        float(atr_ref_pct) * 100.0,
+                        float(base_mult),
                     )
                     with contextlib.suppress(Exception):
                         await maybe_call(
@@ -4863,10 +5167,11 @@ class ExecutionManager:
                                 "round_trip_cost_pct": float(round_trip_cost_pct),
                                 "safety_mult": float(mult),  # back-compat key
                                 "ev_mult": float(mult),
+                                "regime_mult": float(regime_mult),  # NEW: adaptive multiplier
+                                "regime": regime or "unknown",  # NEW: detected regime
                                 "vol_regime": vol_regime,
-                                "trade_regime": trade_regime,
-                                "atr_ref_pct": float(atr_ref_pct),
-                                "base_mult": float(base_mult),
+                                "atr_pct": float(atr_pct or 0.0),  # NEW: ATR percentage
+                                "base_mult": float(base_mult),  # NEW: configured base
                                 "timestamp": time.time(),
                             },
                         )
@@ -5484,12 +5789,12 @@ class ExecutionManager:
         # ✅ GLOBAL EXECUTION LOCK: Only allow trading in live mode
         # This is a critical safety mechanism to prevent accidental executions
         # in test/paper/simulation environments
-        import os
-        mode = os.getenv("TRADING_MODE", "live").lower()
-        if mode != "live":
+        # Use consistent config check (not env var) to match AppContext behavior
+        trading_mode = str(self._cfg("trading_mode", "live") or "live").lower()
+        if trading_mode != "live":
             self.logger.warning(
                 "[EXECUTION BLOCKED] mode=%s symbol=%s side=%s",
-                mode,
+                trading_mode,
                 intent.symbol,
                 intent.side
             )
@@ -5497,7 +5802,7 @@ class ExecutionManager:
                 "status": "shadow_blocked",
                 "symbol": intent.symbol,
                 "side": intent.side,
-                "reason": f"Execution blocked in {mode} mode"
+                "reason": f"Execution blocked in {trading_mode} mode"
             }
         
         # PHASE 5: Persist intent before execution (event sourcing)
@@ -5589,6 +5894,34 @@ class ExecutionManager:
         is_dust_healing_buy = str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
         is_dust_operation = self._is_dust_operation_context(policy_ctx, tier=tier, tag=tag, symbol=sym)
 
+        # === DUST PRIORITY: REUSE dust when a same-symbol BUY arrives ===
+        # Priority 1 (Reuse > Aggregate > Cleanup): if the symbol already has a
+        # sub-minNotional dust position, net out its notional from planned_quote so
+        # we don't over-allocate capital that we effectively already own.
+        if side == "buy" and not is_dust_healing_buy and planned_quote is not None:
+            try:
+                dust_entry = (getattr(self.shared_state, "dust_registry", None) or {}).get(sym)
+                if dust_entry:
+                    dust_qty = float(dust_entry.get("qty", 0.0))
+                    if dust_qty > 0.0:
+                        pos = await self.shared_state.get_position(sym) or {}
+                        dust_price = float(
+                            pos.get("mark_price") or pos.get("entry_price") or 0.0
+                        )
+                        if dust_price > 0.0:
+                            dust_notional = dust_qty * dust_price
+                            reduced_quote = max(0.0, float(planned_quote) - dust_notional)
+                            self.logger.info(
+                                "[Dust:REUSE] %s dust_qty=%.6f dust_notional=%.4f "
+                                "planned_quote %.4f → %.4f",
+                                sym, dust_qty, dust_notional, float(planned_quote), reduced_quote,
+                            )
+                            planned_quote = reduced_quote
+                            policy_ctx["_dust_reused_qty"] = dust_qty
+                            policy_ctx["_dust_reused_notional"] = dust_notional
+            except Exception as _dust_reuse_err:
+                self.logger.debug("[Dust:REUSE] %s skipped: %s", sym, _dust_reuse_err)
+
         tag_raw = tag or ""
         tag_lower = tag_raw.lower()
         clean_tag = self._sanitize_tag(tag)
@@ -5615,7 +5948,7 @@ class ExecutionManager:
         bypass_checks = False
         if side == "sell" and bool(policy_ctx.get("_forced_exit")):
             try:
-                nav = float(await self._get_total_equity() or 0.0)
+                nav = float(await self.get_tradable_nav() or 0.0)
                 position_value = float(policy_ctx.get("position_value", 0.0))
                 
                 if nav > 0 and position_value > 0:
@@ -6065,7 +6398,7 @@ class ExecutionManager:
                     self.logger.debug(
                         "[EXEC:ProfitGuard] NAV-aware target=%.4f NAV=%.2f",
                         min_target,
-                        float(await self._get_total_equity() or 0.0)
+                        float(await self.get_tradable_nav() or 0.0)
                     )
                     if not guard_ok:
                         # 🔒 DUST RETIREMENT CHECK: Don't record rejection for permanent dust
@@ -6096,6 +6429,41 @@ class ExecutionManager:
             async with self._small_nav_guard():
                 if side == "buy":
                     if planned_quote and planned_quote > 0:
+                        # 🛡️ OWNERSHIP GUARD: Check SharedState classification (canonical authority)
+                        # Design Rule: Classification comes ONLY from SharedState.position.classification
+                        # NOT from agent intent or external signals
+                        # This prevents double-opening external positions or orphaning capital
+                        try:
+                            pos = await self.shared_state.get_position(sym) or {}
+                            classification = pos.get("classification", "")
+                            
+                            if classification == "BOT_POSITION":
+                                # Position already owned by bot - reject to prevent double-entry
+                                self.logger.warning(
+                                    "[EM:Ownership] Blocked BUY %s: position already BOT_POSITION (prevent duplicate entry)",
+                                    sym
+                                )
+                                return {
+                                    "ok": False,
+                                    "status": "blocked",
+                                    "reason": "POSITION_ALREADY_OPEN",
+                                    "error_code": "POSITION_ALREADY_OPEN",
+                                }
+                            elif classification == "EXTERNAL_POSITION":
+                                # External position exists - skip but don't block entire system
+                                self.logger.info(
+                                    "[EM:Ownership] Skipping BUY %s: external position exists (not bot-owned, will track)",
+                                    sym
+                                )
+                                return {
+                                    "ok": False,
+                                    "status": "skipped",
+                                    "reason": "EXTERNAL_POSITION_EXISTS",
+                                    "error_code": "EXTERNAL_POSITION_EXISTS",
+                                }
+                        except Exception as e:
+                            self.logger.debug("[EM:Ownership] Classification check error: %s (proceeding with caution)", e)
+                        
                         # 🎯 BOOTSTRAP FIX: SKIP cooldown check during bootstrap mode
                         # Cooldown is too aggressive when capital is dynamic and prices are volatile
                         is_bootstrap_now = bool(policy_ctx.get("bootstrap_mode", False)) if policy_ctx else False
@@ -7576,24 +7944,28 @@ class ExecutionManager:
         if step_size <= 0 or min_notional <= 0:
             return None
 
-        # ✅ BEST PRACTICE: Normalize quantity to step_size before submission
-        # This ensures the order respects exchange precision requirements.
-        # For SELL orders, preserve the raw quantity so the dust-prevention round-up
-        # logic later can see the true remainder before deciding to round down or up.
+        use_quote_path = side.upper() == "BUY" and planned_quote and planned_quote > 0
+
+        # ✅ BEST PRACTICE: Normalize quantity to step_size before submission for qty-based orders.
+        # Quote-based BUYs must skip this check entirely because they intentionally submit
+        # `quoteOrderQty` with no precomputed quantity.
+        # For SELL orders, preserve the raw quantity so the dust-prevention round-up logic
+        # later can see the true remainder before deciding to round down or up.
         _raw_quantity = float(quantity or 0.0)
-        quantity = self._normalize_quantity(quantity, step_size)
-        if quantity <= 0:
-            self.logger.warning(
-                "[EM:NormalizeQty] %s %s quantity=%.8f normalized to 0 (step_size=%.8f); rejecting order",
-                symbol, side.upper(), float(quantity or 0.0), step_size
-            )
-            return self._canonical_exec_result(
-                symbol=symbol,
-                side=side,
-                raw_order=None,
-                default_status="REJECTED",
-                default_reason="qty_invalid_after_normalization",
-            )
+        if not use_quote_path:
+            quantity = self._normalize_quantity(quantity, step_size)
+            if quantity <= 0:
+                self.logger.warning(
+                    "[EM:NormalizeQty] %s %s raw_quantity=%.8f normalized to 0 (step_size=%.8f); rejecting order",
+                    symbol, side.upper(), _raw_quantity, step_size
+                )
+                return self._canonical_exec_result(
+                    symbol=symbol,
+                    side=side,
+                    raw_order=None,
+                    default_status="REJECTED",
+                    default_reason="qty_invalid_after_normalization",
+                )
 
         safe_tag = self._sanitize_tag(comment)
         decision_id = decision_id or self._resolve_decision_id(getattr(self, "_current_policy_context", None))

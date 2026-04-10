@@ -604,6 +604,7 @@ class RotationExitAuthority:
                 "_forced": True,
                 "_is_rotation": True,
                 "_forced_exit": True,
+                "_is_liquidation": True,  # FIX #11: Mark as liquidation to bypass profit gate
                 "_is_stagnation": True,
                 "_stagnation_force": True,
                 "_stagnation_override": True,
@@ -642,6 +643,7 @@ class RotationExitAuthority:
                 "_forced": False,
                 "_is_rotation": True,
                 "_forced_exit": True,
+                "_is_liquidation": True,  # FIX #11: Mark as liquidation to bypass profit gate
                 "_is_stagnation": True,
                 "_stagnation_pnl_pct": float(worst_pnl),
                 "_rotation_stage": "nomination",

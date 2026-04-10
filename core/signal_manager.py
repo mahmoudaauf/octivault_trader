@@ -127,18 +127,27 @@ class SignalManager:
         self.logger.debug("[SignalManager] Signal ACCEPTED and cached: %s from %s (confidence=%.2f)", sym, agent_name, s["confidence"])
         return True
 
-    def store_signal(self, agent_name: str, symbol: str, signal: Dict[str, Any]) -> None:
+    def store_signal(self, agent_name: str, symbol: str, signal: Dict[str, Any], source_intent=None) -> None:
         """
-        Store a processed signal in the cache.
+        Store a processed signal in the cache, preserving source TradeIntent if provided.
 
         Args:
             agent_name: Name of the agent
             symbol: Trading symbol
             signal: Processed signal dictionary
+            source_intent: Original TradeIntent object (if available)
         """
         cache_key = f"{symbol}:{agent_name}"
+        
+        # Enhance signal dict with source intent reference if provided
+        if source_intent is not None:
+            signal = dict(signal)  # Make a copy to avoid mutating caller's dict
+            signal["_source_intent"] = source_intent
+            signal["_has_source_intent"] = True
+        
         self.signal_cache.set(cache_key, signal)
-        self.logger.debug("[SignalManager] Signal stored for %s from %s", symbol, agent_name)
+        self.logger.debug("[SignalManager] Signal stored for %s from %s (intent preserved: %s)", 
+                         symbol, agent_name, "yes" if source_intent else "no")
 
     def get_all_signals(self) -> List[Dict[str, Any]]:
         """
@@ -162,6 +171,20 @@ class SignalManager:
         all_signals = self.get_all_signals()
         return [s for s in all_signals if s.get("symbol") == symbol]
 
+    def get_source_intent(self, signal: Dict[str, Any]):
+        """
+        Extract source TradeIntent from a cached signal if available.
+        
+        Args:
+            signal: Signal dictionary (may contain _source_intent)
+            
+        Returns:
+            TradeIntent object if preserved, None otherwise
+        """
+        if not isinstance(signal, dict):
+            return None
+        return signal.get("_source_intent")
+
     def cleanup_expired_signals(self) -> int:
         """
         Clean up expired signals from the cache.
@@ -171,12 +194,13 @@ class SignalManager:
         """
         return self.signal_cache.cleanup_expired()
 
-    def flush_intents_to_cache(self, now_ts: float) -> int:
+    def flush_intents_to_cache(self, now_ts: float, max_items: Optional[int] = None) -> int:
         """
-        Process intents from intent_manager into signal cache.
+        Process intents from intent_manager into signal cache, preserving source TradeIntent objects.
 
         Args:
             now_ts: Current timestamp
+            max_items: Maximum number of intents to process
 
         Returns:
             Number of intents processed into signals
@@ -184,7 +208,7 @@ class SignalManager:
         if not self.intent_manager:
             return 0
 
-        intents = self.intent_manager.drain_intents()
+        intents = self.intent_manager.drain_intents(max_items=max_items)
         if not intents:
             return 0
 
@@ -193,12 +217,19 @@ class SignalManager:
         accepted = 0
         for it in intents:
             try:
+                # Preserve the original intent object for traceability
+                source_intent = None
+                
                 if hasattr(it, "to_dict"):
                     d = it.to_dict()
+                    source_intent = it  # ← KEY: Preserve the original TradeIntent object
                 elif isinstance(it, dict):
                     d = dict(it)
+                    # Try to recover intent from dict if it has __class__ marker
+                    source_intent = it.get("_source_object")
                 elif hasattr(it, "__dict__"):
                     d = dict(getattr(it, "__dict__", {}) or {})
+                    source_intent = it  # ← Preserve if it's an object
                 else:
                     continue
 
@@ -258,19 +289,32 @@ class SignalManager:
                     "budget_required": budget_required,
                 })
                 
-                if "planned_quote" in d or "quote" in d:
-                    sig["quote"] = float(d.get("planned_quote", d.get("quote", float(getattr(self.config, 'DEFAULT_PLANNED_QUOTE', 10.0)))))
-                if "planned_qty" in d or "quantity" in d:
-                    sig["quantity"] = float(d.get("planned_qty", d.get("quantity", 0.0)))
+                quote_value = d.get("planned_quote")
+                if quote_value is None:
+                    quote_value = d.get("quote")
+                if quote_value is not None:
+                    try:
+                        sig["quote"] = float(quote_value)
+                    except Exception:
+                        pass
 
-                # Store the signal directly (this is synchronous, unlike MetaController.receive_signal which is async)
-                self.store_signal(agent, symbol, sig)
+                quantity_value = d.get("planned_qty")
+                if quantity_value is None:
+                    quantity_value = d.get("quantity")
+                if quantity_value is not None:
+                    try:
+                        sig["quantity"] = float(quantity_value)
+                    except Exception:
+                        pass
+
+                # Store the signal with source intent preserved (← KEY CHANGE)
+                self.store_signal(agent, symbol, sig, source_intent=source_intent)
                 accepted += 1
             except Exception:
                 self.logger.debug("intent->signal failed: %r", it, exc_info=True)
 
         if accepted > 0:
-            self.logger.info("[SignalManager:Flush] Successfully ingested %d signals into cache.", accepted)
+            self.logger.info("[SignalManager:Flush] Successfully ingested %d signals into cache (intents preserved).", accepted)
         return accepted
 
     def get_current_nav(self) -> float:
