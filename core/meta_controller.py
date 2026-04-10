@@ -2509,11 +2509,21 @@ class MetaController:
           max(exchange_min_notional, MIN_SIGNIFICANT_POSITION_USDT)
         """
         sym = self._normalize_symbol(symbol)
+        handler = get_error_handler()
         try:
             _, min_notional = await _safe_await(self.shared_state.compute_symbol_trade_rules(sym))
             if min_notional is None or float(min_notional) <= 0:
                 min_notional = float(self._cfg("MIN_NOTIONAL_USDT", 10.0))
-        except Exception:
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "compute_symbol_trade_rules",
+                    "component": "ExchangeRules",
+                    "symbol": sym
+                }
+            )
+            self.logger.debug("[Meta:TradeRules] Failed to get trade rules for %s: %s", sym, e.context.message)
             min_notional = float(self._cfg("MIN_NOTIONAL_USDT", 10.0))
         strategy_floor = float(
             self._cfg(
@@ -2919,6 +2929,7 @@ class MetaController:
         
         ✅ ENHANCEMENT: Properly count dust in fallback mode
         """
+        handler = get_error_handler()
         try:
             # Get position classification from SharedState
             if hasattr(self.shared_state, "classify_positions_by_size"):
@@ -2939,8 +2950,15 @@ class MetaController:
                     )
                 
                 return total, len(sig_list), dust_count
-        except Exception as e:
-            self.logger.debug("[Meta:PosCounts] Primary classification failed: %s", e)
+        except ExchangeError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "classify_positions_by_size",
+                    "component": "PositionAnalysis"
+                }
+            )
+            self.logger.debug("[Meta:PosCounts] Primary classification failed: %s", e.context.message)
         
         # Fallback: manually count dust positions
         try:
@@ -3096,10 +3114,27 @@ class MetaController:
                 return False
 
             # Hard invariant: if inventory exists, SELL must be allowed
+            handler = get_error_handler()
             try:
                 if await self._should_allow_sell(symbol):
                     return True
-            except Exception:
+            except ExecutionError as e:
+                classification = handler.handle_exception(
+                    e,
+                    additional_context={
+                        "operation": "should_allow_sell",
+                        "component": "SellGating",
+                        "symbol": symbol
+                    }
+                )
+                self.logger.debug("[WALLET_FOCUS_BOOTSTRAP] Gate check failed, fail-open: %s", e.context.message)
+                # Fail-open for SELL if gate check fails
+                return True
+            except TraderException as e:
+                classification = handler.handle_exception(e)
+                return True
+            except Exception as e:
+                self.logger.debug("[WALLET_FOCUS_BOOTSTRAP] Unexpected gate check error: %s", type(e).__name__)
                 # Fail-open for SELL if gate check fails
                 return True
             
@@ -3162,13 +3197,32 @@ class MetaController:
             # All gates passed - allow SELL
             return True
             
+        except ExecutionError as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "should_execute_sell",
+                    "component": "SellGating",
+                    "symbol": symbol
+                }
+            )
+            self.logger.warning("[WALLET_FOCUS_BOOTSTRAP] Error checking sell gate for %s: %s", symbol, e.context.message)
+            # Fail-safe: allow execution if uncertain (prefer execution over silence)
+            return True
+        except TraderException as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(e)
+            self.logger.warning("[WALLET_FOCUS_BOOTSTRAP] Trader error checking sell gate for %s", symbol)
+            return True
         except Exception as e:
-            self.logger.warning(f"[WALLET_FOCUS_BOOTSTRAP] Error checking sell gate for {symbol}: {e}")
+            self.logger.warning("[WALLET_FOCUS_BOOTSTRAP] Unexpected error checking sell gate for %s: %s", symbol, type(e).__name__)
             # Fail-safe: allow execution if uncertain (prefer execution over silence)
             return True
             
     def _get_fee_bps(self, shared_state: Any, fee_type: str = "taker") -> float:
         """Helper to safely get fee bps with defaults."""
+        handler = get_error_handler()
         try:
             # Try to get from PolicyManager if available
             if hasattr(self, "policy_manager") and hasattr(self.policy_manager, "get_fee_bps"):
@@ -3177,7 +3231,22 @@ class MetaController:
             if hasattr(shared_state, "get_fee_bps"):
                 return float(shared_state.get_fee_bps(fee_type) or 10.0)
             return 10.0
-        except Exception:
+        except ConfigurationError as e:
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "get_fee_bps",
+                    "component": "FeeFetch",
+                    "fee_type": fee_type
+                }
+            )
+            self.logger.debug("[Meta:Fees] Failed to fetch fee configuration: %s", e.context.message)
+            return 10.0
+        except TraderException as e:
+            classification = handler.handle_exception(e)
+            return 10.0
+        except Exception as e:
+            self.logger.debug("[Meta:Fees] Unexpected error fetching fees: %s", type(e).__name__)
             return 10.0
 
     def _resolve_sell_tag(self, signal: Dict[str, Any]) -> str:
