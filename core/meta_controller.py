@@ -4760,15 +4760,47 @@ class MetaController:
                     "amount": amount,
                 }
 
-        except Exception as e:
-            self.logger.error(
-                "[Meta:Directive] Unhandled error in propose_exposure_directive: %s", e, exc_info=True
+        except ExecutionError as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "propose_exposure_directive",
+                    "component": "DirectiveExecution",
+                    "symbol": directive.get("symbol", "UNKNOWN"),
+                    "action": directive.get("action", "UNKNOWN")
+                }
             )
+            self.logger.error("[Meta:Directive] Execution error in propose_exposure_directive: %s", e.context.message)
             return {
                 "ok": False,
                 "trace_id": None,
                 "status": "ERROR",
-                "reason": f"unhandled_error: {str(e)}",
+                "reason": f"execution_error: {e.context.message}",
+                "symbol": directive.get("symbol", "UNKNOWN") if isinstance(directive, dict) else "UNKNOWN",
+                "action": directive.get("action", "UNKNOWN") if isinstance(directive, dict) else "UNKNOWN",
+                "amount": 0.0,
+            }
+        except TraderException as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(e)
+            self.logger.error("[Meta:Directive] Trader error in propose_exposure_directive")
+            return {
+                "ok": False,
+                "trace_id": None,
+                "status": "ERROR",
+                "reason": "trader_exception",
+                "symbol": directive.get("symbol", "UNKNOWN") if isinstance(directive, dict) else "UNKNOWN",
+                "action": directive.get("action", "UNKNOWN") if isinstance(directive, dict) else "UNKNOWN",
+                "amount": 0.0,
+            }
+        except Exception as e:
+            self.logger.error("[Meta:Directive] Unexpected error in propose_exposure_directive: %s", type(e).__name__)
+            return {
+                "ok": False,
+                "trace_id": None,
+                "status": "ERROR",
+                "reason": f"unhandled_error: {type(e).__name__}",
                 "symbol": directive.get("symbol", "UNKNOWN") if isinstance(directive, dict) else "UNKNOWN",
                 "action": directive.get("action", "UNKNOWN") if isinstance(directive, dict) else "UNKNOWN",
                 "amount": 0.0,
@@ -4841,10 +4873,10 @@ class MetaController:
                     "severity": validation_result.severity,
                 }
             
-            self.logger.debug(
-                "[Meta:SafetyGate] Operation validated: %s %s (reason: %s)",
-                action, symbol, validation_result.reason
-            )
+                self.logger.debug(
+                    "[Meta:SafetyGate] Operation validated: %s %s (reason: %s)",
+                    action, symbol, validation_result.reason
+                )
 
             # Map directive amount to execution parameters
             if action == "BUY":
@@ -4905,14 +4937,38 @@ class MetaController:
 
             return execution_result
 
-        except Exception as e:
-            self.logger.error(
-                "[Meta:Directive:Execute] Execution error: %s", e, exc_info=True
+        except ExecutionError as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(
+                e,
+                additional_context={
+                    "operation": "execute_approved_directive",
+                    "component": "DirectiveExecution",
+                    "symbol": symbol,
+                    "action": action
+                }
             )
+            self.logger.error("[Meta:Directive:Execute] Execution error: %s", e.context.message)
             return {
                 "ok": False,
                 "status": "execution_error",
-                "reason": str(e),
+                "reason": e.context.message,
+            }
+        except TraderException as e:
+            handler = get_error_handler()
+            classification = handler.handle_exception(e)
+            self.logger.error("[Meta:Directive:Execute] Trader error during execution")
+            return {
+                "ok": False,
+                "status": "execution_error",
+                "reason": "trader_exception",
+            }
+        except Exception as e:
+            self.logger.error("[Meta:Directive:Execute] Unexpected execution error: %s", type(e).__name__)
+            return {
+                "ok": False,
+                "status": "execution_error",
+                "reason": type(e).__name__,
             }
 
     async def _log_execution_event(self, event_type: str, symbol: str, details: Dict[str, Any]) -> None:
