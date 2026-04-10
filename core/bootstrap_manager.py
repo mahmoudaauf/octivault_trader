@@ -44,7 +44,7 @@ class BootstrapDustBypassManager:
     
     def can_use(self, symbol: str) -> bool:
         """Check if this symbol can bypass dust checks this bootstrap cycle."""
-        return symbol in self._bootstrap_dust_bypass_symbols
+        return symbol not in self._bootstrap_dust_bypass_symbols
     
     def mark_used(self, symbol: str):
         """Mark symbol as used for bootstrap dust bypass."""
