@@ -379,13 +379,24 @@ def parse_timestamp(val: Any, default_ts: float = 0.0) -> float:
     if isinstance(val, (int, float)):
         return float(val)
     if isinstance(val, str):
+        handler = get_error_handler()
         try:
             if val.endswith('Z'):
                 val = val[:-1] + '+00:00'
             from datetime import datetime
             dt = datetime.fromisoformat(val.replace('Z', '+00:00'))
             return dt.timestamp()
-        except Exception:
+        except TypedValidationError as e:
+            classification = handler.handle_exception(e, 
+                additional_context={
+                    "operation": "parse_timestamp",
+                    "component": "TimestampParsing"
+                })
+            return default_ts
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug("[Meta] Timestamp parse failed: %s, using default", str(e))
             return default_ts
     return default_ts
 
@@ -604,6 +615,7 @@ class MetaController:
             )
             
             # Emit event for monitoring
+            handler = get_error_handler()
             try:
                 if hasattr(self.shared_state, "emit_event"):
                     await _safe_await(self.shared_state.emit_event(
@@ -615,7 +627,16 @@ class MetaController:
                             "timeout_sec": timeout_sec,
                         }
                     ))
-            except Exception:
+            except ExecutionError as e:
+                classification = handler.handle_exception(e, 
+                    additional_context={
+                        "operation": "emit_dust_event",
+                        "component": "EventEmission",
+                        "symbol": symbol
+                    })
+                pass
+            except Exception as e:
+                self.logger.debug("[Meta:DustEvent] Failed to emit dust state event: %s", str(e))
                 pass
             
             return True
@@ -1013,6 +1034,7 @@ class MetaController:
         """Reset bootstrap override counter if is_flat, no realized trades, and last override did NOT produce execution."""
         # Check if position is flat
         is_flat = False
+        handler = get_error_handler()
         try:
             qty = 0.0
             if hasattr(self.shared_state, "get_position_qty"):
@@ -1027,7 +1049,16 @@ class MetaController:
                 if isinstance(pos, dict):
                     qty = float(pos.get("qty", 0.0) or pos.get("quantity", 0.0) or 0.0)
                     is_flat = qty == 0.0
-        except Exception:
+        except StateError as e:
+            classification = handler.handle_exception(e, 
+                additional_context={
+                    "operation": "check_position_flat",
+                    "component": "BootstrapDeadlockDetection",
+                    "symbol": symbol
+                })
+            pass
+        except Exception as e:
+            self.logger.debug("[Meta:Bootstrap] Position flat check failed: %s", str(e))
             pass
         
         # Check if no realized trades yet
@@ -1035,7 +1066,15 @@ class MetaController:
         try:
             metrics = getattr(self.shared_state, "metrics", {}) or {}
             realized_trades = int(metrics.get("total_trades_executed", 0) or 0)
-        except Exception:
+        except TypeMismatchError as e:
+            classification = handler.handle_exception(e, 
+                additional_context={
+                    "operation": "get_realized_trades",
+                    "component": "BootstrapDeadlockDetection"
+                })
+            pass
+        except Exception as e:
+            self.logger.debug("[Meta:Bootstrap] Realized trades check failed: %s", str(e))
             pass
         
         # Check if last override did NOT produce execution
