@@ -48,6 +48,8 @@ import logging
 from typing import Dict, List, Tuple, Any, Optional, Set
 from types import SimpleNamespace
 
+from utils.shared_state_tools import spread_bps as ss_spread_bps, min_notional as ss_min_notional
+
 
 logger = logging.getLogger("UniverseRotationEngine")
 
@@ -100,6 +102,8 @@ class UniverseRotationEngine:
         # Use MAX_TOTAL_EXPOSURE_PCT from Config (default 0.6), not hardcoded 0.8
         # This ensures universe cap respects actual portfolio allocation settings
         self.max_exposure = float(self._cfg("MAX_TOTAL_EXPOSURE_PCT", 0.6))
+        # Cycle-local snapshot of proposal metadata (captured before proposal stores are cleared).
+        self._latest_proposal_snapshot: Dict[str, Dict[str, Any]] = {}
 
     def wire_runtime_dependencies(
         self,
@@ -193,6 +197,72 @@ class UniverseRotationEngine:
         if isinstance(self.config, dict):
             return self.config.get(key, default)
         return getattr(self.config, key, default)
+
+    @staticmethod
+    def _as_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, str):
+            raw = value.strip().lower()
+            if raw in {"1", "true", "yes", "on"}:
+                return True
+            if raw in {"0", "false", "no", "off"}:
+                return False
+            return default
+        if value is None:
+            return default
+        return bool(value)
+
+    @staticmethod
+    def _looks_like_leveraged_symbol(symbol: str, base: str) -> bool:
+        base_u = str(base or "").upper()
+        sym_u = str(symbol or "").upper()
+        leveraged_suffixes = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S")
+        return any(base_u.endswith(sfx) or sym_u.endswith(f"{sfx}USDT") for sfx in leveraged_suffixes)
+
+    def _reject_discovery_symbol(self, symbol: str, proposal: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+        if not self._as_bool(self._cfg("DISCOVERY_FILTER_LOW_UTILITY_SYMBOLS", True), True):
+            return False, ""
+        sym = str(symbol or "").replace("/", "").strip().upper()
+        if not sym:
+            return True, "empty_symbol"
+
+        quote = str(self._cfg("QUOTE_ASSET", "USDT") or "USDT").upper()
+        base = sym
+        if quote and sym.endswith(quote):
+            base = sym[: -len(quote)]
+
+        if not base:
+            return True, "invalid_symbol"
+
+        stable_csv = str(
+            self._cfg(
+                "DISCOVERY_STABLE_ASSETS",
+                "USDT,USDC,FDUSD,BUSD,TUSD,USDP,DAI,USDE,USD1,USDS,USD0",
+            )
+            or ""
+        )
+        stable_assets = {token.strip().upper() for token in stable_csv.split(",") if token.strip()}
+        if self._as_bool(self._cfg("DISCOVERY_REJECT_STABLE_BASE_PAIRS", True), True):
+            if base in stable_assets:
+                return True, "stablecoin_base_pair"
+
+        if self._as_bool(self._cfg("DISCOVERY_REJECT_LEVERAGED_TOKENS", True), True):
+            if self._looks_like_leveraged_symbol(sym, base):
+                return True, "leveraged_token"
+
+        min_vol = float(self._cfg("DISCOVERY_MIN_PROPOSAL_VOLUME_USDT", 0.0) or 0.0)
+        if min_vol > 0.0 and isinstance(proposal, dict):
+            try:
+                vol = float(
+                    proposal.get("24h_volume")
+                    or proposal.get("volume_24h")
+                    or proposal.get("quote_volume")
+                    or 0.0
+                )
+                if 0.0 < vol < min_vol:
+                    return True, "volume_below_floor"
+            except Exception:
+                pass
+        return False, ""
 
     async def _safe_price(self, symbol: str) -> float:
         sym = str(symbol or "").replace("/", "").upper()
@@ -621,25 +691,29 @@ class UniverseRotationEngine:
                 f"[UURE] Relative replacement rule applied: {len(profitable)} → {len(final_universe)}"
             )
 
-            # Step 5: Identify rotation
-            rotation = await self._identify_rotation(final_universe)
+            # Step 5: Identify candidate rotation
+            candidate_rotation = await self._identify_rotation(final_universe)
             self.logger.info(
-                f"[UURE] Rotation: +{len(rotation['added'])} -{len(rotation['removed'])} ={len(rotation['kept'])}"
+                f"[UURE] Candidate rotation: +{len(candidate_rotation['added'])} "
+                f"-{len(candidate_rotation['removed'])} ={len(candidate_rotation['kept'])}"
             )
 
             # Step 6: Hard replace universe
-            await self._hard_replace_universe(final_universe)
+            applied_universe = await self._hard_replace_universe(final_universe)
+            rotation = await self._identify_rotation(applied_universe)
             self.logger.info(
-                f"[UURE] Universe hard-replaced: {len(final_universe)} symbols"
+                f"[UURE] Universe applied: {len(applied_universe)} symbols "
+                f"(effective rotation +{len(rotation['added'])} -{len(rotation['removed'])} ={len(rotation['kept'])})"
             )
 
-            # Step 7: Trigger liquidation of removed symbols
+            # Step 7: Trigger liquidation of effectively removed symbols only.
             if rotation["removed"]:
                 await self._trigger_liquidation(rotation["removed"])
 
-            result["new_universe"] = final_universe
-            result["score_info"] = {sym: scored[sym] for sym in final_universe}
+            result["new_universe"] = applied_universe
+            result["score_info"] = {sym: scored[sym] for sym in applied_universe if sym in scored}
             result["rotation"] = rotation
+            result["candidate_rotation"] = candidate_rotation
             result["execution"] = rotation["removed"]  # Liquidated symbols
 
             return result
@@ -743,7 +817,7 @@ class UniverseRotationEngine:
 
             # ✅ PHASE 2c: DISCOVERY PROPOSALS - Wire discovery proposals into UURE
             # This is the KEY CHANGE that enables 10x candidate expansion
-            discovery_syms = await self._collect_discovery_proposals()
+            discovery_syms = await self._collect_discovery_proposals_weighted()
 
             # Union of all sources (accepted + bot-managed positions + discovery)
             all_syms = accepted_syms | position_syms | discovery_syms
@@ -793,10 +867,13 @@ class UniverseRotationEngine:
 
             if not proposals and not symbol_proposals:
                 self.logger.debug("[UURE] No discovery proposals available this cycle")
+                self._latest_proposal_snapshot = {}
                 return set()
 
             # Extract symbols from both stores
             discovery_syms: Set[str] = set()
+            filtered_counts: Dict[str, int] = {}
+            proposal_snapshot: Dict[str, Dict[str, Any]] = {}
 
             for source_store in (proposals, symbol_proposals):
                 for symbol, prop in source_store.items():
@@ -805,7 +882,30 @@ class UniverseRotationEngine:
                     else:
                         sym = str(symbol).upper()
                     if sym:
+                        reject, reason = self._reject_discovery_symbol(
+                            sym,
+                            prop if isinstance(prop, dict) else None,
+                        )
+                        if reject:
+                            filtered_counts[reason] = filtered_counts.get(reason, 0) + 1
+                            continue
                         discovery_syms.add(sym)
+                        if isinstance(prop, dict):
+                            existing = proposal_snapshot.get(sym, {}) or {}
+                            merged = dict(existing)
+                            merged.update(prop)
+                            proposal_snapshot[sym] = merged
+
+            # Keep cycle-local snapshot for quality scoring even after stores are cleared.
+            self._latest_proposal_snapshot = proposal_snapshot
+
+            if filtered_counts:
+                rejected = sum(filtered_counts.values())
+                self.logger.info(
+                    "[UURE] Discovery quality filter rejected %d proposal(s): %s",
+                    rejected,
+                    filtered_counts,
+                )
 
             self.logger.info(
                 f"[UURE] Collected {len(discovery_syms)} discovery proposals "
@@ -824,6 +924,7 @@ class UniverseRotationEngine:
 
         except Exception as e:
             self.logger.error(f"[UURE] Error collecting discovery proposals: {e}")
+            self._latest_proposal_snapshot = {}
             return set()
 
     async def _collect_discovery_proposals_weighted(self) -> Set[str]:
@@ -851,6 +952,7 @@ class UniverseRotationEngine:
             
             # Extract symbols sorted by weighted_score
             discovery_syms = []
+            proposal_snapshot: Dict[str, Dict[str, Any]] = {}
             for symbol, prop in sorted(
                 weighted_props.items(),
                 key=lambda x: x[1].get("weighted_score", 0.0) if isinstance(x[1], dict) else 0.0,
@@ -859,6 +961,7 @@ class UniverseRotationEngine:
                 if isinstance(prop, dict):
                     symbol = str(prop.get("symbol", symbol)).upper()
                     weighted_score = float(prop.get("weighted_score", 0.0))
+                    proposal_snapshot[symbol] = dict(prop)
                 else:
                     symbol = str(symbol).upper()
                     weighted_score = 0.0
@@ -868,6 +971,7 @@ class UniverseRotationEngine:
             
             # Extract just symbols
             syms = set(s[0] for s in discovery_syms)
+            self._latest_proposal_snapshot = proposal_snapshot
             
             self.logger.debug(
                 f"[UURE] Collected {len(syms)} weighted discovery proposals, "
@@ -880,6 +984,100 @@ class UniverseRotationEngine:
             self.logger.error(f"[UURE] Error collecting weighted proposals: {e}")
             # Fall back to unweighted
             return await self._collect_discovery_proposals()
+
+    @staticmethod
+    def _extract_first_float(payload: Optional[Dict[str, Any]], keys: Tuple[str, ...], default: float = 0.0) -> float:
+        if not isinstance(payload, dict):
+            return float(default)
+        for key in keys:
+            try:
+                val = payload.get(key)
+                if val is not None:
+                    return float(val)
+            except Exception:
+                continue
+        return float(default)
+
+    async def _quality_multiplier(self, symbol: str) -> float:
+        """
+        Quality multiplier to break flat-score ties using already-available execution quality signals.
+        Reuses:
+          - discovery proposal metadata (volume/spread hints),
+          - shared_state symbol filters (spread/minNotional),
+          - live price availability.
+        """
+        sym = str(symbol or "").replace("/", "").upper()
+        if not sym:
+            return 1.0
+
+        score = 1.0
+        proposal = self._latest_proposal_snapshot.get(sym, {}) or {}
+
+        # Spread quality (prefer tighter markets).
+        spread_bps_val = ss_spread_bps(self.ss, sym)
+        if spread_bps_val is None:
+            spread_bps_val = self._extract_first_float(
+                proposal,
+                ("spread_bps", "spreadBasisPoints", "spread"),
+                0.0,
+            )
+            if 0.0 < spread_bps_val < 1.0:
+                spread_bps_val *= 10000.0
+        if spread_bps_val is not None and spread_bps_val > 0.0:
+            max_spread = float(self._cfg("UURE_QUALITY_MAX_SPREAD_BPS", 30.0) or 30.0)
+            ratio = float(spread_bps_val) / max(max_spread, 1e-6)
+            if ratio <= 1.0:
+                score += 0.06 * (1.0 - ratio)
+            else:
+                score -= min(0.25, 0.12 * (ratio - 1.0))
+
+        # Notional executability quality (penalize symbols where default entry is below minNotional).
+        min_notional_val = ss_min_notional(self.ss, sym)
+        if min_notional_val is None:
+            min_notional_val = self._extract_first_float(
+                proposal,
+                ("minNotional", "min_notional", "min_notional_usdt"),
+                0.0,
+            )
+        if min_notional_val and min_notional_val > 0.0:
+            entry_quote = float(
+                self._cfg(
+                    "MIN_ENTRY_QUOTE_USDT",
+                    self._cfg("MIN_ENTRY_USDT", self._cfg("DEFAULT_PLANNED_QUOTE", 0.0)),
+                )
+                or 0.0
+            )
+            ratio = entry_quote / max(float(min_notional_val), 1e-6)
+            if ratio < 1.0:
+                score -= min(0.22, 0.18 * (1.0 - ratio))
+            elif ratio >= 1.5:
+                score += min(0.06, 0.03 * (ratio - 1.0))
+
+        # Proposal liquidity quality (prefer higher-volume discovery candidates when available).
+        volume_24h = self._extract_first_float(
+            proposal,
+            ("24h_volume", "volume_24h", "quote_volume", "quote_volume_usdt"),
+            0.0,
+        )
+        if volume_24h > 0.0:
+            min_vol_cfg = float(self._cfg("DISCOVERY_MIN_PROPOSAL_VOLUME_USDT", 0.0) or 0.0)
+            ref_vol = float(self._cfg("UURE_QUALITY_REF_VOLUME_USDT", max(min_vol_cfg, 500000.0)) or max(min_vol_cfg, 500000.0))
+            vol_ratio = volume_24h / max(ref_vol, 1e-6)
+            if vol_ratio >= 1.0:
+                score += min(0.12, 0.08 * (vol_ratio - 1.0))
+            else:
+                score -= min(0.12, 0.10 * (1.0 - vol_ratio))
+
+        # Price readiness quality (small penalty if no current price is available yet).
+        px = float(await self._safe_price(sym) or 0.0)
+        if px <= 0.0:
+            score -= 0.10
+        else:
+            score += 0.02
+
+        min_mult = float(self._cfg("UURE_QUALITY_MIN_MULT", 0.65) or 0.65)
+        max_mult = float(self._cfg("UURE_QUALITY_MAX_MULT", 1.35) or 1.35)
+        return max(min_mult, min(max_mult, float(score)))
 
     async def _score_all(
         self, candidates: List[str]
@@ -909,8 +1107,18 @@ class UniverseRotationEngine:
                 symbol = str(symbol).upper()
                 
                 try:
-                    score = self.ss.get_unified_score(symbol)
+                    base_score = float(self.ss.get_unified_score(symbol))
+                    quality_mult = float(await self._quality_multiplier(symbol))
+                    score = float(base_score * quality_mult)
                     scores[symbol] = score
+                    if abs(quality_mult - 1.0) >= 0.05:
+                        self.logger.debug(
+                            "[UURE:Quality] %s base=%.4f mult=%.3f final=%.4f",
+                            symbol,
+                            base_score,
+                            quality_mult,
+                            score,
+                        )
                 except Exception as score_err:
                     self.logger.debug(f"[UURE] Failed to score {symbol}: {score_err}")
                     skipped.append(symbol)
@@ -1330,7 +1538,7 @@ class UniverseRotationEngine:
             self.logger.error(f"[UURE] Error identifying rotation: {e}")
             return {"added": [], "removed": [], "kept": []}
 
-    async def _hard_replace_universe(self, new_universe: List[str]) -> None:
+    async def _hard_replace_universe(self, new_universe: List[str]) -> List[str]:
         """Step 6: Merge new universe with existing accepted symbols (union, not replace).
         
         CRITICAL FIX: Use union instead of hard replace.
@@ -1381,9 +1589,11 @@ class UniverseRotationEngine:
                 f"[UURE] Merged universe: {len(current_accepted)} existing + "
                 f"{len(new_universe)} new ranked = {len(merged_symbols)} total"
             )
+            return sorted(str(s).replace("/", "").upper() for s in merged_symbols if s)
 
         except Exception as e:
             self.logger.error(f"[UURE] Error merging universe: {e}")
+            return [str(s).replace("/", "").upper() for s in (new_universe or []) if s]
 
     async def _trigger_liquidation(self, symbols_to_remove: List[str]) -> None:
         """Step 7: Trigger liquidation of removed symbols."""

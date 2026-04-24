@@ -2,6 +2,8 @@ import logging
 import os
 import json
 import time
+import re
+from collections import defaultdict
 
 try:
     import tensorflow as tf
@@ -26,6 +28,111 @@ logger.setLevel(logging.INFO)
 # -------------------------------
 KERAS_EXT = ".keras"
 LEGACY_EXT = ".h5"
+_LOG_THROTTLE_SEC = 120.0
+_LAST_LOG_TS: Dict[str, float] = defaultdict(float)
+_INCOMPATIBLE_QUARANTINE_DIR = "_incompatible_quarantine"
+
+
+def _is_truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _auto_cleanup_incompatible_enabled() -> bool:
+    # Enabled by default so legacy/incompatible artifacts are auto-cleaned and retrained.
+    return _is_truthy(os.getenv("MODEL_AUTO_CLEANUP_INCOMPATIBLE", "true"))
+
+
+def _classify_model_load_error(exc: Exception) -> Tuple[bool, str]:
+    """
+    Classify model-load exceptions that should trigger quarantine cleanup.
+    """
+    msg = str(exc or "")
+    lower = msg.lower()
+
+    signature_map: Dict[str, List[str]] = {
+        "legacy_inputlayer_batch_shape": [
+            "error when deserializing class 'inputlayer'",
+            "unrecognized keyword arguments: ['batch_shape']",
+            "unrecognized keyword arguments: ['batch_input_shape']",
+        ],
+        "legacy_keras_deserialization": [
+            "could not deserialize",
+            "error when deserializing",
+            "unknown layer",
+        ],
+        "corrupt_or_invalid_model_file": [
+            "file signature not found",
+            "no model config found",
+            "unable to open file",
+            "bad marshal data",
+        ],
+    }
+
+    for reason, needles in signature_map.items():
+        if any(needle in lower for needle in needles):
+            return True, reason
+    return False, "unclassified_load_error"
+
+
+def _safe_reason_token(reason: str) -> str:
+    token = re.sub(r"[^a-z0-9]+", "_", str(reason or "").lower()).strip("_")
+    token = token[:48]
+    return token or "incompatible_model"
+
+
+def _quarantine_model_artifact(path: Path, reason: str) -> Optional[Path]:
+    """
+    Move an incompatible/corrupt model artifact to a quarantine folder.
+    Sidecar metadata is moved as well when present.
+    """
+    src = Path(path)
+    if not src.exists():
+        return None
+    try:
+        qdir = _ensure_models_dir(src.parent / _INCOMPATIBLE_QUARANTINE_DIR)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        token = _safe_reason_token(reason)
+        dst = qdir / f"{src.stem}__{stamp}__{token}{src.suffix}"
+        i = 1
+        while dst.exists():
+            dst = qdir / f"{src.stem}__{stamp}__{token}_{i}{src.suffix}"
+            i += 1
+
+        src.rename(dst)
+
+        # Move optional metadata sidecar when available.
+        meta_src = src.with_name(f"{src.stem}_metadata.pkl")
+        if meta_src.exists():
+            meta_dst = qdir / f"{meta_src.stem}__{stamp}__{token}{meta_src.suffix}"
+            j = 1
+            while meta_dst.exists():
+                meta_dst = qdir / f"{meta_src.stem}__{stamp}__{token}_{j}{meta_src.suffix}"
+                j += 1
+            try:
+                meta_src.rename(meta_dst)
+            except Exception as me:
+                logger.warning("⚠️ Failed moving metadata sidecar to quarantine (%s): %s", meta_src, me)
+
+        return dst
+    except Exception as qe:
+        logger.warning("⚠️ Failed to quarantine incompatible model artifact (%s): %s", src, qe)
+        return None
+
+
+def _log_throttled(level: str, key: str, msg: str, *args):
+    """Emit repetitive model-load logs at most once per throttle window."""
+    now = time.time()
+    k = str(key or "")
+    last = float(_LAST_LOG_TS.get(k, 0.0) or 0.0)
+    if (now - last) < _LOG_THROTTLE_SEC:
+        return
+    _LAST_LOG_TS[k] = now
+    if level == "warning":
+        logger.warning(msg, *args)
+    elif level == "error":
+        logger.error(msg, *args)
+    else:
+        logger.info(msg, *args)
 
 def _ensure_models_dir(p: Union[str, Path]) -> Path:
     """Ensures the given directory path exists and returns it as a Path object."""
@@ -56,20 +163,39 @@ def build_model_path(agent_name: str, symbol: str, version: str = "v2",
     Defaults to the modern .keras format. Set `use_legacy_h5=True`
     only if you need to interoperate with older code that expects HDF5.
 
+    CRITICAL: Always uses absolute paths to ensure models are found
+    regardless of the current working directory.
+
     Args:
         agent_name (str): The name of the agent (e.g., "MLForecaster", "RLAgent").
         symbol (str): The trading symbol (e.g., "BTC-USD").
         version (str): A version string for the model (e.g., "5m", "v1").
         model_dir (Union[str, Path, None]): Optional. The base directory for models.
-                                            If None, defaults to "models/".
+                                            If None, defaults to "models/" in project root.
         use_legacy_h5 (bool): If True, forces the use of the .h5 extension.
 
     Returns:
-        Path: The constructed file path for the model.
+        Path: The constructed absolute file path for the model.
     """
-    base_model_dir = _ensure_models_dir(model_dir or "models/")
+    # If no model_dir provided, construct absolute path to models/ in project root
+    if model_dir is None:
+        try:
+            # Get the absolute path to this file (core/model_manager.py)
+            this_file = Path(__file__).resolve()
+            # Navigate up to project root: core/model_manager.py -> core/ -> octivault_trader/
+            project_root = this_file.parent.parent
+            model_dir = project_root / "models"
+        except Exception:
+            # Fallback: use relative path if __file__ resolution fails
+            model_dir = Path("models")
+    
+    # Convert to absolute path and ensure directory exists
+    base_model_dir = _ensure_models_dir(Path(model_dir).resolve())
     ext = LEGACY_EXT if use_legacy_h5 else KERAS_EXT
-    model_filename = f"{agent_name.lower()}_{symbol}_{version}{ext}"
+    agent_key = "".join(ch for ch in str(agent_name or "").lower() if ch.isalnum()) or "agent"
+    symbol_key = str(symbol or "").replace("/", "").replace("-", "").upper() or "SYMBOL"
+    version_key = str(version or "v2").strip() or "v2"
+    model_filename = f"{agent_key}_{symbol_key}_{version_key}{ext}"
     return base_model_dir / model_filename
 
 def save_model(model, path: Path):
@@ -107,6 +233,19 @@ def _try_load(path: Path) -> Any:
         if path.exists() and path.stat().st_size > 0:
             return tf.keras.models.load_model(path)
     except Exception as e:
+        should_quarantine, reason = _classify_model_load_error(e)
+        if should_quarantine and _auto_cleanup_incompatible_enabled():
+            quarantined = _quarantine_model_artifact(path, reason)
+            if quarantined is not None:
+                _log_throttled(
+                    "warning",
+                    f"model_quarantined:{str(path)}",
+                    "🧹 Auto-cleaned incompatible model: %s -> %s (reason=%s). Will retrain using fresh artifact.",
+                    str(path),
+                    str(quarantined),
+                    str(reason),
+                )
+                return None
         logger.error(f"❌ Error loading model from {path}: {e}")
     return None
 
@@ -123,7 +262,7 @@ def load_model(path: Path):
     Returns:
         tf.keras.Model or None: The loaded Keras model, or None if loading fails.
     """
-    primary = path
+    primary = Path(path)
     keras_path, h5_path = _paired_paths(path)
 
     candidates: list[Path] = []
@@ -135,13 +274,46 @@ def load_model(path: Path):
         # No extension or unknown extension provided, try .keras first then .h5
         candidates = [keras_path, h5_path]
 
+    available_candidates = [p for p in candidates if p.exists() and p.stat().st_size > 0]
+    if tf is None:
+        # Distinguish runtime dependency failure from true missing-model failure.
+        if available_candidates:
+            _log_throttled(
+                "warning",
+                f"tf_missing:{str(primary)}",
+                "⚠️ TensorFlow unavailable; model file exists but cannot be loaded: %s",
+                str(available_candidates[0]),
+            )
+        else:
+            _log_throttled(
+                "info",
+                f"model_missing:{str(primary)}",
+                "ℹ️ Model file not found yet (expected for bootstrap): %s",
+                str(primary),
+            )
+        return None
+
     for p in candidates:
         m = _try_load(p)
         if m is not None:
             logger.info(f"✅ Model loaded from: {p}")
             return m
 
-    logger.error(f"❌ Failed to load model; tried: {', '.join(str(c) for c in candidates)}")
+    remaining_candidates = [p for p in candidates if p.exists() and p.stat().st_size > 0]
+    if remaining_candidates:
+        _log_throttled(
+            "warning",
+            f"model_corrupt_or_incompatible:{str(primary)}",
+            "⚠️ Failed to load existing model (possibly incompatible/corrupt); tried: %s",
+            ", ".join(str(c) for c in candidates),
+        )
+    else:
+        _log_throttled(
+            "info",
+            f"model_missing:{str(primary)}",
+            "ℹ️ Model file not found yet (expected for bootstrap): %s",
+            ", ".join(str(c) for c in candidates),
+        )
     return None
 
 def model_exists(path: Path) -> bool:

@@ -270,16 +270,28 @@ class PositionOperationValidator:
                     severity="WARNING"
                 )
             
-            # CRITICAL: Block liquidation of EXTERNAL_POSITION
+            # EXTERNAL_POSITION: allow only with explicit approval reason.
+            # This preserves user-holding protection while still letting
+            # explicitly authorized portfolio-optimization exits proceed.
             if classification == "EXTERNAL_POSITION":
-                self.logger.critical(
-                    f"[VALIDATE] LIQUIDATION {symbol}: BLOCKED (EXTERNAL_POSITION is protected, "
+                if self.protect_external_positions and not self._is_approved_external_operation(reason):
+                    self.logger.critical(
+                        f"[VALIDATE] LIQUIDATION {symbol}: BLOCKED (EXTERNAL_POSITION requires approval, "
+                        f"quantity={quantity}, reason='{reason}')"
+                    )
+                    return OperationResult(
+                        allowed=False,
+                        reason="EXTERNAL_POSITION cannot be liquidated (user holding)",
+                        severity="CRITICAL"
+                    )
+                self.logger.warning(
+                    f"[VALIDATE] LIQUIDATION {symbol}: APPROVED (EXTERNAL_POSITION, "
                     f"quantity={quantity}, reason='{reason}')"
                 )
                 return OperationResult(
-                    allowed=False,
-                    reason="EXTERNAL_POSITION cannot be liquidated (user holding)",
-                    severity="CRITICAL"
+                    allowed=True,
+                    reason=f"Approved external position liquidation (reason: {reason})",
+                    severity="WARNING"
                 )
             
             # Allow liquidation of BOT_POSITION
@@ -395,15 +407,26 @@ class PositionOperationValidator:
     
     def _is_approved_external_operation(self, reason: str) -> bool:
         """Check if reason indicates explicit approval for external position operation."""
+        reason_u = str(reason or "").upper()
         approved_reasons = {
             "USER_APPROVED",
             "MANUAL_OVERRIDE",
             "EMERGENCY_LIQUIDATION",
             "SYSTEM_EMERGENCY",
             "FORCED_EXIT",
-            "COMPLIANCE_REQUIREMENT"
+            "COMPLIANCE_REQUIREMENT",
+            # Meta/rotation authority paths used for capital recycling.
+            "FORCED_ROTATION",
+            "ROTATION_AUTHORITY",
+            "STAGNATION_FORCE",
+            "VELOCITY_PURGE",
+            "ROTATION_STAGNATION_OVERRIDE",
+            "ROTATION_EXIT_VELOCITY_OVERRIDE",
+            "CAPITAL_RECOVERY",
+            "SELL_RECOVERY",
+            "FLAT_PORTFOLIO_SELL_RECOVERY",
         }
-        return any(ar in str(reason).upper() for ar in approved_reasons)
+        return any(ar in reason_u for ar in approved_reasons)
 
 
 # Import asyncio at module level (needed for iscoroutine checks)

@@ -3,10 +3,12 @@ Rotation & Exit Authority (REA) - P9 Canonical Design
 Provides capital velocity governance by authorizing forced exits for rotation.
 """
 
+import os
 import time
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 from utils.shared_state_tools import fee_bps
+from core.holding_utility import compute_holding_utility
 
 
 def _dynamic_exposure_cap(nav: float) -> float:
@@ -39,7 +41,7 @@ class RotationExitAuthority:
             # Try to import if not provided (fallback)
             try:
                 from core.capital_governor import CapitalGovernor
-                self.capital_governor = CapitalGovernor(config)
+                self.capital_governor = CapitalGovernor(config, shared_state=shared_state)
                 self.logger.info("[REA:Init] Capital Governor initialized for rotation enforcement (PHASE C)")
             except ImportError:
                 self.logger.warning("[REA:Init] Capital Governor not available, rotation will not be restricted by bracket")
@@ -172,6 +174,20 @@ class RotationExitAuthority:
             
             # Check if rotation should be restricted (MICRO bracket only)
             should_restrict = self.capital_governor.should_restrict_rotation(nav)
+            allow_micro_rotation = str(
+                getattr(
+                    self.config,
+                    "ALLOW_MICRO_BRACKET_ROTATION",
+                    os.getenv("ALLOW_MICRO_BRACKET_ROTATION", "false"),
+                )
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if should_restrict and allow_micro_rotation:
+                self.logger.info(
+                    "[REA:RotationRestriction] MICRO bracket rotation allowed (config override: ALLOW_MICRO_BRACKET_ROTATION=%s). NAV=%.2f, allowing rotation.",
+                    allow_micro_rotation,
+                    nav,
+                )
+                return False, "micro_bracket_override"
             
             if should_restrict:
                 self.logger.warning(
@@ -248,48 +264,38 @@ class RotationExitAuthority:
         except Exception:
             return False
 
-    def calculate_rotation_score(self, position: Dict[str, Any], best_opp_score: float) -> float:
+    def calculate_rotation_score(
+        self,
+        position: Dict[str, Any],
+        best_opp_score: float,
+        *,
+        symbol: Optional[str] = None,
+    ) -> float:
         """
-        R2/R3: Score a held position for rotation eligibility.
-        rotation_score = f(time_decay, pnl_efficiency, opportunity_cost)
-        
-        Higher score = STRONGER candidate for EXIT.
+        Unified rotation score from holding utility model.
+        Higher score = stronger candidate for exit.
         """
-        symbol = position.get("symbol", "unknown")
-        
-        # 1. Time Factor (Normalized age)
-        entry_ts = float(position.get("entry_time") or position.get("opened_at") or time.time())
-        max_hold_sec = float(getattr(self.config, "MAX_HOLD_SEC", 1800)) # 30 mins default
-        age_sec = time.time() - entry_ts
-        time_factor = min(age_sec / max_hold_sec, 1.0)
-        
-        # 2. PnL Efficiency (Clamped) — use net PnL after round-trip fees
-        gross_pnl_pct = float(position.get("unrealized_pnl_pct", 0.0) or 0.0)
-        rt_fee = self._round_trip_fee_pct()
-        pnl_pct = gross_pnl_pct - rt_fee  # net of fees
-        target_pnl = 0.03 # 3% target
-        pnl_factor = max(-1.0, min(1.0, pnl_pct / target_pnl))
-
-        # We want to keep winners (high pnl) and cycle losers (low/neg pnl)
-        # So efficiency_score is lower for winners
-        efficiency_score = 1.0 - pnl_factor
-
-        # 3. Opportunity Cost
-        # (How much better is the candidate compared to this position?)
-        # best_opp_score is expected ROI * confidence; compare against net held performance
-        held_score = pnl_pct * 0.5 # Basic proxy for held performance expectancy (net of fees)
-        opportunity_cost = max(0.0, best_opp_score - held_score)
-        
-        # Weighting
-        w_time = 0.3
-        w_eff = 0.3
-        w_opp = 0.4
-        
-        rotation_score = (w_time * time_factor) + (w_eff * efficiency_score) + (w_opp * opportunity_cost)
-        
+        sym = str(symbol or position.get("symbol") or "unknown")
+        utility_snapshot = compute_holding_utility(
+            sym,
+            position,
+            best_opp_score=best_opp_score,
+            shared_state=self.ss,
+            config=self.config,
+            now_ts=time.time(),
+        )
+        rotation_score = float(utility_snapshot.get("rotation_pressure", 0.0) or 0.0)
         self.logger.debug(
-            "[REA:Score] %s rotation_score=%.4f (time=%.2f, eff=%.2f, opp=%.2f)",
-            symbol, rotation_score, time_factor, efficiency_score, opportunity_cost
+            "[REA:Score] %s rotation_score=%.4f utility=%.4f (age=%.2fh pnl_eff=%.2f liq=%.2f trade=%.2f edge=%.2f opp_pen=%.2f)",
+            sym,
+            rotation_score,
+            float(utility_snapshot.get("utility", 0.0) or 0.0),
+            float(utility_snapshot.get("age_hours", 0.0) or 0.0),
+            float(utility_snapshot.get("pnl_efficiency_component", 0.0) or 0.0),
+            float(utility_snapshot.get("liquidity_component", 0.0) or 0.0),
+            float(utility_snapshot.get("tradability_component", 0.0) or 0.0),
+            float(utility_snapshot.get("forward_edge_component", 0.0) or 0.0),
+            float(utility_snapshot.get("opportunity_penalty", 0.0) or 0.0),
         )
         return rotation_score
 
@@ -300,7 +306,8 @@ class RotationExitAuthority:
         owned_positions: Dict[str, Any], 
         best_opp: Dict[str, Any],
         current_mode: str,
-        is_starved: bool = False
+        is_starved: bool = False,
+        force_rotation: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         R4: Authorize a FORCED_EXIT if rotation criteria met.
@@ -308,12 +315,21 @@ class RotationExitAuthority:
         
         OVERRIDE AUTHORITY: This can override standard TPSL and mode constraints
         if the alpha gap (opportunity cost) is sufficient.
+        
+        PRECEDENCE: force_rotation flag overrides MICRO bracket restrictions.
         """
         # ─────────────────────────────────────────────────────────────────
         # PHASE C: Capital Governor Rotation Restriction Check
         # Block rotation in MICRO bracket for focused learning
+        # Override permitted if force_rotation or _force_micro_rotation is set
         # ─────────────────────────────────────────────────────────────────
-        if owned_positions:
+        force_rotation = bool(
+            force_rotation
+            or (isinstance(best_opp, dict) and bool(best_opp.get("_force_micro_rotation")))
+        )
+
+        if owned_positions and not force_rotation:
+            # PHASE C check: Only apply MICRO bracket restriction if NOT forced
             first_symbol = next(iter(owned_positions.keys()), None)
             if first_symbol:
                 should_restrict, reason = self.should_restrict_rotation(first_symbol)
@@ -323,6 +339,17 @@ class RotationExitAuthority:
                         first_symbol, reason
                     )
                     return None  # Block rotation
+        elif owned_positions and force_rotation:
+            # Force rotation overrides MICRO bracket restriction
+            first_symbol = next(iter(owned_positions.keys()), None)
+            if first_symbol:
+                should_restrict, reason = self.should_restrict_rotation(first_symbol)
+                if should_restrict:
+                    self.logger.warning(
+                        "[REA:authorize_rotation] ⚠️ MICRO restriction OVERRIDDEN for %s due to forced rotation (%s)",
+                        first_symbol,
+                        reason or "no_reason",
+                    )
         
         # Condition Check: Either we are full OR we are out of capital
         if sig_pos < max_pos and not is_starved:
@@ -338,6 +365,7 @@ class RotationExitAuthority:
         candidates = []
         now = time.time()
         cooldown = float(getattr(self.config, "ROTATION_COOLDOWN_SEC", 600))
+        keep_utility_min = float(getattr(self.config, "ROTATION_KEEP_UTILITY_MIN", 0.72) or 0.72)
         
         # Bootstrap bypass: ignore cooldown if we need velocity
         if current_mode == "BOOTSTRAP":
@@ -368,14 +396,30 @@ class RotationExitAuthority:
                     )
                     continue
 
-            r_score = self.calculate_rotation_score(pos, opp_score)
-            candidates.append((sym, r_score, pos))
+            utility_snapshot = compute_holding_utility(
+                sym,
+                pos,
+                best_opp_score=opp_score,
+                shared_state=self.ss,
+                config=self.config,
+                now_ts=now,
+            )
+            utility = float(utility_snapshot.get("utility", 0.0) or 0.0)
+            if utility >= keep_utility_min and not is_starved:
+                self.logger.debug(
+                    "[REA:UtilityKeep] %s utility=%.3f >= %.3f (kept; no starvation override)",
+                    sym, utility, keep_utility_min
+                )
+                continue
+
+            r_score = float(utility_snapshot.get("rotation_pressure", 0.0) or 0.0)
+            candidates.append((sym, r_score, utility, pos, utility_snapshot))
             
         if not candidates:
             return None
             
         # Find best exit candidate (highest rotation score)
-        worst_sym, highest_r_score, worst_pos = max(candidates, key=lambda x: x[1])
+        worst_sym, highest_r_score, worst_utility, worst_pos, worst_snapshot = max(candidates, key=lambda x: x[1])
         
         # Threshold logic
         threshold = self.mode_thresholds.get(current_mode, 0.6)
@@ -404,8 +448,8 @@ class RotationExitAuthority:
             if stagnation_override and highest_r_score < threshold:
                 reason = "ROTATION_STAGNATION_OVERRIDE"
             self.logger.info(
-                "[REA:Authorized] 🔄 Rotation GRANTED: %s (score=%.2f) -> %s (opp=%.2f) [Mode: %s, Starved: %s]",
-                worst_sym, highest_r_score, best_opp_sym, opp_score, current_mode, is_starved
+                "[REA:Authorized] 🔄 Rotation GRANTED: %s (pressure=%.2f, utility=%.2f) -> %s (opp=%.2f) [Mode: %s, Starved: %s]",
+                worst_sym, highest_r_score, worst_utility, best_opp_sym, opp_score, current_mode, is_starved
             )
             
             return {
@@ -420,6 +464,9 @@ class RotationExitAuthority:
                 "_is_rotation": True,
                 "_forced_exit": True,
                 "_rotation_score": highest_r_score,
+                "_holding_utility": float(worst_snapshot.get("utility", 0.0) or 0.0),
+                "_rotation_pressure": float(worst_snapshot.get("rotation_pressure", 0.0) or 0.0),
+                "_utility_opportunity_penalty": float(worst_snapshot.get("opportunity_penalty", 0.0) or 0.0),
                 "_stagnation_override": stagnation_override,
                 "allow_partial": True,
                 "target_fraction": 0.5
@@ -687,6 +734,147 @@ class RotationExitAuthority:
                     "target_fraction": 0.5 
                 }
         return None
+
+    def authorize_liquidity_restoration_exit(
+        self,
+        owned_positions: Dict[str, Any],
+        nav: float,
+        free_usdt: float,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Rule 3.5: Liquidity restoration / optionality preservation.
+
+        If operating cash drops below strategic reserve, recycle the lowest-utility
+        holding (preferring dead-capital style positions) to restore quote liquidity.
+        """
+        if not owned_positions:
+            return None
+
+        shared_cfg = getattr(self.ss, "config", None)
+        reserve_ratio = float(
+            getattr(shared_cfg, "quote_reserve_ratio", getattr(self.config, "CAPITAL_FLOOR_PCT", 0.20)) or 0.20
+        )
+        abs_floor = float(
+            getattr(self.config, "ABSOLUTE_MIN_FLOOR", getattr(self.config, "CAPITAL_PRESERVATION_FLOOR", 10.0))
+            or 10.0
+        )
+        reserve_target = max(abs_floor, float(nav or 0.0) * reserve_ratio)
+        shortfall = reserve_target - float(free_usdt or 0.0)
+        if shortfall <= 0.0:
+            return None
+
+        # Avoid micro-churn for tiny reserve drift.
+        min_shortfall = float(getattr(self.config, "LIQUIDITY_RESTORE_MIN_SHORTFALL_USDT", 1.0) or 1.0)
+        ss_metrics = getattr(self.ss, "metrics", {}) if hasattr(self.ss, "metrics") else {}
+        dead_cap_ratio = float((ss_metrics or {}).get("dead_capital_ratio", 0.0) or 0.0)
+        min_dead_cap_ratio = float(getattr(self.config, "LIQUIDITY_RESTORE_MIN_DEAD_CAP_RATIO", 0.08) or 0.08)
+        if shortfall < min_shortfall and dead_cap_ratio < min_dead_cap_ratio:
+            return None
+
+        keep_utility_min = float(getattr(self.config, "LIQUIDITY_RESTORE_KEEP_UTILITY_MIN", 0.86) or 0.86)
+        target_buffer_mult = float(getattr(self.config, "LIQUIDITY_RESTORE_BUFFER_MULT", 1.10) or 1.10)
+        desired_recovery = max(shortfall, min_shortfall) * target_buffer_mult
+        now_ts = time.time()
+
+        candidates = []
+        for sym, pos in owned_positions.items():
+            if self._is_permanent_dust_position(sym, pos):
+                continue
+            if str(pos.get("state", "")).upper() == "EXITING":
+                continue
+
+            qty = float(pos.get("quantity", 0.0) or pos.get("qty", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+
+            px = float(pos.get("mark_price", 0.0) or pos.get("entry_price", 0.0) or 0.0)
+            value_usdt = float(pos.get("value_usdt", 0.0) or (qty * px if px > 0 else 0.0) or 0.0)
+            if value_usdt <= 0:
+                continue
+
+            utility_snapshot = compute_holding_utility(
+                sym,
+                pos,
+                best_opp_score=0.0,
+                shared_state=self.ss,
+                config=self.config,
+                now_ts=now_ts,
+            )
+            utility = float(utility_snapshot.get("utility", 0.0) or 0.0)
+            rotation_pressure = float(utility_snapshot.get("rotation_pressure", 0.0) or 0.0)
+            try:
+                sig_flag = pos.get("is_significant", 1.0)
+                is_significant = bool(sig_flag) if isinstance(sig_flag, bool) else float(sig_flag or 0.0) > 0.0
+            except Exception:
+                is_significant = True
+
+            # Prefer selling low-utility and dead-capital-like positions first.
+            is_dead_like = bool(
+                pos.get("is_dust")
+                or pos.get("_is_dust")
+                or str(pos.get("status", "")).upper() in {"DUST", "PERMANENT_DUST"}
+                or bool(pos.get("_mirrored", False))
+                or not is_significant
+            )
+
+            # Keep very high-utility positions unless reserve gap is severe.
+            severe_shortfall = shortfall >= max(min_shortfall * 2.0, reserve_target * 0.10)
+            if utility >= keep_utility_min and not severe_shortfall and not is_dead_like:
+                continue
+
+            candidates.append((
+                0 if is_dead_like else 1,             # dead capital first
+                utility,                               # then lowest utility
+                -rotation_pressure,                    # then highest pressure
+                -value_usdt,                           # then larger recovery impact
+                sym,
+                value_usdt,
+                utility_snapshot,
+            ))
+
+        if not candidates:
+            return None
+
+        _, worst_utility, _, _, chosen_sym, chosen_value, chosen_snapshot = min(candidates, key=lambda x: x[:4])
+
+        target_fraction = min(1.0, max(0.25, desired_recovery / max(chosen_value, 1e-9)))
+        # If this is already low-utility pressure, prefer decisive cleanup.
+        if float(chosen_snapshot.get("rotation_pressure", 0.0) or 0.0) >= 0.75:
+            target_fraction = max(target_fraction, 0.85)
+        allow_partial = target_fraction < 0.98
+
+        self.logger.warning(
+            "[REA:LiquidityRestore] 💧 free=%.2f target=%.2f shortfall=%.2f (dead_cap_ratio=%.2f). "
+            "Recycling %s utility=%.3f pressure=%.3f value=%.2f target_fraction=%.2f",
+            free_usdt,
+            reserve_target,
+            shortfall,
+            dead_cap_ratio,
+            chosen_sym,
+            float(chosen_snapshot.get("utility", 0.0) or 0.0),
+            float(chosen_snapshot.get("rotation_pressure", 0.0) or 0.0),
+            chosen_value,
+            target_fraction,
+        )
+
+        return {
+            "symbol": chosen_sym,
+            "action": "SELL",
+            "confidence": 1.0,
+            "agent": "RotationExitAuthority",
+            "reason": "CAPITAL_RECOVERY_LIQUIDITY_RESTORATION",
+            "priority": "HIGH",
+            "_forced_exit": True,
+            "_capital_recovery_forced": True,
+            "_is_liquidity_restoration": True,
+            "_holding_utility": float(chosen_snapshot.get("utility", 0.0) or 0.0),
+            "_rotation_pressure": float(chosen_snapshot.get("rotation_pressure", 0.0) or 0.0),
+            "_reserve_target_usdt": float(reserve_target),
+            "_reserve_shortfall_usdt": float(shortfall),
+            "allow_partial": bool(allow_partial),
+            "target_fraction": float(target_fraction if allow_partial else 1.0),
+        }
+
     def authorize_starvation_efficiency_exit(
         self,
         owned_positions: Dict[str, Any],
@@ -706,31 +894,52 @@ class RotationExitAuthority:
             
         now = time.time()
         candidates = []
-        
-        for sym, pos in owned_positions.items():
-            if self._is_permanent_dust_position(sym, pos):
-                continue
-            entry_ts = float(pos.get("entry_time") or pos.get("opened_at") or now)
-            age_hours = (now - entry_ts) / 3600.0
-            pnl_pct = float(pos.get("unrealized_pnl_pct", 0.0) or 0.0)
-            
-            # Efficiency: profit generated per hour held
-            # We use age_hours + 0.1 to avoid division by zero and dampen very new positions
-            efficiency = pnl_pct / (age_hours + 0.1)
-            candidates.append((sym, efficiency, pos))
-            
+        min_age_min = float(getattr(self.config, "STARVATION_UTILITY_MIN_AGE_MINUTES", 5.0) or 5.0)
+        min_age_h = min_age_min / 60.0
+
+        def _collect(require_min_age: bool) -> List[Tuple[str, float, Dict[str, float], Dict[str, Any]]]:
+            tmp: List[Tuple[str, float, Dict[str, float], Dict[str, Any]]] = []
+            for sym, pos in owned_positions.items():
+                if self._is_permanent_dust_position(sym, pos):
+                    continue
+                entry_ts = float(pos.get("entry_time") or pos.get("opened_at") or now)
+                age_hours = (now - entry_ts) / 3600.0
+                if require_min_age and age_hours < min_age_h:
+                    continue
+                utility_snapshot = compute_holding_utility(
+                    sym,
+                    pos,
+                    best_opp_score=0.0,
+                    shared_state=self.ss,
+                    config=self.config,
+                    now_ts=now,
+                )
+                utility = float(utility_snapshot.get("utility", 0.0) or 0.0)
+                tmp.append((sym, utility, utility_snapshot, pos))
+            return tmp
+
+        candidates = _collect(require_min_age=True)
+        if not candidates:
+            candidates = _collect(require_min_age=False)
         if not candidates:
             return None
-            
-        # Exit the one with the LOWEST efficiency
-        worst_sym, lowest_eff, worst_pos = min(candidates, key=lambda x: x[1])
-        
+
+        # Exit the holding with the LOWEST utility under starvation.
+        worst_sym, worst_utility, worst_snapshot, worst_pos = min(
+            candidates,
+            key=lambda x: (x[1], -float(x[2].get("rotation_pressure", 0.0) or 0.0)),
+        )
+
         self.logger.warning(
             "[REA:Starvation] 🚨 CAPITAL STARVED (free=%.2f < floor=%.2f). "
-            "Exiting lowest efficiency position: %s (eff=%.4f/hr)",
-            free_usdt, capital_floor, worst_sym, lowest_eff
+            "Exiting lowest-utility position: %s (utility=%.3f pressure=%.3f)",
+            free_usdt,
+            capital_floor,
+            worst_sym,
+            worst_utility,
+            float(worst_snapshot.get("rotation_pressure", 0.0) or 0.0),
         )
-        
+
         return {
             "symbol": worst_sym,
             "action": "SELL",
@@ -738,5 +947,7 @@ class RotationExitAuthority:
             "agent": "RotationExitAuthority",
             "reason": "STARVATION_EFFICIENCY_EXIT",
             "_forced_exit": True,
+            "_holding_utility": float(worst_snapshot.get("utility", 0.0) or 0.0),
+            "_rotation_pressure": float(worst_snapshot.get("rotation_pressure", 0.0) or 0.0),
             "allow_partial": False # Full exit to maximize recovery
         }

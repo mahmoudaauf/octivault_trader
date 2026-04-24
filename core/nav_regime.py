@@ -76,9 +76,35 @@ FILE DEPENDENCIES:
 """
 
 import logging
+import os
 import time
 from typing import Dict, Any, Optional, Set
 from enum import Enum
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Safely parse bool-like values from config/env."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _coerce_int(value: Any, default: int, minimum: int = 1) -> int:
+    """Safely parse int-like values with lower bound."""
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(default)
+    return max(int(minimum), parsed)
 
 
 class NAVRegime:
@@ -97,7 +123,7 @@ class MicroSniperConfig:
     
     # Quality gates
     MIN_EXPECTED_MOVE_PCT = 1.0  # 1.0% minimum move required
-    MIN_CONFIDENCE = 0.70  # 70% confidence minimum
+    MIN_CONFIDENCE = 0.50  # 🔧 FIX: Lowered from 0.70 to 0.50 to allow high-quality signals (0.75+) to execute
     MIN_HOLD_TIME_SEC = 600  # 10 minutes minimum holding period
     MAX_TRADES_PER_DAY = 3  # Maximum 3 trades per calendar day
     
@@ -125,7 +151,7 @@ class StandardConfig:
     
     # Quality gates
     MIN_EXPECTED_MOVE_PCT = 0.50  # Relaxed vs MICRO
-    MIN_CONFIDENCE = 0.65
+    MIN_CONFIDENCE = 0.55  # 🔧 FIX: Lowered from 0.65 to 0.55
     MIN_HOLD_TIME_SEC = 300  # 5 minutes
     MAX_TRADES_PER_DAY = 6  # Moderate trade frequency
     
@@ -152,7 +178,7 @@ class MultiAgentConfig:
     
     # Quality gates
     MIN_EXPECTED_MOVE_PCT = 0.30  # Full sensitivity
-    MIN_CONFIDENCE = 0.60  # Standard threshold
+    MIN_CONFIDENCE = 0.45  # 🔧 FIX: Lowered from 0.60 to 0.45
     MIN_HOLD_TIME_SEC = 180  # Normal scaling
     MAX_TRADES_PER_DAY = 20  # Unrestricted
     
@@ -170,7 +196,12 @@ class MultiAgentConfig:
     MIN_PROFITABLE_MOVE_PCT = 0.8  # Increased from 0.55% but lower than smaller account tiers
 
 
-def get_nav_regime(nav: float) -> str:
+def get_nav_regime(
+    nav: float,
+    *,
+    micro_threshold: float = 1000.0,
+    multi_agent_threshold: float = 5000.0,
+) -> str:
     """
     Determine regime based on live NAV.
     
@@ -180,9 +211,14 @@ def get_nav_regime(nav: float) -> str:
     Returns:
         str: NAVRegime constant (MICRO_SNIPER, STANDARD, or MULTI_AGENT)
     """
-    if nav < 1000.0:
+    micro_threshold = float(micro_threshold or 1000.0)
+    multi_agent_threshold = float(multi_agent_threshold or 5000.0)
+    if multi_agent_threshold <= micro_threshold:
+        multi_agent_threshold = micro_threshold * 2.0
+
+    if nav < micro_threshold:
         return NAVRegime.MICRO_SNIPER
-    elif nav < 5000.0:
+    elif nav < multi_agent_threshold:
         return NAVRegime.STANDARD
     else:
         return NAVRegime.MULTI_AGENT
@@ -231,14 +267,39 @@ class RegimeManager:
     3. Log regime state changes
     """
     
-    def __init__(self, logger: Optional[logging.Logger] = None):
+    def __init__(self, logger: Optional[logging.Logger] = None, config: Optional[Any] = None):
         self.logger = logger or logging.getLogger("NAVRegime")
+        self.config = config
+        self.micro_threshold = float(
+            getattr(config, "NAV_REGIME_MICRO_THRESHOLD", 0.0)
+            or getattr(config, "CAPITAL_MICRO_THRESHOLD", 0.0)
+            or os.getenv("NAV_REGIME_MICRO_THRESHOLD", os.getenv("CAPITAL_MICRO_THRESHOLD", "500"))
+            or 500.0
+        )
+        self.multi_agent_threshold = float(
+            getattr(config, "NAV_REGIME_MULTI_AGENT_THRESHOLD", 0.0)
+            or getattr(config, "CAPITAL_MEDIUM_THRESHOLD", 0.0)
+            or os.getenv(
+                "NAV_REGIME_MULTI_AGENT_THRESHOLD",
+                os.getenv("CAPITAL_MEDIUM_THRESHOLD", "10000"),
+            )
+            or 10000.0
+        )
+        if self.multi_agent_threshold <= self.micro_threshold:
+            self.multi_agent_threshold = self.micro_threshold * 2.0
+
         self.current_regime = NAVRegime.MULTI_AGENT  # Default assume large account
-        self.current_config = get_regime_config(NAVRegime.MULTI_AGENT)
+        self.current_config = self._apply_runtime_overrides(get_regime_config(NAVRegime.MULTI_AGENT))
         self.last_regime_switch_ts = time.time()
         self.regime_switch_count = 0
         self._trades_executed_today = 0
         self._last_trade_day_utc = None
+        self.logger.info(
+            "[NAVRegime] thresholds loaded: micro<%.2f, standard<%.2f, multi_agent>=%.2f",
+            self.micro_threshold,
+            self.multi_agent_threshold,
+            self.multi_agent_threshold,
+        )
     
     def update_regime(self, nav: float) -> bool:
         """
@@ -250,13 +311,17 @@ class RegimeManager:
         Returns:
             bool: True if regime changed, False if same regime
         """
-        new_regime = get_nav_regime(nav)
+        new_regime = get_nav_regime(
+            nav,
+            micro_threshold=self.micro_threshold,
+            multi_agent_threshold=self.multi_agent_threshold,
+        )
         regime_switched = (new_regime != self.current_regime)
         
         if regime_switched:
             old_regime = self.current_regime
             self.current_regime = new_regime
-            self.current_config = get_regime_config(new_regime)
+            self.current_config = self._apply_runtime_overrides(get_regime_config(new_regime))
             self.last_regime_switch_ts = time.time()
             self.regime_switch_count += 1
             
@@ -266,6 +331,54 @@ class RegimeManager:
             )
         
         return regime_switched
+
+    def _apply_runtime_overrides(self, base_config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Apply runtime micro-capital overrides so NAV regime gates stay aligned with
+        adaptive capital-governor settings.
+        """
+        cfg = dict(base_config or {})
+        regime = str(cfg.get("regime") or "")
+        if regime != NAVRegime.MICRO_SNIPER:
+            return cfg
+
+        default_max_pos = int(cfg.get("max_open_positions", 1) or 1)
+        default_max_symbols = int(cfg.get("max_active_symbols", default_max_pos) or default_max_pos)
+        default_rotation = bool(cfg.get("rotation_enabled", False))
+
+        raw_micro_max = getattr(self.config, "CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS", None)
+        if raw_micro_max is None:
+            raw_micro_max = os.getenv("CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS")
+        micro_max_pos = _coerce_int(raw_micro_max, default=default_max_pos, minimum=1)
+
+        raw_rotation = getattr(self.config, "CAPITAL_MICRO_ALLOW_ROTATION", None)
+        if raw_rotation is None:
+            raw_rotation = os.getenv("CAPITAL_MICRO_ALLOW_ROTATION")
+        rotation_enabled = _coerce_bool(raw_rotation, default=default_rotation)
+
+        raw_rot_slots = getattr(self.config, "CAPITAL_MICRO_ADAPTIVE_MAX_ROTATING_SLOTS", None)
+        if raw_rot_slots is None:
+            raw_rot_slots = os.getenv("CAPITAL_MICRO_ADAPTIVE_MAX_ROTATING_SLOTS")
+        rotating_slots = _coerce_int(raw_rot_slots, default=1, minimum=0)
+
+        target_symbols = micro_max_pos + (rotating_slots if rotation_enabled else 0)
+        cfg["max_open_positions"] = micro_max_pos
+        cfg["rotation_enabled"] = rotation_enabled
+        cfg["max_active_symbols"] = max(default_max_symbols, target_symbols, 1)
+
+        if (
+            cfg["max_open_positions"] != default_max_pos
+            or cfg["rotation_enabled"] != default_rotation
+            or cfg["max_active_symbols"] != default_max_symbols
+        ):
+            self.logger.info(
+                "[NAVRegime:Override] MICRO_SNIPER overrides applied: max_open_positions=%d max_active_symbols=%d rotation_enabled=%s",
+                cfg["max_open_positions"],
+                cfg["max_active_symbols"],
+                cfg["rotation_enabled"],
+            )
+
+        return cfg
     
     def get_regime(self) -> str:
         """Get current regime."""

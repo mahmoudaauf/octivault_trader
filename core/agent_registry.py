@@ -265,6 +265,7 @@ if __name__ == "__main__":
 # iterating AGENT_CLASS_MAP, which also contains non-discovery agents.
 _DISCOVERY_AGENTS = [
     ("wallet_scanner_agent", "WalletScannerAgent"),
+    ("symbol_screener", "SymbolScreener"),
     ("symbol_screener_agent", "SymbolScreener"),
     ("ipo_chaser", "IPOChaser"),
 ]
@@ -294,7 +295,20 @@ def register_all_discovery_agents(agent_manager, app_context):
             "tp_sl_engine": getattr(app_context, "tp_sl_engine", None),
         }
         try:
-            return cls(**{k: v for k, v in kwargs.items() if v is not None})
+            filtered = {k: v for k, v in kwargs.items() if v is not None}
+            try:
+                sig = inspect.signature(cls.__init__)
+                params = set(sig.parameters.keys()) - {"self"}
+                accepts_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                )
+                if not accepts_var_kw:
+                    filtered = {k: v for k, v in filtered.items() if k in params}
+            except Exception:
+                # Signature introspection failed; keep best-effort kwargs.
+                pass
+            return cls(**filtered)
         except Exception as exc:
             _logger.debug("[_safe_build] %s construction failed: %s", name, exc)
             return None
@@ -350,7 +364,19 @@ def register_all_strategy_agents(agent_manager, app_context):
             "market_data_feed": getattr(app_context, "market_data_feed", None),
         }
         try:
-            return cls(**{k: v for k, v in kwargs.items() if v is not None})
+            filtered = {k: v for k, v in kwargs.items() if v is not None}
+            try:
+                sig = inspect.signature(cls.__init__)
+                params = set(sig.parameters.keys()) - {"self"}
+                accepts_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                )
+                if not accepts_var_kw:
+                    filtered = {k: v for k, v in filtered.items() if k in params}
+            except Exception:
+                pass
+            return cls(**filtered)
         except Exception as exc:
             _logger.debug("[_safe_build] %s construction failed: %s", name, exc)
             return None

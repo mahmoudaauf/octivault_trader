@@ -41,6 +41,7 @@ Architecture Notes:
 """
 
 import logging
+import time
 from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
 
@@ -83,6 +84,92 @@ class CapitalGovernor:
         self.small_threshold = float(getattr(config, "CAPITAL_SMALL_THRESHOLD", 2000.0) or 2000.0)
         self.medium_threshold = float(getattr(config, "CAPITAL_MEDIUM_THRESHOLD", 10000.0) or 10000.0)
         # >= medium_threshold: LARGE bracket
+
+        # MICRO bracket policy knobs (env-configurable through Config)
+        self.micro_max_active_symbols = max(
+            1, int(getattr(config, "CAPITAL_MICRO_MAX_ACTIVE_SYMBOLS", 3) or 3)
+        )
+        self.micro_core_pairs = max(
+            1, int(getattr(config, "CAPITAL_MICRO_CORE_PAIRS", 2) or 2)
+        )
+        self.micro_rotating_slots = max(
+            0, int(getattr(config, "CAPITAL_MICRO_MAX_ROTATING_SLOTS", 1) or 1)
+        )
+        self.micro_max_concurrent_positions = max(
+            1, int(getattr(config, "CAPITAL_MICRO_MAX_CONCURRENT_POSITIONS", 2) or 2)
+        )
+        self.micro_allow_rotation = bool(
+            getattr(config, "CAPITAL_MICRO_ALLOW_ROTATION", True)
+        )
+        self.micro_replacement_multiplier = float(
+            getattr(config, "CAPITAL_MICRO_SYMBOL_REPLACEMENT_MULTIPLIER", 1.35) or 1.35
+        )
+        self.micro_soft_lock_sec = max(
+            60, int(getattr(config, "CAPITAL_MICRO_SOFT_LOCK_DURATION_SEC", 3600) or 3600)
+        )
+        self.micro_enforce_liveness = bool(
+            getattr(config, "CAPITAL_MICRO_ENFORCE_LIVENESS", True)
+        )
+
+        # Adaptive micro-capacity escape hatch: respond to POSITION_ALREADY_OPEN pressure.
+        self.micro_adaptive_enabled = bool(
+            getattr(config, "CAPITAL_MICRO_ADAPTIVE_CAPACITY_ENABLED", True)
+        )
+        self.micro_adaptive_trigger = max(
+            1, int(getattr(config, "CAPITAL_MICRO_ADAPTIVE_PRESSURE_TRIGGER", 6) or 6)
+        )
+        self.micro_adaptive_window_sec = max(
+            30.0, float(getattr(config, "CAPITAL_MICRO_ADAPTIVE_WINDOW_SEC", 300.0) or 300.0)
+        )
+        self.micro_adaptive_max_positions = max(
+            self.micro_max_concurrent_positions,
+            int(getattr(config, "CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS", 2) or 2),
+        )
+        self.micro_adaptive_rotating_slots = max(
+            self.micro_rotating_slots,
+            int(getattr(config, "CAPITAL_MICRO_ADAPTIVE_MAX_ROTATING_SLOTS", 1) or 1),
+        )
+        self.micro_adaptive_soft_lock_sec = max(
+            60, int(getattr(config, "CAPITAL_MICRO_ADAPTIVE_SOFT_LOCK_DURATION_SEC", 900) or 900)
+        )
+        self.micro_adaptive_replacement_multiplier = float(
+            getattr(config, "CAPITAL_MICRO_ADAPTIVE_SYMBOL_REPLACEMENT_MULTIPLIER", 1.35) or 1.35
+        )
+        self.micro_adaptive_sell_deadlock_enabled = bool(
+            getattr(config, "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_ENABLED", True)
+        )
+        self.micro_adaptive_sell_deadlock_trigger = max(
+            1, int(getattr(config, "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_TRIGGER", 5) or 5)
+        )
+        self.micro_adaptive_sell_deadlock_window_sec = max(
+            30.0,
+            float(
+                getattr(
+                    config,
+                    "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_WINDOW_SEC",
+                    self.micro_adaptive_window_sec,
+                )
+                or self.micro_adaptive_window_sec
+            ),
+        )
+        sell_deadlock_reasons_csv = str(
+            getattr(
+                config,
+                "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_REASONS",
+                "PORTFOLIO_PNL_IMPROVEMENT,SELL_DYNAMIC_EDGE_MIN,CLOSE_NOT_SUBMITTED,SELL_NET_PNL_MIN",
+            )
+            or ""
+        )
+        sell_deadlock_reasons = [
+            token.strip().upper()
+            for token in sell_deadlock_reasons_csv.split(",")
+            if str(token).strip()
+        ]
+        self.micro_adaptive_sell_deadlock_reasons = tuple(sell_deadlock_reasons)
+
+        # Prevent deadlock-prone micro setup (single slot + no rotation) unless explicitly disabled.
+        if self.micro_enforce_liveness:
+            self._apply_micro_liveness_guard()
         
         logger.info(
             "[CapitalGovernor] Initialized with brackets: "
@@ -93,6 +180,42 @@ class CapitalGovernor:
             self.small_threshold,
             self.medium_threshold,
             self.medium_threshold
+        )
+
+    def _apply_micro_liveness_guard(self) -> None:
+        """
+        Ensure micro profile can execute at least one new opportunity while holding one position.
+
+        This preserves conservative risk while preventing perpetual decision=NONE loops
+        caused by (max_positions=1, rotation=False).
+        """
+        deadlock_prone = (
+            int(self.micro_max_concurrent_positions) <= 1
+            and int(self.micro_rotating_slots) <= 0
+            and not bool(self.micro_allow_rotation)
+        )
+        if not deadlock_prone:
+            return
+
+        self.micro_max_concurrent_positions = max(2, int(self.micro_max_concurrent_positions))
+        self.micro_rotating_slots = max(1, int(self.micro_rotating_slots))
+        self.micro_allow_rotation = True
+        self.micro_max_active_symbols = max(
+            int(self.micro_max_active_symbols),
+            int(self.micro_core_pairs) + int(self.micro_rotating_slots),
+        )
+        self.micro_replacement_multiplier = min(float(self.micro_replacement_multiplier), 1.35)
+        self.micro_soft_lock_sec = min(int(self.micro_soft_lock_sec), 3600)
+        logger.warning(
+            "[CapitalGovernor] Applied MICRO liveness guard: active_symbols=%d core_pairs=%d "
+            "rotating_slots=%d max_positions=%d rotation=%s replacement_multiplier=%.2f soft_lock=%ss",
+            self.micro_max_active_symbols,
+            self.micro_core_pairs,
+            self.micro_rotating_slots,
+            self.micro_max_concurrent_positions,
+            self.micro_allow_rotation,
+            self.micro_replacement_multiplier,
+            self.micro_soft_lock_sec,
         )
     
     async def get_fresh_nav(self) -> float:
@@ -170,6 +293,118 @@ class CapitalGovernor:
             return CapitalBracket.MEDIUM
         else:
             return CapitalBracket.LARGE
+
+    def _get_position_open_pressure(self) -> int:
+        """
+        Estimate recent POSITION_ALREADY_OPEN BUY rejection pressure.
+
+        Uses SharedState rejection_history when available and falls back to
+        rejection_counters. This keeps pressure local in time and avoids
+        permanently widening limits from stale historical rejections.
+        """
+        if not self.shared_state:
+            return 0
+
+        now_ts = time.time()
+        window_sec = float(self.micro_adaptive_window_sec)
+        pressure = 0
+
+        try:
+            history = list(getattr(self.shared_state, "rejection_history", []) or [])
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("side", "")).upper() != "BUY":
+                    continue
+                if str(item.get("reason", "")).upper() != "POSITION_ALREADY_OPEN":
+                    continue
+                ts = float(item.get("ts", 0.0) or 0.0)
+                if ts <= 0 or (now_ts - ts) > window_sec:
+                    continue
+                pressure += 1
+        except Exception:
+            pressure = 0
+
+        if pressure > 0:
+            return int(pressure)
+
+        # Fallback: aggregate from counters when history is unavailable.
+        try:
+            counters = getattr(self.shared_state, "rejection_counters", {}) or {}
+            timestamps = getattr(self.shared_state, "rejection_timestamps", {}) or {}
+            for key, count in counters.items():
+                if not isinstance(key, tuple) or len(key) < 3:
+                    continue
+                sym, side, reason = key[0], key[1], key[2]
+                if str(side).upper() != "BUY":
+                    continue
+                if str(reason).upper() != "POSITION_ALREADY_OPEN":
+                    continue
+                ts = float(timestamps.get(key, 0.0) or 0.0)
+                if ts > 0 and (now_ts - ts) <= window_sec:
+                    pressure += int(count or 0)
+        except Exception:
+            return 0
+
+        return max(0, int(pressure))
+
+    def _get_sell_deadlock_pressure(self) -> int:
+        """
+        Estimate recent SELL deadlock pressure in micro mode.
+
+        Captures repeated SELL rejections that block capacity recycling
+        (for example portfolio improvement or dynamic edge guards), then
+        allows the governor to temporarily widen micro limits.
+        """
+        if not self.shared_state or not self.micro_adaptive_sell_deadlock_enabled:
+            return 0
+
+        reasons = set(self.micro_adaptive_sell_deadlock_reasons)
+        if not reasons:
+            return 0
+
+        now_ts = time.time()
+        window_sec = float(self.micro_adaptive_sell_deadlock_window_sec)
+        pressure = 0
+
+        try:
+            history = list(getattr(self.shared_state, "rejection_history", []) or [])
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("side", "")).upper() != "SELL":
+                    continue
+                if str(item.get("reason", "")).upper() not in reasons:
+                    continue
+                ts = float(item.get("ts", 0.0) or 0.0)
+                if ts <= 0 or (now_ts - ts) > window_sec:
+                    continue
+                pressure += 1
+        except Exception:
+            pressure = 0
+
+        if pressure > 0:
+            return int(pressure)
+
+        # Fallback to counters when detailed history is unavailable.
+        try:
+            counters = getattr(self.shared_state, "rejection_counters", {}) or {}
+            timestamps = getattr(self.shared_state, "rejection_timestamps", {}) or {}
+            for key, count in counters.items():
+                if not isinstance(key, tuple) or len(key) < 3:
+                    continue
+                _, side, reason = key[0], key[1], key[2]
+                if str(side).upper() != "SELL":
+                    continue
+                if str(reason).upper() not in reasons:
+                    continue
+                ts = float(timestamps.get(key, 0.0) or 0.0)
+                if ts > 0 and (now_ts - ts) <= window_sec:
+                    pressure += int(count or 0)
+        except Exception:
+            return 0
+
+        return max(0, int(pressure))
     
     def get_position_limits(self, nav: float) -> Dict[str, Any]:
         """
@@ -198,16 +433,60 @@ class CapitalGovernor:
             # Best Practice: Fix 1-2 core pairs, allow 1 rotating slot max
             limits = {
                 "bracket": bracket.value,
-                "max_active_symbols": 2,              # Only 2 symbols total
-                "core_pairs": 2,                      # Both are core (no rotation)
-                "max_rotating_slots": 0,              # No rotation allowed!
-                "max_concurrent_positions": 1,        # Only 1 position at a time
-                "allow_rotation": False,              # Disable rotation
-                "symbol_replacement_multiplier": 2.0, # Require 100% improvement (unreachable)
-                "soft_lock_duration_sec": 86400,      # Lock for 24 hours (1 day)
+                "max_active_symbols": self.micro_max_active_symbols,
+                "core_pairs": self.micro_core_pairs,
+                "max_rotating_slots": self.micro_rotating_slots,
+                "max_concurrent_positions": self.micro_max_concurrent_positions,
+                "allow_rotation": self.micro_allow_rotation,
+                "symbol_replacement_multiplier": self.micro_replacement_multiplier,
+                "soft_lock_duration_sec": self.micro_soft_lock_sec,
                 "rotation_mode": "NONE",
                 "reason": "MICRO_BRACKET: Focus on 2 core pairs for learning"
             }
+
+            # Adaptive unlock for micro deadlocks:
+            # when BUYs repeatedly fail with POSITION_ALREADY_OPEN, temporarily allow
+            # one extra slot + limited rotation to restore throughput.
+            pressure = self._get_position_open_pressure()
+            sell_deadlock_pressure = self._get_sell_deadlock_pressure()
+            adaptive_open_pressure = pressure >= self.micro_adaptive_trigger
+            adaptive_sell_deadlock = (
+                self.micro_adaptive_sell_deadlock_enabled
+                and sell_deadlock_pressure >= self.micro_adaptive_sell_deadlock_trigger
+            )
+            if self.micro_adaptive_enabled and (adaptive_open_pressure or adaptive_sell_deadlock):
+                limits["max_concurrent_positions"] = int(self.micro_adaptive_max_positions)
+                limits["max_rotating_slots"] = int(self.micro_adaptive_rotating_slots)
+                limits["allow_rotation"] = bool(limits["max_rotating_slots"] > 0)
+                limits["max_active_symbols"] = max(
+                    int(limits["max_active_symbols"]),
+                    int(limits["core_pairs"]) + int(limits["max_rotating_slots"]),
+                )
+                limits["soft_lock_duration_sec"] = int(
+                    min(limits["soft_lock_duration_sec"], self.micro_adaptive_soft_lock_sec)
+                )
+                limits["symbol_replacement_multiplier"] = float(
+                    min(
+                        float(limits["symbol_replacement_multiplier"]),
+                        float(self.micro_adaptive_replacement_multiplier),
+                    )
+                )
+                limits["rotation_mode"] = "MICRO_ADAPTIVE"
+                adaptive_reasons = []
+                if adaptive_open_pressure:
+                    adaptive_reasons.append(
+                        f"POSITION_ALREADY_OPEN pressure ({pressure} rejects/{int(self.micro_adaptive_window_sec)}s)"
+                    )
+                if adaptive_sell_deadlock:
+                    adaptive_reasons.append(
+                        f"SELL deadlock pressure ({sell_deadlock_pressure} rejects/{int(self.micro_adaptive_sell_deadlock_window_sec)}s)"
+                    )
+                if not adaptive_reasons:
+                    adaptive_reasons.append("pressure trigger")
+                limits["reason"] = (
+                    "MICRO_ADAPTIVE: unlocked extra slot/rotation due to "
+                    + " + ".join(adaptive_reasons)
+                )
             
         elif bracket == CapitalBracket.SMALL:
             # SMALL BRACKET: $500-$2000
@@ -404,8 +683,8 @@ class CapitalGovernor:
         Returns:
             True if rotation is disabled for this bracket
         """
-        bracket = self.get_bracket(nav)
-        return bracket == CapitalBracket.MICRO
+        limits = self.get_position_limits(nav)
+        return not bool(limits.get("allow_rotation", False))
     
     def get_recommended_core_pairs(self, nav: float, available_symbols: Optional[List[str]] = None) -> List[str]:
         """
@@ -450,18 +729,11 @@ class CapitalGovernor:
         Returns:
             True if symbol is allowed in this bracket
         """
-        bracket = self.get_bracket(nav)
-        
         if is_core:
             return True  # Core pairs always allowed
-        
-        # Non-core symbols (rotating) check
-        if bracket == CapitalBracket.MICRO:
-            # MICRO: No rotation at all
-            return False
-        
-        # All other brackets allow rotation
-        return True
+
+        limits = self.get_position_limits(nav)
+        return bool(limits.get("allow_rotation", False))
     
     def format_limits_for_display(self, nav: float) -> str:
         """

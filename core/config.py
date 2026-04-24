@@ -1,6 +1,8 @@
 from dotenv import load_dotenv, find_dotenv
-# Force-load the .env closest to your repo (not the caller's cwd), and override any stale env
-load_dotenv(dotenv_path=find_dotenv(usecwd=True), override=True)
+
+# Load repo .env, but keep explicit shell/runtime env vars authoritative.
+# This is critical for live-session overrides (e.g. SYMBOLS, feature flags, durations).
+load_dotenv(dotenv_path=find_dotenv(usecwd=True), override=False)
 
 import os
 import logging
@@ -70,7 +72,7 @@ class Config:
     STAGNATION_PNL_BAND = 0.001
     STAGNATION_OVERRIDE_ENABLED = True
     STAGNATION_EXIT_ENABLED = True
-    STAGNATION_EXIT_MAX_LOSS_PCT = 0.0002
+    STAGNATION_EXIT_MAX_LOSS_PCT = 0.004  # was 0.0002 (0.02%) — hair-trigger that turned every dip into a realized loss
 
     # ---------- CAPITAL PROFILES (Dynamic NAV-based switching) ----------
     # P9 Architecture: Profile system maintains integrity while adapting to capital scale
@@ -94,6 +96,33 @@ class Config:
     #   Goal: Sustainable long-term compounding
     
     CAPITAL_PROFILE_NAV_THRESHOLD = 500.0  # Switch threshold (USDT)
+    # Capital governor bracket thresholds
+    CAPITAL_MICRO_THRESHOLD = 500.0
+    CAPITAL_SMALL_THRESHOLD = 2000.0
+    CAPITAL_MEDIUM_THRESHOLD = 10000.0
+    # Micro-bracket position/rotation policy (override via env without code change)
+    CAPITAL_MICRO_MAX_ACTIVE_SYMBOLS = 3
+    CAPITAL_MICRO_CORE_PAIRS = 2
+    CAPITAL_MICRO_MAX_ROTATING_SLOTS = 1
+    CAPITAL_MICRO_MAX_CONCURRENT_POSITIONS = 2
+    CAPITAL_MICRO_ALLOW_ROTATION = True
+    CAPITAL_MICRO_SYMBOL_REPLACEMENT_MULTIPLIER = 1.35
+    CAPITAL_MICRO_SOFT_LOCK_DURATION_SEC = 3600
+    # Liveness guard: prevents deadlock-prone micro profiles (1 slot + no rotation)
+    # from stalling execution while still preserving conservative risk posture.
+    CAPITAL_MICRO_ENFORCE_LIVENESS = True
+    # Adaptive micro-capacity escape hatch for POSITION_ALREADY_OPEN pressure
+    CAPITAL_MICRO_ADAPTIVE_CAPACITY_ENABLED = True
+    CAPITAL_MICRO_ADAPTIVE_PRESSURE_TRIGGER = 6
+    CAPITAL_MICRO_ADAPTIVE_WINDOW_SEC = 300.0
+    CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS = 2
+    CAPITAL_MICRO_ADAPTIVE_MAX_ROTATING_SLOTS = 1
+    CAPITAL_MICRO_ADAPTIVE_SOFT_LOCK_DURATION_SEC = 900
+    CAPITAL_MICRO_ADAPTIVE_SYMBOL_REPLACEMENT_MULTIPLIER = 1.35
+    CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_ENABLED = True
+    CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_TRIGGER = 5
+    CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_WINDOW_SEC = 300.0
+    CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_REASONS = "PORTFOLIO_PNL_IMPROVEMENT,SELL_DYNAMIC_EDGE_MIN,CLOSE_NOT_SUBMITTED,SELL_NET_PNL_MIN"
     
     # Profile definitions (can be extended for intermediate phases)
     CAPITAL_PROFILES = {
@@ -165,13 +194,16 @@ class Config:
     MIN_SIGNIFICANT_POSITION_USDT = 20.0
     SIGNIFICANT_POSITION_FLOOR = MIN_SIGNIFICANT_POSITION_USDT
     EXEC_PROBE_QUOTE = 12.0
-    MAX_HOLD_SEC = 1800.0
-    MAX_HOLD_TIME_SEC = 1800.0
+    MAX_HOLD_SEC = 3600.0      # 1 hour — was 30 min, caused forced exits during temporary dips
+    MAX_HOLD_TIME_SEC = 3600.0
     LIQ_ORCH_MIN_USDT_FLOOR = 5.0
     LIQ_ORCH_MIN_USDT_TARGET = 6.0
     DUST_MIN_QUOTE_USDT = 5.0
     DUST_POSITION_QTY = 0.0001
     PERMANENT_DUST_USDT_THRESHOLD = 1.0
+    DUST_LIQUIDATION_ENABLED = True
+    DUST_REENTRY_OVERRIDE = True
+    ALLOW_ENTRY_BELOW_SIGNIFICANT_FLOOR = False
     # Dust priority system thresholds (Reuse > Aggregate > Cleanup)
     DUST_AGGREGATE_THRESHOLD_HOURS = 4.0   # hold dust this long before triggering cleanup
     DUST_STALL_THRESHOLD_HOURS = 4.0       # used by DustMonitor to classify STALLED status
@@ -227,8 +259,8 @@ class Config:
             "TPSL_VOL_TARGET_ATR_PCT": 0.0090,
             "TPSL_DYNAMIC_RR_MIN": 1.35,
             "TPSL_DYNAMIC_RR_MAX": 2.60,
-            "TP_PCT_MIN": 0.0030,
-            "TP_PCT_MAX": 0.0200,
+            "TP_PCT_MIN": 0.0080,  # Fee-aware: round-trip ~0.30%, must clear with margin
+            "TP_PCT_MAX": 0.0250,
             "SL_PCT_MIN": 0.0030,
             "SL_PCT_MAX": 0.0100,
             "TRAILING_ACTIVATE_R_MULT": 0.60,
@@ -250,8 +282,8 @@ class Config:
             "TRAILING_ACTIVATE_R_MULT": 0.55,
         },
     }
-    TP_PCT_MIN = 0.003  # Increased minimum TP
-    TP_PCT_MAX = 0.020  # Increased maximum TP for asymmetry headroom
+    TP_PCT_MIN = 0.008  # Fee-aware minimum: round-trip friction ~0.30%, TP must clear it with margin
+    TP_PCT_MAX = 0.025  # Increased maximum TP for asymmetry headroom
     # Spread-adaptive TP shaping (microstructure-aware TP optimization)
     TPSL_SPREAD_ADAPTIVE_ENABLED = True
     TPSL_SPREAD_TIGHT_BPS = 6.0
@@ -269,6 +301,66 @@ class Config:
     MIN_PROFIT_EXIT_FEE_MULT = 2.5
     MIN_ECONOMIC_TRADE_USDT = 30.0
     MIN_NET_PROFIT_AFTER_FEES = 0.004
+    STRICT_PROFIT_ONLY_SELLS = False
+    # Pre-trade effect + micro-backtest gate
+    PRETRADE_EFFECT_GUARD_ENABLED = True
+    PRETRADE_ALLOW_MISSING_EXPECTED_MOVE = False
+    PRETRADE_ALLOW_MISSING_EXPECTED_MOVE_SELL = True
+    PRETRADE_SELL_REQUIRE_EXPECTED_EDGE = False
+    PRETRADE_SELL_GATE_ENFORCED = False
+    PRETRADE_ALLOW_BOOTSTRAP_BYPASS = False
+    PRETRADE_DIRECTIVE_GATE_ENABLED = True
+    PRETRADE_EFFECT_BUFFER_BPS = 5.0
+    PRETRADE_MIN_EXPECTED_NET_PCT = 0.0012
+    PRETRADE_MIN_EXPECTED_NET_USDT = 0.04
+    PRETRADE_RECENT_REALIZED_WINDOW = 30
+    PRETRADE_MIN_REALIZED_SAMPLES = 10
+    PRETRADE_MIN_REALIZED_WIN_RATE = 0.50
+    PRETRADE_MICRO_BACKTEST_ENABLED = True
+    PRETRADE_MICRO_BACKTEST_TIMEFRAME = "5m"
+    PRETRADE_MICRO_BACKTEST_LOOKBACK_BARS = 96
+    PRETRADE_MICRO_BACKTEST_HORIZON_BARS = 3
+    PRETRADE_MICRO_BACKTEST_MIN_SAMPLES = 12
+    PRETRADE_MICRO_BACKTEST_REQUIRE_SAMPLES = True
+    PRETRADE_MICRO_BACKTEST_MIN_WIN_RATE = 0.52
+    PRETRADE_MICRO_BACKTEST_MIN_AVG_NET_PCT = 0.0002
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_ENABLED = True
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_REJECTION_TRIGGER = 6
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_STEP_REJECTIONS = 4
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_WIN_STEP = 0.015
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_WIN_RATE_FLOOR = 0.45
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_AVG_NET_FLOOR_PCT = -0.0003
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_DISABLE_SAMPLE_REQUIRE_AFTER_STEPS = 2
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_AFTER_REJECTIONS = 16
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_CONF = 0.68
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_PCT = 0.0022
+    PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_USDT = 0.025
+    PRETRADE_MICRO_BACKTEST_STARVATION_CYCLES_TRIGGER = 10
+    PRETRADE_MICRO_BACKTEST_STARVATION_REJECTION_TRIGGER = 6
+    PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_CONF = 0.60
+    PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_PCT = 0.0015
+    PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_USDT = 0.02
+    PRETRADE_NET_USDT_DEADLOCK_RELAX_ENABLED = True
+    PRETRADE_NET_USDT_DEADLOCK_REJECTION_TRIGGER = 6
+    PRETRADE_NET_USDT_DEADLOCK_STEP_REJECTIONS = 4
+    PRETRADE_NET_USDT_DEADLOCK_RELAX_STEP_FACTOR = 0.85
+    PRETRADE_NET_USDT_DEADLOCK_MIN_USDT_FLOOR = 0.02
+    PRETRADE_STALL_RELAX_ENABLED = True
+    PRETRADE_STALL_RELAX_CYCLES_TRIGGER = 10
+    PRETRADE_STALL_RELAX_STEP_CYCLES = 5
+    PRETRADE_STALL_RELAX_NET_PCT_STEP = 0.00012
+    PRETRADE_STALL_RELAX_NET_USDT_STEP = 0.005
+    PRETRADE_STALL_RELAX_WIN_RATE_STEP = 0.01
+    PRETRADE_STALL_RELAX_MAX_STEPS = 6
+    PRETRADE_STALL_RELAX_MIN_NET_PCT_FLOOR = 0.0006
+    PRETRADE_STALL_RELAX_MIN_NET_USDT_FLOOR = 0.02
+    PRETRADE_STALL_RELAX_MIN_WIN_RATE_FLOOR = 0.45
+    PRETRADE_STALL_RELAX_MIN_BT_WIN_RATE_FLOOR = 0.46
+    PRETRADE_MICRO_BACKTEST_SOFT_GATE_ENABLED = True
+    PRETRADE_MICRO_BACKTEST_SOFT_GATE_MIN_SAMPLES = 24
+    PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_WIN_RATE = 0.03
+    PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_AVG_NET_PCT = 0.00015
+    PRETRADE_MICRO_BACKTEST_SOFT_GATE_ALLOW_MISSING_AFTER_CYCLES = 16
     SELL_DYNAMIC_EDGE_GATE_ENABLED = True
     SELL_DYNAMIC_SLIPPAGE_MIN_PCT = 0.0003
     SELL_DYNAMIC_SLIPPAGE_ATR_MULT = 0.05
@@ -283,6 +375,21 @@ class Config:
     SELL_DYNAMIC_LEGACY_NET_PCT_GUARD = False
     MIN_PORTFOLIO_IMPROVEMENT_USD = 0.05
     MIN_PORTFOLIO_IMPROVEMENT_PCT = 0.0015
+    CLOSE_ESCAPE_HATCH_ENABLED = True
+    CLOSE_ESCAPE_HATCH_TRIGGER_COUNT = 4
+    CLOSE_ESCAPE_HATCH_WINDOW_SEC = 900.0
+    CLOSE_ESCAPE_HATCH_MIN_AGE_SEC = 120.0
+    CLOSE_ESCAPE_HATCH_RETRY_COOLDOWN_SEC = 180.0
+    CLOSE_ESCAPE_HATCH_BUY_LOCK_TRIGGER = 0
+    CLOSE_ESCAPE_HATCH_ALLOW_REASONS = "portfolio_pnl_improvement,sell_dynamic_edge_below_min,sell_net_pnl_below_min,sell_net_pct_below_min"
+    TRADEABILITY_FILL_STALL_RELAX_ENABLED = True
+    TRADEABILITY_FILL_STALL_WINDOW_SEC = 900.0
+    TRADEABILITY_FILL_STALL_MAX_STEPS = 6
+    TRADEABILITY_FILL_STALL_MIN_RECENT_TRADES = 1
+    TRADEABILITY_FILL_STALL_RELAX_STEP = 0.008
+    TRADEABILITY_FILL_STALL_RELAX_MAX = 0.045
+    TRADEABILITY_FILL_STALL_MEDIUM_RATIO_STEP = 0.010
+    TRADEABILITY_FILL_STALL_MEDIUM_RATIO_MAX_DROP = 0.10
     BOOTSTRAP_VETO_COOLDOWN_SEC = 600.0
     # Micro-trade kill switch (low equity + low volatility)
     MICRO_TRADE_KILL_SWITCH_ENABLED = True
@@ -560,6 +667,9 @@ class Config:
     TRENDHUNTER_EMA_SHORT = 12
     TRENDHUNTER_EMA_LONG = 26
     TRENDHUNTER_EMA_SIGNAL = 9
+    AUTO_TRAIN = True
+    SWING_AUTO_TRAIN = True
+    TREND_AUTO_TRAIN = True
     ENABLE_COT_VALIDATION = True  # keep CoT guard path enabled
     DEFAULT_AGENT_DIRECT_EXECUTION = False  # global safe default; agents read AGENT_EXECUTION
 
@@ -672,6 +782,35 @@ class Config:
 
         self.BASE_CURRENCY = os.getenv("BASE_CURRENCY", "USDT").upper()
 
+        # ---------- BINANCE EXCHANGE CONFIGURATION ----------
+        # API Keys and testnet configuration MUST be loaded here
+        self.TESTNET_MODE = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
+        self.BINANCE_ACCOUNT_TYPE = os.getenv("BINANCE_ACCOUNT_TYPE", "spot").lower()
+        self.BINANCE_REGION = os.getenv("BINANCE_REGION", "global").lower()
+        
+        # Load API keys for LIVE or TESTNET based on TESTNET_MODE
+        if self.TESTNET_MODE:
+            self.BINANCE_API_KEY = os.getenv("BINANCE_TESTNET_API_KEY", "")
+            self.BINANCE_API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET_HMAC", "") or os.getenv("BINANCE_TESTNET_API_SECRET", "")
+            self.BINANCE_API_SECRET_ED25519 = os.getenv("BINANCE_TESTNET_API_SECRET_ED25519", "")
+        else:
+            self.BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+            self.BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET_HMAC", "") or os.getenv("BINANCE_API_SECRET", "")
+            self.BINANCE_API_SECRET_ED25519 = os.getenv("BINANCE_API_SECRET_ED25519", "")
+        
+        # Determine API base URL
+        if self.TESTNET_MODE:
+            self.BINANCE_BASE_URL = "https://testnet.binance.vision"
+        else:
+            if self.BINANCE_ACCOUNT_TYPE == "futures":
+                self.BINANCE_BASE_URL = "https://fapi.binance.com"
+            elif self.BINANCE_REGION == "us":
+                self.BINANCE_BASE_URL = "https://api.binance.us"
+            else:
+                self.BINANCE_BASE_URL = "https://api.binance.com"
+        
+        logger.info(f"[Config] Binance loaded: testnet={self.TESTNET_MODE}, account_type={self.BINANCE_ACCOUNT_TYPE}, region={self.BINANCE_REGION}, api_key_loaded={len(self.BINANCE_API_KEY) > 0}")
+
         # ---------- Universe & allocation defaults ----------
         # Structural separation:
         # - MAX_UNIVERSE_SYMBOLS controls discovery/watchlist breadth.
@@ -693,6 +832,110 @@ class Config:
         )
         if self.MAX_POSITIONS_TOTAL <= 0:
             self.MAX_POSITIONS_TOTAL = int(getattr(Config, "MAX_POSITIONS_TOTAL", 2))
+
+        # Capital governor thresholds (override-able via env)
+        self.CAPITAL_MICRO_THRESHOLD = float(
+            os.getenv("CAPITAL_MICRO_THRESHOLD", str(getattr(Config, "CAPITAL_MICRO_THRESHOLD", 500.0)))
+        )
+        self.CAPITAL_SMALL_THRESHOLD = float(
+            os.getenv("CAPITAL_SMALL_THRESHOLD", str(getattr(Config, "CAPITAL_SMALL_THRESHOLD", 2000.0)))
+        )
+        self.CAPITAL_MEDIUM_THRESHOLD = float(
+            os.getenv("CAPITAL_MEDIUM_THRESHOLD", str(getattr(Config, "CAPITAL_MEDIUM_THRESHOLD", 10000.0)))
+        )
+        self.CAPITAL_MICRO_MAX_ACTIVE_SYMBOLS = int(
+            os.getenv("CAPITAL_MICRO_MAX_ACTIVE_SYMBOLS", str(getattr(Config, "CAPITAL_MICRO_MAX_ACTIVE_SYMBOLS", 3)))
+        )
+        self.CAPITAL_MICRO_CORE_PAIRS = int(
+            os.getenv("CAPITAL_MICRO_CORE_PAIRS", str(getattr(Config, "CAPITAL_MICRO_CORE_PAIRS", 2)))
+        )
+        self.CAPITAL_MICRO_MAX_ROTATING_SLOTS = int(
+            os.getenv("CAPITAL_MICRO_MAX_ROTATING_SLOTS", str(getattr(Config, "CAPITAL_MICRO_MAX_ROTATING_SLOTS", 1)))
+        )
+        self.CAPITAL_MICRO_MAX_CONCURRENT_POSITIONS = int(
+            os.getenv("CAPITAL_MICRO_MAX_CONCURRENT_POSITIONS", str(getattr(Config, "CAPITAL_MICRO_MAX_CONCURRENT_POSITIONS", 2)))
+        )
+        self.CAPITAL_MICRO_ALLOW_ROTATION = os.getenv(
+            "CAPITAL_MICRO_ALLOW_ROTATION", str(getattr(Config, "CAPITAL_MICRO_ALLOW_ROTATION", True))
+        ).lower() == "true"
+        self.CAPITAL_MICRO_SYMBOL_REPLACEMENT_MULTIPLIER = float(
+            os.getenv(
+                "CAPITAL_MICRO_SYMBOL_REPLACEMENT_MULTIPLIER",
+                str(getattr(Config, "CAPITAL_MICRO_SYMBOL_REPLACEMENT_MULTIPLIER", 1.35)),
+            )
+        )
+        self.CAPITAL_MICRO_SOFT_LOCK_DURATION_SEC = int(
+            os.getenv(
+                "CAPITAL_MICRO_SOFT_LOCK_DURATION_SEC",
+                str(getattr(Config, "CAPITAL_MICRO_SOFT_LOCK_DURATION_SEC", 3600)),
+            )
+        )
+        self.CAPITAL_MICRO_ENFORCE_LIVENESS = os.getenv(
+            "CAPITAL_MICRO_ENFORCE_LIVENESS",
+            str(getattr(Config, "CAPITAL_MICRO_ENFORCE_LIVENESS", True)),
+        ).lower() == "true"
+        self.CAPITAL_MICRO_ADAPTIVE_CAPACITY_ENABLED = os.getenv(
+            "CAPITAL_MICRO_ADAPTIVE_CAPACITY_ENABLED",
+            str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_CAPACITY_ENABLED", True)),
+        ).lower() == "true"
+        self.CAPITAL_MICRO_ADAPTIVE_PRESSURE_TRIGGER = int(
+            os.getenv(
+                "CAPITAL_MICRO_ADAPTIVE_PRESSURE_TRIGGER",
+                str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_PRESSURE_TRIGGER", 6)),
+            )
+        )
+        self.CAPITAL_MICRO_ADAPTIVE_WINDOW_SEC = float(
+            os.getenv(
+                "CAPITAL_MICRO_ADAPTIVE_WINDOW_SEC",
+                str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_WINDOW_SEC", 300.0)),
+            )
+        )
+        self.CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS = int(
+            os.getenv(
+                "CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS",
+                str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS", 2)),
+            )
+        )
+        self.CAPITAL_MICRO_ADAPTIVE_MAX_ROTATING_SLOTS = int(
+            os.getenv(
+                "CAPITAL_MICRO_ADAPTIVE_MAX_ROTATING_SLOTS",
+                str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_MAX_ROTATING_SLOTS", 1)),
+            )
+        )
+        self.CAPITAL_MICRO_ADAPTIVE_SOFT_LOCK_DURATION_SEC = int(
+            os.getenv(
+                "CAPITAL_MICRO_ADAPTIVE_SOFT_LOCK_DURATION_SEC",
+                str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_SOFT_LOCK_DURATION_SEC", 900)),
+            )
+        )
+        self.CAPITAL_MICRO_ADAPTIVE_SYMBOL_REPLACEMENT_MULTIPLIER = float(
+            os.getenv(
+                "CAPITAL_MICRO_ADAPTIVE_SYMBOL_REPLACEMENT_MULTIPLIER",
+                str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_SYMBOL_REPLACEMENT_MULTIPLIER", 1.35)),
+            )
+        )
+        self.CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_ENABLED = os.getenv(
+            "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_ENABLED",
+            str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_ENABLED", True)),
+        ).lower() == "true"
+        self.CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_TRIGGER = int(
+            os.getenv(
+                "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_TRIGGER",
+                str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_TRIGGER", 5)),
+            )
+        )
+        self.CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_WINDOW_SEC = float(
+            os.getenv(
+                "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_WINDOW_SEC",
+                str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_WINDOW_SEC", 300.0)),
+            )
+        )
+        self.CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_REASONS = str(
+            os.getenv(
+                "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_REASONS",
+                str(getattr(Config, "CAPITAL_MICRO_ADAPTIVE_SELL_DEADLOCK_REASONS", "")),
+            )
+        )
 
         # ---------- Phase 1: Safe Upgrade - Symbol Rotation ----------
         self.BOOTSTRAP_SOFT_LOCK_ENABLED = os.getenv("BOOTSTRAP_SOFT_LOCK_ENABLED", "true").lower() == "true"
@@ -1114,13 +1357,41 @@ class Config:
                 self.MIN_TRADE_QUOTE,
             )
             self.MAX_TRADE_QUOTE = float(self.MIN_TRADE_QUOTE)
-        if self.MIN_ENTRY_USDT < self.MIN_POSITION_USDT:
+        
+        # FIX #3: Entry-sizing floor alignment
+        # Config defaults should match SIGNIFICANT_POSITION_FLOOR to avoid runtime normalization churn
+        required_entry_floor = float(max(self.MIN_POSITION_USDT, self.SIGNIFICANT_POSITION_FLOOR))
+        if self.MIN_ENTRY_USDT < required_entry_floor:
             logger.warning(
-                "MIN_ENTRY_USDT (%.2f) < MIN_POSITION_USDT (%.2f). Bumping min entry to position floor.",
+                "[Config:EntryFloor] MIN_ENTRY_USDT (%.2f) < floor (max(MIN_POSITION_USDT=%.2f, SIGNIFICANT_POSITION_FLOOR=%.2f)=%.2f). "
+                "Bumping MIN_ENTRY_USDT to align config intent with runtime expectations.",
                 self.MIN_ENTRY_USDT,
                 self.MIN_POSITION_USDT,
+                self.SIGNIFICANT_POSITION_FLOOR,
+                required_entry_floor,
             )
-            self.MIN_ENTRY_USDT = float(self.MIN_POSITION_USDT)
+            self.MIN_ENTRY_USDT = float(required_entry_floor)
+        if self.MIN_ENTRY_QUOTE_USDT < self.MIN_ENTRY_USDT:
+            logger.warning(
+                "[Config:EntryFloor] MIN_ENTRY_QUOTE_USDT (%.2f) < MIN_ENTRY_USDT (%.2f). Bumping MIN_ENTRY_QUOTE_USDT to keep planners/execution aligned.",
+                self.MIN_ENTRY_QUOTE_USDT,
+                self.MIN_ENTRY_USDT,
+            )
+            self.MIN_ENTRY_QUOTE_USDT = float(self.MIN_ENTRY_USDT)
+        if self.DEFAULT_PLANNED_QUOTE < self.MIN_ENTRY_USDT:
+            logger.warning(
+                "DEFAULT_PLANNED_QUOTE (%.2f) < MIN_ENTRY_USDT (%.2f). Bumping default planned quote.",
+                self.DEFAULT_PLANNED_QUOTE,
+                self.MIN_ENTRY_USDT,
+            )
+            self.DEFAULT_PLANNED_QUOTE = float(self.MIN_ENTRY_USDT)
+        if self.EMIT_BUY_QUOTE < self.MIN_ENTRY_USDT:
+            logger.warning(
+                "EMIT_BUY_QUOTE (%.2f) < MIN_ENTRY_USDT (%.2f). Bumping emitted buy quote.",
+                self.EMIT_BUY_QUOTE,
+                self.MIN_ENTRY_USDT,
+            )
+            self.EMIT_BUY_QUOTE = float(self.MIN_ENTRY_USDT)
         self.MAX_HOLD_TIME_SEC = float(os.getenv("MAX_HOLD_TIME_SEC", str(Config.MAX_HOLD_TIME_SEC)))
         self.MAX_HOLD_SEC = float(os.getenv("MAX_HOLD_SEC", str(self.MAX_HOLD_TIME_SEC)))
         self.EXIT_EXCURSION_TICK_MULT = float(os.getenv("EXIT_EXCURSION_TICK_MULT", str(Config.EXIT_EXCURSION_TICK_MULT)))
@@ -1138,8 +1409,358 @@ class Config:
         self.MIN_PROFIT_EXIT_FEE_MULT = float(os.getenv("MIN_PROFIT_EXIT_FEE_MULT", str(Config.MIN_PROFIT_EXIT_FEE_MULT)))
         self.MIN_ECONOMIC_TRADE_USDT = float(os.getenv("MIN_ECONOMIC_TRADE_USDT", str(Config.MIN_ECONOMIC_TRADE_USDT)))
         self.MIN_NET_PROFIT_AFTER_FEES = float(os.getenv("MIN_NET_PROFIT_AFTER_FEES", str(Config.MIN_NET_PROFIT_AFTER_FEES)))
+        self.STRICT_PROFIT_ONLY_SELLS = os.getenv(
+            "STRICT_PROFIT_ONLY_SELLS",
+            str(Config.STRICT_PROFIT_ONLY_SELLS)
+        ).lower() == "true"
+        # Pre-trade effect + micro-backtest gate
+        self.PRETRADE_EFFECT_GUARD_ENABLED = os.getenv(
+            "PRETRADE_EFFECT_GUARD_ENABLED",
+            str(Config.PRETRADE_EFFECT_GUARD_ENABLED)
+        ).lower() == "true"
+        self.PRETRADE_ALLOW_MISSING_EXPECTED_MOVE = os.getenv(
+            "PRETRADE_ALLOW_MISSING_EXPECTED_MOVE",
+            str(Config.PRETRADE_ALLOW_MISSING_EXPECTED_MOVE)
+        ).lower() == "true"
+        self.PRETRADE_ALLOW_MISSING_EXPECTED_MOVE_SELL = os.getenv(
+            "PRETRADE_ALLOW_MISSING_EXPECTED_MOVE_SELL",
+            str(Config.PRETRADE_ALLOW_MISSING_EXPECTED_MOVE_SELL)
+        ).lower() == "true"
+        self.PRETRADE_SELL_REQUIRE_EXPECTED_EDGE = os.getenv(
+            "PRETRADE_SELL_REQUIRE_EXPECTED_EDGE",
+            str(Config.PRETRADE_SELL_REQUIRE_EXPECTED_EDGE)
+        ).lower() == "true"
+        self.PRETRADE_SELL_GATE_ENFORCED = os.getenv(
+            "PRETRADE_SELL_GATE_ENFORCED",
+            str(Config.PRETRADE_SELL_GATE_ENFORCED)
+        ).lower() == "true"
+        self.PRETRADE_ALLOW_BOOTSTRAP_BYPASS = os.getenv(
+            "PRETRADE_ALLOW_BOOTSTRAP_BYPASS",
+            str(Config.PRETRADE_ALLOW_BOOTSTRAP_BYPASS)
+        ).lower() == "true"
+        self.PRETRADE_DIRECTIVE_GATE_ENABLED = os.getenv(
+            "PRETRADE_DIRECTIVE_GATE_ENABLED",
+            str(Config.PRETRADE_DIRECTIVE_GATE_ENABLED)
+        ).lower() == "true"
+        self.PRETRADE_EFFECT_BUFFER_BPS = float(
+            os.getenv("PRETRADE_EFFECT_BUFFER_BPS", str(Config.PRETRADE_EFFECT_BUFFER_BPS))
+        )
+        self.PRETRADE_MIN_EXPECTED_NET_PCT = float(
+            os.getenv("PRETRADE_MIN_EXPECTED_NET_PCT", str(Config.PRETRADE_MIN_EXPECTED_NET_PCT))
+        )
+        self.PRETRADE_MIN_EXPECTED_NET_USDT = float(
+            os.getenv("PRETRADE_MIN_EXPECTED_NET_USDT", str(Config.PRETRADE_MIN_EXPECTED_NET_USDT))
+        )
+        self.PRETRADE_RECENT_REALIZED_WINDOW = int(
+            os.getenv("PRETRADE_RECENT_REALIZED_WINDOW", str(Config.PRETRADE_RECENT_REALIZED_WINDOW))
+        )
+        self.PRETRADE_MIN_REALIZED_SAMPLES = int(
+            os.getenv("PRETRADE_MIN_REALIZED_SAMPLES", str(Config.PRETRADE_MIN_REALIZED_SAMPLES))
+        )
+        self.PRETRADE_MIN_REALIZED_WIN_RATE = float(
+            os.getenv("PRETRADE_MIN_REALIZED_WIN_RATE", str(Config.PRETRADE_MIN_REALIZED_WIN_RATE))
+        )
+        self.PRETRADE_MICRO_BACKTEST_ENABLED = os.getenv(
+            "PRETRADE_MICRO_BACKTEST_ENABLED",
+            str(Config.PRETRADE_MICRO_BACKTEST_ENABLED)
+        ).lower() == "true"
+        self.PRETRADE_MICRO_BACKTEST_TIMEFRAME = str(
+            os.getenv("PRETRADE_MICRO_BACKTEST_TIMEFRAME", str(Config.PRETRADE_MICRO_BACKTEST_TIMEFRAME))
+        )
+        self.PRETRADE_MICRO_BACKTEST_LOOKBACK_BARS = int(
+            os.getenv("PRETRADE_MICRO_BACKTEST_LOOKBACK_BARS", str(Config.PRETRADE_MICRO_BACKTEST_LOOKBACK_BARS))
+        )
+        self.PRETRADE_MICRO_BACKTEST_HORIZON_BARS = int(
+            os.getenv("PRETRADE_MICRO_BACKTEST_HORIZON_BARS", str(Config.PRETRADE_MICRO_BACKTEST_HORIZON_BARS))
+        )
+        self.PRETRADE_MICRO_BACKTEST_MIN_SAMPLES = int(
+            os.getenv("PRETRADE_MICRO_BACKTEST_MIN_SAMPLES", str(Config.PRETRADE_MICRO_BACKTEST_MIN_SAMPLES))
+        )
+        self.PRETRADE_MICRO_BACKTEST_REQUIRE_SAMPLES = os.getenv(
+            "PRETRADE_MICRO_BACKTEST_REQUIRE_SAMPLES",
+            str(Config.PRETRADE_MICRO_BACKTEST_REQUIRE_SAMPLES)
+        ).lower() == "true"
+        self.PRETRADE_MICRO_BACKTEST_MIN_WIN_RATE = float(
+            os.getenv("PRETRADE_MICRO_BACKTEST_MIN_WIN_RATE", str(Config.PRETRADE_MICRO_BACKTEST_MIN_WIN_RATE))
+        )
+        self.PRETRADE_MICRO_BACKTEST_MIN_AVG_NET_PCT = float(
+            os.getenv("PRETRADE_MICRO_BACKTEST_MIN_AVG_NET_PCT", str(Config.PRETRADE_MICRO_BACKTEST_MIN_AVG_NET_PCT))
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_ENABLED = os.getenv(
+            "PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_ENABLED",
+            str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_ENABLED),
+        ).lower() == "true"
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_REJECTION_TRIGGER = int(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_REJECTION_TRIGGER",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_REJECTION_TRIGGER),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_STEP_REJECTIONS = int(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_STEP_REJECTIONS",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_STEP_REJECTIONS),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_WIN_STEP = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_WIN_STEP",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_WIN_STEP),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_WIN_RATE_FLOOR = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_WIN_RATE_FLOOR",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_WIN_RATE_FLOOR),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_AVG_NET_FLOOR_PCT = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_AVG_NET_FLOOR_PCT",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_AVG_NET_FLOOR_PCT),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_DISABLE_SAMPLE_REQUIRE_AFTER_STEPS = int(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_DISABLE_SAMPLE_REQUIRE_AFTER_STEPS",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_DISABLE_SAMPLE_REQUIRE_AFTER_STEPS),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_AFTER_REJECTIONS = int(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_AFTER_REJECTIONS",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_AFTER_REJECTIONS),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_CONF = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_CONF",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_CONF),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_PCT = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_PCT",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_PCT),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_USDT = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_USDT",
+                str(Config.PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_USDT),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_STARVATION_CYCLES_TRIGGER = int(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_STARVATION_CYCLES_TRIGGER",
+                str(Config.PRETRADE_MICRO_BACKTEST_STARVATION_CYCLES_TRIGGER),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_STARVATION_REJECTION_TRIGGER = int(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_STARVATION_REJECTION_TRIGGER",
+                str(Config.PRETRADE_MICRO_BACKTEST_STARVATION_REJECTION_TRIGGER),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_CONF = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_CONF",
+                str(Config.PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_CONF),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_PCT = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_PCT",
+                str(Config.PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_PCT),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_USDT = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_USDT",
+                str(Config.PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_USDT),
+            )
+        )
+        self.PRETRADE_NET_USDT_DEADLOCK_RELAX_ENABLED = os.getenv(
+            "PRETRADE_NET_USDT_DEADLOCK_RELAX_ENABLED",
+            str(Config.PRETRADE_NET_USDT_DEADLOCK_RELAX_ENABLED),
+        ).lower() == "true"
+        self.PRETRADE_NET_USDT_DEADLOCK_REJECTION_TRIGGER = int(
+            os.getenv(
+                "PRETRADE_NET_USDT_DEADLOCK_REJECTION_TRIGGER",
+                str(Config.PRETRADE_NET_USDT_DEADLOCK_REJECTION_TRIGGER),
+            )
+        )
+        self.PRETRADE_NET_USDT_DEADLOCK_STEP_REJECTIONS = int(
+            os.getenv(
+                "PRETRADE_NET_USDT_DEADLOCK_STEP_REJECTIONS",
+                str(Config.PRETRADE_NET_USDT_DEADLOCK_STEP_REJECTIONS),
+            )
+        )
+        self.PRETRADE_NET_USDT_DEADLOCK_RELAX_STEP_FACTOR = float(
+            os.getenv(
+                "PRETRADE_NET_USDT_DEADLOCK_RELAX_STEP_FACTOR",
+                str(Config.PRETRADE_NET_USDT_DEADLOCK_RELAX_STEP_FACTOR),
+            )
+        )
+        self.PRETRADE_NET_USDT_DEADLOCK_MIN_USDT_FLOOR = float(
+            os.getenv(
+                "PRETRADE_NET_USDT_DEADLOCK_MIN_USDT_FLOOR",
+                str(Config.PRETRADE_NET_USDT_DEADLOCK_MIN_USDT_FLOOR),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_ENABLED = os.getenv(
+            "PRETRADE_STALL_RELAX_ENABLED",
+            str(Config.PRETRADE_STALL_RELAX_ENABLED),
+        ).lower() == "true"
+        self.PRETRADE_STALL_RELAX_CYCLES_TRIGGER = int(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_CYCLES_TRIGGER",
+                str(Config.PRETRADE_STALL_RELAX_CYCLES_TRIGGER),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_STEP_CYCLES = int(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_STEP_CYCLES",
+                str(Config.PRETRADE_STALL_RELAX_STEP_CYCLES),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_NET_PCT_STEP = float(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_NET_PCT_STEP",
+                str(Config.PRETRADE_STALL_RELAX_NET_PCT_STEP),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_NET_USDT_STEP = float(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_NET_USDT_STEP",
+                str(Config.PRETRADE_STALL_RELAX_NET_USDT_STEP),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_WIN_RATE_STEP = float(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_WIN_RATE_STEP",
+                str(Config.PRETRADE_STALL_RELAX_WIN_RATE_STEP),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_MAX_STEPS = int(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_MAX_STEPS",
+                str(Config.PRETRADE_STALL_RELAX_MAX_STEPS),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_MIN_NET_PCT_FLOOR = float(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_MIN_NET_PCT_FLOOR",
+                str(Config.PRETRADE_STALL_RELAX_MIN_NET_PCT_FLOOR),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_MIN_NET_USDT_FLOOR = float(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_MIN_NET_USDT_FLOOR",
+                str(Config.PRETRADE_STALL_RELAX_MIN_NET_USDT_FLOOR),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_MIN_WIN_RATE_FLOOR = float(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_MIN_WIN_RATE_FLOOR",
+                str(Config.PRETRADE_STALL_RELAX_MIN_WIN_RATE_FLOOR),
+            )
+        )
+        self.PRETRADE_STALL_RELAX_MIN_BT_WIN_RATE_FLOOR = float(
+            os.getenv(
+                "PRETRADE_STALL_RELAX_MIN_BT_WIN_RATE_FLOOR",
+                str(Config.PRETRADE_STALL_RELAX_MIN_BT_WIN_RATE_FLOOR),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_SOFT_GATE_ENABLED = os.getenv(
+            "PRETRADE_MICRO_BACKTEST_SOFT_GATE_ENABLED",
+            str(Config.PRETRADE_MICRO_BACKTEST_SOFT_GATE_ENABLED),
+        ).lower() == "true"
+        self.PRETRADE_MICRO_BACKTEST_SOFT_GATE_MIN_SAMPLES = int(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_SOFT_GATE_MIN_SAMPLES",
+                str(Config.PRETRADE_MICRO_BACKTEST_SOFT_GATE_MIN_SAMPLES),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_WIN_RATE = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_WIN_RATE",
+                str(Config.PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_WIN_RATE),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_AVG_NET_PCT = float(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_AVG_NET_PCT",
+                str(Config.PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_AVG_NET_PCT),
+            )
+        )
+        self.PRETRADE_MICRO_BACKTEST_SOFT_GATE_ALLOW_MISSING_AFTER_CYCLES = int(
+            os.getenv(
+                "PRETRADE_MICRO_BACKTEST_SOFT_GATE_ALLOW_MISSING_AFTER_CYCLES",
+                str(Config.PRETRADE_MICRO_BACKTEST_SOFT_GATE_ALLOW_MISSING_AFTER_CYCLES),
+            )
+        )
         self.MIN_PORTFOLIO_IMPROVEMENT_USD = float(os.getenv("MIN_PORTFOLIO_IMPROVEMENT_USD", str(Config.MIN_PORTFOLIO_IMPROVEMENT_USD)))
         self.MIN_PORTFOLIO_IMPROVEMENT_PCT = float(os.getenv("MIN_PORTFOLIO_IMPROVEMENT_PCT", str(Config.MIN_PORTFOLIO_IMPROVEMENT_PCT)))
+        self.CLOSE_ESCAPE_HATCH_ENABLED = os.getenv(
+            "CLOSE_ESCAPE_HATCH_ENABLED",
+            str(Config.CLOSE_ESCAPE_HATCH_ENABLED),
+        ).lower() == "true"
+        self.CLOSE_ESCAPE_HATCH_TRIGGER_COUNT = int(
+            os.getenv("CLOSE_ESCAPE_HATCH_TRIGGER_COUNT", str(Config.CLOSE_ESCAPE_HATCH_TRIGGER_COUNT))
+        )
+        self.CLOSE_ESCAPE_HATCH_WINDOW_SEC = float(
+            os.getenv("CLOSE_ESCAPE_HATCH_WINDOW_SEC", str(Config.CLOSE_ESCAPE_HATCH_WINDOW_SEC))
+        )
+        self.CLOSE_ESCAPE_HATCH_MIN_AGE_SEC = float(
+            os.getenv("CLOSE_ESCAPE_HATCH_MIN_AGE_SEC", str(Config.CLOSE_ESCAPE_HATCH_MIN_AGE_SEC))
+        )
+        self.CLOSE_ESCAPE_HATCH_RETRY_COOLDOWN_SEC = float(
+            os.getenv(
+                "CLOSE_ESCAPE_HATCH_RETRY_COOLDOWN_SEC",
+                str(Config.CLOSE_ESCAPE_HATCH_RETRY_COOLDOWN_SEC),
+            )
+        )
+        self.CLOSE_ESCAPE_HATCH_BUY_LOCK_TRIGGER = int(
+            os.getenv("CLOSE_ESCAPE_HATCH_BUY_LOCK_TRIGGER", str(Config.CLOSE_ESCAPE_HATCH_BUY_LOCK_TRIGGER))
+        )
+        self.CLOSE_ESCAPE_HATCH_ALLOW_REASONS = str(
+            os.getenv("CLOSE_ESCAPE_HATCH_ALLOW_REASONS", str(Config.CLOSE_ESCAPE_HATCH_ALLOW_REASONS))
+        )
+        self.TRADEABILITY_FILL_STALL_RELAX_ENABLED = os.getenv(
+            "TRADEABILITY_FILL_STALL_RELAX_ENABLED",
+            str(Config.TRADEABILITY_FILL_STALL_RELAX_ENABLED),
+        ).lower() == "true"
+        self.TRADEABILITY_FILL_STALL_WINDOW_SEC = float(
+            os.getenv("TRADEABILITY_FILL_STALL_WINDOW_SEC", str(Config.TRADEABILITY_FILL_STALL_WINDOW_SEC))
+        )
+        self.TRADEABILITY_FILL_STALL_MAX_STEPS = int(
+            os.getenv("TRADEABILITY_FILL_STALL_MAX_STEPS", str(Config.TRADEABILITY_FILL_STALL_MAX_STEPS))
+        )
+        self.TRADEABILITY_FILL_STALL_MIN_RECENT_TRADES = int(
+            os.getenv(
+                "TRADEABILITY_FILL_STALL_MIN_RECENT_TRADES",
+                str(Config.TRADEABILITY_FILL_STALL_MIN_RECENT_TRADES),
+            )
+        )
+        self.TRADEABILITY_FILL_STALL_RELAX_STEP = float(
+            os.getenv("TRADEABILITY_FILL_STALL_RELAX_STEP", str(Config.TRADEABILITY_FILL_STALL_RELAX_STEP))
+        )
+        self.TRADEABILITY_FILL_STALL_RELAX_MAX = float(
+            os.getenv("TRADEABILITY_FILL_STALL_RELAX_MAX", str(Config.TRADEABILITY_FILL_STALL_RELAX_MAX))
+        )
+        self.TRADEABILITY_FILL_STALL_MEDIUM_RATIO_STEP = float(
+            os.getenv(
+                "TRADEABILITY_FILL_STALL_MEDIUM_RATIO_STEP",
+                str(Config.TRADEABILITY_FILL_STALL_MEDIUM_RATIO_STEP),
+            )
+        )
+        self.TRADEABILITY_FILL_STALL_MEDIUM_RATIO_MAX_DROP = float(
+            os.getenv(
+                "TRADEABILITY_FILL_STALL_MEDIUM_RATIO_MAX_DROP",
+                str(Config.TRADEABILITY_FILL_STALL_MEDIUM_RATIO_MAX_DROP),
+            )
+        )
         self.BOOTSTRAP_VETO_COOLDOWN_SEC = float(os.getenv("BOOTSTRAP_VETO_COOLDOWN_SEC", str(Config.BOOTSTRAP_VETO_COOLDOWN_SEC)))
         self.CAPITAL_ALLOCATOR_SHARED_WALLET = str(
             os.getenv("CAPITAL_ALLOCATOR_SHARED_WALLET", str(Config.CAPITAL_ALLOCATOR_SHARED_WALLET))
@@ -1165,6 +1786,9 @@ class Config:
             "BOOTSTRAP_ESCAPE_HATCH_ENABLED",
             str(Config.BOOTSTRAP_ESCAPE_HATCH_ENABLED)
         ).lower() == "true"
+        self.MAX_OPEN_POSITIONS_PER_SYMBOL = int(
+            os.getenv("MAX_OPEN_POSITIONS_PER_SYMBOL", str(Config.MAX_OPEN_POSITIONS_PER_SYMBOL))
+        )
 
         # ProfitTargetEngine knobs
         self.PROFIT_TARGET_DAILY_PCT = float(os.getenv("PROFIT_TARGET_DAILY_PCT", str(Config.PROFIT_TARGET_DAILY_PCT)))
@@ -1197,13 +1821,30 @@ class Config:
         self.DUST_CRITICAL_THRESHOLD_HOURS = float(os.getenv("DUST_CRITICAL_THRESHOLD_HOURS", str(Config.DUST_CRITICAL_THRESHOLD_HOURS)))
 
         # Ensure dust controls exist (some logs assume these attributes)
-        self.DUST_LIQUIDATION_ENABLED = os.getenv("DUST_LIQUIDATION_ENABLED", "false").lower() == "true"
+        # ✅ Standardized to lowercase for consistent runtime naming
+        self.dust_liquidation_enabled = os.getenv(
+            "DUST_LIQUIDATION_ENABLED",
+            str(Config.DUST_LIQUIDATION_ENABLED),
+        ).lower() == "true"
         # Allow dust positions to bypass re-entry lock (merge dust back into tradable size)
-        self.DUST_REENTRY_OVERRIDE = os.getenv("DUST_REENTRY_OVERRIDE", "true").lower() == "true"
+        self.dust_reentry_override = os.getenv(
+            "DUST_REENTRY_OVERRIDE",
+            str(Config.DUST_REENTRY_OVERRIDE),
+        ).lower() == "true"
+        # 🔧 NEW: Guard to prevent opening new trades below significant floor unless explicitly allowed
+        self.allow_entry_below_significant_floor = os.getenv(
+            "ALLOW_ENTRY_BELOW_SIGNIFICANT_FLOOR",
+            str(Config.ALLOW_ENTRY_BELOW_SIGNIFICANT_FLOOR),
+        ).lower() == "true"
+        # Back-compat aliases used by older callsites/scripts.
+        self.DUST_LIQUIDATION_ENABLED = bool(self.dust_liquidation_enabled)
+        self.DUST_REENTRY_OVERRIDE = bool(self.dust_reentry_override)
+        self.ALLOW_ENTRY_BELOW_SIGNIFICANT_FLOOR = bool(self.allow_entry_below_significant_floor)
         logger.info(
-            "🧹 Dust authority → reentry_override=%s | liquidation_enabled=%s",
-            self.DUST_REENTRY_OVERRIDE,
-            self.DUST_LIQUIDATION_ENABLED,
+            "🧹 Dust authority → reentry_override=%s | liquidation_enabled=%s | entry_floor_guard=%s",
+            self.dust_reentry_override,
+            self.dust_liquidation_enabled,
+            not self.allow_entry_below_significant_floor,  # Show guard status (True = guard enabled)
         )
         # Provide a minimal DUST_REGISTER namespace if not defined elsewhere
         if not hasattr(self, "DUST_REGISTER"):
@@ -1223,6 +1864,19 @@ class Config:
         self.ML_GOOD_CONF = float(os.getenv("ML_GOOD_CONF", "0.65"))
         self.ML_STRONG_CONF = float(os.getenv("ML_STRONG_CONF", "0.75"))
         self.ML_CONF_BACKTEST_ON_STARTUP = os.getenv("ML_CONF_BACKTEST_ON_STARTUP", "true").lower() == "true"
+        self.AUTO_TRAIN = str(os.getenv("AUTO_TRAIN", str(Config.AUTO_TRAIN))).strip().lower() in {"1", "true", "yes", "on"}
+        self.SWING_AUTO_TRAIN = str(
+            os.getenv("SWING_AUTO_TRAIN", str(self.AUTO_TRAIN))
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.TREND_AUTO_TRAIN = str(
+            os.getenv("TREND_AUTO_TRAIN", str(self.AUTO_TRAIN))
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        logger.info(
+            "Auto-train toggles: AUTO_TRAIN=%s SWING_AUTO_TRAIN=%s TREND_AUTO_TRAIN=%s",
+            self.AUTO_TRAIN,
+            self.SWING_AUTO_TRAIN,
+            self.TREND_AUTO_TRAIN,
+        )
 
         self.TREND_MIN_CONF = float(os.getenv("TREND_MIN_CONF", "0.60"))
         self.TREND_MIN_CONF_SELL = float(os.getenv("TREND_MIN_CONF_SELL", str(self.SELL_MIN_CONF)))
@@ -1236,7 +1890,13 @@ class Config:
         self.DEADLOCK_REJECTION_THRESHOLD = int(os.getenv("DEADLOCK_REJECTION_THRESHOLD", "10"))
         self.DEADLOCK_REJECTION_IGNORE_REASONS = os.getenv(
             "DEADLOCK_REJECTION_IGNORE_REASONS",
-            "COLD_BOOTSTRAP_BLOCK,PORTFOLIO_FULL",
+            (
+                "COLD_BOOTSTRAP_BLOCK,PORTFOLIO_FULL,EXPECTED_MOVE_LT_ROUND_TRIP_COST,POSITION_ALREADY_OPEN,"
+                "CONF_BELOW_REQUIRED,NET_USDT_BELOW_THRESHOLD,PRETRADE_EFFECT_GATE:NET_USDT_BELOW_THRESHOLD,"
+                "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
+                "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
+                "MICRO_BACKTEST_INSUFFICIENT_SAMPLES"
+            ),
         )
 
         # ---------- Global Economic Thresholds ----------
@@ -1521,7 +2181,7 @@ class Config:
         logger.info(
             "🧰 Wallet-sync & dust → auto_position_from_balances=%s | dust_liq_enabled=%s | dust_min_quote=%.2f",
             self.AUTO_POSITION_FROM_BALANCES,
-            self.DUST_LIQUIDATION_ENABLED,
+            self.dust_liquidation_enabled,
             self.DUST_MIN_QUOTE_USDT,
         )
         logger.info("🛡️ HYG guards → max_per_trade_usdt=%.2f | require_trading_status=%s | watchdog_warn_cooldown=%ss",

@@ -15,7 +15,7 @@ class ModeManager:
         self._current_mode = "BOOTSTRAP"  # Start in bootstrap mode
         self._last_mode = None
         self._mode_switch_count = 0
-        self._mode_switch_timestamps = {}
+        self._mode_switch_timestamps = {self._current_mode: time.time()}
         
         # ═══════════════════════════════════════════════════════════════════
         # MODES SOP MATRIX (HARD ENVELOPE)
@@ -174,43 +174,62 @@ class ModeManager:
             if current != "BOOTSTRAP":
                 self.logger.warning("[ModeManager:SOP] 🟦 Triggering BOOTSTRAP: portfolio_flat=True, startup=%s, idle=%ds", 
                                    metrics.get("is_restart"), int(idle_time))
-                self.set_mode("BOOTSTRAP")
+                self.set_mode("BOOTSTRAP", force=True, reason="bootstrap_gate")
                 return
 
         # 2. Circuit Breaker Opens -> SAFE (Immediate)
         if metrics.get("circuit_breaker_open", False):
              if current != "SAFE":
                   self.logger.warning("[EmergencySOP] 🛑 Circuit Breaker OPEN -> Switching to SAFE immediately.")
-                  self.set_mode("SAFE")
+                  self.set_mode("SAFE", force=True, reason="circuit_breaker_open")
                   return
 
         # 3. Manual Pause / Compliance -> PAUSED (Immediate)
         if metrics.get("manual_pause", False) or "paused" in status:
              if current != "PAUSED":
                   self.logger.warning("[SOP:Authority] ⏸️ Manual Pause Detected -> Switching to PAUSED mode.")
-                  self.set_mode("PAUSED")
+                  self.set_mode("PAUSED", force=True, reason="manual_pause")
                   return
 
         # 4. Manual Operator Freeze (via Health/Status) -> SAFE (Immediate)
         if "frozen" in status or metrics.get("manual_freeze", False):
              if current != "SAFE":
                   self.logger.warning("[EmergencySOP] 🛑 Manual Freeze Detected -> Switching to SAFE immediately.")
-                  self.set_mode("SAFE")
+                  self.set_mode("SAFE", force=True, reason="manual_freeze")
                   return
 
         # 4. Reservation Corruption (Integrity Error) -> SAFE (Immediate)
         if metrics.get("integrity_error", False):
              if current != "SAFE":
                   self.logger.warning("[EmergencySOP] 🛑 Integrity/Reservation Corruption -> Switching to SAFE immediately.")
-                  self.set_mode("SAFE")
+                  self.set_mode("SAFE", force=True, reason="integrity_error")
                   return
 
         # 5. Repeated HYG Failures -> PROTECTIVE (Immediate)
         if metrics.get("repeated_failures", False):
              if current not in ("SAFE", "PROTECTIVE"):
+                  if current == "RECOVERY":
+                      # Prevent RECOVERY <-> PROTECTIVE ping-pong under noisy failure counters.
+                      persist_sec = float(
+                          getattr(self.config, "RECOVERY_TO_PROTECTIVE_FAILURE_PERSISTENCE_SEC", 120.0) or 120.0
+                      )
+                      if self._check_condition_persistence("recovery_to_protective_failures", now, persist_sec):
+                          self.logger.warning(
+                              "[EmergencySOP] ⚠️ Repeated Outcomes/HYG Failures persisted in RECOVERY (%.0fs) -> PROTECTIVE.",
+                              persist_sec,
+                          )
+                          self.set_mode("PROTECTIVE", force=True, reason="repeated_failures_recovery")
+                          return
+                      self.logger.warning(
+                          "[EmergencySOP] ⚠️ Repeated failures detected in RECOVERY; waiting %.0fs persistence before PROTECTIVE.",
+                          persist_sec,
+                      )
+                      return
                   self.logger.warning("[EmergencySOP] ⚠️ Repeated Outcomes/HYG Failures -> Switching to PROTECTIVE immediately.")
-                  self.set_mode("PROTECTIVE")
+                  self.set_mode("PROTECTIVE", force=True, reason="repeated_failures")
                   return
+        else:
+            self._reset_condition("recovery_to_protective_failures")
 
         # 6. RECOVERY Triggers (Restart / Health Faults / Forced Liquidation)
         # RECOVERY: stabilize, don’t freeze.
@@ -225,7 +244,7 @@ class ModeManager:
             if current not in ("RECOVERY", "BOOTSTRAP", "SAFE", "PAUSED"):
                 self.logger.warning("[ModeManager:SOP] 🟨 Triggering RECOVERY: health_ok=%s, forced_liq=%s, status=%s", 
                                    health_ok, forced_liq, status)
-                self.set_mode("RECOVERY")
+                self.set_mode("RECOVERY", force=True, reason="health_or_forced_liq")
                 return
 
         # 7. Drawdown Breach -> PROTECTIVE (SOP REQUIREMENT)
@@ -233,7 +252,7 @@ class ModeManager:
             protective_dd_limit = float(getattr(self.config, "PROTECTIVE_DRAWDOWN_LIMIT", 2.0))
             if metrics.get("drawdown_pct", 0.0) >= protective_dd_limit:
                  self.logger.warning("[ModeManager:SOP] 🛡️ Drawdown Breach -> Switching to PROTECTIVE (%.2f%%)", metrics.get("drawdown_pct"))
-                 self.set_mode("PROTECTIVE")
+                 self.set_mode("PROTECTIVE", force=True, reason="drawdown_breach")
                  return
                  
         # 8. Hard Drawdown Breach -> SAFE (Absolute floor)
@@ -241,7 +260,7 @@ class ModeManager:
             hard_dd_limit = float(getattr(self.config, "HARD_DRAWDOWN_LIMIT", 5.0))
             if metrics.get("drawdown_pct", 0.0) >= hard_dd_limit:
                 self.logger.warning("[ModeManager:SOP] 🛑 Hard Drawdown Breach -> Switching to SAFE (%.2f%%)", metrics.get("drawdown_pct"))
-                self.set_mode("SAFE")
+                self.set_mode("SAFE", force=True, reason="hard_drawdown_breach")
                 return
 
         # =====================================================================
@@ -257,7 +276,7 @@ class ModeManager:
             if rr_low and dd_low:
                 if self._check_condition_persistence("normal_to_aggressive", now, 1800):
                     self.logger.info("[ModeManager:SOP] NORMAL -> AGGRESSIVE: Low run-rate and drawdown persistence met.")
-                    self.set_mode("AGGRESSIVE")
+                    self.set_mode("AGGRESSIVE", reason="normal_to_aggressive")
                     return
             else:
                 self._reset_condition("normal_to_aggressive")
@@ -270,7 +289,7 @@ class ModeManager:
             if rr_ok:
                 if self._check_condition_persistence("aggressive_to_normal", now, 1200):
                     self.logger.info("[ModeManager:SOP] AGGRESSIVE -> NORMAL: Target run-rate recovery persistence met.")
-                    self.set_mode("NORMAL")
+                    self.set_mode("NORMAL", reason="aggressive_to_normal")
                     return
             else:
                 self._reset_condition("aggressive_to_normal")
@@ -284,7 +303,7 @@ class ModeManager:
                 # SOP requirement: Gradual transition (persistence check) for both Volatility and Risk Flags
                 if self._check_condition_persistence("normal_to_protective", now, 300):
                     self.logger.info("[ModeManager:SOP] NORMAL -> PROTECTIVE: Volatility/Risk flags persistence met.")
-                    self.set_mode("PROTECTIVE")
+                    self.set_mode("PROTECTIVE", reason="normal_to_protective")
                     return
             else:
                 self._reset_condition("normal_to_protective")
@@ -298,7 +317,7 @@ class ModeManager:
                 stabilization_sec = int(getattr(self.config, "RECOVERY_STABILIZATION_MIN", 10)) * 60
                 if self._check_condition_persistence("recovery_to_normal", now, stabilization_sec):
                     self.logger.info("[ModeManager:SOP] RECOVERY -> NORMAL: Health stabilization met.")
-                    self.set_mode("NORMAL")
+                    self.set_mode("NORMAL", reason="recovery_to_normal")
                     return
             else:
                 self._reset_condition("recovery_to_normal")
@@ -312,7 +331,7 @@ class ModeManager:
             if health_ok and dd_stable:
                 if self._check_condition_persistence("protective_to_recovery", now, 600): # 10 min stabilization
                     self.logger.info("[ModeManager:SOP] 🛡️ -> 🟨 PROTECTIVE -> RECOVERY: Health and PnL stabilized.")
-                    self.set_mode("RECOVERY")
+                    self.set_mode("RECOVERY", reason="protective_to_recovery")
                     return
             else:
                 self._reset_condition("protective_to_recovery")
@@ -338,6 +357,12 @@ class ModeManager:
         if name in self._condition_start_times:
             del self._condition_start_times[name]
 
+    def _seconds_in_current_mode(self, now: Optional[float] = None) -> float:
+        """Return elapsed seconds in current mode."""
+        now_ts = time.time() if now is None else float(now)
+        entered = self._mode_switch_timestamps.get(self._current_mode, now_ts)
+        return max(0.0, now_ts - float(entered))
+
 
     def get_mode(self) -> str:
         """Get the current trading mode."""
@@ -347,25 +372,45 @@ class ModeManager:
         """Get the hard envelope (constraints) for the current mode."""
         return self._SOP_MATRIX.get(self._current_mode, self._SOP_MATRIX["NORMAL"])
 
-    def set_mode(self, mode: str):
+    def set_mode(self, mode: str, force: bool = False, reason: str = "") -> bool:
         """Set the current trading mode and emit an event if changed."""
         mode = mode.upper()
         if mode not in self._SOP_MATRIX:
             self.logger.warning(f"[ModeManager] Attempted to set invalid mode: {mode}")
-            return
+            return False
 
         if mode != self._current_mode:
+            now = time.time()
+            if not force:
+                min_mode_duration_sec = max(0.0, float(self._mode_config.get("min_mode_duration_sec", 0.0) or 0.0))
+                elapsed = self._seconds_in_current_mode(now)
+                if elapsed < min_mode_duration_sec:
+                    suffix = f" reason={reason}" if reason else ""
+                    self.logger.info(
+                        "[ModeManager] Transition %s -> %s deferred by min_mode_duration_sec (%.1fs < %.1fs)%s",
+                        self._current_mode,
+                        mode,
+                        elapsed,
+                        min_mode_duration_sec,
+                        suffix,
+                    )
+                    return False
+
             old_mode = self._current_mode
             self._current_mode = mode
             self._last_mode = old_mode
             self._mode_switch_count += 1
-            self._mode_switch_timestamps[mode] = time.time()
+            self._mode_switch_timestamps[mode] = now
+            # Reset stale persistence timers so a fresh mode starts with fresh hysteresis.
+            self._condition_start_times.clear()
             
             # Update universe cap independently from allocation envelope.max_positions.
             self._active_symbol_limit = self._resolve_mode_universe_limit(mode)
             
             self.logger.info(f"[ModeManager] Mode changed from {old_mode} to {mode} | Objective: {self._SOP_MATRIX[mode]['objective']}")
             self._emit_event('mode_changed', {'old_mode': old_mode, 'new_mode': mode})
+            return True
+        return False
 
     def get_mode_info(self) -> Dict[str, Any]:
         """Get detailed mode information."""
@@ -394,7 +439,7 @@ class ModeManager:
     def transition_from_bootstrap(self):
         """Transition from bootstrap mode to normal mode."""
         if self._current_mode == "BOOTSTRAP":
-            self.set_mode("NORMAL")
+            self.set_mode("NORMAL", force=True, reason="bootstrap_complete")
             self.logger.info(f"[ModeManager] Bootstrap transition complete. Active symbol limit: {self._active_symbol_limit}")
 
     def register_event_handler(self, handler):

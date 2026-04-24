@@ -551,21 +551,22 @@ class ExchangeClient:
         # === API KEY SELECTION LOGIC ===
         # Use self.testnet which was correctly set above (avoiding local variable shadowing)
         if self.testnet:
-            api_key = os.getenv("BINANCE_TESTNET_API_KEY")
-            api_secret_hmac = os.getenv("BINANCE_TESTNET_API_SECRET_HMAC")
-            api_secret_ed25519 = os.getenv("BINANCE_TESTNET_API_SECRET_ED25519")
+            api_key = _cfg("BINANCE_TESTNET_API_KEY")
+            api_secret_hmac = _cfg("BINANCE_TESTNET_API_SECRET_HMAC") or _cfg("BINANCE_TESTNET_API_SECRET")
+            api_secret_ed25519 = _cfg("BINANCE_TESTNET_API_SECRET_ED25519")
             base_url = "https://testnet.binance.vision"
         else:
-            api_key = os.getenv("BINANCE_API_KEY")
-            api_secret_hmac = os.getenv("BINANCE_API_SECRET_HMAC")
-            api_secret_ed25519 = os.getenv("BINANCE_API_SECRET_ED25519")
+            api_key = _cfg("BINANCE_API_KEY")
+            api_secret_hmac = _cfg("BINANCE_API_SECRET_HMAC") or _cfg("BINANCE_API_SECRET")
+            api_secret_ed25519 = _cfg("BINANCE_API_SECRET_ED25519")
             base_url = "https://api.binance.com"
-        
-        self.api_key = api_key
-        self.api_secret_hmac = api_secret_hmac  # For REST signed endpoints
-        self.api_secret_ed25519 = api_secret_ed25519  # For WS API v3 session.logon
-        # Keep api_secret for backward compatibility (use Ed25519 if available)
-        self.api_secret = api_secret_ed25519 or api_secret_hmac
+
+        # Normalize credential strings defensively (trim accidental whitespace/newlines).
+        self.api_key = str(api_key or "").strip()
+        self.api_secret_hmac = str(api_secret_hmac or "").strip()  # For REST signed endpoints
+        self.api_secret_ed25519 = str(api_secret_ed25519 or "").strip()  # For WS API v3 session.logon
+        # Backward compatibility: prioritize HMAC for REST signing paths.
+        self.api_secret = self.api_secret_hmac or self.api_secret_ed25519
 
         # FIX 1: Validate API keys early before AsyncClient initialization
         if self.paper_trade:
@@ -628,7 +629,7 @@ class ExchangeClient:
         self.symbol_filters: Dict[str, Dict[str, Any]] = {}
         self._exchange_info: Optional[Dict[str, Any]] = None
         self._exchange_info_timestamp: float = 0
-        self._sync_lock = asyncio.Lock()
+        self._sync_lock = None  # Lazy-init when needed to avoid event loop issues in sync tests
         self._paper_trade_orders: Dict[str, Dict[str, Any]] = {}
         self._time_offset_ms: int = 0  # server - local
         self._weight_counters = defaultdict(lambda: {"ts": 0.0, "w": 0})
@@ -816,6 +817,12 @@ class ExchangeClient:
                 raise RuntimeError("Unsafe order path: ENFORCE_EXECUTION_MANAGER_PATH must be True")
 
     # ------------- tiny utils -------------
+    async def _get_sync_lock(self):
+        """Get or lazily initialize the async lock."""
+        if self._sync_lock is None:
+            self._sync_lock = asyncio.Lock()
+        return self._sync_lock
+
     async def _maybe_await(self, v):
         if asyncio.iscoroutine(v):
             return await v
@@ -1284,12 +1291,14 @@ class ExchangeClient:
         
         # Calculate HMAC-SHA256 signature BEFORE adding to params
         # REST API ALWAYS uses HMAC, never Ed25519
-        if not self.api_secret_hmac:
+        # Use api_secret_hmac if available, fall back to api_secret for tests
+        secret_for_hmac = self.api_secret_hmac or self.api_secret
+        if not secret_for_hmac:
             self.logger.warning("[EC] HMAC secret not available for REST signing")
             return params
         
         signature = hmac.new(
-            self.api_secret_hmac.encode('utf-8'),
+            secret_for_hmac.encode('utf-8'),
             query_string.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
@@ -2482,8 +2491,9 @@ class ExchangeClient:
         from aiohttp import ClientTimeout, TCPConnector
 
         # If already started but we have API keys and the client might be public-only, recreate with signed keys
+        rest_secret = self.api_secret_hmac or self.api_secret
         _has_real_keys = (
-            self.api_key and self.api_secret
+            self.api_key and rest_secret
             and self.api_key != "paper_key"
             and not self.paper_trade
         )
@@ -2491,7 +2501,7 @@ class ExchangeClient:
             try:
                 if self.client:
                     await self.client.close_connection()
-                self.client = await AsyncClient.create(self.api_key, self.api_secret, testnet=self.testnet)
+                self.client = await AsyncClient.create(self.api_key, rest_secret, testnet=self.testnet)
                 self.logger.info("Exchange client upgraded to signed mode.")
                 with contextlib.suppress(Exception):
                     await self.start_user_data_stream()
@@ -2516,7 +2526,7 @@ class ExchangeClient:
                 self.logger.warning("ExchangeClient starting without API keys — public endpoints only.")
             self.client = await AsyncClient.create(api_key="", api_secret="", testnet=self.testnet)
         else:
-            self.client = await AsyncClient.create(self.api_key, self.api_secret, testnet=self.testnet)
+            self.client = await AsyncClient.create(self.api_key, rest_secret, testnet=self.testnet)
         self.logger.info("Exchange client connected.")
         self._ready = True
 
@@ -2968,7 +2978,8 @@ class ExchangeClient:
         if self._exchange_info and now - self._exchange_info_timestamp < 12 * 3600:
             return
 
-        async with self._sync_lock:
+        sync_lock = await self._get_sync_lock()
+        async with sync_lock:
             if self._exchange_info and now - self._exchange_info_timestamp < 12 * 3600:
                 return
 

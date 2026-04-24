@@ -339,8 +339,8 @@ class CapitalAllocator:
         """Read authoritative free USDT from SharedState (Point 1)."""
         try:
             if hasattr(self.ss, "get_spendable_balance"):
-                # Use a small 5% reserve ratio for safety
-                return await self.ss.get_spendable_balance("USDT", reserve_ratio=0.05)
+                # Use SharedState canonical reserve policy (do not override with hardcoded ratio).
+                return await self.ss.get_spendable_balance("USDT")
             # Fallback to direct balance read
             bal = self.ss.get_balance_snapshot()
             usdt = bal.get("USDT", {})
@@ -618,6 +618,118 @@ class CapitalAllocator:
         )
         return result
 
+    async def _apply_capital_hygiene_gate(
+        self,
+        usable_pool: float,
+        *,
+        nav: float,
+        is_bootstrap: bool,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """
+        Compounding gate: throttle BUY allocation when capital quality degrades.
+
+        Goal: preserve quote optionality and avoid compounding into fragmented/dead capital.
+        """
+        if usable_pool <= 0 or is_bootstrap:
+            return max(0.0, float(usable_pool)), {
+                "action": "none",
+                "scale": 1.0,
+                "reason": "bootstrap_or_zero_pool",
+            }
+
+        snapshot: Dict[str, Any] = {}
+        try:
+            updater = getattr(self.ss, "update_capital_bucket_metrics", None)
+            if callable(updater):
+                snapshot = await updater(nav_hint=float(nav or 0.0)) or {}
+        except Exception as e:
+            self.logger.debug("[Allocator:Hygiene] Snapshot refresh failed: %s", e)
+            snapshot = {}
+
+        metrics = snapshot if isinstance(snapshot, dict) and snapshot else getattr(self.ss, "metrics", {}) or {}
+        free_cash_ratio = float(metrics.get("free_cash_ratio", 0.0) or 0.0)
+        dead_capital_ratio = float(metrics.get("dead_capital_ratio", 0.0) or 0.0)
+        dust_breakdown = metrics.get("dust_class_breakdown", {}) if isinstance(metrics.get("dust_class_breakdown", {}), dict) else {}
+        recoverable_dust_count = int(dust_breakdown.get("RECOVERABLE_DUST", 0) or 0)
+
+        shared_cfg = getattr(self.ss, "config", None)
+        reserve_ratio = float(
+            getattr(shared_cfg, "quote_reserve_ratio", getattr(self.config, "QUOTE_RESERVE_RATIO", 0.20))
+            or 0.20
+        )
+        reserve_warn_mult = float(self._cfg("CAPITAL_HYGIENE_RESERVE_WARN_MULT", 1.0) or 1.0)
+        reserve_warn = max(0.0, reserve_ratio * reserve_warn_mult)
+        dead_cap_max = float(self._cfg("CAPITAL_HYGIENE_DEAD_CAP_MAX_RATIO", 0.30) or 0.30)
+        severe_dead_cap = float(self._cfg("CAPITAL_HYGIENE_SEVERE_DEAD_CAP_RATIO", 0.45) or 0.45)
+        min_gate_scale = float(self._cfg("CAPITAL_HYGIENE_MIN_SCALE", 0.25) or 0.25)
+        min_gate_scale = min(max(min_gate_scale, 0.0), 1.0)
+
+        gate_scale = 1.0
+        reasons = []
+
+        if reserve_warn > 0 and free_cash_ratio < reserve_warn:
+            cash_scale = max(min_gate_scale, free_cash_ratio / max(reserve_warn, 1e-9))
+            gate_scale = min(gate_scale, cash_scale)
+            reasons.append(f"cash_ratio_{free_cash_ratio:.3f}_below_{reserve_warn:.3f}")
+
+        if dead_capital_ratio > dead_cap_max:
+            if dead_capital_ratio >= severe_dead_cap:
+                dead_scale = min_gate_scale
+            else:
+                excess = (dead_capital_ratio - dead_cap_max) / max(severe_dead_cap - dead_cap_max, 1e-9)
+                dead_scale = max(min_gate_scale, 1.0 - min(max(excess, 0.0), 1.0))
+            gate_scale = min(gate_scale, dead_scale)
+            reasons.append(f"dead_cap_ratio_{dead_capital_ratio:.3f}_above_{dead_cap_max:.3f}")
+
+        if recoverable_dust_count > 0 and free_cash_ratio < reserve_warn:
+            # Active recoverable dust + weak cash => bias toward cleanup/sell cycles.
+            gate_scale = min(gate_scale, 0.20)
+            reasons.append(f"recoverable_dust_{recoverable_dust_count}")
+
+        gated_pool = max(0.0, float(usable_pool) * gate_scale)
+        action = "throttle_buys" if gate_scale < 0.999 else "none"
+        reason = ";".join(reasons) if reasons else "capital_hygiene_healthy"
+
+        if gate_scale < 0.999:
+            self.logger.warning(
+                "[Allocator:Hygiene] action=%s scale=%.2f pool %.2f -> %.2f | free_cash_ratio=%.3f reserve_warn=%.3f "
+                "dead_cap_ratio=%.3f recoverable_dust=%d reason=%s",
+                action,
+                gate_scale,
+                float(usable_pool),
+                float(gated_pool),
+                free_cash_ratio,
+                reserve_warn,
+                dead_capital_ratio,
+                recoverable_dust_count,
+                reason,
+            )
+            try:
+                await self.ss.emit_event("CapitalHygieneGate", {
+                    "action": action,
+                    "scale": float(gate_scale),
+                    "pool_before": float(usable_pool),
+                    "pool_after": float(gated_pool),
+                    "free_cash_ratio": float(free_cash_ratio),
+                    "reserve_warn_ratio": float(reserve_warn),
+                    "dead_capital_ratio": float(dead_capital_ratio),
+                    "recoverable_dust_count": int(recoverable_dust_count),
+                    "reason": reason,
+                    "ts": time.time(),
+                })
+            except Exception:
+                pass
+
+        return gated_pool, {
+            "action": action,
+            "scale": float(gate_scale),
+            "reason": reason,
+            "free_cash_ratio": float(free_cash_ratio),
+            "dead_capital_ratio": float(dead_capital_ratio),
+            "recoverable_dust_count": int(recoverable_dust_count),
+            "reserve_warn_ratio": float(reserve_warn),
+        }
+
 
     async def _build_plan(self, perf_map: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -746,6 +858,22 @@ class CapitalAllocator:
         if allocatable_free > 0:
             usable_pool = min(float(usable_pool), float(allocatable_free))
 
+        # Capital-quality compounding gate:
+        # reduce BUY budget when reserve/capital hygiene is unhealthy.
+        hygiene_gate: Dict[str, Any] = {
+            "action": "none",
+            "scale": 1.0,
+            "reason": "not_evaluated",
+        }
+        try:
+            usable_pool, hygiene_gate = await self._apply_capital_hygiene_gate(
+                usable_pool,
+                nav=float(await self._nav_quote() or 0.0),
+                is_bootstrap=bool(is_bootstrap),
+            )
+        except Exception as e:
+            self.logger.debug("[Allocator:Hygiene] Gate evaluation failed: %s", e)
+
         if usable_pool <= 0:
              # G007: UsablePoolZero gate - ELEVATED to INFO
              self.logger.info(f"[EXEC_BLOCK] gate=USABLE_POOL_ZERO reason=INSUFFICIENT_LIQUIDITY_HEADROOM component=CapitalAllocator action=DENY_ALLOCATION")
@@ -753,10 +881,11 @@ class CapitalAllocator:
              return {
                  "agent_budgets": {},
                  "per_agent_usdt": {},
-                 "reason": "usable_pool_zero",
+                 "reason": str(hygiene_gate.get("reason") or "usable_pool_zero"),
                  "pool_quote": 0.0,
                  "keep_free": round(float(keep_free), 6),
                  "headroom_quote": round(float(headroom), 6),
+                 "hygiene_gate": hygiene_gate,
              }
 
         # 2. Agent Weighting (with Rejection-Aware Filtering - I2 Invariant)
@@ -886,6 +1015,7 @@ class CapitalAllocator:
             "is_bootstrap": is_bootstrap,
             "shared_wallet_mode": bool(self.shared_wallet_mode),
             "accumulate_count": 0, # Logic moved to event consumer
+            "hygiene_gate": hygiene_gate,
         }
 
     async def _old_build_plan(self, perf_map: Dict[str, Any]) -> Dict[str, Any]:
@@ -903,6 +1033,10 @@ class CapitalAllocator:
                 metrics["alloc_last_free_usdt"] = float(plan.get("free_usdt", 0.0) or 0.0)
                 metrics["alloc_last_keep_free"] = float(plan.get("keep_free", 0.0) or 0.0)
                 metrics["alloc_last_headroom_quote"] = float(plan.get("headroom_quote", 0.0) or 0.0)
+                hg = plan.get("hygiene_gate", {}) if isinstance(plan.get("hygiene_gate", {}), dict) else {}
+                metrics["alloc_hygiene_action"] = str(hg.get("action", "none"))
+                metrics["alloc_hygiene_scale"] = float(hg.get("scale", 1.0) or 1.0)
+                metrics["alloc_hygiene_reason"] = str(hg.get("reason", "") or "")
                 metrics["alloc_last_ts"] = self._now_iso()
         except Exception:
             self.logger.debug("Allocation metrics publish failed", exc_info=True)

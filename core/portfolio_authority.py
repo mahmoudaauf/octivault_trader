@@ -6,6 +6,7 @@ Provides higher-level governance for capital utilization, profit recycling, and 
 import time
 import logging
 from typing import Dict, Any, List, Optional, Tuple
+from core.holding_utility import compute_holding_utility
 
 
 def _dynamic_exposure_cap(nav: float) -> float:
@@ -72,48 +73,56 @@ class PortfolioAuthority:
         if not owned_positions:
             return None
             
-        # Find position with lowest unrealized PnL or highest age with low profit
+        # Find lowest-utility position for recycling under weak velocity.
         candidates = []
         now = time.time()
+        utility_exit_max = float(getattr(self.config, "VELOCITY_EXIT_MAX_UTILITY", 0.60) or 0.60)
         
         for sym, pos in owned_positions.items():
             if self._is_permanent_dust_position(sym, pos):
                 continue
             if pos.get("state") == "EXITING":
                 continue
-                
-            pnl = float(pos.get("unrealized_pnl_pct", 0.0) or 0.0)
+
             entry_ts = float(pos.get("entry_time") or pos.get("opened_at") or now)
             age_hr = (now - entry_ts) / 3600.0
-            
-            # Recyclability score: higher = better for recycling
-            # (Young positions or high-PnL winners are NOT candidates)
-            if age_hr > 0.5: # At least 30 mins hold
-                recycle_score = (1.0 - pnl) * (age_hr / 1.0)
-                candidates.append((sym, recycle_score))
+            if age_hr <= 0.5:  # At least 30 mins hold
+                continue
+
+            utility_snapshot = compute_holding_utility(
+                sym,
+                pos,
+                best_opp_score=0.0,
+                shared_state=self.ss,
+                config=self.config,
+                now_ts=now,
+            )
+            utility = float(utility_snapshot.get("utility", 0.0) or 0.0)
+            if utility <= utility_exit_max:
+                candidates.append((sym, utility, utility_snapshot))
                 
         if not candidates:
             return None
             
-        worst_sym, highest_score = max(candidates, key=lambda x: x[1])
-        
-        # Authority check: only recycle if score is high enough
-        if highest_score > 1.2: # Tuneable threshold
-            self.logger.warning(
-                "[PortfolioAuth:Velocity] 🔄 RECYCLING CAPITAL: %s (score=%.2f) - Below target velocity ($%.2f/hr)",
-                worst_sym, highest_score, target_velocity
-            )
-            return {
-                "symbol": worst_sym,
-                "action": "SELL",
-                "confidence": 1.0,
-                "agent": "PortfolioAuthority",
-                "reason": "VELOCITY_RECYCLING",
-                "_forced_exit": True,
-                "_is_recycling": True
-            }
-            
-        return None
+        worst_sym, worst_utility, worst_snapshot = min(candidates, key=lambda x: x[1])
+        self.logger.warning(
+            "[PortfolioAuth:Velocity] 🔄 RECYCLING CAPITAL: %s (utility=%.3f pressure=%.3f) - Below target velocity ($%.2f/hr)",
+            worst_sym,
+            worst_utility,
+            float(worst_snapshot.get("rotation_pressure", 0.0) or 0.0),
+            target_velocity,
+        )
+        return {
+            "symbol": worst_sym,
+            "action": "SELL",
+            "confidence": 1.0,
+            "agent": "PortfolioAuthority",
+            "reason": "VELOCITY_RECYCLING",
+            "_forced_exit": True,
+            "_is_recycling": True,
+            "_holding_utility": float(worst_snapshot.get("utility", 0.0) or 0.0),
+            "_rotation_pressure": float(worst_snapshot.get("rotation_pressure", 0.0) or 0.0),
+        }
 
     def authorize_rebalance_exit(self, owned_positions: Dict[str, Any], nav: float) -> Optional[Dict[str, Any]]:
         """
@@ -154,6 +163,7 @@ class PortfolioAuthority:
         """
         recycle_pnl_threshold = float(getattr(self.config, "RECYCLE_PNL_PCT", 0.02)) # 2% profit
         recycle_min_age_hr = float(getattr(self.config, "RECYCLE_MIN_AGE_HR", 1.0)) # 1 hour
+        recycle_keep_utility_min = float(getattr(self.config, "RECYCLE_KEEP_UTILITY_MIN", 0.82) or 0.82)
         
         now = time.time()
         for sym, pos in owned_positions.items():
@@ -168,10 +178,22 @@ class PortfolioAuthority:
             
             # If we have a decent profit and have held long enough, recycle it
             if pnl >= recycle_pnl_threshold and age_hr >= recycle_min_age_hr:
+                utility_snapshot = compute_holding_utility(
+                    sym,
+                    pos,
+                    best_opp_score=0.0,
+                    shared_state=self.ss,
+                    config=self.config,
+                    now_ts=now,
+                )
+                utility = float(utility_snapshot.get("utility", 0.0) or 0.0)
+                # Keep exceptional high-utility winners unless explicitly forced by other authorities.
+                if utility >= recycle_keep_utility_min:
+                    continue
                 self.logger.warning(
-                    "[PortfolioAuth:Recycle] ♻️ PROFIT RECYCLING: %s at %.2f%% profit after %.1fh. "
-                    "Locking in for rotation.",
-                    sym, pnl * 100, age_hr
+                    "[PortfolioAuth:Recycle] ♻️ PROFIT RECYCLING: %s at %.2f%% profit after %.1fh "
+                    "(utility=%.3f). Locking in for rotation.",
+                    sym, pnl * 100, age_hr, utility
                 )
                 return {
                     "symbol": sym,
@@ -180,6 +202,8 @@ class PortfolioAuthority:
                     "agent": "PortfolioAuthority",
                     "reason": "PROFIT_RECYCLING",
                     "_forced_exit": True,
-                    "_is_recycling": True
+                    "_is_recycling": True,
+                    "_holding_utility": float(utility_snapshot.get("utility", 0.0) or 0.0),
+                    "_rotation_pressure": float(utility_snapshot.get("rotation_pressure", 0.0) or 0.0),
                 }
         return None

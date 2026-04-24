@@ -168,6 +168,12 @@ class PerformanceEvaluator:
             # Placeholders for future enrichment (Sharpe, winrate, drawdown, etc.)
             "usdt_per_hour": await self._estimate_usdt_per_hour(default=0.0),
             "drawdown_pct": await self._estimate_drawdown_pct(default=0.0),
+            # Capital-quality buckets (published by SharedState.update_capital_bucket_metrics)
+            "free_cash_ratio": float(getattr(self.ss, "metrics", {}).get("free_cash_ratio", 0.0) or 0.0),
+            "operating_cash_ratio": float(getattr(self.ss, "metrics", {}).get("operating_cash_ratio", 0.0) or 0.0),
+            "productive_capital_ratio": float(getattr(self.ss, "metrics", {}).get("productive_capital_ratio", 0.0) or 0.0),
+            "dead_capital_ratio": float(getattr(self.ss, "metrics", {}).get("dead_capital_ratio", 0.0) or 0.0),
+            "dust_class_breakdown": dict(getattr(self.ss, "metrics", {}).get("dust_class_breakdown", {}) or {}),
             "breaches": int(getattr(self.ss, "kpi_breaches", 0) or 0),
         }
 
@@ -214,7 +220,21 @@ class PerformanceEvaluator:
         total_rejections = 0
         max_rejection_count = 0
         deadlock_threshold = int(getattr(self.config, "DEADLOCK_REJECTION_THRESHOLD", 10))
-        ignore_csv = str(getattr(self.config, "DEADLOCK_REJECTION_IGNORE_REASONS", "COLD_BOOTSTRAP_BLOCK,PORTFOLIO_FULL") or "")
+        ignore_csv = str(
+            getattr(
+                self.config,
+                "DEADLOCK_REJECTION_IGNORE_REASONS",
+                (
+                    "COLD_BOOTSTRAP_BLOCK,PORTFOLIO_FULL,"
+                    "CONF_BELOW_REQUIRED,NET_USDT_BELOW_THRESHOLD,PRETRADE_EFFECT_GATE:NET_USDT_BELOW_THRESHOLD,"
+                    "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
+                    "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
+                    "MICRO_BACKTEST_INSUFFICIENT_SAMPLES,"
+                    "EXPECTED_MOVE_LT_ROUND_TRIP_COST,POSITION_ALREADY_OPEN"
+                ),
+            )
+            or ""
+        )
         ignore_reasons = {r.strip().upper() for r in ignore_csv.split(",") if r.strip()}
         rej_ttl_sec = 300.0  # 5 minutes (must match shared_state.py TTL)
         now_ts_local = time.time()

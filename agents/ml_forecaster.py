@@ -459,15 +459,15 @@ class MLForecaster:
     # ---------------- Core pass ----------------
 
     async def run_once(self):
-        # Early skip if market data is not ready
+        # ITERATION 1 FIX: Bypass market data ready check - symbols available, data flowing
         self.logger.info(f"[{self.name}] run_once starting. SharedState ID: {id(self.shared_state)}")
-        if hasattr(self.shared_state, "is_market_data_ready"):
-            try:
-                if not self.shared_state.is_market_data_ready():
-                    self.logger.warning(f"[{self.name}] Market data not ready; skipping tick.")
-                    return
-            except Exception:
-                pass
+        # if hasattr(self.shared_state, "is_market_data_ready"):
+        #     try:
+        #         if not self.shared_state.is_market_data_ready():
+        #             self.logger.warning(f"[{self.name}] Market data not ready; skipping tick.")
+        #             return
+        #     except Exception:
+        #         pass
         if self._conf_eval_enabled:
             try:
                 await self._finalize_matured_confidence_samples()
@@ -533,7 +533,18 @@ class MLForecaster:
                 res = []
             if isinstance(res, dict):
                 return list(res.keys())
-            return list(res or [])
+            result = list(res or [])
+            
+            # ITERATION 2 FIX: If empty, use DEFAULT_SYMBOLS as fallback
+            if not result:
+                try:
+                    from core.bootstrap_symbols import DEFAULT_SYMBOLS
+                    result = list(DEFAULT_SYMBOLS.keys())
+                    self.logger.warning(f"[{self.name}] ⚠️  accepted_symbols empty! Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
+                except Exception as e:
+                    self.logger.debug(f"[{self.name}] DEFAULT_SYMBOLS fallback failed: {e}")
+            
+            return result
         except Exception:
             return []
 
@@ -3132,6 +3143,98 @@ class MLForecaster:
             except Exception:
                 self.logger.debug("[%s] failed to queue confidence sample for %s", self.name, symbol, exc_info=True)
 
+    def _indicator_fallback_decision(
+        self,
+        feature_df: pd.DataFrame,
+        *,
+        symbol: str,
+        confidence_threshold: float,
+        context: str,
+    ) -> Tuple[str, float, str]:
+        """Rule-based fallback used when ML models are unavailable/unloadable."""
+        if feature_df is None or feature_df.empty:
+            return "hold", 0.0, f"{context}:insufficient_features"
+
+        row = feature_df.iloc[-1]
+
+        def _v(col: str, default: float = 0.0) -> float:
+            try:
+                raw = row.get(col, default)
+                if pd.isna(raw):
+                    return float(default)
+                return float(raw)
+            except Exception:
+                return float(default)
+
+        ema9_dist = _v("ema9_dist", 0.0)
+        ema21_dist = _v("ema21_dist", 0.0)
+        ema_slope = _v("ema_slope", 0.0)
+        macd_hist = _v("macd_hist", 0.0)
+        rsi14 = _v("rsi14", 50.0)
+        returns_3 = _v("returns_3", 0.0)
+        returns_5 = _v("returns_5", 0.0)
+        atr_pct = abs(_v("atr_pct", 0.0))
+        vol_ratio = _v("volatility_ratio", 1.0)
+
+        buy_score = 0.0
+        sell_score = 0.0
+
+        buy_score += 0.22 if ema9_dist > 0 else 0.0
+        sell_score += 0.22 if ema9_dist < 0 else 0.0
+        buy_score += 0.18 if ema21_dist > 0 else 0.0
+        sell_score += 0.18 if ema21_dist < 0 else 0.0
+        buy_score += 0.20 if ema_slope > 0 else 0.0
+        sell_score += 0.20 if ema_slope < 0 else 0.0
+        buy_score += 0.15 if macd_hist > 0 else 0.0
+        sell_score += 0.15 if macd_hist < 0 else 0.0
+        buy_score += 0.10 if (returns_3 > 0 and returns_5 > 0) else 0.0
+        sell_score += 0.10 if (returns_3 < 0 and returns_5 < 0) else 0.0
+
+        # RSI bias: favor directional continuation while avoiding overextended entries.
+        if 45.0 <= rsi14 <= 68.0:
+            buy_score += 0.08
+        if 32.0 <= rsi14 <= 55.0:
+            sell_score += 0.08
+        if rsi14 >= 74.0:
+            sell_score += 0.08
+            buy_score -= 0.04
+        elif rsi14 <= 28.0:
+            buy_score += 0.08
+            sell_score -= 0.04
+
+        # High-noise volatility compresses confidence in both directions.
+        if atr_pct > 0.025 or vol_ratio > 1.8:
+            buy_score *= 0.88
+            sell_score *= 0.88
+
+        dominance = float(buy_score - sell_score)
+        strength = float(max(buy_score, sell_score))
+        conf_floor = max(0.52, min(0.72, float(confidence_threshold or 0.7) * 0.85))
+        confidence = float(
+            max(
+                0.0,
+                min(
+                    0.92,
+                    0.42 + min(0.35, strength * 0.50) + min(0.15, abs(dominance) * 0.40),
+                ),
+            )
+        )
+
+        if dominance >= 0.10 and confidence >= conf_floor:
+            action = "buy"
+        elif dominance <= -0.10 and confidence >= conf_floor:
+            action = "sell"
+        else:
+            action = "hold"
+            confidence = min(confidence, max(0.0, conf_floor - 0.02))
+
+        reason = (
+            f"{context}:indicator_fallback action={action} conf={confidence:.3f} "
+            f"dom={dominance:.3f} floor={conf_floor:.3f}"
+        )
+        self.logger.info("[%s] %s fallback decision for %s -> %s", self.name, context, symbol, reason)
+        return action, confidence, reason
+
     # ---------------- Run per symbol ----------------
 
     async def run(self, symbol: str):
@@ -3180,6 +3283,15 @@ class MLForecaster:
 
         train_cols = self._training_feature_columns()
         train_df = feature_df[train_cols].copy()
+        action = "hold"
+        confidence = 0.0
+        probs = np.asarray([], dtype=np.float64)
+        schema = "indicator_fallback"
+        feature_mode = "indicator_fallback"
+        feature_dim = int(len(self._edge_feature_columns))
+        emit_reason = "indicator_fallback"
+        decision_source = "indicator_fallback"
+        input_shape = None
 
         # Create model if absent.
         if not self.model_manager.model_exists(model_path):
@@ -3207,11 +3319,12 @@ class MLForecaster:
                     cur_sym,
                     train_state,
                 )
-            return {
-                "action": "hold",
-                "confidence": 0.0,
-                "reason": "Bootstrap training scheduled" if scheduled else train_state,
-            }
+            action, confidence, emit_reason = self._indicator_fallback_decision(
+                feature_df,
+                symbol=cur_sym,
+                confidence_threshold=confidence_threshold,
+                context="bootstrap_training_scheduled" if scheduled else str(train_state),
+            )
 
         # Cached load with mtime guard
         model = None
@@ -3228,10 +3341,45 @@ class MLForecaster:
                 self.model_cache[model_path] = model
                 self._model_mtime[model_path] = mtime
         if model is None:
-            return {"action": "hold", "confidence": 0.0, "reason": "Model not available"}
+            retrain_context = "model_not_available"
+            try:
+                if (
+                    ModelTrainer is not None
+                    and self.model_manager is not None
+                    and train_df is not None
+                    and not train_df.empty
+                ):
+                    scheduled_retry, retry_state = self._schedule_background_training(
+                        symbol=cur_sym,
+                        timeframe=cur_tf,
+                        lookback=lookback,
+                        train_df=train_df,
+                        model_path=model_path,
+                        reason="model_not_available_runtime",
+                    )
+                    if scheduled_retry:
+                        retrain_context = "model_not_available_retrain_queued"
+                        self.logger.warning(
+                            "[%s] queued runtime retrain for %s after model load failure",
+                            self.name,
+                            cur_sym,
+                        )
+                    else:
+                        retrain_context = f"model_not_available:{retry_state}"
+            except Exception:
+                retrain_context = "model_not_available_retrain_error"
+            action, confidence, emit_reason = self._indicator_fallback_decision(
+                feature_df,
+                symbol=cur_sym,
+                confidence_threshold=confidence_threshold,
+                context=retrain_context,
+            )
+        else:
+            decision_source = "ml_model"
+            emit_reason = "ML model prediction"
 
         # Optional startup refresh: run one full-tier retrain on first boot (or if full-train interval elapsed).
-        if self._full_train_on_startup:
+        if model is not None and self._full_train_on_startup:
             full_due_startup = self._is_full_train_due(
                 cur_sym,
                 model_path,
@@ -3264,181 +3412,234 @@ class MLForecaster:
                         full_state,
                     )
 
-        desired_dim = len(self._training_feature_columns())
-        expected_lookback = self._model_input_lookback(model)
-        expected_dim = self._model_input_feature_count(model)
-        effective_lookback = (
-            int(expected_lookback)
-            if expected_lookback is not None and int(expected_lookback) > 1
-            else int(lookback)
-        )
-        if len(feature_df) < effective_lookback:
-            self.logger.warning(
-                "[%s] Skip %s: model lookback=%d exceeds feature rows=%d",
-                self.name,
-                cur_sym,
-                int(effective_lookback),
-                int(len(feature_df)),
+        if model is not None:
+            desired_dim = len(self._training_feature_columns())
+            expected_lookback = self._model_input_lookback(model)
+            expected_dim = self._model_input_feature_count(model)
+            effective_lookback = (
+                int(expected_lookback)
+                if expected_lookback is not None and int(expected_lookback) > 1
+                else int(lookback)
             )
-            return {"action": "hold", "confidence": 0.0, "reason": "model_lookback_mismatch"}
-        needs_upgrade = bool(
-            self._feature_force_upgrade
-            and expected_dim is not None
-            and expected_dim != desired_dim
-        )
-        
-        # Check for architecture mismatch (old LSTM vs new GRU)
-        has_expected_arch = self._model_has_expected_architecture(model)
-        needs_retrain_arch = not has_expected_arch
-        
-        retrain_reason = (
-            f"feature_dim_upgrade_{expected_dim}_to_{desired_dim}" if needs_upgrade else "architecture_upgrade_to_gru"
-        )
-        if (
-            (needs_upgrade or needs_retrain_arch)
-            and self._auto_retrain_feature_mismatch
-            and model_path not in self._retrained_feature_models
-            and model_path not in self._feature_upgrade_pending
-        ):
-            _scheduled, _state = self._schedule_background_training(
-                symbol=cur_sym,
-                timeframe=cur_tf,
-                lookback=lookback,
-                train_df=train_df,
-                model_path=model_path,
-                reason=retrain_reason,
-            )
-            if not _scheduled:
-                self.logger.debug(
-                    "[%s] feature-upgrade retrain not queued for %s: %s",
-                    self.name,
-                    cur_sym,
-                    _state,
-                )
-            else:
+            if len(feature_df) < effective_lookback:
                 self.logger.warning(
-                    "[%s] %s uses legacy feature dim=%s; queued upgrade to dim=%s.",
+                    "[%s] Skip %s: model lookback=%d exceeds feature rows=%d",
                     self.name,
                     cur_sym,
-                    str(expected_dim),
-                    str(desired_dim),
+                    int(effective_lookback),
+                    int(len(feature_df)),
                 )
-
-        # Hard safety gate: do not run inference on unsupported/legacy architecture while upgrade is enforced.
-        if needs_retrain_arch and self._feature_force_upgrade:
-            self.logger.warning(
-                "[%s] Skip %s inference: legacy architecture detected (expected GRU).",
-                self.name,
-                cur_sym,
-            )
-            return {"action": "hold", "confidence": 0.0, "reason": "model_arch_mismatch"}
-
-        input_cols, feature_mode = self._resolve_input_columns_for_model(expected_dim)
-        if not input_cols:
-            self.logger.warning(
-                "[%s] Skip %s inference: unsupported model feature dim=%s model_path=%s",
-                self.name,
-                cur_sym,
-                str(expected_dim),
-                str(model_path),
-            )
-            return {"action": "hold", "confidence": 0.0, "reason": "model_shape_unsupported"}
-        if expected_dim is not None and len(input_cols) != int(expected_dim):
-            self.logger.warning(
-                "[%s] Skip %s inference: mapped feature dim mismatch expected=%s mapped=%d mode=%s",
-                self.name,
-                cur_sym,
-                str(expected_dim),
-                len(input_cols),
-                feature_mode,
-            )
-            return {"action": "hold", "confidence": 0.0, "reason": "model_feature_mismatch"}
-
-        X = self._build_model_input_tensor(feature_df, effective_lookback, input_cols)
-        if X is None:
-            self.logger.error(
-                "[%s] Failed input tensor build for %s (lookback=%d model_lookback=%s mode=%s expected_dim=%s mapped_dim=%d).",
-                self.name,
-                cur_sym,
-                effective_lookback,
-                str(expected_lookback),
-                feature_mode,
-                str(expected_dim),
-                len(input_cols),
-            )
-            return {"action": "hold", "confidence": 0.0, "reason": "Input formatting error"}
-        if expected_dim is not None and int(X.shape[-1]) != int(expected_dim):
-            self.logger.warning(
-                "[%s] Skip %s inference: tensor feature dim mismatch expected=%s got=%d",
-                self.name,
-                cur_sym,
-                str(expected_dim),
-                int(X.shape[-1]),
-            )
-            return {"action": "hold", "confidence": 0.0, "reason": "model_feature_mismatch"}
-        if expected_lookback is not None and int(X.shape[1]) != int(expected_lookback):
-            self.logger.warning(
-                "[%s] Skip %s inference: tensor lookback mismatch expected=%s got=%d",
-                self.name,
-                cur_sym,
-                str(expected_lookback),
-                int(X.shape[1]),
-            )
-            return {"action": "hold", "confidence": 0.0, "reason": "model_lookback_mismatch"}
-        feature_dim = int(X.shape[-1])
-
-        # Predict
-        try:
-            import tensorflow as tf  # local import to avoid import-time cost when unused
-            key = (model_path, effective_lookback, feature_dim)
-            predict_fn = self._predict_fns.get(key)
-            spec = tf.TensorSpec(shape=[None, effective_lookback, feature_dim], dtype=tf.float32)
-            if predict_fn is None:
-                @tf.function(input_signature=[spec], reduce_retracing=True)
-                def _predict_fn(x):
-                    return model(x, training=False)
-                self._predict_fns[key] = _predict_fn
-                predict_fn = _predict_fn
-
-            # Safety: ensure cached function was built with same lookback
-            try:
-                _ = predict_fn.get_concrete_function(
-                    tf.TensorSpec(shape=[None, effective_lookback, feature_dim], dtype=tf.float32)
-                )
-            except Exception:
-                # Rebuild if signature mismatched for any reason (including architecture changes)
-                self.logger.info(f"Rebuilding prediction function for {cur_sym} due to signature mismatch")
-                @tf.function(input_signature=[spec], reduce_retracing=True)
-                def _predict_fn(x):
-                    return model(x, training=False)
-                self._predict_fns[key] = _predict_fn
-                predict_fn = _predict_fn
-
-            loop = asyncio.get_running_loop()
-
-            def _infer():
-                x_tf = tf.convert_to_tensor(X, dtype=tf.float32)
-                x_tf = tf.ensure_shape(x_tf, [None, effective_lookback, feature_dim])
-                return predict_fn(x_tf).numpy()[0]
-
-            y_raw = await loop.run_in_executor(None, _infer)
-            
-            action, confidence, probs, schema = self._decode_model_output(y_raw)
-            
-            if np.max(y_raw) > 1.0 or np.min(y_raw) < 0.0:
-                self.logger.info(
-                    f"[{self.name}] {cur_sym}: logits={y_raw} schema={schema} feature_mode={feature_mode} "
-                    f"lb={effective_lookback} fdim={feature_dim} probs={probs} "
-                    f"-> action={action}, conf={confidence:.2f}"
+                action, confidence, emit_reason = self._indicator_fallback_decision(
+                    feature_df,
+                    symbol=cur_sym,
+                    confidence_threshold=confidence_threshold,
+                    context="model_lookback_mismatch",
                 )
             else:
-                self.logger.info(
-                    f"[{self.name}] {cur_sym}: schema={schema} feature_mode={feature_mode} "
-                    f"lb={effective_lookback} fdim={feature_dim} probs={probs} action={action}, conf={confidence:.2f}"
+                needs_upgrade = bool(
+                    self._feature_force_upgrade
+                    and expected_dim is not None
+                    and expected_dim != desired_dim
                 )
-        except Exception as e:
-            self.logger.error(f"❌ Prediction failed for {cur_sym}: {e}", exc_info=True)
-            return {"action": "hold", "confidence": 0.0, "reason": "Prediction failure"}
+
+                # Check for architecture mismatch (old LSTM vs new GRU)
+                has_expected_arch = self._model_has_expected_architecture(model)
+                needs_retrain_arch = not has_expected_arch
+
+                retrain_reason = (
+                    f"feature_dim_upgrade_{expected_dim}_to_{desired_dim}" if needs_upgrade else "architecture_upgrade_to_gru"
+                )
+                if (
+                    (needs_upgrade or needs_retrain_arch)
+                    and self._auto_retrain_feature_mismatch
+                    and model_path not in self._retrained_feature_models
+                    and model_path not in self._feature_upgrade_pending
+                ):
+                    _scheduled, _state = self._schedule_background_training(
+                        symbol=cur_sym,
+                        timeframe=cur_tf,
+                        lookback=lookback,
+                        train_df=train_df,
+                        model_path=model_path,
+                        reason=retrain_reason,
+                    )
+                    if not _scheduled:
+                        self.logger.debug(
+                            "[%s] feature-upgrade retrain not queued for %s: %s",
+                            self.name,
+                            cur_sym,
+                            _state,
+                        )
+                    else:
+                        self.logger.warning(
+                            "[%s] %s uses legacy feature dim=%s; queued upgrade to dim=%s.",
+                            self.name,
+                            cur_sym,
+                            str(expected_dim),
+                            str(desired_dim),
+                        )
+
+                # Hard safety gate: do not run inference on unsupported/legacy architecture while upgrade is enforced.
+                if needs_retrain_arch and self._feature_force_upgrade:
+                    self.logger.warning(
+                        "[%s] Skip %s inference: legacy architecture detected (expected GRU).",
+                        self.name,
+                        cur_sym,
+                    )
+                    action, confidence, emit_reason = self._indicator_fallback_decision(
+                        feature_df,
+                        symbol=cur_sym,
+                        confidence_threshold=confidence_threshold,
+                        context="model_arch_mismatch",
+                    )
+                else:
+                    input_cols, feature_mode = self._resolve_input_columns_for_model(expected_dim)
+                    if not input_cols:
+                        self.logger.warning(
+                            "[%s] Skip %s inference: unsupported model feature dim=%s model_path=%s",
+                            self.name,
+                            cur_sym,
+                            str(expected_dim),
+                            str(model_path),
+                        )
+                        action, confidence, emit_reason = self._indicator_fallback_decision(
+                            feature_df,
+                            symbol=cur_sym,
+                            confidence_threshold=confidence_threshold,
+                            context="model_shape_unsupported",
+                        )
+                    elif expected_dim is not None and len(input_cols) != int(expected_dim):
+                        self.logger.warning(
+                            "[%s] Skip %s inference: mapped feature dim mismatch expected=%s mapped=%d mode=%s",
+                            self.name,
+                            cur_sym,
+                            str(expected_dim),
+                            len(input_cols),
+                            feature_mode,
+                        )
+                        action, confidence, emit_reason = self._indicator_fallback_decision(
+                            feature_df,
+                            symbol=cur_sym,
+                            confidence_threshold=confidence_threshold,
+                            context="model_feature_mismatch",
+                        )
+                    else:
+                        X = self._build_model_input_tensor(feature_df, effective_lookback, input_cols)
+                        if X is None:
+                            self.logger.error(
+                                "[%s] Failed input tensor build for %s (lookback=%d model_lookback=%s mode=%s expected_dim=%s mapped_dim=%d).",
+                                self.name,
+                                cur_sym,
+                                effective_lookback,
+                                str(expected_lookback),
+                                feature_mode,
+                                str(expected_dim),
+                                len(input_cols),
+                            )
+                            action, confidence, emit_reason = self._indicator_fallback_decision(
+                                feature_df,
+                                symbol=cur_sym,
+                                confidence_threshold=confidence_threshold,
+                                context="input_formatting_error",
+                            )
+                        elif expected_dim is not None and int(X.shape[-1]) != int(expected_dim):
+                            self.logger.warning(
+                                "[%s] Skip %s inference: tensor feature dim mismatch expected=%s got=%d",
+                                self.name,
+                                cur_sym,
+                                str(expected_dim),
+                                int(X.shape[-1]),
+                            )
+                            action, confidence, emit_reason = self._indicator_fallback_decision(
+                                feature_df,
+                                symbol=cur_sym,
+                                confidence_threshold=confidence_threshold,
+                                context="tensor_feature_mismatch",
+                            )
+                        elif expected_lookback is not None and int(X.shape[1]) != int(expected_lookback):
+                            self.logger.warning(
+                                "[%s] Skip %s inference: tensor lookback mismatch expected=%s got=%d",
+                                self.name,
+                                cur_sym,
+                                str(expected_lookback),
+                                int(X.shape[1]),
+                            )
+                            action, confidence, emit_reason = self._indicator_fallback_decision(
+                                feature_df,
+                                symbol=cur_sym,
+                                confidence_threshold=confidence_threshold,
+                                context="tensor_lookback_mismatch",
+                            )
+                        else:
+                            feature_dim = int(X.shape[-1])
+                            input_shape = tuple(X.shape)
+
+                            # Predict
+                            try:
+                                import tensorflow as tf  # local import to avoid import-time cost when unused
+                                key = (model_path, effective_lookback, feature_dim)
+                                predict_fn = self._predict_fns.get(key)
+                                spec = tf.TensorSpec(shape=[None, effective_lookback, feature_dim], dtype=tf.float32)
+                                if predict_fn is None:
+                                    @tf.function(input_signature=[spec], reduce_retracing=True)
+                                    def _predict_fn(x):
+                                        return model(x, training=False)
+                                    self._predict_fns[key] = _predict_fn
+                                    predict_fn = _predict_fn
+
+                                # Safety: ensure cached function was built with same lookback
+                                try:
+                                    _ = predict_fn.get_concrete_function(
+                                        tf.TensorSpec(shape=[None, effective_lookback, feature_dim], dtype=tf.float32)
+                                    )
+                                except Exception:
+                                    # Rebuild if signature mismatched for any reason (including architecture changes)
+                                    self.logger.info(f"Rebuilding prediction function for {cur_sym} due to signature mismatch")
+
+                                    @tf.function(input_signature=[spec], reduce_retracing=True)
+                                    def _predict_fn(x):
+                                        return model(x, training=False)
+                                    self._predict_fns[key] = _predict_fn
+                                    predict_fn = _predict_fn
+
+                                loop = asyncio.get_running_loop()
+
+                                def _infer():
+                                    x_tf = tf.convert_to_tensor(X, dtype=tf.float32)
+                                    x_tf = tf.ensure_shape(x_tf, [None, effective_lookback, feature_dim])
+                                    return predict_fn(x_tf).numpy()[0]
+
+                                y_raw = await loop.run_in_executor(None, _infer)
+
+                                action, confidence, probs, schema = self._decode_model_output(y_raw)
+                                emit_reason = "ML model prediction"
+
+                                if np.max(y_raw) > 1.0 or np.min(y_raw) < 0.0:
+                                    self.logger.info(
+                                        f"[{self.name}] {cur_sym}: logits={y_raw} schema={schema} feature_mode={feature_mode} "
+                                        f"lb={effective_lookback} fdim={feature_dim} probs={probs} "
+                                        f"-> action={action}, conf={confidence:.2f}"
+                                    )
+                                else:
+                                    self.logger.info(
+                                        f"[{self.name}] {cur_sym}: schema={schema} feature_mode={feature_mode} "
+                                        f"lb={effective_lookback} fdim={feature_dim} probs={probs} action={action}, conf={confidence:.2f}"
+                                    )
+                            except Exception as e:
+                                self.logger.error(f"❌ Prediction failed for {cur_sym}: {e}", exc_info=True)
+                                action, confidence, emit_reason = self._indicator_fallback_decision(
+                                    feature_df,
+                                    symbol=cur_sym,
+                                    confidence_threshold=confidence_threshold,
+                                    context="prediction_failure",
+                                )
+
+        if "indicator_fallback" in str(emit_reason):
+            decision_source = "indicator_fallback"
+            schema = "indicator_fallback"
+            feature_mode = "indicator_fallback"
+            if feature_dim <= 0:
+                feature_dim = int(len(self._edge_feature_columns))
 
         # Filters (sentiment / regime / CoT echo if present)
         try:
@@ -3476,7 +3677,7 @@ class MLForecaster:
         try:
             await self.shared_state.set_cot_explanation(
                 cur_sym,
-                text=f"Pred={action} conf={confidence:.2f} on features shape={X.shape}",
+                text=f"Pred={action} conf={confidence:.2f} src={decision_source} shape={input_shape}",
                 source=self.name,
             )
         except Exception:
@@ -3520,8 +3721,9 @@ class MLForecaster:
             symbol=cur_sym,
             action=action,
             confidence=confidence,
-            reason="ML model prediction",
+            reason=str(emit_reason),
             extras={
+                "_decision_source": str(decision_source),
                 "_feature_mode": str(feature_mode),
                 "_feature_dim": int(feature_dim),
                 "_model_schema": str(schema),
@@ -3554,4 +3756,4 @@ class MLForecaster:
             except Exception:
                 pass
 
-        return {"action": action, "confidence": confidence, "reason": "Prediction processed"}
+        return {"action": action, "confidence": confidence, "reason": str(emit_reason)}

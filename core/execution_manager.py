@@ -395,6 +395,7 @@ class ExecutionManager:
             except Exception:
                 pass
             
+            delta = None
             trade_recorded = False
             # P9 Frequency Engineering: Record trade for tier tracking and open trades
             if hasattr(ss, "record_trade"):
@@ -437,10 +438,9 @@ class ExecutionManager:
                 except Exception as e:
                     self.logger.warning(f"Failed to record trade in SharedState: {e}")
 
-            delta = None
-
             # Try canonical API first
-            delta = await maybe_call(ss, "compute_realized_pnl_delta", sym, side_u, exec_qty, price)
+            if delta is None:
+                delta = await maybe_call(ss, "compute_realized_pnl_delta", sym, side_u, exec_qty, price)
 
             # Try fill-recording APIs that return a dict containing the delta
             # FIX: Don't call record_fill again if record_trade already did the job
@@ -458,67 +458,72 @@ class ExecutionManager:
             realized_after = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
             realized_committed = realized_after != realized_before
 
-            # If we have a delta or no commit happened, persist and emit
-            if delta is not None or (side_u == "SELL" and not realized_committed):
-                if delta is not None:
-                    try:
-                        delta_f = float(delta)
-                    except Exception:
-                        delta_f = None
-                if delta_f is None and side_u == "SELL" and not realized_committed:
-                    try:
-                        pos = getattr(ss, "positions", {}).get(sym, {}) if hasattr(ss, "positions") else {}
-                        entry = float(pos.get("avg_price", 0.0) or 0.0)
-                        if entry <= 0:
-                            ot = getattr(ss, "open_trades", {}).get(sym, {}) if hasattr(ss, "open_trades") else {}
-                            entry = float(ot.get("entry_price", 0.0) or 0.0)
-                        side_hint = str(pos.get("side") or pos.get("position") or "long").lower()
-                        if entry > 0:
-                            if side_hint in ("short", "sell"):
-                                delta_f = (entry - price) * exec_qty - fee_quote
-                            else:
-                                delta_f = (price - entry) * exec_qty - fee_quote
-                    except Exception:
-                        delta_f = None
+            # If SharedState already committed realized PnL but didn't expose a delta,
+            # infer the exact delta from before/after snapshots for audit consistency.
+            if delta is None and side_u == "SELL" and realized_committed:
+                delta = realized_after - realized_before
 
-                if delta_f is not None and delta_f != 0.0:
-                    now = time.time()
-                    try:
-                        ss.metrics["realized_pnl"] = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0) + delta_f
-                        # Manual commit to metrics succeeded — mark committed so callers won't double-write
-                        realized_committed = True
-                    except Exception:
-                        pass
-                    # Persist via public API when available
-                    if hasattr(ss, "append_realized_pnl_delta"):
-                        with contextlib.suppress(Exception):
-                            await maybe_call(ss, "append_realized_pnl_delta", now, delta_f)
-                        # Best-effort: mark as committed when public API wrote the delta
-                        realized_committed = True
-                    else:
-                        # Fallback to internal store (bounded deque)
-                        try:
-                            ss._realized_pnl.append((now, delta_f))
-                            realized_committed = True
-                        except Exception:
-                            ss._realized_pnl = deque(maxlen=4096)
-                            ss._realized_pnl.append((now, delta_f))
-                            realized_committed = True
+            if delta is not None:
+                try:
+                    delta_f = float(delta)
+                except Exception:
+                    delta_f = None
+            if delta_f is None and side_u == "SELL" and not realized_committed:
+                try:
+                    pos = getattr(ss, "positions", {}).get(sym, {}) if hasattr(ss, "positions") else {}
+                    entry = float(pos.get("avg_price", 0.0) or 0.0)
+                    if entry <= 0:
+                        ot = getattr(ss, "open_trades", {}).get(sym, {}) if hasattr(ss, "open_trades") else {}
+                        entry = float(ot.get("entry_price", 0.0) or 0.0)
+                    side_hint = str(pos.get("side") or pos.get("position") or "long").lower()
+                    if entry > 0:
+                        if side_hint in ("short", "sell"):
+                            delta_f = (entry - price) * exec_qty - fee_quote
+                        else:
+                            delta_f = (price - entry) * exec_qty - fee_quote
+                except Exception:
+                    delta_f = None
 
-                    # Emit the event with optional nav_quote
-                    nav_q = None
-                    try:
-                        if hasattr(ss, "get_nav_quote"):
-                            nav_q = float(await maybe_call(ss, "get_nav_quote"))
-                    except Exception:
-                        nav_q = None
-
-                    payload = {"pnl_delta": delta_f, "symbol": sym, "timestamp": now}
-                    if nav_q is not None:
-                        payload["nav_quote"] = nav_q
+            # Only persist manually when SharedState did NOT already commit.
+            # This prevents double counting when record_trade/record_fill handled PnL.
+            if not realized_committed and delta_f is not None and delta_f != 0.0:
+                now = time.time()
+                try:
+                    ss.metrics["realized_pnl"] = float(getattr(ss, "metrics", {}).get("realized_pnl", 0.0) or 0.0) + delta_f
+                    # Manual commit to metrics succeeded — mark committed so callers won't double-write
+                    realized_committed = True
+                except Exception:
+                    pass
+                # Persist via public API when available
+                if hasattr(ss, "append_realized_pnl_delta"):
                     with contextlib.suppress(Exception):
-                        await maybe_call(ss, "emit_event", "RealizedPnlUpdated", payload)
-                        emitted = True
+                        await maybe_call(ss, "append_realized_pnl_delta", now, delta_f)
+                    # Best-effort: mark as committed when public API wrote the delta
+                    realized_committed = True
+                else:
+                    # Fallback to internal store (bounded deque)
+                    try:
+                        ss._realized_pnl.append((now, delta_f))
+                        realized_committed = True
+                    except Exception:
+                        ss._realized_pnl = deque(maxlen=4096)
+                        ss._realized_pnl.append((now, delta_f))
+                        realized_committed = True
+
+                # Emit the event with optional nav_quote
+                nav_q = None
+                try:
+                    if hasattr(ss, "get_nav_quote"):
+                        nav_q = float(await maybe_call(ss, "get_nav_quote"))
+                except Exception:
+                    nav_q = None
+
+                payload = {"pnl_delta": delta_f, "symbol": sym, "timestamp": now}
+                if nav_q is not None:
+                    payload["nav_quote"] = nav_q
+                with contextlib.suppress(Exception):
+                    await maybe_call(ss, "emit_event", "RealizedPnlUpdated", payload)
+                    emitted = True
         except Exception:
             self.logger.debug("post-fill PnL handler failed (non-fatal)", exc_info=True)
 
@@ -564,6 +569,26 @@ class ExecutionManager:
         try:
             sym = self._norm_symbol(symbol)
             side_u = (side or "").upper()
+            ss = self.shared_state
+            if not ss:
+                return False
+
+            # Canonical fill accounting lives in SharedState.record_trade/record_fill and
+            # is triggered from _handle_post_fill in this same execution path.
+            # Running this legacy pre-fill mutation as well causes double-mutation drift
+            # (qty/avg corruption, phantom dust, and inaccurate realized accounting).
+            # Keep this path only as an explicit fallback for legacy SharedState shapes.
+            direct_phase4_enabled = bool(self._cfg("ENABLE_PHASE4_DIRECT_POSITION_UPDATE", False))
+            has_canonical_fill_api = callable(getattr(ss, "record_trade", None)) or callable(
+                getattr(ss, "record_fill", None)
+            )
+            if has_canonical_fill_api and not direct_phase4_enabled:
+                self.logger.debug(
+                    "[PHASE4_BYPASS] %s %s fill delegated to SharedState record_fill pipeline",
+                    sym,
+                    side_u,
+                )
+                return True
             
             # CRITICAL: Use actual fill, not planned amount
             executed_qty = float(order.get("executedQty") or 0.0)
@@ -583,10 +608,6 @@ class ExecutionManager:
                     "symbol=%s orderId=%s",
                     sym, order.get("orderId")
                 )
-                return False
-            
-            ss = self.shared_state
-            if not ss:
                 return False
             
             # Get current position
@@ -800,14 +821,27 @@ class ExecutionManager:
         )
         if oid_raw in (None, "") and not cid_raw:
             if str(side or "").upper() == "SELL":
-                self._journal("SELL_RECOVERY_UNAVAILABLE_NO_IDS", {
-                    "symbol": self._norm_symbol(symbol),
-                    "side": "SELL",
-                    "status": str(merged.get("status", "")).upper() or "UNKNOWN",
-                    "reason": "missing_order_id_and_client_order_id",
-                    "tag": str(tag or ""),
-                    "timestamp": time.time(),
-                })
+                status_u = str(merged.get("status", "")).upper() or "UNKNOWN"
+                reason_u = str(merged.get("reason", "")).upper()
+                # Avoid misclassifying cleanly blocked/skipped exits as "recovery unavailable".
+                # This signal is meant for ambiguous exchange submissions only.
+                non_submission_statuses = {"BLOCKED", "SKIPPED", "REJECTED", "CANCELED", "EXPIRED"}
+                is_non_submission = (
+                    status_u in non_submission_statuses
+                    or "NO_POSITION" in reason_u
+                    or "SELL_GUARD" in reason_u
+                    or "MISSING_META_TRACE_ID" in reason_u
+                    or "TRADEABILITY_GATE_MISSING" in reason_u
+                )
+                if not is_non_submission:
+                    self._journal("SELL_RECOVERY_UNAVAILABLE_NO_IDS", {
+                        "symbol": self._norm_symbol(symbol),
+                        "side": "SELL",
+                        "status": status_u,
+                        "reason": "missing_order_id_and_client_order_id",
+                        "tag": str(tag or ""),
+                        "timestamp": time.time(),
+                    })
             return merged
 
         delay_s = float(self._cfg("POST_SUBMIT_RECHECK_DELAY_S", 0.2) or 0.2)
@@ -1063,6 +1097,8 @@ class ExecutionManager:
         exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
         if status in ("FILLED", "PARTIALLY_FILLED") and exec_qty > 0:
             return
+        if status in {"REJECTED", "CANCELED", "EXPIRED"}:
+            return
         oid = order.get("orderId") or order.get("order_id") or order.get("exchange_order_id")
         cid = order.get("clientOrderId") or order.get("client_order_id") or order.get("origClientOrderId")
         if not oid and not cid:
@@ -1274,18 +1310,38 @@ class ExecutionManager:
         except Exception:
             self.logger.debug("[EM:CloseEmitRecover] re-emit TRADE_EXECUTED failed", exc_info=True)
 
+        # Keep realized PnL accounting authoritative in SharedState.
+        # If post-fill did not commit (or committed zero), apply close delta here
+        # through increment_realized_pnl when available so lock + mirrors stay consistent.
+        close_delta = None
         if not committed:
-            try:
-                cur = float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
-                self.shared_state.metrics["realized_pnl"] = cur + float(realized_pnl)
-            except Exception:
-                pass
+            pf_delta = None
+            if isinstance(post_fill, dict) and post_fill.get("delta") is not None:
+                with contextlib.suppress(Exception):
+                    pf_delta = float(post_fill.get("delta") or 0.0)
+            if pf_delta is not None and abs(pf_delta) > 1e-12:
+                close_delta = pf_delta
+            elif abs(float(realized_pnl or 0.0)) > 1e-12:
+                close_delta = float(realized_pnl)
+
+            if close_delta is not None:
+                applied = False
+                with contextlib.suppress(Exception):
+                    if hasattr(self.shared_state, "increment_realized_pnl"):
+                        await maybe_call(self.shared_state, "increment_realized_pnl", float(close_delta))
+                        applied = True
+                if not applied:
+                    with contextlib.suppress(Exception):
+                        cur = float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
+                        self.shared_state.metrics["realized_pnl"] = cur + float(close_delta)
+                        setattr(self.shared_state, "realized_pnl", float(self.shared_state.metrics["realized_pnl"]))
 
         if not emitted:
             now = time.time()
+            event_delta = float(close_delta if close_delta is not None else realized_pnl)
             payload = {
                 "realized_pnl": float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0),
-                "pnl_delta": float(realized_pnl),
+                "pnl_delta": event_delta,
                 "symbol": sym,
                 "price": exec_px,
                 "qty": actual_executed_qty,  # ← Use actual filled quantity
@@ -1293,6 +1349,26 @@ class ExecutionManager:
             }
             with contextlib.suppress(Exception):
                 await maybe_call(self.shared_state, "emit_event", "RealizedPnlUpdated", payload)
+
+        # Append to trade_history so PerformanceEvaluator.usdt_per_hour is non-zero.
+        # Without this, PerformanceEvaluator reads an empty history, reports 0 usdt/h,
+        # triggers global_systemic_degradation, and CapitalAllocator halves all budgets.
+        with contextlib.suppress(Exception):
+            _trade_delta = float(close_delta if close_delta is not None else realized_pnl or 0.0)
+            _history = getattr(self.shared_state, "trade_history", None)
+            if _history is None:
+                self.shared_state.trade_history = []
+                _history = self.shared_state.trade_history
+            _history.append({
+                "ts": time.time(),
+                "symbol": sym,
+                "realized_delta": _trade_delta,
+                "price": exec_px,
+                "qty": actual_executed_qty,
+            })
+            # Keep the deque bounded (max 2000 entries ≈ last ~10 trading hours at 5min avg hold)
+            if isinstance(_history, list) and len(_history) > 2000:
+                del _history[:-2000]
 
         self.logger.info(json.dumps({
             "event": "POSITION_CLOSED",
@@ -1874,6 +1950,7 @@ class ExecutionManager:
 
         # Execution-block cooldowns (finite no-trade states)
         self._buy_block_state: Dict[str, Dict[str, float]] = {}
+        self._position_open_buy_block_until: Dict[str, float] = {}
 
         # Contract check: must expose place_market_order()
         if not hasattr(self.exchange_client, "place_market_order") or not callable(getattr(self.exchange_client, "place_market_order", None)):
@@ -2029,12 +2106,20 @@ class ExecutionManager:
         self._sell_finalize_last_report_finalized = -1
         self._sell_fill_recovery_tasks: Dict[str, asyncio.Task] = {}
         self._exchange_zero_mismatch_counts: Dict[str, int] = {}
+        self._liq_sell_fail_counts: Dict[str, int] = {}
+        self._liq_sell_cooldown_until: Dict[str, float] = {}
+        self._close_escape_last_attempt_ts: Dict[str, float] = {}
 
         # Optional local cache to serve callers that want filters without reaching ExchangeClient internals.
         # ExchangeClient already maintains its own `symbol_filters` cache; this layer is primarily API sugar.
         self._symbol_filters_cache: Dict[str, Dict[str, Any]] = {}
         self._symbol_filters_cache_ts: Dict[str, float] = {}
         self._symbol_filters_cache_max_age_s = float(getattr(config, "SYMBOL_FILTERS_CACHE_MAX_AGE_S", 900.0) or 900.0)
+
+        # Watchdog periodic status reporting
+        self._execution_counter = 0
+        self._last_watchdog_report_ts = time.time()
+        self._watchdog_report_interval_s = 30.0  # Report to watchdog every 30 seconds
 
         self.logger.info("ExecutionManager initialized with P9 configuration")
         self._ensure_trade_journal_ready(reason="init")
@@ -2062,6 +2147,86 @@ class ExecutionManager:
                 pass
         except Exception:
             self.logger.debug("EM init health update failed", exc_info=True)
+
+    # 🔧 NEW: Entry floor guard to prevent new dust creation
+    async def _check_entry_floor_guard(
+        self, symbol: str, quote_amount: float, is_dust_healing_buy: bool = False
+    ) -> Tuple[bool, str]:
+        """
+        Guard: Prevent opening new trades below significant floor unless:
+        1. Explicitly allowed via allow_entry_below_significant_floor flag, OR
+        2. Dust healing buyback (is_dust_healing_buy=True)
+        
+        This prevents creating new dust positions from regular entries.
+        
+        Args:
+            symbol: Trading pair
+            quote_amount: Entry amount in quote asset (USDT)
+            is_dust_healing_buy: True if this is a dust healing/reentry trade
+        
+        Returns:
+            (is_allowed: bool, reason: str)
+        """
+        # Allow dust healing trades to bypass floor guard
+        if is_dust_healing_buy:
+            return True, "[EM:ENTRY_FLOOR_GUARD] Dust healing trade bypasses floor guard"
+        
+        shared_cfg = getattr(self.shared_state, "config", None)
+        significant_floor = float(
+            getattr(
+                self.config,
+                "SIGNIFICANT_POSITION_FLOOR",
+                getattr(self.config, "MIN_SIGNIFICANT_POSITION_USDT", 20.0),
+            ) or 20.0
+        )
+        allow_below_floor = bool(
+            getattr(
+                self.shared_state,
+                "allow_entry_below_significant_floor",
+                getattr(
+                    shared_cfg,
+                    "allow_entry_below_significant_floor",
+                    getattr(
+                        self.config,
+                        "allow_entry_below_significant_floor",
+                        getattr(self.config, "ALLOW_ENTRY_BELOW_SIGNIFICANT_FLOOR", False),
+                    ),
+                ),
+            )
+        )
+        
+        # Check if entry would be below significant floor
+        if quote_amount < significant_floor:
+            if not allow_below_floor:
+                reason = (
+                    f"[EM:ENTRY_FLOOR_GUARD] {symbol} entry ${quote_amount:.2f} "
+                    f"below significant floor ${significant_floor:.2f}. "
+                    f"Would create dust on entry. "
+                    f"Set allow_entry_below_significant_floor=True to override."
+                )
+                self.logger.warning(reason)
+                return False, reason
+            else:
+                reason = (
+                    f"[EM:ENTRY_FLOOR_GUARD_OVERRIDE] {symbol} entry ${quote_amount:.2f} "
+                    f"below significant floor ${significant_floor:.2f}, "
+                    f"but override flag is enabled."
+                )
+                self.logger.info(reason)
+                return True, reason
+        
+        return True, "[EM:ENTRY_FLOOR_GUARD] Entry floor check passed"
+
+    async def _report_watchdog_status(self, status: str = "Operational", detail: str = ""):
+        """Report status to watchdog for health monitoring"""
+        try:
+            update_fn = getattr(self.shared_state, "update_component_status", None)
+            if update_fn:
+                result = update_fn("ExecutionManager", status, detail)
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            pass  # Status reporting is non-critical
 
     def _cfg(self, path: str, default):
         cur = self.config
@@ -2726,7 +2891,46 @@ class ExecutionManager:
             float(shared_state_floor or 0.0),
         )
         final_floor = max(float(x) for x in candidates if float(x) >= 0.0)
-        return final_floor
+
+        # Ensure the floor survives lot-step rounding so the eventual notional
+        # remains exchange-valid after quantity quantization.
+        rounded_exchange_floor = float(min_notional_val or 0.0)
+        rounded_final_floor = float(final_floor or 0.0)
+        if price_f > 0:
+            try:
+                filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
+                step_size, _, _, _, _ = self._extract_filter_vals(filters)
+                if min_notional_val > 0:
+                    rounded_exchange_floor = float(
+                        self._adjust_quote_for_step_rounding(
+                            min_entry_quote=min_notional_val,
+                            current_price=price_f,
+                            step_size=step_size,
+                        )
+                    )
+                if final_floor > 0:
+                    rounded_final_floor = float(
+                        self._adjust_quote_for_step_rounding(
+                            min_entry_quote=final_floor,
+                            current_price=price_f,
+                            step_size=step_size,
+                        )
+                    )
+            except Exception:
+                rounded_exchange_floor = float(min_notional_val or 0.0)
+                rounded_final_floor = float(final_floor or 0.0)
+
+        # Guardrail: never let dynamic entry floors exceed the configured per-trade
+        # spend cap, otherwise affordability probes can deadlock on small accounts.
+        max_spend_cap = float(self._cfg("MAX_SPEND_PER_TRADE_USDT", 0.0) or 0.0)
+        if max_spend_cap > 0.0:
+            final_floor = min(final_floor, max_spend_cap)
+        return max(
+            float(final_floor),
+            float(min_notional_val or 0.0),
+            float(rounded_exchange_floor or 0.0),
+            float(rounded_final_floor or 0.0),
+        )
 
     def _is_dust_operation_context(
         self,
@@ -3010,13 +3214,15 @@ class ExecutionManager:
             qty = 0.0
             base_asset, _ = self._split_base_quote(sym)
             exchange_checked = False
+            exchange_query_ok = False
             
             # ✅ FIX #2: CHECK EXCHANGE FIRST (authoritative source, < 50ms)
             get_bal = getattr(self.exchange_client, "get_account_balance", None)
             if callable(get_bal):
-                with contextlib.suppress(Exception):
-                    exchange_checked = True
+                exchange_checked = True
+                try:
                     bal = await get_bal(base_asset)
+                    exchange_query_ok = True
                     free = float((bal or {}).get("free", 0.0))
                     locked = float((bal or {}).get("locked", 0.0))
                     qty = float(free + locked)
@@ -3024,8 +3230,15 @@ class ExecutionManager:
                         self._exchange_zero_mismatch_counts.pop(sym, None)
                         self.logger.debug(f"[GetSellable] {sym}: qty={qty:.6f} from Exchange (AUTHORITATIVE)")
                         return qty
+                except Exception:
+                    # Lookup failure is not authoritative zero; keep local fallback path alive.
+                    self.logger.debug(
+                        "[GetSellable] %s exchange balance lookup failed; using local fallback path",
+                        sym,
+                        exc_info=True,
+                    )
 
-            if exchange_checked:
+            if exchange_checked and exchange_query_ok:
                 local_qty = 0.0
                 with contextlib.suppress(Exception):
                     if hasattr(self.shared_state, "get_position_quantity"):
@@ -3033,22 +3246,34 @@ class ExecutionManager:
                     elif isinstance(getattr(self.shared_state, "positions", None), dict):
                         local_qty = float((self.shared_state.positions.get(sym, {}) or {}).get("quantity", 0.0) or 0.0)
                 
-                # ✅ CRITICAL FIX: If exchange=0 but local>0, allow SELL attempt for reconciliation
-                # (Don't immediately return 0; let canonical SELL flow process mutation)
+                # If exchange=0 but local>0, treat local state as potentially stale.
+                # Optional override exists for environments that intentionally permit
+                # one-shot local fallback during eventual-consistency windows.
                 if local_qty > 0:
                     mismatch_count = int(self._exchange_zero_mismatch_counts.get(sym, 0) or 0) + 1
                     self._exchange_zero_mismatch_counts[sym] = mismatch_count
                     repair_threshold = int(self._cfg("EXCHANGE_ZERO_REPAIR_THRESHOLD", 2) or 2)
-                    
-                    # ✅ NEW: Return local_qty immediately to allow canonical SELL path
-                    # Don't wait for threshold - let reconciliation finalize the mutation
+
+                    allow_local_fallback = str(
+                        self._cfg("ALLOW_LOCAL_SELL_QTY_WHEN_EXCHANGE_ZERO", "true")
+                    ).strip().lower() in {"1", "true", "yes", "on"}
+
+                    if allow_local_fallback and mismatch_count <= max(1, repair_threshold):
+                        self.logger.warning(
+                            "[GetSellable] %s exchange qty=0 but local qty=%.8f (count=%d) -> using local fallback (flag enabled)",
+                            sym,
+                            local_qty,
+                            mismatch_count,
+                        )
+                        return float(local_qty)
+
                     self.logger.warning(
-                        "[GetSellable] %s exchange qty=0 but local qty=%.8f (count=%d) -> returning local qty for canonical SELL",
+                        "[GetSellable] %s exchange qty=0 while local qty=%.8f (count=%d) -> blocking SELL fallback (authoritative exchange zero)",
                         sym,
                         local_qty,
                         mismatch_count,
                     )
-                    return float(local_qty)
+                    return 0.0
                 else:
                     self._exchange_zero_mismatch_counts.pop(sym, None)
                     self.logger.debug(f"[GetSellable] {sym}: qty=0 from Exchange (authoritative, no local position)")
@@ -3086,6 +3311,99 @@ class ExecutionManager:
         except Exception:
             self.logger.debug("_get_sellable_qty failed (non-fatal)", exc_info=True)
         return 0.0
+
+    async def _buffer_liquidation_sell_qty(self, sym: str, qty: float) -> float:
+        """
+        Conservative qty buffer for liquidation SELL to reduce repeated insufficient-balance rejects.
+
+        Why: exchange balances can lag local fill bookkeeping by fees/rounding dust.
+        Subtracting one lot step for liquidation exits is a cheap, robust guard.
+        """
+        qty_in = float(qty or 0.0)
+        if qty_in <= 0:
+            return 0.0
+
+        try:
+            filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
+            step_size, min_qty, _, _, _ = self._extract_filter_vals(filters)
+            step_size = float(step_size or 0.0)
+            min_qty = float(min_qty or 0.0)
+
+            use_step_buffer = str(
+                self._cfg("LIQUIDATION_SELL_STEP_BUFFER_ENABLED", "true")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            qty_out = float(qty_in)
+
+            if use_step_buffer and step_size > 0:
+                rounded_no_buffer = float(round_step(qty_out, step_size))
+                candidate = round_step(max(0.0, qty_out - step_size), step_size)
+                # Keep exchange-valid minimums; fallback to original rounded qty if buffer is too aggressive.
+                if candidate > 0 and (min_qty <= 0 or candidate >= min_qty):
+                    qty_out = float(candidate)
+                else:
+                    qty_out = float(rounded_no_buffer)
+
+                # Dust-trap guard:
+                # For tiny positions, subtracting one step can leave a meaningful residual
+                # that repeatedly triggers dust-healing buy/sell loops. If buffered qty
+                # would leave residual notional above the permanent-dust threshold,
+                # prefer unbuffered rounded qty to retire position cleanly.
+                avoid_dust_trap = str(
+                    self._cfg("LIQUIDATION_SELL_AVOID_DUST_TRAP", "true")
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if avoid_dust_trap and rounded_no_buffer > 0 and qty_out < rounded_no_buffer:
+                    residual_qty = max(0.0, float(qty_in) - float(qty_out))
+                    if residual_qty > 0:
+                        mark_price = 0.0
+                        try:
+                            mark_price = float(
+                                (getattr(self.shared_state, "latest_prices", {}) or {}).get(sym, 0.0) or 0.0
+                            )
+                        except Exception:
+                            mark_price = 0.0
+                        if mark_price <= 0:
+                            with contextlib.suppress(Exception):
+                                get_px = getattr(self.exchange_client, "get_current_price", None) or getattr(
+                                    self.exchange_client, "get_price", None
+                                )
+                                if callable(get_px):
+                                    mark_price = float(await get_px(sym) or 0.0)
+
+                        if mark_price > 0:
+                            residual_notional = residual_qty * mark_price
+                            permanent_floor = float(
+                                self._cfg("PERMANENT_DUST_USDT_THRESHOLD", 1.0) or 1.0
+                            )
+                            if residual_notional > permanent_floor:
+                                self.logger.info(
+                                    "[EM:LiqQtyBuffer] %s avoid dust trap: buffered_residual=%.6f (~$%.4f) > permanent_floor=$%.2f. "
+                                    "Using unbuffered rounded qty %.10f instead of %.10f.",
+                                    sym,
+                                    residual_qty,
+                                    residual_notional,
+                                    permanent_floor,
+                                    rounded_no_buffer,
+                                    qty_out,
+                                )
+                                qty_out = float(rounded_no_buffer)
+
+            if qty_out > qty_in:
+                qty_out = qty_in
+
+            if qty_out > 0 and qty_out < qty_in:
+                self.logger.info(
+                    "[EM:LiqQtyBuffer] %s qty %.10f -> %.10f (step=%.10f min_qty=%.10f)",
+                    sym,
+                    qty_in,
+                    qty_out,
+                    step_size,
+                    min_qty,
+                )
+            return float(qty_out or qty_in)
+        except Exception:
+            self.logger.debug("[EM:LiqQtyBuffer] %s failed; using raw qty", sym, exc_info=True)
+            return float(qty_in)
+
     async def _ensure_position_ready(self, sym: str, max_retries: int = 3) -> float:
         """
         ✅ FIX #4: Wait for position to be available, with state reconciliation retries.
@@ -3162,25 +3480,26 @@ class ExecutionManager:
         atr_pct: Optional[float] = None,
     ) -> Tuple[bool, Dict[str, float]]:
         """Check if TP max can clear required exit move and net-profit floor."""
-        trade_fee_pct = float(self._cfg("TRADE_FEE_PCT", 0.0) or 0.0)
-        exit_fee_bps = float(self._cfg("EXIT_FEE_BPS", 0.0) or 0.0)
+        # FIXED: Use realistic defaults for Binance trading instead of 0.0
+        trade_fee_pct = float(self._cfg("TRADE_FEE_PCT", 0.001) or 0.001)  # 0.1% default
+        exit_fee_bps = float(self._cfg("EXIT_FEE_BPS", 10.0) or 10.0)  # 10 bps default
         fee_bps = max(exit_fee_bps, trade_fee_pct * 10000.0)
         r_fee = fee_bps / 10000.0
-        r_slip = float(self._cfg("EXIT_SLIPPAGE_BPS", 0.0) or 0.0) / 10000.0
-        r_buf = float(self._cfg("TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
-        m_entry = float(self._cfg("MIN_PLANNED_QUOTE_FEE_MULT", 2.5) or 2.5)
-        m_exit = float(self._cfg("MIN_PROFIT_EXIT_FEE_MULT", 2.0) or 2.0)
+        r_slip = float(self._cfg("EXIT_SLIPPAGE_BPS", 15.0) or 15.0) / 10000.0  # 15 bps default
+        r_buf = float(self._cfg("TP_MIN_BUFFER_BPS", 5.0) or 5.0) / 10000.0  # 5 bps default
+        m_entry = float(self._cfg("MIN_PLANNED_QUOTE_FEE_MULT", 1.5) or 1.5)  # Lowered from 2.5
+        m_exit = float(self._cfg("MIN_PROFIT_EXIT_FEE_MULT", 1.0) or 1.0)  # Lowered from 2.0
         m_exit = max(m_exit, m_entry)
 
         r_req = (2.0 * r_fee * m_exit) + r_slip + r_buf
-        r_min_net = float(self._cfg("MIN_NET_PROFIT_AFTER_FEES", 0.0) or 0.0)
+        r_min_net = float(self._cfg("MIN_NET_PROFIT_AFTER_FEES", 0.0001) or 0.0001)  # 0.01% min profit
         min_tp_needed_for_net = r_min_net + (2.0 * r_fee) + r_slip
         required_tp = max(r_req, min_tp_needed_for_net)
-        tp_pct_min = float(self._cfg("TP_PCT_MIN", 0.0) or 0.0)
-        tp_max_cfg = float(self._cfg("TP_PCT_MAX", 0.0) or 0.0)
-        tp_atr_mult = float(self._cfg("TP_ATR_MULT", 0.0) or 0.0)
+        tp_pct_min = float(self._cfg("TP_PCT_MIN", 0.003) or 0.003)  # 0.3% minimum TP
+        tp_max_cfg = float(self._cfg("TP_PCT_MAX", 0.05) or 0.05)  # 5% maximum TP
+        tp_atr_mult = float(self._cfg("TP_ATR_MULT", 2.0) or 2.0)  # 2x ATR for TP
         if atr_pct is None or atr_pct <= 0:
-            atr_pct = float(self._cfg("TPSL_FALLBACK_ATR_PCT", 0.0) or 0.0)
+            atr_pct = float(self._cfg("TPSL_FALLBACK_ATR_PCT", 0.005) or 0.005)  # 0.5% fallback
 
         tp_from_atr = (atr_pct * tp_atr_mult) if (atr_pct > 0 and tp_atr_mult > 0) else 0.0
         tp_max = tp_max_cfg if tp_max_cfg > 0 else max(tp_from_atr, tp_pct_min)
@@ -3249,9 +3568,44 @@ class ExecutionManager:
         volatility_buffer = max(0.0, atr_pct * vol_buffer_atr_mult)
 
         strategic_buffer = float(self._cfg("SELL_DYNAMIC_STRATEGIC_BUFFER_PCT", 0.0) or 0.0)
-        min_usdt_floor = float(self._cfg("SELL_DYNAMIC_MIN_USDT_FLOOR", 0.12) or 0.12)
-        pos_notional_quote = max(float(qty or 0.0) * float(price or 0.0), float(qty or 0.0) * float(entry or 0.0), 0.0)
-        usdt_floor_pct = (min_usdt_floor / pos_notional_quote) if pos_notional_quote > 0 else 0.0
+        min_usdt_floor_cfg = float(self._cfg("SELL_DYNAMIC_MIN_USDT_FLOOR", 0.12) or 0.12)
+        pos_notional_quote = max(
+            float(qty or 0.0) * float(price or 0.0),
+            float(qty or 0.0) * float(entry or 0.0),
+            0.0,
+        )
+
+        # Adapt USDT floor for micro-notional exits and repeated dynamic-edge deadlocks.
+        usdt_floor_notional_scale = 1.0
+        micro_notional_cap = float(self._cfg("SELL_DYNAMIC_MICRO_NOTIONAL_CAP_USDT", 80.0) or 80.0)
+        micro_floor_min_scale = float(self._cfg("SELL_DYNAMIC_MICRO_MIN_FLOOR_SCALE", 0.30) or 0.30)
+        min_usdt_floor_effective = max(0.0, min_usdt_floor_cfg)
+        if pos_notional_quote > 0.0 and micro_notional_cap > 0.0 and pos_notional_quote < micro_notional_cap:
+            usdt_floor_notional_scale = max(
+                micro_floor_min_scale,
+                min(1.0, pos_notional_quote / micro_notional_cap),
+            )
+            min_usdt_floor_effective *= usdt_floor_notional_scale
+
+        sell_edge_rejections = 0
+        try:
+            if hasattr(self.shared_state, "get_rejection_count"):
+                sell_edge_rejections = int(
+                    self.shared_state.get_rejection_count(sym, "SELL", "SELL_DYNAMIC_EDGE_MIN") or 0
+                )
+        except Exception:
+            sell_edge_rejections = 0
+
+        usdt_floor_feedback_scale = 1.0
+        relax_trigger = int(self._cfg("SELL_DYNAMIC_EDGE_RELAX_TRIGGER", 3) or 3)
+        if sell_edge_rejections >= max(1, relax_trigger):
+            relax_steps = min(6, sell_edge_rejections - relax_trigger + 1)
+            relax_step = float(self._cfg("SELL_DYNAMIC_EDGE_RELAX_STEP", 0.10) or 0.10)
+            relax_min_scale = float(self._cfg("SELL_DYNAMIC_EDGE_RELAX_MIN_SCALE", 0.45) or 0.45)
+            usdt_floor_feedback_scale = max(relax_min_scale, 1.0 - (relax_steps * relax_step))
+            min_usdt_floor_effective *= usdt_floor_feedback_scale
+
+        usdt_floor_pct = (min_usdt_floor_effective / pos_notional_quote) if pos_notional_quote > 0 else 0.0
 
         required_profit_pct = fee_component + slippage_component + volatility_buffer + strategic_buffer
         required_profit_pct = max(required_profit_pct, usdt_floor_pct)
@@ -3280,7 +3634,11 @@ class ExecutionManager:
             "regime": regime,
             "regime_mult": float(regime_mult),
             "position_notional_quote": float(pos_notional_quote),
-            "min_usdt_floor": float(min_usdt_floor),
+            "min_usdt_floor": float(min_usdt_floor_cfg),
+            "min_usdt_floor_effective": float(min_usdt_floor_effective),
+            "usdt_floor_notional_scale": float(usdt_floor_notional_scale),
+            "usdt_floor_feedback_scale": float(usdt_floor_feedback_scale),
+            "sell_edge_rejection_count": int(sell_edge_rejections),
         }
 
     async def _check_sell_net_pnl_gate(
@@ -3360,10 +3718,78 @@ class ExecutionManager:
         slippage_bps = slippage_component * 10000.0
         net_after_fees_pct = expected_move_pct - fee_component - slippage_component
         required_move_pct = float(dynamic.get("required_profit_pct", 0.0) or 0.0)
-        if dynamic_gate_enabled and expected_move_pct < required_move_pct:
+        sell_edge_rej = int(dynamic.get("sell_edge_rejection_count", 0) or 0)
+        buy_lock_rej = 0
+        try:
+            if hasattr(self.shared_state, "get_rejection_count"):
+                buy_lock_rej = int(self.shared_state.get_rejection_count(sym, "BUY", "POSITION_ALREADY_OPEN") or 0)
+        except Exception:
+            buy_lock_rej = 0
+
+        deadlock_bypass_trigger_sell = int(self._cfg("DEADLOCK_SELL_EDGE_BYPASS_TRIGGER", 4) or 4)
+        deadlock_bypass_trigger_buy = int(self._cfg("DEADLOCK_SELL_EDGE_BUY_LOCK_TRIGGER", 6) or 6)
+        deadlock_bypass_max_fraction = float(self._cfg("DEADLOCK_SELL_EDGE_BYPASS_MAX_FRACTION", 0.5) or 0.5)
+        deadlock_bypass_max_fraction_recovery = float(
+            self._cfg("DEADLOCK_SELL_EDGE_BYPASS_MAX_FRACTION_RECOVERY", 1.0) or 1.0
+        )
+        deadlock_min_net_usdt = float(self._cfg("DEADLOCK_SELL_EDGE_MIN_NET_USDT", -0.25) or -0.25)
+        is_capacity_recovery_sell = any(
+            token in reason_text
+            for token in (
+                "CAPITAL_RECOVERY",
+                "LIQUIDITY_RESTORATION",
+                "ROTATION",
+                "REBALANCE",
+                "FORCED_EXIT",
+                "META_EXIT",
+                "STRATEGY_SELL",
+            )
+        )
+
+        total_sellable_qty = 0.0
+        try:
+            total_sellable_qty = float(await self._get_sellable_qty(sym) or 0.0)
+        except Exception:
+            total_sellable_qty = 0.0
+        qty_fraction = (qty / max(total_sellable_qty, 1e-12)) if total_sellable_qty > 0 else 1.0
+        max_bypass_fraction = max(0.05, min(1.0, deadlock_bypass_max_fraction))
+        if is_capacity_recovery_sell or buy_lock_rej >= max(1, deadlock_bypass_trigger_buy):
+            max_bypass_fraction = max(
+                max_bypass_fraction,
+                max(0.05, min(1.0, deadlock_bypass_max_fraction_recovery)),
+            )
+
+        deadlock_bypass = bool(
+            dynamic_gate_enabled
+            and expected_move_pct < required_move_pct
+            and sell_edge_rej >= max(1, deadlock_bypass_trigger_sell)
+            and (
+                buy_lock_rej >= max(1, deadlock_bypass_trigger_buy)
+                or is_capacity_recovery_sell
+            )
+            and qty_fraction <= max_bypass_fraction
+        )
+        if deadlock_bypass:
+            min_net = min(min_net, deadlock_min_net_usdt)
+            self.logger.warning(
+                "[EM:SellDynamicGate:DeadlockBypass] Allowing SELL %s despite edge gate "
+                "(edge=%.4f%% req=%.4f%% sell_edge_rej=%d buy_lock_rej=%d recovery_sell=%s qty_frac=%.3f max_frac=%.3f min_net=%.4f)",
+                sym,
+                expected_move_pct * 100.0,
+                required_move_pct * 100.0,
+                sell_edge_rej,
+                buy_lock_rej,
+                is_capacity_recovery_sell,
+                qty_fraction,
+                max_bypass_fraction,
+                min_net,
+            )
+
+        if dynamic_gate_enabled and expected_move_pct < required_move_pct and not deadlock_bypass:
             self.logger.info(
                 "[EM:SellDynamicGate] Blocked SELL %s: edge=%.4f%% < required=%.4f%% "
-                "(fee=%.4f%% slip=%.4f%% vol=%.4f%% floor=%.4f%% regime=%s x%.2f atr=%.4f%% pos=%.4f)",
+                "(fee=%.4f%% slip=%.4f%% vol=%.4f%% floor=%.4f%% regime=%s x%.2f atr=%.4f%% "
+                "pos=%.4f floor_eff=%.4f floor_cfg=%.4f edge_rej=%d)",
                 sym,
                 expected_move_pct * 100.0,
                 required_move_pct * 100.0,
@@ -3375,6 +3801,9 @@ class ExecutionManager:
                 float(dynamic.get("regime_mult", 1.0) or 1.0),
                 float(dynamic.get("atr_pct", 0.0) or 0.0) * 100.0,
                 float(dynamic.get("position_notional_quote", 0.0) or 0.0),
+                float(dynamic.get("min_usdt_floor_effective", 0.0) or 0.0),
+                float(dynamic.get("min_usdt_floor", 0.0) or 0.0),
+                int(dynamic.get("sell_edge_rejection_count", 0) or 0),
             )
             try:
                 await self.shared_state.record_rejection(sym, "SELL", "SELL_DYNAMIC_EDGE_MIN", source="ExecutionManager")
@@ -3392,6 +3821,10 @@ class ExecutionManager:
                 "slippage_component_pct": slippage_component,
                 "volatility_buffer_pct": float(dynamic.get("volatility_buffer_pct", 0.0) or 0.0),
                 "usdt_floor_pct": float(dynamic.get("usdt_floor_pct", 0.0) or 0.0),
+                "min_usdt_floor_effective": float(dynamic.get("min_usdt_floor_effective", 0.0) or 0.0),
+                "min_usdt_floor": float(dynamic.get("min_usdt_floor", 0.0) or 0.0),
+                "sell_edge_rejection_count": int(dynamic.get("sell_edge_rejection_count", 0) or 0),
+                "buy_position_lock_rejection_count": int(buy_lock_rej),
                 "atr_pct": float(dynamic.get("atr_pct", 0.0) or 0.0),
                 "regime": str(dynamic.get("regime", "normal")),
                 "regime_mult": float(dynamic.get("regime_mult", 1.0) or 1.0),
@@ -4834,7 +5267,14 @@ class ExecutionManager:
         if policy_ctx.get("bootstrap_bypass", False):
             skip_micro_trade_kill_switch = True
         # --- DUST HEALING BYPASS ---
-        is_dust_healing_buy = str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+        is_dust_healing_buy = bool(
+            policy_ctx.get("_is_dust_healing_buy")
+            or policy_ctx.get("is_dust_healing")
+            or policy_ctx.get("_dust_healing")
+            or str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+        )
+        if is_dust_healing_buy:
+            policy_ctx["_is_dust_healing_buy"] = True
         is_dust_operation = self._is_dust_operation_context(policy_ctx, symbol=symbol)
         if is_dust_operation:
             # For dust healing/recovery, only validate step_size, min_notional, available balance
@@ -5069,17 +5509,19 @@ class ExecutionManager:
                         self.logger.debug("[EM:EV_HARD_GATE] Failed to fetch regime from MetaController: %s", e)
                 
                 # ADAPTIVE: Regime-aware multiplier scaling
+                # LOWERED: Previous values were too aggressive for small account trading (0.35% base cost)
+                # New values account for fact that round-trip costs dominate on small accounts
                 regime_multipliers = {
-                    "trend": 1.4,          # Higher threshold for trend confirmation
-                    "volatile": 1.2,       # Standard for volatility
-                    "sideways": 1.0,       # Lower threshold in chop (matches MetaController)
-                    "chop": 1.0,           # Alias
-                    "range": 1.0,          # Alias
-                    "low": 1.0,            # Alias
-                    "flat": 1.0,           # Alias
-                    "unknown": 1.2,        # Conservative default
+                    "trend": 1.1,          # Lowered from 1.4 (was blocking too many low-vol opportunities)
+                    "volatile": 1.0,       # Lowered from 1.2 (small accounts need less stringency)
+                    "sideways": 0.95,      # Lowered from 1.0 (range-bound favors entries)
+                    "chop": 0.95,          # Lowered from 1.0 (Alias)
+                    "range": 0.95,         # Lowered from 1.0 (Alias)
+                    "low": 0.95,           # Lowered from 1.0 (Alias)
+                    "flat": 0.95,          # Lowered from 1.0 (Alias)
+                    "unknown": 0.95,       # Lowered from 1.2 (unknown regime should be conservative but not aggressive)
                 }
-                regime_mult = float(regime_multipliers.get(regime, 1.2))
+                regime_mult = float(regime_multipliers.get(regime, 0.95))  # Default to conservative 0.95
                 
                 # ADAPTIVE: ATR-based scaling
                 if atr_pct is not None and float(atr_pct) > 0:
@@ -5294,8 +5736,13 @@ class ExecutionManager:
             # CRITICAL: accumulate_mode allows dust promotion without min_notional guards
             bypass_min_notional = accumulate_mode
             
-            # For dust healing, bypass internal economic floor but enforce exchange min_notional
-            bypass_internal_economic_floor = bypass_min_notional or is_dust_operation
+            # For dust healing and Meta-validated decisions, bypass internal economic floor
+            # but keep enforcing exchange min_notional and hard affordability.
+            bypass_internal_economic_floor = (
+                bypass_min_notional
+                or is_dust_operation
+                or skip_micro_trade_kill_switch
+            )
             
             if not bypass_internal_economic_floor:
                 # 3) If planned quote + accumulation is below the floor, decide between MIN_NOTIONAL vs NAV shortfall
@@ -5304,6 +5751,17 @@ class ExecutionManager:
                     # and that amount is still below the venue/config floor, classify as NAV shortfall.
                     if spendable_dec > 0 and (qa <= spendable_dec + eps) and (spendable_dec + acc_val < min_required - eps):
                         gap = (min_required - (spendable_dec + acc_val)).max(Decimal("0"))
+                        self.logger.warning(
+                            "[AFFORD_BLOCK] %s BUY insufficient quote vs min_required "
+                            "(qa=%.2f effective=%.2f spendable=%.2f min_required=%.2f min_notional=%.2f acc=%.2f)",
+                            sym,
+                            float(qa),
+                            float(effective_qa),
+                            float(spendable_dec),
+                            float(min_required),
+                            float(min_notional),
+                            float(acc_val),
+                        )
                         return (False, gap, "INSUFFICIENT_QUOTE")
                     # QUOTE UPGRADE: Instead of rejecting, upgrade the quote to meet minimum
                     # The caller asked below the floor but has enough NAV.
@@ -5438,7 +5896,7 @@ class ExecutionManager:
                     max_qty=float("inf"),
                     tick_size=1e-8,
                     min_notional=float(min_notional),
-                    min_entry_quote=(0.0 if is_dust_operation else float(min_required))
+                    min_entry_quote=(0.0 if bypass_internal_economic_floor else float(min_required))
                 )
                 # Re-fetch real filters for accuracy
                 f_data = await self.exchange_client.ensure_symbol_filters_ready(sym)
@@ -5541,6 +5999,163 @@ class ExecutionManager:
                 await asyncio.sleep(self.liquidity_retry_delay)
         return False
 
+    def _recent_rejection_stats(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        reason: str,
+        window_sec: float,
+    ) -> Tuple[int, float]:
+        """
+        Return (count, age_sec) for recent matching rejections from SharedState history.
+        age_sec is the elapsed time since the oldest matching event in the window.
+        """
+        if not self.shared_state:
+            return 0, 0.0
+
+        sym = self._norm_symbol(symbol)
+        side_u = str(side or "").upper()
+        reason_u = str(reason or "").upper()
+        now_ts = time.time()
+        oldest_ts = 0.0
+        count = 0
+
+        try:
+            history = list(getattr(self.shared_state, "rejection_history", []) or [])
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("symbol", "")).upper() != sym:
+                    continue
+                if str(item.get("side", "")).upper() != side_u:
+                    continue
+                if str(item.get("reason", "")).upper() != reason_u:
+                    continue
+                ts = float(item.get("ts", 0.0) or 0.0)
+                if ts <= 0:
+                    continue
+                if (now_ts - ts) > float(window_sec or 0.0):
+                    continue
+                count += 1
+                if oldest_ts <= 0.0 or ts < oldest_ts:
+                    oldest_ts = ts
+        except Exception:
+            return 0, 0.0
+
+        age_sec = max(0.0, now_ts - oldest_ts) if oldest_ts > 0.0 else 0.0
+        return int(count), float(age_sec)
+
+    async def _maybe_retry_close_with_forced_exit(
+        self,
+        *,
+        symbol: str,
+        reason_text: str,
+        tag: str,
+        trace_id: Optional[str],
+        policy_context: Dict[str, Any],
+        blocked_reason: str,
+        blocked_error_code: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Timed close escape hatch:
+        after repeated CLOSE_NOT_SUBMITTED blocks in a short window, retry SELL once
+        with `_forced_exit` + `CAPITAL_RECOVERY` context so deadlocked positions can close.
+        """
+        if not bool(self._cfg("CLOSE_ESCAPE_HATCH_ENABLED", True)):
+            return None
+        if bool(policy_context.get("_close_escape_retry")):
+            return None
+
+        reason_l = str(blocked_reason or "").strip().lower()
+        code_l = str(blocked_error_code or "").strip().lower()
+        allow_csv = str(
+            self._cfg(
+                "CLOSE_ESCAPE_HATCH_ALLOW_REASONS",
+                "portfolio_pnl_improvement,sell_dynamic_edge_below_min,sell_net_pnl_below_min,sell_net_pct_below_min",
+            )
+            or ""
+        )
+        allow_tokens = {
+            tok.strip().lower()
+            for tok in allow_csv.split(",")
+            if str(tok).strip()
+        }
+        if allow_tokens and reason_l not in allow_tokens and code_l not in allow_tokens:
+            return None
+
+        window_sec = max(30.0, float(self._cfg("CLOSE_ESCAPE_HATCH_WINDOW_SEC", 900.0) or 900.0))
+        trigger_count = max(1, int(self._cfg("CLOSE_ESCAPE_HATCH_TRIGGER_COUNT", 4) or 4))
+        min_age_sec = max(0.0, float(self._cfg("CLOSE_ESCAPE_HATCH_MIN_AGE_SEC", 120.0) or 120.0))
+        cooldown_sec = max(0.0, float(self._cfg("CLOSE_ESCAPE_HATCH_RETRY_COOLDOWN_SEC", 180.0) or 180.0))
+        now_ts = time.time()
+
+        recent_count, age_sec = self._recent_rejection_stats(
+            symbol=symbol,
+            side="SELL",
+            reason="CLOSE_NOT_SUBMITTED",
+            window_sec=window_sec,
+        )
+        if recent_count < trigger_count or age_sec < min_age_sec:
+            return None
+
+        buy_lock_trigger = int(self._cfg("CLOSE_ESCAPE_HATCH_BUY_LOCK_TRIGGER", 0) or 0)
+        if buy_lock_trigger > 0:
+            buy_lock_count = 0
+            try:
+                if hasattr(self.shared_state, "get_rejection_count"):
+                    buy_lock_count = int(
+                        self.shared_state.get_rejection_count(symbol, "BUY", "POSITION_ALREADY_OPEN") or 0
+                    )
+            except Exception:
+                buy_lock_count = 0
+            if buy_lock_count < buy_lock_trigger:
+                return None
+
+        sym = self._norm_symbol(symbol)
+        last_attempt_ts = float(self._close_escape_last_attempt_ts.get(sym, 0.0) or 0.0)
+        if last_attempt_ts > 0 and (now_ts - last_attempt_ts) < cooldown_sec:
+            return None
+
+        self._close_escape_last_attempt_ts[sym] = now_ts
+        forced_ctx = dict(policy_context or {})
+        forced_ctx["_close_escape_retry"] = True
+        forced_ctx["_forced_exit"] = True
+        forced_ctx["reason"] = "CAPITAL_RECOVERY_FORCED_EXIT"
+        forced_ctx["exit_reason"] = "CAPITAL_RECOVERY_FORCED_EXIT"
+        forced_ctx["liquidation_reason"] = "CAPITAL_RECOVERY"
+        forced_ctx["close_escape_origin_reason"] = str(blocked_reason or "")
+        forced_ctx["close_escape_origin_code"] = str(blocked_error_code or "")
+        forced_ctx["close_escape_requested_reason"] = str(reason_text or "")
+        forced_ctx["close_escape_recent_blocks"] = int(recent_count)
+        forced_ctx["close_escape_block_age_sec"] = float(age_sec)
+
+        self.logger.warning(
+            "[EM:CLOSE_ESCAPE] Triggering forced-exit retry for %s after %d CLOSE_NOT_SUBMITTED blocks in %.0fs (reason=%s code=%s).",
+            sym,
+            recent_count,
+            age_sec,
+            str(blocked_reason or ""),
+            str(blocked_error_code or ""),
+        )
+        try:
+            if hasattr(self.shared_state, "record_rejection"):
+                await self.shared_state.record_rejection(sym, "SELL", "CLOSE_ESCAPE_ATTEMPT", source="ExecutionManager")
+        except Exception:
+            pass
+
+        retry_intent = TradeIntent(
+            symbol=symbol,
+            side="SELL",
+            quantity=None,
+            planned_quote=None,
+            tag=str(tag or "tp_sl"),
+            trace_id=trace_id,
+            is_liquidation=True,
+            policy_context=forced_ctx,
+        )
+        return await self.execute_trade(retry_intent)
+
     # =============================
     # Canonical execution API
     # =============================
@@ -5549,8 +6164,11 @@ class ExecutionManager:
         *,
         symbol: str,
         reason: str = "",
+        is_liquidation: Optional[bool] = None,
         force_finalize: bool = False,
         tag: str = "tp_sl",
+        trace_id: Optional[str] = None,
+        policy_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Close a position via the canonical execution path with optional forced finalization."""
         reason_text = str(reason or "").strip() or "EXIT"
@@ -5563,15 +6181,36 @@ class ExecutionManager:
                 pos_qty = float((self.shared_state.positions.get(sym, {}) or {}).get("quantity", 0.0) or 0.0)
         except Exception:
             pos_qty = 0.0
+        if is_liquidation is None:
+            tag_l = str(tag or "").lower()
+            reason_u = reason_text.upper()
+            is_liq_intent = bool(
+                tag_l in {"tp_sl", "liquidation", "dust_cleanup"}
+                or "LIQUIDATION" in reason_u
+                or "EMERGENCY" in reason_u
+                or "STOP_LOSS" in reason_u
+                or "SL" == reason_u
+            )
+        else:
+            is_liq_intent = bool(is_liquidation)
         self.logger.info(
-            "[EM:CLOSE_ATTEMPT] symbol=%s qty=%.8f reason=%s tag=%s force_finalize=%s",
-            sym, pos_qty, reason_text, tag, bool(force_finalize)
+            "[EM:CLOSE_ATTEMPT] symbol=%s qty=%.8f reason=%s tag=%s is_liquidation=%s force_finalize=%s trace_id=%s",
+            sym,
+            pos_qty,
+            reason_text,
+            tag,
+            is_liq_intent,
+            bool(force_finalize),
+            str(trace_id or ""),
         )
-        policy_context = {
-            "exit_reason": reason_text,
-            "reason": reason_text,
-            "liquidation_reason": reason_text,
-        }
+        policy_context = dict(policy_context or {})
+        policy_context.setdefault("exit_reason", reason_text)
+        policy_context.setdefault("reason", reason_text)
+        if trace_id:
+            policy_context["trace_id"] = str(trace_id)
+            policy_context["decision_id"] = str(trace_id)
+        if is_liq_intent:
+            policy_context["liquidation_reason"] = reason_text
         # Create a TradeIntent for the canonical execute_trade API
         from core.stubs import TradeIntent
         trade_intent = TradeIntent(
@@ -5580,7 +6219,8 @@ class ExecutionManager:
             quantity=None,
             planned_quote=None,
             tag=tag,
-            is_liquidation=True,
+            trace_id=trace_id,
+            is_liquidation=is_liq_intent,
             policy_context=policy_context,
         )
         res = await self.execute_trade(trade_intent)
@@ -5603,6 +6243,97 @@ class ExecutionManager:
             self.logger.debug("[EM] close result logging failed for %s", sym, exc_info=True)
         if isinstance(res, dict):
             try:
+                initial_status = str(res.get("status", "")).upper()
+                has_submission_ref = bool(
+                    res.get("orderId")
+                    or res.get("order_id")
+                    or res.get("exchange_order_id")
+                    or res.get("clientOrderId")
+                    or res.get("client_order_id")
+                    or res.get("origClientOrderId")
+                )
+                # Preserve upstream block/skip reasons when nothing was submitted.
+                # Running delayed-fill reconciliation here would emit misleading
+                # recovery-no-ids events and hide the true failure cause.
+                if (not has_submission_ref) and initial_status in {"BLOCKED", "SKIPPED", "REJECTED", "CANCELED", "EXPIRED"}:
+                    reason_l = str(res.get("reason", "") or "").lower()
+                    code_l = str(res.get("error_code", "") or "").lower()
+                    is_terminal_dust = (
+                        "terminal_dust" in reason_l
+                        or "permanent_dust" in reason_l
+                        or code_l == "terminaldust"
+                        or code_l == "permanentdust"
+                    )
+                    if is_terminal_dust:
+                        # Terminal dust cannot be executed economically on exchange.
+                        # Retire local position to prevent infinite retry/reject loops.
+                        try:
+                            await self._force_finalize_position(sym, "terminal_dust_write_down")
+                            if hasattr(self.shared_state, "close_position"):
+                                await maybe_call(self.shared_state, "close_position", sym, "terminal_dust_write_down")
+                            self.logger.info(
+                                "[EM:CLOSE_TERMINAL_DUST] symbol=%s retired local position after blocked close (%s/%s)",
+                                sym,
+                                str(res.get("reason", "")),
+                                str(res.get("error_code", "")),
+                            )
+                        except Exception:
+                            self.logger.debug("[EM] terminal dust local retirement failed for %s", sym, exc_info=True)
+                    try:
+                        if hasattr(self.shared_state, "record_rejection"):
+                            await self.shared_state.record_rejection(
+                                sym,
+                                "SELL",
+                                "CLOSE_NOT_SUBMITTED",
+                                source="ExecutionManager",
+                            )
+                    except Exception:
+                        pass
+                    escape_res = await self._maybe_retry_close_with_forced_exit(
+                        symbol=sym,
+                        reason_text=reason_text,
+                        tag=str(tag or "tp_sl"),
+                        trace_id=trace_id,
+                        policy_context=policy_context,
+                        blocked_reason=str(res.get("reason", "") or ""),
+                        blocked_error_code=str(res.get("error_code", "") or ""),
+                    )
+                    if isinstance(escape_res, dict):
+                        res = escape_res
+                        initial_status = str(res.get("status", "")).upper()
+                        has_submission_ref = bool(
+                            res.get("orderId")
+                            or res.get("order_id")
+                            or res.get("exchange_order_id")
+                            or res.get("clientOrderId")
+                            or res.get("client_order_id")
+                            or res.get("origClientOrderId")
+                        )
+                        self.logger.warning(
+                            "[EM:CLOSE_ESCAPE_RESULT] symbol=%s submitted=%s status=%s reason=%s error_code=%s",
+                            sym,
+                            has_submission_ref,
+                            initial_status,
+                            str(res.get("reason", "")),
+                            str(res.get("error_code", "")),
+                        )
+                    if (not has_submission_ref) and initial_status in {"BLOCKED", "SKIPPED", "REJECTED", "CANCELED", "EXPIRED"}:
+                        self.logger.info(
+                            "[EM:CLOSE_RECONCILE_SKIPPED] symbol=%s status=%s reason=%s (no submission refs)",
+                            sym,
+                            initial_status,
+                            str(res.get("reason", "")),
+                        )
+                        self._journal("CLOSE_NOT_SUBMITTED", {
+                            "symbol": sym,
+                            "side": "SELL",
+                            "status": initial_status or "UNKNOWN",
+                            "reason": str(res.get("reason", "") or "close_not_submitted"),
+                            "error_code": str(res.get("error_code", "") or ""),
+                            "tag": str(tag or "tp_sl"),
+                            "timestamp": time.time(),
+                        })
+                        return res
                 res = await self._reconcile_delayed_fill(
                     symbol=sym,
                     side="SELL",
@@ -5839,6 +6570,16 @@ class ExecutionManager:
         Internal implementation of trade execution.
         Use execute_trade() public API instead.
         """
+        # Periodic watchdog status reporting
+        self._execution_counter += 1
+        now_ts = time.time()
+        if (now_ts - self._last_watchdog_report_ts) >= self._watchdog_report_interval_s:
+            await self._report_watchdog_status(
+                "Operational",
+                f"Processed {self._execution_counter} executions"
+            )
+            self._last_watchdog_report_ts = now_ts
+        
         self._ensure_heartbeat()
         side = (side or "").lower()
 
@@ -5891,7 +6632,14 @@ class ExecutionManager:
                 }
 
         # Define dust operation flags for bypass logic
-        is_dust_healing_buy = str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+        is_dust_healing_buy = bool(
+            policy_ctx.get("_is_dust_healing_buy")
+            or policy_ctx.get("is_dust_healing")
+            or policy_ctx.get("_dust_healing")
+            or str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+        )
+        if is_dust_healing_buy:
+            policy_ctx["_is_dust_healing_buy"] = True
         is_dust_operation = self._is_dust_operation_context(policy_ctx, tier=tier, tag=tag, symbol=sym)
 
         # === DUST PRIORITY: REUSE dust when a same-symbol BUY arrives ===
@@ -5935,10 +6683,43 @@ class ExecutionManager:
         # _forced_exit=True signals (concentration, starvation, rotation, rebalance exits)
         # are risk-management decisions — they must never be blocked by profit gates,
         # scaling rules, or capital allocation checks that apply only to entries.
+        reason_hint_u = " ".join([
+            str(policy_ctx.get("reason") or ""),
+            str(policy_ctx.get("exit_reason") or ""),
+            str(policy_ctx.get("signal_reason") or ""),
+            str(policy_ctx.get("liquidation_reason") or ""),
+        ]).upper()
+        meta_exit_forced_liq = bool(
+            "meta_exit" in tag_lower
+            and any(k in reason_hint_u for k in ("LIQUIDATION", "EMERGENCY", "CAPITAL_RECOVERY", "DUST_CLEANUP"))
+        )
+        forced_exit_flag = side == "sell" and bool(policy_ctx.get("_forced_exit"))
+        forced_exit_is_risk_liq = bool(
+            forced_exit_flag
+            and any(
+                k in reason_hint_u
+                for k in (
+                    "LIQUIDATION",
+                    "EMERGENCY",
+                    "STOP_LOSS",
+                    "HARD_STOP",
+                    "CAPITAL_RECOVERY",
+                    "DUST_CLEANUP",
+                    "CONCENTRATION",
+                )
+            )
+        )
+        if forced_exit_flag and not forced_exit_is_risk_liq and "ROTATION" in reason_hint_u:
+            self.logger.info(
+                "[EXEC:ForcedExit] %s SELL forced_exit treated as regular exit (rotation path). "
+                "Profitability gates remain active.",
+                sym,
+            )
         is_liq_full = (
             is_liquidation
-            or any(x in tag_lower for x in ("tp_sl", "balancer", "meta_exit"))
-            or (side == "sell" and bool(policy_ctx.get("_forced_exit")))
+            or any(x in tag_lower for x in ("tp_sl", "balancer", "liquidation"))
+            or meta_exit_forced_liq
+            or forced_exit_is_risk_liq
         )
 
         # ===== CAPITAL ESCAPE HATCH =====
@@ -5968,7 +6749,19 @@ class ExecutionManager:
         # Global SELL guard (real capital only): allow only TP/SL (liquidation) or explicit EMERGENCY exits.
         # This prevents state/rotation/recovery SELLs from fragmenting compounding on live capital.
         is_real_mode = bool(self._cfg("LIVE_MODE", False)) and not bool(self._cfg("SIMULATION_MODE", False)) and not bool(self._cfg("PAPER_MODE", False)) and not bool(self._cfg("TESTNET_MODE", False))
-        if side == "sell" and is_real_mode and not is_liq_full and not bypass_checks:
+        allow_authorized_meta_exit = False
+        if side == "sell":
+            meta_reason_u = " ".join([
+                str(policy_ctx.get("reason") or ""),
+                str(policy_ctx.get("exit_reason") or ""),
+                str(policy_ctx.get("signal_reason") or ""),
+            ]).upper()
+            allow_authorized_meta_exit = bool(
+                "meta_exit" in tag_lower
+                and any(k in meta_reason_u for k in ("STRATEGY_SELL", "STRATEGY_EXIT", "META_EXIT", "ROTATION"))
+            )
+
+        if side == "sell" and is_real_mode and not is_liq_full and not bypass_checks and not allow_authorized_meta_exit:
             reason_text = " ".join([
                 str(policy_ctx.get("reason") or ""),
                 str(policy_ctx.get("exit_reason") or ""),
@@ -5991,14 +6784,26 @@ class ExecutionManager:
                 }
         
         if not is_liq_full and not bypass_checks:
-            mode = str((getattr(self.shared_state, "metrics", None) or {}).get("current_mode", "NORMAL")).upper()
+            metrics = getattr(self.shared_state, "metrics", None) or {}
+            mode = str(metrics.get("current_mode", "NORMAL")).upper()
+            gov_decision = metrics.get("governance_decision") or {}
+            allowed_actions = {
+                str(a).upper() for a in (gov_decision.get("allowed_actions") or [])
+            }
             if mode == "PAUSED":
                 self.logger.warning(f"[EM:GovBlock] Blocked {side.upper()} {sym}: System is PAUSED.")
                 return {"ok": False, "status": "blocked", "reason": "System PAUSED", "error_code": "PAUSED_MODE"}
             
             if side == "buy" and mode == "PROTECTIVE":
-                self.logger.warning(f"[EM:GovBlock] Blocked BUY {sym}: System is in PROTECTIVE mode.")
-                return {"ok": False, "status": "blocked", "reason": "BUY Disabled in PROTECTIVE Mode", "error_code": "PROTECTIVE_MODE"}
+                # Respect MetaController governance decision (micro-account exception may allow BUY in PROTECTIVE).
+                if "BUY" not in allowed_actions:
+                    self.logger.warning(f"[EM:GovBlock] Blocked BUY {sym}: System is in PROTECTIVE mode.")
+                    return {"ok": False, "status": "blocked", "reason": "BUY Disabled in PROTECTIVE Mode", "error_code": "PROTECTIVE_MODE"}
+                self.logger.info(
+                    "[EM:GovAllow] BUY %s allowed in PROTECTIVE (governance allowed_actions=%s)",
+                    sym,
+                    sorted(allowed_actions),
+                )
         allow_partial = bool(
             policy_ctx.get("allow_partial")
             or policy_ctx.get("partial_exit")
@@ -6039,7 +6844,14 @@ class ExecutionManager:
             self.logger.info(f"[EM:DUST_RECOVERY] Set risk_based_quote for {sym} to {planned_quote:.2f}")
 
         # HARD-SEPARATE DUST HEALING: Bypass all risk sizing for DUST_HEALING_BUY
-        is_dust_healing_buy = str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+        is_dust_healing_buy = bool(
+            policy_ctx.get("_is_dust_healing_buy")
+            or policy_ctx.get("is_dust_healing")
+            or policy_ctx.get("_dust_healing")
+            or str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+        )
+        if is_dust_healing_buy:
+            policy_ctx["_is_dust_healing_buy"] = True
         if is_dust_operation and side == "buy":
             deficit = getattr(self.shared_state, "dust_healing_deficit", {}).get(sym, 0.0)
             if deficit <= 0:
@@ -6104,9 +6916,22 @@ class ExecutionManager:
         policy_authority = str(policy_ctx.get("authority") or policy_ctx.get("policy_authority") or "").lower()
         policy_validated = policy_authority == "metacontroller"
         if policy_validated and side == "buy" and planned_quote and planned_quote > 0:
-            # MetaController planned_quote is authoritative: do not downscale below it.
-            policy_ctx.setdefault("_no_downscale_planned_quote", True)
-            policy_ctx.setdefault("_planned_quote_floor", float(planned_quote))
+            # ✅ FIX #11: Check if this is a bootstrap first trade
+            # During bootstrap with limited capital, we MUST allow downscaling
+            # Only lock planned_quote if we're NOT in bootstrap override mode
+            is_bootstrap_override = policy_ctx.get("_bootstrap_override", False) or policy_ctx.get("_bypass_reason") == "BOOTSTRAP_FIRST_TRADE"
+            
+            # DEBUG: Log the policy context
+            self.logger.info(f"[EM:Bootstrap:DEBUG] sym={sym} _bootstrap_override={policy_ctx.get('_bootstrap_override')} _bypass_reason={policy_ctx.get('_bypass_reason')} is_bootstrap={is_bootstrap_override}")
+            
+            if not is_bootstrap_override:
+                # MetaController planned_quote is authoritative: do not downscale below it.
+                policy_ctx.setdefault("_no_downscale_planned_quote", True)
+                policy_ctx.setdefault("_planned_quote_floor", float(planned_quote))
+            else:
+                # Bootstrap mode: Allow downscaling to available capital
+                self.logger.info(f"[EM:Bootstrap] Allowing downscale for {sym}: bootstrap_override=True")
+                policy_ctx["_no_downscale_planned_quote"] = False
         
         # [FIX #4] UNIFIED SELL AUTHORITY: MetaController has supreme authority over SELL decisions
         # If UNIFIED_SELL_AUTHORITY=True, SELL overrides most operational gates
@@ -6189,16 +7014,52 @@ class ExecutionManager:
         # [FIX #9] LIQUIDATION BYPASS: If this is liquidation, skip ALL guards and go straight to execution
         if is_liq_full and side == "sell":
             self.logger.info(f"[EXEC:LIQ] LIQUIDATION SELL: {sym} - bypassing all guards (capital, min-notional, throughput)")
+
+            now_ts = time.time()
+            cooldown_until = float(self._liq_sell_cooldown_until.get(sym, 0.0) or 0.0)
+            if cooldown_until > now_ts:
+                wait_s = max(0.0, cooldown_until - now_ts)
+                self.logger.warning(
+                    "[EXEC:LIQ] %s in liquidation cooldown for %.1fs after repeated failures",
+                    sym,
+                    wait_s,
+                )
+                self.shared_state.exit_in_progress[sym] = False
+                return {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "liquidation_cooldown",
+                    "error_code": "LiquidationCooldown",
+                }
             
             # For liquidation SELLs, we execute with best-effort quantity
             if not quantity or quantity <= 0:
                 qty = await self._get_sellable_qty(sym)
                 if qty <= 0:
                     self.logger.warning(f"[EXEC:LIQ] No position to liquidate for {sym}")
+                    self._journal("LIQUIDATION_SKIPPED_NO_POSITION_QTY", {
+                        "symbol": sym,
+                        "side": "SELL",
+                        "status": "SKIPPED",
+                        "reason": "no_position_quantity",
+                        "tag": str(clean_tag or ""),
+                        "timestamp": time.time(),
+                    })
                     await self.shared_state.record_rejection(sym, "SELL", "NO_POSITION_QUANTITY", source="ExecutionManager")
                     self.shared_state.exit_in_progress[sym] = False
                     return {"ok": False, "status": "skipped", "reason": "no_position_quantity", "error_code": "NoPosition"}
                 quantity = qty
+
+            quantity = await self._buffer_liquidation_sell_qty(sym, float(quantity))
+            if not quantity or float(quantity) <= 0:
+                self.logger.warning("[EXEC:LIQ] Buffered qty resolved to zero for %s", sym)
+                self.shared_state.exit_in_progress[sym] = False
+                return {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "no_position_quantity",
+                    "error_code": "NoPosition",
+                }
             
             # Execute SELL immediately without any guards, then always reconcile delayed fill
             raw = await self._place_market_order_qty(
@@ -6305,21 +7166,70 @@ class ExecutionManager:
                     "_sell_finalize_key": merged.get("_sell_finalize_key"),
                 }
                 self.logger.info(f"[EXEC:LIQ] ✅ Liquidation SELL executed: {sym} qty={result['executedQty']:.6f}")
+                self._liq_sell_fail_counts.pop(sym, None)
+                self._liq_sell_cooldown_until.pop(sym, None)
                 self.shared_state.exit_in_progress[sym] = False
                 return result
             else:
-                self.logger.warning(f"[EXEC:LIQ] ⚠️ Liquidation SELL failed: status={status}, qty={exec_qty}")
+                fail_reason = str(merged.get("reason") or raw.get("reason") or "liquidation_not_filled")
+                fail_code = str(merged.get("error_code") or raw.get("error_code") or "LiquidationFailed")
+                self.logger.warning(
+                    "[EXEC:LIQ] ⚠️ Liquidation SELL failed: status=%s qty=%.8f reason=%s code=%s",
+                    status,
+                    exec_qty,
+                    fail_reason,
+                    fail_code,
+                )
+
+                # If exchange now reports zero sellable qty, retire stale local position
+                # to stop retry storms from trapped/non-existent inventory.
+                post_fail_qty = await self._get_sellable_qty(sym)
+                if float(post_fail_qty) <= 0.0:
+                    self._journal("LIQUIDATION_SKIPPED_NO_POSITION_QTY", {
+                        "symbol": sym,
+                        "side": "SELL",
+                        "status": "SKIPPED",
+                        "reason": "no_position_after_failed_liquidation",
+                        "tag": str(clean_tag or ""),
+                        "timestamp": time.time(),
+                    })
+                    with contextlib.suppress(Exception):
+                        await self.shared_state.close_position(sym, reason="no_position_after_failed_liquidation")
+                    self._liq_sell_fail_counts.pop(sym, None)
+                    self._liq_sell_cooldown_until.pop(sym, None)
+                    self.shared_state.exit_in_progress[sym] = False
+                    return {
+                        "ok": False,
+                        "status": "skipped",
+                        "reason": "no_position_quantity",
+                        "error_code": "NoPosition",
+                    }
+
+                fail_count = int(self._liq_sell_fail_counts.get(sym, 0) or 0) + 1
+                self._liq_sell_fail_counts[sym] = fail_count
+                base_cd = float(self._cfg("LIQUIDATION_FAILURE_COOLDOWN_SEC", 30.0) or 30.0)
+                max_cd = float(self._cfg("LIQUIDATION_FAILURE_COOLDOWN_MAX_SEC", 300.0) or 300.0)
+                cooldown_s = min(max_cd, base_cd * float(2 ** min(max(fail_count - 1, 0), 4)))
+                self._liq_sell_cooldown_until[sym] = time.time() + cooldown_s
+                self.logger.warning(
+                    "[EXEC:LIQ] %s fail_count=%d -> cooldown %.1fs (remaining_qty=%.10f)",
+                    sym,
+                    fail_count,
+                    cooldown_s,
+                    float(post_fail_qty),
+                )
                 await self._log_execution_event("liquidation_fail", sym, {"reason": "not_filled"})
                 self.shared_state.exit_in_progress[sym] = False
                 return {
                     "ok": False,
                     "status": status.lower(),
                     "executedQty": exec_qty,
-                    "orderId": raw.get("orderId") or raw.get("exchange_order_id") or raw.get("order_id"),
-                    "exchange_order_id": raw.get("exchange_order_id") or raw.get("orderId") or raw.get("order_id"),
-                    "client_order_id": raw.get("clientOrderId") or raw.get("client_order_id") or raw.get("origClientOrderId"),
+                    "orderId": merged.get("orderId") or raw.get("orderId") or raw.get("exchange_order_id") or raw.get("order_id"),
+                    "exchange_order_id": merged.get("exchange_order_id") or raw.get("exchange_order_id") or raw.get("orderId") or raw.get("order_id"),
+                    "client_order_id": merged.get("clientOrderId") or raw.get("clientOrderId") or raw.get("client_order_id") or raw.get("origClientOrderId"),
                     "reason": "[LIQUIDATION_FAILED]",
-                    "error_code": "LiquidationFailed"
+                    "reason_detail": fail_reason,
+                    "error_code": fail_code or "LiquidationFailed",
                 }
 
         # ---- Risk gate (ALLOW / DENY / ADJUST) ---- [SKIPPED FOR LIQUIDATION AND DUST HEALING]
@@ -6428,6 +7338,26 @@ class ExecutionManager:
             # ---- Route by side ----
             async with self._small_nav_guard():
                 if side == "buy":
+                    # Local cooldown for repeated POSITION_ALREADY_OPEN loops.
+                    now_buy = time.time()
+                    pos_open_block_until = float(self._position_open_buy_block_until.get(sym, 0.0) or 0.0)
+                    if pos_open_block_until > now_buy:
+                        wait_s = int(max(0.0, pos_open_block_until - now_buy))
+                        self.logger.warning(
+                            "[EM:PositionOpenCooldown] Blocking BUY %s for %ss after repeated POSITION_ALREADY_OPEN rejections",
+                            sym,
+                            wait_s,
+                        )
+                        return {
+                            "ok": False,
+                            "status": "blocked",
+                            "reason": "POSITION_OPEN_COOLDOWN",
+                            "error_code": "POSITION_OPEN_COOLDOWN",
+                            "retry_after_sec": wait_s,
+                        }
+                    elif pos_open_block_until > 0.0:
+                        self._position_open_buy_block_until.pop(sym, None)
+
                     if planned_quote and planned_quote > 0:
                         # 🛡️ OWNERSHIP GUARD: Check SharedState classification (canonical authority)
                         # Design Rule: Classification comes ONLY from SharedState.position.classification
@@ -6439,6 +7369,30 @@ class ExecutionManager:
                             
                             if classification == "BOT_POSITION":
                                 # Position already owned by bot - reject to prevent double-entry
+                                rej_count = 0
+                                try:
+                                    await self.shared_state.record_rejection(
+                                        sym, "BUY", "POSITION_ALREADY_OPEN", source="ExecutionManager"
+                                    )
+                                    rej_count = int(
+                                        self.shared_state.get_rejection_count(sym, "BUY", "POSITION_ALREADY_OPEN") or 0
+                                    )
+                                except Exception:
+                                    rej_count = 0
+                                cooldown_trigger = int(
+                                    self._cfg("POSITION_OPEN_BUY_COOLDOWN_TRIGGER", 6) or 6
+                                )
+                                cooldown_sec = float(
+                                    self._cfg("POSITION_OPEN_BUY_COOLDOWN_SEC", 120.0) or 120.0
+                                )
+                                if rej_count >= max(1, cooldown_trigger):
+                                    self._position_open_buy_block_until[sym] = time.time() + max(5.0, cooldown_sec)
+                                    self.logger.warning(
+                                        "[EM:PositionOpenCooldown] Engaged for %s BUY (%ss) after %d POSITION_ALREADY_OPEN rejections",
+                                        sym,
+                                        int(max(5.0, cooldown_sec)),
+                                        rej_count,
+                                    )
                                 self.logger.warning(
                                     "[EM:Ownership] Blocked BUY %s: position already BOT_POSITION (prevent duplicate entry)",
                                     sym
@@ -6448,6 +7402,7 @@ class ExecutionManager:
                                     "status": "blocked",
                                     "reason": "POSITION_ALREADY_OPEN",
                                     "error_code": "POSITION_ALREADY_OPEN",
+                                    "reason_detail": f"position_open_rej_count_{rej_count}",
                                 }
                             elif classification == "EXTERNAL_POSITION":
                                 # External position exists - skip but don't block entire system
@@ -6642,6 +7597,23 @@ class ExecutionManager:
                         # Normalize execute_quote to exchange precision requirements
                         execute_quote = self._normalize_quote_precision(sym, execute_quote)
 
+                        # 🛡️ ENTRY FLOOR GUARD: Prevent opening new trades below significant floor
+                        is_dust_healing = bool(
+                            policy_ctx.get("_is_dust_healing_buy")
+                            or policy_ctx.get("is_dust_healing")
+                            or policy_ctx.get("_dust_healing")
+                            or str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+                        ) if policy_ctx else False
+                        guard_allowed, guard_reason = await self._check_entry_floor_guard(
+                            symbol=sym,
+                            quote_amount=float(execute_quote),
+                            is_dust_healing_buy=bool(is_dust_healing)
+                        )
+                        if not guard_allowed:
+                            self.logger.warning(f"[EM:EXEC_BLOCKED] {guard_reason}")
+                            await self.shared_state.record_rejection(sym, "BUY", guard_reason, source="ExecutionManager")
+                            return {"ok": False, "status": "skipped", "reason": guard_reason, "error_code": "ENTRY_FLOOR_GUARD"}
+
                         # Route BUY-by-quote through canonical placement path so delayed fills are
                         # reconciled before post-fill accounting/mutation checks.
                         raw = await self._place_market_order_quote(
@@ -6693,6 +7665,31 @@ class ExecutionManager:
                         if not quantity or quantity <= 0:
                             await self._log_execution_event("order_skip", sym, {"side": "buy", "reason": "InvalidQuantity"})
                             return {"ok": False, "status": "skipped", "reason": "zero_or_negative_quantity", "error_code": "InvalidQuantity"}
+                        
+                        # 🛡️ ENTRY FLOOR GUARD: Prevent opening new trades below significant floor
+                        # For qty-based BUY, estimate quote from current market price
+                        try:
+                            current_price = await self.exchange_client.get_mark_price(sym)
+                            estimated_quote = float(quantity) * float(current_price or 0.0)
+                        except Exception:
+                            estimated_quote = float(planned_quote or 0.0)
+                        
+                        is_dust_healing = bool(
+                            policy_ctx.get("_is_dust_healing_buy")
+                            or policy_ctx.get("is_dust_healing")
+                            or policy_ctx.get("_dust_healing")
+                            or str(policy_ctx.get("reason") or "").upper() == "DUST_HEALING_BUY"
+                        ) if policy_ctx else False
+                        guard_allowed, guard_reason = await self._check_entry_floor_guard(
+                            symbol=sym,
+                            quote_amount=estimated_quote,
+                            is_dust_healing_buy=bool(is_dust_healing)
+                        )
+                        if not guard_allowed:
+                            self.logger.warning(f"[EM:EXEC_BLOCKED] {guard_reason}")
+                            await self.shared_state.record_rejection(sym, "BUY", guard_reason, source="ExecutionManager")
+                            return {"ok": False, "status": "skipped", "reason": guard_reason, "error_code": "ENTRY_FLOOR_GUARD"}
+                        
                         raw = await self._place_market_order_qty(
                             sym,
                             quantity,
@@ -6772,7 +7769,8 @@ class ExecutionManager:
                         )
                     else:
                         # Standard quantity-based SELL path
-                        if not quantity or quantity <= 0:
+                        qty = float(quantity or 0.0)
+                        if qty <= 0:
                             # ✅ FIX #4: RETRY LOOP - wait for position to be available
                             # Rationale: Execution happens in sub-second, but balance refresh takes 100-500ms.
                             # Don't fail on first check; wait a bit and retry.
@@ -7975,6 +8973,8 @@ class ExecutionManager:
         is_bootstrap_signal = False
         if hasattr(self, "_current_policy_context") and self._current_policy_context:
             is_bootstrap_signal = bool(self._current_policy_context.get("_bootstrap", False))
+            # CRITICAL: Also check for _bootstrap_override (used by gate bypass)
+            is_bootstrap_signal = is_bootstrap_signal or bool(self._current_policy_context.get("_bootstrap_override", False))
         
         # Only allow bootstrap bypass if:
         # 1. Signal is marked as bootstrap
@@ -8061,6 +9061,7 @@ class ExecutionManager:
             if side.upper() == "BUY" and planned_quote and planned_quote > 0:
                     # Initialize spend from the planned quote
                     spend = float(planned_quote)
+                    was_downscaled_for_affordability = False  # Track if we downscaled
                     
                     # Bootstrap/dust bypass modes intentionally skip this internal floor and rely on
                     # executable-qty + exchange min_notional checks downstream.
@@ -8070,22 +9071,59 @@ class ExecutionManager:
                     # When order is placed with quote=X, Binance computes qty = X / price and rounds by step_size.
                     # This can result in final_quote < min_entry. We must increase min_entry to the actual
                     # minimum that will SURVIVE rounding.
+                    # HOWEVER: For bootstrap mode with limited capital, cap to available funds first
+                    if (is_bootstrap or bypass_min_notional):
+                        # Check available capital FIRST for bootstrap mode
+                        q_asset_bootstrap = self._split_symbol_quote(symbol)
+                        _free_bootstrap, _ok_bootstrap, _ = await self._get_free_quote_and_remainder_ok(q_asset_bootstrap, spend)
+                        if spend > _free_bootstrap:
+                            self.logger.info(
+                                "[EM:BootstrapCap] %s BUY spend capped from %.2f to available %.2f before rounding calc",
+                                symbol, float(spend), float(_free_bootstrap)
+                            )
+                            spend = float(_free_bootstrap)
+                            was_downscaled_for_affordability = True  # Mark that we downscaled
+                    
+                    # CRITICAL: Recalculate min_entry_after_rounding based on CURRENT spend, not planned_quote
+                    # If we downscaled from $30 to $27, we need to verify $27 meets Binance's minimums
+                    # NOT validate against the $30 minimums
+                    effective_min_entry = await self._get_min_entry_quote(symbol, price=current_price, min_notional=min_notional)
+                    # Only use the original min_entry if we HAVEN'T downscaled
+                    if was_downscaled_for_affordability:
+                        # After downscaling, recalculate minimum entry requirements for bootstrap mode
+                        # Bootstrap mode is allowed to go below normal minimums if capital limited
+                        min_entry_for_validation = max(effective_min_entry, min_notional)
+                        self.logger.info(
+                            "[EM:PostDownscale] After downscaling spend to %.2f, min_entry for validation=%.2f (was %.2f)",
+                            float(spend), float(min_entry_for_validation), float(effective_min_entry)
+                        )
+                    else:
+                        min_entry_for_validation = effective_min_entry
+                        min_entry = min_entry_for_validation
+                    
                     min_entry_after_rounding = self._adjust_quote_for_step_rounding(
                         min_entry_quote=min_entry,
                         current_price=current_price,
                         step_size=step_size,
                     )
                     self.logger.info(
-                        "[EM:RoundingAdjust] %s min_entry before rounding=%.2f after rounding=%.2f",
-                        symbol, float(min_entry), float(min_entry_after_rounding)
+                        "[EM:RoundingAdjust] %s min_entry before rounding=%.2f after rounding=%.2f (downscaled=%s)",
+                        symbol, float(min_entry), float(min_entry_after_rounding), was_downscaled_for_affordability
                     )
                     
-                    if spend < min_entry_after_rounding and not (is_bootstrap or bypass_min_notional):
+                    # For non-bootstrap mode, escalate spend to meet rounding floor
+                    # BUT: Never escalate if MetaController marked this as bootstrap override
+                    is_bootstrap_override = bool(
+                        (getattr(self, "_current_policy_context", None) or {}).get("_bootstrap_override", False)
+                    )
+                    if spend < min_entry_after_rounding and not (is_bootstrap or bypass_min_notional or is_bootstrap_override) and not was_downscaled_for_affordability:
                         self.logger.info(
                             "[EM:AutoAdjust] Escalating %s BUY spend from %.2f → %.2f to meet min_entry_after_rounding",
                             symbol, float(spend), float(min_entry_after_rounding)
                         )
                         spend = float(min_entry_after_rounding)
+                    
+                    # For bootstrap mode, don't escalate beyond what we have
                     if spend < min_entry_after_rounding and (is_bootstrap or bypass_min_notional):
                         self.logger.info(
                             "[EM:MinEntryBypass] %s BUY bypassing min_entry floor %.4f with spend %.4f "
@@ -8107,10 +9145,29 @@ class ExecutionManager:
                     min_required_gross = min_entry_after_rounding * gross_factor
 
                     no_downscale = False
+                    is_bootstrap_escalation = False
                     if hasattr(self, "_current_policy_context") and self._current_policy_context:
                         no_downscale = bool(self._current_policy_context.get("_no_downscale_planned_quote", False))
+                        is_bootstrap_escalation = bool(self._current_policy_context.get("_bootstrap_override", False))
 
-                    if spend < min_required_gross and not no_downscale:
+                    # FIX: For bootstrap orders, DISABLE escalation - just use what we have
+                    # CRITICAL: After downscaling for affordability, ALWAYS cap spend to available capital
+                    if was_downscaled_for_affordability:
+                        # Double-check we never exceed available capital after downscaling
+                        q_asset_check = self._split_symbol_quote(symbol)
+                        _free_final, _ok_final, _ = await self._get_free_quote_and_remainder_ok(q_asset_check, spend)
+                        if spend > _free_final:
+                            self.logger.warning(
+                                "[EM:FinalCapCap] After escalation check, spend %.2f still > available %.2f. Re-capping.",
+                                float(spend), float(_free_final)
+                            )
+                            spend = float(_free_final)
+                        else:
+                            self.logger.info(
+                                "[EM:PostDownscaleCheck] After downscaling and escalation check, spend=%.2f is within available=%.2f ✓",
+                                float(spend), float(_free_final)
+                            )
+                    if spend < min_required_gross and not no_downscale and not is_bootstrap_escalation:
                         # Attempt escalation to meet gross requirements
                         escalated_spend = min_required_gross
                         _free_esc, _ok_rem_esc, _why_rem_esc = await self._get_free_quote_and_remainder_ok(
@@ -8311,13 +9368,37 @@ class ExecutionManager:
             # 0.001 and leaves 0.000234 stranded forever. Round UP to 0.002 only when remainder < min_qty.
             if side.upper() == "SELL" and step_size > 0:
                 remainder = _raw_quantity - float(qty)
-                if remainder > 0 and remainder < max(float(min_qty), float(step_size)):
+                residual_notional = max(0.0, remainder) * float(current_price or 0.0)
+                dust_floor_quote = float(
+                    self._cfg(
+                        "DUST_MIN_QUOTE_USDT",
+                        getattr(self.config, "DUST_MIN_QUOTE_USDT", getattr(self.config, "dust_min_quote_usdt", 5.0)),
+                    ) or 5.0
+                )
+                write_down_quote = float(
+                    self._cfg(
+                        "PERMANENT_DUST_USDT_THRESHOLD",
+                        getattr(self.config, "PERMANENT_DUST_USDT_THRESHOLD", 1.0),
+                    ) or 1.0
+                )
+                residual_floor = max(float(min_notional or 0.0), dust_floor_quote, write_down_quote)
+                qty_residual_is_dust = remainder > 0 and remainder < max(float(min_qty), float(step_size))
+                notional_residual_is_dust = residual_notional > 0 and residual_notional < residual_floor
+                if qty_residual_is_dust or notional_residual_is_dust:
                     qty_up = float(qty) + float(step_size)
                     # Only round up if the position actually has that much (don't oversell)
                     if qty_up <= _raw_quantity + float(step_size) * 0.01:
                         self.logger.info(
-                            "[EM:SellRoundUp] %s: qty ROUND_UP %.8f→%.8f to avoid dust remainder=%.8f (min_qty=%.8f step=%.8f)",
-                            symbol, float(qty), float(qty_up), float(remainder), float(min_qty), float(step_size),
+                            "[EM:SellRoundUp] %s: qty ROUND_UP %.8f→%.8f to avoid dust "
+                            "(remainder=%.8f residual_notional=%.4f floor=%.4f min_qty=%.8f step=%.8f)",
+                            symbol,
+                            float(qty),
+                            float(qty_up),
+                            float(remainder),
+                            float(residual_notional),
+                            float(residual_floor),
+                            float(min_qty),
+                            float(step_size),
                         )
                         qty = qty_up
             if max_qty > 0 and qty > max_qty:

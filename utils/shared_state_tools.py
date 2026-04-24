@@ -243,7 +243,20 @@ async def inject_agent_signal(
 
         # Fix: Update last_signal_timestamp to per-symbol granularity
         per_symbol_ts = shared_state.last_signal_timestamp.get(sym, {})
-        per_symbol_ts[agent_name] = float(signal.get("timestamp", now_ts))
+        
+        # Handle both ISO format strings and unix timestamps
+        ts_value = signal.get("timestamp", now_ts)
+        if isinstance(ts_value, str):
+            # Try to parse ISO format or fallback to current time
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(ts_value.replace('Z', '+00:00'))
+                per_symbol_ts[agent_name] = dt.timestamp()
+            except Exception:
+                per_symbol_ts[agent_name] = now_ts
+        else:
+            per_symbol_ts[agent_name] = float(ts_value)
+        
         shared_state.last_signal_timestamp[sym] = per_symbol_ts
 
     # Normalize & validate action; clamp confidence

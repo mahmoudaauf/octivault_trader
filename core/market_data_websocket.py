@@ -309,6 +309,13 @@ class MarketDataWebSocket:
                 # Fallback to direct attribute access
                 if hasattr(self.shared_state, "latest_prices"):
                     self.shared_state.latest_prices[symbol] = price
+            
+            # ✅ CRITICAL FIX: Signal that market data is ready for agents
+            # SwingTradeHunter and other agents wait for this event
+            if hasattr(self.shared_state, "market_data_ready_event"):
+                event = self.shared_state.market_data_ready_event
+                if event and hasattr(event, "set"):
+                    event.set()
         except Exception as e:
             self._logger.debug(f"[MDW] failed to inject price for {symbol}: {e}")
     
