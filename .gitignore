@@ -125,3 +125,10 @@ dmypy.json
 ########################################
 *.pyy
 *\\
+
+# Generated ML Model Files
+models/*.pkl
+models/mlforecaster_*.pkl
+models/trendhunter_*.pkl
+models/_incompatible_quarantine/
+*.pkl
