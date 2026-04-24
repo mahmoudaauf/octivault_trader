@@ -167,6 +167,182 @@ class PolicyManager:
             "max_positions_nudge": 0,
         }
 
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            num = float(value)
+            if num != num:
+                return float(default)
+            return float(num)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(float(low), min(float(high), float(value)))
+
+    def _normalize_market_regime(self, volatility: str, mode: str) -> str:
+        vol_u = str(volatility or "").strip().upper()
+        mode_u = str(mode or "").strip().upper()
+        if vol_u in {"EXTREME", "HIGH"}:
+            return "volatile"
+        if vol_u in {"LOW"}:
+            return "sideways"
+        if mode_u in {"PROTECTIVE", "RECOVERY", "SAFE", "PAUSED"}:
+            return "volatile"
+        if mode_u in {"BOOTSTRAP", "NORMAL", "AGGRESSIVE"}:
+            return "trend"
+        return "unknown"
+
+    def _compute_conf_policy_bias(
+        self,
+        metrics: Dict[str, Any],
+        mode: str,
+        nudges: Dict[str, float],
+    ) -> Dict[str, Any]:
+        run_rate = self._safe_float(metrics.get("run_rate", 0.0), 0.0)
+        target_rr = max(1e-6, self._safe_float(metrics.get("target_run_rate", 20.0), 20.0))
+        rr_ratio = run_rate / target_rr
+        dd_pct = max(0.0, self._safe_float(metrics.get("drawdown_pct", 0.0), 0.0))
+        idle_sec = max(0.0, self._safe_float(metrics.get("idle_time_sec", 0.0), 0.0))
+        win_rate = self._clamp(self._safe_float(metrics.get("win_rate", 0.5), 0.5), 0.0, 1.0)
+        health_ok = bool(metrics.get("health_ok", True))
+        repeated_failures = bool(metrics.get("repeated_failures", False))
+        volatility = str(metrics.get("volatility", "NORMAL") or "NORMAL")
+
+        bias = 0.0
+        # Risk-on tightening branch.
+        if dd_pct >= 4.0:
+            bias += 0.08
+        elif dd_pct >= 2.0:
+            bias += 0.04
+
+        if not health_ok:
+            bias += 0.05
+        if repeated_failures:
+            bias += 0.04
+
+        vol_u = volatility.upper()
+        if vol_u == "EXTREME":
+            bias += 0.06
+        elif vol_u == "HIGH":
+            bias += 0.03
+
+        if win_rate <= 0.38:
+            bias += 0.02
+        elif win_rate >= 0.66:
+            bias -= 0.01
+
+        # Throughput recovery branch (only when risk is stable).
+        if rr_ratio < 0.45 and idle_sec > 600 and dd_pct < 1.5 and health_ok and not repeated_failures:
+            bias -= 0.02
+        if rr_ratio < 0.25 and idle_sec > 1800 and dd_pct < 1.0 and health_ok and vol_u not in {"HIGH", "EXTREME"}:
+            bias -= 0.02
+
+        # Keep policy bias directionally aligned with nudges.
+        conf_nudge = self._safe_float((nudges or {}).get("confidence_nudge", 0.0), 0.0)
+        bias += self._clamp(-0.35 * conf_nudge, -0.02, 0.02)
+
+        raw_bias = self._clamp(bias, -0.10, 0.15)
+        regime_key = self._normalize_market_regime(volatility, mode)
+        regime_multiplier = {
+            "volatile": 1.15,
+            "trend": 0.85,
+            "sideways": 0.90,
+            "unknown": 1.00,
+        }.get(regime_key, 1.0)
+        regime_bias = self._clamp(raw_bias * regime_multiplier, -0.12, 0.18)
+
+        return {
+            "raw_bias": float(raw_bias),
+            "regime_key": regime_key,
+            "raw_regime_bias": float(regime_bias),
+            "diagnostics": {
+                "run_rate_ratio": float(rr_ratio),
+                "drawdown_pct": float(dd_pct),
+                "idle_time_sec": float(idle_sec),
+                "win_rate": float(win_rate),
+                "volatility": vol_u,
+                "health_ok": bool(health_ok),
+                "repeated_failures": bool(repeated_failures),
+            },
+        }
+
+    async def _apply_dynamic_tradeability_policy(
+        self,
+        meta_controller,
+        metrics: Dict[str, Any],
+        mode: str,
+        nudges: Dict[str, float],
+    ) -> None:
+        shared_state = getattr(meta_controller, "shared_state", None)
+        if shared_state is None:
+            return
+
+        try:
+            dyn_cfg = getattr(shared_state, "dynamic_config", {}) or {}
+            if not isinstance(dyn_cfg, dict):
+                dyn_cfg = {}
+        except Exception:
+            dyn_cfg = {}
+
+        computed = self._compute_conf_policy_bias(metrics, mode=mode, nudges=nudges)
+        raw_bias = self._safe_float(computed.get("raw_bias", 0.0), 0.0)
+        regime_key = str(computed.get("regime_key", "unknown") or "unknown")
+        raw_regime_bias = self._safe_float(computed.get("raw_regime_bias", raw_bias), raw_bias)
+
+        alpha = self._clamp(self._safe_float(getattr(self.config, "POLICY_CONF_BIAS_EMA_ALPHA", 0.25), 0.25), 0.05, 1.0)
+        regime_alpha = self._clamp(
+            self._safe_float(getattr(self.config, "POLICY_CONF_BIAS_REGIME_EMA_ALPHA", 0.35), 0.35),
+            0.05,
+            1.0,
+        )
+
+        prev_global = self._safe_float(dyn_cfg.get("ML_DYNAMIC_REQUIRED_CONF_POLICY_BIAS", 0.0), 0.0)
+        smoothed_global = prev_global + (alpha * (raw_bias - prev_global))
+        smoothed_global = self._clamp(smoothed_global, -0.15, 0.20)
+
+        prev_map = dyn_cfg.get("ML_DYNAMIC_REQUIRED_CONF_POLICY_BIAS_BY_REGIME", {}) or {}
+        if not isinstance(prev_map, dict):
+            prev_map = {}
+        next_map = dict(prev_map)
+        prev_regime = self._safe_float(next_map.get(regime_key, smoothed_global), smoothed_global)
+        smoothed_regime = prev_regime + (regime_alpha * (raw_regime_bias - prev_regime))
+        smoothed_regime = self._clamp(smoothed_regime, -0.18, 0.22)
+        next_map[regime_key] = float(smoothed_regime)
+
+        payload = {
+            "ML_DYNAMIC_REQUIRED_CONF_POLICY_BIAS": float(smoothed_global),
+            "ML_DYNAMIC_REQUIRED_CONF_POLICY_BIAS_BY_REGIME": next_map,
+            "ML_DYNAMIC_REQUIRED_CONF_POLICY_BIAS_TS": float(time.time()),
+            "ML_DYNAMIC_REQUIRED_CONF_POLICY_MODE": str(mode or "UNKNOWN").upper(),
+            "ML_DYNAMIC_REQUIRED_CONF_POLICY_REGIME": regime_key,
+        }
+        if raw_bias != smoothed_global or raw_regime_bias != smoothed_regime:
+            payload["ML_DYNAMIC_REQUIRED_CONF_POLICY_LAST_RAW_BIAS"] = float(raw_bias)
+            payload["ML_DYNAMIC_REQUIRED_CONF_POLICY_LAST_RAW_REGIME_BIAS"] = float(raw_regime_bias)
+
+        update_dynamic = getattr(shared_state, "update_dynamic_config", None)
+        if callable(update_dynamic):
+            await _safe_await(update_dynamic(payload))
+        else:
+            if not hasattr(shared_state, "dynamic_config") or getattr(shared_state, "dynamic_config", None) is None:
+                shared_state.dynamic_config = {}
+            shared_state.dynamic_config.update(payload)
+
+        if abs(smoothed_global) >= 0.005 or abs(smoothed_regime) >= 0.005:
+            meta_controller.logger.info(
+                "[PolicyManager:DynamicConf] mode=%s regime=%s bias=%.4f regime_bias=%.4f rr=%.2f dd=%.2f idle=%ds win=%.2f",
+                str(mode).upper(),
+                regime_key,
+                smoothed_global,
+                smoothed_regime,
+                float(computed.get("diagnostics", {}).get("run_rate_ratio", 0.0)),
+                float(computed.get("diagnostics", {}).get("drawdown_pct", 0.0)),
+                int(float(computed.get("diagnostics", {}).get("idle_time_sec", 0.0))),
+                float(computed.get("diagnostics", {}).get("win_rate", 0.5)),
+            )
+
     def _apply_velocity_policy(self, metrics: Dict[str, Any], nudges: Dict[str, Any]):
         """
         VelocityPolicy: Run-rate < Target -> Loosen constraints to encourage trading.
@@ -312,6 +488,9 @@ class PolicyManager:
             # Apply to MetaController
             if hasattr(meta_controller, "set_active_policy_nudges"):
                 meta_controller.set_active_policy_nudges(nudges)
+
+            # Feed dynamic confidence control into shared dynamic config.
+            await self._apply_dynamic_tradeability_policy(meta_controller, metrics, mode=mode, nudges=nudges)
                 
             # Log significant nudges
             if any(abs(v) > 0.001 if isinstance(v, (int, float)) else False for v in nudges.values()):
@@ -531,6 +710,42 @@ class PolicyManager:
                         await shared_state.mark_accumulating(symbol, position_qty, notional)
                     except Exception as e:
                         self.logger.debug(f"[INVARIANT:DustGuard] Failed to record accumulating: {e}")
+
+                # Dead-loop breaker:
+                # Ultra-small residuals (below permanent dust threshold) cannot
+                # economically recover through repeated liquidation attempts.
+                # Retire them once so they stop cycling in SELL suppression loops.
+                try:
+                    auto_retire_raw = getattr(
+                        self.config, "DUST_GUARD_AUTO_RETIRE_BELOW_PERMANENT", True
+                    )
+                    auto_retire = (
+                        auto_retire_raw.strip().lower() in {"1", "true", "yes", "on"}
+                        if isinstance(auto_retire_raw, str)
+                        else bool(auto_retire_raw)
+                    )
+                    permanent_floor = float(
+                        getattr(self.config, "PERMANENT_DUST_USDT_THRESHOLD", 1.0) or 1.0
+                    )
+                    if (
+                        auto_retire
+                        and shared_state is not None
+                        and 0.0 < notional <= permanent_floor
+                        and hasattr(shared_state, "mark_as_permanent_dust")
+                    ):
+                        shared_state.mark_as_permanent_dust(symbol)
+                        if hasattr(shared_state, "dust_unhealable"):
+                            shared_state.dust_unhealable = getattr(shared_state, "dust_unhealable", {})
+                            shared_state.dust_unhealable[str(symbol).upper()] = "UNHEALABLE_LT_MIN_NOTIONAL"
+                        self.logger.info(
+                            "[INVARIANT:DustGuard:RETIRE] %s notional=%.4f <= permanent_floor=%.4f "
+                            "→ marked as PERMANENT_DUST to stop repeat retries.",
+                            symbol,
+                            notional,
+                            permanent_floor,
+                        )
+                except Exception:
+                    self.logger.debug("[INVARIANT:DustGuard] Auto-retire path failed for %s", symbol, exc_info=True)
                 
                 return False  # ❌ BLOCK: Cannot emit TradeIntent
             

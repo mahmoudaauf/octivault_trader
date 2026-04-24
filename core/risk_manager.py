@@ -959,14 +959,43 @@ class RiskManager:
         raise SystemExit(f"Risk limit breached: {reason}")
 
     async def _safe_health(self, component: str, status: str, detail: str):
+        # Prefer canonical component-status APIs first.
         with contextlib.suppress(Exception):
-            await self.shared_state.update_system_health(component, status, detail)
+            upd = getattr(self.shared_state, "update_component_status", None) or getattr(
+                self.shared_state, "set_component_status", None
+            )
+            if callable(upd):
+                res = upd(component, status, detail)
+                if inspect.isawaitable(res):
+                    await res
+
+        # Backward-compatible fallback for older update_system_health signatures.
+        with contextlib.suppress(Exception):
+            uh = getattr(self.shared_state, "update_system_health", None)
+            if callable(uh):
+                try:
+                    res = uh(component=component, status=status, message=detail)
+                except TypeError:
+                    try:
+                        res = uh(component=component, status=status, detail=detail)
+                    except TypeError:
+                        res = uh(component, status, detail)
+                if inspect.isawaitable(res):
+                    await res
+
         with contextlib.suppress(Exception):
             ComponentStatusLogger.log_status(component, status, detail)
 
     async def _safe_timestamp(self, component: str):
         with contextlib.suppress(Exception):
-            await self.shared_state.update_timestamp(component)
+            upd_ts = getattr(self.shared_state, "update_timestamp", None)
+            if callable(upd_ts):
+                res = upd_ts(component)
+                if inspect.isawaitable(res):
+                    await res
+            else:
+                # Fallback heartbeat update when explicit timestamp API is unavailable.
+                await self._safe_health(component, "Healthy", "Heartbeat ping")
         with contextlib.suppress(Exception):
             ComponentStatusLogger.log_status(component, "Ping", "Timestamp updated")
 

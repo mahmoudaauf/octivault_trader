@@ -2,6 +2,7 @@
 import logging
 import os
 import time
+import platform
 import numpy as np
 from typing import Any, Dict, Optional, Union
 from pathlib import Path
@@ -11,11 +12,16 @@ try:
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
     from tensorflow.keras.optimizers import Adam
+    try:
+        from tensorflow.keras.optimizers.legacy import Adam as LegacyAdam
+    except Exception:
+        LegacyAdam = None
     from tensorflow.keras.callbacks import EarlyStopping, Callback
 except ImportError:
     tf = None
     EarlyStopping = None
     Callback = object
+    LegacyAdam = None
 
 try:
     import pandas as pd
@@ -94,6 +100,31 @@ class ModelTrainer:
         if tf is None:
             self.logger.warning("TensorFlow not available. Training will be disabled.")
 
+    def _build_optimizer(self):
+        """
+        Build optimizer with a sensible Apple Silicon default.
+        On M-series macOS, legacy Adam is materially faster than v2 optimizer.
+        Override with ML_TRAIN_USE_LEGACY_ADAM=true/false (default: auto).
+        """
+        use_legacy = False
+        if LegacyAdam is not None:
+            pref = str(os.getenv("ML_TRAIN_USE_LEGACY_ADAM", "auto") or "auto").strip().lower()
+            if pref in {"1", "true", "yes", "on"}:
+                use_legacy = True
+            elif pref in {"0", "false", "no", "off"}:
+                use_legacy = False
+            else:
+                is_apple_arm = (
+                    platform.system().lower() == "darwin"
+                    and platform.machine().lower() in {"arm64", "aarch64"}
+                )
+                use_legacy = bool(is_apple_arm)
+
+        if use_legacy:
+            self.logger.info("Using legacy Adam optimizer for improved Apple Silicon training performance.")
+            return LegacyAdam(learning_rate=self.learning_rate, clipnorm=1.0)
+        return Adam(learning_rate=self.learning_rate, clipnorm=1.0)
+
     def _build_model(self, state_shape):
         if tf is None: return None
         
@@ -123,7 +154,7 @@ class ModelTrainer:
         model = Sequential(layers)
         model.compile(
             loss='binary_crossentropy',
-            optimizer=Adam(learning_rate=self.learning_rate, clipnorm=1.0),
+            optimizer=self._build_optimizer(),
             metrics=['accuracy'],
         )
         return model

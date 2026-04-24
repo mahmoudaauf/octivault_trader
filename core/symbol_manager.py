@@ -1126,12 +1126,23 @@ class SymbolManager:
         return max(0, int(cap))
 
     async def _get_symbols_snapshot(self, *, force: bool = False) -> Dict[str, Any]:
-        if not self.shared_state or not hasattr(self.shared_state, "get_symbols_snapshot"):
+        if not self.shared_state:
             return {}
         now = self._now_mono()
         if not force and self._snapshot_symbols_cache and (now - self._snapshot_ts) < self._snapshot_ttl:
             return self._snapshot_symbols_cache
-        snap = self.shared_state.get_symbols_snapshot()
+        
+        # Try multiple methods to get symbols snapshot
+        snap = None
+        if hasattr(self.shared_state, "get_symbols_snapshot"):
+            snap = self.shared_state.get_symbols_snapshot()
+        elif hasattr(self.shared_state, "get_accepted_symbols_snapshot"):
+            snap = self.shared_state.get_accepted_symbols_snapshot()
+        elif hasattr(self.shared_state, "get_accepted_symbols"):
+            snap = self.shared_state.get_accepted_symbols()
+        else:
+            snap = getattr(self.shared_state, "accepted_symbols", {})
+        
         # support both sync/async
         snap = await snap if asyncio.iscoroutine(snap) else snap
         self._snapshot_symbols_cache = dict(snap or {})

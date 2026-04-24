@@ -537,6 +537,71 @@ class PositionMergerEnhanced:
         
         return total_notional / total_quantity
     
+    async def _execute_merge_consolidation(self, proposal: MergeProposal) -> bool:
+        """
+        Execute the merge by consolidating positions.
+        
+        Process:
+        1. Sell source positions at market price
+        2. Buy consolidated position
+        3. Update position records
+        4. Track execution timestamp
+        
+        Args:
+            proposal: Merge proposal to execute
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if not self.execution_manager:
+                self.logger.error("[PositionMergerEnhanced] No execution manager available")
+                return False
+            
+            symbol = proposal.symbol
+            
+            # Step 1: Liquidate source positions
+            self.logger.debug(f"[PositionMergerEnhanced] Liquidating {len(proposal.source_positions)} source positions")
+            for src_pos in proposal.source_positions:
+                try:
+                    # Sell at market price
+                    result = await self.execution_manager.submit_order(
+                        symbol=src_pos.symbol,
+                        side="SELL",
+                        order_type="MARKET",
+                        quantity=src_pos.quantity,
+                        client_order_id=f"merge_liquidate_{src_pos.symbol}_{int(time.time())}"
+                    )
+                    if not result:
+                        self.logger.warning(f"[PositionMergerEnhanced] Failed to liquidate {src_pos.symbol}")
+                except Exception as e:
+                    self.logger.error(f"[PositionMergerEnhanced] Error liquidating {src_pos.symbol}: {e}")
+            
+            # Step 2: Execute consolidated buy order
+            self.logger.debug(f"[PositionMergerEnhanced] Buying consolidated position: {symbol} x {proposal.total_quantity}")
+            try:
+                result = await self.execution_manager.submit_order(
+                    symbol=symbol,
+                    side="BUY",
+                    order_type="MARKET",
+                    quantity=proposal.total_quantity,
+                    client_order_id=f"merge_buy_{symbol}_{int(time.time())}"
+                )
+                if not result:
+                    self.logger.error(f"[PositionMergerEnhanced] Failed to buy consolidated position")
+                    return False
+            except Exception as e:
+                self.logger.error(f"[PositionMergerEnhanced] Error buying consolidated position: {e}")
+                return False
+            
+            self.logger.info(f"[PositionMergerEnhanced] Successfully executed merge for {symbol}: "
+                           f"consolidated {len(proposal.source_positions)} positions")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"[PositionMergerEnhanced] Error executing merge consolidation: {e}", exc_info=True)
+            return False
+    
     async def execute_merge(self, proposal: MergeProposal) -> bool:
         """
         Execute a merge operation.
@@ -555,23 +620,24 @@ class PositionMergerEnhanced:
             async with self._lock:
                 proposal.merge_status = MergeStatus.EXECUTING
                 
-                # TODO: Implement actual merge execution
-                # This would involve:
-                # 1. Placing sell orders for source positions at market price
-                # 2. Placing single buy order for consolidated position
-                # 3. Updating position records
-                # 4. Tracking execution timestamp
+                # Execute merge by consolidating positions
+                execution_success = await self._execute_merge_consolidation(proposal)
                 
-                proposal.merge_status = MergeStatus.COMPLETED
-                proposal.execution_timestamp = time.time()
-                
-                # Update metrics
-                self.metrics.total_merges_completed += 1
-                self.metrics.total_positions_consolidated += len(proposal.source_positions)
-                self.metrics.total_quantity_consolidated += proposal.total_quantity
-                self.metrics.total_cost_savings += proposal.estimated_cost_savings
-                self.metrics.total_fee_savings += proposal.estimated_fee_savings
-                self.metrics.last_merge_timestamp = time.time()
+                if execution_success:
+                    proposal.merge_status = MergeStatus.COMPLETED
+                    proposal.execution_timestamp = time.time()
+                    
+                    # Update metrics
+                    self.metrics.total_merges_completed += 1
+                    self.metrics.total_positions_consolidated += len(proposal.source_positions)
+                    self.metrics.total_quantity_consolidated += proposal.total_quantity
+                    self.metrics.total_cost_savings += proposal.estimated_cost_savings
+                    self.metrics.total_fee_savings += proposal.estimated_fee_savings
+                    self.metrics.last_merge_timestamp = time.time()
+                else:
+                    proposal.merge_status = MergeStatus.FAILED
+                    self.logger.error(f"[PositionMergerEnhanced] Merge execution failed for {proposal.symbol}")
+                    return False
                 
                 # Track in history
                 self.merge_history.append(proposal)

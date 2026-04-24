@@ -24,7 +24,7 @@ class PnLCalculator:
         logger.info("PnLCalculator initialized.")
 
         # Rolling realized window cache baseline
-        self._last_realized_seen = float(getattr(self.shared_state, "realized_pnl", 0.0))
+        self._last_realized_seen = float(self._read_realized_pnl_total())
         
         # Phase 5: Price cache from WebSocket events
         self._price_cache: Dict[str, float] = {}
@@ -64,6 +64,19 @@ class PnLCalculator:
     def _is_open(trade: Dict[str, Any]) -> bool:
         status = (str(trade.get("status") or trade.get("trade_status") or "")).upper()
         return status in OPEN_STATUSES
+
+    def _read_realized_pnl_total(self) -> float:
+        """
+        Canonical realized PnL accessor.
+        SharedState stores authoritative realized PnL in metrics["realized_pnl"].
+        """
+        try:
+            metrics = getattr(self.shared_state, "metrics", {}) or {}
+            if isinstance(metrics, dict):
+                return float(metrics.get("realized_pnl", 0.0) or 0.0)
+        except Exception:
+            pass
+        return float(getattr(self.shared_state, "realized_pnl", 0.0) or 0.0)
 
     async def _get_active_trades_snapshot(self) -> Dict[str, Dict[str, Any]]:
         """
@@ -302,7 +315,7 @@ class PnLCalculator:
             else:
                 total_value = float(getattr(self.shared_state, "total_value", 0.0))
                 unrealized_pnl = float(getattr(self.shared_state, "unrealized_pnl", 0.0))
-            realized_pnl = float(getattr(self.shared_state, "realized_pnl", 0.0))
+            realized_pnl = float(self._read_realized_pnl_total())
             await self._maybe_call(
                 self.shared_state, "update_system_health",
                 component="PnLCalculator",
@@ -328,7 +341,7 @@ class PnLCalculator:
 
         # 2) rolling 60m realized PnL feed (append deltas)
         now = time.time()
-        cur_realized = float(getattr(self.shared_state, "realized_pnl", 0.0))
+        cur_realized = float(self._read_realized_pnl_total())
         delta = cur_realized - self._last_realized_seen
         self._last_realized_seen = cur_realized
 
@@ -376,7 +389,7 @@ class PnLCalculator:
                 try:
                     snapshot = {
                         "total_value": float(getattr(self.shared_state, "total_value", 0.0)),
-                        "realized_pnl": float(getattr(self.shared_state, "realized_pnl", 0.0)),
+                        "realized_pnl": float(self._read_realized_pnl_total()),
                         "unrealized_pnl": float(getattr(self.shared_state, "unrealized_pnl", 0.0)),
                         "total_equity": float(getattr(self.shared_state, "total_equity", 0.0)),
                         "symbol_updated": symbol,
@@ -522,7 +535,7 @@ class PnLCalculator:
                 try:
                     snapshot = {
                         "total_value": float(getattr(self.shared_state, "total_value", 0.0)),
-                        "realized_pnl": float(getattr(self.shared_state, "realized_pnl", 0.0)),
+                        "realized_pnl": float(self._read_realized_pnl_total()),
                         "unrealized_pnl": float(getattr(self.shared_state, "unrealized_pnl", 0.0)),
                         "total_equity": float(getattr(self.shared_state, "total_equity", 0.0)),
                         "ts": time.time(),

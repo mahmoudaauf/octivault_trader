@@ -200,20 +200,20 @@ def get_regime_confidence_floor(regime: str) -> float:
     
     floors = {
         # Trending: lower floor (momentum helps us)
-        "trend": 0.50,
-        "uptrend": 0.50,
-        "downtrend": 0.50,
+        "trend": 0.55,
+        "uptrend": 0.55,
+        "downtrend": 0.55,
         
-        # Neutral/Normal: standard
-        "normal": 0.55,
-        "neutral": 0.55,
+        # Neutral/Normal: standard (RAISED to 0.60 to match emission threshold)
+        "normal": 0.60,
+        "neutral": 0.60,
         
-        # High volatility: moderate
-        "high_vol": 0.60,
-        "high": 0.60,
-        "volatile": 0.60,
+        # High volatility: moderate (RAISED to 0.62)
+        "high_vol": 0.62,
+        "high": 0.62,
+        "volatile": 0.62,
         
-        # Bear: defensive
+        # Bear: defensive (RAISED to 0.65)
         "bear": 0.65,
         "bearish": 0.65,
         
@@ -229,7 +229,7 @@ def get_regime_confidence_floor(regime: str) -> float:
         "consolidating": 0.75,
     }
     
-    return floors.get(regime_norm, 0.55)
+    return floors.get(regime_norm, 0.60)
 
 
 def compute_heuristic_confidence(

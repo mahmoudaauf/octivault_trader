@@ -1,6 +1,7 @@
 # core/health.py
 
 import logging
+import time
 from datetime import datetime
 
 logger = logging.getLogger("Health")
@@ -9,11 +10,11 @@ async def update_health(shared_state, component_name, status, detail=""):
     """
     Report health status of a component to the shared state.
     """
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = time.time()  # Use float timestamp, not ISO string
     try:
         if hasattr(shared_state, "set_component_status"):
             await shared_state.set_component_status(
-                component_name=component_name,
+                component=component_name,
                 status=status,
                 detail=detail,
                 timestamp=timestamp

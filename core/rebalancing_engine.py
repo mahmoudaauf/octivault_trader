@@ -596,6 +596,59 @@ class RebalancingEngine:
         else:
             plan.rebalance_status = RebalanceStatus.REJECTED
     
+    async def _execute_rebalancing_orders(self, plan: RebalancePlan) -> bool:
+        """
+        Execute rebalancing orders via the execution manager.
+        
+        This implements the order submission, tracking, and verification.
+        
+        Args:
+            plan: Rebalance plan with orders to execute
+            
+        Returns:
+            bool: True if execution succeeded, False otherwise
+        """
+        try:
+            if not self.execution_manager:
+                self.logger.error("[RebalancingEngine] No execution manager available")
+                return False
+            
+            if not plan.rebalance_orders:
+                self.logger.warning(f"[RebalancingEngine] No orders in plan {plan.plan_id}")
+                return True  # Empty plan is technically successful
+            
+            # Submit orders to the execution manager
+            submitted_orders = []
+            for order in plan.rebalance_orders:
+                try:
+                    # Use execution manager to submit order
+                    result = await self.execution_manager.submit_order(
+                        symbol=order.symbol,
+                        side=order.side,
+                        order_type=order.order_type or "MARKET",
+                        quantity=order.quantity,
+                        price=order.price,
+                        client_order_id=order.order_id
+                    )
+                    
+                    if result:
+                        submitted_orders.append(order.order_id)
+                        self.logger.debug(f"[RebalancingEngine] Submitted order {order.order_id}: {order.symbol} {order.side}")
+                    else:
+                        self.logger.warning(f"[RebalancingEngine] Failed to submit order {order.order_id}")
+                        return False
+                        
+                except Exception as e:
+                    self.logger.error(f"[RebalancingEngine] Error submitting order {order.order_id}: {e}")
+                    return False
+            
+            self.logger.info(f"[RebalancingEngine] Successfully submitted {len(submitted_orders)} orders for plan {plan.plan_id}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"[RebalancingEngine] Error executing rebalancing orders: {e}", exc_info=True)
+            return False
+    
     async def execute_rebalance(self, plan: RebalancePlan) -> bool:
         """
         Execute rebalance plan.
@@ -614,25 +667,27 @@ class RebalancingEngine:
             async with self._lock:
                 plan.rebalance_status = RebalanceStatus.EXECUTING
                 
-                # TODO: Implement actual execution
-                # This would involve:
-                # 1. Submitting orders to MetaController or ExecutionManager
-                # 2. Tracking execution status
-                # 3. Verifying fills
+                # Execute rebalancing orders
+                execution_success = await self._execute_rebalancing_orders(plan)
                 
-                plan.rebalance_status = RebalanceStatus.COMPLETED
-                plan.execution_timestamp = time.time()
-                
-                # Update metrics
-                self.metrics.total_rebalances += 1
-                self.metrics.successful_rebalances += 1
-                self.metrics.last_rebalance_timestamp = time.time()
-                self.metrics.total_fee_cost += plan.estimated_fee_cost
-                
-                strategy_key = plan.strategy.value
-                self.metrics.rebalances_by_strategy[strategy_key] = (
-                    self.metrics.rebalances_by_strategy.get(strategy_key, 0) + 1
-                )
+                if execution_success:
+                    plan.rebalance_status = RebalanceStatus.COMPLETED
+                    plan.execution_timestamp = time.time()
+                    
+                    # Update metrics
+                    self.metrics.total_rebalances += 1
+                    self.metrics.successful_rebalances += 1
+                    self.metrics.last_rebalance_timestamp = time.time()
+                    self.metrics.total_fee_cost += plan.estimated_fee_cost
+                    
+                    strategy_key = plan.strategy.value
+                    self.metrics.rebalances_by_strategy[strategy_key] = (
+                        self.metrics.rebalances_by_strategy.get(strategy_key, 0) + 1
+                    )
+                else:
+                    plan.rebalance_status = RebalanceStatus.FAILED
+                    self.logger.error(f"[RebalancingEngine] Rebalance execution failed: {plan.plan_id}")
+                    return False
                 
                 trigger_key = plan.trigger.value
                 self.metrics.rebalances_by_trigger[trigger_key] = (

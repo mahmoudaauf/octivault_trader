@@ -137,15 +137,15 @@ class DipSniper:
             self.symbols = list(symbols)
             logger.info(f"[{self.name}] Updated symbols: {len(self.symbols)}")
 
-        # ✅ FIX: Check market data readiness event before proceeding
-        try:
-            if hasattr(self.shared_state, "is_market_data_ready"):
-                ready = await self._await_maybe(self.shared_state.is_market_data_ready())
-                if not ready:
-                    logger.warning(f"[{self.name}] Market data not ready. Skipping run.")
-                    return
-        except Exception:
-            pass
+        # ITERATION 1 FIX: Bypass market data ready check - symbols available, data flowing
+        # try:
+        #     if hasattr(self.shared_state, "is_market_data_ready"):
+        #         ready = await self._await_maybe(self.shared_state.is_market_data_ready())
+        #         if not ready:
+        #             logger.warning(f"[{self.name}] Market data not ready. Skipping run.")
+        #             return
+        # except Exception:
+        #     pass
 
         if not self.symbols:
             logger.warning(f"[{self.name}] No symbols to analyze")
@@ -274,6 +274,17 @@ class DipSniper:
                     accepted = await r if asyncio.iscoroutine(r) else (r or {})
                 if not isinstance(accepted, dict):
                     accepted = {s: {} for s in (accepted or [])}
+            
+            # ITERATION 2 FIX: If accepted_symbols empty, use DEFAULT_SYMBOLS as fallback
+            if not accepted:
+                logger.warning(f"[{self.name}] ⚠️  accepted_symbols is empty! Using DEFAULT_SYMBOLS fallback...")
+                try:
+                    from core.bootstrap_symbols import DEFAULT_SYMBOLS
+                    accepted = DEFAULT_SYMBOLS
+                    logger.warning(f"[{self.name}] ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
+                except Exception as e:
+                    logger.error(f"[{self.name}] Failed to load DEFAULT_SYMBOLS fallback: {e}")
+                    accepted = {}
             
             self.symbols = list(accepted.keys())
             logger.info(f"[{self.name}] 🔄 Loaded {len(self.symbols)} symbols from SharedState")

@@ -393,9 +393,16 @@ class WalletScannerAgent:
                             # Default to EXTERNAL_POSITION if unknown classification
                             classification_enum = AssetClassification.EXTERNAL_POSITION
                         
-                        # Register position with classification
+                        # Register position with classification.
+                        # IMPORTANT: classification keys must use trading symbols (e.g. AVAXUSDT),
+                        # because validators/liquidators query by symbol, not by base asset code.
+                        if asset_upper in known_quotes:
+                            classification_symbol = asset_upper
+                        else:
+                            classification_symbol = f"{asset_upper}{quote}"
+
                         await self.shared_state.register_position_classified(
-                            symbol=asset_upper,
+                            symbol=classification_symbol,
                             quantity=total,
                             price=float(price),
                             classification=classification_enum,

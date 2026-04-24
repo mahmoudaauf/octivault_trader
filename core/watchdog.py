@@ -101,6 +101,19 @@ class Watchdog:
         self._stop_event = asyncio.Event()
         self._task = None
 
+        # Centralized AppContext attribute mapping for component probes/wiring checks.
+        self._component_attr_map = {
+            "MarketDataFeed": "market_data_feed",
+            "ExecutionManager": "execution_manager",
+            "MetaController": "meta_controller",
+            "AgentManager": "agent_manager",
+            "RiskManager": "risk_manager",
+            "PnLCalculator": "pnl_calculator",
+            "PerformanceEvaluator": "performance_evaluator",
+            "TPSLEngine": "tp_sl_engine",
+            "Heartbeat": "heartbeat",
+        }
+
         # Allow override from config; include both TPSLEngine spellings for safety
         default_components = [
             "MarketDataFeed",
@@ -122,6 +135,21 @@ class Watchdog:
             self.monitored_components = comps or list(default_components)
         else:
             self.monitored_components = list(default_components)
+
+        # Required vs optional components:
+        # required components can degrade global health; optional components only warn.
+        # Keep default required set narrow to avoid false global degradation from
+        # auxiliary components that may initialize/report asynchronously.
+        default_required = ["ExecutionManager", "MetaController"]
+        required_cfg = getattr(config, "WATCHDOG_REQUIRED_COMPONENTS", None)
+        if isinstance(required_cfg, str):
+            req = {c.strip() for c in required_cfg.split(",") if c and c.strip()}
+            self.required_components = req or set(default_required)
+        elif isinstance(required_cfg, (list, tuple, set)):
+            req = {str(c).strip() for c in required_cfg if str(c).strip()}
+            self.required_components = req or set(default_required)
+        else:
+            self.required_components = set(default_required)
 
         # Track last time a component was confirmed healthy
         self.last_healthy_report: Dict[str, float] = {}
@@ -250,21 +278,59 @@ class Watchdog:
         app = getattr(self, "app", None)
         if app is None:
             return None
-        attr_map = {
-            "MarketDataFeed": "market_data_feed",
-            "ExecutionManager": "execution_manager",
-            "MetaController": "meta_controller",
-            "AgentManager": "agent_manager",
-            "RiskManager": "risk_manager",
-            "PnLCalculator": "pnl_calculator",
-            "PerformanceEvaluator": "performance_evaluator",
-            "TPSLEngine": "tp_sl_engine",
-            "Heartbeat": "heartbeat",
-        }
-        attr_name = attr_map.get(component_name)
+        attr_name = self._component_attr_map.get(component_name)
         if not attr_name:
             return None
         return getattr(app, attr_name, None) is not None
+
+    def _is_required_component(self, component_name: str) -> bool:
+        """Whether this component should influence overall watchdog degradation."""
+        try:
+            return str(component_name or "") in set(self.required_components or set())
+        except Exception:
+            return True
+
+    def _get_component_instance(self, component_name: str) -> Any:
+        """Best-effort AppContext component lookup."""
+        app = getattr(self, "app", None)
+        if app is None:
+            return None
+        attr = self._component_attr_map.get(component_name)
+        if not attr:
+            return None
+        return getattr(app, attr, None)
+
+    async def _probe_component_health(self, component_name: str) -> bool:
+        """
+        Try a direct health() probe when status timestamps are missing/stale.
+        If healthy, refresh SharedState status and return True.
+        """
+        inst = self._get_component_instance(component_name)
+        if inst is None:
+            return False
+
+        health_fn = getattr(inst, "health", None)
+        if not callable(health_fn):
+            return False
+
+        try:
+            snap = health_fn()
+            if inspect.isawaitable(snap):
+                snap = await snap
+            if not isinstance(snap, dict):
+                return False
+            st = str(snap.get("status", "") or "")
+            detail = str(snap.get("detail", "") or snap.get("message", "") or "")
+            if _is_healthy(st):
+                await self._safe_update_component_status(
+                    component_name,
+                    st or "Operational",
+                    detail or "probed healthy via health()",
+                )
+                return True
+        except Exception:
+            logger.debug("Watchdog health probe failed for %s", component_name, exc_info=True)
+        return False
 
     async def _safe_update_component_status(self, comp: str, status: str, detail: str):
         """
@@ -367,9 +433,13 @@ class Watchdog:
 
         # Case 1: never reported
         if last_ts == 0.0:
+            if await self._probe_component_health(component_name):
+                return component_name, True, None
+
+            required = self._is_required_component(component_name)
             wired = self._is_component_wired(component_name)
             if wired is False:
-                if self._should_warn(component_name):
+                if required and self._should_warn(component_name):
                     logger.warning(
                         "🚨 Watchdog: '%s' is configured but component instance is not wired.",
                         component_name,
@@ -378,14 +448,24 @@ class Watchdog:
                         "Watchdog", "Warning",
                         f"'{component_name}' missing-component (not wired in AppContext)."
                     )
-                return component_name, False, "missing-component"
+                if required:
+                    return component_name, False, "missing-component"
+                if self._should_warn(component_name):
+                    logger.warning(
+                        "⚠️ Watchdog: optional '%s' is not wired; skipping degradation.",
+                        component_name,
+                    )
+                return component_name, True, None
+
             if self._should_warn(component_name):
                 logger.warning("🚨 Watchdog: '%s' has not reported any status yet.", component_name)
                 await self._safe_update_component_status(
                     "Watchdog", "Warning",
                     f"'{component_name}' status unknown / not yet reported."
                 )
-            return component_name, False, "no-report"
+            if required:
+                return component_name, False, "no-report"
+            return component_name, True, None
 
         # Case 2: current status string evaluation
         healthy_string = _is_healthy(status)
@@ -414,6 +494,17 @@ class Watchdog:
             self.last_healthy_report[component_name] = now
 
             if stale_s is not None and stale_s > self.tolerance_time_seconds:
+                if await self._probe_component_health(component_name):
+                    return component_name, True, None
+
+                if not self._is_required_component(component_name):
+                    if self._should_warn(component_name):
+                        logger.warning(
+                            "⚠️ Watchdog: optional '%s' is stale (%.1fs) — not degrading overall health.",
+                            component_name, stale_s
+                        )
+                    return component_name, True, None
+
                 if self._should_warn(component_name):
                     logger.warning(
                         "⚠️ Watchdog: '%s' marked '%s' but last report is %.1fs old (tolerating up to %.1fs).",
@@ -427,6 +518,16 @@ class Watchdog:
             return component_name, True, None
 
         # Non-healthy string → emit error and consider escalation
+        if not self._is_required_component(component_name):
+            if self._should_warn(component_name):
+                logger.warning(
+                    "⚠️ Watchdog: optional '%s' reported '%s' (detail=%s) — not degrading overall health.",
+                    component_name,
+                    status,
+                    detail,
+                )
+            return component_name, True, None
+
         logger.error("❌ Watchdog: '%s' reported '%s'. Detail: %s", component_name, status, detail)
         await self._safe_update_component_status("Watchdog", "Error", f"'{component_name}' reported {status}: {detail}")
 

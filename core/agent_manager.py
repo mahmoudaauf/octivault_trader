@@ -21,6 +21,16 @@ from datetime import datetime
 from core.component_status_logger import ComponentStatusLogger
 # HealthStatus import removed - not used after P9 refactor
 try:
+    from core.health import update_health
+except ImportError:
+    try:
+        from core.healthy import update_health
+    except ImportError:
+        async def update_health(shared_state, component_name, status, detail=""):
+            """Fallback stub for update_health"""
+            pass
+
+try:
     from core.model_manager import ModelManager
 except ImportError:
     ModelManager = None
@@ -105,10 +115,12 @@ class AgentManager:
     async def bootstrap_symbol_universe(self):
         """
         Run discovery agents ONCE to populate the initial symbol universe.
+        If discovery fails or returns no symbols, fallback to default symbols.
         This ensures strategy agents can access symbols when they call generate_signals().
         
         ✅ Fixes: SwingTradeHunter, TrendHunter, DipSniper 0 symbols issue
         ✅ Timing: Called during startup BEFORE strategy agents run
+        ✅ Fallback: Uses default symbols if discovery fails
         """
         self.logger.info("[Bootstrap] Populating symbol universe from discovery agents...")
         
@@ -116,30 +128,29 @@ class AgentManager:
         discovery_count = 0
         
         # Get discovery agents
-        discovery_agent_instances = [a for a in self.agents.values() if getattr(a, 'agent_type', None) == 'discovery']
+        discovery_agent_instances = self.get_discovery_agents()
         
         if not discovery_agent_instances:
             self.logger.debug("[Bootstrap] No discovery agents registered")
-            return
-        
-        # Run each discovery agent once
-        for agent in discovery_agent_instances:
-            agent_name = getattr(agent, 'name', agent.__class__.__name__)
-            if not hasattr(agent, 'run_once'):
-                self.logger.debug(f"[Bootstrap] Agent {agent_name} has no run_once() method")
-                continue
-            
-            try:
-                self.logger.info(f"[Bootstrap] Running discovery: {agent_name}")
-                result = agent.run_once()
-                if inspect.iscoroutine(result):
-                    await result
-                self.logger.info(f"[Bootstrap] ✅ {agent_name} completed discovery")
-                populated = True
-                discovery_count += 1
-            except Exception as e:
-                self.logger.warning(f"[Bootstrap] Discovery failed for {agent_name}: {e}", exc_info=True)
-                continue
+        else:
+            # Run each discovery agent once
+            for agent in discovery_agent_instances:
+                agent_name = getattr(agent, 'name', agent.__class__.__name__)
+                if not hasattr(agent, 'run_once'):
+                    self.logger.debug(f"[Bootstrap] Agent {agent_name} has no run_once() method")
+                    continue
+                
+                try:
+                    self.logger.info(f"[Bootstrap] Running discovery: {agent_name}")
+                    result = agent.run_once()
+                    if inspect.iscoroutine(result):
+                        await result
+                    self.logger.info(f"[Bootstrap] ✅ {agent_name} completed discovery")
+                    populated = True
+                    discovery_count += 1
+                except Exception as e:
+                    self.logger.warning(f"[Bootstrap] Discovery failed for {agent_name}: {e}", exc_info=True)
+                    continue
         
         # Verify symbols were populated
         try:
@@ -152,9 +163,26 @@ class AgentManager:
             else:
                 sym_count = len(list(syms or []))
             
-            self.logger.info(f"[Bootstrap] ✅ Symbol universe populated: {sym_count} symbols from {discovery_count} agents")
+            # If still empty, use fallback
+            if sym_count == 0:
+                self.logger.warning("[Bootstrap] ⚠️ Symbol universe is EMPTY after discovery! Applying fallback...")
+                try:
+                    from core.bootstrap_symbols import bootstrap_default_symbols
+                    result = await bootstrap_default_symbols(self.shared_state, self.logger)
+                    if result:
+                        syms = self.shared_state.get_accepted_symbols()
+                        if inspect.iscoroutine(syms):
+                            syms = await syms
+                        if isinstance(syms, dict):
+                            sym_count = len(syms)
+                        self.logger.info(f"[Bootstrap] ✅ Fallback: Seeded {sym_count} default symbols")
+                except Exception as e:
+                    self.logger.error(f"[Bootstrap] Fallback failed: {e}", exc_info=True)
+            else:
+                self.logger.info(f"[Bootstrap] ✅ Symbol universe populated: {sym_count} symbols from {discovery_count} agents")
         except Exception as e:
             self.logger.warning(f"[Bootstrap] Could not verify symbols: {e}")
+
     
     def __init__(
         self,
@@ -261,6 +289,270 @@ class AgentManager:
         self._last_optional_import_log_ts: Dict[str, float] = {}
         # Cached _MetaAdapter — stateless wrapper, safe to create once per meta_controller.
         self._meta_adapter: Optional[Any] = None
+        
+        # Watchdog periodic status reporting
+        self._signal_counter = 0
+        self._last_watchdog_report_ts = time.time()
+        self._watchdog_report_interval_s = 30.0  # Report to watchdog every 30 seconds
+
+    def _cfg(self, key: str, default: Any = None) -> Any:
+        """Config getter supporting dict and attribute-style configs."""
+        if isinstance(self.config, dict):
+            return self.config.get(key, default)
+        return getattr(self.config, key, default)
+
+    def _resolve_intent_planned_quote(self, intent: Dict[str, Any]) -> float:
+        """Best-effort planned quote resolver for pre-publish viability checks."""
+        if not isinstance(intent, dict):
+            return 0.0
+        for key in ("quote_hint", "planned_quote", "quote", "_planned_quote", "qty_quote"):
+            try:
+                val = float(intent.get(key, 0.0) or 0.0)
+                if val > 0.0:
+                    return val
+            except Exception:
+                continue
+        fallback = float(
+            self._cfg(
+                "DEFAULT_PLANNED_QUOTE",
+                self._cfg("MIN_ENTRY_USDT", self._cfg("MIN_ENTRY_QUOTE_USDT", 0.0)),
+            )
+            or 0.0
+        )
+        return max(0.0, fallback)
+
+    def _passes_prepublish_viability_gate(self, intent: Dict[str, Any]) -> tuple[bool, str]:
+        """
+        Manager-side pre-publish viability gate.
+        Reuses MetaController's existing pretrade effect gate instead of duplicating logic.
+        """
+        if not bool(self._cfg("AGENTMGR_PREPUBLISH_PRETRADE_GUARD_ENABLED", True)):
+            return True, "disabled"
+        if not isinstance(intent, dict):
+            return False, "invalid_intent_payload"
+        if self.meta_controller is None:
+            return True, "meta_unavailable"
+
+        gate_fn = getattr(self.meta_controller, "_passes_pretrade_effect_gate", None)
+        if not callable(gate_fn):
+            return True, "meta_gate_unavailable"
+
+        side = str(intent.get("side") or intent.get("action") or "").upper().strip()
+        if side not in {"BUY", "SELL"}:
+            return False, "invalid_side"
+        if side == "SELL" and not bool(self._cfg("AGENTMGR_PREPUBLISH_GUARD_SELL", False)):
+            return True, "sell_bypass"
+
+        symbol = str(intent.get("symbol") or "").replace("/", "").upper().strip()
+        if not symbol:
+            return False, "missing_symbol"
+
+        planned_quote = float(self._resolve_intent_planned_quote(intent))
+        if planned_quote <= 0.0:
+            return False, "invalid_quote"
+
+        signal: Dict[str, Any] = {
+            "action": side,
+            "confidence": float(intent.get("confidence", 0.0) or 0.0),
+            "reason": str(intent.get("rationale") or intent.get("reason") or ""),
+            "quote": planned_quote,
+            "quote_hint": planned_quote,
+        }
+
+        passthrough_keys = (
+            "_expected_move_pct",
+            "expected_move_pct",
+            "_regime",
+            "regime",
+            "_regime_scaling",
+            "_tradeability_hint",
+            "_break_even_prob",
+            "_required_conf",
+            "_atr_pct",
+            "atr_pct",
+            "edge",
+        )
+        for key in passthrough_keys:
+            if key in intent and intent.get(key) is not None:
+                signal[key] = intent.get(key)
+        if isinstance(intent.get("policy_context"), dict):
+            for key, value in intent["policy_context"].items():
+                signal.setdefault(key, value)
+
+        try:
+            ok, reason = gate_fn(
+                symbol=symbol,
+                signal=signal,
+                planned_quote=float(planned_quote),
+                side=side,
+            )
+            if ok:
+                return True, str(reason or "ok")
+
+            reason_s = str(reason or "pretrade_gate")
+            reason_u = reason_s.upper()
+            if (
+                side == "BUY"
+                and bool(self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_RELAX_ENABLED", True))
+                and reason_u in {
+                    "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD",
+                    "MICRO_BACKTEST_AVG_NET_BELOW_THRESHOLD",
+                    "MICRO_BACKTEST_INSUFFICIENT_SAMPLES",
+                    "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD",
+                    "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_AVG_NET_BELOW_THRESHOLD",
+                    "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_INSUFFICIENT_SAMPLES",
+                }
+            ):
+                bt_rejections = 0
+                try:
+                    rej_getter = getattr(self.shared_state, "get_rejection_count", None)
+                    if callable(rej_getter):
+                        bt_rejections += int(
+                            rej_getter(symbol, "BUY", "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD") or 0
+                        )
+                        bt_rejections += int(
+                            rej_getter(symbol, "BUY", "MICRO_BACKTEST_AVG_NET_BELOW_THRESHOLD") or 0
+                        )
+                        bt_rejections += int(
+                            rej_getter(symbol, "BUY", "MICRO_BACKTEST_INSUFFICIENT_SAMPLES") or 0
+                        )
+                        bt_rejections += int(
+                            rej_getter(
+                                symbol,
+                                "BUY",
+                                "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD",
+                            )
+                            or 0
+                        )
+                        bt_rejections += int(
+                            rej_getter(
+                                symbol,
+                                "BUY",
+                                "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_AVG_NET_BELOW_THRESHOLD",
+                            )
+                            or 0
+                        )
+                        bt_rejections += int(
+                            rej_getter(
+                                symbol,
+                                "BUY",
+                                "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_INSUFFICIENT_SAMPLES",
+                            )
+                            or 0
+                        )
+                except Exception:
+                    bt_rejections = 0
+
+                relax_trigger = int(
+                    self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_REJECTION_TRIGGER", 24) or 24
+                )
+                relax_step = int(
+                    self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_CONF_STEP_REJECTIONS", 12) or 12
+                )
+                conf_floor = float(
+                    self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_MIN_CONF_FLOOR", 0.60) or 0.60
+                )
+                conf_base = float(
+                    self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_MIN_CONF_BASE", 0.74) or 0.74
+                )
+                conf_step_decay = float(
+                    self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_MIN_CONF_DECAY_PER_STEP", 0.02) or 0.02
+                )
+                min_exp_move = float(
+                    self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_MIN_EXPECTED_MOVE_PCT", 0.0030) or 0.0030
+                )
+
+                confidence = max(0.0, min(1.0, float(signal.get("confidence", 0.0) or 0.0)))
+                exp_move = signal.get("_expected_move_pct", signal.get("expected_move_pct"))
+                exp_move_norm = 0.0
+                try:
+                    if exp_move is not None:
+                        exp_move_norm = float(exp_move)
+                        if abs(exp_move_norm) > 1.0:
+                            exp_move_norm = exp_move_norm / 100.0
+                except Exception:
+                    exp_move_norm = 0.0
+
+                if bt_rejections >= max(1, relax_trigger):
+                    extra = max(0, bt_rejections - relax_trigger)
+                    relief_steps = 1 + int(extra // max(1, relax_step))
+                    required_conf = max(conf_floor, conf_base - (conf_step_decay * relief_steps))
+                    required_conf = max(conf_floor, min(0.95, required_conf))
+                    if confidence >= required_conf and exp_move_norm >= min_exp_move:
+                        self.logger.warning(
+                            "[AgentManager:PrePublishGate:DeadlockRelief] Allowing %s BUY "
+                            "after bt_rejections=%d (reason=%s conf=%.2f req=%.2f exp_move=%.3f%% min=%.3f%%)",
+                            symbol,
+                            int(bt_rejections),
+                            reason_s,
+                            confidence,
+                            required_conf,
+                            exp_move_norm * 100.0,
+                            min_exp_move * 100.0,
+                        )
+                        return True, "deadlock_relief_override"
+
+            return False, reason_s
+        except Exception as exc:
+            self.logger.debug(
+                "[AgentManager:PrePublishGate] Meta pretrade gate error for %s %s: %s",
+                symbol,
+                side,
+                exc,
+                exc_info=True,
+            )
+            return True, "gate_error_allow"
+
+    async def _filter_intents_prepublish(self, intents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Filter BUY intents through pretrade viability before publishing to Meta/event bus."""
+        if not intents:
+            return []
+
+        filtered: List[Dict[str, Any]] = []
+        dropped = 0
+        for intent in intents:
+            ok, reason = self._passes_prepublish_viability_gate(intent)
+            if ok:
+                filtered.append(intent)
+                continue
+            dropped += 1
+            symbol = str(intent.get("symbol") or "").replace("/", "").upper()
+            side = str(intent.get("side") or intent.get("action") or "").upper()
+            self.logger.info(
+                "[AgentManager:PrePublishGate] Dropped intent %s %s agent=%s reason=%s",
+                symbol,
+                side,
+                intent.get("agent", "unknown"),
+                reason,
+            )
+            try:
+                rec = getattr(self.shared_state, "record_rejection", None)
+                if callable(rec) and symbol and side:
+                    rv = rec(symbol, side, str(reason or "prepublish_gate"), source="AgentManager")
+                    if _asyncio.iscoroutine(rv):
+                        await rv
+            except Exception:
+                pass
+
+        if dropped > 0:
+            self.logger.info(
+                "[AgentManager:PrePublishGate] Filtered intents: in=%d out=%d dropped=%d",
+                len(intents),
+                len(filtered),
+                dropped,
+            )
+        return filtered
+
+    async def _report_watchdog_status(self, status: str = "Operational", detail: str = ""):
+        """Report status to watchdog for health monitoring"""
+        try:
+            update_fn = getattr(self.shared_state, "update_component_status", None)
+            if update_fn:
+                result = update_fn("AgentManager", status, detail)
+                if _asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            pass  # Status reporting is non-critical
 
     # --- Meta signal adapter so all agents have a consistent API ---
     class _MetaAdapter:
@@ -508,6 +800,16 @@ class AgentManager:
 
     async def collect_and_forward_signals(self):
         """Single signal collection point - calls generate_signals() once per tick."""
+        # Periodic watchdog status reporting
+        self._signal_counter += 1
+        now_ts = time.time()
+        if (now_ts - self._last_watchdog_report_ts) >= self._watchdog_report_interval_s:
+            await self._report_watchdog_status(
+                "Operational",
+                f"Processed {self._signal_counter} signal batches"
+            )
+            self._last_watchdog_report_ts = now_ts
+        
         self.logger.debug("[AgentManager] Signal Collection Tick. SharedState ID: %d, Meta ID: %d", id(self.shared_state), id(self.meta_controller))
         batch = []
         strategy_agents = [
@@ -581,20 +883,28 @@ class AgentManager:
                 self.logger.warning("[%s] Signal generation failed: %s", name, e, exc_info=True)
 
         if batch:
-            await self.submit_trade_intents(batch)
-            self.logger.info("Submitted %d TradeIntents to Meta", len(batch))
+            publish_batch = await self._filter_intents_prepublish(batch)
+            if not publish_batch:
+                self.logger.info(
+                    "[AgentManager] All %d intents were filtered by pre-publish viability gate.",
+                    len(batch),
+                )
+                return
+
+            await self.submit_trade_intents(publish_batch)
+            self.logger.info("Submitted %d TradeIntents to Meta", len(publish_batch))
             
             # 🔥 CRITICAL DEBUG: Log submission
             self.logger.warning("[AgentManager:BATCH] Submitted batch of %d intents: %s", 
-                               len(batch),
-                               [f"{i.get('agent')}:{i.get('symbol')}" for i in batch])
+                               len(publish_batch),
+                               [f"{i.get('agent')}:{i.get('symbol')}" for i in publish_batch])
             
             # 🔥 CRITICAL FIX: DIRECT PATH TO METACONTROLLER
             # Don't wait for event bus drain - forward signals directly to MetaController
             # This ensures signals reach the signal_cache IMMEDIATELY
             if self.meta_controller:
                 direct_count = 0
-                for intent in batch:
+                for intent in publish_batch:
                     try:
                         symbol = intent.get("symbol")
                         agent = intent.get("agent", "AgentManager")
@@ -797,7 +1107,15 @@ class AgentManager:
                 registered += 1
 
             except Exception as e:
-                self.logger.warning(f"❌ Failed to register agent '{agent_name}': {str(e)}", exc_info=True)
+                # CRITICAL: Log full error details to diagnose registration failures
+                self.logger.critical(
+                    f"❌ REGISTRATION FAILED FOR '{agent_name}': {type(e).__name__}: {str(e)}",
+                    exc_info=True
+                )
+                # Also log simplified version for easier grep
+                import traceback
+                tb_lines = traceback.format_exc().split('\n')
+                self.logger.critical(f"[AGENT_REGISTRATION_FAILURE] {agent_name}: {tb_lines[-3] if len(tb_lines) > 2 else str(e)}")
                 failures += 1
 
         self.logger.info(f"✅ Final Registered Agents: {list(self.agents.keys())}")
@@ -904,20 +1222,54 @@ class AgentManager:
     def get_discovery_agents(self):
         """
         Returns a list of registered discovery agents.
-        Assumes discovery agents have an 'agent_type' attribute set to 'discovery'.
+        Merges both manual discovery registry and main agent registry to avoid
+        bootstrap/observability mismatches.
         """
-        return [
-            agent for agent in self.agents.values()
-            if getattr(agent, "agent_type", None) == "discovery"
-        ]
+        merged = []
+        seen_names = set()
+        seen_ids = set()
+        for bucket in (self.discovery_agents, list(self.agents.values())):
+            for agent in bucket:
+                if getattr(agent, "agent_type", None) != "discovery":
+                    continue
+                name = str(getattr(agent, "name", "") or "").strip()
+                if name and name in seen_names:
+                    continue
+                aid = id(agent)
+                if aid in seen_ids:
+                    continue
+                if name:
+                    seen_names.add(name)
+                seen_ids.add(aid)
+                merged.append(agent)
+        return merged
 
     def register_discovery_agent(self, agent):
         """
         Allows manual registration of discovery agents (used during Phase 3).
         This is used when you directly pass agent instances from AppContext.
         """
-        self.discovery_agents.append(agent)
-        self.logger.info(f"📥 Registered discovery agent: {agent.__class__.__name__}")
+        if not getattr(agent, "agent_type", None):
+            setattr(agent, "agent_type", "discovery")
+
+        if not hasattr(agent, "name") or not getattr(agent, "name", None):
+            setattr(agent, "name", agent.__class__.__name__)
+
+        existing_name_index = None
+        for idx, existing in enumerate(self.discovery_agents):
+            if str(getattr(existing, "name", "") or "") == str(agent.name):
+                existing_name_index = idx
+                break
+
+        if existing_name_index is None:
+            self.discovery_agents.append(agent)
+        else:
+            self.discovery_agents[existing_name_index] = agent
+
+        # Keep the canonical registry consistent so startup checks, bootstrap,
+        # and task launch logic see discovery agents too.
+        self.agents[agent.name] = agent
+        self.logger.info(f"📥 Registered discovery agent: {agent.__class__.__name__} ({agent.name})")
 
     async def run_discovery_agents(self):
         """
@@ -1044,6 +1396,21 @@ class AgentManager:
         # ISSUE 1 FIX: Do NOT call generate_signals here - collect_and_forward_signals does it
         # This tick prepares agents (symbol refresh, readiness checks) but doesn't execute them
         # Signal generation happens in collect_and_forward_signals() to avoid double execution
+        shared_wallet_mode_raw = getattr(self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True)
+        if isinstance(shared_wallet_mode_raw, str):
+            shared_wallet_mode = shared_wallet_mode_raw.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            shared_wallet_mode = bool(shared_wallet_mode_raw)
+        shared_wallet_spendable = 0.0
+        if shared_wallet_mode and hasattr(self.shared_state, "get_spendable_balance"):
+            try:
+                quote_asset = str(getattr(self.config, "QUOTE_ASSET", "USDT") or "USDT").upper()
+                spendable_res = self.shared_state.get_spendable_balance(quote_asset)
+                if inspect.isawaitable(spendable_res):
+                    spendable_res = await spendable_res
+                shared_wallet_spendable = float(spendable_res or 0.0)
+            except Exception as e:
+                self.logger.debug("[AgentManager] Failed to read shared spendable budget: %s", e)
         
         for name, agent_obj in self.agents.items():
             try:
@@ -1053,9 +1420,12 @@ class AgentManager:
 
                 # ARCHITECTURAL FIX: Budget gating moved to MetaController.
                 # Agents are prepared (symbols synced) regardless of budget to allow exits.
-                budget = 0.0
+                raw_budget = 0.0
                 if hasattr(self.shared_state, "get_authoritative_reservation"):
-                    budget = float(self.shared_state.get_authoritative_reservation(name))
+                    raw_budget = float(self.shared_state.get_authoritative_reservation(name))
+                budget = float(raw_budget)
+                if budget <= 0.0 and shared_wallet_mode and shared_wallet_spendable > 0.0:
+                    budget = float(shared_wallet_spendable)
 
                 # ISSUE 2: Throttled symbol visibility logging (once per minute)
                 now_t = time.time()
@@ -1064,7 +1434,16 @@ class AgentManager:
                 
                 if (now_t - last_log) > 60.0:
                     status = "Active" if budget > 0 else "Active (Exit-Only/ZeroBudget)"
-                    self.logger.info("[Agent:%s] %s with %d symbols", name, status, symbol_count)
+                    if raw_budget <= 0.0 < budget:
+                        self.logger.info(
+                            "[Agent:%s] %s with %d symbols (shared wallet fallback=%.2f)",
+                            name,
+                            status,
+                            symbol_count,
+                            budget,
+                        )
+                    else:
+                        self.logger.info("[Agent:%s] %s with %d symbols", name, status, symbol_count)
                     self._last_agent_log_t[name] = now_t
 
                 # ISSUE 3: Enforce strategy agent contract
@@ -1101,6 +1480,21 @@ class AgentManager:
             if hasattr(self.shared_state, "get_authoritative_reservation"):
                 budget = float(self.shared_state.get_authoritative_reservation(name))
                 if budget <= 0:
+                    shared_wallet_mode_raw = getattr(self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True)
+                    if isinstance(shared_wallet_mode_raw, str):
+                        shared_wallet_mode = shared_wallet_mode_raw.strip().lower() in {"1", "true", "yes", "on"}
+                    else:
+                        shared_wallet_mode = bool(shared_wallet_mode_raw)
+                    if shared_wallet_mode and hasattr(self.shared_state, "get_spendable_balance"):
+                        try:
+                            quote_asset = str(getattr(self.config, "QUOTE_ASSET", "USDT") or "USDT").upper()
+                            spendable = self.shared_state.get_spendable_balance(quote_asset)
+                            if inspect.isawaitable(spendable):
+                                spendable = await spendable
+                            if float(spendable or 0.0) > 0.0:
+                                return True
+                        except Exception as e:
+                            self.logger.debug("[Agent:%s] Shared wallet budget probe failed: %s", name, e)
                     self.logger.debug("[Agent:%s] Idle: No authoritative budget allocated.", name)
                     return False
             return True

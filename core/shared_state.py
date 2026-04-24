@@ -38,7 +38,7 @@ __version__ = "2.0.1"
 __component__ = "core.shared_state"
 __contract_id__ = "core:SharedState:v2.0.0"
 
-__all__ = ["SharedState", "SharedStateConfig", "HealthCode", "Component", "AssetClassification", "SharedStateError", "ErrorCode", "CircuitBreaker", "CircuitBreakerState", "PortfolioState", "BootstrapMetrics", "DustPosition", "DustRegistry", "MergeOperation", "MergeImpact", "PositionMerger", "TradeExecution", "TradingCoordinator", "OHLCVBar", "SellableLine"]
+__all__ = ["SharedState", "SharedStateConfig", "HealthCode", "Component", "AssetClassification", "DustClass", "SharedStateError", "ErrorCode", "CircuitBreaker", "CircuitBreakerState", "PortfolioState", "BootstrapMetrics", "DustPosition", "DustRegistry", "MergeOperation", "MergeImpact", "PositionMerger", "TradeExecution", "TradingCoordinator", "OHLCVBar", "SellableLine"]
 
 # ---- Decimal Precision ----
 getcontext().prec = 28
@@ -56,6 +56,16 @@ class PositionState(Enum):
     ACTIVE = "ACTIVE"
     DUST_LOCKED = "DUST_LOCKED"
     LIQUIDATING = "LIQUIDATING"
+
+class DustClass(Enum):
+    """
+    Formal dust lifecycle taxonomy used for portfolio hygiene policy.
+    """
+    TRADABLE = "TRADABLE"
+    NEAR_DUST = "NEAR_DUST"
+    DUST = "DUST"
+    RECOVERABLE_DUST = "RECOVERABLE_DUST"
+    PERMANENT_WRITE_DOWN_DUST = "PERMANENT_WRITE_DOWN_DUST"
 
 class ExecutionResult(Enum):
     FILLED = "FILLED"
@@ -194,13 +204,19 @@ class SharedStateConfig:
 
     # --- New runtime knobs (P9 QoL) ---
     quote_asset: str = "USDT"  # Canonical quote asset for all capital evaluation
-    quote_reserve_ratio: float = 0.10  # default reserve ratio for quote when computing spendable
+    quote_reserve_ratio: float = 0.20  # default reserve ratio for quote when computing spendable
     quote_min_reserve: float = 0.0     # hard floor for quote reserve
     auto_positions_from_balances: bool = True  # mirror wallet (non-quote) into positions
     dust_min_quote_usdt: float = 5.0   # minimum notional to treat as non-dust
     dust_liquidation_enabled: bool = True  # allow listing dust as sellable inventory
+    dust_reentry_override: bool = True  # allow dust positions to bypass re-entry lock
+    dust_near_ratio: float = 0.85  # 85%+ of tradable floor is near-dust (can become dust after partial exits)
+    dust_write_down_quote_usdt: float = 1.0  # permanent write-down floor for tiny residuals
+    dust_recoverable_age_hours: float = 4.0  # stale dust age threshold to classify as recoverable
     DUST_POSITION_QTY: float = 0.0001
     liq_queue_maxsize: int = 1000      # maximum size for liquidation queue
+    # 🔧 NEW: Guard to prevent opening new trades below significant floor unless explicitly allowed
+    allow_entry_below_significant_floor: bool = False  # False = guard enabled (blocks entries below floor)
 
     # --- Active symbols fallback behavior (helps agents like LiquidationAgent) ---
     active_symbols_fallback_from_positions: bool = True  # include currently held positions if accepted list is small/empty
@@ -1067,6 +1083,44 @@ class SharedState:
                 if hasattr(self.config, k):
                     setattr(self.config, k, v)
 
+        def _legacy_cfg(key: str, default: Any) -> Any:
+            try:
+                if isinstance(config, dict):
+                    return config.get(key, default)
+                if config is not None:
+                    return getattr(config, key, default)
+            except Exception:
+                pass
+            return default
+
+        # Runtime mirrors for legacy callsites that still read SharedState attributes directly.
+        self.quote_asset = str(getattr(self.config, "quote_asset", _legacy_cfg("QUOTE_ASSET", "USDT")) or "USDT").upper()
+        self.auto_positions_from_balances = bool(
+            getattr(self.config, "auto_positions_from_balances", _legacy_cfg("AUTO_POSITION_FROM_BALANCES", True))
+        )
+        self.dust_min_quote_usdt = float(
+            getattr(self.config, "dust_min_quote_usdt", _legacy_cfg("DUST_MIN_QUOTE_USDT", 5.0)) or 5.0
+        )
+        self.dust_liquidation_enabled = bool(
+            getattr(self.config, "dust_liquidation_enabled", _legacy_cfg("DUST_LIQUIDATION_ENABLED", True))
+        )
+        self.dust_reentry_override = bool(
+            getattr(self.config, "dust_reentry_override", _legacy_cfg("DUST_REENTRY_OVERRIDE", True))
+        )
+        self.allow_entry_below_significant_floor = bool(
+            getattr(
+                self.config,
+                "allow_entry_below_significant_floor",
+                _legacy_cfg("ALLOW_ENTRY_BELOW_SIGNIFICANT_FLOOR", False),
+            )
+        )
+        self.config.quote_asset = self.quote_asset
+        self.config.auto_positions_from_balances = self.auto_positions_from_balances
+        self.config.dust_min_quote_usdt = self.dust_min_quote_usdt
+        self.config.dust_liquidation_enabled = self.dust_liquidation_enabled
+        self.config.dust_reentry_override = self.dust_reentry_override
+        self.config.allow_entry_below_significant_floor = self.allow_entry_below_significant_floor
+
         # Database
         self._database_manager = database_manager
 
@@ -1109,9 +1163,23 @@ class SharedState:
             "total_holding_time_sec": 0.0, # Sum of holding times for completed trades
             "completed_trades_count": 0,  # Number of trades that have been closed
             "capital_utilization_pct": 0.0, # % of NAV currently in positions
+            # Capital-quality buckets (wealth engine): operating cash vs productive vs dead capital
+            "operating_cash_usdt": 0.0,
+            "operating_cash_spendable_usdt": 0.0,
+            "productive_inventory_usdt": 0.0,
+            "dead_capital_usdt": 0.0,
+            "capital_unclassified_usdt": 0.0,
+            "capital_bucket_nav_ref_usdt": 0.0,
+            "operating_cash_ratio": 0.0,
+            "productive_inventory_ratio": 0.0,
+            "dead_capital_ratio": 0.0,
+            # Alias requested by portfolio-quality dashboards.
+            "free_cash_ratio": 0.0,
+            "productive_capital_ratio": 0.0,
             "ops_plane_ready_at": 0.0,
             "dust_registry_size": 0,
             "dust_origin_breakdown": {},
+            "dust_class_breakdown": {},
             "policy_conflicts": {
                 "single_authority_vs_economic": 0,
                 "economic_vs_phase2_grace": 0,
@@ -1130,6 +1198,10 @@ class SharedState:
         self.total_equity_usdt = 0.0
         self.free_quote = 0.0
         self.invested_capital = 0.0
+        # Backward-compatible public mirrors for legacy readers.
+        self.realized_pnl = float(self.metrics.get("realized_pnl", 0.0) or 0.0)
+        self.unrealized_pnl = float(self.metrics.get("unrealized_pnl", 0.0) or 0.0)
+        self.total_value = float(self.metrics.get("nav", 0.0) or 0.0)
         
         # Phase 2: Persistent Bootstrap Metrics
         # Initialize persistent storage for bootstrap history
@@ -1560,37 +1632,65 @@ class SharedState:
             return self.config.get(key, default)
         return getattr(self.config, key, default)
 
-    def is_intent_valid(self, symbol: str, side: str) -> bool:
-        """Condition B: Check if the market intent is still valid based on current signals. (Point 4)"""
+    def is_intent_valid(self, symbol: str, side: str, candidate_signal: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Condition B: Check if the market intent is still valid based on current signals.
+
+        Validation strategy:
+        1. Prefer validating the exact decision-time signal (candidate_signal) when provided.
+           This avoids false negatives caused by cross-agent races in latest_signals_by_symbol.
+        2. Fallback to ANY matching recent signal from latest_signals_by_symbol (not only latest-any-side).
+        """
         sym = symbol.upper()
+        target_side = side.upper()
+
+        def _safe_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except Exception:
+                return float(default)
+
+        default_min_conf = _safe_float(self._cfg("MIN_CONFIDENCE_TO_TRADE", 0.5), 0.5)
+        now_ts = time.time()
+
+        def _signal_matches(sig: Any, allow_side_fallback: bool) -> bool:
+            if not isinstance(sig, dict):
+                return False
+
+            action_default = target_side if allow_side_fallback else ""
+            action = str(sig.get("action", "") or sig.get("side", action_default)).upper()
+            if action != target_side:
+                return False
+
+            conf = _safe_float(sig.get("confidence", 0.0), 0.0)
+            min_conf = _safe_float(sig.get("min_confidence", default_min_conf), default_min_conf)
+            if conf < min_conf:
+                return False
+
+            sig_ts = _safe_float(sig.get("timestamp", 0.0), 0.0)
+            ttl = _safe_float(sig.get("ttl", 300), 300.0)
+            if ttl <= 0:
+                ttl = 300.0
+            if sig_ts > 0 and (now_ts - sig_ts) > ttl:
+                return False
+
+            return True
+
+        # Prefer the decision-time signal first (prevents race-induced false invalidation at firing).
+        if _signal_matches(candidate_signal, allow_side_fallback=True):
+            return True
+
         # P9: Multi-agent signal lookup
         per_agent = self.latest_signals_by_symbol.get(sym, {})
         if not per_agent:
             return False
-        
-        # Take the most-recent signal by timestamp across all agents
-        signal = max(per_agent.values(), key=lambda s: float(s.get("timestamp", 0.0)))
-            
-        # 1. Action Alignment
-        action = str(signal.get("action", "") or signal.get("side", "")).upper()
-        if action != side.upper():
-            return False
-            
-        # 2. Confidence (Point 4)
-        conf = float(signal.get("confidence", 0.0))
-        min_conf = float(signal.get("min_confidence", 0.5))
-        if conf < min_conf:
-            return False
-            
-        # 3. Age / TTL (Point 4)
-        sig_ts = float(signal.get("timestamp", 0.0))
-        if sig_ts > 0:
-            age = time.time() - sig_ts
-            max_age = float(signal.get("ttl", 300)) # Default 5 min signal life
-            if age > max_age:
-                return False
-                
-        return True
+
+        # Any aligned, fresh, sufficiently confident signal keeps the intent valid.
+        for sig in per_agent.values():
+            if _signal_matches(sig, allow_side_fallback=False):
+                return True
+
+        return False
 
     async def clear_pending_intent(self, symbol: str, side: str) -> None:
         """Remove an intent after execution or cancellation."""
@@ -1842,6 +1942,9 @@ class SharedState:
         self.portfolio_nav = float(nav)
         self.total_equity = float(nav)
         self.total_equity_usdt = float(nav)
+        self.total_value = float(nav)
+        self.unrealized_pnl = float(unrealized_pnl)
+        self.realized_pnl = float(self.metrics.get("realized_pnl", 0.0) or 0.0)
         self.free_quote = float(primary_quote_free)
         self.invested_capital = float(invested_capital)
 
@@ -1928,14 +2031,49 @@ class SharedState:
             )
             return nav
         
+        # CRITICAL FIX: Convert ALL non-quote asset balances to USDT value
+        # This includes free holdings like BTC, ETH, SOL that are not in positions yet
+        # Formula: for each non-quote asset, value_usd = balance × price
+        dust_threshold = getattr(self, "dust_min_quote_usdt", 5.0)
+        
+        balance_values_added = 0
+        for asset, balance_info in self.balances.items():
+            asset_upper = asset.upper()
+            # Skip quote assets (already counted above)
+            if asset_upper in quote_assets:
+                continue
+            
+            qty = float(balance_info.get("free", 0.0))
+            if qty <= 0:
+                continue
+                
+            # Get price for this asset (e.g., BTCUSDT, ETHUSDT)
+            symbol = f"{asset_upper}USDT"
+            px = float(self.latest_prices.get(symbol) or 0.0)
+            
+            # Skip if no price available
+            if px <= 0:
+                self.logger.debug(
+                    f"[NAV] Excluding balance {asset}: no price feed for {symbol}"
+                )
+                continue
+            
+            # Calculate value at market price
+            asset_value = qty * px
+            
+            # Include in NAV even if small (don't dust-filter holdings, only filter positions)
+            nav += asset_value
+            balance_values_added += 1
+            self.logger.debug(
+                f"[NAV] Adding balance {asset}: {qty:.8f} × {px:.2f} = {asset_value:.2f}"
+            )
+        
         # PROFESSIONAL STANDARD: Add position values with professional filtering
         # Formula: NAV = USDT_balance + Σ(position_qty × current_market_price)
         # Rules:
         #  1. Use current price (NOT entry price) - professional requirement
         #  2. Exclude dust positions below threshold - professional requirement
         #  3. Exclude assets with no price feed - professional requirement
-        
-        dust_threshold = getattr(self, "dust_min_quote_usdt", 5.0)
         
         has_positions = False
         positions_excluded_dust = 0
@@ -2717,6 +2855,16 @@ class SharedState:
             for k in keys_to_del:
                 self.rejection_counters.pop(k, None)
                 self.rejection_timestamps.pop(k, None)
+
+            if sym in self.dust_registry:
+                entry = dict(self.dust_registry.get(sym, {}))
+                entry["dust_class"] = DustClass.PERMANENT_WRITE_DOWN_DUST.value
+                entry["state"] = PositionState.DUST_LOCKED.value
+                entry["last_seen"] = time.time()
+                self.dust_registry[sym] = entry
+            self.metrics["dust_registry_size"] = len(self.dust_registry)
+            self._update_dust_origin_metrics()
+            self._update_dust_class_metrics()
             
             self.logger.info(f"[SS:DUST_RETIRED] {sym} marked PERMANENT_DUST (irrevocable, retirement complete)")
 
@@ -3271,24 +3419,22 @@ class SharedState:
         """
         Calculate dynamic capital floor based on NAV, trade size, and volatility-adjusted ratio.
         
-        Formula: capital_floor = max(8, NAV * dynamic_ratio, trade_size * 0.5)
+        Sustainable compounding policy:
+        - Keep at least CAPITAL_FLOOR_PCT (default 20%) in quote currency.
+        - Keep at least ABSOLUTE_MIN_FLOOR (default 10 USDT) as hard reserve.
+        - Never allow volatility/dynamic overrides to reduce the configured floor ratio.
         
-        Where dynamic_ratio is (production-grade, hard-capped at 12%):
-        - 0.12 (12%) in very low volatility (≤1.5% ATR) — growth-oriented
-        - 0.08 (8%)  in low-mid volatility (≤3.0% ATR) — balanced
-        - 0.05 (5%)  in high volatility (>3.0% ATR) — agility-focused
-        - HARD CAP: ratio never exceeds 0.12 (professional best-practice)
+        Formula:
+            capital_floor = max(ABSOLUTE_MIN_FLOOR, NAV * max(CAPITAL_FLOOR_PCT, dynamic_ratio))
         
-        This ensures:
-        - Absolute minimum of $8 (maintenance buffer)
-        - NAV-proportional reserve with volatility adjustment
-        - At least 50% of typical trade size reserved (trade viability)
-        - Conservative enough to protect capital, aggressive enough to trade profitably
+        Note:
+        - trade_size is kept in signature for backward compatibility.
+        - dynamic_ratio may increase reserve requirements, but cannot reduce below configured floor.
         
         Args:
             nav: Net Asset Value in USDT (uses self.nav if not provided)
-            trade_size: Typical trade size in USDT (uses configured trade amount if not provided)
-            dynamic_ratio: Override ratio (uses 0.12 if not provided, hard-capped at 0.12)
+            trade_size: Typical trade size in USDT (reserved for compatibility)
+            dynamic_ratio: Optional runtime ratio override (e.g., volatility engine)
             
         Returns:
             Capital floor in USDT
@@ -3298,31 +3444,29 @@ class SharedState:
             if nav <= 0:
                 nav = float(getattr(self, "nav", 0.0) or 0.0)
             
-            # Use provided trade_size or get from config
-            if trade_size <= 0:
-                trade_size = float(self._cfg("TRADE_AMOUNT_USDT", self._cfg("DEFAULT_PLANNED_QUOTE", 30.0)) or 30.0)
+            cfg_ratio = float(
+                self._cfg("CAPITAL_FLOOR_PCT", self._cfg("capital_floor_pct", 0.20)) or 0.20
+            )
+            if cfg_ratio <= 0:
+                cfg_ratio = 0.20
+            absolute_min = float(
+                self._cfg("ABSOLUTE_MIN_FLOOR", self._cfg("CAPITAL_PRESERVATION_FLOOR", 10.0)) or 10.0
+            )
+            # Dynamic ratio can only tighten reserve requirements, never loosen below policy.
+            runtime_ratio = float(dynamic_ratio) if dynamic_ratio is not None else cfg_ratio
+            effective_ratio = max(cfg_ratio, runtime_ratio)
             
-            # Use provided dynamic_ratio or default to 0.12 (baseline)
-            if dynamic_ratio is None:
-                dynamic_ratio = 0.12
+            # Calculate floor
+            nav_based = nav * effective_ratio
             
-            # HARD CAP: Enforce professional best-practice limit (never exceed 12%)
-            # This prevents volatility classifiers from being too conservative
-            dynamic_ratio = min(dynamic_ratio, 0.12)
-            
-            # Calculate three floor candidates
-            absolute_min = 8.0
-            nav_based = nav * dynamic_ratio
-            trade_based = trade_size * 0.5
-            
-            # Capital floor is the maximum of all three components
-            capital_floor = max(absolute_min, nav_based, trade_based)
+            # Capital floor is maximum of absolute min and NAV-based
+            capital_floor = max(absolute_min, nav_based)
             
             return capital_floor
             
         except Exception as e:
-            self.logger.warning(f"[SS] Error calculating capital floor: {e}, using base 8.0")
-            return 8.0
+            self.logger.warning(f"[SS] Error calculating capital floor: {e}, using conservative fallback")
+            return max(10.0, nav * 0.20 if nav > 0 else 10.0)
 
     def _significant_position_floor_from_min_notional(self, min_notional: float = 0.0) -> float:
         """Canonical significant-position floor used across Meta/SharedState/TPSL.
@@ -3854,6 +3998,113 @@ class SharedState:
             return float((int(value / step)) * step)
         except Exception:
             return float(value)
+    
+    async def flush_and_reinitialize_balances(self) -> None:
+        """
+        Flush all stale balance data and prepare for fresh live sync.
+        
+        Called on Phase 3 startup to ensure clean slate with no test data carryover.
+        """
+        async with self._lock_context("balances"):
+            # Clear all old balance data
+            self.balances.clear()
+            self.logger.info("[SS:Flush] Cleared all stale balances")
+            
+            # Reset balance-ready event (wait for fresh data)
+            if self.balances_ready_event.is_set():
+                self.balances_ready_event.clear()
+                self.logger.debug("[SS:Flush] Reset balances_ready_event")
+            
+            # Clear virtual balances if in shadow mode
+            if self.virtual_balances:
+                self.virtual_balances.clear()
+                self.logger.info("[SS:Flush] Cleared virtual balances")
+            
+            # Clear price cache (prices may have changed)
+            if hasattr(self, '_price_cache'):
+                self._price_cache.clear()
+                self.logger.debug("[SS:Flush] Cleared price cache")
+            
+            # Reset update timestamp
+            self.metrics["balances_updated_at"] = 0.0
+            self.metrics["balances_ready"] = False
+            
+            self.logger.info("[SS:Flush] SharedState balance data flushed - ready for live sync")
+    
+    async def sync_authoritative_balance_from_exchange(self, exchange_client) -> bool:
+        """
+        Force fetch of authoritative balance from live exchange.
+        
+        Bypasses any caching and gets fresh data from Binance.
+        Ensures trading uses correct current capital amount.
+        
+        Args:
+            exchange_client: ExchangeClient instance for API calls
+            
+        Returns:
+            True if successful fetch and sync, False if failed
+        """
+        try:
+            self.logger.info("[SS:AuthSync] Fetching authoritative balance from live Binance...")
+            
+            # Try both methods to ensure we get account balance
+            balances = None
+            
+            # Method 1: Try get_account_balances()
+            if hasattr(exchange_client, 'get_account_balances'):
+                try:
+                    balances = await exchange_client.get_account_balances()
+                    self.logger.info("[SS:AuthSync] ✓ Fetched using get_account_balances()")
+                except Exception as e:
+                    self.logger.debug(f"[SS:AuthSync] get_account_balances() failed: {e}")
+            
+            # Method 2: Try get_balances()
+            if not balances and hasattr(exchange_client, 'get_balances'):
+                try:
+                    balances = await exchange_client.get_balances()
+                    self.logger.info("[SS:AuthSync] ✓ Fetched using get_balances()")
+                except Exception as e:
+                    self.logger.error(f"[SS:AuthSync] Both methods failed: {e}")
+                    return False
+            
+            if not balances:
+                self.logger.error("[SS:AuthSync] ✗ No balance data retrieved")
+                return False
+            
+            # Update with fresh data
+            await self.update_balances(balances)
+            
+            # Log what we got (for verification)
+            self.logger.info(f"[SS:AuthSync] ✓ Authoritative balance synced")
+            
+            # Log ALL non-zero balances for complete visibility
+            logged_any = False
+            for symbol in sorted(self.balances.keys()):
+                balance_data = self.balances.get(symbol, {})
+                if not isinstance(balance_data, dict):
+                    continue
+                    
+                free = float(balance_data.get('free', 0))
+                locked = float(balance_data.get('locked', 0))
+                total = free + locked
+                
+                # Only log if we have a balance
+                if total > 0:
+                    if symbol == 'USDT':
+                        self.logger.info(f"[SS:AuthSync] {symbol:6s} Free: ${free:12.2f} | Locked: ${locked:12.2f} | Total: ${total:12.2f}")
+                    else:
+                        self.logger.info(f"[SS:AuthSync] {symbol:6s} Free: {free:12.8f} | Locked: {locked:12.8f} | Total: {total:12.8f}")
+                    logged_any = True
+            
+            if not logged_any:
+                self.logger.warning("[SS:AuthSync] ⚠️  No non-zero balances found")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"[SS:AuthSync] Exception during sync: {e}", exc_info=True)
+            return False
+    
     @track_performance
     async def update_balances(self, balances: Dict[str, Dict[str, float]]) -> None:
         """Update balances with change detection and reservation reconciliation.
@@ -4066,6 +4317,21 @@ class SharedState:
                         self.logger.warning(msg)
                     else:
                         self.logger.info(msg)
+                    
+                    # ✅ CRITICAL FIX #7: Rebuild NAV after syncing balances
+                    # Problem: sync_authoritative_balance() updates self.balances but doesn't rebuild NAV
+                    # Result: Callers reading shared_state.nav after sync still get stale/old value
+                    # This causes NAV=0.00 errors in CapitalGovernor during trade execution
+                    # Solution: Rebuild NAV from updated balance state immediately after sync completes
+                    try:
+                        nav_result = await self.rebuild_nav_from_state(source="sync_authoritative_balance")
+                        if nav_result:
+                            self.logger.debug(f"[SS] NAV rebuilt after balance sync: {nav_result}")
+                        else:
+                            self.logger.warning("[SS] Failed to rebuild NAV after balance sync")
+                    except Exception as e:
+                        self.logger.error(f"[SS] Exception rebuilding NAV after balance sync: {e}")
+                    
                     return True
                 return False
             except Exception as e:
@@ -4340,6 +4606,116 @@ class SharedState:
             counts[origin] += 1
         self.metrics["dust_origin_breakdown"] = dict(counts)
 
+    @staticmethod
+    def _coerce_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _resolve_dust_price(self, symbol: str, context: Optional[Dict[str, Any]] = None) -> float:
+        """
+        Resolve best-effort price for dust notional classification.
+        """
+        sym = self._norm_sym(symbol)
+        ctx = context if isinstance(context, dict) else {}
+        for key in ("price", "mark_price", "entry_price", "avg_price"):
+            px = self._coerce_float(ctx.get(key), 0.0)
+            if px > 0:
+                return px
+
+        pos = self.positions.get(sym) or {}
+        for key in ("mark_price", "entry_price", "avg_price", "price"):
+            px = self._coerce_float(pos.get(key), 0.0)
+            if px > 0:
+                return px
+
+        return self._coerce_float((self.latest_prices or {}).get(sym), 0.0)
+
+    def classify_dust_bucket(
+        self,
+        symbol: str,
+        *,
+        qty: float,
+        price: float,
+        min_quote_value: Optional[float] = None,
+        min_notional: Optional[float] = None,
+    ) -> str:
+        """
+        Formal dust taxonomy classifier.
+
+        Returns one of:
+        TRADABLE | NEAR_DUST | DUST | RECOVERABLE_DUST | PERMANENT_WRITE_DOWN_DUST
+        """
+        sym = self._norm_sym(symbol)
+        qty_f = max(self._coerce_float(qty, 0.0), 0.0)
+        px_f = max(self._coerce_float(price, 0.0), 0.0)
+        notional_usdt = qty_f * px_f if qty_f > 0 and px_f > 0 else 0.0
+
+        min_quote = self._coerce_float(
+            min_quote_value,
+            self._coerce_float(
+                getattr(self.config, "dust_min_quote_usdt", getattr(self.config, "DUST_MIN_QUOTE_USDT", 5.0)),
+                5.0,
+            ),
+        )
+        min_notional_f = max(self._coerce_float(min_notional, 0.0), 0.0)
+        tradable_floor = max(min_quote, min_notional_f, 0.0)
+
+        write_down_floor = self._coerce_float(
+            getattr(
+                self.config,
+                "dust_write_down_quote_usdt",
+                getattr(
+                    self.config,
+                    "PERMANENT_DUST_USDT_THRESHOLD",
+                    getattr(self.config, "DUST_WRITE_DOWN_QUOTE_USDT", 1.0),
+                ),
+            ),
+            1.0,
+        )
+        near_ratio = self._coerce_float(
+            getattr(self.config, "dust_near_ratio", getattr(self.config, "DUST_NEAR_RATIO", 0.85)),
+            0.85,
+        )
+        near_ratio = min(max(near_ratio, 0.50), 0.99)
+
+        if self.is_permanent_dust(sym):
+            return DustClass.PERMANENT_WRITE_DOWN_DUST.value
+        if 0 < notional_usdt <= write_down_floor:
+            return DustClass.PERMANENT_WRITE_DOWN_DUST.value
+        if tradable_floor <= 0:
+            return DustClass.TRADABLE.value if qty_f > 0 else DustClass.DUST.value
+        if qty_f > 0 and notional_usdt >= tradable_floor:
+            return DustClass.TRADABLE.value
+
+        # Stale sub-floor dust graduates to recoverable cleanup class.
+        recoverable_hours = self._coerce_float(
+            getattr(
+                self.config,
+                "dust_recoverable_age_hours",
+                getattr(self.config, "DUST_AGGREGATE_THRESHOLD_HOURS", 4.0),
+            ),
+            4.0,
+        )
+        entry = self.dust_registry.get(sym) or {}
+        first_seen = self._coerce_float(entry.get("first_seen") or entry.get("timestamp"), time.time())
+        age_hours = max(0.0, (time.time() - first_seen) / 3600.0)
+        if age_hours >= recoverable_hours and notional_usdt > write_down_floor:
+            return DustClass.RECOVERABLE_DUST.value
+
+        near_floor = tradable_floor * near_ratio
+        if notional_usdt >= near_floor and notional_usdt > 0:
+            return DustClass.NEAR_DUST.value
+        return DustClass.DUST.value
+
+    def _update_dust_class_metrics(self) -> None:
+        counts: Dict[str, int] = defaultdict(int)
+        for data in self.dust_registry.values():
+            dust_class = str(data.get("dust_class") or DustClass.DUST.value)
+            counts[dust_class] += 1
+        self.metrics["dust_class_breakdown"] = dict(counts)
+
     def record_dust(
         self,
         symbol: str,
@@ -4360,14 +4736,30 @@ class SharedState:
             now = time.time()
             entry = dict(self.dust_registry.get(sym, {}))
             first_seen = float(entry.get("first_seen") or entry.get("timestamp") or now)
+            price_hint = self._resolve_dust_price(sym, context=context)
+            min_notional_hint = self._coerce_float((context or {}).get("min_notional"), 0.0)
+            qty_value = float(max(qty, 0.0))
+            dust_class = self.classify_dust_bucket(
+                sym,
+                qty=qty_value,
+                price=price_hint,
+                min_quote_value=self._coerce_float(
+                    getattr(self.config, "dust_min_quote_usdt", getattr(self.config, "DUST_MIN_QUOTE_USDT", 5.0)),
+                    5.0,
+                ),
+                min_notional=min_notional_hint,
+            )
 
             entry.update({
-                "qty": float(max(qty, 0.0)),
+                "qty": qty_value,
+                "price_hint": float(price_hint),
+                "notional_usdt": float(qty_value * price_hint if price_hint > 0 else 0.0),
                 "timestamp": entry.get("timestamp", first_seen),
                 "first_seen": first_seen,
                 "last_seen": now,
                 "state": PositionState.DUST_LOCKED.value,
                 "origin": origin or entry.get("origin") or self._infer_dust_origin(sym),
+                "dust_class": dust_class,
             })
 
             if context:
@@ -4382,12 +4774,14 @@ class SharedState:
             pos = self.positions.get(sym)
             if pos is not None:
                 pos["state"] = PositionState.DUST_LOCKED.value
+                pos["dust_class"] = dust_class
 
             if sym not in self._dust_first_seen:
                 self._dust_first_seen[sym] = first_seen
 
             self.metrics["dust_registry_size"] = len(self.dust_registry)
             self._update_dust_origin_metrics()
+            self._update_dust_class_metrics()
         except Exception:
             pass
 
@@ -4398,6 +4792,10 @@ class SharedState:
     async def get_dust_origin_breakdown(self) -> Dict[str, int]:
         """Expose the current dust-origin histogram for monitoring/telemetry."""
         return dict(self.metrics.get("dust_origin_breakdown", {}))
+
+    async def get_dust_class_breakdown(self) -> Dict[str, int]:
+        """Expose the current dust-class histogram for monitoring/telemetry."""
+        return dict(self.metrics.get("dust_class_breakdown", {}))
 
     async def prune_reservations(self) -> None:
         """
@@ -4476,6 +4874,7 @@ class SharedState:
                 self.dust_registry.pop(s, None)
             self.metrics["dust_registry_size"] = len(self.dust_registry)
             self._update_dust_origin_metrics()
+            self._update_dust_class_metrics()
             if drop:
                 await self.emit_event("DustRegistryPruned", {"dropped": drop, "remaining": len(self.dust_registry)})
         except Exception:
@@ -4494,7 +4893,10 @@ class SharedState:
         symbol, base_asset, quote_asset, qty, est_quote_value, price, filters, reason
         """
         if min_quote_value is None:
-            min_quote_value = float(getattr(self.config, "dust_min_quote_usdt", 5.0) or 0.0)
+            min_quote_value = float(
+                getattr(self.config, "dust_min_quote_usdt", getattr(self.config, "DUST_MIN_QUOTE_USDT", 5.0))
+                or 0.0
+            )
         if include_dust is None:
             include_dust = bool(getattr(self.config, "dust_liquidation_enabled", True))
         results: List[Dict[str, Any]] = []
@@ -4540,6 +4942,14 @@ class SharedState:
             else:
                 est_quote_value = eff_qty * px
                 reason = "ok"
+            tradable_floor = max(float(min_quote_value or 0.0), float(min_notional or 0.0))
+            dust_class = self.classify_dust_bucket(
+                sym,
+                qty=eff_qty,
+                price=px,
+                min_quote_value=float(min_quote_value or 0.0),
+                min_notional=float(min_notional or 0.0),
+            )
 
             # ===== PHASE 3: Track dust eligibility for cleanup =====
             dust_cleanup_eligible = False
@@ -4551,31 +4961,49 @@ class SharedState:
                 reason = "qty_below_step"
             origin_hint = (self.dust_registry.get(sym) or {}).get("origin")
             default_origin = origin_hint or ("strategy_portfolio" if sym in positions else "external_untracked")
+            is_dust_like = dust_class in {
+                DustClass.NEAR_DUST.value,
+                DustClass.DUST.value,
+                DustClass.RECOVERABLE_DUST.value,
+                DustClass.PERMANENT_WRITE_DOWN_DUST.value,
+            }
+            if is_dust_like:
+                self.record_dust(
+                    sym,
+                    eff_qty,
+                    origin=default_origin,
+                    context={
+                        "source": "sellable_inventory",
+                        "price": px,
+                        "est_quote_value": est_quote_value,
+                        "min_notional": float(min_notional or 0.0),
+                        "min_quote_value": float(min_quote_value or 0.0),
+                        "tradable_floor": float(tradable_floor),
+                        "dust_class": dust_class,
+                    },
+                )
 
-            if px > 0 and min_notional > 0 and est_quote_value < min_notional:
-                self.record_dust(
-                    sym,
-                    eff_qty,
-                    origin=default_origin,
-                    context={"source": "sellable_inventory", "reason": "below_min_notional"},
-                )
-                dust_cleanup_eligible = True  # ← PHASE 3: Mark for cleanup even if below threshold
+            if px > 0 and dust_class == DustClass.RECOVERABLE_DUST.value:
+                dust_cleanup_eligible = True
+                reason = "dust_recoverable"
                 if not include_dust and not self.bypass_portfolio_flat_for_dust:
-                    # Only skip if we're NOT doing dust cleanup
                     eligible = False
-                    reason = "below_min_notional"
-            if px > 0 and est_quote_value < float(min_quote_value or 0.0):
-                self.record_dust(
-                    sym,
-                    eff_qty,
-                    origin=default_origin,
-                    context={"source": "sellable_inventory", "reason": "below_threshold"},
-                )
-                dust_cleanup_eligible = True  # ← PHASE 3: Mark for cleanup even if below threshold
+            elif px > 0 and dust_class in {DustClass.DUST.value, DustClass.NEAR_DUST.value}:
+                dust_cleanup_eligible = True
+                reason = "dust_below_floor"
                 if not include_dust and not self.bypass_portfolio_flat_for_dust:
-                    # Only skip if we're NOT doing dust cleanup
                     eligible = False
-                    reason = "below_threshold"
+            elif dust_class == DustClass.PERMANENT_WRITE_DOWN_DUST.value:
+                dust_cleanup_eligible = False
+                reason = "dust_write_down"
+                if not include_dust and not self.bypass_portfolio_flat_for_dust:
+                    eligible = False
+            elif sym in self.dust_registry:
+                # Position recovered back to tradable size; remove stale dust entry.
+                self.dust_registry.pop(sym, None)
+                self.metrics["dust_registry_size"] = len(self.dust_registry)
+                self._update_dust_origin_metrics()
+                self._update_dust_class_metrics()
 
             # ===== PHASE 3 FIX: Always include dust when in cleanup mode =====
             if dust_cleanup_eligible and self.bypass_portfolio_flat_for_dust:
@@ -4594,6 +5022,8 @@ class SharedState:
                 "price": px,
                 "filters": f,
                 "reason": reason,
+                "dust_class": dust_class,
+                "tradable_floor": float(tradable_floor),
             })
 
         # Sort largest first to help the LiquidationAgent free capital quickly
@@ -4626,6 +5056,7 @@ class SharedState:
         # Get all positions that are currently in dust register
         for symbol in list(self.dust_registry.keys()):
             try:
+                sym = self._norm_sym(symbol)
                 pos = await self.get_position(symbol)
                 if not pos:
                     continue
@@ -4633,56 +5064,97 @@ class SharedState:
                 qty = float(pos.get("quantity", 0.0))
                 if qty <= 0:
                     # Already liquidated, remove from dust register
-                    self.dust_registry.pop(symbol, None)
+                    self.dust_registry.pop(sym, None)
                     self.metrics["dust_registry_size"] = len(self.dust_registry)
                     self._update_dust_origin_metrics()
+                    self._update_dust_class_metrics()
+                    continue
+
+                px = float(pos.get("mark_price") or pos.get("entry_price") or 0.0)
+                est_value = qty * px if px > 0 else 0.0
+                entry = self.dust_registry.get(sym) or {}
+                min_notional_hint = self._coerce_float(
+                    (entry.get("context") or {}).get("min_notional"),
+                    0.0,
+                )
+                dust_class = self.classify_dust_bucket(
+                    sym,
+                    qty=qty,
+                    price=px,
+                    min_quote_value=float(
+                        getattr(self.config, "dust_min_quote_usdt", getattr(self.config, "DUST_MIN_QUOTE_USDT", 5.0))
+                        or 5.0
+                    ),
+                    min_notional=min_notional_hint,
+                )
+                entry["dust_class"] = dust_class
+                entry["notional_usdt"] = float(est_value)
+                entry["last_seen"] = now
+                self.dust_registry[sym] = entry
+
+                if dust_class == DustClass.TRADABLE.value:
+                    # Clean stale registry row once symbol returns to tradable utility.
+                    self.dust_registry.pop(sym, None)
+                    self.metrics["dust_registry_size"] = len(self.dust_registry)
+                    self._update_dust_origin_metrics()
+                    self._update_dust_class_metrics()
+                    continue
+                if dust_class == DustClass.PERMANENT_WRITE_DOWN_DUST.value:
+                    self.logger.debug(
+                        "[Phase3:Dust] %s classified as PERMANENT_WRITE_DOWN_DUST — excluded from cleanup queue",
+                        sym,
+                    )
                     continue
                 
                 # Check attempt count
-                attempt_count = self.dust_cleanup_attempts.get(symbol, 0)
+                attempt_count = self.dust_cleanup_attempts.get(sym, 0)
                 if attempt_count >= max_attempts:
                     self.logger.info(
-                        f"[Phase3] {symbol} dust cleanup: max attempts ({max_attempts}) reached"
+                        f"[Phase3] {sym} dust cleanup: max attempts ({max_attempts}) reached"
                     )
                     continue
                 
                 # Check age using priority action: AGGREGATE-phase dust is held, not cleaned up
-                first_seen = self._dust_first_seen.get(symbol, now)
+                first_seen = self._dust_first_seen.get(sym, now)
                 age_sec = now - first_seen
                 if age_sec < min_age_sec:
                     continue
-                action, _ = self.get_dust_priority_action(symbol)
-                if action == "AGGREGATE":
+                action, _ = self.get_dust_priority_action(sym)
+                if action in {"AGGREGATE", "WRITE_DOWN", "NONE"}:
                     self.logger.debug(
-                        "[Phase3:Dust] %s is AGGREGATE-phase (age=%.1fh < threshold) — skipping cleanup",
-                        symbol, age_sec / 3600.0,
+                        "[Phase3:Dust] %s action=%s (age=%.1fh) — skipping cleanup",
+                        sym,
+                        action,
+                        age_sec / 3600.0,
                     )
                     continue
                 
                 # Check cooldown from last attempt
-                last_try = self.dust_cleanup_last_try.get(symbol, 0)
+                last_try = self.dust_cleanup_last_try.get(sym, 0)
                 time_since_last_try = now - last_try
                 if time_since_last_try < attempt_cooldown_sec and attempt_count > 0:
                     continue
                 
                 # This dust position is eligible for cleanup
-                px = float(pos.get("mark_price") or pos.get("entry_price") or 0.0)
-                est_value = qty * px if px > 0 else 0.0
-                
                 candidates.append({
-                    "symbol": symbol,
+                    "symbol": sym,
                     "qty": qty,
                     "price": px,
                     "est_quote_value": est_value,
                     "age_sec": age_sec,
                     "attempt_count": attempt_count,
-                    "reason": "dust_cleanup_eligible"
+                    "reason": "dust_cleanup_eligible",
+                    "action": action,
+                    "dust_class": dust_class,
                 })
             except Exception as e:
                 self.logger.warning(f"Error checking dust cleanup for {symbol}: {e}")
                 continue
         
         # Sort by age (oldest first) and attempt count (fewer attempts first)
+        self.metrics["dust_registry_size"] = len(self.dust_registry)
+        self._update_dust_origin_metrics()
+        self._update_dust_class_metrics()
         candidates.sort(key=lambda x: (-x["age_sec"], x["attempt_count"]))
         
         return candidates
@@ -4699,9 +5171,10 @@ class SharedState:
         Priority order: Reuse > Aggregate > Cleanup
 
         Returns (action, dust_qty) where action is:
-          "AGGREGATE" – dust is young (age < aggregate_threshold_hours), hold and accumulate
-          "CLEANUP"   – dust is stale (age >= aggregate_threshold_hours), trigger cleanup sell
-          "NONE"      – no dust position for this symbol
+          "AGGREGATE"  – dust is young, hold and accumulate
+          "CLEANUP"    – dust is stale/recoverable, trigger cleanup sell
+          "WRITE_DOWN" – permanent write-down dust, never route to cleanup
+          "NONE"       – no dust position for this symbol
 
         Note: "REUSE" is decided by the caller (ExecutionManager) when a same-symbol
         BUY is incoming — this method only classifies AGGREGATE vs CLEANUP.
@@ -4718,6 +5191,34 @@ class SharedState:
         threshold = float(getattr(self.config, "DUST_AGGREGATE_THRESHOLD_HOURS", aggregate_threshold_hours))
         first_seen = float(entry.get("first_seen") or entry.get("timestamp") or time.time())
         age_hours = (time.time() - first_seen) / 3600.0
+        price_hint = self._coerce_float(
+            entry.get("price_hint")
+            or (self.positions.get(sym) or {}).get("mark_price")
+            or (self.positions.get(sym) or {}).get("entry_price"),
+            0.0,
+        )
+        dust_class = str(
+            entry.get("dust_class")
+            or self.classify_dust_bucket(
+                sym,
+                qty=dust_qty,
+                price=price_hint,
+                min_quote_value=self._coerce_float(
+                    getattr(self.config, "dust_min_quote_usdt", getattr(self.config, "DUST_MIN_QUOTE_USDT", 5.0)),
+                    5.0,
+                ),
+                min_notional=self._coerce_float((entry.get("context") or {}).get("min_notional"), 0.0),
+            )
+        )
+        entry["dust_class"] = dust_class
+        self.dust_registry[sym] = entry
+
+        if dust_class == DustClass.PERMANENT_WRITE_DOWN_DUST.value:
+            return ("WRITE_DOWN", dust_qty)
+        if dust_class == DustClass.RECOVERABLE_DUST.value:
+            return ("CLEANUP", dust_qty)
+        if dust_class == DustClass.TRADABLE.value:
+            return ("NONE", dust_qty)
 
         if age_hours < threshold:
             return ("AGGREGATE", dust_qty)
@@ -4836,7 +5337,22 @@ class SharedState:
                 self.logger.debug(f"[SS:HydratePosFromBal] Skipping non-tradable symbol {sym} for asset {a}")
                 continue
             prev = self.positions.get(sym, {})
-            if float(prev.get("quantity", 0.0)) != free_qty or not prev.get("_mirrored"):
+            prev_qty = float(prev.get("quantity", 0.0) or 0.0)
+            prev_is_mirrored = bool(prev.get("_mirrored", False))
+            prev_classification = str(prev.get("classification") or "").upper()
+            open_trade = self.open_trades.get(sym, {}) if isinstance(self.open_trades, dict) else {}
+            open_trade_qty = float((open_trade if isinstance(open_trade, dict) else {}).get("quantity", 0.0) or 0.0)
+
+            # CRITICAL OWNERSHIP FIX:
+            # Do not downgrade bot-managed inventory into mirrored/external ownership
+            # during wallet hydration. Hydration is reconciliation, not ownership transfer.
+            is_bot_managed = bool(prev) and (
+                (not prev_is_mirrored)
+                or prev_classification in {"BOT_POSITION", "RECOVERY"}
+                or open_trade_qty > 0.0
+            )
+
+            if prev_qty != free_qty or not prev:
                 pos = dict(prev)
                 price = float(self.latest_prices.get(sym, 0.0) or 0.0)
                 if price <= 0 and self._exchange_client:
@@ -4895,6 +5411,13 @@ class SharedState:
                 # Normalize avg_price to mark_price if also zero
                 if avg_price <= 0 and price > 0:
                     avg_price = price
+
+                if is_bot_managed:
+                    mirrored_flag = False
+                    classification_value = "BOT_POSITION" if is_significant else "DUST"
+                else:
+                    mirrored_flag = True
+                    classification_value = "EXTERNAL_POSITION" if is_significant else "DUST"
                 
                 pos.update({
                     "quantity": free_qty,
@@ -4908,7 +5431,8 @@ class SharedState:
                     "_is_dust": not bool(is_significant),
                     "open_position": bool(is_significant),
                     "state": PositionState.ACTIVE.value if is_significant else PositionState.DUST_LOCKED.value,
-                    "_mirrored": True,
+                    "_mirrored": mirrored_flag,
+                    "classification": classification_value,
                     "status": "SIGNIFICANT" if is_significant else "DUST",
                 })
                 
@@ -5177,9 +5701,27 @@ class SharedState:
             avg = float(pos.get("avg_price") or pos.get("entry_price") or px)
             if avg > 0 and px > 0:
                 unreal += (px - avg) * qty
-        
+
+        # Keep portfolio_snapshot NAV aligned with the authoritative NAV path used by
+        # get_total_equity()/risk sizing to avoid split-brain accounting between
+        # `total_value` and `total_equity`.
+        nav_snapshot = float(nav)
+        with contextlib.suppress(Exception):
+            nav_authoritative = float(self.get_nav_quote())
+            if nav_authoritative > 0.0:
+                nav = nav_authoritative
+                if abs(nav - nav_snapshot) > 1e-9:
+                    self.logger.debug(
+                        "[NAV:SnapshotAlign] portfolio_snapshot nav adjusted %.4f -> %.4f via get_nav_quote()",
+                        nav_snapshot,
+                        nav,
+                    )
+
         self.metrics["nav"] = nav
         self.metrics["unrealized_pnl"] = unreal
+        self.total_value = float(nav)
+        self.unrealized_pnl = float(unreal)
+        self.realized_pnl = float(self.metrics.get("realized_pnl", 0.0) or 0.0)
         if not self.nav_ready_event.is_set():
             self.nav_ready_event.set()
             self.metrics["nav_ready"] = True
@@ -5245,6 +5787,9 @@ class SharedState:
         # Update metrics
         self.metrics["nav"] = nav
         self.metrics["unrealized_pnl"] = unreal
+        self.total_value = float(nav)
+        self.unrealized_pnl = float(unreal)
+        self.realized_pnl = float(self.metrics.get("realized_pnl", 0.0) or 0.0)
         self.virtual_nav = nav  # Sync virtual_nav with calculated NAV
         
         if not self.nav_ready_event.is_set():
@@ -5440,6 +5985,9 @@ class SharedState:
                 "value_usdt": new_qty * price,  # Update position value
             })
             self._avg_price_cache[symbol] = new_avg
+            # Bot-executed fills are bot-managed inventory, not passive mirrored wallet holdings.
+            pos["_mirrored"] = False
+            pos["classification"] = "BOT_POSITION"
             
             # Frequency Engineering: Track tier count
             if tier == "A":
@@ -5469,6 +6017,8 @@ class SharedState:
             pos.update({"quantity": new_qty, "avg_price": avg if new_qty > 0 else 0.0, "last_fill_ts": time.time()})
             if new_qty > 0:
                 pos["value_usdt"] = new_qty * price  # Update position value for remaining quantity
+                pos["_mirrored"] = False
+                pos["classification"] = "BOT_POSITION"
             
             # Frequency Engineering: Track holding time
             ot = self.open_trades.get(symbol)
@@ -5500,6 +6050,20 @@ class SharedState:
             pos["status"] = "CLOSED"
 
         await self.update_position(symbol, pos)
+
+        # Keep professional classification registry aligned with runtime ownership.
+        # Once bot executes a fill on a symbol, that inventory is managed as BOT_POSITION.
+        if current_qty > 0:
+            with contextlib.suppress(Exception):
+                await self.register_position_classified(
+                    symbol=symbol,
+                    quantity=float(current_qty),
+                    price=float(price),
+                    classification=AssetClassification.BOT_POSITION,
+                    origin="trade_execution",
+                    created_by_agent="ExecutionManager",
+                    management_strategy="ACTIVE",
+                )
 
         # Hard invariant: only significant positions are represented in open_trades.
         if side_u == "BUY" and current_qty > 0 and is_significant:
@@ -5544,6 +6108,7 @@ class SharedState:
         async with self._lock_context("metrics"):
             self.metrics["realized_pnl"] = float(self.metrics.get("realized_pnl", 0.0)) + realized
             total_realized = self.metrics["realized_pnl"]
+        self.realized_pnl = float(total_realized)
         self._realized_pnl.append((now_ts, realized))
         self.trade_history.append({
             "ts": now_ts, "symbol": symbol, "side": side_u, "qty": qty, "price": price, "fee_quote": fee_quote,
@@ -5566,6 +6131,7 @@ class SharedState:
         async with self._lock_context("metrics"):
             current = float(self.metrics.get("realized_pnl", 0.0) or 0.0)
             self.metrics["realized_pnl"] = current + delta
+            self.realized_pnl = float(self.metrics["realized_pnl"])
         try:
             self._realized_pnl.append((time.time(), delta))
         except AttributeError:
@@ -5585,6 +6151,7 @@ class SharedState:
             nav = await _safe_await(self.get_nav_quote())
             if not nav or nav <= 0:
                 self.metrics["capital_utilization_pct"] = 0.0
+                await self.update_capital_bucket_metrics(nav_hint=0.0)
                 return 0.0
             
             total_pos_value = 0.0
@@ -5596,9 +6163,121 @@ class SharedState:
             
             utilization = (total_pos_value / nav) * 100.0
             self.metrics["capital_utilization_pct"] = round(utilization, 2)
+            await self.update_capital_bucket_metrics(nav_hint=float(nav))
             return self.metrics["capital_utilization_pct"]
         except Exception:
             return 0.0
+
+    async def update_capital_bucket_metrics(self, nav_hint: float = 0.0) -> Dict[str, float]:
+        """
+        Build explicit three-bucket capital accounting:
+          1) Operating cash (quote cash, plus spendable sub-view)
+          2) Productive inventory (significant, strategy-usable positions)
+          3) Dead capital (dust, unmanaged/external, non-significant positions)
+
+        Returns a snapshot dict and updates self.metrics with bucket values/ratios.
+        """
+        quote_asset = str(
+            getattr(self.config, "quote_asset", getattr(self, "quote_asset", "USDT")) or "USDT"
+        ).upper()
+
+        operating_cash_total = 0.0
+        operating_cash_spendable = 0.0
+        productive_inventory = 0.0
+        dead_capital = 0.0
+
+        try:
+            bal = await self.get_balance(quote_asset)
+            operating_cash_total = float(bal.get("free", 0.0) or 0.0) + float(bal.get("locked", 0.0) or 0.0)
+        except Exception:
+            operating_cash_total = 0.0
+
+        try:
+            operating_cash_spendable = float(await self.get_spendable_balance(quote_asset) or 0.0)
+        except Exception:
+            operating_cash_spendable = operating_cash_total
+
+        positions_source = self.virtual_positions if self.trading_mode == "shadow" else self.positions
+        for symbol, pos in dict(positions_source).items():
+            try:
+                p = pos if isinstance(pos, dict) else {}
+                qty = float(p.get("quantity", 0.0) or p.get("qty", 0.0) or 0.0)
+                if qty <= 0:
+                    continue
+
+                is_significant, value_usdt, _floor = self.classify_position_snapshot(symbol, p)
+                if value_usdt <= 0:
+                    continue
+
+                sym = self._norm_sym(symbol)
+                status = str(p.get("status", "") or "").upper()
+                state = str(p.get("state", "") or "").upper()
+                is_dust_like = bool(
+                    p.get("is_dust")
+                    or p.get("_is_dust")
+                    or status in {"DUST", "PERMANENT_DUST"}
+                    or state == PositionState.DUST_LOCKED.value
+                    or sym in self.dust_registry
+                    or sym in self.permanent_dust
+                )
+                # Wallet-mirrored positions are holdings but not strategy-owned inventory.
+                is_unmanaged = bool(p.get("_mirrored", False))
+
+                if is_unmanaged or is_dust_like or not is_significant:
+                    dead_capital += float(value_usdt)
+                else:
+                    productive_inventory += float(value_usdt)
+            except Exception:
+                continue
+
+        nav_ref = float(nav_hint or 0.0)
+        if nav_ref <= 0:
+            nav_ref = float(
+                self.metrics.get("nav", 0.0)
+                or getattr(self, "nav", 0.0)
+                or getattr(self, "_total_value", 0.0)
+                or 0.0
+            )
+        if nav_ref <= 0:
+            nav_ref = operating_cash_total + productive_inventory + dead_capital
+
+        classified_total = operating_cash_total + productive_inventory + dead_capital
+        capital_unclassified = max(0.0, nav_ref - classified_total)
+
+        if nav_ref > 0:
+            operating_ratio = operating_cash_total / nav_ref
+            productive_ratio = productive_inventory / nav_ref
+            dead_ratio = dead_capital / nav_ref
+            free_cash_ratio = operating_cash_spendable / nav_ref
+        else:
+            operating_ratio = 0.0
+            productive_ratio = 0.0
+            dead_ratio = 0.0
+            free_cash_ratio = 0.0
+
+        snapshot = {
+            "quote_asset": quote_asset,
+            "operating_cash_usdt": float(operating_cash_total),
+            "operating_cash_spendable_usdt": float(operating_cash_spendable),
+            "productive_inventory_usdt": float(productive_inventory),
+            "dead_capital_usdt": float(dead_capital),
+            "capital_unclassified_usdt": float(capital_unclassified),
+            "capital_bucket_nav_ref_usdt": float(nav_ref),
+            "operating_cash_ratio": float(operating_ratio),
+            "productive_inventory_ratio": float(productive_ratio),
+            "dead_capital_ratio": float(dead_ratio),
+            "free_cash_ratio": float(free_cash_ratio),
+            "productive_capital_ratio": float(productive_ratio),
+        }
+
+        async with self._lock_context("metrics"):
+            self.metrics.update(snapshot)
+
+        return snapshot
+
+    async def get_capital_bucket_snapshot(self) -> Dict[str, float]:
+        """Return latest capital buckets, refreshing snapshot before read."""
+        return await self.update_capital_bucket_metrics()
 
     @track_performance
     async def update_position(self, symbol: str, position_data: Dict[str, Any]) -> None:
@@ -5864,11 +6543,85 @@ class SharedState:
             return False
 
     async def get_position_classification(self, symbol: str) -> Optional[str]:
-        """Get classification of a position"""
-        if not hasattr(self, '_positions_classified'):
-            return None
-        pos = self._positions_classified.get(symbol)
-        return pos.classification.value if pos else None
+        """
+        Get classification of a position.
+
+        Lookup order is intentionally resilient:
+        1) Explicit classified registry (symbol key, then base-asset fallback)
+        2) Runtime position/open-trade state heuristics
+        3) Wallet balance fallback (external inventory)
+        """
+        sym = self._norm_sym(symbol)
+
+        quote_assets = getattr(self, "quote_assets", None)
+        if not quote_assets:
+            quote_assets = [getattr(self, "quote_asset", "USDT").upper()]
+        else:
+            quote_assets = [str(q).upper() for q in (quote_assets if isinstance(quote_assets, list) else [quote_assets])]
+
+        base_asset = sym
+        for q in quote_assets:
+            if sym.endswith(q) and len(sym) > len(q):
+                base_asset = sym[: -len(q)]
+                break
+
+        # 1) Explicit registry lookup (symbol key first, then base key)
+        try:
+            registry = getattr(self, "_positions_classified", None)
+            if isinstance(registry, dict) and registry:
+                pos = registry.get(sym) or registry.get(base_asset)
+                if pos:
+                    return pos.classification.value
+        except Exception:
+            pass
+
+        # 2) Runtime state fallback
+        pos_data = {}
+        try:
+            pos_data = dict((self.positions or {}).get(sym) or {})
+        except Exception:
+            pos_data = {}
+
+        cls = str(pos_data.get("classification") or "").strip().upper()
+        if cls:
+            return cls
+
+        # Significant open-trade slots are always bot-owned inventory.
+        try:
+            if isinstance(self.open_trades, dict):
+                ot = self.open_trades.get(sym)
+                if isinstance(ot, dict):
+                    qty = float(ot.get("quantity", 0.0) or 0.0)
+                    if qty > 0:
+                        return "BOT_POSITION"
+        except Exception:
+            pass
+
+        if pos_data:
+            status = str(pos_data.get("status") or "").upper()
+            if status in {"DUST", "PERMANENT_DUST"} or bool(pos_data.get("is_dust")):
+                return "DUST"
+            if bool(pos_data.get("_mirrored", False)):
+                return "EXTERNAL_POSITION"
+            qty = float(pos_data.get("quantity", 0.0) or 0.0)
+            if qty > 0:
+                return "BOT_POSITION"
+
+        # 3) Wallet fallback (treat remaining base-asset holdings as external inventory)
+        if base_asset in quote_assets:
+            return "STABLE"
+        try:
+            bal = (self.balances or {}).get(base_asset)
+            if isinstance(bal, dict):
+                qty = float(bal.get("free", 0.0) or 0.0) + float(bal.get("locked", 0.0) or 0.0)
+            else:
+                qty = float(bal or 0.0)
+            if qty > 0:
+                return "EXTERNAL_POSITION"
+        except Exception:
+            pass
+
+        return None
 
     async def get_positions_by_classification(self, classification: str) -> Dict[str, Any]:
         """Get all positions matching a classification"""
@@ -6820,7 +7573,8 @@ class SharedState:
         
         Returns True if:
         1. Authoritative reservations have positive budget allocated, OR
-        2. Positions snapshot contains at least one position with qty > 0
+        2. Spendable quote balance is above a minimal executable floor, OR
+        3. Any position (including wallet inventory) has qty > 0
         
         This is the authoritative source of truth for ops plane readiness.
         No early returns, no race conditions, no timing-dependent logic.
@@ -6830,9 +7584,25 @@ class SharedState:
             reservations = self.get_authoritative_reservations()
             if sum(reservations.values()) > 0:
                 return True
+
+            # Check 2: Quote liquidity (free + locked)
+            quote_asset = str(getattr(self, "quote_asset", "USDT") or "USDT").upper()
+            min_floor = 0.0
+            try:
+                min_floor = float(getattr(self.config, "MIN_NOTIONAL_FLOOR", 0.0) or 0.0)
+            except Exception:
+                min_floor = 0.0
+            quote_bal = self.balances.get(quote_asset)
+            quote_total = 0.0
+            if isinstance(quote_bal, dict):
+                quote_total = float(quote_bal.get("free", 0.0) or 0.0) + float(quote_bal.get("locked", 0.0) or 0.0)
+            elif quote_bal is not None:
+                quote_total = float(quote_bal or 0.0)
+            if quote_total >= max(0.0, min_floor):
+                return True
             
-            # Check 2: Positions snapshot
-            snap = self.get_positions_snapshot()
+            # Check 3: Positions snapshot (include wallet inventory)
+            snap = self.get_positions_snapshot(include_wallet_inventory=True)
             for p in snap.values():
                 if float(p.get("quantity", 0.0)) > 0:
                     return True
@@ -6923,7 +7693,8 @@ class SharedState:
         p = self.positions.get(self._norm_sym(symbol))
         if not p:
             return 0.0
-        qty = float(p.get("quantity", 0.0))
+        # Canonical qty access: support both `quantity` and legacy `qty`.
+        qty = float(p.get("quantity", p.get("qty", 0.0)) or p.get("qty", 0.0) or 0.0)
         fee_base = float(p.get("buy_fee_base", 0.0) or 0.0)
         return max(0.0, qty - fee_base)
 
@@ -7037,8 +7808,29 @@ class SharedState:
         s = str(symbol).upper()
         sd = str(side).upper()
         now = time.time()
+        market_closed_block_sec = float(
+            getattr(self.config, "MARKET_CLOSED_BLOCK_SECONDS", 900.0) or 900.0
+        )
+
+        def _is_market_closed_reason(reason_text: str) -> bool:
+            rt = str(reason_text or "").upper()
+            return (
+                "MARKET IS CLOSED" in rt
+                or "SYMBOL IS CLOSED" in rt
+                or ("CODE=-1013" in rt and "CLOSED" in rt)
+            )
+
         for (sym_k, side_k, reason_k), ts in list(self.rejection_timestamps.items()):
-            if sym_k == s and side_k == sd and (now - ts) <= float(window_seconds):
+            if sym_k != s or side_k != sd:
+                continue
+
+            age = now - ts
+            if age <= float(window_seconds):
+                return True
+
+            # Targeted long quarantine for exchange-level market-closed rejections.
+            # Prevents pathological loops repeatedly trying a temporarily disabled pair.
+            if _is_market_closed_reason(reason_k) and age <= market_closed_block_sec:
                 return True
         return False
 

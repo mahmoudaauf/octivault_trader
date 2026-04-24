@@ -44,6 +44,7 @@ import json
 import uuid
 import threading
 import os
+import contextlib
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -160,6 +161,14 @@ try:
     )
 except ImportError as e:
     _error_framework_import_warning = f"Error framework not available: {e}"
+    # Fallback exception shims so `except ExchangeError/TraderException`
+    # clauses remain valid even when the typed framework import is partial.
+    class TraderException(Exception):
+        pass
+
+    class ExchangeError(Exception):
+        pass
+
     # Provide fallback dummy handler
     def get_error_handler():
         """Fallback error handler when error framework not available."""
@@ -1465,14 +1474,18 @@ class MetaController:
             bool: True if can open new position, False if at limit
         """
         regime = self.regime_manager.get_regime()
-        max_pos = self.regime_manager.get_max_positions()
+        max_pos = self._get_max_positions()
         current_pos = self._count_open_positions()
         
         can_open = current_pos < max_pos
         
         if not can_open:
-            self.logger.info("[REGIME:MaxPos] Blocking trade: %s regime allows max %d open, currently have %d",
-                           regime, max_pos, current_pos)
+            self.logger.info(
+                "[REGIME:MaxPos] Blocking trade: %s effective max=%d open_positions=%d",
+                regime,
+                max_pos,
+                current_pos,
+            )
         
         return can_open
 
@@ -1766,6 +1779,7 @@ class MetaController:
         kernel_state: Optional["KernelState"] = None,
         portfolio_manager: Optional[object] = None,
         adaptive_capital_engine=None,
+        signal_manager=None,  # CRITICAL: Accept external SignalManager to share with orchestrator
     ):
         self.shared_state = shared_state
         self.exchange_client = exchange_client
@@ -1832,8 +1846,8 @@ class MetaController:
             bootstrap_budget = float(getattr(config, 'BOOTSTRAP_BUDGET', 1000.0))
             if BootstrapOrchestrator is not None:
                 self.bootstrap_orchestrator = BootstrapOrchestrator(
-                    initial_budget=bootstrap_budget,
-                    logger=self.logger
+                    shared_state=shared_state,
+                    meta_controller=self
                 )
                 self.logger.info(f"[Meta:Init] BootstrapOrchestrator initialized: budget={bootstrap_budget}")
             else:
@@ -1842,7 +1856,7 @@ class MetaController:
             
             # Arbitration Engine: 6-layer signal evaluation pipeline
             if ArbitrationEngine is not None:
-                self.arbitration_engine = ArbitrationEngine()
+                self.arbitration_engine = ArbitrationEngine(shared_state=shared_state, config=config)
                 self.logger.info("[Meta:Init] ArbitrationEngine initialized")
             else:
                 self.arbitration_engine = None
@@ -1924,6 +1938,7 @@ class MetaController:
 
         # WHY_NO_TRADE counters for fast observability
         self._why_no_trade_counts = defaultdict(int)
+        self._why_no_trade_class_counts = defaultdict(int)
 
         # Universe-layer limits are independent from allocation max_positions.
         # Keep legacy fallback to MAX_ACTIVE_SYMBOLS for backward compatibility.
@@ -1961,6 +1976,9 @@ class MetaController:
         self._bootstrap_lock_engaged = False
         self._bootstrap_cooldown_until = 0.0
         self._bootstrap_last_veto_reason = None
+        # Local BUY rejection quarantine map: (symbol, side) -> unblock_ts
+        # Used as a defensive layer when exchange returns persistent market-closed errors.
+        self._symbol_side_block_until: Dict[Tuple[str, str], float] = {}
         self._running = False
         self._stop = False
         self._trade_intent_subscriber_name = f"MetaController.trade_intent.{id(self)}"
@@ -2008,7 +2026,7 @@ class MetaController:
             "per_symbol": {},          # Latest per symbol
             "universe_stats": None,
             "cache_time": 0.0,
-            "ttl": 5.0,               # 5 second TTL
+            "ttl": 30.0,              # 30 second TTL (allow signals to persist across multiple cycles)
             "max_recent": 100         # Keep last 100 signals
         }
         
@@ -2256,7 +2274,7 @@ class MetaController:
         # Enforce position structure limits before BUY execution
         # ═══════════════════════════════════════════════════════════════════
         from core.capital_governor import CapitalGovernor
-        self.capital_governor = CapitalGovernor(config)
+        self.capital_governor = CapitalGovernor(config, shared_state=self.shared_state)
         self.logger.info("[Meta:Init] Capital Governor initialized for position limiting")
         
         self._throughput_window_sec = 600.0  # 10 minutes throughput window
@@ -2282,7 +2300,22 @@ class MetaController:
 
         # Use SignalManager for all signal cache and intake logic
         from core.signal_manager import SignalManager
-        self.signal_manager = SignalManager(config, self.logger, self.signal_cache, self.intent_manager)
+        if signal_manager is not None:
+            # CRITICAL FIX: Use external SignalManager passed from orchestrator (shares cache with injector)
+            self.signal_manager = signal_manager
+            # Ensure event-bus intents drained by MetaController are actually flushed into
+            # the shared signal cache when an external SignalManager is injected.
+            # Without this wiring, flush_intents_to_cache() drains zero usable items.
+            self.signal_manager.intent_manager = self.intent_manager
+            if getattr(self.signal_manager, "signal_cache", None) is not None:
+                self.signal_cache = self.signal_manager.signal_cache
+            if getattr(self.signal_manager, "shared_state", None) is None:
+                self.signal_manager.shared_state = self.shared_state
+            self.logger.warning(f"[Meta:Init] Using EXTERNAL SignalManager (shared with orchestrator/injector)")
+        else:
+            # Fallback: Create internal SignalManager (for testing without orchestrator)
+            self.signal_manager = SignalManager(config, self.logger, self.signal_cache, self.intent_manager)
+            self.logger.info(f"[Meta:Init] Created internal SignalManager (standalone mode)")
 
         # Initialize SignalFusion for multi-agent consensus voting (P9-compliant async component)
         # ALPHA AMPLIFIER: Use composite_edge mode for institutional-grade edge aggregation
@@ -2321,7 +2354,7 @@ class MetaController:
         # Dynamically switches system behavior based on live NAV from SharedState
         # ═══════════════════════════════════════════════════════════════════
         from core.nav_regime import RegimeManager
-        self.regime_manager = RegimeManager(self.logger)
+        self.regime_manager = RegimeManager(self.logger, self.config)
         self.logger.info("[Meta:Init] NAV Regime Manager initialized (MICRO_SNIPER <1000, STANDARD 1000-5000, MULTI_AGENT >=5000)")
 
         # Profit-locked re-entry (compounding guard)
@@ -2390,6 +2423,20 @@ class MetaController:
         self.DUST_EXIT_ENABLED = bool(getattr(config, "DUST_EXIT_ENABLED", True))
         self.DUST_EXIT_THRESHOLD = float(getattr(config, "DUST_EXIT_THRESHOLD", 0.60))
         self.DUST_EXIT_NO_TRADE_CYCLES = int(getattr(config, "DUST_EXIT_NO_TRADE_CYCLES", 20))
+        # Dust sacrifice prioritization defaults (guards against missing-attribute runtime faults)
+        self.SACRIFICE_MEME_COINS = tuple(
+            getattr(
+                config,
+                "SACRIFICE_MEME_COINS",
+                ("DOGE", "SHIB", "PEPE", "FLOKI", "BONK", "WIF"),
+            )
+        )
+        self.SACRIFICE_PRECIOUS = tuple(
+            getattr(config, "SACRIFICE_PRECIOUS", ("BTC", "ETH"))
+        )
+        self.SACRIFICE_PRIORITY_MEME = int(getattr(config, "SACRIFICE_PRIORITY_MEME", 0))
+        self.SACRIFICE_PRIORITY_COMMON = int(getattr(config, "SACRIFICE_PRIORITY_COMMON", 50))
+        self.SACRIFICE_PRIORITY_PRECIOUS = int(getattr(config, "SACRIFICE_PRIORITY_PRECIOUS", 100))
 
         # Time-based exit configuration
         self._time_exit_enabled = bool(getattr(config, "TIME_EXIT_ENABLED", True))
@@ -2455,6 +2502,22 @@ class MetaController:
         self._init_symbol_lifecycle()
         # Build marker for operational verification in live logs.
         self.logger.info("[Meta:Build] RECOVERY_FORCE_SELL_FIX_V2 enabled (2026-02-14).")
+        
+        # Watchdog periodic status reporting
+        self._decision_counter = 0
+        self._last_watchdog_report_ts = time.time()
+        self._watchdog_report_interval_s = 30.0  # Report to watchdog every 30 seconds
+
+    async def _report_watchdog_status(self, status: str = "Operational", detail: str = ""):
+        """Report status to watchdog for health monitoring"""
+        try:
+            update_fn = getattr(self.shared_state, "update_component_status", None)
+            if update_fn:
+                result = update_fn("MetaController", status, detail)
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            pass  # Status reporting is non-critical
 
     def _get_current_planned_quote(self, signal: Dict[str, Any]) -> float:
         """Best-effort quote hint for non-execution paths."""
@@ -2571,6 +2634,10 @@ class MetaController:
             try:
                 if hasattr(self.shared_state, "classify_position_snapshot"):
                     is_open, _value, _floor = self.shared_state.classify_position_snapshot(sym, pos_obj or {})
+                    # 🔧 FIX: Filter out dust positions worth < $0.50 (they were blocking all new trades)
+                    if is_open and _value < 0.50:
+                        self.logger.debug(f"[Meta:DustFilter] Ignoring dust position {sym} (value=${_value:.2f})")
+                        return False
                     return bool(is_open)
             except TypedValidationError as e:
                 classification = handler.handle_exception(e, 
@@ -2584,6 +2651,14 @@ class MetaController:
                 pass
             status = str((pos_obj or {}).get("status") or "").upper()
             qty_local = float((pos_obj or {}).get("quantity") or (pos_obj or {}).get("qty") or 0.0)
+            price_local = float((pos_obj or {}).get("price") or (pos_obj or {}).get("latest_price") or 0.0)
+            value_local = qty_local * price_local if price_local > 0 else 0.0
+            
+            # 🔧 FIX: Exclude dust positions (< $0.50 value) from blocking new trades
+            if qty_local > 0 and value_local < 0.50:
+                self.logger.debug(f"[Meta:DustFilter] Ignoring dust position {sym} (qty={qty_local}, value=${value_local:.2f})")
+                return False
+            
             return bool(qty_local > 0 and status in {"OPEN", "PARTIALLY_FILLED", "SIGNIFICANT", "ACTIVE", "IN_POSITION", "RUNNING"})
 
         handler = get_error_handler()
@@ -3301,6 +3376,146 @@ class MetaController:
             self.logger.warning("[Meta:PosCounts] Fallback also failed: %s. Returning zeros.", e)
             return 0, 0, 0
 
+    async def _reconcile_open_trade_book(self) -> int:
+        """
+        Keep open_trades aligned with live significant positions during long no-trade streaks.
+        This prevents stale capacity perception when trade state drifts after API lag/restarts.
+        """
+        repaired = 0
+        try:
+            pos_getter = getattr(self.shared_state, "get_positions_snapshot", None)
+            positions = pos_getter() if callable(pos_getter) else getattr(self.shared_state, "positions", {})
+            open_trades = getattr(self.shared_state, "open_trades", None)
+            classify_snapshot = getattr(self.shared_state, "classify_position_snapshot", None)
+            if not isinstance(positions, dict) or not isinstance(open_trades, dict):
+                return 0
+
+            for sym, pos in list(positions.items()):
+                if not isinstance(pos, dict):
+                    continue
+                qty = float((pos or {}).get("quantity", (pos or {}).get("qty", 0.0)) or 0.0)
+                if qty <= 0.0:
+                    open_trades.pop(sym, None)
+                    continue
+                if bool((pos or {}).get("_mirrored", False)):
+                    # Wallet mirrored inventory is not a bot-managed open trade.
+                    continue
+                if str((pos or {}).get("status", "")).upper() in {"CLOSED", "LIQUIDATED"}:
+                    open_trades.pop(sym, None)
+                    continue
+
+                is_significant = True
+                if callable(classify_snapshot):
+                    with contextlib.suppress(Exception):
+                        is_significant, _val, _floor = classify_snapshot(sym, pos)
+                if not is_significant:
+                    open_trades.pop(sym, None)
+                    continue
+
+                ot = open_trades.get(sym)
+                if not isinstance(ot, dict):
+                    entry_price = float(
+                        (pos or {}).get("entry_price")
+                        or (pos or {}).get("avg_price")
+                        or (pos or {}).get("mark_price")
+                        or (pos or {}).get("current_price")
+                        or 0.0
+                    )
+                    open_trades[sym] = {
+                        "symbol": sym,
+                        "quantity": qty,
+                        "entry_price": entry_price,
+                        "avg_price": float((pos or {}).get("avg_price") or entry_price),
+                        "opened_at": float(
+                            (pos or {}).get("opened_at")
+                            or (pos or {}).get("created_at")
+                            or (pos or {}).get("last_fill_ts")
+                            or time.time()
+                        ),
+                        "status": "OPEN",
+                        "_reconciled": True,
+                    }
+                    repaired += 1
+                    continue
+
+                ot_qty = float((ot or {}).get("quantity", 0.0) or 0.0)
+                if abs(ot_qty - qty) > max(1e-10, qty * 0.001):
+                    ot["quantity"] = qty
+                    open_trades[sym] = ot
+
+            if repaired > 0:
+                self.logger.warning(
+                    "[Meta:OpenTradeReconcile] repaired=%d after no-trade streak (cycles=%d)",
+                    int(repaired),
+                    int(getattr(self, "cycles_no_trade", 0) or 0),
+                )
+            with contextlib.suppress(Exception):
+                metrics = getattr(self.shared_state, "metrics", None)
+                if isinstance(metrics, dict) and repaired > 0:
+                    metrics["open_trade_reconciliations"] = int(metrics.get("open_trade_reconciliations", 0) or 0) + int(
+                        repaired
+                    )
+        except Exception as exc:
+            self.logger.debug("[Meta:OpenTradeReconcile] skipped due to error: %s", exc)
+            return 0
+        return int(repaired)
+
+    def _get_owned_positions_for_exit(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Canonical exit-authority position source.
+
+        Primary source: bot-managed significant positions (get_open_positions()).
+        Fallback source: significant wallet inventory (mirrored balances), so recovery
+        logic can still SELL existing holdings when bot-managed position records are empty.
+        """
+        owned = self.shared_state.get_open_positions() or {}
+        if owned:
+            return owned
+
+        fallback: Dict[str, Dict[str, Any]] = {}
+        try:
+            snapshot = self.shared_state.get_positions_snapshot(include_wallet_inventory=True) or {}
+        except TypeError:
+            snapshot = self.shared_state.get_positions_snapshot() or {}
+        except Exception:
+            snapshot = {}
+
+        for sym, pos in (snapshot or {}).items():
+            if not isinstance(pos, dict):
+                continue
+            qty = float(pos.get("quantity", 0.0) or pos.get("qty", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+
+            is_significant = True
+            value_usdt = float(pos.get("value_usdt", 0.0) or 0.0)
+            try:
+                if hasattr(self.shared_state, "classify_position_snapshot"):
+                    is_significant, cls_value, _floor = self.shared_state.classify_position_snapshot(sym, pos)
+                    value_usdt = float(cls_value or value_usdt)
+                else:
+                    is_significant = not bool(pos.get("is_dust", False) or pos.get("_is_dust", False))
+            except Exception:
+                is_significant = not bool(pos.get("is_dust", False) or pos.get("_is_dust", False))
+
+            if not is_significant:
+                continue
+
+            norm_sym = str(sym or "").upper()
+            record = dict(pos)
+            record["is_significant"] = True
+            if value_usdt > 0:
+                record["value_usdt"] = value_usdt
+            fallback[norm_sym] = record
+
+        if fallback:
+            self._info_once(
+                "__exit_positions_wallet_fallback__",
+                "[Meta:Positions] Using wallet-inventory fallback for exit authority (%d significant symbols).",
+                len(fallback),
+            )
+        return fallback
+
 ############################################################
 # SECTION: State & Internal Counters  
 # Responsibility:
@@ -3671,8 +3886,24 @@ class MetaController:
         from core.position_operation_validator import OperationType
         
         # Determine if this is a liquidation or normal exit
-        reason_text = str(signal.get("reason", "")).upper()
-        is_liquidation = "liquidation" in reason_text or sell_tag == "liquidation"
+        raw_reason = str(signal.get("reason") or "").strip()
+        fallback_reason = str(
+            signal.get("exit_reason")
+            or signal.get("signal_reason")
+            or sell_tag
+            or "meta_exit"
+        ).strip()
+        validation_reason = raw_reason or fallback_reason
+
+        # Ensure forced-capacity/rotation exits carry an explicit authority marker so
+        # ownership safety checks can distinguish them from accidental sells.
+        if self._is_forced_capacity_recovery_sell(signal):
+            reason_u = validation_reason.upper()
+            if ("CAPITAL_RECOVERY" not in reason_u) and ("ROTATION" not in reason_u):
+                validation_reason = f"CAPITAL_RECOVERY::{validation_reason}"
+
+        reason_text = validation_reason.upper()
+        is_liquidation = "LIQUIDATION" in reason_text or sell_tag == "liquidation"
         
         operation_type = OperationType.LIQUIDATION if is_liquidation else OperationType.TRADE_EXIT
         
@@ -3681,7 +3912,7 @@ class MetaController:
             operation_type=operation_type,
             symbol=symbol,
             quantity=qty,
-            reason=signal.get("reason", "")
+            reason=validation_reason
         )
         
         if not validation_result.allowed:
@@ -3702,6 +3933,26 @@ class MetaController:
             "[Meta:SafetyGate:SELL] Operation validated: SELL %s qty=%.8f (type: %s)",
             symbol, qty, operation_type.value
         )
+
+        # Hard execution-time gate for regular meta exits:
+        # Prevent sub-economic churn from bypassing earlier decision-layer checks.
+        if sell_tag == "meta_exit" and not is_liquidation and not self._is_forced_capacity_recovery_sell(signal):
+            profit_ok = await self._passes_meta_sell_profit_gate(symbol, signal)
+            excursion_ok = await self._passes_meta_sell_excursion_gate(symbol, signal)
+            if not (profit_ok and excursion_ok):
+                self.logger.warning(
+                    "[Meta:ExitHardGate] Blocking meta_exit SELL %s (profit=%s excursion=%s reason=%s)",
+                    symbol,
+                    profit_ok,
+                    excursion_ok,
+                    validation_reason or signal.get("reason", ""),
+                )
+                return {
+                    "ok": False,
+                    "status": "blocked",
+                    "reason": "meta_exit_hard_gate",
+                    "error_code": "META_EXIT_HARD_GATE",
+                }
         
         if sell_tag == "meta_exit" or self._is_full_sell_exit(symbol, signal, qty):
             exit_reason = str(
@@ -3711,12 +3962,34 @@ class MetaController:
                 or sell_tag
                 or "meta_exit"
             )
-            return await self.execution_manager.close_position(
+            result = await self.execution_manager.close_position(
                 symbol=symbol,
                 reason=exit_reason,
                 tag=sell_tag,
+                is_liquidation=is_liquidation,
                 force_finalize=True,
+                trace_id=(signal.get("trace_id") or signal.get("decision_id")),
+                policy_context=policy_ctx,
             )
+            try:
+                reason_u = str((result or {}).get("reason", "")).upper()
+                code_u = str((result or {}).get("error_code", "")).upper()
+                status_u = str((result or {}).get("status", "")).upper()
+                if status_u == "BLOCKED" and ("SELL_DYNAMIC_EDGE_MIN" in code_u or "SELL_DYNAMIC_EDGE_BELOW_MIN" in reason_u):
+                    cooldown_s = float(self._cfg("SELL_EDGE_RETRY_COOLDOWN_SEC", 45.0) or 45.0)
+                    block_key = (str(symbol or "").upper(), "SELL")
+                    self._symbol_side_block_until[block_key] = max(
+                        float(self._symbol_side_block_until.get(block_key, 0.0) or 0.0),
+                        time.time() + cooldown_s,
+                    )
+                    self.logger.info(
+                        "[Meta:SellCooldown] Set SELL retry cooldown for %s (%ss) after dynamic-edge block.",
+                        symbol,
+                        int(cooldown_s),
+                    )
+            except Exception:
+                self.logger.debug("[Meta:SellCooldown] Failed to set SELL cooldown for %s", symbol, exc_info=True)
+            return result
         # PHASE 3: Create TradeIntent instead of passing loose parameters
         trade_intent = TradeIntent(
             symbol=symbol,
@@ -3729,7 +4002,7 @@ class MetaController:
             confidence=signal.get("confidence", 0.0),
             agent=signal.get("agent"),
             is_liquidation=signal.get("_is_liquidation", False),  # FIX #11B: Pass liquidation flag to ExecutionManager
-            reason=signal.get("reason", ""),  # CRITICAL: Include reason for governance tier determination
+            reason=validation_reason,  # CRITICAL: Include reason for governance tier determination
         )
         return await self._route_and_execute(trade_intent)
 
@@ -3754,6 +4027,8 @@ class MetaController:
             or "FORCED_CAPACITY" in reason_text
             or "PORTFOLIO_FULL" in reason_text
             or "CAPITAL_RECOVERY" in reason_text
+            or "SELL_RECOVERY" in reason_text
+            or "FLAT_PORTFOLIO" in reason_text
             or "ROTATION" in reason_text
             or "REBALANCE" in reason_text
             or "STAGNATION" in reason_text
@@ -3761,6 +4036,7 @@ class MetaController:
 
     async def _passes_meta_sell_profit_gate(self, symbol: str, sig: Dict[str, Any]) -> bool:
         """Fee-aware profit gate for MetaController-originated SELLs."""
+        strict_profit_only = bool(getattr(self.config, "STRICT_PROFIT_ONLY_SELLS", False))
         reason_text = " ".join([
             str(sig.get("reason") or ""),
             str(sig.get("tag") or ""),
@@ -3772,25 +4048,44 @@ class MetaController:
         # When _forced_exit=True (from CONCENTRATION_REBALANCE or PORTFOLIO_REBALANCE),
         # bypass profit gate to allow recovery from loss positions
         if sig.get("_forced_exit") or "REBALANCE" in reason_text or "CONCENTRATION" in reason_text:
-            self.logger.warning(
-                "[Meta:ProfitGate] FORCED EXIT override for %s (bypassing profit gate for recovery). reason=%s",
-                symbol, reason_text or sig.get("reason", "?")
-            )
-            return True
-        
+            if strict_profit_only:
+                self.logger.info(
+                    "[Meta:ProfitGate] STRICT mode active; forced SELL for %s will still pass fee-aware profit gate. reason=%s",
+                    symbol, reason_text or sig.get("reason", "?")
+                )
+            else:
+                self.logger.warning(
+                    "[Meta:ProfitGate] FORCED EXIT override for %s (bypassing profit gate for recovery). reason=%s",
+                    symbol, reason_text or sig.get("reason", "?")
+                )
+                return True
+
         # ARCHITECTURAL FIX: Allow strategy reversal SELL regardless of profit
         # Directional exits (e.g., bearish signal) must not be blocked by fee gate.
         # Still subject to governance, excursion, SL, and risk gates.
         if sig.get("tag", "").startswith("strategy/"):
-            self.logger.info(
-                "[Meta:ProfitGate] Strategy reversal SELL bypass for %s (directional exit, not profit-capture).",
-                symbol
-            )
-            return True
-        
+            if strict_profit_only:
+                self.logger.info(
+                    "[Meta:ProfitGate] STRICT mode active; strategy SELL for %s must satisfy fee-aware profit gate.",
+                    symbol
+                )
+            else:
+                self.logger.info(
+                    "[Meta:ProfitGate] Strategy reversal SELL bypass for %s (directional exit, not profit-capture).",
+                    symbol
+                )
+                return True
+
         if self._is_forced_capacity_recovery_sell(sig):
-            self.logger.info("[Meta:ProfitGate] Forced recovery SELL bypass for %s.", symbol)
-            return True
+            if strict_profit_only:
+                self.logger.info(
+                    "[Meta:ProfitGate] STRICT mode active; recovery SELL for %s must satisfy fee-aware profit gate.",
+                    symbol
+                )
+            else:
+                self.logger.info("[Meta:ProfitGate] Forced recovery SELL bypass for %s.", symbol)
+                return True
+
         if (
             sig.get("_is_liquidation")
             or sig.get("_is_starvation_sell")
@@ -3885,7 +4180,12 @@ class MetaController:
         stagnation_override = bool(sig.get("_stagnation_override"))
         stagnation_exit_enabled = bool(getattr(self.config, "STAGNATION_EXIT_ENABLED", False))
         stagnation_max_loss_pct = abs(float(getattr(self.config, "STAGNATION_EXIT_MAX_LOSS_PCT", 0.0) or 0.0))
-        if stagnation_override and stagnation_exit_enabled and pnl_pct >= -stagnation_max_loss_pct:
+        if (
+            not strict_profit_only
+            and stagnation_override
+            and stagnation_exit_enabled
+            and pnl_pct >= -stagnation_max_loss_pct
+        ):
             self.logger.info(
                 "[Meta:ProfitGate] Stagnation override allows micro-loss exit for %s pnl=%.3f%% (max_loss=%.3f%%).",
                 symbol, pnl_pct * 100.0, stagnation_max_loss_pct * 100.0,
@@ -4206,7 +4506,19 @@ class MetaController:
             original_planned_quote = planned_quote
             planned_quote = float(planned_quote or 0.0) * float(ml_scale or 1.0)
             
-            if ml_scale != 1.0:
+            # FLOOR: ML scaling must not reduce below exchange minimum on small accounts
+            # On small accounts (<$500), aggressive ML scaling creates dust
+            nav_usd = float(await self.shared_state.get_nav() or 0.0)
+            if nav_usd < 500.0 and planned_quote < exchange_min_with_buffer:
+                # Clamp ML scaling to preserve minimum tradeable size
+                planned_quote = min(original_planned_quote, exchange_min_with_buffer)
+                self.logger.info(
+                    "[Meta:MLScaling] CLAMPED (small account): %s | "
+                    "original_scaled=%.2f → clamped=%.2f (ml_scale=%.2f, nav=%.2f, min=%.2f)",
+                    symbol, float(original_planned_quote or 0.0) * float(ml_scale or 1.0), 
+                    planned_quote, ml_scale, nav_usd, exchange_min_with_buffer
+                )
+            elif ml_scale != 1.0:
                 self.logger.info(
                     "[Meta:MLScaling] %s planned_quote scaled: %.2f → %.2f (ml_scale=%.2f)",
                     symbol, original_planned_quote, planned_quote, ml_scale
@@ -4228,25 +4540,37 @@ class MetaController:
                 realized_profit = 0.0
             realized_profit = max(0.0, realized_profit)
             base_quote = float(getattr(self.config, "PROFIT_LOCK_BASE_QUOTE", self._default_planned_quote) or self._default_planned_quote)
-            if planned_quote > (base_quote + realized_profit):
-                self.logger.info(
-                    "[Meta:BuyGate] PROFIT_LOCK %s planned_quote=%.2f > base+realized=%.2f",
-                    symbol, planned_quote, base_quote + realized_profit,
+            profit_lock_limit = float(base_quote + realized_profit)
+            if planned_quote > profit_lock_limit:
+                # Allow a small notional uplift so exchange/step-size rounding floors
+                # do not deadlock entries on small accounts.
+                profit_lock_tolerance = float(
+                    getattr(self.config, "PROFIT_LOCK_QUOTE_TOLERANCE_USDT", 1.0) or 1.0
                 )
-                return False
-            
-            # 🔑 STEP 2.5: Profitability Expectancy Rule (3x Fees)
-            # ═══════════════════════════════════════════════════════════════════════
-            is_profitable, err_msg = self.policy_manager.check_entry_profitability(
-                planned_quote, expected_alpha, taker_bps
-            )
-            if not is_profitable:
-                # RELAXATION: Allow if it's a consolidation BUY (dust merge)
-                # But log it clearly.
-                self.logger.warning("[Meta:Profitability] %s %s. Checking consolidation exception...", symbol, err_msg)
+                overage = float(planned_quote - profit_lock_limit)
+                if overage <= max(0.0, profit_lock_tolerance):
+                    self.logger.info(
+                        "[Meta:BuyGate] PROFIT_LOCK_TOLERANCE %s allowing quote %.2f "
+                        "(limit=%.2f overage=%.2f tolerance=%.2f)",
+                        symbol,
+                        planned_quote,
+                        profit_lock_limit,
+                        overage,
+                        profit_lock_tolerance,
+                    )
+                else:
+                    self.logger.info(
+                        "[Meta:BuyGate] PROFIT_LOCK %s planned_quote=%.2f > limit=%.2f (tolerance=%.2f)",
+                        symbol,
+                        planned_quote,
+                        profit_lock_limit,
+                        profit_lock_tolerance,
+                    )
+                    return False
             
             # ═══════════════════════════════════════════════════════════════════════
             # STEP 3: Get EXISTING position notional for this symbol
+            # (Check BEFORE profitability so we can allow consolidation exceptions)
             # ═══════════════════════════════════════════════════════════════════════
             existing_position_notional = 0.0
             is_existing_dust = False
@@ -4287,6 +4611,28 @@ class MetaController:
                     )
             except Exception as e:
                 self.logger.debug(f"[Meta:BuyGate] Failed to get existing position for {symbol}: {e}")
+            
+            # 🔑 STEP 2.5: Profitability Expectancy Rule (3x Fees)
+            # ═══════════════════════════════════════════════════════════════════════
+            # CRITICAL FIX: Skip profitability check for consolidation BUYs (dust healing)
+            # Consolidation signals are exempt because they improve portfolio health,
+            # not profit capture. The small quote is justified by dust clearing.
+            skip_profitability_check = bool(is_existing_dust)  # Consolidation case
+            
+            if skip_profitability_check:
+                self.logger.info(
+                    "[Meta:Profitability] CONSOLIDATION EXEMPT: Skipping profitability check for %s "
+                    "(existing_dust=%.2f, consolidation BUY). Dust healing takes priority.",
+                    symbol, existing_position_notional
+                )
+                is_profitable = True  # GRANT: Consolidation BUYs are exempt
+                err_msg = "consolidation_exempt"
+            else:
+                is_profitable, err_msg = self.policy_manager.check_entry_profitability(
+                    planned_quote, expected_alpha, taker_bps
+                )
+                if not is_profitable:
+                    self.logger.warning("[Meta:Profitability] %s %s", symbol, err_msg)
             
             # ═══════════════════════════════════════════════════════════════════════
             # STEP 4: Apply NO_DUST_BUY invariant with CONSOLIDATION ALLOWANCE
@@ -4388,8 +4734,27 @@ class MetaController:
             # Apply risk-based position cap formula
             if equity > 0 and sl_pct > 0:
                 risk_position = equity * risk_pct / sl_pct
-                max_position_cap = equity * 0.05
-                max_pos = min(risk_position, max_position_cap)
+                # Use configured exposure policy instead of hard-coded 5%,
+                # and keep a min-notional floor so micro NAV accounts can
+                # still place at least one exchange-valid order.
+                exposure_cap_pct = float(getattr(self.config, "MAX_POSITION_EXPOSURE_PCT", 0.20) or 0.20)
+                exposure_cap_pct = max(0.01, min(1.0, exposure_cap_pct))
+                min_notional_floor = float(getattr(self.config, "MIN_NOTIONAL_USDT", 10.0) or 10.0)
+                significant_floor = float(
+                    self._cfg(
+                        "MIN_SIGNIFICANT_POSITION_USDT",
+                        self._cfg("SIGNIFICANT_POSITION_FLOOR", self._cfg("SIGNIFICANT_POSITION_USDT", min_notional_floor)),
+                    )
+                )
+                min_entry_floor = float(self._cfg("MIN_ENTRY_USDT", self._cfg("SAFE_ENTRY_USDT", min_notional_floor)))
+                operational_target = float(planned_quote)
+                if is_existing_dust:
+                    operational_target += float(existing_position_notional)
+                operational_target = max(0.0, min(float(equity), operational_target))
+                effective_floor = max(min_notional_floor, significant_floor, min_entry_floor, operational_target)
+
+                max_position_cap = max(equity * exposure_cap_pct, effective_floor)
+                max_pos = min(max_position_cap, max(risk_position, effective_floor))
             else:
                 # Fallback if equity/sl_pct unavailable
                 max_pos = float(getattr(self.config, "MAX_POSITION_USDT", 30.0))
@@ -4675,19 +5040,36 @@ class MetaController:
         
         repeated_failures = False
         deadlock_threshold = int(getattr(self.config, "DEADLOCK_REJECTION_THRESHOLD", 10))
-        ignore_csv = str(getattr(self.config, "DEADLOCK_REJECTION_IGNORE_REASONS", "COLD_BOOTSTRAP_BLOCK,PORTFOLIO_FULL") or "")
+        ignore_csv = str(
+            getattr(
+                self.config,
+                "DEADLOCK_REJECTION_IGNORE_REASONS",
+                (
+                    "COLD_BOOTSTRAP_BLOCK,PORTFOLIO_FULL,EXPECTED_MOVE_LT_ROUND_TRIP_COST,POSITION_ALREADY_OPEN,"
+                    "CONF_BELOW_REQUIRED,NET_USDT_BELOW_THRESHOLD,PRETRADE_EFFECT_GATE:NET_USDT_BELOW_THRESHOLD,"
+                    "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
+                    "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
+                    "MICRO_BACKTEST_INSUFFICIENT_SAMPLES"
+                ),
+            )
+            or ""
+        )
         ignore_reasons = {r.strip().upper() for r in ignore_csv.split(",") if r.strip()}
         rej_ttl_sec = 300.0
         now_ts_local = time.time()
+        self.logger.debug(f"[Deadlock:Check] Ignore reasons: {ignore_reasons}, threshold={deadlock_threshold}")
         if hasattr(self.shared_state, "rejection_counters"):
             for (sym, side, reason), count in self.shared_state.rejection_counters.items():
                 reason_u = str(reason).upper()
+                self.logger.debug(f"[Deadlock:Check] {sym} {side} reason='{reason}' (normalized={reason_u}) count={count} ignored={reason_u in ignore_reasons}")
                 if reason_u in ignore_reasons:
+                    self.logger.debug(f"[Deadlock:Check] ✅ IGNORING {reason_u} (in ignore list)")
                     continue
                 ts = self.shared_state.rejection_timestamps.get((sym, side, reason), now_ts_local)
                 if now_ts_local - ts > rej_ttl_sec:
                     continue
                 if count >= deadlock_threshold:
+                    self.logger.critical(f"[Deadlock:TRIGGER] ❌ REPEATED FAILURES DETECTED: {reason_u} count={count} >= threshold={deadlock_threshold}")
                     repeated_failures = True
                     break
         
@@ -5187,6 +5569,33 @@ class MetaController:
 
             # Map directive amount to execution parameters
             if action == "BUY":
+                if bool(self._cfg("PRETRADE_DIRECTIVE_GATE_ENABLED", True)):
+                    directive_signal = dict(directive or {})
+                    if directive_signal.get("_expected_move_pct") is None and directive_signal.get("expected_move_pct") is None:
+                        with contextlib.suppress(Exception):
+                            directive_signal["_expected_move_pct"] = float(
+                                directive_signal.get("expected_alpha", directive_signal.get("alpha", 0.0)) or 0.0
+                            )
+
+                    pretrade_ok, pretrade_reason = self._passes_pretrade_effect_gate(
+                        symbol=symbol,
+                        signal=directive_signal,
+                        planned_quote=float(amount or 0.0),
+                        side="BUY",
+                    )
+                    if not pretrade_ok:
+                        self.logger.warning(
+                            "[Meta:Directive] Blocking BUY directive for %s due pre-trade gate=%s (amount=%.2f)",
+                            symbol,
+                            pretrade_reason,
+                            float(amount or 0.0),
+                        )
+                        return {
+                            "ok": False,
+                            "status": "pretrade_effect_gate",
+                            "reason": pretrade_reason,
+                        }
+
                 # For BUY: amount is the USDT planned_quote
                 # PHASE 3: Create TradeIntent
                 trade_intent = TradeIntent(
@@ -5634,8 +6043,17 @@ class MetaController:
             allowed_actions = ["NONE"]
             blocking_reason = "Manual / Compliance Pause and Freeze"
         elif mode == "PROTECTIVE":
-            allowed_actions = ["SELL", "LIQUIDATE"]
-            blocking_reason = "Capital Defense: New positions blocked"
+            # Micro-account exception: Allow BUY even in PROTECTIVE mode if account is very small
+            # This is critical because micro accounts with $60 NAV need to bootstrap and can't
+            # be blocked by protective mode when they haven't executed a single trade yet
+            nav_usd = float(getattr(self, '_last_nav_usd', 0.0) or 0.0)
+            if nav_usd > 0 and nav_usd < 500.0:
+                allowed_actions = ["BUY", "SELL", "LIQUIDATE"]
+                blocking_reason = None
+                rationale = "Micro-account bootstrap exception: Allow trading despite PROTECTIVE mode"
+            else:
+                allowed_actions = ["SELL", "LIQUIDATE"]
+                blocking_reason = "Capital Defense: New positions blocked"
         elif mode == "BOOTSTRAP":
             allowed_actions = ["BUY"]
             if not is_flat:
@@ -5708,8 +6126,21 @@ class MetaController:
         # but they cannot LOWER the floor for safety-critical modes (PROTECTIVE, SAFE, RECOVERY).
         if mode in ("PROTECTIVE", "SAFE", "RECOVERY"):
             effective = max(base, effective)
-            
-        return max(0.0, min(1.0, effective))
+        
+        final_floor = max(0.0, min(1.0, effective))
+        
+        # 🔍 DIAGNOSTIC: Log mode confidence floor
+        if not hasattr(self, "_mode_floor_log_count"):
+            self._mode_floor_log_count = 0
+        
+        if self._mode_floor_log_count < 10:  # Only log first 10 times to avoid spam
+            self.logger.critical(
+                "[Meta:ModeConfFloor] mode=%s base=%.3f nudge=%.3f effective=%.3f final=%.3f",
+                mode, base, nudge, effective, final_floor
+            )
+            self._mode_floor_log_count += 1
+        
+        return final_floor
 
     def _signal_tradeability_bypass(
         self,
@@ -5828,29 +6259,6 @@ class MetaController:
         if not isinstance(signal, dict):
             return None
 
-    def _adaptive_break_even_cap(self, be_floor: float, regime: str, atr_pct: float) -> float:
-        """
-        Regime + volatility aware cap for break-even probability.
-        Prevents economic deadlock in low-volatility environments.
-        """
-        regime_caps = {
-            "trend": 0.85,
-            "volatile": 0.80,
-            "sideways": 0.70,
-            "unknown": 0.75,
-        }
-
-        base_cap = regime_caps.get(regime or "unknown", 0.75)
-
-        # Volatility relaxation
-        if atr_pct is not None:
-            if atr_pct < 0.0015:        # 0.15%
-                base_cap *= 0.80
-            elif atr_pct < 0.003:       # 0.30%
-                base_cap *= 0.90
-
-        return min(be_floor, base_cap)
-
         def _coerce01(val: Any) -> Optional[float]:
             try:
                 num = float(val)
@@ -5859,6 +6267,47 @@ class MetaController:
             if num != num:
                 return None
             return max(0.0, min(1.0, num))
+
+        def _coerce_bias(val: Any) -> Optional[float]:
+            try:
+                num = float(val)
+            except Exception:
+                return None
+            if num != num:
+                return None
+            return max(-0.35, min(0.35, num))
+
+        def _lookup_regime_map_value(
+            mapping: Dict[str, Any],
+            regime_key: str,
+            coerce_fn,
+        ) -> Optional[float]:
+            if not isinstance(mapping, dict):
+                return None
+            raw = str(regime_key or "").strip()
+            if not raw:
+                return None
+
+            lower = raw.lower()
+            keys: List[str] = [raw, lower, raw.upper()]
+            if lower in {"high", "high_vol", "volatility_high", "volatile"}:
+                keys.extend(["volatile", "high", "high_vol", "volatility_high"])
+            elif lower in {"low", "low_vol", "sideways", "chop", "range", "flat"}:
+                keys.extend(["sideways", "low", "low_vol", "chop", "range", "flat"])
+            elif lower in {"trend", "trending", "normal"}:
+                keys.extend(["trend", "normal", "trending"])
+            else:
+                keys.extend(["unknown"])
+
+            seen = set()
+            for key in keys:
+                if key in seen:
+                    continue
+                seen.add(key)
+                val = coerce_fn(mapping.get(key))
+                if val is not None:
+                    return val
+            return None
 
         try:
             dyn_cfg = getattr(self.shared_state, "dynamic_config", {}) or {}
@@ -5874,8 +6323,22 @@ class MetaController:
             if num is not None:
                 dynamic_ev_candidates.append(num)
 
+        policy_bias_global = _coerce_bias((dyn_cfg.get("ML_DYNAMIC_REQUIRED_CONF_POLICY_BIAS") if isinstance(dyn_cfg, dict) else None))
+        policy_bias_regime = None
+        if regime and isinstance(dyn_cfg, dict):
+            policy_bias_by_regime = dyn_cfg.get("ML_DYNAMIC_REQUIRED_CONF_POLICY_BIAS_BY_REGIME", {}) or {}
+            policy_bias_regime = _lookup_regime_map_value(policy_bias_by_regime, regime, _coerce_bias)
+        policy_bias_total = None
+        if policy_bias_global is not None or policy_bias_regime is not None:
+            policy_bias_total = max(
+                -0.35,
+                min(0.35, float(policy_bias_global or 0.0) + float(policy_bias_regime or 0.0)),
+            )
+
         # Global dynamic EV floor from calibration.
         dyn_global = _coerce01((dyn_cfg.get("ML_DYNAMIC_REQUIRED_CONF") if isinstance(dyn_cfg, dict) else None))
+        if dyn_global is not None and policy_bias_total is not None:
+            dyn_global = _coerce01(float(dyn_global) + float(policy_bias_total))
         if dyn_global is not None:
             dynamic_ev_candidates.append(dyn_global)
 
@@ -5895,21 +6358,15 @@ class MetaController:
         if regime and isinstance(dyn_cfg, dict):
             by_regime = dyn_cfg.get("ML_DYNAMIC_REQUIRED_CONF_BY_REGIME", {}) or {}
             if isinstance(by_regime, dict):
-                regime_floor = _coerce01(by_regime.get(regime))
-                if regime_floor is None:
-                    regime_floor = _coerce01(by_regime.get(str(regime).lower()))
-                if regime_floor is None:
-                    regime_floor = _coerce01(by_regime.get(str(regime).upper()))
+                regime_floor = _lookup_regime_map_value(by_regime, regime, _coerce01)
+                if regime_floor is not None and policy_bias_total is not None:
+                    regime_floor = _coerce01(float(regime_floor) + float(policy_bias_total))
                 if regime_floor is not None:
                     regime_adj_candidates.append(regime_floor)
 
             be_by_regime = dyn_cfg.get("ML_BREAK_EVEN_PROB_BY_REGIME", {}) or {}
             if isinstance(be_by_regime, dict):
-                regime_be = _coerce01(be_by_regime.get(regime))
-                if regime_be is None:
-                    regime_be = _coerce01(be_by_regime.get(str(regime).lower()))
-                if regime_be is None:
-                    regime_be = _coerce01(be_by_regime.get(str(regime).upper()))
+                regime_be = _lookup_regime_map_value(be_by_regime, regime, _coerce01)
                 if regime_be is not None:
                     break_even_candidates.append(regime_be)
 
@@ -5917,10 +6374,24 @@ class MetaController:
         break_even_floor = max(break_even_candidates) if break_even_candidates else None
         regime_adjustment = max(regime_adj_candidates) if regime_adj_candidates else None
 
-        # Cap break-even confidence to prevent unrealistic win-prob demands (e.g. 96%)
+        # Cap break-even confidence to prevent unrealistic win-prob demands (e.g. 96%).
+        # Apply regime/volatility-aware adaptive cap to avoid deadlock in low-volatility conditions.
         if break_even_floor is not None:
             max_break_even_cap = float(self._cfg("MAX_BREAK_EVEN_CONF_CAP", 0.75))
             break_even_floor = min(break_even_floor, max_break_even_cap)
+
+            atr_pct = (
+                _coerce01(signal.get("_atr_pct"))
+                or _coerce01(signal.get("atr_pct"))
+                or _coerce01(signal.get("tradeability_atr_pct"))
+                or 0.0
+            )
+            cap_regime = regime_norm or "unknown"
+            if cap_regime in {"high", "high_vol", "volatility_high"}:
+                cap_regime = "volatile"
+            elif cap_regime in {"low", "low_vol", "chop", "range", "flat"}:
+                cap_regime = "sideways"
+            break_even_floor = self._adaptive_break_even_cap(float(break_even_floor), cap_regime, float(atr_pct or 0.0))
 
         high_regimes = {"high", "high_vol", "volatile", "volatility_high"}
         low_regimes = {"low", "low_vol", "sideways", "chop", "range", "flat"}
@@ -5962,6 +6433,29 @@ class MetaController:
         if not candidates:
             return None
         return max(candidates)
+
+    def _adaptive_break_even_cap(self, be_floor: float, regime: str, atr_pct: float) -> float:
+        """
+        Regime + volatility aware cap for break-even probability.
+        Prevents economic deadlock in low-volatility environments.
+        """
+        regime_caps = {
+            "trend": 0.85,
+            "volatile": 0.80,
+            "sideways": 0.70,
+            "unknown": 0.75,
+        }
+
+        base_cap = regime_caps.get(regime or "unknown", 0.75)
+
+        # Volatility relaxation
+        if atr_pct is not None:
+            if atr_pct < 0.0015:        # 0.15%
+                base_cap *= 0.80
+            elif atr_pct < 0.003:       # 0.30%
+                base_cap *= 0.90
+
+        return min(be_floor, base_cap)
 
     def _passes_tradeability_gate(
         self,
@@ -6005,6 +6499,140 @@ class MetaController:
         conf = float(signal.get("confidence", 0.0) or 0.0) if isinstance(signal, dict) else 0.0
         hint = str(signal.get("_tradeability_hint", "")).strip().lower() if isinstance(signal, dict) else ""
         strict_hint = bool(self._cfg("ML_TRADEABILITY_REQUIRE_HINT_MATCH", True))
+        regime_hint = str(
+            signal.get("_regime")
+            or signal.get("regime")
+            or signal.get("tradeability_regime")
+            or ""
+        ).strip().lower() if isinstance(signal, dict) else ""
+        high_regime = regime_hint in {"high", "high_vol", "volatile", "volatility_high", "extreme"}
+        low_regime = regime_hint in {"low", "low_vol", "sideways", "chop", "range", "flat"}
+
+        conf_rejections = 0
+        try:
+            if hasattr(self.shared_state, "get_rejection_count"):
+                conf_rejections = int(
+                    self.shared_state.get_rejection_count(symbol, "BUY", "CONF_BELOW_REQUIRED") or 0
+                )
+        except Exception:
+            conf_rejections = 0
+
+        required_conf_pre_feedback = float(required_conf)
+        base_medium_ratio = float(self._cfg("CONFIDENCE_BAND_MEDIUM_RATIO", 0.8) or 0.8)
+        medium_ratio = max(0.55, min(0.95, base_medium_ratio))
+        if low_regime:
+            low_regime_medium_ratio = float(
+                self._cfg("CONFIDENCE_BAND_LOW_REGIME_MEDIUM_RATIO", 0.74) or 0.74
+            )
+            medium_ratio = min(medium_ratio, max(0.60, min(0.95, low_regime_medium_ratio)))
+        feedback_relax_applied = False
+        feedback_sources: List[str] = []
+        feedback_floor_drop = 0.0
+        feedback_ratio_drop = 0.0
+        feedback_floor_guard_mult = float(self._cfg("TRADEABILITY_FEEDBACK_MIN_BASE_MULT", 0.85) or 0.85)
+        feedback_floor_guard_mult = max(0.50, min(1.00, feedback_floor_guard_mult))
+
+        fill_stall_sec = 0.0
+        recent_trades_in_window = 0
+        relax_trigger = int(self._cfg("TRADEABILITY_FEEDBACK_RELAX_TRIGGER", 3) or 3)
+        if conf_rejections >= max(1, relax_trigger):
+            relax_steps = min(8, conf_rejections - relax_trigger + 1)
+            floor_relax_step = float(self._cfg("TRADEABILITY_FEEDBACK_RELAX_STEP", 0.01) or 0.01)
+            floor_relax_max = float(self._cfg("TRADEABILITY_FEEDBACK_RELAX_MAX", 0.07) or 0.07)
+            ratio_relax_step = float(self._cfg("TRADEABILITY_FEEDBACK_MEDIUM_RATIO_STEP", 0.015) or 0.015)
+            ratio_relax_max = float(self._cfg("TRADEABILITY_FEEDBACK_MEDIUM_RATIO_MAX_DROP", 0.12) or 0.12)
+
+            floor_drop = min(floor_relax_max, relax_steps * floor_relax_step)
+            ratio_drop = min(ratio_relax_max, relax_steps * ratio_relax_step)
+
+            if high_regime:
+                floor_drop *= 0.45
+                ratio_drop *= 0.45
+            elif low_regime:
+                floor_drop *= 1.15
+                ratio_drop *= 1.10
+
+            if bootstrap_override or portfolio_flat:
+                floor_drop *= 1.10
+                ratio_drop *= 1.10
+
+            feedback_floor_drop += max(0.0, float(floor_drop))
+            feedback_ratio_drop += max(0.0, float(ratio_drop))
+            if floor_drop > 1e-9 or ratio_drop > 1e-9:
+                feedback_sources.append("conf_rejections")
+
+        fill_stall_enabled = bool(self._cfg("TRADEABILITY_FILL_STALL_RELAX_ENABLED", True))
+        if fill_stall_enabled:
+            stall_window_sec = max(
+                60.0,
+                float(self._cfg("TRADEABILITY_FILL_STALL_WINDOW_SEC", 900.0) or 900.0),
+            )
+            stall_max_steps = max(1, int(self._cfg("TRADEABILITY_FILL_STALL_MAX_STEPS", 6) or 6))
+            min_recent_trades = max(0, int(self._cfg("TRADEABILITY_FILL_STALL_MIN_RECENT_TRADES", 1) or 1))
+            now_ts = time.time()
+            last_trade_ts = 0.0
+            try:
+                trade_history = list(getattr(self.shared_state, "trade_history", []) or [])
+                # Bound scan cost while still keeping enough horizon for stall detection.
+                for item in reversed(trade_history[-512:]):
+                    if not isinstance(item, dict):
+                        continue
+                    ts = float(item.get("ts", 0.0) or 0.0)
+                    if ts <= 0.0:
+                        continue
+                    if last_trade_ts <= 0.0:
+                        last_trade_ts = ts
+                    if (now_ts - ts) <= stall_window_sec:
+                        recent_trades_in_window += 1
+                    if (now_ts - ts) > (stall_window_sec * 4.0) and recent_trades_in_window > 0:
+                        break
+            except Exception:
+                last_trade_ts = 0.0
+                recent_trades_in_window = 0
+
+            fill_stall_sec = (now_ts - last_trade_ts) if last_trade_ts > 0 else (stall_window_sec * 2.0)
+            no_recent_fill_flow = recent_trades_in_window < min_recent_trades
+            if no_recent_fill_flow and fill_stall_sec >= stall_window_sec:
+                stall_steps = min(stall_max_steps, int(fill_stall_sec // stall_window_sec))
+                stall_floor_step = float(self._cfg("TRADEABILITY_FILL_STALL_RELAX_STEP", 0.008) or 0.008)
+                stall_floor_max = float(self._cfg("TRADEABILITY_FILL_STALL_RELAX_MAX", 0.045) or 0.045)
+                stall_ratio_step = float(
+                    self._cfg("TRADEABILITY_FILL_STALL_MEDIUM_RATIO_STEP", 0.010) or 0.010
+                )
+                stall_ratio_max = float(
+                    self._cfg("TRADEABILITY_FILL_STALL_MEDIUM_RATIO_MAX_DROP", 0.10) or 0.10
+                )
+
+                stall_floor_drop = min(stall_floor_max, stall_steps * stall_floor_step)
+                stall_ratio_drop = min(stall_ratio_max, stall_steps * stall_ratio_step)
+
+                if high_regime:
+                    stall_floor_drop *= 0.60
+                    stall_ratio_drop *= 0.60
+                elif low_regime:
+                    stall_floor_drop *= 1.15
+                    stall_ratio_drop *= 1.10
+
+                if bootstrap_override or portfolio_flat:
+                    stall_floor_drop *= 1.10
+                    stall_ratio_drop *= 1.10
+
+                feedback_floor_drop += max(0.0, float(stall_floor_drop))
+                feedback_ratio_drop += max(0.0, float(stall_ratio_drop))
+                if stall_floor_drop > 1e-9 or stall_ratio_drop > 1e-9:
+                    feedback_sources.append("fill_stall")
+
+        if feedback_floor_drop > 0.0 or feedback_ratio_drop > 0.0:
+            conf_floor_guard = max(base_mode_floor, adaptive_base_floor * feedback_floor_guard_mult)
+            adjusted_required = max(conf_floor_guard, required_conf - feedback_floor_drop)
+            adjusted_medium_ratio = max(0.60, medium_ratio - feedback_ratio_drop)
+
+            feedback_relax_applied = (
+                (adjusted_required < required_conf - 1e-9)
+                or (adjusted_medium_ratio < medium_ratio - 1e-9)
+            )
+            required_conf = adjusted_required
+            medium_ratio = adjusted_medium_ratio
 
         # ═══════════════════════════════════════════════════════════════════
         # CONFIDENCE BAND TRADING (NEW)
@@ -6015,7 +6643,43 @@ class MetaController:
         # This increases trading opportunities without increasing risk.
         # ═══════════════════════════════════════════════════════════════════
         strong_conf = required_conf
-        medium_conf = required_conf * float(self._cfg("CONFIDENCE_BAND_MEDIUM_RATIO", 0.8))
+        medium_conf = required_conf * medium_ratio
+
+        if feedback_relax_applied:
+            signal["_tradeability_feedback_relaxed"] = True
+            signal["_tradeability_required_conf_pre_feedback"] = required_conf_pre_feedback
+            signal["_tradeability_required_conf_post_feedback"] = required_conf
+            signal["_tradeability_medium_ratio_post_feedback"] = medium_ratio
+            signal["_tradeability_feedback_sources"] = ",".join(feedback_sources) if feedback_sources else ""
+            signal["_tradeability_fill_stall_sec"] = float(fill_stall_sec)
+            signal["_tradeability_recent_trades_window"] = int(recent_trades_in_window)
+        
+        # 🔍 DIAGNOSTIC LOGGING: Show exact gate floor calculation
+        # This helps identify why signals pass or fail
+        self.logger.critical(
+            "[Meta:GateDebug:TRADEABILITY] %s BUY gate assessment: "
+            "signal_conf=%.3f | required_conf=%.3f "
+            "(base=%.3f mode=%.3f signal_floor=%.3f) | "
+            "strong_band=%.3f medium_band=%.3f medium_ratio=%.3f "
+            "feedback_relax=%s feedback_sources=%s conf_rejections=%d fill_stall_sec=%.0f recent_trades=%d bootstrap=%s | "
+            "result=%s",
+            symbol,
+            conf,
+            required_conf,
+            adaptive_base_floor,
+            base_mode_floor,
+            signal_floor or 0.0,
+            strong_conf,
+            medium_conf,
+            medium_ratio,
+            feedback_relax_applied,
+            ",".join(feedback_sources) if feedback_sources else "none",
+            conf_rejections,
+            fill_stall_sec,
+            recent_trades_in_window,
+            bootstrap_override,
+            "STRONG" if conf >= strong_conf else ("MEDIUM" if conf >= medium_conf else "REJECT"),
+        )
         
         # Store position scale in signal for later application to planned_quote
         if conf >= strong_conf:
@@ -6031,18 +6695,31 @@ class MetaController:
             gate_reason = "conf_below_floor"
             passes = False
 
-        if strict_hint and hint == "below_required_conf" and conf < required_conf:
+        # Strict hint should align with the currently active acceptance band.
+        # Otherwise, a "below_required_conf" hint can incorrectly veto medium-band passes.
+        if strict_hint and hint == "below_required_conf" and conf < medium_conf:
             self.logger.debug(
-                "[Meta:Tradeability] %s BUY blocked by hint (conf=%.2f required=%.2f strong=%.2f medium=%.2f).",
+                "[Meta:Tradeability] %s BUY blocked by hint (conf=%.2f medium=%.2f required=%.2f strong=%.2f).",
                 symbol,
                 conf,
+                medium_conf,
                 required_conf,
                 strong_conf,
-                medium_conf,
             )
             return False, required_conf, "hint_below_required_conf"
         
         if not passes:
+            self.logger.critical(
+                "[Meta:GateDebug:TRADEABILITY_REJECTED] %s BUY REJECTED: "
+                "conf=%.3f < medium_band=%.3f (required_conf=%.3f) | "
+                "reason=%s | pass=%s",
+                symbol,
+                conf,
+                medium_conf,
+                required_conf,
+                gate_reason,
+                passes,
+            )
             return False, required_conf, gate_reason
         
         # Log confidence band decision
@@ -6059,6 +6736,753 @@ class MetaController:
         
         return True, required_conf, gate_reason
 
+    def _estimate_expected_move_pct_from_market(self, symbol: str) -> Optional[float]:
+        """
+        Best-effort expected move ratio (e.g., 0.006 = 0.6%) when signal metadata is missing.
+        This keeps pre-trade viability deterministic for symbols whose upstream agents omit
+        expected-move fields.
+        """
+
+        def _coerce_ratio(val: Any) -> Optional[float]:
+            try:
+                ratio = float(val)
+            except Exception:
+                return None
+            if ratio != ratio:
+                return None
+            if abs(ratio) > 1.0:
+                ratio = ratio / 100.0
+            return float(abs(ratio))
+
+        if not bool(self._cfg("PRETRADE_POPULATE_MISSING_EXPECTED_MOVE", True)):
+            return None
+
+        tf = str(
+            self._cfg(
+                "PRETRADE_EXPECTED_MOVE_TIMEFRAME",
+                self._cfg("PRETRADE_MICRO_BACKTEST_TIMEFRAME", "5m"),
+            )
+            or "5m"
+        )
+        lookback = max(20, int(self._cfg("PRETRADE_EXPECTED_MOVE_LOOKBACK_BARS", 120) or 120))
+        atr_period = max(2, int(self._cfg("PRETRADE_EXPECTED_MOVE_ATR_PERIOD", 14) or 14))
+        atr_mult = max(0.2, float(self._cfg("PRETRADE_EXPECTED_MOVE_ATR_MULT", 1.0) or 1.0))
+        fallback_ratio = _coerce_ratio(
+            self._cfg(
+                "PRETRADE_EXPECTED_MOVE_FALLBACK_RATIO",
+                self._cfg("ML_EXPECTED_MOVE_FALLBACK_PCT", 0.0065),
+            )
+        )
+        min_ratio = _coerce_ratio(self._cfg("PRETRADE_EXPECTED_MOVE_MIN_RATIO", 0.0010))
+        max_ratio = _coerce_ratio(self._cfg("PRETRADE_EXPECTED_MOVE_MAX_RATIO", 0.0500))
+
+        fallback_ratio = float(fallback_ratio if fallback_ratio is not None else 0.0065)
+        min_ratio = float(min_ratio if min_ratio is not None else 0.0010)
+        max_ratio = float(max_ratio if max_ratio is not None else 0.0500)
+
+        rows: List[Any] = []
+        with contextlib.suppress(Exception):
+            getter = getattr(self.shared_state, "get_market_data_sync", None)
+            if callable(getter):
+                rows = list(getter(symbol, tf) or [])
+
+        if not rows:
+            return max(min_ratio, min(max_ratio, fallback_ratio))
+
+        highs: List[float] = []
+        lows: List[float] = []
+        closes: List[float] = []
+        for row in rows[-lookback:]:
+            h = l = c = 0.0
+            if isinstance(row, dict):
+                with contextlib.suppress(Exception):
+                    h = float(row.get("h", row.get("high", 0.0)) or 0.0)
+                with contextlib.suppress(Exception):
+                    l = float(row.get("l", row.get("low", 0.0)) or 0.0)
+                with contextlib.suppress(Exception):
+                    c = float(row.get("c", row.get("close", row.get("price", 0.0))) or 0.0)
+            elif isinstance(row, (list, tuple)) and len(row) >= 5:
+                with contextlib.suppress(Exception):
+                    h = float(row[2])
+                with contextlib.suppress(Exception):
+                    l = float(row[3])
+                with contextlib.suppress(Exception):
+                    c = float(row[4])
+            if h > 0.0 and l > 0.0 and c > 0.0:
+                highs.append(h)
+                lows.append(l)
+                closes.append(c)
+
+        if len(closes) < 2:
+            return max(min_ratio, min(max_ratio, fallback_ratio))
+
+        est_ratio = 0.0
+
+        # 1) Prefer ATR-like estimate.
+        if len(closes) > atr_period:
+            tr_values: List[float] = []
+            for idx in range(1, len(closes)):
+                prev_close = float(closes[idx - 1])
+                high = float(highs[idx])
+                low = float(lows[idx])
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                if tr > 0.0:
+                    tr_values.append(tr)
+            if len(tr_values) >= atr_period:
+                atr = sum(tr_values[-atr_period:]) / float(atr_period)
+                last_close = float(closes[-1] or 0.0)
+                if atr > 0.0 and last_close > 0.0:
+                    est_ratio = (atr / last_close) * atr_mult
+
+        # 2) Fall back to median absolute close-to-close move.
+        if est_ratio <= 0.0:
+            abs_moves: List[float] = []
+            for idx in range(1, len(closes)):
+                prev_close = float(closes[idx - 1] or 0.0)
+                curr_close = float(closes[idx] or 0.0)
+                if prev_close > 0.0 and curr_close > 0.0:
+                    abs_moves.append(abs(curr_close - prev_close) / prev_close)
+            if abs_moves:
+                abs_moves.sort()
+                mid = len(abs_moves) // 2
+                if len(abs_moves) % 2:
+                    est_ratio = float(abs_moves[mid])
+                else:
+                    est_ratio = float((abs_moves[mid - 1] + abs_moves[mid]) / 2.0)
+
+        if est_ratio <= 0.0:
+            est_ratio = fallback_ratio
+
+        return max(min_ratio, min(max_ratio, float(est_ratio)))
+
+    def _passes_pretrade_effect_gate(
+        self,
+        *,
+        symbol: str,
+        signal: Dict[str, Any],
+        planned_quote: float,
+        side: str = "BUY",
+    ) -> Tuple[bool, str]:
+        """
+        Deterministic pre-trade effect gate (live risk control).
+
+        Enhancements:
+        1) Symbol-level micro-backtest from recent OHLCV before order submission.
+        2) Adaptive threshold tuning from realized outcomes + micro-backtest feedback.
+        """
+        if not bool(self._cfg("PRETRADE_EFFECT_GUARD_ENABLED", True)):
+            return True, "disabled"
+
+        side_u = str(side or "BUY").upper()
+        if side_u not in {"BUY", "SELL"}:
+            side_u = "BUY"
+
+        quote = float(planned_quote or 0.0)
+        if quote <= 0.0:
+            return False, "invalid_quote"
+
+        def _coerce_pct(val: Any) -> Optional[float]:
+            try:
+                pct = float(val)
+            except Exception:
+                return None
+            if pct != pct:  # NaN check
+                return None
+            if abs(pct) > 1.0:
+                pct = pct / 100.0
+            return float(pct)
+
+        expected_move_pct = signal.get("_expected_move_pct")
+        if expected_move_pct is None:
+            expected_move_pct = signal.get("expected_move_pct")
+        if expected_move_pct is None:
+            # Backward-compat aliases used by some strategy emitters.
+            for key in ("_expected_move", "expected_move"):
+                if signal.get(key) is not None:
+                    expected_move_pct = signal.get(key)
+                    break
+        if expected_move_pct is None and side_u == "SELL":
+            # For discretionary SELLs, allow deriving from live PnL context.
+            for key in ("_unrealized_pnl_pct", "unrealized_pnl_pct", "roi", "pnl_pct"):
+                if signal.get(key) is not None:
+                    expected_move_pct = signal.get(key)
+                    break
+        if expected_move_pct is None and side_u == "BUY":
+            est_move = self._estimate_expected_move_pct_from_market(symbol)
+            if est_move is not None and float(est_move) > 0.0:
+                expected_move_pct = float(est_move)
+                signal.setdefault("_expected_move_pct", float(est_move))
+                signal.setdefault("expected_move_pct", float(est_move))
+                self.logger.info(
+                    "[Meta:PreTradeEffect] %s BUY expected_move populated from market fallback: %.4f%%",
+                    symbol,
+                    float(est_move) * 100.0,
+                )
+
+        expected_move_pct_norm = _coerce_pct(expected_move_pct)
+        allow_missing_expected_move_buy = bool(self._cfg("PRETRADE_ALLOW_MISSING_EXPECTED_MOVE", False))
+        allow_missing_expected_move_sell = bool(self._cfg("PRETRADE_ALLOW_MISSING_EXPECTED_MOVE_SELL", True))
+        sell_requires_expected_edge = bool(self._cfg("PRETRADE_SELL_REQUIRE_EXPECTED_EDGE", False))
+        skip_expected_net_gate = False
+
+        if expected_move_pct_norm is None:
+            if side_u == "BUY":
+                if allow_missing_expected_move_buy:
+                    return True, "missing_expected_move_allowed"
+                return False, "missing_expected_move"
+            if sell_requires_expected_edge and not allow_missing_expected_move_sell:
+                return False, "missing_expected_move_sell"
+            expected_move_pct_norm = 0.0
+            skip_expected_net_gate = True
+
+        fee_bps = float(self._cfg("CR_FEE_BPS", 10.0) or 10.0)
+        slip_bps = float(self._cfg("CR_PRICE_SLIPPAGE_BPS", 10.0) or 10.0)
+        buffer_bps = float(self._cfg("PRETRADE_EFFECT_BUFFER_BPS", 5.0) or 5.0)
+        round_trip_cost_pct = ((fee_bps * 2.0) + (slip_bps * 2.0) + buffer_bps) / 10000.0
+
+        directional_expected_move_pct = (
+            float(expected_move_pct_norm) if side_u == "BUY" else -float(expected_move_pct_norm)
+        )
+        expected_net_pct = directional_expected_move_pct - round_trip_cost_pct
+        expected_net_usdt = quote * expected_net_pct
+
+        # SELL profitability is already guarded downstream by dedicated sell gates.
+        # Keep expected-edge requirement optional for SELL to avoid over-blocking exits.
+        if side_u == "SELL" and not sell_requires_expected_edge:
+            skip_expected_net_gate = True
+
+        base_min_net_pct = float(self._cfg("PRETRADE_MIN_EXPECTED_NET_PCT", 0.0015) or 0.0015)
+        base_min_net_usdt = float(self._cfg("PRETRADE_MIN_EXPECTED_NET_USDT", 0.05) or 0.05)
+        base_min_win_rate = float(self._cfg("PRETRADE_MIN_REALIZED_WIN_RATE", 0.50) or 0.50)
+        no_trade_cycles = int(getattr(self, "cycles_no_trade", 0) or 0)
+        stall_relax_enabled = bool(self._cfg("PRETRADE_STALL_RELAX_ENABLED", True))
+        stall_relax_trigger = int(self._cfg("PRETRADE_STALL_RELAX_CYCLES_TRIGGER", 10) or 10)
+        stall_relax_step_cycles = int(self._cfg("PRETRADE_STALL_RELAX_STEP_CYCLES", 5) or 5)
+        stall_relax_net_pct_step = float(self._cfg("PRETRADE_STALL_RELAX_NET_PCT_STEP", 0.00012) or 0.00012)
+        stall_relax_net_usdt_step = float(self._cfg("PRETRADE_STALL_RELAX_NET_USDT_STEP", 0.005) or 0.005)
+        stall_relax_win_rate_step = float(self._cfg("PRETRADE_STALL_RELAX_WIN_RATE_STEP", 0.01) or 0.01)
+        stall_relax_max_steps = int(self._cfg("PRETRADE_STALL_RELAX_MAX_STEPS", 6) or 6)
+        stall_relax_min_net_pct_floor = float(self._cfg("PRETRADE_STALL_RELAX_MIN_NET_PCT_FLOOR", 0.0006) or 0.0006)
+        stall_relax_min_net_usdt_floor = float(self._cfg("PRETRADE_STALL_RELAX_MIN_NET_USDT_FLOOR", 0.02) or 0.02)
+        stall_relax_min_win_rate_floor = float(self._cfg("PRETRADE_STALL_RELAX_MIN_WIN_RATE_FLOOR", 0.45) or 0.45)
+        stall_relax_min_bt_win_rate_floor = float(
+            self._cfg("PRETRADE_STALL_RELAX_MIN_BT_WIN_RATE_FLOOR", 0.46) or 0.46
+        )
+
+        # Optional live "micro-backtest" health check from recent realized deltas.
+        recent_window = int(self._cfg("PRETRADE_RECENT_REALIZED_WINDOW", 20) or 20)
+        min_samples = int(self._cfg("PRETRADE_MIN_REALIZED_SAMPLES", 8) or 8)
+        samples: List[float] = []
+        with contextlib.suppress(Exception):
+            pnl_hist = list(getattr(self.shared_state, "_realized_pnl", []) or [])
+            for _, delta in pnl_hist[-recent_window:]:
+                d = float(delta or 0.0)
+                if abs(d) > 1e-12:
+                    samples.append(d)
+
+        win_rate_now: Optional[float] = None
+        if len(samples) >= min_samples:
+            wins = sum(1 for x in samples if x > 0.0)
+            win_rate_now = float(wins) / float(len(samples))
+
+        # Symbol micro-backtest from recent OHLCV bars.
+        bt_enabled = bool(self._cfg("PRETRADE_MICRO_BACKTEST_ENABLED", True))
+        bt_tf = str(self._cfg("PRETRADE_MICRO_BACKTEST_TIMEFRAME", "5m") or "5m")
+        bt_lookback = int(self._cfg("PRETRADE_MICRO_BACKTEST_LOOKBACK_BARS", 90) or 90)
+        bt_horizon = int(self._cfg("PRETRADE_MICRO_BACKTEST_HORIZON_BARS", 3) or 3)
+        bt_min_samples = int(self._cfg("PRETRADE_MICRO_BACKTEST_MIN_SAMPLES", 12) or 12)
+        bt_require_samples = bool(self._cfg("PRETRADE_MICRO_BACKTEST_REQUIRE_SAMPLES", False))
+        base_bt_min_win_rate = float(self._cfg("PRETRADE_MICRO_BACKTEST_MIN_WIN_RATE", 0.52) or 0.52)
+        bt_min_avg_net_pct = float(self._cfg("PRETRADE_MICRO_BACKTEST_MIN_AVG_NET_PCT", 0.0) or 0.0)
+        bt_soft_gate_enabled = bool(self._cfg("PRETRADE_MICRO_BACKTEST_SOFT_GATE_ENABLED", True))
+        bt_soft_gate_min_samples = int(self._cfg("PRETRADE_MICRO_BACKTEST_SOFT_GATE_MIN_SAMPLES", 24) or 24)
+        bt_soft_gate_relax_win_rate = float(
+            self._cfg("PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_WIN_RATE", 0.03) or 0.03
+        )
+        bt_soft_gate_relax_avg_net_pct = float(
+            self._cfg("PRETRADE_MICRO_BACKTEST_SOFT_GATE_RELAX_AVG_NET_PCT", 0.00015) or 0.00015
+        )
+        bt_soft_gate_allow_missing_after_cycles = int(
+            self._cfg("PRETRADE_MICRO_BACKTEST_SOFT_GATE_ALLOW_MISSING_AFTER_CYCLES", 16) or 16
+        )
+
+        bt_sample_count = 0
+        bt_win_rate: Optional[float] = None
+        bt_avg_net_pct: Optional[float] = None
+        bt_gate_ok = True
+        bt_force_bypass = False
+        bt_soft_gate_active = False
+        bt_soft_gate_reason = "off"
+        net_usdt_deadlock_rejections = 0
+        net_usdt_relief_steps = 0
+        stall_relax_steps = 0
+
+        if bt_enabled:
+            rows: List[Any] = []
+            with contextlib.suppress(Exception):
+                getter = getattr(self.shared_state, "get_market_data_sync", None)
+                if callable(getter):
+                    rows = list(getter(symbol, bt_tf) or [])
+
+            closes: List[float] = []
+            if rows:
+                for r in rows[-max(10, bt_lookback):]:
+                    px = 0.0
+                    if isinstance(r, dict):
+                        for k in ("c", "close", "C"):
+                            if r.get(k) is not None:
+                                with contextlib.suppress(Exception):
+                                    px = float(r.get(k))
+                                break
+                    elif isinstance(r, (list, tuple)) and len(r) >= 5:
+                        with contextlib.suppress(Exception):
+                            px = float(r[4])
+                    if px > 0.0:
+                        closes.append(px)
+
+            bt_horizon = max(1, bt_horizon)
+            if len(closes) > bt_horizon:
+                win_count = 0
+                net_sum = 0.0
+                for i in range(0, len(closes) - bt_horizon):
+                    p0 = float(closes[i] or 0.0)
+                    p1 = float(closes[i + bt_horizon] or 0.0)
+                    if p0 <= 0.0 or p1 <= 0.0:
+                        continue
+                    raw_ret = (p1 - p0) / p0
+                    dir_ret = raw_ret if side_u == "BUY" else -raw_ret
+                    net_ret = dir_ret - round_trip_cost_pct
+                    net_sum += net_ret
+                    bt_sample_count += 1
+                    if net_ret > 0.0:
+                        win_count += 1
+
+                if bt_sample_count > 0:
+                    bt_win_rate = float(win_count) / float(bt_sample_count)
+                    bt_avg_net_pct = net_sum / float(bt_sample_count)
+
+        # Dynamic adaptation from realized + backtest feedback.
+        perf_score = 0.0
+        perf_weight = 0.0
+        if win_rate_now is not None:
+            perf_score += (float(win_rate_now) - 0.50) * 1.10
+            perf_weight += 1.10
+        if bt_win_rate is not None:
+            perf_score += (float(bt_win_rate) - 0.50) * 1.00
+            perf_weight += 1.00
+        if bt_avg_net_pct is not None:
+            bounded_bt_edge = max(-0.01, min(0.01, float(bt_avg_net_pct)))
+            perf_score += bounded_bt_edge * 40.0
+            perf_weight += 0.90
+        if perf_weight > 0:
+            perf_score /= perf_weight
+        else:
+            perf_score = 0.0
+
+        adapt_mult = max(0.75, min(1.35, 1.0 - (perf_score * 0.60)))
+        min_net_pct = max(0.0005, min(0.01, base_min_net_pct * adapt_mult))
+        min_net_usdt = max(0.02, min(2.0, base_min_net_usdt * adapt_mult))
+        min_win_rate = max(0.35, min(0.80, base_min_win_rate - (perf_score * 0.14)))
+        bt_min_win_rate = max(0.40, min(0.80, base_bt_min_win_rate - (perf_score * 0.10)))
+
+        # Stall-aware relief: if we keep cycling without any fills, gradually ease
+        # net/win-rate thresholds inside bounded safety floors.
+        if side_u == "BUY" and stall_relax_enabled and no_trade_cycles >= max(1, stall_relax_trigger):
+            extra_cycles = max(0, no_trade_cycles - stall_relax_trigger)
+            stall_relax_steps = min(
+                max(1, stall_relax_max_steps),
+                1 + int(extra_cycles // max(1, stall_relax_step_cycles)),
+            )
+            prev_net_pct = float(min_net_pct)
+            prev_net_usdt = float(min_net_usdt)
+            prev_win_rate = float(min_win_rate)
+            prev_bt_win_rate = float(bt_min_win_rate)
+            min_net_pct = max(
+                float(stall_relax_min_net_pct_floor),
+                float(min_net_pct) - (float(stall_relax_net_pct_step) * float(stall_relax_steps)),
+            )
+            min_net_usdt = max(
+                float(stall_relax_min_net_usdt_floor),
+                float(min_net_usdt) - (float(stall_relax_net_usdt_step) * float(stall_relax_steps)),
+            )
+            min_win_rate = max(
+                float(stall_relax_min_win_rate_floor),
+                float(min_win_rate) - (float(stall_relax_win_rate_step) * float(stall_relax_steps)),
+            )
+            bt_min_win_rate = max(
+                float(stall_relax_min_bt_win_rate_floor),
+                float(bt_min_win_rate) - (float(stall_relax_win_rate_step) * float(stall_relax_steps)),
+            )
+            self.logger.warning(
+                "[Meta:PreTradeEffect:StallRelief] %s BUY no_trade_cycles=%d steps=%d "
+                "net_pct %.4f%%->%.4f%% net_usdt %.4f->%.4f win %.3f->%.3f bt_win %.3f->%.3f",
+                symbol,
+                int(no_trade_cycles),
+                int(stall_relax_steps),
+                prev_net_pct * 100.0,
+                float(min_net_pct) * 100.0,
+                prev_net_usdt,
+                float(min_net_usdt),
+                prev_win_rate,
+                float(min_win_rate),
+                prev_bt_win_rate,
+                float(bt_min_win_rate),
+            )
+
+        def _buy_rejection_count(*reason_keys: str) -> int:
+            """
+            Fetch BUY rejection count for a symbol with a resilient fallback.
+            Primary path uses exact reason counters; fallback scans historical
+            counters for compatible suffix/prefix matches.
+            """
+            normalized: List[str] = [
+                str(k or "").strip().upper() for k in reason_keys if str(k or "").strip()
+            ]
+            if not normalized:
+                return 0
+
+            total = 0
+            got_any = False
+            with contextlib.suppress(Exception):
+                rej_getter = getattr(self.shared_state, "get_rejection_count", None)
+                if callable(rej_getter):
+                    for key in normalized:
+                        got = int(rej_getter(symbol, "BUY", key) or 0)
+                        total += max(0, got)
+                        if got > 0:
+                            got_any = True
+            if got_any:
+                return int(max(0, total))
+
+            # Fallback for environments where reasons are wrapped/prefixed.
+            fallback_total = 0
+            with contextlib.suppress(Exception):
+                counters = getattr(self.shared_state, "rejection_counters", None)
+                if isinstance(counters, dict):
+                    for (sym_k, side_k, reason_k), cnt in counters.items():
+                        if str(sym_k).upper() != str(symbol or "").upper():
+                            continue
+                        if str(side_k).upper() != "BUY":
+                            continue
+                        reason_u = str(reason_k or "").upper()
+                        if any((needle in reason_u) or reason_u.endswith(needle) for needle in normalized):
+                            fallback_total += int(cnt or 0)
+            return int(max(0, fallback_total))
+
+        # Anti-deadlock adaptive relief:
+        # If the symbol is repeatedly rejected specifically by the micro-backtest gate,
+        # relax thresholds gradually (within strict floors) so the system can recover.
+        bt_deadlock_rejections = 0
+        bt_relief_steps = 0
+        if side_u == "BUY":
+            bt_deadlock_rejections = _buy_rejection_count(
+                "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD",
+                "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD",
+                "MICRO_BACKTEST_INSUFFICIENT_SAMPLES",
+                "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_INSUFFICIENT_SAMPLES",
+            )
+
+            bt_relax_enabled = bool(self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_ENABLED", True))
+            bt_relax_trigger = int(
+                self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_REJECTION_TRIGGER", 8) or 8
+            )
+            bt_relax_step_rejections = int(
+                self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_STEP_REJECTIONS", 6) or 6
+            )
+            bt_relax_win_step = float(
+                self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_RELAX_WIN_STEP", 0.015) or 0.015
+            )
+            bt_relax_win_floor = float(
+                self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_WIN_RATE_FLOOR", 0.45) or 0.45
+            )
+            bt_relax_avg_floor = float(
+                self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_MIN_AVG_NET_FLOOR_PCT", -0.0003) or -0.0003
+            )
+            bt_relax_disable_samples_after_steps = int(
+                self._cfg(
+                    "PRETRADE_MICRO_BACKTEST_DEADLOCK_DISABLE_SAMPLE_REQUIRE_AFTER_STEPS",
+                    2,
+                )
+                or 2
+            )
+            bt_starvation_cycles_trigger = int(
+                self._cfg("PRETRADE_MICRO_BACKTEST_STARVATION_CYCLES_TRIGGER", 12) or 12
+            )
+            bt_starvation_rejection_trigger = int(
+                self._cfg("PRETRADE_MICRO_BACKTEST_STARVATION_REJECTION_TRIGGER", 6) or 6
+            )
+
+            if no_trade_cycles >= max(1, bt_starvation_cycles_trigger):
+                bt_relax_trigger = min(
+                    max(1, bt_relax_trigger),
+                    max(1, bt_starvation_rejection_trigger),
+                )
+                bt_relax_step_rejections = max(2, min(bt_relax_step_rejections, 4))
+
+            if bt_relax_enabled and bt_deadlock_rejections >= max(1, bt_relax_trigger):
+                extra = max(0, bt_deadlock_rejections - bt_relax_trigger)
+                bt_relief_steps = 1 + int(extra // max(1, bt_relax_step_rejections))
+
+                bt_min_win_rate = max(
+                    float(bt_relax_win_floor),
+                    float(bt_min_win_rate) - (float(bt_relax_win_step) * float(bt_relief_steps)),
+                )
+
+                # Allow neutral/slightly negative micro-BT edge under persistent lock,
+                # but cap by configured floor to preserve safety.
+                bt_min_avg_net_pct = max(
+                    float(bt_relax_avg_floor),
+                    min(float(bt_min_avg_net_pct), 0.0)
+                    - (0.00005 * float(bt_relief_steps)),
+                )
+
+                if bt_require_samples and bt_relief_steps >= max(1, bt_relax_disable_samples_after_steps):
+                    bt_require_samples = False
+
+                self.logger.warning(
+                    "[Meta:PreTradeEffect:DeadlockRelief] %s BUY bt_rejections=%d steps=%d "
+                    "=> bt_min_win_rate=%.3f bt_min_avg_net=%.4f%% bt_require_samples=%s",
+                    symbol,
+                    int(bt_deadlock_rejections),
+                    int(bt_relief_steps),
+                    float(bt_min_win_rate),
+                    float(bt_min_avg_net_pct) * 100.0,
+                    bool(bt_require_samples),
+                )
+
+            # Hard deadlock bypass (final escape hatch):
+            # If repeated micro-backtest rejections persist and the forward edge + confidence
+            # are strong, allow the trade to pass this micro-BT gate to re-enable learning.
+            bt_force_bypass_trigger = int(
+                self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_AFTER_REJECTIONS", 24) or 24
+            )
+            bt_force_bypass_min_conf = float(
+                self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_CONF", 0.72) or 0.72
+            )
+            bt_force_bypass_min_net_pct = float(
+                self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_PCT", 0.0030) or 0.0030
+            )
+            bt_force_bypass_min_net_usdt = float(
+                self._cfg("PRETRADE_MICRO_BACKTEST_DEADLOCK_FORCE_BYPASS_MIN_EXPECTED_NET_USDT", 0.03) or 0.03
+            )
+            bt_starvation_force_conf = float(
+                self._cfg("PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_CONF", 0.60) or 0.60
+            )
+            bt_starvation_force_net_pct = float(
+                self._cfg("PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_PCT", 0.0015) or 0.0015
+            )
+            bt_starvation_force_net_usdt = float(
+                self._cfg("PRETRADE_MICRO_BACKTEST_STARVATION_FORCE_BYPASS_MIN_EXPECTED_NET_USDT", 0.02) or 0.02
+            )
+            if no_trade_cycles >= max(1, bt_starvation_cycles_trigger):
+                bt_force_bypass_trigger = min(
+                    max(1, bt_force_bypass_trigger),
+                    max(1, bt_starvation_rejection_trigger),
+                )
+                bt_force_bypass_min_conf = min(bt_force_bypass_min_conf, bt_starvation_force_conf)
+                bt_force_bypass_min_net_pct = min(
+                    bt_force_bypass_min_net_pct,
+                    bt_starvation_force_net_pct,
+                )
+                bt_force_bypass_min_net_usdt = min(
+                    bt_force_bypass_min_net_usdt,
+                    bt_starvation_force_net_usdt,
+                )
+            signal_conf = 0.0
+            signal_conf_present = False
+            try:
+                if signal.get("confidence") is not None:
+                    signal_conf = float(signal.get("confidence"))
+                    signal_conf_present = True
+                elif signal.get("conf") is not None:
+                    signal_conf = float(signal.get("conf"))
+                    signal_conf_present = True
+            except Exception:
+                signal_conf = 0.0
+                signal_conf_present = False
+            if (
+                bt_deadlock_rejections >= max(1, bt_force_bypass_trigger)
+                and expected_net_pct >= bt_force_bypass_min_net_pct
+                and expected_net_usdt >= bt_force_bypass_min_net_usdt
+                and ((not signal_conf_present) or (signal_conf >= bt_force_bypass_min_conf))
+            ):
+                bt_force_bypass = True
+                self.logger.warning(
+                    "[Meta:PreTradeEffect:DeadlockBypass] %s BUY forcing micro-BT bypass "
+                    "(bt_rejections=%d conf=%s exp_net=%.3f%% exp_net_usdt=%.4f no_trade_cycles=%d)",
+                    symbol,
+                    int(bt_deadlock_rejections),
+                    f"{signal_conf:.2f}" if signal_conf_present else "n/a",
+                    float(expected_net_pct) * 100.0,
+                    float(expected_net_usdt),
+                    int(no_trade_cycles),
+                )
+
+            # NET_USDT deadlock relief:
+            # reduce minimum net USDT threshold gradually when repeated net-usdt
+            # blocks occur and system is not executing trades.
+            net_usdt_deadlock_rejections = _buy_rejection_count(
+                "NET_USDT_BELOW_THRESHOLD",
+                "PRETRADE_EFFECT_GATE:NET_USDT_BELOW_THRESHOLD",
+            )
+            net_relax_enabled = bool(self._cfg("PRETRADE_NET_USDT_DEADLOCK_RELAX_ENABLED", True))
+            net_relax_trigger = int(self._cfg("PRETRADE_NET_USDT_DEADLOCK_REJECTION_TRIGGER", 8) or 8)
+            net_relax_step_rejections = int(
+                self._cfg("PRETRADE_NET_USDT_DEADLOCK_STEP_REJECTIONS", 5) or 5
+            )
+            net_relax_step_factor = float(
+                self._cfg("PRETRADE_NET_USDT_DEADLOCK_RELAX_STEP_FACTOR", 0.88) or 0.88
+            )
+            net_relax_floor = float(
+                self._cfg("PRETRADE_NET_USDT_DEADLOCK_MIN_USDT_FLOOR", 0.02) or 0.02
+            )
+            if no_trade_cycles >= max(1, bt_starvation_cycles_trigger):
+                net_relax_trigger = min(net_relax_trigger, max(1, bt_starvation_rejection_trigger))
+                net_relax_step_factor = min(net_relax_step_factor, 0.85)
+            if net_relax_enabled and net_usdt_deadlock_rejections >= max(1, net_relax_trigger):
+                extra = max(0, net_usdt_deadlock_rejections - net_relax_trigger)
+                net_usdt_relief_steps = 1 + int(extra // max(1, net_relax_step_rejections))
+                prev_min_usdt = float(min_net_usdt)
+                scaled = float(min_net_usdt) * (float(net_relax_step_factor) ** float(net_usdt_relief_steps))
+                min_net_usdt = max(float(net_relax_floor), float(scaled))
+                self.logger.warning(
+                    "[Meta:PreTradeEffect:NetUsdRelief] %s BUY net_usdt_rejections=%d steps=%d "
+                    "min_net_usdt %.4f -> %.4f (floor=%.4f no_trade_cycles=%d)",
+                    symbol,
+                    int(net_usdt_deadlock_rejections),
+                    int(net_usdt_relief_steps),
+                    prev_min_usdt,
+                    float(min_net_usdt),
+                    float(net_relax_floor),
+                    int(no_trade_cycles),
+                )
+
+        # Publish adaptive outputs for observability.
+        with contextlib.suppress(Exception):
+            dyn = getattr(self.shared_state, "dynamic_config", None)
+            if isinstance(dyn, dict):
+                dyn["PRETRADE_ADAPTIVE_SCORE"] = float(perf_score)
+                dyn["PRETRADE_ADAPTIVE_MULT"] = float(adapt_mult)
+                dyn["PRETRADE_ADAPTIVE_MIN_EXPECTED_NET_PCT"] = float(min_net_pct)
+                dyn["PRETRADE_ADAPTIVE_MIN_EXPECTED_NET_USDT"] = float(min_net_usdt)
+                dyn["PRETRADE_ADAPTIVE_MIN_REALIZED_WIN_RATE"] = float(min_win_rate)
+                dyn["PRETRADE_LAST_BT_WIN_RATE"] = None if bt_win_rate is None else float(bt_win_rate)
+                dyn["PRETRADE_LAST_BT_AVG_NET_PCT"] = None if bt_avg_net_pct is None else float(bt_avg_net_pct)
+                dyn["PRETRADE_LAST_BT_SAMPLES"] = int(bt_sample_count)
+                dyn["PRETRADE_LAST_BT_DEADLOCK_REJECTIONS"] = int(bt_deadlock_rejections)
+                dyn["PRETRADE_LAST_BT_DEADLOCK_RELIEF_STEPS"] = int(bt_relief_steps)
+                dyn["PRETRADE_LAST_NET_USDT_DEADLOCK_REJECTIONS"] = int(net_usdt_deadlock_rejections)
+                dyn["PRETRADE_LAST_NET_USDT_RELIEF_STEPS"] = int(net_usdt_relief_steps)
+                dyn["PRETRADE_LAST_NO_TRADE_CYCLES"] = int(no_trade_cycles)
+                dyn["PRETRADE_LAST_STALL_RELAX_STEPS"] = int(stall_relax_steps)
+
+        expected_gate_ok = (
+            True
+            if skip_expected_net_gate
+            else (expected_net_pct >= min_net_pct and expected_net_usdt >= min_net_usdt)
+        )
+
+        win_rate_gate_ok = True
+        if win_rate_now is not None:
+            win_rate_gate_ok = float(win_rate_now) >= float(min_win_rate)
+
+        bt_eval_min_win_rate = float(bt_min_win_rate)
+        bt_eval_min_avg_net_pct = float(bt_min_avg_net_pct)
+        if bt_enabled:
+            # Soft micro-BT gate for low-sample windows: stay selective but avoid
+            # over-blocking during thin data / fresh symbol rotation.
+            if (
+                side_u == "BUY"
+                and bt_soft_gate_enabled
+                and bt_sample_count > 0
+                and bt_sample_count < max(bt_min_samples, bt_soft_gate_min_samples)
+            ):
+                bt_soft_gate_active = True
+                bt_soft_gate_reason = "low_sample_softening"
+                bt_eval_min_win_rate = max(0.40, bt_eval_min_win_rate - float(bt_soft_gate_relax_win_rate))
+                bt_eval_min_avg_net_pct = min(bt_eval_min_avg_net_pct, 0.0) - float(
+                    bt_soft_gate_relax_avg_net_pct
+                )
+
+            if bt_sample_count < bt_min_samples:
+                bt_gate_ok = (not bt_require_samples)
+                if (
+                    side_u == "BUY"
+                    and bt_soft_gate_enabled
+                    and no_trade_cycles >= max(1, bt_soft_gate_allow_missing_after_cycles)
+                ):
+                    bt_gate_ok = True
+                    bt_soft_gate_active = True
+                    bt_soft_gate_reason = "missing_samples_stall_relief"
+            else:
+                bt_gate_ok = True
+                if bt_win_rate is not None and bt_win_rate < bt_eval_min_win_rate:
+                    bt_gate_ok = False
+                if bt_avg_net_pct is not None and bt_avg_net_pct < bt_eval_min_avg_net_pct:
+                    bt_gate_ok = False
+            if bt_force_bypass:
+                bt_gate_ok = True
+                bt_soft_gate_reason = "force_bypass"
+        else:
+            bt_gate_ok = True
+
+        with contextlib.suppress(Exception):
+            dyn = getattr(self.shared_state, "dynamic_config", None)
+            if isinstance(dyn, dict):
+                dyn["PRETRADE_LAST_BT_SOFT_GATE_ACTIVE"] = bool(bt_soft_gate_active)
+                dyn["PRETRADE_LAST_BT_SOFT_GATE_REASON"] = str(bt_soft_gate_reason)
+                dyn["PRETRADE_LAST_BT_EFFECTIVE_MIN_WIN_RATE"] = float(bt_eval_min_win_rate)
+                dyn["PRETRADE_LAST_BT_EFFECTIVE_MIN_AVG_NET_PCT"] = float(bt_eval_min_avg_net_pct)
+
+        passes = bool(expected_gate_ok and win_rate_gate_ok and bt_gate_ok)
+        self.logger.info(
+            "[Meta:PreTradeEffect] %s %s quote=%.2f exp_move=%.4f%% cost=%.4f%% exp_net=%.4f%% exp_net_usdt=%.4f "
+            "realized_win=%s micro_bt(win=%s avg_net=%s samples=%d) "
+            "thresholds(net_pct>=%.4f%% net_usdt>=%.4f win>=%.2f bt_win>=%.2f bt_avg_net>=%.4f%%) "
+            "adaptive(score=%.4f mult=%.3f stall_steps=%d bt_soft=%s:%s) pass=%s",
+            symbol,
+            side_u,
+            quote,
+            float(directional_expected_move_pct) * 100.0,
+            round_trip_cost_pct * 100.0,
+            expected_net_pct * 100.0,
+            expected_net_usdt,
+            f"{win_rate_now:.2f}" if win_rate_now is not None else "n/a",
+            f"{bt_win_rate:.2f}" if bt_win_rate is not None else "n/a",
+            f"{(bt_avg_net_pct * 100.0):.4f}%" if bt_avg_net_pct is not None else "n/a",
+            int(bt_sample_count),
+            min_net_pct * 100.0,
+            min_net_usdt,
+            min_win_rate,
+            bt_eval_min_win_rate,
+            bt_eval_min_avg_net_pct * 100.0,
+            perf_score,
+            adapt_mult,
+            int(stall_relax_steps),
+            bool(bt_soft_gate_active),
+            str(bt_soft_gate_reason),
+            passes,
+        )
+
+        if not passes:
+            if not expected_gate_ok:
+                if expected_net_pct < min_net_pct:
+                    return False, "net_pct_below_threshold"
+                if expected_net_usdt < min_net_usdt:
+                    return False, "net_usdt_below_threshold"
+            if not win_rate_gate_ok:
+                return False, "recent_win_rate_below_threshold"
+            if not bt_gate_ok:
+                if bt_sample_count < bt_min_samples and bt_require_samples:
+                    return False, "micro_backtest_insufficient_samples"
+                if bt_win_rate is not None and bt_win_rate < bt_eval_min_win_rate:
+                    return False, "micro_backtest_win_rate_below_threshold"
+                if bt_avg_net_pct is not None and bt_avg_net_pct < bt_eval_min_avg_net_pct:
+                    return False, "micro_backtest_avg_net_below_threshold"
+            return False, "pretrade_effect_gate"
+
+        return True, "ok"
+
     @staticmethod
     def _is_tp_sl_exit_reason(reason: Optional[str]) -> bool:
         reason_u = str(reason or "").strip().upper()
@@ -6067,6 +7491,17 @@ class MetaController:
         if reason_u in {"TP", "SL", "TP_HIT", "SL_HIT", "TPSL_EXIT", "TP_SL", "TAKE_PROFIT", "STOP_LOSS"}:
             return True
         return ("TP_SL" in reason_u) or ("TAKE_PROFIT" in reason_u) or ("STOP_LOSS" in reason_u)
+
+    @staticmethod
+    def _is_market_closed_reason(reason: Optional[str]) -> bool:
+        reason_u = str(reason or "").strip().upper()
+        if not reason_u:
+            return False
+        return (
+            "MARKET IS CLOSED" in reason_u
+            or "SYMBOL IS CLOSED" in reason_u
+            or ("CODE=-1013" in reason_u and "CLOSED" in reason_u)
+        )
 
     def set_active_policy_nudges(self, nudges: Dict[str, float]):
         """Update active policy nudges from PolicyManager."""
@@ -6332,6 +7767,70 @@ class MetaController:
         """Delegate policy context building to PolicyManager."""
         return self.policy_manager._build_policy_context(symbol, side, policies, extra)
 
+    def _build_affordability_policy_context(
+        self,
+        symbol: str,
+        side: str,
+        signal: Optional[Dict[str, Any]],
+        *,
+        policies: Optional[List[str]] = None,
+        force_bootstrap_bypass: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Build canonical policy context for affordability checks.
+
+        Why this exists:
+        - ExecutionManager bypasses redundant micro/EV gates when policy authority is explicit.
+        - Several BUY validation paths previously passed `None` context, which downgraded
+          authority to unknown and re-triggered strict micro gates.
+        """
+        sig = signal if isinstance(signal, dict) else {}
+        side_u = str(side or "BUY").upper()
+        policy_extra: Dict[str, Any] = {"tradeability_gate_checked": True}
+
+        decision_trace_id = self._ensure_decision_id(symbol, side_u, sig, int(self.tick_id or 0))
+        if decision_trace_id:
+            policy_extra["decision_id"] = decision_trace_id
+            policy_extra["trace_id"] = decision_trace_id
+
+        exp_move = sig.get("_expected_move_pct")
+        if exp_move is None:
+            exp_move = sig.get("expected_move_pct")
+        if exp_move is not None:
+            try:
+                policy_extra["tradeability_expected_move_pct"] = float(exp_move)
+            except Exception:
+                pass
+
+        reg_val = sig.get("_regime") or sig.get("regime")
+        if reg_val:
+            policy_extra["tradeability_regime"] = str(reg_val)
+
+        is_dust_healing = bool(
+            sig.get("_dust_healing")
+            or sig.get("is_dust_healing")
+            or str(sig.get("reason", "")).upper() == "DUST_HEALING_BUY"
+        )
+        if is_dust_healing and side_u == "BUY":
+            policy_extra.update(
+                {
+                    "reason": "DUST_HEALING_BUY",
+                    "is_dust_healing": True,
+                    "_dust_healing": True,
+                    "tier": "DUST_RECOVERY",
+                }
+            )
+
+        if force_bootstrap_bypass or self._is_bootstrap_buy_context(sig, side=side_u):
+            policy_extra["bootstrap_bypass"] = True
+
+        return self._build_policy_context(
+            symbol,
+            side_u,
+            policies=policies,
+            extra=policy_extra,
+        )
+
     def _ensure_decision_id(self, symbol: str, side: str, sig: Dict[str, Any], idx: int) -> str:
         """
         Ensure every Meta decision has a canonical execution trace id.
@@ -6425,17 +7924,51 @@ class MetaController:
         try:
             total, significant_count, dust_count = await self._count_significant_positions()
 
-            if significant_count == 0:
-                self.logger.info(
-                    "[Meta:CheckFlat] Portfolio FLAT (authoritative): significant_positions=0"
-                )
-                return True
-            else:
+            if significant_count > 0:
                 self.logger.debug(
                     "[Meta:CheckFlat] Portfolio NOT FLAT (authoritative): significant_positions=%d",
                     significant_count
                 )
                 return False
+
+            # Guardrail: avoid treating the portfolio as flat when we still hold
+            # any *tradable* inventory (>= min notional), even if it is below the
+            # "significant" threshold. This prevents repeated bootstrap loops.
+            tradable_floor = float(
+                self._cfg(
+                    "PORTFOLIO_FLAT_TRADABLE_FLOOR_USDT",
+                    self._cfg("MIN_NOTIONAL_USDT", 10.0),
+                )
+                or 10.0
+            )
+            snap = self.shared_state.get_positions_snapshot() or {}
+            latest_prices = getattr(self.shared_state, "latest_prices", {}) or {}
+            for sym_raw, pos in (snap.items() if isinstance(snap, dict) else []):
+                if not isinstance(pos, dict):
+                    continue
+                qty = float(pos.get("quantity", pos.get("qty", 0.0)) or 0.0)
+                if qty <= 0:
+                    continue
+                value_usdt = float(pos.get("value_usdt", 0.0) or 0.0)
+                if value_usdt <= 0:
+                    sym = self._normalize_symbol(sym_raw)
+                    px = float(latest_prices.get(sym, 0.0) or latest_prices.get(str(sym_raw), 0.0) or 0.0)
+                    if px > 0:
+                        value_usdt = qty * px
+                if value_usdt >= tradable_floor:
+                    self.logger.info(
+                        "[Meta:CheckFlat] Portfolio NOT FLAT (tradable inventory): %s value=%.2f >= floor=%.2f",
+                        self._normalize_symbol(sym_raw),
+                        value_usdt,
+                        tradable_floor,
+                    )
+                    return False
+
+            self.logger.info(
+                "[Meta:CheckFlat] Portfolio FLAT (authoritative): significant_positions=0 tradable_floor=%.2f",
+                tradable_floor,
+            )
+            return True
 
         except Exception as e:
             self.logger.warning(
@@ -6499,7 +8032,7 @@ class MetaController:
         # Fallback: Try get_positions_snapshot()
         try:
             if hasattr(self.shared_state, "get_positions_snapshot"):
-                snap = self.shared_state.get_positions_snapshot()
+                snap = self.shared_state.get_positions_snapshot(include_wallet_inventory=True)
                 if snap and isinstance(snap, dict):
                     p = snap.get(symbol)
                     if p and isinstance(p, dict):
@@ -6707,6 +8240,14 @@ class MetaController:
             self.logger.warning("[MetaController:RECV_SIGNAL] ✗ SignalManager rejected signal for %s from %s", 
                                symbol, agent_name)
             return
+        
+        # DEBUG: Log cache state immediately after caching
+        all_cached = self.signal_manager.get_all_signals()
+        self.logger.critical(
+            "[MetaController:RECV_SIGNAL:CACHE_DEBUG] Signal just cached! Total in cache=%d. Cache object id=%s",
+            len(all_cached),
+            id(self.signal_cache)
+        )
 
         # Fetch the normalized signal for SharedState sync
         sig = self.signal_manager.get_signals_for_symbol(self._normalize_symbol(symbol))
@@ -6945,8 +8486,21 @@ class MetaController:
     async def run(self):
         """Mandatory P9 lifecycle loop: runs forever executing evaluation and heartbeat."""
         # 🔥 CRITICAL DEBUG: run() loop started
+        # Defensive: ensure interval is set (in case run() called directly instead of through start())
+        if not hasattr(self, 'interval') or self.interval is None:
+            self.interval = 2.0
+            self.logger.warning("[Meta:RUN] ⚠️ interval was not set; defaulting to 2.0s")
+        
         self.logger.warning("[Meta:RUN] ⚠️ LIFECYCLE LOOP STARTING! interval=%.1f", self.interval)
         self.logger.info("[MetaController] Starting lifecycle loop (interval=%.1fs)", self.interval)
+        
+        # 🔧 CRITICAL FIX: Wait for market data to be ready before starting trades
+        # Simple sleep-based approach to allow MarketDataFeed.warmup() time to complete
+        # This avoids relying on event synchronization which may have timing issues
+        self.logger.info("[Meta:RUN] Waiting 8 seconds for MarketDataFeed.warmup() to complete...")
+        await _asyncio.sleep(8)  # Give MDF 8 seconds for OHLCV fetching from Binance
+        self.logger.info("[Meta:RUN] ✅ Startup delay complete! Starting decision cycles with populated market data")
+        
         iteration = 0
         while not self._stop and self._running:
             iteration += 1
@@ -7167,7 +8721,7 @@ class MetaController:
                     # TPSLEngine, PnLCalculator, PerformanceEvaluator can startup asynchronously
                     for comp in required_components:
                         st = snap.get(comp, {}).get("status", "").lower()
-                        if st not in ("running", "operational", "healthy", "no-report", ""):
+                        if st not in ("running", "operational", "healthy", "initialized", "ready", "no-report", ""):
                             health_ready = False
                             self.logger.debug(f"[Meta] Bootstrap={is_bootstrap}, {comp} not ready: {st}")
                             break
@@ -7481,6 +9035,21 @@ class MetaController:
 
         now_ts = time.time()
         
+        # Cache NAV for use in governance decisions (micro-account PROTECTIVE mode exception)
+        try:
+            self._last_nav_usd = float(await self.shared_state.get_nav() or 0.0)
+        except Exception:
+            self._last_nav_usd = getattr(self, '_last_nav_usd', 0.0)
+        
+        # Periodic watchdog status reporting
+        self._decision_counter += 1
+        if (now_ts - self._last_watchdog_report_ts) >= self._watchdog_report_interval_s:
+            await self._report_watchdog_status(
+                "Operational",
+                f"Completed {self._decision_counter} evaluation cycles"
+            )
+            self._last_watchdog_report_ts = now_ts
+        
         # ✅ CRITICAL LOG: Mark start of evaluation cycle
         self.logger.warning("[Meta:evaluate_and_act] 🎯 EVALUATION CYCLE #%d starting", loop_id)
 
@@ -7611,7 +9180,20 @@ class MetaController:
 
         # --- Signal Cache Cleanup: Remove expired signals at start of each cycle ---
         try:
+            now_time = time.time()
+            self.logger.critical(
+                "[Meta:SignalCache:BEFORE_CLEANUP] Cache ID=%s TTL=%s cached_entries=%d now=%s",
+                id(self.signal_cache),
+                getattr(self.signal_cache, '_default_ttl', 'UNKNOWN'),
+                len(self.signal_cache._cache) if hasattr(self.signal_cache, '_cache') else 0,
+                now_time
+            )
             cleaned_count = self.signal_manager.cleanup_expired_signals()
+            self.logger.critical(
+                "[Meta:SignalCache:AFTER_CLEANUP] Cleaned=%d remaining_entries=%d",
+                cleaned_count,
+                len(self.signal_cache._cache) if hasattr(self.signal_cache, '_cache') else 0
+            )
             if cleaned_count > 0:
                 self.logger.debug(f"[Meta:SignalCache] Cleaned up {cleaned_count} expired signals")
         except Exception as e:
@@ -7699,6 +9281,19 @@ class MetaController:
         except Exception as e:
             self.logger.debug("[Meta:FIX2] Cache reset failed (non-fatal): %s", e)
 
+        # 🔥 FIX 0: COLLECT AGENT SIGNALS FIRST
+        # Ensure all agent signals are published to event bus BEFORE we drain
+        # This way bootstrap will find signals when _build_decisions queries cache
+        try:
+            if hasattr(self, "agent_manager") and self.agent_manager:
+                cache_before = len(self.signal_manager.get_all_signals())
+                await self.agent_manager.collect_and_forward_signals()
+                cache_after = len(self.signal_manager.get_all_signals())
+                self.logger.critical("[Meta:FIX0] ✅ Collected agent signals | cache: %d→%d signals (added %d)", 
+                                    cache_before, cache_after, cache_after - cache_before)
+        except Exception as e:
+            self.logger.warning("[Meta:FIX0] Signal collection failed (non-fatal): %s", e)
+
         # 1. Consolidate Signal Ingestion (sink + bus + liquidation)
         now_epoch = self._epoch()
         # 🔥 CRITICAL DEBUG: About to drain
@@ -7733,16 +9328,6 @@ class MetaController:
             return
         
         self._loop_summary_state["symbols_considered"] = len(accepted_symbols_set)
-
-        # 🔥 FIX 1: Force signal sync before decisions
-        # Ensure all signals from agents exist in signal_cache before building decisions
-        # This prevents MetaController from making decisions based on stale signal data
-        try:
-            if hasattr(self, "agent_manager") and self.agent_manager:
-                await self.agent_manager.collect_and_forward_signals()
-                self.logger.warning("[Meta:FIX1] ✅ Forced signal collection before decision building")
-        except Exception as e:
-            self.logger.warning("[Meta:FIX1] Signal collection failed (non-fatal): %s", e)
 
         # 3. Build Decision Context (Portfolio Arbitration)
         decisions = await self._build_decisions(accepted_symbols_set)
@@ -7925,17 +9510,29 @@ class MetaController:
 
         try:
             if gated_reasons:
-                # Gated Mode: Process actions that DON'T require budget (SELL/HOLD)
-                safe_decisions = []
-                for d in decisions:
-                    sym, side, sig = _normalize_decision_for_execution(d)
-                    if not self._is_budget_required(side):
+                # CRITICAL FIX: If bootstrap override is set, BYPASS GATES completely
+                has_bootstrap_override = any(d[2].get("_bootstrap_override") for d in decisions if len(d) >= 3)
+                if has_bootstrap_override:
+                    self.logger.critical(
+                        "[Meta:GATE_BYPASS] 🚀 BOOTSTRAP OVERRIDE DETECTED! "
+                        "Bypassing system gates (%s) to execute BUY decision",
+                        ", ".join(gated_reasons)
+                    )
+                    # EXECUTE ALL DECISIONS - gates do NOT apply to bootstrap
+                    safe_decisions = decisions
+                else:
+                    # Normal gated mode: only SELL/HOLD allowed
+                    # Gated Mode: Process actions that DON'T require budget (SELL/HOLD)
+                    safe_decisions = []
+                    for d in decisions:
+                        sym, side, sig = _normalize_decision_for_execution(d)
+                        if not self._is_budget_required(side):
+                            safe_decisions.append((sym, side, sig))
+                    
+                    if bootstrap_buy:
+                        sym, side, sig = bootstrap_buy
+                        self.logger.info("[Meta:Bootstrap] 🚀 Gating bypass: Promoting %s BUY to safe_decisions.", sym)
                         safe_decisions.append((sym, side, sig))
-                
-                if bootstrap_buy:
-                    sym, side, sig = bootstrap_buy
-                    self.logger.info("[Meta:Bootstrap] 🚀 Gating bypass: Promoting %s BUY to safe_decisions.", sym)
-                    safe_decisions.append((sym, side, sig))
 
                 if safe_decisions:
                     for sym, side, sig in safe_decisions:
@@ -7965,6 +9562,39 @@ class MetaController:
                             except Exception as e:
                                 self.logger.error("[Meta:TradeIntent] Failed to publish %s %s: %s", sym, side, e)
                             
+                        # 🚀 TIER 1 COMPONENT CHECKS (NEW - Activation Phase - Bootstrap Mode)
+                        # ────────────────────────────────────────────────────────────
+                        # 1. Check for market anomalies (AnomalyDetector)
+                        should_skip_bootstrap = False
+                        if hasattr(self, 'anomaly_detector') and self.anomaly_detector is not None:
+                            try:
+                                if hasattr(self.anomaly_detector, 'is_anomaly_detected'):
+                                    if callable(self.anomaly_detector.is_anomaly_detected):
+                                        is_anomaly = self.anomaly_detector.is_anomaly_detected()
+                                        if is_anomaly:
+                                            self.logger.warning("[Meta:Tier1] ⚠️ ANOMALY DETECTED (Bootstrap) - Skipping %s %s", sym, side)
+                                            should_skip_bootstrap = True
+                            except Exception as e:
+                                self.logger.debug("[Meta:Tier1] AnomalyDetector check failed (bootstrap): %s", e)
+
+                        # 2. Validate position correlation in bootstrap mode
+                        if not should_skip_bootstrap and hasattr(self, 'correlation_manager') and self.correlation_manager is not None:
+                            try:
+                                if hasattr(self.correlation_manager, 'validate_position'):
+                                    if callable(self.correlation_manager.validate_position):
+                                        allocation = float(sig.get('_planned_quote', 0.0)) / max(float(await self.shared_state.get_nav() or 1.0), 1.0) * 100
+                                        corr_result = self.correlation_manager.validate_position(sym, allocation)
+                                        if corr_result and hasattr(corr_result, 'status'):
+                                            if str(corr_result.status) != "ACCEPTED":
+                                                reason = getattr(corr_result, 'reason', 'Correlation check failed')
+                                                self.logger.warning("[Meta:Tier1] ❌ CORRELATION CHECK FAILED (Bootstrap) - %s: %s", sym, reason)
+                                                should_skip_bootstrap = True
+                            except Exception as e:
+                                self.logger.debug("[Meta:Tier1] CorrelationManager check failed (bootstrap): %s", e)
+
+                        if should_skip_bootstrap:
+                            continue
+                            
                         res = await self._execute_decision(sym, side, sig, accepted_symbols_set)
                         status = "FAILED"
                         if isinstance(res, dict): status = str(res.get("status", "FAILED")).upper()
@@ -7980,6 +9610,15 @@ class MetaController:
                         if side == "BUY": break
                 else:
                     self.logger.info("[MetaTick] System gated (%s) and no safe decisions found.", ", ".join(gated_reasons))
+                    try:
+                        if isinstance(getattr(self, "_loop_summary_state", None), dict):
+                            if not self._loop_summary_state.get("rejection_reason"):
+                                gate_key = "_".join(str(x).upper() for x in gated_reasons if x)
+                                self._loop_summary_state["rejection_reason"] = (
+                                    f"SYSTEM_GATED_{gate_key}" if gate_key else "SYSTEM_GATED"
+                                )
+                    except Exception:
+                        pass
             else:
                 # Normal Mode Execution
                 executed_this_tick: set = set()
@@ -8027,6 +9666,51 @@ class MetaController:
                         except Exception as e:
                             self.logger.error("[Meta:TradeIntent] Failed to publish %s %s: %s", sym, side, e)
 
+                    # 🚀 TIER 1 COMPONENT CHECKS (NEW - Activation Phase)
+                    # ────────────────────────────────────────────────────────────
+                    # 1. Check for market anomalies (AnomalyDetector)
+                    if hasattr(self, 'anomaly_detector') and self.anomaly_detector is not None:
+                        try:
+                            if hasattr(self.anomaly_detector, 'is_anomaly_detected'):
+                                if callable(self.anomaly_detector.is_anomaly_detected):
+                                    is_anomaly = self.anomaly_detector.is_anomaly_detected()
+                                    if is_anomaly:
+                                        self.logger.warning("[Meta:Tier1] ⚠️ ANOMALY DETECTED - Skipping trade %s %s", sym, side)
+                                        continue
+                        except Exception as e:
+                            self.logger.debug("[Meta:Tier1] AnomalyDetector check failed: %s", e)
+
+                    # 2. Validate position correlation (CorrelationManager)
+                    if hasattr(self, 'correlation_manager') and self.correlation_manager is not None:
+                        try:
+                            if hasattr(self.correlation_manager, 'validate_position'):
+                                if callable(self.correlation_manager.validate_position):
+                                    allocation = float(sig.get('_planned_quote', 0.0)) / max(float(await self.shared_state.get_nav() or 1.0), 1.0) * 100
+                                    corr_result = self.correlation_manager.validate_position(sym, allocation)
+                                    if corr_result and hasattr(corr_result, 'status'):
+                                        if str(corr_result.status) != "ACCEPTED":
+                                            reason = getattr(corr_result, 'reason', 'Correlation check failed')
+                                            self.logger.warning("[Meta:Tier1] ❌ CORRELATION CHECK FAILED - %s: %s", sym, reason)
+                                            continue
+                        except Exception as e:
+                            self.logger.debug("[Meta:Tier1] CorrelationManager check failed: %s", e)
+
+                    # 3. Deploy bootstrap capital if in bootstrap mode (BootstrapOrchestrator)
+                    if hasattr(self, 'bootstrap_orchestrator') and self.bootstrap_orchestrator is not None:
+                        try:
+                            if hasattr(self.bootstrap_orchestrator, 'is_active'):
+                                if callable(self.bootstrap_orchestrator.is_active):
+                                    if self.bootstrap_orchestrator.is_active():
+                                        if hasattr(self.bootstrap_orchestrator, 'execute'):
+                                            if callable(self.bootstrap_orchestrator.execute):
+                                                self.logger.info("[Meta:Tier1] 🟢 BOOTSTRAP MODE ACTIVE - Deploying capital for %s", sym)
+                                                try:
+                                                    await self.bootstrap_orchestrator.execute()
+                                                except Exception as e:
+                                                    self.logger.debug("[Meta:Tier1] Bootstrap deploy failed: %s", e)
+                        except Exception as e:
+                            self.logger.debug("[Meta:Tier1] BootstrapOrchestrator check failed: %s", e)
+
                     res = await self._execute_decision(sym, side, sig, accepted_symbols_set)
                     
                     status = "FAILED"
@@ -8046,6 +9730,11 @@ class MetaController:
                 self.cycles_no_trade = 0
             else:
                 self.cycles_no_trade += 1
+
+            # Periodic reconciliation during no-trade streaks to avoid stale capacity locks.
+            if opened_trades <= 0 and closed_trades <= 0 and (self.cycles_no_trade % 3 == 0):
+                with contextlib.suppress(Exception):
+                    await self._reconcile_open_trade_book()
             
             # Post-execution refresh
             if opened_trades > 0 or closed_trades > 0:
@@ -8072,11 +9761,19 @@ class MetaController:
             end_snap = await _safe_await(self.shared_state.get_portfolio_snapshot())
             end_pnl = float(end_snap.get("realized_pnl", 0.0))
             realized_pnl_delta = end_pnl - start_pnl
+            attempts_this_cycle = int(self.get_execution_attempts_this_cycle() or 0)
+            attempted_execution = attempts_this_cycle > 0
+            if (opened_trades + closed_trades) > 0:
+                exec_result = "SUCCESS"
+            elif attempted_execution:
+                exec_result = "REJECTED"
+            else:
+                exec_result = "SKIPPED"
             
             # Layer 1: Update LOOP_SUMMARY
             self._loop_summary_state.update({
-                "execution_attempted": len(decisions) > 0,
-                "execution_result": "SUCCESS" if (opened_trades + closed_trades) > 0 else ("SKIPPED" if not decisions else "REJECTED"),
+                "execution_attempted": attempted_execution,
+                "execution_result": exec_result,
                 "trade_opened": opened_trades > 0,
                 "trade_closed": closed_trades > 0,
                 "realized_pnl": realized_pnl_delta,
@@ -8090,6 +9787,22 @@ class MetaController:
             
             # EMIT SUMMARY
             self._emit_loop_summary()
+
+            # 🚀 TIER 1: Reinvest Profits (CompoundingEngine)
+            # ────────────────────────────────────────────────────────────
+            if hasattr(self, 'compounding_engine') and self.compounding_engine is not None:
+                try:
+                    if hasattr(self.compounding_engine, 'propose_compounding'):
+                        if callable(self.compounding_engine.propose_compounding):
+                            # Only reinvest if a trade was executed
+                            if (opened_trades > 0 or closed_trades > 0) and realized_pnl_delta > 0:
+                                self.logger.info("[Meta:Tier1] 💰 REINVESTING PROFITS - Realized PnL: $%.2f", realized_pnl_delta)
+                                try:
+                                    await self.compounding_engine.propose_compounding()
+                                except Exception as e:
+                                    self.logger.debug("[Meta:Tier1] CompoundingEngine reinvestment failed: %s", e)
+                except Exception as e:
+                    self.logger.debug("[Meta:Tier1] CompoundingEngine call failed: %s", e)
 
 
 
@@ -8837,10 +10550,24 @@ class MetaController:
                 state = pos_data.get("state", "")
                 qty = float(pos_data.get("quantity", 0.0) or pos_data.get("qty", 0.0))
                 value_usdt = float(pos_data.get("value_usdt", 0.0) or 0.0)
+
+                # Ignore stale/empty artifacts that cannot produce an executable SELL.
+                # Also clean obvious stale records to avoid repeated deadlock loops.
+                if qty <= 0.0 or value_usdt <= 0.0:
+                    with contextlib.suppress(Exception):
+                        await self.shared_state.close_position(
+                            sym, reason="dust_sacrifice_stale_zero_qty"
+                        )
+                    continue
                 
                 # Check if position is dust-locked
                 is_dust_locked = self._is_position_dust_locked(state, qty, value_usdt)
                 if not is_dust_locked:
+                    continue
+
+                # Sacrifice path must be executable; below min_notional it will churn
+                # without freeing capital. Leave these for dust-healing/maintenance.
+                if value_usdt < float(min_notional):
                     continue
                 
                 # Determine sacrifice priority using centralized helper
@@ -10212,11 +11939,23 @@ class MetaController:
 
         return True
 
-    def _safe_passes_min_hold(self, symbol: Optional[str]) -> bool:
+    def _safe_passes_min_hold(self, symbol: Optional[str], bypass: bool = False) -> bool:
         """
         Safe wrapper for _passes_min_hold that handles AttributeError gracefully.
-        Fail-open: if method doesn't exist, return True (allow the exit).
+        
+        Args:
+            symbol: Position symbol to check
+            bypass: If True, skip min-hold check (for forced recovery exits)
+        
+        Returns:
+            True if exit is allowed, False if min-hold blocks it.
+            Fail-open: if method doesn't exist, return True (allow the exit).
         """
+        # Forced recovery exits can bypass min-hold
+        if bypass:
+            self.logger.info("[Meta:SafeMinHold] Bypassing min-hold check for forced recovery exit: %s", symbol)
+            return True
+        
         try:
             if hasattr(self, "_passes_min_hold") and callable(getattr(self, "_passes_min_hold")):
                 return self._passes_min_hold(symbol)
@@ -10555,7 +12294,14 @@ class MetaController:
         # NOT the stale sig_pos from _count_significant_positions()
         # This ensures we're using cleaned/filtered positions, not raw count
         actual_open_positions = self.shared_state.get_open_positions()
-        current_sig_pos = len(actual_open_positions)
+        current_sig_pos = max(len(actual_open_positions), int(sig_pos or 0))
+        if current_sig_pos > len(actual_open_positions):
+            self._info_once(
+                "__sig_pos_fallback_inventory__",
+                "[Meta:PosCounts] Using authoritative significant count fallback (%d) over open_positions (%d).",
+                current_sig_pos,
+                len(actual_open_positions),
+            )
         
         # STEP 0.1: Mandatory Sell Unsticking (Enforce SOP capacity recovered)
         # We need max_pos here early to evaluate unsticking condition
@@ -10587,12 +12333,17 @@ class MetaController:
         except Exception:
             nav = 0.0
 
+        quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
+        try:
+            available_capital = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
+        except Exception:
+            available_capital = 0.0
+
         if not capital_ok:
             # Do NOT return early—BUYs blocked; SELLs still allowed
             capital_block = True
             context_flags["CAPITAL_BLOCK"] = True
-            quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
-            free_usdt = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
+            free_usdt = available_capital
             
             abs_min_floor = float(self._cfg("ABSOLUTE_MIN_FLOOR", self._cfg("CAPITAL_PRESERVATION_FLOOR", 10.0)))
             floor_pct = float(self._cfg("CAPITAL_FLOOR_PCT", 0.20))
@@ -10607,8 +12358,8 @@ class MetaController:
         # Allow bootstrap seed when account is empty, EVEN if capital_stable=False
         # AUTO-ENABLE: If account is completely empty (NAV=0, free_usdt=0), enable bootstrap
         # ────────────────────────────────────────────────────────────────────────
-        quote_asset_for_bootstrap = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
-        free_usdt_for_check = float(await self.shared_state.get_spendable_balance(quote_asset_for_bootstrap) or 0.0)
+        quote_asset_for_bootstrap = quote_asset
+        free_usdt_for_check = available_capital
         
         # AUTO-ENABLE bootstrap when account is empty (emergency measure)
         if nav <= 0.0 and free_usdt_for_check <= 0.0:
@@ -10735,7 +12486,15 @@ class MetaController:
                 "[Meta:PhaseGate] BOOTSTRAP_VIRTUAL active: stability=%s | Blocking real trades until stable.",
                 stability_reason,
             )
-            return []
+            # Critical sell-path invariant:
+            # Capital-floor instability must block BUY expansion, but must NOT block SELL recovery.
+            # If we are unstable due capital floor/starvation, continue in SELL-only mode.
+            if capital_block or str(stability_reason).lower() in {"capital_floor", "starved", "capital_starved"}:
+                self.logger.warning(
+                    "[Meta:PhaseGate] SELL-only override active under capital instability; allowing exits to recover quote liquidity."
+                )
+            else:
+                return []
 
         # ────────────────────────────────────────────────────────────────────────
         # STEP 1: EXPLICIT VELOCITY & EXIT AUTHORITY (Canonical REA Override)
@@ -10744,7 +12503,7 @@ class MetaController:
         # looking at new buys. This solves the "deadlock" where the bot holds
         # stagnant positions and hits limits on new buys.
         
-        owned_positions_for_rea = self.shared_state.get_open_positions()
+        owned_positions_for_rea = self._get_owned_positions_for_exit()
         
         # 1.1 Proactive Stagnation Purge (Always running to maintain velocity)
         # Identifies "zombie" positions that are old and unprofitable.
@@ -10758,7 +12517,30 @@ class MetaController:
                 await self._passes_meta_sell_profit_gate(stagnation_exit_sig.get("symbol"), stagnation_exit_sig)
                 and await self._passes_meta_sell_excursion_gate(stagnation_exit_sig.get("symbol"), stagnation_exit_sig)
             ):
+                # Mark forced recovery exit to bypass min-hold gate in pre-decision
+                stagnation_exit_sig["_bypass_min_hold"] = True
                 return [(stagnation_exit_sig.get("symbol"), "SELL", stagnation_exit_sig)]
+
+        # 1.15 Liquidity Restoration (preserve strategic reserve/optionality)
+        liquidity_restore_sig = self.rotation_authority.authorize_liquidity_restoration_exit(
+            owned_positions=owned_positions_for_rea,
+            nav=nav,
+            free_usdt=available_capital,
+        )
+        if liquidity_restore_sig:
+            self.logger.warning(
+                "[Meta:ExitAuth] LIQUIDITY_RESTORE: Recycling %s to rebuild operating cash.",
+                liquidity_restore_sig.get("symbol"),
+            )
+            if (
+                await self._passes_meta_sell_profit_gate(liquidity_restore_sig.get("symbol"), liquidity_restore_sig)
+                and await self._passes_meta_sell_excursion_gate(liquidity_restore_sig.get("symbol"), liquidity_restore_sig)
+            ):
+                # Mark forced recovery exit to bypass min-hold gate in pre-decision
+                liquidity_restore_sig["_bypass_min_hold"] = True
+                if not self._safe_passes_min_hold(liquidity_restore_sig.get("symbol"), bypass=True):
+                    return []
+                return [(liquidity_restore_sig.get("symbol"), "SELL", liquidity_restore_sig)]
 
         # 1.2 Proactive Rotation (if full or starved)
         # Authorizes forced exits to free capital for higher-alpha opportunities.
@@ -10773,6 +12555,39 @@ class MetaController:
                     best_buy_cand = max(buy_sigs, key=lambda x: self.score_opportunity(x))
                     opp_score = self.score_opportunity(best_buy_cand)
                     best_buy_cand["_opp_score"] = opp_score
+                    force_micro_rotation = False
+                    try:
+                        esc_raw = self._cfg("MICRO_CAPACITY_ESCAPE_ENABLE", True)
+                        if isinstance(esc_raw, str):
+                            esc_enabled = esc_raw.strip().lower() in {"1", "true", "yes", "on"}
+                        else:
+                            esc_enabled = bool(esc_raw)
+                        escape_cycles = int(self._cfg("MICRO_CAPACITY_ESCAPE_NO_TRADE_CYCLES", 8) or 8)
+                        escape_conf = float(self._cfg("MICRO_CAPACITY_ESCAPE_MIN_CONFIDENCE", 0.55) or 0.55)
+                        micro_nav_threshold = float(self._cfg("CAPITAL_MICRO_THRESHOLD", 500.0) or 500.0)
+                        no_trade_streak = int(getattr(self, "cycles_no_trade", 0) or 0)
+                        buy_conf = float(best_buy_cand.get("confidence", 0.0) or 0.0)
+                        is_micro_profile = bool((0.0 < float(nav) <= micro_nav_threshold) or (max_pos_for_clear <= 1))
+                        if (
+                            esc_enabled
+                            and current_sig_pos >= max_pos_for_clear
+                            and is_micro_profile
+                            and no_trade_streak >= escape_cycles
+                            and buy_conf >= escape_conf
+                        ):
+                            force_micro_rotation = True
+                            best_buy_cand["_force_micro_rotation"] = True
+                            best_buy_cand["_force_rotation_reason"] = "micro_capacity_escape"
+                            self.logger.warning(
+                                "[Meta:CapacityEscape] Triggering forced micro rotation pre-check "
+                                "(sig_pos=%d max_pos=%d no_trade_cycles=%d conf=%.3f).",
+                                current_sig_pos,
+                                max_pos_for_clear,
+                                no_trade_streak,
+                                buy_conf,
+                            )
+                    except Exception:
+                        force_micro_rotation = False
                     
                     rotation_sig = await self.rotation_authority.authorize_rotation(
                         sig_pos=sig_pos, 
@@ -10780,7 +12595,8 @@ class MetaController:
                         owned_positions=owned_positions_for_rea,
                         best_opp=best_buy_cand,
                         current_mode=current_mode,
-                        is_starved=is_starved
+                        is_starved=is_starved,
+                        force_rotation=force_micro_rotation,
                     )
                     
                     if rotation_sig:
@@ -11345,41 +13161,31 @@ class MetaController:
         # CRITICAL: If healing_possible == True, NEVER trigger sacrifice
         # Neither returns early - both feed into normal decision pipeline for prioritization
         
-        metrics = getattr(self.shared_state, "metrics", {}) or {}
-        trade_count = int(
-            metrics.get("total_trades_executed", 0)
-            or getattr(self.shared_state, "trade_count", 0)
-            or 0
-        )
-        if trade_count < 1:
-            self.logger.info(
-                "[Meta:DUST_HEALING] Disabled before evaluation: trade_count=%d < 1 (no realized trades yet)",
-                trade_count,
+        # Dust-healing readiness (trade-count, dust existence, regime) is evaluated
+        # inside _check_dust_healing_opportunity(). Do not pre-block here using only
+        # trade_count, otherwise restart scenarios with existing dust get stuck.
+        # 🔥 CRITICAL FIX: Wrap dust healing check with timeout
+        # The wallet sync inside _check_dust_healing_opportunity() can hang indefinitely
+        # Without a timeout, dust sync stall cascades to block ALL decision issuance
+        dust_healing_timeout = float(self._cfg("DUST_HEALING_EVALUATION_TIMEOUT_SEC", 5.0) or 5.0)
+        try:
+            dust_healing_decisions = await _asyncio.wait_for(
+                self._check_dust_healing_opportunity(),
+                timeout=dust_healing_timeout
+            )
+        except _asyncio.TimeoutError:
+            self.logger.warning(
+                "[Meta:DUST_HEALING_TIMEOUT] ⚠️ Dust healing check timed out after %.1fs; "
+                "skipping healing opportunity for this cycle (normal decisions will proceed)",
+                dust_healing_timeout
             )
             dust_healing_decisions = None
-        else:
-            # 🔥 CRITICAL FIX: Wrap dust healing check with timeout
-            # The wallet sync inside _check_dust_healing_opportunity() can hang indefinitely
-            # Without a timeout, dust sync stall cascades to block ALL decision issuance
-            dust_healing_timeout = float(self._cfg("DUST_HEALING_EVALUATION_TIMEOUT_SEC", 5.0) or 5.0)
-            try:
-                dust_healing_decisions = await _asyncio.wait_for(
-                    self._check_dust_healing_opportunity(),
-                    timeout=dust_healing_timeout
-                )
-            except _asyncio.TimeoutError:
-                self.logger.warning(
-                    "[Meta:DUST_HEALING_TIMEOUT] ⚠️ Dust healing check timed out after %.1fs; "
-                    "skipping healing opportunity for this cycle (normal decisions will proceed)",
-                    dust_healing_timeout
-                )
-                dust_healing_decisions = None
-            except Exception as e:
-                self.logger.warning(
-                    "[Meta:DUST_HEALING_ERROR] Dust healing check failed: %s; skipping for this cycle",
-                    e
-                )
-                dust_healing_decisions = None
+        except Exception as e:
+            self.logger.warning(
+                "[Meta:DUST_HEALING_ERROR] Dust healing check failed: %s; skipping for this cycle",
+                e
+            )
+            dust_healing_decisions = None
         if dust_healing_decisions:
             context_flags["DUST_HEALING_AVAILABLE"] = True
             context_flags["DUST_HEALING_DECISION"] = dust_healing_decisions[0]
@@ -11427,7 +13233,7 @@ class MetaController:
         
         # 🔴 CRITICAL FIX: Populate owned_positions with ACTUAL portfolio positions from SharedState
         # Without this, all subsequent capacity checks use an empty dict, causing false overcapacity errors
-        owned_positions = self.shared_state.get_open_positions() or {}
+        owned_positions = self._get_owned_positions_for_exit()
         
         # AUTHORITATIVE FLAT CHECK: bootstrap-aware (dust-only portfolios treated as flat in BOOTSTRAP)
         is_flat = await self._check_portfolio_flat()
@@ -11459,7 +13265,7 @@ class MetaController:
                     available_capital = float(await _safe_await(
                         self.shared_state.get_spendable_balance(quote_asset)
                     ) or 0.0)
-                    min_bootstrap_capital = 50.0  # Minimum capital to attempt bootstrap
+                    min_bootstrap_capital = 25.0  # Minimum capital to attempt bootstrap (LOWERED for micro-cap trading)
                     
                     # CRITICAL DEBUG: Log bootstrap conditions
                     self.logger.warning(
@@ -11473,12 +13279,35 @@ class MetaController:
                         # Look for signals with sufficient confidence
                         all_signals_now = self.signal_manager.get_all_signals()
                         
-                        # CRITICAL DEBUG: Log signal cache contents
-                        self.logger.warning(
-                            "[Meta:BOOTSTRAP_DEBUG] Signal cache contains %d signals: %s",
-                            len(all_signals_now),
-                            [f"{s.get('symbol')}:{s.get('action')}:{s.get('confidence')}" for s in all_signals_now[:3]]
+                        # CRITICAL DEBUG: Log signal cache contents AND cache object identity
+                        self.logger.critical(
+                            "[Meta:BOOTSTRAP_DEBUG:CACHE_QUERY] 🔍 Querying cache NOW! "
+                            "Cache object id=%s signal_manager id=%s signal_manager.signal_cache id=%s. "
+                            "Total signals=%d",
+                            id(self.signal_cache),
+                            id(self.signal_manager),
+                            id(self.signal_manager.signal_cache) if self.signal_manager else "N/A",
+                            len(all_signals_now)
                         )
+                        
+                        if all_signals_now:
+                            # Log first 3 signals in detail
+                            for idx, sig in enumerate(all_signals_now[:3]):
+                                self.logger.critical(
+                                    "[Meta:BOOTSTRAP_DEBUG] Signal #%d: %s %s (conf=%.2f, agent=%s)",
+                                    idx + 1,
+                                    sig.get('symbol'),
+                                    sig.get('action'),
+                                    float(sig.get('confidence', 0.0)),
+                                    sig.get('agent', 'unknown')
+                                )
+                        else:
+                            self.logger.critical(
+                                "[Meta:BOOTSTRAP_DEBUG] ⚠️ NO SIGNALS IN CACHE! "
+                                "signal_cache._cache=%s, len=%s",
+                                hasattr(self.signal_cache, '_cache'),
+                                len(self.signal_cache._cache) if hasattr(self.signal_cache, '_cache') else 'N/A'
+                            )
                         
                         best_bootstrap_signal = None
                         for sig in all_signals_now:
@@ -11487,6 +13316,38 @@ class MetaController:
                                 if conf >= 0.60:  # Bootstrap confidence threshold
                                     if best_bootstrap_signal is None or conf > float(best_bootstrap_signal.get("confidence", 0.0)):
                                         best_bootstrap_signal = sig
+
+                        # Flat-wallet starvation fix:
+                        # If portfolio is flat and agents emit SELL-only, optionally convert the
+                        # strongest SELL to a bootstrap BUY probe to keep the cycle alive.
+                        if best_bootstrap_signal is None and bool(
+                            self._cfg("BOOTSTRAP_ALLOW_SELL_SIGNAL_CONVERSION", True)
+                        ):
+                            best_sell_signal = None
+                            for sig in all_signals_now:
+                                if str(sig.get("action", "")).upper() != "SELL":
+                                    continue
+                                conf = float(sig.get("confidence", 0.0))
+                                if conf >= 0.60 and (
+                                    best_sell_signal is None
+                                    or conf > float(best_sell_signal.get("confidence", 0.0))
+                                ):
+                                    best_sell_signal = sig
+
+                            if best_sell_signal is not None:
+                                best_bootstrap_signal = dict(best_sell_signal)
+                                best_bootstrap_signal["_original_action"] = "SELL"
+                                best_bootstrap_signal["_converted_from_sell"] = True
+                                best_bootstrap_signal["_bootstrap_from_sell_only"] = True
+                                best_bootstrap_signal["action"] = "BUY"
+                                best_bootstrap_signal["reason"] = "BOOTSTRAP_CONVERTED_FROM_SELL_ONLY"
+                                self.logger.warning(
+                                    "[Meta:BOOTSTRAP_CONVERT] FLAT portfolio + SELL-only flow. "
+                                    "Converting %s SELL(conf=%.2f agent=%s) into bootstrap BUY to avoid starvation.",
+                                    best_bootstrap_signal.get("symbol", "UNKNOWN"),
+                                    float(best_bootstrap_signal.get("confidence", 0.0)),
+                                    best_bootstrap_signal.get("agent", "unknown"),
+                                )
                         
                         if best_bootstrap_signal:
                             # FIX: Enforce one-shot limit (Caveat #1)
@@ -11538,8 +13399,73 @@ class MetaController:
 
         # ═══════════════════════════════════════════════════════════════════════════════
         
+        # 🔥 CRITICAL FIX: BOOTSTRAP IMMEDIATE TRADE EXECUTION
+        # If bootstrap sets override, DO NOT wait for signals to pass through gates
+        # Directly create and return a decision tuple RIGHT NOW
+        if bootstrap_execution_override and best_bootstrap_signal:
+            sym = best_bootstrap_signal.get("symbol")
+            self.logger.critical(
+                "[Meta:BOOTSTRAP_IMMEDIATE] 🚀 CREATING IMMEDIATE TRADE DECISION! "
+                "symbol=%s action=BUY confidence=%.2f",
+                sym,
+                float(best_bootstrap_signal.get("confidence", 0.0))
+            )
+            # Mark signal as bootstrap override
+            best_bootstrap_signal["_bootstrap_override"] = True
+            best_bootstrap_signal["_bypass_reason"] = "BOOTSTRAP_OVERRIDE"
+            # Ensure bootstrap signal has an executable quote floor (prevents zero-qty skips).
+            try:
+                current_price = 0.0
+                if self.exchange_client:
+                    get_px = getattr(self.exchange_client, "get_current_price", None) or getattr(
+                        self.exchange_client, "get_price", None
+                    )
+                    if get_px:
+                        current_price = float(await get_px(sym) or 0.0)
+
+                proposed_quote = float(
+                    best_bootstrap_signal.get("_planned_quote")
+                    or best_bootstrap_signal.get("planned_quote")
+                    or 0.0
+                )
+                if proposed_quote <= 0:
+                    proposed_quote = float(
+                        await self._planned_quote_for(sym, best_bootstrap_signal) or 0.0
+                    )
+
+                hard_min_quote = max(
+                    float(self._cfg("MIN_ENTRY_USDT", 12.0)),
+                    float(self._cfg("MIN_NOTIONAL_USDT", 10.0)),
+                )
+                proposed_quote = max(proposed_quote, hard_min_quote)
+                planned_quote = await self._resolve_entry_quote_floor(
+                    sym,
+                    proposed_quote=proposed_quote,
+                    price=float(current_price or 0.0),
+                )
+                planned_quote = max(float(planned_quote or 0.0), hard_min_quote)
+                best_bootstrap_signal["_planned_quote"] = planned_quote
+                self.logger.warning(
+                    "[Meta:BOOTSTRAP_IMMEDIATE] Quote floor applied for %s: planned_quote=%.2f (px=%.6f)",
+                    sym,
+                    planned_quote,
+                    float(current_price or 0.0),
+                )
+            except Exception as e:
+                self.logger.warning(
+                    "[Meta:BOOTSTRAP_IMMEDIATE] Failed quote floor prep for %s: %s",
+                    sym,
+                    e,
+                )
+            # DIRECTLY return a decision tuple - DO NOT go through normal gates!
+            self.logger.warning(
+                "[Meta:BOOTSTRAP_IMMEDIATE] ✅ Bypassing normal pipeline! "
+                "Returning immediate bootstrap decision tuple"
+            )
+            # This will be picked up and executed immediately after _build_decisions returns
+            return [(sym, "BUY", best_bootstrap_signal)]
+        
         # ═══════════════════════════════════════════════════════════════════════════════
-        # GOVERNANCE BLOCKER (RE-RE-ENFORCEMENT)
         # ─────────────────────────────────────────────────────────────────────────────
         # If BUY is not in allowed actions (e.g. PROTECTIVE or SIGNAL_ONLY), set capital_block=True
         # to ensure no new positions are planned, while allowing SELLs to continue.
@@ -11733,6 +13659,7 @@ class MetaController:
                     # 2. Probing Gate: Block new symbols if probing disabled for mode
                     # EXCEPTION: Bootstrap signals AND BOOTSTRAP MODE itself bypass this restriction
                     # The ENTIRE purpose of BOOTSTRAP mode is to make the first trade on a flat portfolio
+                    # MICRO-ACCOUNT EXCEPTION: Allow probing on very small accounts (<$500) even in recovery
                     is_bootstrap_signal = (
                         sig.get("_bootstrap")
                         or sig.get("_bootstrap_override")
@@ -11741,10 +13668,18 @@ class MetaController:
                     current_mode = self.mode_manager.get_mode()
                     is_bootstrap_mode = current_mode == "BOOTSTRAP"
                     
+                    # Micro account detection: Allow probing even in RECOVERY mode if account is very small
+                    nav_usd = float(await self.shared_state.get_nav() or 0.0)
+                    is_micro_account = nav_usd < 500.0
+                    
                     # In BOOTSTRAP mode, probing IS allowed (that's the point of the mode)
-                    if not probing_enabled and sym not in owned_positions and not is_bootstrap_signal and not is_bootstrap_mode:
+                    # On micro accounts, probing ALWAYS allowed (critical to bootstrap on small capital)
+                    if not probing_enabled and sym not in owned_positions and not is_bootstrap_signal and not is_bootstrap_mode and not is_micro_account:
                         self.logger.info("[Meta:Envelope] BLOCKED %s BUY: Probing (new assets) disabled in %s mode.", sym, current_mode)
                         continue
+                    
+                    if is_micro_account and not probing_enabled:
+                        self.logger.info("[Meta:Envelope:MicroAccount] ALLOWING %s BUY: Micro account probing override (nav=$%.2f < $500)", sym, nav_usd)
 
                     # 3. Confidence Floor Gate
                     # Phase A: Dynamic Execution Floor (Aggression-Aware)
@@ -11848,6 +13783,10 @@ class MetaController:
                             )
                             continue
                 if action not in ("BUY", "SELL", "HOLD"):
+                    self.logger.warning(
+                        "[Meta:GATE_DROP_INVALID_ACTION] %s dropped: action=%s is not BUY/SELL/HOLD",
+                        sym, action
+                    )
                     continue
 
                 # Per-symbol BUY cooldown to prevent overtrading
@@ -11915,6 +13854,20 @@ class MetaController:
 
                 # Anti-churn: enforce one position per symbol unless explicitly accumulating
                 if action == "BUY":
+                    buy_block_key = (str(sym).upper(), "BUY")
+                    buy_unblock_ts = float(self._symbol_side_block_until.get(buy_block_key, 0.0) or 0.0)
+                    now_buy_gate = time.time()
+                    if buy_unblock_ts > now_buy_gate:
+                        remaining = int(max(0.0, buy_unblock_ts - now_buy_gate))
+                        self.logger.info(
+                            "[Meta:PositionOpenCooldown] Skipping %s BUY: cooldown active (%ss remaining)",
+                            sym,
+                            remaining,
+                        )
+                        continue
+                    elif buy_unblock_ts > 0.0:
+                        self._symbol_side_block_until.pop(buy_block_key, None)
+
                     max_per_symbol = int(self._cfg(
                         "MAX_OPEN_POSITIONS_PER_SYMBOL",
                         default=self._max_open_positions_per_symbol,
@@ -11941,6 +13894,30 @@ class MetaController:
                                     side="BUY",
                                     signal=sig,
                                 )
+                                try:
+                                    rej_getter = getattr(self.shared_state, "get_rejection_count", None)
+                                    rej_count = int(
+                                        rej_getter(sym, "BUY", "POSITION_ALREADY_OPEN") if callable(rej_getter) else 0
+                                    )
+                                except Exception:
+                                    rej_count = 0
+                                cooldown_trigger = int(
+                                    self._cfg("POSITION_OPEN_BUY_COOLDOWN_TRIGGER", 6) or 6
+                                )
+                                cooldown_sec = float(
+                                    self._cfg("POSITION_OPEN_BUY_COOLDOWN_SEC", 120.0) or 120.0
+                                )
+                                if rej_count >= max(1, cooldown_trigger):
+                                    self._symbol_side_block_until[buy_block_key] = max(
+                                        float(self._symbol_side_block_until.get(buy_block_key, 0.0) or 0.0),
+                                        time.time() + max(5.0, cooldown_sec),
+                                    )
+                                    self.logger.warning(
+                                        "[Meta:PositionOpenCooldown] Engaged for %s BUY (%ss) after %d POSITION_ALREADY_OPEN rejections",
+                                        sym,
+                                        int(max(5.0, cooldown_sec)),
+                                        rej_count,
+                                    )
                                 continue
                             self.logger.info(
                                 "[Meta:POSITION_LOCK_BYPASS] %s bypassed one-position lock (%s qty=%.6f value=%.6f floor=%.6f)",
@@ -11997,6 +13974,30 @@ class MetaController:
                                 side="BUY",
                                 signal=sig,
                             )
+                            try:
+                                rej_getter = getattr(self.shared_state, "get_rejection_count", None)
+                                rej_count = int(
+                                    rej_getter(sym, "BUY", "POSITION_ALREADY_OPEN") if callable(rej_getter) else 0
+                                )
+                            except Exception:
+                                rej_count = 0
+                            cooldown_trigger = int(
+                                self._cfg("POSITION_OPEN_BUY_COOLDOWN_TRIGGER", 6) or 6
+                            )
+                            cooldown_sec = float(
+                                self._cfg("POSITION_OPEN_BUY_COOLDOWN_SEC", 120.0) or 120.0
+                            )
+                            if rej_count >= max(1, cooldown_trigger):
+                                self._symbol_side_block_until[buy_block_key] = max(
+                                    float(self._symbol_side_block_until.get(buy_block_key, 0.0) or 0.0),
+                                    time.time() + max(5.0, cooldown_sec),
+                                )
+                                self.logger.warning(
+                                    "[Meta:PositionOpenCooldown] Engaged for %s BUY (%ss) after %d POSITION_ALREADY_OPEN rejections",
+                                    sym,
+                                    int(max(5.0, cooldown_sec)),
+                                    rej_count,
+                                )
                             continue
                         else:
                             # Position is DUST or UNHEALABLE_DUST - ALLOW signal through
@@ -12110,7 +14111,21 @@ class MetaController:
                 
                 # Short-circuit on recent rejections to avoid looping on known-bad combos
                 try:
-                    cooldown_s = float(self._cfg("REJECTION_COOLDOWN_SECONDS", 60))
+                    block_key = (sym, str(action).upper())
+                    unblock_ts = float(self._symbol_side_block_until.get(block_key, 0.0) or 0.0)
+                    if unblock_ts > time.time():
+                        remaining = int(max(0.0, unblock_ts - time.time()))
+                        self.logger.info(
+                            "[Meta:Cooldown] Skipping %s %s due to local rejection quarantine (%ss remaining)",
+                            sym,
+                            action,
+                            remaining,
+                        )
+                        continue
+                    elif unblock_ts > 0.0:
+                        self._symbol_side_block_until.pop(block_key, None)
+
+                    cooldown_s = float(self._cfg("REJECTION_COOLDOWN_SECONDS", 10))  # Lowered from 60s for faster iteration during bootstrap
                     if hasattr(self.shared_state, "is_symbol_temporarily_blocked"):
                         if await _safe_await(self.shared_state.is_symbol_temporarily_blocked(sym, action, cooldown_s)):
                             self.logger.debug("[Meta:Cooldown] Skipping %s %s due to recent rejections (cooldown=%ss)", sym, action, cooldown_s)
@@ -12122,12 +14137,23 @@ class MetaController:
                 # because SELL is risk-reducing and must be executable even during capital shortage
                 # BOOTSTRAP BYPASS: Bootstrap mode must NOT be subject to rejection_threshold blocking
                 # because the goal is liquidity seeding and confidence gating is counterproductive
+                # MICRO-ACCOUNT BYPASS: Micro accounts need higher rejection threshold for more retries
                 if action != "SELL" and not self._is_bootstrap_mode():
                     try:
-                        if hasattr(self.shared_state, "is_symbol_blocked") and self.shared_state.is_symbol_blocked(sym, action):
-                            self.logger.info("[Meta:Block] Skipping %s %s: blocked by rejection threshold", sym, action)
-                            continue
-                    except Exception:
+                        # For micro accounts (<$500), use higher threshold (10) to allow more retries
+                        # For normal accounts, use default threshold (3)
+                        nav_usd = float(await self.shared_state.get_nav() or 0.0)
+                        is_micro = nav_usd < 500.0
+                        threshold = 10 if is_micro else 3
+                        
+                        if hasattr(self.shared_state, "is_symbol_blocked"):
+                            # Create a custom check with dynamic threshold
+                            count = self.shared_state.get_rejection_count(sym, action)
+                            if count >= threshold:
+                                self.logger.info("[Meta:Block:RejectionThreshold] Skipping %s %s: rejected %d times >= threshold %d (micro=%s)", sym, action, count, threshold, is_micro)
+                                continue
+                    except Exception as e:
+                        self.logger.debug("[Meta:Block:Exception] Error checking rejection threshold: %s", str(e))
                         pass
 
                 # ✅ GATE PASSED: Signal made it through all gates - add to valid list
@@ -12544,8 +14570,41 @@ class MetaController:
                     len(candidates) + len(dusty_symbols), len(candidates), len(dusty_symbols)
                 )
             
-            # Sort by confidence (descending)
-            candidates.sort(key=lambda x: float(x[1].get("confidence", 0.0)), reverse=True)
+            # MICRO-ACCOUNT FIX: Sort by affordability + confidence hybrid
+            # For accounts < $500, prioritize tradable coins by price tier
+            spendable = await self.shared_state.get_spendable_balance("USDT")
+            nav_usd = float(await _safe_await(self.shared_state.get_nav_quote()) or 0.0)
+            
+            def affordability_sort_key(item):
+                """Sort by: (1) Affordability tier (cheaper coins first), (2) Confidence (highest first)"""
+                sym, s = item
+                conf = float(s.get("confidence", 0.0))
+                
+                # Get estimated price tier for this symbol
+                try:
+                    price = self.latest_prices.get(sym, 999999)  # High default if unknown
+                except:
+                    price = 999999
+                
+                # For micro accounts, prefer cheaper coins (lower price = lower notional min)
+                # Priority: (1) affordability_tier_score (lower price), (2) confidence (higher)
+                if nav_usd < 500:  # Micro account
+                    # Tier scoring: penny coins << alt coins << majors
+                    # Estimate min notional by price point
+                    if price < 1:
+                        tier_priority = (0, -conf)  # Tier 0 (cheapest): DOGE, etc
+                    elif price < 100:
+                        tier_priority = (1, -conf)  # Tier 1 (medium): XRP, LINK, MATIC, ADA
+                    else:
+                        tier_priority = (2, -conf)  # Tier 2 (expensive): BTC, ETH, BNB, SOL, AVAX
+                    return tier_priority
+                else:
+                    # Standard account: just sort by confidence
+                    return (0, -conf)
+            
+            # Sort by affordability_sort_key
+            candidates.sort(key=affordability_sort_key)
+            self.logger.debug(f"[Meta:MicroOptimize] Sorted {len(candidates)} candidates: {[(s[0], round(s[1].get('confidence', 0), 2)) for s in candidates[:5]]}")
             
             for sym, s in candidates:
                 conf = float(s.get("confidence", 0.0))
@@ -12920,49 +14979,75 @@ class MetaController:
         regime = (regime or "normal").lower()
 
         if regime == "low":
-            blocked_agents = {"trendhunter", "bootstrapscalper"}
+            nav_usd = float(
+                (getattr(self.shared_state, "metrics", {}) or {}).get("nav")
+                or (getattr(self.shared_state, "metrics", {}) or {}).get("total_nav")
+                or getattr(self.shared_state, "nav", 0.0)
+                or 0.0
+            )
+            if nav_usd <= 0.0:
+                try:
+                    snap = await _safe_await(self.shared_state.get_portfolio_snapshot())
+                    nav_usd = float((snap or {}).get("nav", 0.0) or 0.0)
+                except Exception:
+                    nav_usd = nav_usd or 0.0
+            micro_threshold = float(self._cfg("CAPITAL_MICRO_THRESHOLD", 500.0) or 500.0)
+            allow_micro_low_regime_buy = str(
+                self._cfg("LOW_REGIME_ALLOW_BUY_MICRO", True)
+            ).strip().lower() in {"1", "true", "yes", "on"}
 
-            def _low_regime_exit(sig: Dict[str, Any]) -> bool:
-                reason_text = " ".join([
-                    str(sig.get("reason") or ""),
-                    str(sig.get("exit_reason") or ""),
-                    str(sig.get("signal_reason") or ""),
-                    str(sig.get("liquidation_reason") or ""),
-                    str(sig.get("tag") or ""),
-                    str(sig.get("_tag") or ""),
-                    str(sig.get("execution_tag") or ""),
-                ]).lower()
-                if sig.get("_is_starvation_sell") or sig.get("_force_dust_liquidation"):
-                    return True
-                if "tp_sl" in reason_text or "take_profit" in reason_text or "stop_loss" in reason_text:
-                    return True
-                if "liquidation" in reason_text or "dust" in reason_text:
-                    return True
-                return False
-
-            dropped = 0
-            for sym in list(valid_signals_by_symbol.keys()):
-                filtered = []
-                for sig in valid_signals_by_symbol.get(sym, []):
-                    action = str(sig.get("action") or "").upper()
-                    agent = str(sig.get("agent") or "").lower()
-                    if action == "SELL" and _low_regime_exit(sig):
-                        filtered.append(sig)
-                        continue
-                    if agent in blocked_agents or action == "BUY":
-                        dropped += 1
-                        continue
-                    dropped += 1
-                if filtered:
-                    valid_signals_by_symbol[sym] = filtered
-                else:
-                    valid_signals_by_symbol.pop(sym, None)
-
-            if dropped > 0:
-                self.logger.warning(
-                    "[Meta:RegimeGate] LOW regime: blocked %d signals (allowed exits only).",
-                    dropped,
+            # Micro account carve-out: keep buy flow alive in low regime so the engine can
+            # continue learning/compounding instead of going fully inert.
+            if allow_micro_low_regime_buy and 0.0 < nav_usd <= micro_threshold:
+                self.logger.info(
+                    "[Meta:RegimeGate] LOW regime micro override active (NAV=$%.2f <= $%.2f): BUY signals allowed.",
+                    nav_usd,
+                    micro_threshold,
                 )
+            else:
+                blocked_agents = {"trendhunter", "bootstrapscalper"}
+
+                def _low_regime_exit(sig: Dict[str, Any]) -> bool:
+                    reason_text = " ".join([
+                        str(sig.get("reason") or ""),
+                        str(sig.get("exit_reason") or ""),
+                        str(sig.get("signal_reason") or ""),
+                        str(sig.get("liquidation_reason") or ""),
+                        str(sig.get("tag") or ""),
+                        str(sig.get("_tag") or ""),
+                        str(sig.get("execution_tag") or ""),
+                    ]).lower()
+                    if sig.get("_is_starvation_sell") or sig.get("_force_dust_liquidation"):
+                        return True
+                    if "tp_sl" in reason_text or "take_profit" in reason_text or "stop_loss" in reason_text:
+                        return True
+                    if "liquidation" in reason_text or "dust" in reason_text:
+                        return True
+                    return False
+
+                dropped = 0
+                for sym in list(valid_signals_by_symbol.keys()):
+                    filtered = []
+                    for sig in valid_signals_by_symbol.get(sym, []):
+                        action = str(sig.get("action") or "").upper()
+                        agent = str(sig.get("agent") or "").lower()
+                        if action == "SELL" and _low_regime_exit(sig):
+                            filtered.append(sig)
+                            continue
+                        if agent in blocked_agents or action == "BUY":
+                            dropped += 1
+                            continue
+                        dropped += 1
+                    if filtered:
+                        valid_signals_by_symbol[sym] = filtered
+                    else:
+                        valid_signals_by_symbol.pop(sym, None)
+
+                if dropped > 0:
+                    self.logger.warning(
+                        "[Meta:RegimeGate] LOW regime: blocked %d signals (allowed exits only).",
+                        dropped,
+                    )
         
         # ✅ FIX #2: Bootstrap lock engaged - log it and proceed with normal decision making
         if is_flat and bootstrap_lock_engaged:
@@ -12986,6 +15071,16 @@ class MetaController:
         symbol_scores = []
         deadlock_threshold = int(self._cfg("DEADLOCK_REJECTION_THRESHOLD", 10))
         for sym, signals in valid_signals_by_symbol.items():
+            local_block_until = float(self._symbol_side_block_until.get((str(sym).upper(), "BUY"), 0.0) or 0.0)
+            if local_block_until > time.time():
+                remaining = int(max(0.0, local_block_until - time.time()))
+                self.logger.info(
+                    "[Meta:Rank] Skipping %s BUY candidates due to active local quarantine (%ss remaining)",
+                    sym,
+                    remaining,
+                )
+                continue
+
             max_conf = max(float(s.get("confidence", 0.0)) for s in signals)
             rank_weight = 1.3 if sym in owned_positions else 1.0
             
@@ -13042,21 +15137,54 @@ class MetaController:
         
         # PRE-LAYER: Initialize agent budgets (needed by Layers 1, 3)
         agent_budgets = {}
+        quote_asset_for_budget = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
         try:
-            plan = self.shared_state.get_active_allocation_plan()
+            spendable_quote_budget = float(
+                await self.shared_state.get_spendable_balance(quote_asset_for_budget) or 0.0
+            )
+        except Exception:
+            spendable_quote_budget = 0.0
+        shared_wallet_mode_raw = self._cfg("CAPITAL_ALLOCATOR_SHARED_WALLET", True)
+        if isinstance(shared_wallet_mode_raw, str):
+            shared_wallet_mode = shared_wallet_mode_raw.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            shared_wallet_mode = bool(shared_wallet_mode_raw)
+        try:
+            plan = self.shared_state.get_active_allocation_plan() or {}
+            if not isinstance(plan, dict):
+                plan = {}
+            per_agent_plan = plan.get("per_agent_usdt", {}) or {}
+            if not isinstance(per_agent_plan, dict):
+                per_agent_plan = {}
             meta_reservation = 0.0
             if hasattr(self.shared_state, "get_authoritative_reservation"):
                 meta_reservation = float(self.shared_state.get_authoritative_reservation("Meta") or 0.0)
-            for agent in plan.get("per_agent_usdt", {}).keys():
-                raw_budget = float(self.shared_state.get_authoritative_reservation(agent))
-                if raw_budget <= 0.0 and meta_reservation > 0.0:
-                    agent_budgets[agent] = meta_reservation
-                    self.logger.warning(
-                        "[Meta:ReservationFallback] Agent %s has zero reservation; using Meta reservation %.2f for sizing",
-                        agent, meta_reservation
-                    )
+            known_agents = set(per_agent_plan.keys())
+            if not known_agents:
+                if hasattr(self.shared_state, "get_authoritative_reservations"):
+                    known_agents.update((self.shared_state.get_authoritative_reservations() or {}).keys())
+                for _sym, _signals in (valid_signals_by_symbol or {}).items():
+                    for _sig in (_signals or []):
+                        ag = str((_sig or {}).get("agent", "")).strip()
+                        if ag:
+                            known_agents.add(ag)
+            for agent in sorted(known_agents):
+                if hasattr(self.shared_state, "get_authoritative_reservation"):
+                    raw_budget = float(self.shared_state.get_authoritative_reservation(agent) or 0.0)
                 else:
-                    agent_budgets[agent] = raw_budget
+                    raw_budget = float(per_agent_plan.get(agent, 0.0) or 0.0)
+                fallback_budget = 0.0
+                if raw_budget <= 0.0 and meta_reservation > 0.0:
+                    fallback_budget = max(fallback_budget, meta_reservation)
+                if raw_budget <= 0.0 and shared_wallet_mode and spendable_quote_budget > 0.0:
+                    fallback_budget = max(fallback_budget, spendable_quote_budget)
+                agent_budgets[agent] = raw_budget if raw_budget > 0.0 else fallback_budget
+                if raw_budget <= 0.0 and agent_budgets[agent] > 0.0:
+                    self.logger.info(
+                        "[Meta:ReservationFallback] Agent %s reservation is zero; using fallback budget %.2f",
+                        agent,
+                        agent_budgets[agent],
+                    )
         
         except Exception:
             self.logger.debug("[Meta:PreLayer] Failed to initialize agent budgets early, will use defaults")
@@ -13106,11 +15234,20 @@ class MetaController:
         # MAIN SIGNAL PROCESSING
         self.logger.debug("[Meta:SignalProcessing] Starting main signal processing phase")
         
-        # Ensure Meta fallback exists
-        if "Meta" not in agent_budgets:
-            agent_budgets["Meta"] = float(await self.shared_state.get_spendable_balance("USDT") or 0.0)
-
-        shared_wallet_mode = bool(self._cfg("CAPITAL_ALLOCATOR_SHARED_WALLET", True))
+        # Ensure Meta fallback exists and can represent shared spendable capital.
+        agent_budgets["Meta"] = max(
+            float(agent_budgets.get("Meta", 0.0) or 0.0),
+            float(spendable_quote_budget or 0.0),
+        )
+        if shared_wallet_mode and max((float(v or 0.0) for v in agent_budgets.values()), default=0.0) <= 0.0:
+            agent_budgets["Meta"] = float(spendable_quote_budget or 0.0)
+            if agent_budgets["Meta"] > 0.0:
+                self.logger.warning(
+                    "[Meta:ReservationFallback] Allocation plan yielded zero budgets while wallet has %.2f %s. "
+                    "Using Meta fallback budget to avoid false exit-only gating.",
+                    agent_budgets["Meta"],
+                    quote_asset_for_budget,
+                )
 
         def _wallet_budget_for(agent_name: str) -> float:
             if shared_wallet_mode:
@@ -13148,11 +15285,33 @@ class MetaController:
             strategy_floor,
             min_entry,
         )
+
+        quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
+        spendable_quote = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
+        adaptive_entry_floor = float(significant_position_usdt)
+
+        # MICRO-CAPITAL ANTI-DEADLOCK:
+        # If free quote is below the static significant floor, use a dynamic floor that
+        # still respects exchange economics while allowing the engine to keep cycling.
+        if 0.0 < spendable_quote < significant_position_usdt:
+            micro_floor = max(1.25 * min_notional, min_entry)
+            adaptive_entry_floor = max(
+                micro_floor,
+                min(significant_position_usdt, spendable_quote * 0.95),
+            )
+            self.logger.warning(
+                "[Meta:Layer1] MICRO_CAPITAL_ADAPTIVE_ENTRY: spendable=%.2f %s | "
+                "static_floor=%.2f -> adaptive_floor=%.2f",
+                spendable_quote,
+                quote_asset,
+                significant_position_usdt,
+                adaptive_entry_floor,
+            )
         
         self.logger.info(
             "[Meta:Layer1] ENTRY_SIZE_ENFORCEMENT: significant_position_usdt=$%.2f | "
-            "min_notional=$%.2f, avg_trade_cost=$%.2f",
-            significant_position_usdt, min_notional, await self._get_avg_trade_cost()
+            "adaptive_floor=$%.2f | min_notional=$%.2f, avg_trade_cost=$%.2f",
+            significant_position_usdt, adaptive_entry_floor, min_notional, await self._get_avg_trade_cost()
         )
         
         # Filter BUY signals: reject if planned_quote < significant_position_usdt (NEW positions only)
@@ -13188,7 +15347,7 @@ class MetaController:
                 # No planned quote in signal, calculate from agent budget
                 signal_planned_quote = _wallet_budget_for(agent_name)
             
-            if signal_planned_quote >= significant_position_usdt:
+            if signal_planned_quote >= adaptive_entry_floor:
                 # Entry size sufficient
                 filtered_buy_symbols.append(sym)
             else:
@@ -13199,7 +15358,7 @@ class MetaController:
                     self.logger.warning(
                         "[Meta:Layer1] 🚫 ENTRY_TOO_SMALL_PREVENT_DUST: %s | "
                         "planned=%.2f < minimum=%.2f USD (DENIED)",
-                        sym, signal_planned_quote, significant_position_usdt
+                        sym, signal_planned_quote, adaptive_entry_floor
                     )
         
         # Update valid_signals_by_symbol to only include qualified symbols
@@ -13214,7 +15373,6 @@ class MetaController:
         # Once dust, locked until promotion capital exists
         # ═══════════════════════════════════════════════════════════════════════════════
         
-        quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
         available_capital = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
         
         # Dynamic promotion threshold (capital-relative scaling)
@@ -13592,6 +15750,39 @@ class MetaController:
                     # Attach opportunity score for REA analysis
                     opp_score = self.score_opportunity(best_buy_sig)
                     best_buy_sig["_opp_score"] = opp_score
+                    force_micro_rotation = False
+                    try:
+                        esc_raw = self._cfg("MICRO_CAPACITY_ESCAPE_ENABLE", True)
+                        if isinstance(esc_raw, str):
+                            esc_enabled = esc_raw.strip().lower() in {"1", "true", "yes", "on"}
+                        else:
+                            esc_enabled = bool(esc_raw)
+                        escape_cycles = int(self._cfg("MICRO_CAPACITY_ESCAPE_NO_TRADE_CYCLES", 8) or 8)
+                        escape_conf = float(self._cfg("MICRO_CAPACITY_ESCAPE_MIN_CONFIDENCE", 0.55) or 0.55)
+                        micro_nav_threshold = float(self._cfg("CAPITAL_MICRO_THRESHOLD", 500.0) or 500.0)
+                        no_trade_streak = int(getattr(self, "cycles_no_trade", 0) or 0)
+                        buy_conf = float(best_buy_sig.get("confidence", 0.0) or 0.0)
+                        is_micro_profile = bool((0.0 < float(nav) <= micro_nav_threshold) or (max_pos <= 1))
+                        if (
+                            esc_enabled
+                            and current_sig_pos >= max_pos
+                            and is_micro_profile
+                            and no_trade_streak >= escape_cycles
+                            and buy_conf >= escape_conf
+                        ):
+                            force_micro_rotation = True
+                            best_buy_sig["_force_micro_rotation"] = True
+                            best_buy_sig["_force_rotation_reason"] = "micro_capacity_escape"
+                            self.logger.warning(
+                                "[Meta:CapacityEscape] Triggering forced micro rotation "
+                                "(sig_pos=%d max_pos=%d no_trade_cycles=%d conf=%.3f).",
+                                current_sig_pos,
+                                max_pos,
+                                no_trade_streak,
+                                buy_conf,
+                            )
+                    except Exception:
+                        force_micro_rotation = False
 
                     rotation_sig = await self.rotation_authority.authorize_rotation(
                         sig_pos=current_sig_pos,
@@ -13600,6 +15791,7 @@ class MetaController:
                         best_opp=best_buy_sig,
                         current_mode=current_mode,
                         is_starved=is_starved,
+                        force_rotation=force_micro_rotation,
                     )
 
                     if rotation_sig:
@@ -13640,6 +15832,7 @@ class MetaController:
 
             # --- 4. DEADLOCK / WAIT STATE ---
             if not replacement_triggered:
+                enforce_sell_only = bool((sig_pos > max_pos) or is_starved)
                 if sig_pos > max_pos:
                     fallback_holdings = []
                     for p_sym, p_data in owned_positions.items():
@@ -13671,17 +15864,39 @@ class MetaController:
                         "[Meta:SopEnforcer] OVERCAPACITY_NO_SELL_CANDIDATE: sig_pos=%d max_pos=%d owned_positions=%d",
                         sig_pos, max_pos, len(owned_positions),
                     )
-                mandatory_sell_mode = True
-                self._mandatory_sell_mode_active = True
+
+                if enforce_sell_only:
+                    mandatory_sell_mode = True
+                    self._mandatory_sell_mode_active = True
+                    try:
+                        if isinstance(self._loop_summary_state, dict):
+                            self._loop_summary_state["deadlock"] = True
+                            self._loop_summary_state["rejection_reason"] = (
+                                "OVERCAPACITY_NO_SELL_CANDIDATE" if sig_pos > max_pos else "CAPITAL_STARVATION"
+                            )
+                    except Exception:
+                        pass
+                    self.logger.warning(
+                        "[Meta:SELL_ONLY_MODE] 🔒 PORTFOLIO_FULL with no rotation/exit justified. "
+                        "Skipping BUY ranking until capacity recovered."
+                    )
+                    return []
+
+                # At exact capacity (sig_pos == max_pos) with healthy capital, do not hard-latch sell-only.
+                # Keep neutral mode so subsequent cycles can evaluate fresh rotation candidates.
+                self._mandatory_sell_mode_active = False
                 try:
                     if isinstance(self._loop_summary_state, dict):
-                        self._loop_summary_state["deadlock"] = True
-                        self._loop_summary_state["rejection_reason"] = "OVERCAPACITY_NO_SELL_CANDIDATE"
+                        self._loop_summary_state["deadlock"] = False
+                        self._loop_summary_state["rejection_reason"] = None
                 except Exception:
                     pass
-                self.logger.warning(
-                    "[Meta:SELL_ONLY_MODE] 🔒 PORTFOLIO_FULL with no rotation/exit justified. "
-                    "Skipping BUY ranking until capacity recovered."
+                self.logger.info(
+                    "[Meta:Capacity] At capacity but stable (sig_pos=%d max_pos=%d, starved=%s). "
+                    "No forced SELL this cycle; awaiting next rotation/exit signal.",
+                    sig_pos,
+                    max_pos,
+                    is_starved,
                 )
                 return []
 
@@ -14591,54 +16806,13 @@ class MetaController:
             
             if planned_quote > 0 and (total_intended_quote >= (planned_quote - 0.01) or force_eval):
                 # FINAL EXECUTION GUARANTEE (MANDATORY)
-                # BOOTSTRAP FIX: If this signal is marked with _bootstrap flag, pass bootstrap context
-                bootstrap_policy_ctx = None
-                if self._is_bootstrap_buy_context(best_sig, side="BUY"):
-                    decision_trace_id = self._ensure_decision_id(sym, "BUY", best_sig, int(self.tick_id or 0))
-                    reg_val = best_sig.get("_regime") or best_sig.get("regime")
-                    policy_extra = {"bootstrap_bypass": True}
-                    if decision_trace_id:
-                        policy_extra["decision_id"] = decision_trace_id
-                        policy_extra["trace_id"] = decision_trace_id
-                    exp_move = best_sig.get("_expected_move_pct") or best_sig.get("expected_move_pct")
-                    if exp_move is not None:
-                        try:
-                            policy_extra["tradeability_expected_move_pct"] = float(exp_move)
-                        except Exception:
-                            pass
-                    if reg_val:
-                        policy_extra["tradeability_regime"] = str(reg_val)
-                    bootstrap_policy_ctx = self._build_policy_context(
-                        sym, 
-                        "BUY",
-                        extra=policy_extra,
-                    )
+                bootstrap_policy_ctx = self._build_affordability_policy_context(
+                    sym,
+                    "BUY",
+                    best_sig,
+                )
+                if bool(bootstrap_policy_ctx.get("bootstrap_bypass")):
                     self.logger.info("[Meta:BOOTSTRAP] Using bootstrap_bypass context for affordability check: %s", sym)
-                elif best_sig.get("_dust_healing") or best_sig.get("is_dust_healing") or str(best_sig.get("reason", "")).upper() == "DUST_HEALING_BUY":
-                    decision_trace_id = self._ensure_decision_id(sym, "BUY", best_sig, int(self.tick_id or 0))
-                    reg_val = best_sig.get("_regime") or best_sig.get("regime")
-                    policy_extra = {
-                        "reason": "DUST_HEALING_BUY",
-                        "is_dust_healing": True,
-                        "_dust_healing": True,
-                        "tier": "DUST_RECOVERY",
-                    }
-                    if decision_trace_id:
-                        policy_extra["decision_id"] = decision_trace_id
-                        policy_extra["trace_id"] = decision_trace_id
-                    exp_move = best_sig.get("_expected_move_pct") or best_sig.get("expected_move_pct")
-                    if exp_move is not None:
-                        try:
-                            policy_extra["tradeability_expected_move_pct"] = float(exp_move)
-                        except Exception:
-                            pass
-                    if reg_val:
-                        policy_extra["tradeability_regime"] = str(reg_val)
-                    bootstrap_policy_ctx = self._build_policy_context(
-                        sym,
-                        "BUY",
-                        extra=policy_extra,
-                    )
 
                 can_exec, _, reason = await self.execution_manager.can_afford_market_buy(
                     sym, planned_quote, policy_context=bootstrap_policy_ctx
@@ -14897,25 +17071,13 @@ class MetaController:
 
                 try:
                     # Strict Rule 2: Non-zero qty check BEFORE final decision
-                    # BOOTSTRAP FIX: If this signal is marked with _bootstrap flag, pass bootstrap context
-                    bootstrap_policy_ctx = None
-                    if sig.get("_bootstrap") or sig.get("_bootstrap_override"):
-                        bootstrap_policy_ctx = self._build_policy_context(
-                            sym, 
-                            "BUY",
-                            extra={"bootstrap_bypass": True}
-                        )
-                    elif sig.get("_dust_healing") or sig.get("is_dust_healing") or str(sig.get("reason", "")).upper() == "DUST_HEALING_BUY":
-                        bootstrap_policy_ctx = self._build_policy_context(
-                            sym,
-                            "BUY",
-                            extra={
-                                "reason": "DUST_HEALING_BUY",
-                                "is_dust_healing": True,
-                                "_dust_healing": True,
-                                "tier": "DUST_RECOVERY",
-                            },
-                        )
+                    bootstrap_policy_ctx = self._build_affordability_policy_context(
+                        sym,
+                        "BUY",
+                        sig,
+                    )
+                    if bool(bootstrap_policy_ctx.get("bootstrap_bypass")):
+                        self.logger.info("[Meta:BOOTSTRAP] Using bootstrap_bypass context for affordability check: %s", sym)
 
                     can_afford, gap, reason = await self.execution_manager.can_afford_market_buy(sym, planned_quote, policy_context=bootstrap_policy_ctx)
 
@@ -15209,7 +17371,7 @@ class MetaController:
                 int(self.get_execution_attempts_this_cycle()),
             )
 
-        # Default: no bootstrap override (set inside SELL block when applicable)
+        # Default: no bootstrap override (set inside BUY block when applicable)
         tradeability_bootstrap_override = False
         portfolio_flat_for_bypass = False
 
@@ -15285,16 +17447,57 @@ class MetaController:
                             "[Meta:CapitalGovernor] Failed to sync balance: %s", e
                         )
                 
-                # Step 2: Get fresh NAV after sync
-                nav = float(getattr(self.shared_state, "nav", 0.0) or 
-                           getattr(self.shared_state, "total_value", 0.0) or 0.0)
+                # ✅ CRITICAL FIX #8: Calculate NAV directly from fresh balances
+                # Problem: shared_state.nav might be stale or 0.00 even after sync_authoritative_balance
+                # Solution: Compute NAV on-the-fly from current balances + positions
+                nav = 0.0
+                
+                # Get quote asset balance (primary source of NAV for small accounts)
+                quote_asset = getattr(self.shared_state, "quote_asset", "USDT").upper()
+                balances = getattr(self.shared_state, "balances", {}) or {}
+                
+                # Add all quote asset balances (free + locked)
+                for asset_key, balance_data in balances.items():
+                    if str(asset_key).upper() == quote_asset:
+                        if isinstance(balance_data, dict):
+                            free = float(balance_data.get("free", 0.0) or 0.0)
+                            locked = float(balance_data.get("locked", 0.0) or 0.0)
+                            nav += free + locked
+                            self.logger.debug(
+                                "[Meta:CapitalGovernor] NAV from %s: free=%.2f locked=%.2f total=%.2f",
+                                quote_asset, free, locked, free + locked
+                            )
+                
+                # Add position values (price * quantity)
+                positions = getattr(self.shared_state, "positions", {}) or {}
+                latest_prices = getattr(self.shared_state, "latest_prices", {}) or {}
+                
+                for sym, pos_data in positions.items():
+                    if not pos_data:
+                        continue
+                    qty = float(pos_data.get("quantity", 0.0) or 0.0)
+                    if qty <= 0:
+                        continue
+                    price = float(latest_prices.get(sym, 0.0) or pos_data.get("mark_price", 0.0) or 0.0)
+                    if price > 0:
+                        pos_value = qty * price
+                        nav += pos_value
+                        self.logger.debug(
+                            "[Meta:CapitalGovernor] NAV from %s position: qty=%.6f price=%.2f value=%.2f",
+                            sym, qty, price, pos_value
+                        )
                 
                 if nav <= 0:
                     self.logger.error(
-                        "[Meta:CapitalGovernor] Invalid NAV: %.2f - cannot evaluate position limits",
-                        nav
+                        "[Meta:CapitalGovernor] Invalid NAV: %.2f - cannot evaluate position limits (quote_asset=%s, balances_count=%d, positions_count=%d)",
+                        nav, quote_asset, len(balances), len(positions)
                     )
                     return None
+                
+                self.logger.info(
+                    "[Meta:CapitalGovernor] Calculated fresh NAV: $%.2f (quote_asset=%s)",
+                    nav, quote_asset
+                )
                 
                 # Step 3: Query Capital Governor for position limits at current bracket
                 limits = self.capital_governor.get_position_limits(nav)
@@ -15329,13 +17532,113 @@ class MetaController:
                 # CRITICAL: Do NOT block on exception - let execution proceed with warning
                 self.logger.warning("[Meta:CapitalGovernor] Proceeding with BUY (limit check failed, error: %s)", str(e))
 
-        # Enforce lifecycle lock for SELL
+        # Enforce lifecycle lock for SELL exits before any other pre-exec gates.
         if side.upper() == "SELL":
             if not self._can_act(symbol, "SELL"):
                 self.logger.info(f"[LIFECYCLE] {symbol}: SELL execution blocked by lifecycle lock")
                 return {"ok": False, "status": "skipped", "reason": "lifecycle_lock"}
-            
             now = time.time()
+            block_key = (str(symbol or "").upper(), "SELL")
+            unblock_ts = float(self._symbol_side_block_until.get(block_key, 0.0) or 0.0)
+            if unblock_ts > now:
+                # Safety-critical exits can bypass local cooldown.
+                reason_u = str(signal.get("reason") or signal.get("exit_reason") or "").upper()
+                tag_u = str(signal.get("tag") or signal.get("_tag") or "").upper()
+                allow_bypass = any(k in reason_u for k in ("LIQUIDATION", "EMERGENCY", "STOP_LOSS", "HARD_STOP")) or "LIQUIDATION" in tag_u
+                if not allow_bypass:
+                    remaining = int(max(0.0, unblock_ts - now))
+                    self.logger.info(
+                        "[Meta:SellCooldown] Blocking %s SELL for %ss after edge rejection cooldown.",
+                        str(symbol or "").upper(),
+                        remaining,
+                    )
+                    return {
+                        "ok": False,
+                        "status": "skipped",
+                        "reason": "sell_edge_cooldown",
+                        "reason_detail": f"remaining_{remaining}s",
+                    }
+            elif unblock_ts > 0.0:
+                self._symbol_side_block_until.pop(block_key, None)
+
+        # BUY-only pre-execution gates (tradeability/limits/position lock).
+        if side.upper() == "BUY":
+            now = time.time()
+            block_key = (str(symbol or "").upper(), "BUY")
+            unblock_ts = float(self._symbol_side_block_until.get(block_key, 0.0) or 0.0)
+            if unblock_ts > now:
+                remaining = int(max(0.0, unblock_ts - now))
+                self.logger.warning(
+                    "[Meta:Cooldown] Blocking execution for %s BUY due to active local quarantine (%ss remaining)",
+                    str(symbol or "").upper(),
+                    remaining,
+                )
+                return {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "market_closed_quarantine",
+                    "reason_detail": f"remaining_{remaining}s",
+                }
+            elif unblock_ts > 0.0:
+                self._symbol_side_block_until.pop(block_key, None)
+
+            # Deadlock guard:
+            # Repeated SELL edge blocks + repeated BUY position-lock rejections means
+            # we're thrashing the same symbol without freeing capacity.
+            # Temporarily suppress BUY retries to allow exit path to resolve first.
+            try:
+                rej_getter = getattr(self.shared_state, "get_rejection_count", None)
+                pos_qty_getter = getattr(self.shared_state, "get_position_qty", None)
+                sell_edge_rej = int(
+                    rej_getter(symbol, "SELL", "SELL_DYNAMIC_EDGE_MIN") if callable(rej_getter) else 0
+                )
+                buy_lock_rej = int(
+                    rej_getter(symbol, "BUY", "POSITION_ALREADY_OPEN") if callable(rej_getter) else 0
+                )
+                pos_qty_now = float(pos_qty_getter(symbol) if callable(pos_qty_getter) else 0.0)
+            except Exception:
+                sell_edge_rej = 0
+                buy_lock_rej = 0
+                pos_qty_now = 0.0
+
+            deadlock_sell_trigger = int(self._cfg("DEADLOCK_BUY_COOLDOWN_SELL_EDGE_TRIGGER", 3) or 3)
+            deadlock_buy_trigger = int(self._cfg("DEADLOCK_BUY_COOLDOWN_BUY_LOCK_TRIGGER", 6) or 6)
+            require_sell_edge = bool(self._cfg("DEADLOCK_BUY_COOLDOWN_REQUIRE_SELL_EDGE", False))
+            sell_edge_ok = (
+                sell_edge_rej >= max(1, deadlock_sell_trigger)
+                if require_sell_edge
+                else True
+            )
+            if (
+                pos_qty_now > 0.0
+                and buy_lock_rej >= max(1, deadlock_buy_trigger)
+                and sell_edge_ok
+            ):
+                cooldown_sec = float(self._cfg("DEADLOCK_BUY_COOLDOWN_SEC", 120.0) or 120.0)
+                self._symbol_side_block_until[block_key] = max(
+                    float(self._symbol_side_block_until.get(block_key, 0.0) or 0.0),
+                    now + max(5.0, cooldown_sec),
+                )
+                self.logger.warning(
+                    "[Meta:DeadlockGuard] Suppressing %s BUY for %ss "
+                    "(sell_edge_rej=%d buy_lock_rej=%d pos_qty=%.8f require_sell_edge=%s).",
+                    str(symbol or "").upper(),
+                    int(max(5.0, cooldown_sec)),
+                    sell_edge_rej,
+                    buy_lock_rej,
+                    pos_qty_now,
+                    require_sell_edge,
+                )
+                return {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "deadlock_buy_cooldown",
+                    "reason_detail": (
+                        f"sell_edge_rej_{sell_edge_rej}_buy_lock_rej_{buy_lock_rej}_"
+                        f"require_sell_edge_{str(require_sell_edge).lower()}"
+                    ),
+                }
+
             agent_name = signal.get("agent", "Meta")
             # 1. Clean old timestamps (Hourly window)
             for dq in [self._trade_timestamps, self._trade_timestamps_sym[symbol], self._trade_timestamps_agent[agent_name]]:
@@ -15393,6 +17696,34 @@ class MetaController:
                 }
                 await self._log_execution_result(symbol, side, signal, gate_result)
                 return gate_result
+
+            # Bootstrap bypass should not turn into low-quality reentries.
+            # Keep seed behavior permissive, but require stronger confidence for
+            # non-seed bootstrap buys when portfolio just became flat.
+            if tradeability_bootstrap_override:
+                conf_now = float(signal.get("confidence", 0.0) or 0.0)
+                min_bootstrap_conf = float(self._cfg("BOOTSTRAP_REENTRY_MIN_CONFIDENCE", 0.68) or 0.68)
+                is_bootstrap_seed = bool(
+                    signal.get("_bootstrap_seed")
+                    or signal.get("bootstrap_seed")
+                    or str(signal.get("reason", "")).upper() == "BOOTSTRAP_SEED"
+                )
+                if (not is_bootstrap_seed) and conf_now < min_bootstrap_conf:
+                    self.logger.info(
+                        "[Meta:BootstrapConfGate] Skip %s BUY: conf %.2f < bootstrap floor %.2f",
+                        symbol,
+                        conf_now,
+                        min_bootstrap_conf,
+                    )
+                    gate_result = {
+                        "ok": False,
+                        "status": "skipped",
+                        "reason": "bootstrap_reentry_confidence_gate",
+                        "reason_detail": f"conf_{conf_now:.3f}_lt_{min_bootstrap_conf:.3f}",
+                        "required_conf": min_bootstrap_conf,
+                    }
+                    await self._log_execution_result(symbol, side, signal, gate_result)
+                    return gate_result
 
             # FIX: Position Lock Invariant (User Rule 7)
             # If position exists, REJECT BUY unless scaling is explicitly planned/allowed.
@@ -15473,7 +17804,7 @@ class MetaController:
             concentration_max = 0.85        # Force rotation threshold (85%)
             
             # SOP-REC-004: Dust Healing Execution Authority
-            if position_value >= economic_floor and not is_dust_merge:
+            if str(side).upper() == "BUY" and position_value >= economic_floor and not is_dust_merge:
                 is_bootstrap_dust_bypass = self._bootstrap_dust_bypass_allowed(
                     symbol,
                     bool(is_bootstrap_override),
@@ -15651,6 +17982,40 @@ class MetaController:
                         symbol, original_quote, planned_quote, position_scale
                     )
                     signal["_planned_quote"] = planned_quote
+
+                # Pre-trade effect simulation gate:
+                # Estimate net edge after round-trip costs before sending order.
+                is_dust_healing_buy = bool(
+                    signal.get("_dust_healing")
+                    or signal.get("is_dust_healing")
+                    or str(signal.get("reason", "")).upper() == "DUST_HEALING_BUY"
+                )
+                is_bootstrap_buy_ctx = self._is_bootstrap_buy_context(signal, side=side)
+                allow_bootstrap_bypass = bool(self._cfg("PRETRADE_ALLOW_BOOTSTRAP_BYPASS", True))
+                if not is_dust_healing_buy:
+                    pretrade_ok, pretrade_reason = self._passes_pretrade_effect_gate(
+                        symbol=symbol,
+                        signal=signal,
+                        planned_quote=planned_quote,
+                    )
+                    if not pretrade_ok and not (is_bootstrap_buy_ctx and allow_bootstrap_bypass):
+                        self.logger.warning(
+                            "[Meta:PreTradeEffect] Blocking BUY %s due gate=%s (planned_quote=%.2f).",
+                            symbol,
+                            pretrade_reason,
+                            planned_quote,
+                        )
+                        await self._log_execution_result(
+                            symbol,
+                            side,
+                            signal,
+                            {
+                                "status": "skipped",
+                                "reason": "pretrade_effect_gate",
+                                "reason_detail": pretrade_reason,
+                            },
+                        )
+                        return {"ok": False, "status": "skipped", "reason": "pretrade_effect_gate", "reason_detail": pretrade_reason}
                 
                 # Reservation fallback: remap agent to a funded reservation key if needed
                 agent_name = signal.get("agent", "Meta")
@@ -15927,6 +18292,37 @@ class MetaController:
 
                 
                 can_ex, _, reason = await self.execution_manager.can_afford_market_buy(symbol, planned_quote, policy_context=bootstrap_policy_ctx)
+                # Bootstrap safety valve:
+                # In some micro-account scenarios the affordability probe can overestimate
+                # min entry requirements and return INSUFFICIENT_QUOTE even when current
+                # spendable quote clearly covers the planned order.
+                if not can_ex and str(reason or "").upper() == "INSUFFICIENT_QUOTE":
+                    is_bootstrap_like = bool(
+                        self._is_bootstrap_buy_context(signal, side=side)
+                        or signal.get("_bootstrap_override")
+                        or signal.get("_bootstrap")
+                    )
+                    if is_bootstrap_like:
+                        try:
+                            quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
+                            spendable_now = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
+                            fee_pct = float(getattr(self.config, "TRADE_FEE_PCT", 0.001) or 0.001)
+                            headroom = float(getattr(self.config, "SAFETY_HEADROOM", 1.02) or 1.02)
+                            needed_quote = float(planned_quote) * (1.0 + fee_pct) * headroom
+                            if spendable_now >= needed_quote:
+                                self.logger.warning(
+                                    "[Meta:AffordBypass] Ignoring affordability false-negative for %s BUY "
+                                    "(reason=%s spendable=%.2f needed=%.2f planned=%.2f bootstrap_like=%s)",
+                                    symbol,
+                                    reason,
+                                    spendable_now,
+                                    needed_quote,
+                                    float(planned_quote),
+                                    is_bootstrap_like,
+                                )
+                                can_ex = True
+                        except Exception:
+                            pass
                 if not can_ex:
                     is_dust_healing = bool(
                         signal.get("_dust_healing")
@@ -16011,7 +18407,7 @@ class MetaController:
                     # Bootstrap is designed to break strict gates during startup
                     is_bootstrap_signal = signal.get("_bootstrap", False)
                     if not is_bootstrap_seed and not is_bootstrap_signal:
-                        if not self.shared_state.is_intent_valid(symbol, "BUY"):
+                        if not self.shared_state.is_intent_valid(symbol, "BUY", candidate_signal=signal):
                             self.logger.warning("[Meta] Signal no longer valid at firing time for %s. Skipping.", symbol)
                             await self._log_execution_result(symbol, side, signal, {"status": "skipped", "reason": "signal_invalid_at_firing"})
                             return {"ok": False, "status": "skipped", "reason": "signal_invalid"}
@@ -16043,10 +18439,54 @@ class MetaController:
                 )
                 self.increment_execution_attempts()
                 # PHASE 3: Create TradeIntent
+                # ✅ FIX #13: Copy bootstrap flags from signal to policy context before creating intent
+                # These flags are essential for allowing downscaling in ExecutionManager
+                if signal.get("_bootstrap_override"):
+                    policy_ctx["_bootstrap_override"] = True
+                    policy_ctx["_bypass_reason"] = signal.get("_bypass_reason", "BOOTSTRAP_FIRST_TRADE")
+                
+                # 🔥 CRITICAL FIX: Calculate quantity from planned_quote before creating TradeIntent
+                # PROBLEM: quantity=None was causing all orders to be rejected with qty=0
+                # SOLUTION: Convert planned_quote (USDT) to quantity (base asset units)
+                qty_for_intent = None
+                try:
+                    if planned_quote > 0:
+                        # Get current price for quantity calculation
+                        cur_price = float(signal.get("price") or 0.0)
+                        if not cur_price:
+                            cur_price = float(await _safe_await(self.shared_state.safe_price(symbol)) or 0.0)
+                        
+                        # Get symbol filters for quantity rounding
+                        filters = await self.execution_manager.get_symbol_filters_cached(symbol)
+                        step_size = float((filters or {}).get("step_size", 0.00000001) or 0.00000001)
+                        
+                        if cur_price > 0 and step_size > 0:
+                            # Calculate raw quantity: USDT / Price
+                            raw_qty = planned_quote / cur_price
+                            
+                            # Round down to step_size
+                            qty_for_intent = (int(raw_qty / step_size)) * step_size
+                            
+                            # Ensure we have at least the minimum quantity
+                            min_qty = float((filters or {}).get("min_qty", 0.00000001) or 0.00000001)
+                            if qty_for_intent < min_qty:
+                                qty_for_intent = None  # Will use ExecutionManager's fallback
+                            
+                            self.logger.info(
+                                "[Meta:PositionSizing] Calculated qty for %s: planned_quote=%.2f, price=%.8f, raw_qty=%.8f, rounded_qty=%.8f",
+                                symbol, planned_quote, cur_price, raw_qty, qty_for_intent
+                            )
+                except Exception as e:
+                    self.logger.warning(
+                        "[Meta:PositionSizing] Failed to calculate quantity for %s: %s. Falling back to None (executor will handle)",
+                        symbol, e
+                    )
+                    qty_for_intent = None
+                
                 trade_intent = TradeIntent(
                     symbol=symbol,
                     side="buy",
-                    quantity=None,
+                    quantity=qty_for_intent,  # Now properly calculated!
                     planned_quote=planned_quote,
                     tag=signal.get("tag") or f"meta-{signal.get('agent', 'Meta')}",
                     tier=tier,
@@ -16065,6 +18505,12 @@ class MetaController:
                 # ✅ Log meta/<agent> tag for tracking
                 self.logger.info("[meta/%s] Initiated trade execution for %s", agent.lower(), symbol)
                 result = await self._route_and_execute(trade_intent)
+                if not isinstance(result, dict):
+                    result = {
+                        "ok": bool(result),
+                        "status": "filled" if result else "rejected",
+                        "reason": "non_dict_execution_result",
+                    }
                 # Option A: Reset bootstrap override counter if deadlocked
                 if signal.get("_bootstrap_override", False):
                     self._reset_bootstrap_override_if_deadlocked(symbol, signal, result)
@@ -16151,6 +18597,12 @@ class MetaController:
                             reason=signal.get("reason", ""),  # CRITICAL: Include reason for governance tier determination
                         )
                         result = await self._route_and_execute(trade_intent)
+                        if not isinstance(result, dict):
+                            result = {
+                                "ok": bool(result),
+                                "status": "filled" if result else "rejected",
+                                "reason": "non_dict_execution_result_retry",
+                            }
                 # FIX: Stop infinite dust healing loop
                 if is_dust_healing and not result.get("ok"):
                     # Mark as UNHEALABLE with cooldown
@@ -16373,6 +18825,7 @@ class MetaController:
                         signal.get("_is_rotation")
                         or signal.get("_rotation_escape")
                         or signal.get("_forced_exit")
+                        or signal.get("_mandatory_capacity_recovery")
                     )
                     if not rotation_override:
                         reason_u = str(sell_reason).upper()
@@ -16391,6 +18844,67 @@ class MetaController:
                     # bypass path (bypasses profit gates, risk caps, and scaling rules).
                     "_forced_exit": bool(signal.get("_forced_exit", False)),
                 })
+
+                # SELL pre-trade micro-backtest (advisory by default).
+                # Critical exits keep highest priority and bypass this check.
+                if not is_liq_signal and not is_hard_stop and not rotation_override:
+                    sell_planned_quote = 0.0
+                    sell_qty = 0.0
+                    with contextlib.suppress(Exception):
+                        sell_qty = float(qty or 0.0)
+                    if sell_qty <= 0.0:
+                        with contextlib.suppress(Exception):
+                            if hasattr(self.shared_state, "get_position_qty"):
+                                sell_qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
+
+                    sell_price = 0.0
+                    with contextlib.suppress(Exception):
+                        if hasattr(self.shared_state, "safe_price"):
+                            sell_price = float(await _safe_await(self.shared_state.safe_price(symbol)) or 0.0)
+                    if sell_price <= 0.0:
+                        with contextlib.suppress(Exception):
+                            sell_price = float(getattr(self.shared_state, "latest_prices", {}).get(symbol, 0.0) or 0.0)
+
+                    if sell_qty > 0.0 and sell_price > 0.0:
+                        sell_planned_quote = sell_qty * sell_price
+
+                    if sell_planned_quote > 0.0:
+                        pretrade_ok, pretrade_reason = self._passes_pretrade_effect_gate(
+                            symbol=symbol,
+                            signal=signal,
+                            planned_quote=sell_planned_quote,
+                            side="SELL",
+                        )
+                        if not pretrade_ok:
+                            if bool(self._cfg("PRETRADE_SELL_GATE_ENFORCED", False)):
+                                self.logger.warning(
+                                    "[Meta:PreTradeEffect] Blocking SELL %s due gate=%s (planned_quote=%.2f).",
+                                    symbol,
+                                    pretrade_reason,
+                                    sell_planned_quote,
+                                )
+                                await self._log_execution_result(
+                                    symbol,
+                                    side,
+                                    signal,
+                                    {
+                                        "status": "skipped",
+                                        "reason": "pretrade_effect_gate_sell",
+                                        "reason_detail": pretrade_reason,
+                                    },
+                                )
+                                return {
+                                    "ok": False,
+                                    "status": "skipped",
+                                    "reason": "pretrade_effect_gate_sell",
+                                    "reason_detail": pretrade_reason,
+                                }
+                            self.logger.info(
+                                "[Meta:PreTradeEffect] Advisory SELL gate=%s for %s (planned_quote=%.2f) - continuing (PRETRADE_SELL_GATE_ENFORCED=false).",
+                                pretrade_reason,
+                                symbol,
+                                sell_planned_quote,
+                            )
                 if not is_liq_signal:
                     is_cold = False
                     try:
@@ -16766,7 +19280,10 @@ class MetaController:
                                 symbol=symbol,
                                 reason="meta_exit",
                                 tag=sell_tag,
+                                is_liquidation=is_liq_signal,
                                 force_finalize=True,
+                                trace_id=(signal.get("trace_id") or signal.get("decision_id")),
+                                policy_context=policy_ctx,
                             )
                         else:
                             # PHASE 3: Create TradeIntent
@@ -16792,6 +19309,12 @@ class MetaController:
                             # ✅ Log meta/<agent> tag for tracking
                             self.logger.info("[meta/%s] Initiated SELL execution for %s (quote-based liquidation)", agent.lower(), symbol)
                             result = await self._route_and_execute(trade_intent)
+                            if not isinstance(result, dict):
+                                result = {
+                                    "ok": bool(result),
+                                    "status": "filled" if result else "rejected",
+                                    "reason": "non_dict_execution_result_sell",
+                                }
                     else:
                         self.logger.warning("[Meta:QuoteLiq:Execute] Quote-based liquidation flag set but _target_usdt is invalid. Falling back to quantity-based sell.")
                         policy_ctx = self._build_policy_context(
@@ -17072,28 +19595,11 @@ class MetaController:
                     self.logger.warning("Failed to refresh balance after liquidity execution: %s", e)
 
                 # Verify liquidity was freed
-                # BOOTSTRAP FIX: Use bootstrap_bypass context if needed
-                bootstrap_policy_ctx = None
-                if signal.get("_bootstrap") or signal.get("_bootstrap_override"):
-                    decision_trace_id = self._ensure_decision_id(symbol, "BUY", signal, int(self.tick_id or 0))
-                    reg_val = signal.get("_regime") or signal.get("regime")
-                    policy_extra = {"bootstrap_bypass": True}
-                    if decision_trace_id:
-                        policy_extra["decision_id"] = decision_trace_id
-                        policy_extra["trace_id"] = decision_trace_id
-                    exp_move = signal.get("_expected_move_pct") or signal.get("expected_move_pct")
-                    if exp_move is not None:
-                        try:
-                            policy_extra["tradeability_expected_move_pct"] = float(exp_move)
-                        except Exception:
-                            pass
-                    if reg_val:
-                        policy_extra["tradeability_regime"] = str(reg_val)
-                    bootstrap_policy_ctx = self._build_policy_context(
-                        symbol, 
-                        "BUY",
-                        extra=policy_extra,
-                    )
+                bootstrap_policy_ctx = self._build_affordability_policy_context(
+                    symbol,
+                    "BUY",
+                    signal,
+                )
                 can_afford, _, reason = await self.execution_manager.can_afford_market_buy(symbol, planned_quote, policy_context=bootstrap_policy_ctx)
 
                 if can_afford:
@@ -17214,15 +19720,28 @@ class MetaController:
         """
         sym = (symbol or "").upper()
         rea = str(reason or "UNKNOWN").upper()
+        rea_class = "OTHER_BLOCK"
+        if any(k in rea for k in ("POSITION_ALREADY_OPEN", "MAX_POSITION_REACHED", "PORTFOLIO_FULL")):
+            rea_class = "CAPACITY_BLOCK"
+        elif any(k in rea for k in ("MICRO_BACKTEST", "NET_USDT_BELOW_THRESHOLD", "RECENT_WIN_RATE_BELOW_THRESHOLD")):
+            rea_class = "SOFT_EDGE_BLOCK"
+        elif any(k in rea for k in ("INSUFFICIENT_BALANCE", "EXCHANGE_MIN_BLOCK", "MARKET_CLOSED")):
+            rea_class = "HARD_EXEC_BLOCK"
+        elif any(k in rea for k in ("COOLDOWN", "COLD_BOOTSTRAP_BLOCK", "FOCUS_MODE_BLOCK")):
+            rea_class = "POLICY_BLOCK"
         try:
             key = (sym, rea)
             self._why_no_trade_counts[key] += 1
+            class_key = (sym, rea_class)
+            self._why_no_trade_class_counts[class_key] += 1
 
             # Mirror into shared_state.metrics for dashboards
             metrics = getattr(self.shared_state, "metrics", None)
             if isinstance(metrics, dict):
                 bucket = metrics.setdefault("why_no_trade_counts", {})
                 bucket[f"{sym}:{rea}"] = self._why_no_trade_counts[key]
+                class_bucket = metrics.setdefault("why_no_trade_class_counts", {})
+                class_bucket[f"{sym}:{rea_class}"] = self._why_no_trade_class_counts[class_key]
         except Exception:
             pass
 
@@ -17231,6 +19750,87 @@ class MetaController:
             recorder = getattr(self.shared_state, "record_rejection", None)
             if callable(recorder):
                 await _safe_await(recorder(sym, side, rea, source="MetaController"))
+        except Exception:
+            pass
+
+        # Global fallback: any BUY POSITION_ALREADY_OPEN rejection path should
+        # eventually trigger local cooldown to prevent fast retry thrashing.
+        try:
+            if str(side or "").upper() == "BUY" and rea == "POSITION_ALREADY_OPEN":
+                rej_getter = getattr(self.shared_state, "get_rejection_count", None)
+                rej_count = int(
+                    rej_getter(sym, "BUY", "POSITION_ALREADY_OPEN") if callable(rej_getter) else 0
+                )
+                cooldown_trigger = int(self._cfg("POSITION_OPEN_BUY_COOLDOWN_TRIGGER", 6) or 6)
+                cooldown_sec = float(self._cfg("POSITION_OPEN_BUY_COOLDOWN_SEC", 120.0) or 120.0)
+                if rej_count >= max(1, cooldown_trigger):
+                    block_key = (sym, "BUY")
+                    self._symbol_side_block_until[block_key] = max(
+                        float(self._symbol_side_block_until.get(block_key, 0.0) or 0.0),
+                        time.time() + max(5.0, cooldown_sec),
+                    )
+                    self.logger.warning(
+                        "[Meta:PositionOpenCooldown] Engaged for %s BUY (%ss) via global fallback after %d POSITION_ALREADY_OPEN rejections",
+                        sym,
+                        int(max(5.0, cooldown_sec)),
+                        rej_count,
+                    )
+        except Exception:
+            pass
+
+        # Adaptive BUY rejection backoff for repeated soft-gate failures.
+        # This suppresses symbol-level retry storms while allowing rotation.
+        try:
+            if bool(self._cfg("REJECTION_BACKOFF_ENABLED", True)) and str(side or "").upper() == "BUY":
+                reason_family = ""
+                trigger = 0
+                base_sec = 0.0
+                max_sec = 0.0
+                if "CONF_BELOW_REQUIRED" in rea:
+                    reason_family = "conf"
+                    trigger = int(self._cfg("REJECTION_BACKOFF_CONF_TRIGGER", 10) or 10)
+                    base_sec = float(self._cfg("REJECTION_BACKOFF_CONF_BASE_SEC", 25.0) or 25.0)
+                    max_sec = float(self._cfg("REJECTION_BACKOFF_CONF_MAX_SEC", 300.0) or 300.0)
+                elif "MICRO_BACKTEST" in rea:
+                    reason_family = "micro_bt"
+                    trigger = int(self._cfg("REJECTION_BACKOFF_MICRO_TRIGGER", 6) or 6)
+                    base_sec = float(self._cfg("REJECTION_BACKOFF_MICRO_BASE_SEC", 20.0) or 20.0)
+                    max_sec = float(self._cfg("REJECTION_BACKOFF_MICRO_MAX_SEC", 240.0) or 240.0)
+                elif "NET_USDT_BELOW_THRESHOLD" in rea:
+                    reason_family = "net_usdt"
+                    trigger = int(self._cfg("REJECTION_BACKOFF_NET_USDT_TRIGGER", 6) or 6)
+                    base_sec = float(self._cfg("REJECTION_BACKOFF_NET_USDT_BASE_SEC", 20.0) or 20.0)
+                    max_sec = float(self._cfg("REJECTION_BACKOFF_NET_USDT_MAX_SEC", 240.0) or 240.0)
+                elif "EXPECTED_MOVE_LT_ROUND_TRIP_COST" in rea:
+                    reason_family = "expected_move"
+                    trigger = int(self._cfg("REJECTION_BACKOFF_EXPECTED_MOVE_TRIGGER", 8) or 8)
+                    base_sec = float(self._cfg("REJECTION_BACKOFF_EXPECTED_MOVE_BASE_SEC", 20.0) or 20.0)
+                    max_sec = float(self._cfg("REJECTION_BACKOFF_EXPECTED_MOVE_MAX_SEC", 240.0) or 240.0)
+
+                if reason_family:
+                    rej_getter = getattr(self.shared_state, "get_rejection_count", None)
+                    rej_count = int(rej_getter(sym, "BUY", rea) if callable(rej_getter) else 0)
+                    if rej_count >= max(1, trigger):
+                        step_rejections = int(self._cfg("REJECTION_BACKOFF_STEP_REJECTIONS", 4) or 4)
+                        exp_factor = float(self._cfg("REJECTION_BACKOFF_EXP_FACTOR", 1.35) or 1.35)
+                        steps = 1 + max(0, (rej_count - trigger)) // max(1, step_rejections)
+                        cooldown_sec = min(
+                            max(5.0, max_sec),
+                            max(5.0, base_sec) * (max(1.0, exp_factor) ** max(0, steps - 1)),
+                        )
+                        block_key = (sym, "BUY")
+                        prev_until = float(self._symbol_side_block_until.get(block_key, 0.0) or 0.0)
+                        next_until = time.time() + float(cooldown_sec)
+                        if next_until > prev_until:
+                            self._symbol_side_block_until[block_key] = next_until
+                            self.logger.warning(
+                                "[Meta:AdaptiveRejectionBackoff] %s BUY backoff=%ss family=%s reason=%s rejections=%d",
+                                sym,
+                                int(cooldown_sec),
+                                reason_family,
+                                rea,
+                                rej_count,
+                            )
         except Exception:
             pass
 
@@ -17333,6 +19933,45 @@ class MetaController:
             self.logger.info("MetaController ACCUMULATING %s: %s (Total: %.4f)", 
                             symbol, side, (result or {}).get("accumulated_quote", 0.0))
             await self._record_signal_outcome(symbol, side, signal, status="accumulating", reason=full_reason, result=result)
+        elif status in {"rejected", "failed", "error", "blocked", "expired", "canceled", "cancelled"}:
+            await self._log_execution_event("TRADE_REJECTED", symbol, details)
+            rejection_reason = str(full_reason or details.get("error_code") or status or "UNKNOWN")
+            self.logger.info(
+                "[EXEC_REJECT] symbol=%s side=%s reason=%s status=%s",
+                str(symbol or "").upper(),
+                str(side or "").upper(),
+                rejection_reason,
+                status,
+            )
+            try:
+                if isinstance(getattr(self, "_loop_summary_state", None), dict):
+                    if not self._loop_summary_state.get("rejection_reason"):
+                        self._loop_summary_state["rejection_reason"] = rejection_reason
+                    self._loop_summary_state["rejection_count"] = int(
+                        self._loop_summary_state.get("rejection_count", 0) or 0
+                    ) + 1
+            except Exception:
+                pass
+            if str(side or "").upper() == "BUY":
+                self.logger.info(
+                    "[WHY_NO_TRADE] symbol=%s reason=%s details=%s",
+                    symbol, rejection_reason, reason_detail
+                )
+                if self._is_market_closed_reason(rejection_reason):
+                    try:
+                        block_sec = float(self._cfg("MARKET_CLOSED_BLOCK_SECONDS", 900.0) or 900.0)
+                    except Exception:
+                        block_sec = 900.0
+                    if block_sec > 0:
+                        self._symbol_side_block_until[(str(symbol or "").upper(), "BUY")] = time.time() + block_sec
+                        self.logger.warning(
+                            "[Meta:Cooldown] Applied local market-closed quarantine for %s BUY (%ss)",
+                            str(symbol or "").upper(),
+                            int(block_sec),
+                        )
+                await self._record_why_no_trade(symbol, rejection_reason, reason_detail, side=side, signal=signal)
+            else:
+                await self._record_signal_outcome(symbol, side, signal, status="rejected", reason=rejection_reason, result=result)
         else:
             await self._log_execution_event("TRADE_UNKNOWN", symbol, details)
             # FIX #4: Enhanced logging for failures
@@ -17861,6 +20500,10 @@ class MetaController:
             # Enrich the intent
             intent.trace_id = decision_id
             intent.tier = tier
+            # ✅ FIX #12: Preserve bootstrap flags when enriching
+            # Problem: Previous code overwrote policy_context, losing _bootstrap_override and other flags
+            # Solution: Merge new governance metadata with existing policy context fields
+            existing_policy_ctx = getattr(intent, 'policy_context', {}) or {}
             intent.policy_context = {
                 "decision_id": decision_id,
                 "trace_id": decision_id,
@@ -17870,6 +20513,13 @@ class MetaController:
                 "policy_tier": tier,
                 "policy_mode": self._get_policy_mode(),
                 "tradeability_gate_checked": True,
+                # PRESERVE existing flags from decision
+                "_bootstrap_override": existing_policy_ctx.get("_bootstrap_override"),
+                "_bypass_reason": existing_policy_ctx.get("_bypass_reason"),
+                "_planned_quote": existing_policy_ctx.get("_planned_quote"),
+                "bootstrap_bypass": existing_policy_ctx.get("bootstrap_bypass"),
+                "bootstrap_mode": existing_policy_ctx.get("bootstrap_mode"),
+                "_bootstrap": existing_policy_ctx.get("_bootstrap"),
             }
             
             self.logger.debug(
@@ -17879,8 +20529,11 @@ class MetaController:
             
             # STEP 2A: PRE-FLIGHT BALANCE VALIDATION (Issue #11 - Week 3 Integration)
             # Validate that we have sufficient balance before attempting execution
+            # ✅ FIX #9: Use planned_quote (USDT amount) not quantity (base asset)
+            # The allocation validator needs the quote amount we're spending, not the quantity
+            planned_quote = float(getattr(intent, 'planned_quote', 0) or getattr(intent, 'quote', 0) or 0)
             is_valid, status, reason = await self.balance_validator.validate_allocation(
-                amount=float(getattr(intent, 'quantity', 0) or 0),
+                amount=planned_quote,
                 symbol=intent.symbol,
                 side=intent.side,
                 order_id=decision_id
@@ -17891,7 +20544,11 @@ class MetaController:
                     "[Meta:BalanceGuard] ⚠️ Allocation rejected: %s - %s (trace_id=%s)",
                     status.value, reason, decision_id
                 )
-                return None  # Prevent execution due to insufficient balance
+                return self._build_rejection_result(
+                    "balance_guard",
+                    f"{status.value}:{reason}",
+                    status="rejected",
+                )
             
             # STEP 2B: LEVERAGE VALIDATION (Issue #12 - Week 3 Integration)
             # Validate that position doesn't exceed max leverage
@@ -17913,7 +20570,11 @@ class MetaController:
                             "[Meta:LeverageGuard] ⚠️ Position rejected: %s - %s (%.2fx, trace_id=%s)",
                             leverage_status.value, leverage_reason, calc_leverage, decision_id
                         )
-                        return None  # Prevent execution due to excessive leverage
+                        return self._build_rejection_result(
+                            "leverage_guard",
+                            f"{leverage_status.value}:{leverage_reason}",
+                            status="rejected",
+                        )
             except Exception as e:
                 self.logger.warning("[Meta:LeverageGuard] Leverage validation error: %s", e)
                 # Continue anyway - don't block on validation error
@@ -17931,7 +20592,11 @@ class MetaController:
                         "[Meta:HoursGuard] ⚠️ Trade rejected: %s - %s (trace_id=%s)",
                         hours_status.value, hours_reason, decision_id
                     )
-                    return None  # Prevent execution due to market hours restrictions
+                    return self._build_rejection_result(
+                        "trading_hours_guard",
+                        f"{hours_status.value}:{hours_reason}",
+                        status="rejected",
+                    )
             except Exception as e:
                 self.logger.warning("[Meta:HoursGuard] Trading hours validation error: %s", e)
                 # Continue anyway - don't block on validation error
@@ -17963,16 +20628,27 @@ class MetaController:
                 routing_decision = await self.action_router.route(intent)
                 if not routing_decision or getattr(routing_decision, "decision", "") != "ACCEPTED":
                     # Router rejected the intent (conflict or lower priority)
+                    router_reason = getattr(routing_decision, "reason", "unknown")
                     self.logger.debug(
                         "[Meta:Route] Intent rejected by ActionRouter: %s %s (trace_id=%s reason=%s)",
                         intent.symbol, intent.side, decision_id,
-                        getattr(routing_decision, "reason", "unknown"),
+                        router_reason,
                     )
-                    return None  # Execution prevented by governance
+                    return self._build_rejection_result(
+                        "action_router_reject",
+                        str(router_reason),
+                        status="rejected",
+                    )
                 intent = getattr(routing_decision, "intent", intent)
             
             # STEP 3: EXECUTE the intent (either routed or direct)
             result = await self.execution_manager.execute_trade(intent=intent)
+            if result is None:
+                return self._build_rejection_result(
+                    "execution_manager_none",
+                    "execute_trade returned None",
+                    status="rejected",
+                )
             
             # STEP 4: CORRELATION TRACKING (Issue #15 - Week 3 Integration)
             # Track correlations between positions for portfolio risk analysis

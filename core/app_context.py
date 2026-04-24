@@ -93,6 +93,11 @@ _liq_agent_mod      = _import_optional("agents.liquidation_agent")
 _adaptive_capital_mod = _import_optional("core.adaptive_capital_engine")
 _truth_auditor_mod  = _import_optional("core.exchange_truth_auditor")
 _dust_monitor_mod   = _import_optional("core.dust_monitor")
+
+# 🚀 TIER 1 COMPONENTS (NEW - Activation Phase)
+_bootstrap_mgr_mod  = _import_optional("core.bootstrap_manager")
+_correlation_mgr_mod = _import_optional("core.correlation_manager")
+_anomaly_det_mod    = _import_optional("core.anomaly_detection")
 _wallet_scanner_mod = _import_optional("agents.wallet_scanner_agent")
 _dashboard_mod      = _import_optional("dashboard_server")
 _cap_alloc_mod      = _import_optional("core.capital_allocator")
@@ -1043,6 +1048,11 @@ class AppContext:
         self.profit_target_engine: Optional[Any] = None # P9 Wealth
         self.dust_monitor: Optional[Any] = None  # Phase G: Real-time dust monitoring
         self.adaptive_capital_engine: Optional[Any] = None  # Adaptive sizing engine
+        
+        # 🚀 TIER 1 COMPONENTS (NEW - Activation Phase)
+        self.bootstrap_orchestrator: Optional[Any] = None  # Deploy capital immediately
+        self.correlation_manager: Optional[Any] = None  # Prevent correlated positions
+        self.anomaly_detector: Optional[Any] = None  # Detect market anomalies
         self.exchange_truth_auditor: Optional[Any] = None  # P3 exchange truth reconciliation
         self.model_manager: Optional[Any] = None  # ✅ NEW: ModelManager for ML/training
         self.position_merger: Optional[Any] = None  # Phase 6: Position consolidation engine
@@ -3962,11 +3972,58 @@ class AppContext:
         if self.compounding_engine is None:
             CompoundingEngine = _get_cls(_comp_mod, "CompoundingEngine")
             self.compounding_engine = _try_construct(CompoundingEngine, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, execution_manager=self.execution_manager, exchange_client=self.exchange_client)
+        
+        # 🚀 TIER 1: Bootstrap Orchestrator (Deploy capital immediately)
+        if self.bootstrap_orchestrator is None:
+            BootstrapOrchestrator = _get_cls(_bootstrap_mgr_mod, "BootstrapOrchestrator")
+            self.bootstrap_orchestrator = _try_construct(
+                BootstrapOrchestrator,
+                config=self.config,
+                logger=self.logger,
+                app=self,
+                shared_state=self.shared_state,
+                meta_controller=self.meta_controller
+            )
+            if self.bootstrap_orchestrator:
+                self.logger.info("[AppContext] ✅ BootstrapOrchestrator initialized")
+        
+        # 🚀 TIER 1: Correlation Manager (Prevent correlated positions)
+        if self.correlation_manager is None:
+            CorrelationManager = _get_cls(_correlation_mgr_mod, "CorrelationManager")
+            self.correlation_manager = _try_construct(
+                CorrelationManager,
+                config=self.config,
+                logger=self.logger,
+                app=self,
+                shared_state=self.shared_state
+            )
+            if self.correlation_manager:
+                self.logger.info("[AppContext] ✅ CorrelationManager initialized")
+        
+        # 🚀 TIER 1: Anomaly Detector (Detect market anomalies)
+        if self.anomaly_detector is None:
+            AnomalyDetector = _get_cls(_anomaly_det_mod, "AnomalyDetector")
+            self.anomaly_detector = _try_construct(
+                AnomalyDetector,
+                config=self.config,
+                logger=self.logger,
+                app=self,
+                shared_state=self.shared_state,
+                market_data_feed=self.market_data_feed
+            )
+            if self.anomaly_detector:
+                self.logger.info("[AppContext] ✅ AnomalyDetector initialized")
         if self.volatility_regime is None:
             VolatilityRegimeDetector = _get_cls(_vol_mod, "VolatilityRegimeDetector")
             # Pass symbols from symbol_manager if available
             symbols = [s.symbol for s in getattr(self.symbol_manager, "symbols", [])] if hasattr(self, "symbol_manager") and self.symbol_manager else []
             self.volatility_regime = _try_construct(VolatilityRegimeDetector, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, market_data_feed=self.market_data_feed, symbols=symbols if symbols else None)
+        
+        # ⚡ CRITICAL FIX: Add VolatilityRegimeDetector to P6 startup sequence
+        if self.volatility_regime:
+            self._p6_startables.append(self.volatility_regime)
+            self.logger.info("[AppContext] Added VolatilityRegimeDetector to P6 startup sequence")
+        
         if self.portfolio_balancer is None:
             PortfolioBalancer = _get_cls(_portfolio_mod, "PortfolioBalancer")
             self.portfolio_balancer = _try_construct(PortfolioBalancer, config=self.config, logger=self.logger, app=self, shared_state=self.shared_state, execution_manager=self.execution_manager, exchange_client=self.exchange_client)

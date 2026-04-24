@@ -237,8 +237,24 @@ class ExternalAdoptionEngine:
 
                 # Could integrate with TPSLEngine to set TP/SL
                 if self.execution_manager and tp_price:
-                    # TODO: Set TP/SL via TPSLEngine
-                    pass
+                    # Set TP/SL via TPSLEngine if available
+                    try:
+                        # Check if execution_manager has TPSLEngine
+                        if hasattr(self.execution_manager, 'tpsl_engine') and self.execution_manager.tpsl_engine:
+                            await self.execution_manager.tpsl_engine.set_take_profit(
+                                symbol=symbol,
+                                tp_price=tp_price,
+                                tp_percent=None
+                            )
+                            if sl_price:
+                                await self.execution_manager.tpsl_engine.set_stop_loss(
+                                    symbol=symbol,
+                                    sl_price=sl_price,
+                                    sl_percent=None
+                                )
+                            self.logger.debug(f"[ExternalAdoption] TP/SL set for {symbol}: TP={tp_price}, SL={sl_price}")
+                    except Exception as e:
+                        self.logger.warning(f"[ExternalAdoption] Could not set TP/SL via TPSLEngine: {e}")
 
                 return True
             except Exception as e:
