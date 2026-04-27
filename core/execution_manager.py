@@ -38,10 +38,23 @@ try:
 except Exception:
     pass
 
-def round_step(value: float, step: float) -> float:
+def round_step(value: float, step: float, direction: str = "down") -> float:
+    """
+    Round a value to the nearest multiple of step_size.
+    
+    Args:
+        value: The value to round
+        step: The step size (e.g., 0.00001 for DOGE)
+        direction: "down" (ROUND_DOWN) or "up" (ROUND_UP)
+    
+    Returns:
+        Rounded value
+    """
     if step <= 0:
         return float(value)
-    q = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+    
+    rounding_mode = ROUND_UP if direction.lower() == "up" else ROUND_DOWN
+    q = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=rounding_mode)
     return float(q * Decimal(str(step)))
 
 
@@ -9891,11 +9904,13 @@ class ExecutionManager:
                 
                 # Round up if ANY dust condition is met
                 if qty_residual_is_dust or notional_residual_is_dust or near_total_exit:
-                    # Sell entire remaining position by rounding to nearest multiple of step_size
-                    qty_up = round_step(_raw_quantity, step_size)
+                    # 🎯 FIX: Actually round UP to include the dust remainder
+                    # Use ROUND_UP direction to ensure we sell the full position
+                    qty_up = round_step(_raw_quantity, step_size, direction="up")
                     
-                    # Safety: don't oversell (should never happen, but defensive)
-                    if qty_up <= _raw_quantity + float(step_size) * 0.01:
+                    # Safety: ensure we're actually rounding UP and not over-selling excessively
+                    # qty_up should be >= _raw_quantity (rounding up means same or more)
+                    if qty_up >= _raw_quantity and qty_up <= _raw_quantity + float(step_size) * 1.1:
                         self.logger.info(
                             "[EM:SellRoundUp] %s: qty ROUND_UP %.8f→%.8f to avoid dust "
                             "(remainder=%.8f notional=%.4f < floor=%.2f | qty_dust=%s notional_dust=%s pct_exit=%.1f%%)",
@@ -9910,6 +9925,12 @@ class ExecutionManager:
                             position_pct_remaining,
                         )
                         qty = qty_up
+                    elif qty_up < _raw_quantity:
+                        # This should never happen with ROUND_UP, but log if it does
+                        self.logger.error(
+                            "[EM:SellRoundUp:ERROR] %s rounding failed: raw=%.8f qty_up=%.8f (went down instead of up!)",
+                            symbol, float(_raw_quantity), float(qty_up)
+                        )
             if max_qty > 0 and qty > max_qty:
                 qty = round_step(max_qty, step_size)
             
