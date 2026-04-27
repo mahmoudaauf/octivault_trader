@@ -6018,7 +6018,7 @@ class SharedState:
         if qty <= 0 or price <= 0: return {"realized_pnl_delta": 0.0}
         pos = dict(self.positions.get(symbol, {}))
         cur_qty = float(pos.get("quantity", 0.0))
-        avg = float(pos.get("avg_price", self._avg_price_cache.get(symbol, 0.0) or 0.0))
+        avg = float(pos.get("avg_price") or self._avg_price_cache.get(symbol, 0.0) or 0.0)
         realized = 0.0
         fee_quote = float(fee_quote or 0.0)
         fee_base = float(fee_base or 0.0)
