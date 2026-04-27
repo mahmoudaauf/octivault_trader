@@ -1940,6 +1940,8 @@ class ExecutionManager:
     def __init__(self, config: Any, shared_state: Any, exchange_client: Any, alert_callback=None, event_store: Optional[Any] = None):
         # Heartbeat task (must be set before any other logic to avoid AttributeError)
         self._heartbeat_task = None
+        self.is_running = True  # System running flag for exit monitor loop
+        self._exit_monitor_task = None  # Task for exit monitoring loop
         self._decision_id_seq = 0
         self.config = config
         self.shared_state = shared_state
@@ -2134,6 +2136,17 @@ class ExecutionManager:
         self._last_watchdog_report_ts = time.time()
         self._watchdog_report_interval_s = 30.0  # Report to watchdog every 30 seconds
 
+        # ═════════════════════════════════════════════════════════════════════
+        # EXIT-FIRST STRATEGY: Initialize metrics tracking
+        # ═════════════════════════════════════════════════════════════════════
+        try:
+            from tools.exit_metrics import ExitMetricsTracker
+            self.exit_metrics = ExitMetricsTracker()
+            self.logger.info("[ExitMetrics] Exit metrics tracker initialized")
+        except Exception as e:
+            self.logger.warning(f"[ExitMetrics] Could not initialize exit metrics: {e}")
+            self.exit_metrics = None
+
         self.logger.info("ExecutionManager initialized with P9 configuration")
         self._ensure_trade_journal_ready(reason="init")
 
@@ -2316,6 +2329,128 @@ class ExecutionManager:
                     await result
         except Exception:
             pass  # Status reporting is non-critical
+
+    # ============================================================================
+    # EXIT-FIRST STRATEGY: Automatic exit monitoring and execution
+    # ============================================================================
+    
+    async def _monitor_and_execute_exits(self):
+        """
+        Exit-First Strategy: Continuous monitoring loop runs every 10 seconds.
+        Checks all open positions for exit triggers:
+        1. Take Profit (TP): Price rises 2.5%+
+        2. Stop Loss (SL): Price falls 1.5%+
+        3. Time Exit: 4-hour max hold expires
+        4. Dust Liquidation: Fallback exit strategy
+        
+        This coroutine runs continuously in the background.
+        """
+        self.logger.info("[ExitMonitor:START] Exit monitoring loop initialized")
+        
+        while self.is_running:
+            try:
+                all_positions = getattr(self.shared_state, "positions", {}) or {}
+                if not isinstance(all_positions, dict):
+                    await asyncio.sleep(10)
+                    continue
+                
+                for symbol, pos_data in list(all_positions.items()):
+                    try:
+                        if not pos_data:
+                            continue
+                        
+                        qty = float((pos_data or {}).get("quantity", 0.0) or 0.0)
+                        if qty <= 0:
+                            continue
+                        
+                        # Get exit plan (if set via Entry Gate)
+                        tp_price = float((pos_data or {}).get("tp_price") or 0.0)
+                        sl_price = float((pos_data or {}).get("sl_price") or 0.0)
+                        time_deadline = float((pos_data or {}).get("time_exit_deadline") or 0.0)
+                        
+                        # Skip if no exit plan defined
+                        if not (tp_price > 0 and sl_price > 0 and time_deadline > 0):
+                            continue
+                        
+                        # Get current price
+                        current_price = 0.0
+                        if hasattr(self.shared_state, 'safe_price'):
+                            current_price = float(await asyncio.create_task(self.shared_state.safe_price(symbol)) or 0.0)
+                        
+                        if current_price <= 0:
+                            continue
+                        
+                        # Check exit triggers
+                        now_ts = time.time()
+                        
+                        if current_price >= tp_price:
+                            self.logger.info(f"[ExitMonitor:TP] {symbol} triggered TP: ${current_price:.4f} >= ${tp_price:.4f}")
+                            await self._execute_tp_exit(symbol, qty, current_price)
+                        
+                        elif current_price <= sl_price:
+                            self.logger.info(f"[ExitMonitor:SL] {symbol} triggered SL: ${current_price:.4f} <= ${sl_price:.4f}")
+                            await self._execute_sl_exit(symbol, qty, current_price)
+                        
+                        elif now_ts > time_deadline:
+                            self.logger.info(f"[ExitMonitor:TIME] {symbol} triggered TIME exit: 4h expired")
+                            await self._execute_time_exit(symbol, qty, current_price)
+                    
+                    except Exception as e:
+                        self.logger.error(f"[ExitMonitor:Error] Error monitoring {symbol}: {e}")
+                
+                await asyncio.sleep(10)  # Check every 10 seconds
+            
+            except Exception as e:
+                self.logger.error(f"[ExitMonitor:MainError] Exit monitoring loop error: {e}")
+                await asyncio.sleep(10)
+    
+    async def _execute_tp_exit(self, symbol: str, qty: float, price: float):
+        """Execute take profit exit"""
+        try:
+            order = await self.place_order(
+                symbol=symbol,
+                side="SELL",
+                quantity=qty,
+                planned_quote=qty * price,
+            )
+            if order and order.get("ok"):
+                self.logger.info(f"[ExitMonitor:TP_EXECUTED] {symbol} @ ${price:.4f}")
+                if hasattr(self, 'exit_metrics'):
+                    self.exit_metrics.record_exit("TP", 0.0, 0.0)
+        except Exception as e:
+            self.logger.error(f"[ExitMonitor:TP_ERROR] Failed to execute TP exit for {symbol}: {e}")
+    
+    async def _execute_sl_exit(self, symbol: str, qty: float, price: float):
+        """Execute stop loss exit"""
+        try:
+            order = await self.place_order(
+                symbol=symbol,
+                side="SELL",
+                quantity=qty,
+                planned_quote=qty * price,
+            )
+            if order and order.get("ok"):
+                self.logger.info(f"[ExitMonitor:SL_EXECUTED] {symbol} @ ${price:.4f}")
+                if hasattr(self, 'exit_metrics'):
+                    self.exit_metrics.record_exit("SL", 0.0, 0.0)
+        except Exception as e:
+            self.logger.error(f"[ExitMonitor:SL_ERROR] Failed to execute SL exit for {symbol}: {e}")
+    
+    async def _execute_time_exit(self, symbol: str, qty: float, price: float):
+        """Execute time-based exit (4h force close)"""
+        try:
+            order = await self.place_order(
+                symbol=symbol,
+                side="SELL",
+                quantity=qty,
+                planned_quote=qty * price,
+            )
+            if order and order.get("ok"):
+                self.logger.info(f"[ExitMonitor:TIME_EXECUTED] {symbol} @ ${price:.4f} (4h forced)")
+                if hasattr(self, 'exit_metrics'):
+                    self.exit_metrics.record_exit("TIME", 0.0, 0.0)
+        except Exception as e:
+            self.logger.error(f"[ExitMonitor:TIME_ERROR] Failed to execute TIME exit for {symbol}: {e}")
 
     def _cfg(self, path: str, default):
         cur = self.config
