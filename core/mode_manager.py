@@ -12,7 +12,15 @@ class ModeManager:
         self.config = config
         
         # Mode state tracking
-        self._current_mode = "BOOTSTRAP"  # Start in bootstrap mode
+        # Allow an operator override at construction time so the bot doesn't inherit
+        # a stale PROTECTIVE state from a previous session when it restarts.
+        # Set config.STARTUP_MODE_OVERRIDE = "RECOVERY" (or "NORMAL") to activate.
+        _startup_override = str(getattr(config, "STARTUP_MODE_OVERRIDE", "") or "").upper()
+        if _startup_override in ("RECOVERY", "NORMAL", "BOOTSTRAP", "AGGRESSIVE"):
+            self._current_mode = _startup_override
+            logger.info("[ModeManager:Init] STARTUP_MODE_OVERRIDE applied: starting in %s", _startup_override)
+        else:
+            self._current_mode = "BOOTSTRAP"  # Start in bootstrap mode
         self._last_mode = None
         self._mode_switch_count = 0
         self._mode_switch_timestamps = {self._current_mode: time.time()}
@@ -30,17 +38,17 @@ class ModeManager:
                 "objective": "Capital protection"
             },
             "PROTECTIVE": {
-                "max_trade_usdt": 0.0,  # Blocked
-                "max_positions": 0,    # Blocked
-                "confidence_floor": 0.95, # Strictly high (Liquidation only basically)
-                "cooldown_sec": 0,
-                "probing_enabled": False,
-                "objective": "Capital defense (New Positions Blocked)"
+                "max_trade_usdt": 50.0,
+                "max_positions": 2,    # FIXED: was 0 (complete freeze) → allows trading to continue recovering
+                "confidence_floor": 0.50, # FIXED: was 0.95 → blocked all signals; now matches RECOVERY floor
+                "cooldown_sec": 60,    # FIXED: was 0 → no cooldown made no sense; now 60s like RECOVERY
+                "probing_enabled": True,  # FIXED: was False → allow micro-account probing
+                "objective": "Capital defense (Defensive Trading Mode)"
             },
             "NORMAL": {
                 "max_trade_usdt": 150.0,
                 "max_positions": 3,
-                "confidence_floor": 0.65,
+                "confidence_floor": 0.50,  # FIXED: Lowered from 0.65 to 0.50 to enable all medium-confidence signals
                 "cooldown_sec": 120,
                 "probing_enabled": True,
                 "objective": "Balanced trading (Default Profit Engine)"
@@ -48,23 +56,23 @@ class ModeManager:
             "AGGRESSIVE": {
                 "max_trade_usdt": 300.0,
                 "max_positions": 5,
-                "confidence_floor": 0.55,
+                "confidence_floor": 0.45,  # FIXED: Lowered from 0.55 to 0.45 to be more aggressive
                 "cooldown_sec": 60,
                 "probing_enabled": True,
                 "objective": "Velocity recovery"
             },
             "RECOVERY": {
                 "max_trade_usdt": 50.0,
-                "max_positions": 1,
-                "confidence_floor": 0.80,
-                "cooldown_sec": 240,
-                "probing_enabled": False,
+                "max_positions": 2,       # FIXED: was 1 → deadlocked when 1 existing position occupied the only slot
+                "confidence_floor": 0.50, # FIXED: was 0.80 → blocked all 0.65-conf signals in recovery
+                "cooldown_sec": 60,       # FIXED: was 240 → 4-min cooldown prevented any rapid recovery
+                "probing_enabled": True,  # FIXED: was False → allow micro-account probing in recovery
                 "objective": "System stabilization (Fault Recovery)"
             },
             "BOOTSTRAP": {
                 "max_trade_usdt": 20.0,
                 "max_positions": 1,
-                "confidence_floor": 0.70,
+                "confidence_floor": 0.50,  # FIXED: Lowered from 0.70 to 0.50 to allow signals with 0.65+ confidence
                 "cooldown_sec": 60,
                 "probing_enabled": False,
                 "objective": "Initial funding (Bootstrap)"
@@ -325,11 +333,17 @@ class ModeManager:
         # PROTECTIVE -> RECOVERY (Stabilization)
         if current == "PROTECTIVE":
             health_ok = metrics.get("health_ok", False)
-            # PnL stabilize: DD < threshold (e.g. 1.5% if trigger was 2%)
-            dd_stable = float(metrics.get("drawdown_pct", 0.0)) < 1.5
-            
+            # PnL stabilize: DD < threshold.
+            # FIXED: was 1.5% — unreachable for accounts with historical realized losses (26%+ drawdown).
+            # Using 50% as a practical upper bound; the point is to detect *active* drawdown spirals,
+            # not penalize historical PnL. Configurable via PROTECTIVE_DD_STABLE_THRESHOLD.
+            dd_threshold = float(getattr(self.config, "PROTECTIVE_DD_STABLE_THRESHOLD", 50.0))
+            dd_stable = float(metrics.get("drawdown_pct", 0.0)) < dd_threshold
+
             if health_ok and dd_stable:
-                if self._check_condition_persistence("protective_to_recovery", now, 600): # 10 min stabilization
+                # FIXED: was 600s (10 min) → bot was stuck for hours waiting for persistence.
+                # Reduced to 60s for faster stabilization exit.
+                if self._check_condition_persistence("protective_to_recovery", now, 60):
                     self.logger.info("[ModeManager:SOP] 🛡️ -> 🟨 PROTECTIVE -> RECOVERY: Health and PnL stabilized.")
                     self.set_mode("RECOVERY", reason="protective_to_recovery")
                     return

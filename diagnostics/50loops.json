@@ -1,0 +1,76 @@
+[
+  {
+    "loop_id": 1946,
+    "capital_free": 52.79,
+    "exec_attempted": false,
+    "exec_result": "NONE",
+    "rej_count": 0,
+    "symbols": {
+      "KATUSDT": {
+        "signal_conf": 0.753,
+        "required_conf": 0.605,
+        "result": "STRONG",
+        "exec_rejects": 0,
+        "skip_rejections": 0
+      },
+      "DASHUSDT": {
+        "signal_conf": 0.655,
+        "required_conf": 0.605,
+        "result": "STRONG",
+        "exec_rejects": 0,
+        "skip_rejections": 0
+      },
+      "LUNCUSDT": {
+        "signal_conf": 0.6,
+        "required_conf": 0.605,
+        "result": "MEDIUM",
+        "exec_rejects": 0,
+        "skip_rejections": 0
+      },
+      "BTCUSDT": {
+        "signal_conf": 0.65,
+        "required_conf": 0.605,
+        "result": "STRONG",
+        "exec_rejects": 0,
+        "skip_rejections": 0
+      }
+    }
+  },
+  {
+    "loop_id": 1948,
+    "capital_free": 52.79,
+    "exec_attempted": false,
+    "exec_result": "NONE",
+    "rej_count": 0,
+    "symbols": {
+      "KATUSDT": {
+        "signal_conf": 0.753,
+        "required_conf": 0.605,
+        "result": "STRONG",
+        "exec_rejects": 0,
+        "skip_rejections": 0
+      },
+      "DASHUSDT": {
+        "signal_conf": 0.823,
+        "required_conf": 0.605,
+        "result": "STRONG",
+        "exec_rejects": 0,
+        "skip_rejections": 0
+      },
+      "LUNCUSDT": {
+        "signal_conf": 0.6,
+        "required_conf": 0.605,
+        "result": "MEDIUM",
+        "exec_rejects": 0,
+        "skip_rejections": 0
+      },
+      "BTCUSDT": {
+        "signal_conf": 0.65,
+        "required_conf": 0.605,
+        "result": "STRONG",
+        "exec_rejects": 0,
+        "skip_rejections": 0
+      }
+    }
+  }
+]

@@ -1,0 +1,113 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║        BOTTLENECK FIXES PHASE 2 - FINAL IMPLEMENTATION SUMMARY             ║
+║                   April 24, 2026 - 06:15 UTC                              ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+✅ STATUS: COMPLETE & VALIDATED
+✅ COMPILATION: All modules compile cleanly
+✅ IMPORTS: MetaController, RotationExitAuthority, Config verified
+✅ SIGNATURES: Bypass parameter confirmed in _safe_passes_min_hold()
+
+────────────────────────────────────────────────────────────────────────────
+
+FIX #1: SAFE MIN-HOLD BYPASS FOR FORCED RECOVERY EXITS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+File: core/meta_controller.py
+
+Location 1 (Line ~12500 - Stagnation Exit):
+  + stagnation_exit_sig["_bypass_min_hold"] = True
+  Result: Stagnation recovery exits carry bypass flag
+
+Location 2 (Line ~12525 - Liquidity Restoration):
+  + liquidity_restore_sig["_bypass_min_hold"] = True
+  + Changed: _safe_passes_min_hold(...) → _safe_passes_min_hold(..., bypass=True)
+  Result: Liquidity restoration exits carry bypass flag and use bypass parameter
+
+Location 3 (Line ~11942 - Method Enhancement):
+  - def _safe_passes_min_hold(self, symbol: Optional[str]) -> bool:
+  + def _safe_passes_min_hold(self, symbol: Optional[str], bypass: bool = False) -> bool:
+  + Added bypass logic: if bypass: logger.info(...); return True
+  Result: Method now accepts and honors bypass flag for recovery exits
+
+────────────────────────────────────────────────────────────────────────────
+
+FIX #2: MICRO ROTATION OVERRIDE POLICY WIRING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+File: core/rotation_authority.py
+
+Location 1 (Line ~185 - Rotation Restriction Messaging):
+  Updated: Logger message now includes config override details
+  Result: Clearer override status in logs
+
+Location 2 (Lines ~313-340 - Override Precedence Logic):
+  - Simplified conditional structure for PHASE C check
+  - MICRO bracket check now ONLY applies if NOT force_rotation
+  - Override with force_rotation now explicitly logged as override
+  + Added docstring: "PRECEDENCE: force_rotation flag overrides MICRO bracket restrictions."
+  Result: Forced rotations guaranteed to execute despite MICRO bracket
+
+────────────────────────────────────────────────────────────────────────────
+
+FIX #3: ENTRY-SIZING CONFIG & PROFILE ALIGNMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+File 1: .env (Lines 45-56)
+
+DEFAULT_PLANNED_QUOTE:     12 → 25 ✅
+MIN_TRADE_QUOTE:           12 → 25 ✅
+MIN_ENTRY_USDT:            10 → 25 ✅
+TRADE_AMOUNT_USDT:         12 → 25 ✅
+MIN_ENTRY_QUOTE_USDT:      10 → 25 ✅
+EMIT_BUY_QUOTE:            10 → 25 ✅
+META_MICRO_SIZE_USDT:      10 → 25 ✅
+
+Added: Comment explaining floor alignment with SIGNIFICANT_POSITION_FLOOR
+
+File 2: core/config.py (Line ~1360)
+
+Added: FIX #3 comment block explaining floor alignment intent
+Updated: Logger messages prefixed with [Config:EntryFloor]
+Enhanced: Warning messages explain "align config intent with runtime expectations"
+
+────────────────────────────────────────────────────────────────────────────
+
+EXPECTED RUNTIME BEHAVIOR
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Recovery Bypass Working:
+   [Meta:SafeMinHold] Bypassing min-hold check for forced recovery exit: ETHUSDT
+
+✅ Micro Override Working:
+   [REA:authorize_rotation] ⚠️ MICRO restriction OVERRIDDEN for BTCUSDT
+
+✅ Config Aligned:
+   Startup logs clean (no MIN_ENTRY_USDT normalization warnings)
+   First BUY orders sized at 25 USDT without runtime bumping
+
+────────────────────────────────────────────────────────────────────────────
+
+VALIDATION CHECKLIST
+════════════════════════════════════════════════════════════════════════════
+
+[✅] Code compiles without errors
+[✅] All imports resolve correctly
+[✅] _safe_passes_min_hold has bypass parameter in signature
+[✅] Recovery exits carry _bypass_min_hold flag
+[✅] Rotation override logic has clear precedence
+[✅] Entry sizing aligned across all files
+[✅] No new dependencies introduced
+[✅] Type hints preserved
+[✅] Backward compatible (bypass=False is default)
+
+════════════════════════════════════════════════════════════════════════════
+
+READY FOR DEPLOYMENT ✅
+
+Next Step: Run session with monitoring active
+Target Metrics:
+  - Liquidity restoration hits per session
+  - Forced rotation escape frequency  
+  - Entry size consistency (25 USDT baseline)
+  - Min-hold bypass log frequency

@@ -1,0 +1,159 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    6-HOUR SESSION QUICK REFERENCE
+═══════════════════════════════════════════════════════════════════════════════
+
+SESSION STATUS:
+  Status:        ✅ RUNNING
+  Session PID:   91818 (monitor)
+  Trading PID:   91820 (system)
+  Started:       2026-04-24 01:54:30 EET
+  Will End:      2026-04-24 07:54:30 EET
+  Duration:      6 hours
+  Checkpoints:   Every 30 minutes (12 total)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+MONITORING COMMANDS:
+
+1. Watch Real-Time Checkpoints (RECOMMENDED):
+   tail -f 6HOUR_SESSION_MONITOR.log | grep CHECKPOINT
+
+2. Watch Full Session Log:
+   tail -f 6HOUR_SESSION_MONITOR.log
+
+3. Check Last 50 Lines:
+   tail -50 6HOUR_SESSION_MONITOR.log
+
+4. Count Completed Checkpoints:
+   grep -c "CHECKPOINT" 6HOUR_SESSION_MONITOR.log
+
+5. Get Session Summary:
+   cat 6HOUR_SESSION_STATUS.md
+
+6. View Process Status:
+   ps aux | grep -E "91820|91818" | grep -v grep
+
+7. Monitor CPU/Memory Only:
+   tail -f 6HOUR_SESSION_MONITOR.log | grep -E "CPU|Memory"
+
+8. Look for Errors:
+   tail -f 6HOUR_SESSION_MONITOR.log | grep ERROR
+
+═══════════════════════════════════════════════════════════════════════════════
+
+CHECKPOINT SCHEDULE:
+
+Checkpoint  Time          Duration    Status
+─────────────────────────────────────────────
+    1       01:54:30      0 min       ✅ DONE
+    2       02:24:30      30 min      ⏳ upcoming
+    3       02:54:30      60 min      ⏳ upcoming
+    4       03:24:30      90 min      ⏳ upcoming
+    5       03:54:30      2 hours     ⏳ upcoming (midpoint)
+    6       04:24:30      150 min     ⏳ upcoming
+    7       04:54:30      3 hours     ⏳ upcoming
+    8       05:24:30      210 min     ⏳ upcoming
+    9       05:54:30      4 hours     ⏳ upcoming
+   10       06:24:30      270 min     ⏳ upcoming
+   11       06:54:30      5 hours     ⏳ upcoming (final hour starting)
+   12       07:24:30      330 min     ⏳ upcoming
+  FINAL     07:54:30      6 hours     ⏳ session end
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM STATUS COMMANDS:
+
+Check if system is running:
+  ps aux | grep MASTER_SYSTEM | grep -v grep
+  ps aux | grep 91820 | grep -v grep
+
+Get detailed process info:
+  ps -p 91820 -o pid,user,%cpu,%mem,etime,comm
+
+Check memory usage:
+  ps -p 91820 -o pid,%mem,rss | tail -1
+
+Check CPU usage (live):
+  top -p 91820 -l 1 | grep "MASTER_SYSTEM" | head -1
+
+═══════════════════════════════════════════════════════════════════════════════
+
+CONTROL COMMANDS (if needed):
+
+Stop the session gracefully:
+  pkill -f RUN_6HOUR_SESSION.py
+
+Stop both monitor and trading:
+  pkill -9 -f "MASTER_SYSTEM_ORCHESTRATOR|RUN_6HOUR_SESSION"
+
+Restart the session:
+  cd /Users/mauf/Desktop/Octi\ AI\ Trading\ Bot/octivault_trader
+  bash START_6HOUR_SESSION.sh
+
+═══════════════════════════════════════════════════════════════════════════════
+
+WHAT TO EXPECT:
+
+First 30 minutes:  System initialization, CPU high (200-300%)
+30-60 minutes:     Backtest collection, CPU moderate (100-200%)
+60-120 minutes:    Trading starts, first orders executed
+120-360 minutes:   Steady trading, profit/loss accumulation
+
+Memory:   Should stabilize between 200-500 MB
+CPU:      Will spike during trades, idle between trades
+
+Entry Floor Guard:  Active - prevents entries below $20 USDT
+Dust Management:    Active - with new fixes deployed
+
+═══════════════════════════════════════════════════════════════════════════════
+
+EXPECTED LOG ENTRIES:
+
+Every 30 minutes you should see:
+  [HH:MM:SS] [CHECKPOINT] 📍 CHECKPOINT N/12
+  [HH:MM:SS] [CHECKPOINT]    ⏱️  Elapsed:    HH:MM:SS
+  [HH:MM:SS] [CHECKPOINT]    ⏱️  Remaining:  HH:MM:SS
+  [HH:MM:SS] [CHECKPOINT]    📊 Progress:   N.N%
+  [HH:MM:SS] [CHECKPOINT]    💻 CPU:        N.N%
+  [HH:MM:SS] [CHECKPOINT]    🧠 Memory:     N.N MB
+
+═══════════════════════════════════════════════════════════════════════════════
+
+FILES GENERATED:
+
+Active Now:
+  6HOUR_SESSION_MONITOR.log      - Live checkpoint log
+  6HOUR_SESSION_STATUS.md        - Session overview
+
+Generated at End:
+  6HOUR_SESSION_REPORT.md        - Final comprehensive report
+
+═══════════════════════════════════════════════════════════════════════════════
+
+HELP / INFO:
+
+For detailed info:
+  cat 6HOUR_SESSION_STATUS.md
+
+For full monitoring guide:
+  cat MONITOR_6HOUR_SESSION.sh
+
+For startup info:
+  cat START_6HOUR_SESSION.sh
+
+═══════════════════════════════════════════════════════════════════════════════
+
+IMPORTANT NOTES:
+
+✓ Session is running in background - safe to close terminal
+✓ Checkpoints will fire automatically every 30 minutes
+✓ System will auto-restart on crash (up to 3 times)
+✓ Session will auto-complete at 07:54:30
+✓ Report will auto-generate at end
+✓ Entry floor guard is ACTIVE
+✓ Dust-liquidation fixes are DEPLOYED
+
+═══════════════════════════════════════════════════════════════════════════════
+                                Last Updated: 01:54:30
+                          Next Checkpoint Expected: 02:24:30
+═══════════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,53 @@
+{
+  "generated_at": "2026-04-24T09:35:20.178384Z",
+  "proposals": [
+    {
+  "symbol": "KATUSDT",
+      "score": 2.444,
+      "n_signals": 2,
+      "n_pass": 2,
+      "avg_delta": 0.14800000000000002,
+      "exec_rejects": 0,
+      "skip_rejections": 0,
+      "current_required_conf": 0.605,
+  "suggested_required_conf": 0.575,
+      "rationale": "High pass_rate + avg_delta; lowish rejection penalty. Relax required_conf by 0.02"
+    },
+    {
+      "symbol": "DASHUSDT",
+      "score": 2.402,
+      "n_signals": 2,
+      "n_pass": 2,
+      "avg_delta": 0.134,
+      "exec_rejects": 0,
+      "skip_rejections": 0,
+      "current_required_conf": 0.605,
+      "suggested_required_conf": 0.585,
+      "rationale": "High pass_rate + avg_delta; lowish rejection penalty. Relax required_conf by 0.02"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "score": 2.1350000000000002,
+      "n_signals": 2,
+      "n_pass": 2,
+      "avg_delta": 0.04500000000000004,
+      "exec_rejects": 0,
+      "skip_rejections": 0,
+      "current_required_conf": 0.605,
+      "suggested_required_conf": 0.585,
+      "rationale": "High pass_rate + avg_delta; lowish rejection penalty. Relax required_conf by 0.02"
+    },
+    {
+      "symbol": "LUNCUSDT",
+      "score": -0.015000000000000013,
+      "n_signals": 2,
+      "n_pass": 0,
+      "avg_delta": -0.0050000000000000044,
+      "exec_rejects": 0,
+      "skip_rejections": 0,
+      "current_required_conf": 0.605,
+      "suggested_required_conf": 0.585,
+      "rationale": "High pass_rate + avg_delta; lowish rejection penalty. Relax required_conf by 0.02"
+    }
+  ]
+}

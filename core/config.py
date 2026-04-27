@@ -1322,6 +1322,16 @@ class Config:
         # Capital floor (NAV-aware): max(ABSOLUTE_MIN_FLOOR, NAV * CAPITAL_FLOOR_PCT)
         self.ABSOLUTE_MIN_FLOOR = float(os.getenv("ABSOLUTE_MIN_FLOOR", "10.0"))
         self.CAPITAL_FLOOR_PCT = float(os.getenv("CAPITAL_FLOOR_PCT", "0.20"))
+        # Allow RecoveryEngine to fetch live balances/positions via Binance REST at startup.
+        # Without this, the bot rebuilds from stale memory/DB and reports wrong free USDT & NAV.
+        self.RECOVERY_ALLOW_REST = os.getenv("RECOVERY_ALLOW_REST", "true").lower() in ("true", "1", "yes")
+        # Override the starting mode so a bot that crashed in PROTECTIVE mode
+        # does not re-enter that state immediately after restart.
+        # Values: RECOVERY, NORMAL, BOOTSTRAP (or empty string to disable).
+        self.STARTUP_MODE_OVERRIDE = os.getenv("STARTUP_MODE_OVERRIDE", "RECOVERY").upper()
+        # Configurable dd_stable threshold for PROTECTIVE -> RECOVERY transition.
+        # Default 50% so accounts with large historical realized losses can still exit PROTECTIVE.
+        self.PROTECTIVE_DD_STABLE_THRESHOLD = float(os.getenv("PROTECTIVE_DD_STABLE_THRESHOLD", "50.0"))
         # Entry sizing defaults (aligned to unified buy size; override via .env)
         self.MIN_ENTRY_QUOTE_USDT = float(os.getenv("MIN_ENTRY_QUOTE_USDT", str(Config.MIN_ENTRY_QUOTE_USDT)))
         self.DEFAULT_PLANNED_QUOTE = float(os.getenv("DEFAULT_PLANNED_QUOTE", str(Config.DEFAULT_PLANNED_QUOTE)))
@@ -1895,7 +1905,14 @@ class Config:
                 "CONF_BELOW_REQUIRED,NET_USDT_BELOW_THRESHOLD,PRETRADE_EFFECT_GATE:NET_USDT_BELOW_THRESHOLD,"
                 "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
                 "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
-                "MICRO_BACKTEST_INSUFFICIENT_SAMPLES"
+                "MICRO_BACKTEST_INSUFFICIENT_SAMPLES,"
+                # Capacity/policy enforcement — normal operating gates, not system failures.
+                # Without these, every PORTFOLIO_FULL cycle accumulates rejection counters
+                # and falsely triggers repeated_failures=True → PROTECTIVE mode lock.
+                "ENTRY_POLICY_GATE,"
+                # CLOSE_NOT_SUBMITTED = sell blocked by profit/edge gate on a losing position.
+                # This is expected during drawdown recovery and should not escalate the mode.
+                "CLOSE_NOT_SUBMITTED"
             ),
         )
 

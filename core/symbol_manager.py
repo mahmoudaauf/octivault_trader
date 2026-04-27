@@ -1150,7 +1150,7 @@ class SymbolManager:
         return self._snapshot_symbols_cache
 
     # New helper to split source from meta
-    def _split_source(self, meta: Dict[str, Any] | None, default_src: str) -> tuple[str, Dict[str, Any]]:
+    def _split_source(self, meta: Optional[Dict[str, Any]], default_src: str) -> Tuple[str, Dict[str, Any]]:
         """
         Return (source, cleaned_meta). Strip keys that map to explicit parameters
         so we can safely do: _is_symbol_valid(symbol, source=..., **meta).

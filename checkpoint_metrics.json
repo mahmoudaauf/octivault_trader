@@ -1,0 +1,57 @@
+{
+  "checkpoints": [
+    {
+      "checkpoint": 1,
+      "timestamp": "2026-04-23T19:43:58.531212",
+      "elapsed_minutes": 0.5000571333333333,
+      "checks": {
+        "deadlock": {
+          "passed": true,
+          "message": "Process responsive"
+        },
+        "adaptation": {
+          "passed": false,
+          "metrics": {
+            "signal_generation": false,
+            "signal_count": 0,
+            "position_changes": false,
+            "new_positions": 0,
+            "market_adaptation": false
+          }
+        },
+        "profit": {
+          "passed": false,
+          "metrics": {
+            "pnl": 0.0,
+            "pnl_change": 0.0,
+            "balance": 0.0,
+            "balance_change": 0.0,
+            "reinvested": 0.0,
+            "profitable": false
+          }
+        },
+        "health": {
+          "passed": true,
+          "metrics": {
+            "components_running": 0,
+            "components_healthy": 0,
+            "unhealthy_components": []
+          }
+        },
+        "capital": {
+          "passed": false,
+          "metrics": {
+            "total_capital": 0.0,
+            "allocated_capital": 0.0,
+            "cash_reserve": 0.0,
+            "utilization_ratio": 0.0,
+            "allocation_efficient": false
+          }
+        }
+      }
+    }
+  ],
+  "total_reinvested": 0.0,
+  "session_start": "2026-04-23T19:43:28.527795",
+  "session_end": "2026-04-23T21:43:28.527795"
+}

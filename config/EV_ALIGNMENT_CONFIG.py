@@ -92,7 +92,7 @@ class CanonicalEVConfig:
     # For spot trading with lower edge requirements (vs futures)
     
     # If enabled, use relaxed multipliers for all regimes
-    SPOT_MODE_ENABLED = False  # Change to True for aggressive spot trading
+    SPOT_MODE_ENABLED = True   # Binance Spot account — lower thresholds appropriate
     
     # Lower multipliers for spot (more opportunities)
     EV_MULT_SPOT_NORMAL = 0.7   # vs 1.3 (46% reduction)

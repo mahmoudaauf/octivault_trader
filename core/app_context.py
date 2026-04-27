@@ -421,7 +421,7 @@ class AppContext:
             pass
 
     # === SECTION: DRY Task Scheduler (fire-and-forget) ===
-    def _ff(self, aw: Awaitable, *, name: str | None = None):
+    def _ff(self, aw: Awaitable, *, name: Optional[str] = None):
         """
         Safely schedule a coroutine as a background task. Returns the created task or None.
         Does not track in _tasks (use _spawn for tracked tasks). Never raises.

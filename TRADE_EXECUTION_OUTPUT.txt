@@ -1,0 +1,25 @@
+🎯 TRADE EXECUTION DIAGNOSTICS
+================================================================================
+Start time: 2026-04-12 17:55:04.857216
+
+[1/5] Importing modules...
+✅ Modules imported
+
+[2/5] Initializing exchange...
+✅ Config loaded - Testnet: False, Mode: live
+✅ Exchange ready - Balance: $60.42 USDT
+
+[3/5] Checking market...
+
+❌ Error: 'ExchangeClient' object has no attribute 'get_symbols'
+Traceback (most recent call last):
+  File "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/🎯_INLINE_TRADE_TEST.py", line 51, in <module>
+    result = asyncio.run(init())
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/base_events.py", line 642, in run_until_complete
+    return future.result()
+  File "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/🎯_INLINE_TRADE_TEST.py", line 39, in init
+    symbols = await exchange.get_symbols()
+AttributeError: 'ExchangeClient' object has no attribute 'get_symbols'
+

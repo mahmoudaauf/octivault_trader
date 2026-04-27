@@ -987,7 +987,7 @@ class SharedState:
         return True # Fail open if no guard
 
     # Synchronous fallback for status reporting (for threads/no event loop)
-    def update_system_health(self, component: str, status: str, message: str = "", detail: str | None = None):
+    def update_system_health(self, component: str, status: str, message: str = "", detail: Optional[str] = None):
         ts = time.time()
         payload = {"status": status, "message": message or (detail or ""), "timestamp": ts}
         self.component_statuses[component] = payload
@@ -1011,7 +1011,7 @@ class SharedState:
         # No await here (sync context) — it's fine to skip emit_event in this path
 
     # ---- Component status API (CSL + Watchdog friendly) ----
-    async def update_component_status(self, component: str, status: str, detail: str = "", *, timestamp: float | None = None):
+    async def update_component_status(self, component: str, status: str, detail: str = "", *, timestamp: Optional[float] = None):
         ts = float(timestamp or time.time())
         payload = {"status": status, "message": detail, "timestamp": ts}
         async with self._lock_context("global"):
@@ -1032,7 +1032,7 @@ class SharedState:
         await self.update_component_status(component, initial_status, detail)
 
     # back-compat alias used by CSL
-    async def set_component_status(self, component: str, status: str, detail: str, *, timestamp: float | None = None):
+    async def set_component_status(self, component: str, status: str, detail: str, *, timestamp: Optional[float] = None):
         await self.update_component_status(component, status, detail, timestamp=timestamp)
 
     # snapshot reader used by Watchdog (if present)
@@ -3455,7 +3455,12 @@ class SharedState:
             # Dynamic ratio can only tighten reserve requirements, never loosen below policy.
             runtime_ratio = float(dynamic_ratio) if dynamic_ratio is not None else cfg_ratio
             effective_ratio = max(cfg_ratio, runtime_ratio)
-            
+
+            # If CAPITAL_FLOOR_PCT was explicitly injected via dynamic_config (operator override),
+            # treat it as a hard cap so the dynamic engine cannot defeat the explicit override.
+            if "CAPITAL_FLOOR_PCT" in getattr(self, "dynamic_config", {}):
+                effective_ratio = min(effective_ratio, cfg_ratio)
+
             # Calculate floor
             nav_based = nav * effective_ratio
             
@@ -6801,7 +6806,7 @@ class SharedState:
         return False
 
     # -------- Liquidation requests (consumed by LiquidationAgent) --------
-    async def request_liquidation(self, symbol: str, reason: str = "", *, min_quote_target: float | None = None) -> None:
+    async def request_liquidation(self, symbol: str, reason: str = "", *, min_quote_target: Optional[float] = None) -> None:
         """
         Enqueue a liquidation request for a specific symbol. The LiquidationAgent will
         pick this up.

@@ -1,0 +1,50 @@
+================================================================================
+🎯 COMPREHENSIVE TRADE EXECUTION DIAGNOSTICS
+================================================================================
+Started: 2026-04-14 18:01:23.191296
+
+[PHASE 1] IMPORTING CORE MODULES
+--------------------------------------------------------------------------------
+✅ All 11 core modules imported
+
+[PHASE 2] INITIALIZING COMPONENTS
+--------------------------------------------------------------------------------
+✅ Config ready
+   Testnet: False
+   Mode: live
+   Trading Mode: live
+
+✅ Initializing ExchangeClient...
+✅ Exchange connected to LIVE Binance
+   Balance: $30.63 USDT
+
+✅ Initializing Shared State...
+✅ SharedState ready
+   Portfolio initialized
+
+✅ Initializing Signal & Risk Managers...
+✅ Signal & Risk managers ready
+
+✅ Initializing Execution Manager...
+✅ Execution manager ready
+
+✅ Initializing Meta Controller...
+✅ Meta controller ready
+
+✅ Initializing Agent Manager (19 agents)...
+✅ All 19 agents initialized
+
+✅ Initializing Monitoring Systems...
+
+❌ FATAL ERROR: __init__() got an unexpected keyword argument 'interval_seconds'
+Traceback (most recent call last):
+  File "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/🎯_COMPREHENSIVE_DIAGNOSTICS.py", line 197, in <module>
+    result = asyncio.run(run_diagnostics())
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/base_events.py", line 642, in run_until_complete
+    return future.result()
+  File "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/🎯_COMPREHENSIVE_DIAGNOSTICS.py", line 127, in run_diagnostics
+    polling_config = PollingConfig(interval_seconds=30)
+TypeError: __init__() got an unexpected keyword argument 'interval_seconds'
+

@@ -20,13 +20,13 @@ class PolicyManager:
         self._economic_guard = {
             "enabled": getattr(config, "ECONOMIC_GUARD_ENABLED", True),  # Enabled by default (config can disable)
             "min_edge_bps": float(getattr(config, "MIN_EXPECTED_EDGE_BPS", 10.0)),
-            "fallback_edge_bps": float(getattr(config, "FALLBACK_EDGE_BPS", 50.0)),  # Higher fallback for bootstrap success
+            "fallback_edge_bps": float(getattr(config, "FALLBACK_EDGE_BPS", 80.0)),  # INCREASED: 80 bps fallback (2.7x fees)
             # Use actual system trading costs from config.py defaults
             "fee_bps": float(os.getenv("CR_FEE_BPS", "10")),  # 0.1% trading fees (system default)
             "slippage_bps": float(os.getenv("CR_PRICE_SLIPPAGE_BPS", "15")),  # 0.15% slippage (system default)  
             "buffer_bps": float(getattr(config, "SAFETY_BUFFER_BPS", 5.0)),  # 0.05% safety buffer
-            "min_positive_edge_bps": float(getattr(config, "MIN_POSITIVE_EDGE_BPS", 1.0)),  # Lower threshold for bootstrap
-            "fee_expectancy_multiplier": float(os.getenv("FEE_EXPECTANCY_MULTIPLIER", "1.6")), # Profit >= 1.6x fees (relaxed for more opportunities)
+            "min_positive_edge_bps": float(getattr(config, "MIN_POSITIVE_EDGE_BPS", 35.0)),  # INCREASED: 35 bps minimum (covers 30 bps costs + 5 bps profit)
+            "fee_expectancy_multiplier": float(os.getenv("FEE_EXPECTANCY_MULTIPLIER", "2.5")), # INCREASED: Profit >= 2.5x fees (was 1.6x)
             "fee_floor_usdt": float(os.getenv("FEE_FLOOR_USDT", "0.15")), # 0.15 USDT fee floor
         }
         
@@ -450,16 +450,27 @@ class PolicyManager:
             metrics = await meta_controller._gather_mode_metrics()
             
             # Augment with Policy-specific metrics
-            # Idle time
+            # Idle time — guard against last_exec=0 producing a Unix-epoch-sized
+            # idle value (~1.77 billion seconds) that permanently triggers PROTECTIVE mode.
             last_exec = 0.0
             if hasattr(meta_controller.state_manager, "_last_execution_ts"):
-                 # _last_execution_ts is a dict, get max
-                 ts_map = meta_controller.state_manager._last_execution_ts
-                 if isinstance(ts_map, dict) and ts_map:
-                     last_exec = max(ts_map.values())
-                 elif isinstance(ts_map, (int, float)):
-                     last_exec = ts_map
-            metrics["idle_time_sec"] = time.time() - last_exec
+                ts_map = meta_controller.state_manager._last_execution_ts
+                if isinstance(ts_map, dict) and ts_map:
+                    # Only consider values that look like real Unix timestamps (post-year-2001)
+                    _valid_ts = [v for v in ts_map.values()
+                                 if isinstance(v, (int, float)) and float(v) > 1_000_000_000]
+                    last_exec = max(_valid_ts) if _valid_ts else 0.0
+                elif isinstance(ts_map, (int, float)) and float(ts_map) > 1_000_000_000:
+                    last_exec = float(ts_map)
+            _pm_now = time.time()
+            _pm_bot_start = float(getattr(meta_controller, "_start_time", 0) or 0)
+            if _pm_bot_start < 1_000_000_000:
+                _pm_bot_start = _pm_now  # unknown start → treat bot as just started
+            if last_exec < _pm_bot_start:
+                # No trade yet this session → idle since bot start
+                metrics["idle_time_sec"] = _pm_now - _pm_bot_start
+            else:
+                metrics["idle_time_sec"] = _pm_now - last_exec
             
             # Win rate (calculated from metrics)
             win_rate = 0.5
