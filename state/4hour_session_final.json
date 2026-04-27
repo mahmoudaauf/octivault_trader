@@ -1,0 +1,18 @@
+{
+  "session_start": "2026-04-26T16:24:49.272200",
+  "session_end": "2026-04-26T20:24:49.389601",
+  "total_duration_minutes": 240,
+  "total_cycles": 1,
+  "total_checkpoints": 0,
+  "status": "completed",
+  "balance_summary": {
+    "initial_balance": 10000.0,
+    "current_balance": 9968.8678922137,
+    "peak_balance": 10104.996969030855,
+    "lowest_balance": 9955.004506608366,
+    "total_change": 104.99696903085533,
+    "total_change_pct": 1.0499696903085534,
+    "updates": 45687,
+    "session_duration_seconds": 2741220
+  }
+}

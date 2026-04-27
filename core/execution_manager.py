@@ -2110,6 +2110,19 @@ class ExecutionManager:
         self._liq_sell_cooldown_until: Dict[str, float] = {}
         self._close_escape_last_attempt_ts: Dict[str, float] = {}
 
+        # ✅ DUST POSITION TRACKING & PREVENTION
+        # Tracks symptoms of stuck dust to prevent infinite loops
+        self._dust_position_tracker: Dict[str, Dict[str, Any]] = {}  # symbol -> {last_remainder, stuck_count, timestamp}
+        self._dust_detection_enabled = bool(self._cfg("FORCE_LIQUIDATE_DUST_ENABLED", True))
+        self._dust_stuck_threshold_cycles = int(self._cfg("STUCK_DUST_DETECTION_CYCLES", 3))
+        self._dust_exit_minimum_usdt = float(self._cfg("DUST_EXIT_MINIMUM_USDT", 5.0) or 5.0)
+
+        # ✅ PHANTOM POSITION TRACKING & REPAIR
+        # Tracks positions with qty=0.0 that cannot be exited (different from dust)
+        self._phantom_positions: Dict[str, Any] = {}  # symbol -> {detected_ts, scenario, attempts}
+        self._phantom_detection_enabled = bool(self._cfg("PHANTOM_POSITION_DETECTION_ENABLED", True))
+        self._phantom_repair_max_attempts = int(self._cfg("PHANTOM_REPAIR_MAX_ATTEMPTS", 3))
+
         # Optional local cache to serve callers that want filters without reaching ExchangeClient internals.
         # ExchangeClient already maintains its own `symbol_filters` cache; this layer is primarily API sugar.
         self._symbol_filters_cache: Dict[str, Dict[str, Any]] = {}
@@ -2189,7 +2202,7 @@ class ExecutionManager:
                     getattr(
                         self.config,
                         "allow_entry_below_significant_floor",
-                        getattr(self.config, "ALLOW_ENTRY_BELOW_SIGNIFICANT_FLOOR", False),
+                        getattr(self.config, "ALLOW_ENTRY_BELOW_SIGNIFICANT_FLOOR", True),
                     ),
                 ),
             )
@@ -2216,6 +2229,82 @@ class ExecutionManager:
                 return True, reason
         
         return True, "[EM:ENTRY_FLOOR_GUARD] Entry floor check passed"
+
+    # ✅ PHASE 4: STARTUP PHANTOM SCAN
+    async def startup_scan_for_phantoms(self) -> Dict[str, str]:
+        """
+        Scan positions on startup and repair any phantom positions (qty=0.0).
+        Call this during initialization before normal trading begins.
+        
+        Returns dict mapping symbol -> repair_status
+        """
+        repairs = {}
+        
+        if not self._phantom_detection_enabled:
+            self.logger.info("[PHANTOM_STARTUP_SCAN] Phantom detection disabled via config. Skipping scan.")
+            return repairs
+        
+        try:
+            positions = getattr(self.shared_state, "positions", None) or {}
+            if not isinstance(positions, dict):
+                self.logger.debug("[PHANTOM_STARTUP_SCAN] No positions dict available")
+                return repairs
+            
+            self.logger.info(
+                "[PHANTOM_STARTUP_SCAN] Starting scan of %d positions for phantoms",
+                len(positions)
+            )
+            
+            scanned = 0
+            phantoms_found = 0
+            phantoms_repaired = 0
+            
+            for sym, pos_data in list(positions.items()):
+                scanned += 1
+                qty = float((pos_data or {}).get("quantity", 0.0) or 0.0)
+                
+                # Detect phantom
+                if qty <= 0:
+                    phantoms_found += 1
+                    self.logger.warning(
+                        "[PHANTOM_STARTUP_DETECTED] %s: qty=%.8f (phantom)",
+                        sym,
+                        qty
+                    )
+                    
+                    # Attempt repair
+                    repair_ok = await self._handle_phantom_position(sym)
+                    if repair_ok:
+                        repairs[sym] = "REPAIRED"
+                        phantoms_repaired += 1
+                        self.logger.info(
+                            "[PHANTOM_STARTUP_REPAIRED] %s: Successfully repaired",
+                            sym
+                        )
+                    else:
+                        repairs[sym] = "UNRESOLVED"
+                        self.logger.warning(
+                            "[PHANTOM_STARTUP_UNRESOLVED] %s: Repair failed",
+                            sym
+                        )
+            
+            self.logger.info(
+                "[PHANTOM_STARTUP_SCAN_COMPLETE] Scanned: %d, Found: %d, Repaired: %d, Unresolved: %d",
+                scanned,
+                phantoms_found,
+                phantoms_repaired,
+                phantoms_found - phantoms_repaired
+            )
+            
+            return repairs
+        
+        except Exception as e:
+            self.logger.error(
+                "[PHANTOM_STARTUP_SCAN_ERROR] Error during startup scan: %s",
+                str(e),
+                exc_info=True
+            )
+            return repairs
 
     async def _report_watchdog_status(self, status: str = "Operational", detail: str = ""):
         """Report status to watchdog for health monitoring"""
@@ -3452,6 +3541,202 @@ class ExecutionManager:
         self.logger.info(f"[PositionReady] {sym}: Confirmed no position after {max_retries} attempts")
         return 0.0
 
+    async def _detect_stuck_dust_position(self, symbol: str, current_price: float, remainder_qty: float) -> bool:
+        """
+        ✅ DUST TRAP DETECTION: Check if we're in a loop of stuck dust exits.
+        
+        Problem: Partial exits can leave micro-remainder that never fully exits.
+        If we see the same remainder 3+ times, we declare it "stuck dust" and need forced liquidation.
+        
+        Returns: True if stuck dust detected (should force liquidate), False otherwise
+        """
+        if not self._dust_detection_enabled or remainder_qty <= 0:
+            return False
+        
+        try:
+            sym = self._norm_symbol(symbol)
+            now = time.time()
+            
+            # Get or create dust tracker for this symbol
+            if sym not in self._dust_position_tracker:
+                self._dust_position_tracker[sym] = {
+                    "last_remainder": remainder_qty,
+                    "stuck_count": 0,
+                    "last_check_ts": now,
+                    "economic_threshold": current_price * remainder_qty if current_price > 0 else 0
+                }
+                return False
+            
+            tracker = self._dust_position_tracker[sym]
+            last_remainder = tracker.get("last_remainder", 0.0)
+            stuck_count = tracker.get("stuck_count", 0)
+            
+            # ✅ Loop detection: if remainder hasn't changed (floating point equal)
+            if abs(remainder_qty - last_remainder) < 1e-10:  # Effectively equal
+                stuck_count += 1
+                tracker["stuck_count"] = stuck_count
+                tracker["last_check_ts"] = now
+                
+                # Calculate economic value of stuck dust
+                economic_value = current_price * remainder_qty if current_price > 0 else 0
+                
+                if stuck_count >= self._dust_stuck_threshold_cycles:
+                    self.logger.warning(
+                        "[DUST_TRAP] %s: Stuck on remainder %.8f (%s USDT) for %d cycles. "
+                        "Last check: %.1fs ago. FORCING LIQUIDATION.",
+                        sym,
+                        remainder_qty,
+                        f"${economic_value:.4f}" if economic_value > 0 else "unknown",
+                        stuck_count,
+                        now - tracker.get("last_check_ts", now)
+                    )
+                    return True  # Dust is stuck - force liquidate
+            else:
+                # Remainder changed - reset counter
+                tracker["stuck_count"] = 0
+                tracker["last_remainder"] = remainder_qty
+                tracker["last_check_ts"] = now
+                tracker["economic_threshold"] = current_price * remainder_qty if current_price > 0 else 0
+        
+        except Exception as e:
+            self.logger.debug(f"[DUST_DETECTION_ERROR] {symbol}: {e}")
+        
+        return False  # Not stuck
+    
+    # ✅ PHASE 1: PHANTOM POSITION DETECTION
+    def _detect_phantom_position(self, symbol: str, qty: float) -> bool:
+        """
+        Detect phantom positions: qty <= 0.0 that cannot be exited.
+        Different from dust (remainder > 0 but small).
+        
+        Returns True if position is phantom and needs repair.
+        """
+        if not self._phantom_detection_enabled:
+            return False
+        
+        # Phantom is defined as qty = 0.0 (not just small, but zero)
+        if qty > 0:
+            self._phantom_positions.pop(symbol, None)  # Clear if exists
+            return False
+        
+        # Qty <= 0 detected
+        now = time.time()
+        if symbol not in self._phantom_positions:
+            self._phantom_positions[symbol] = {
+                "detected_ts": now,
+                "attempts": 0,
+                "scenario": "AUTO_DETECT"
+            }
+            self.logger.warning(
+                "[PHANTOM_DETECT] %s: Detected phantom position with qty=%.8f (will attempt repair)",
+                symbol,
+                qty
+            )
+        
+        phantom_info = self._phantom_positions[symbol]
+        attempts = phantom_info.get("attempts", 0)
+        
+        if attempts >= self._phantom_repair_max_attempts:
+            self.logger.error(
+                "[PHANTOM_STUCK] %s: Phantom repair exceeded max attempts (%d). Position may be permanently stuck.",
+                symbol,
+                self._phantom_repair_max_attempts
+            )
+            return True
+        
+        return True  # Phantom detected and repairable
+    
+    # ✅ PHASE 2 & 3: PHANTOM POSITION REPAIR
+    async def _handle_phantom_position(self, symbol: str) -> bool:
+        """
+        Attempt to repair phantom position (qty=0.0).
+        
+        Strategy:
+        1. Check if position exists on Binance (Scenario A: sync from exchange)
+        2. If not on Binance, delete locally (Scenario B: already closed)
+        3. If repair fails, mark as liquidated (Scenario C: force completion)
+        
+        Returns True if repair successful, False otherwise.
+        """
+        sym = self._norm_symbol(symbol)
+        
+        if sym not in self._phantom_positions:
+            return False
+        
+        phantom_info = self._phantom_positions[sym]
+        attempts = phantom_info.get("attempts", 0) + 1
+        phantom_info["attempts"] = attempts
+        
+        try:
+            # SCENARIO A: Check if position exists on Binance
+            has_exchange_position, exchange_qty = await self._get_exchange_position_qty(sym)
+            
+            if has_exchange_position and exchange_qty > 0:
+                # Position exists on exchange! Sync it locally
+                self.logger.warning(
+                    "[PHANTOM_REPAIR_A] %s: Found on exchange with qty=%.8f (Scenario A). Syncing locally.",
+                    sym,
+                    exchange_qty
+                )
+                try:
+                    if hasattr(self.shared_state, "positions") and isinstance(self.shared_state.positions, dict):
+                        pos = dict(self.shared_state.positions.get(sym, {}) or {})
+                        pos["quantity"] = exchange_qty
+                        pos["last_sync"] = time.time()
+                        self.shared_state.positions[sym] = pos
+                        self.logger.info(
+                            "[PHANTOM_REPAIR_A_DONE] %s: Synced qty from exchange %.8f to local state",
+                            sym,
+                            exchange_qty
+                        )
+                        self._phantom_positions.pop(sym, None)  # Clear phantom tracking
+                        return True
+                except Exception as e:
+                    self.logger.debug(f"[PHANTOM_REPAIR_A_SYNC_ERROR] {sym}: {e}")
+            else:
+                # SCENARIO B: Not on exchange - delete from local state
+                self.logger.warning(
+                    "[PHANTOM_REPAIR_B] %s: Not found on exchange (Scenario B). Deleting from local state.",
+                    sym
+                )
+                try:
+                    if hasattr(self.shared_state, "positions") and isinstance(self.shared_state.positions, dict):
+                        if sym in self.shared_state.positions:
+                            del self.shared_state.positions[sym]
+                            self.logger.info(
+                                "[PHANTOM_REPAIR_B_DONE] %s: Deleted phantom position from local state",
+                                sym
+                            )
+                    # Also try position_manager if available
+                    pm = getattr(self.shared_state, "position_manager", None)
+                    if pm and hasattr(pm, "close_position"):
+                        await maybe_call(pm, "close_position", sym, "phantom_repair")
+                    
+                    self._phantom_positions.pop(sym, None)  # Clear phantom tracking
+                    return True
+                except Exception as e:
+                    self.logger.debug(f"[PHANTOM_REPAIR_B_DELETE_ERROR] {sym}: {e}")
+            
+            # SCENARIO C: Force liquidate (mark as complete)
+            if attempts >= self._phantom_repair_max_attempts:
+                self.logger.warning(
+                    "[PHANTOM_REPAIR_C] %s: Forcing liquidation after %d attempts (Scenario C).",
+                    sym,
+                    attempts
+                )
+                try:
+                    await self._force_finalize_position(sym, "phantom_force_liquidate")
+                    self._phantom_positions.pop(sym, None)  # Clear phantom tracking
+                    return True
+                except Exception as e:
+                    self.logger.debug(f"[PHANTOM_REPAIR_C_ERROR] {sym}: {e}")
+            
+            return False
+        
+        except Exception as e:
+            self.logger.debug(f"[PHANTOM_REPAIR_ERROR] {sym}: {e}", exc_info=True)
+            return False
+    
     def _get_entry_price_for_sell(self, sym: str) -> float:
         """Best-effort lookup of entry/avg price for net PnL gating."""
         try:
@@ -6181,6 +6466,43 @@ class ExecutionManager:
                 pos_qty = float((self.shared_state.positions.get(sym, {}) or {}).get("quantity", 0.0) or 0.0)
         except Exception:
             pos_qty = 0.0
+        
+        # ✅ PHASE 3: PHANTOM CHECK BEFORE CLOSE
+        # Intercept phantom positions and attempt repair before normal close flow
+        if self._detect_phantom_position(sym, pos_qty):
+            self.logger.info(
+                "[PHANTOM_INTERCEPT] %s: Detected phantom (qty=%.8f). Attempting repair before normal close.",
+                sym,
+                pos_qty
+            )
+            repair_ok = await self._handle_phantom_position(sym)
+            if repair_ok:
+                self.logger.info(
+                    "[PHANTOM_REPAIRED] %s: Phantom repair successful. Continuing with normal close.",
+                    sym
+                )
+                # Re-fetch qty after repair
+                try:
+                    if hasattr(self.shared_state, "get_position_qty"):
+                        pos_qty = float(self.shared_state.get_position_qty(sym) or 0.0)
+                    elif isinstance(getattr(self.shared_state, "positions", None), dict):
+                        pos_qty = float((self.shared_state.positions.get(sym, {}) or {}).get("quantity", 0.0) or 0.0)
+                except Exception:
+                    pass
+            else:
+                self.logger.warning(
+                    "[PHANTOM_REPAIR_FAILED] %s: Repair failed. Position may remain stuck.",
+                    sym
+                )
+                # Return blocked status for phantom unresolved
+                return {
+                    "ok": False,
+                    "status": "BLOCKED",
+                    "reason": "phantom_position_unresolved",
+                    "error_code": "PHANTOM_UNRESOLVED",
+                    "symbol": sym
+                }
+        
         if is_liquidation is None:
             tag_l = str(tag or "").lower()
             reason_u = reason_text.upper()
@@ -6584,6 +6906,11 @@ class ExecutionManager:
         side = (side or "").lower()
 
         sym = self._norm_symbol(symbol)
+        
+        # ===== AGGRESSIVE DIAGNOSTIC TRACING (Blocker Identification) =====
+        # Log every single check point to identify where execution is being rejected
+        self.logger.critical(f"[EXEC_TRACE_1_ENTRY] sym={sym} side={side.upper()} qty={quantity} planned_quote={planned_quote} conf={confidence} trace_id={trace_id} tag={tag}")
+        
         policy_ctx = dict(policy_context or {})
         decision_id = self._resolve_decision_id(policy_ctx)
         policy_ctx.setdefault("decision_id", decision_id)
@@ -6593,6 +6920,7 @@ class ExecutionManager:
         # [PHASE 2] GUARD: Require trace_id for all orders (except liquidation)
         # This ensures CompoundingEngine directives go through MetaController validation
         if not trace_id and not is_liquidation:
+            self.logger.critical(f"[EXEC_BLOCK_TRACE_ID] {side.upper()} {sym}: BLOCKED - missing trace_id")
             self.logger.warning(
                 "[EXEC:TraceID] Blocked %s %s: missing trace_id from MetaController (Phase 2 architecture)",
                 side.upper(), sym,
@@ -6603,6 +6931,8 @@ class ExecutionManager:
                 "reason": "missing_meta_trace_id",
                 "error_code": "MISSING_META_TRACE_ID",
             }
+        self.logger.critical(f"[EXEC_TRACE_2_TRACE_ID_OK] {sym} trace_id={trace_id}")
+
 
         # Contract guard: if tradeability metadata is present, Meta must have evaluated
         # _passes_tradeability_gate before any quote reservation in this method.
@@ -6620,6 +6950,7 @@ class ExecutionManager:
                 str(policy_ctx.get("tradeability_regime", "") or "").strip()
             )
             if has_tradeability_payload and not bool(policy_ctx.get("tradeability_gate_checked")):
+                self.logger.critical(f"[EXEC_BLOCK_TRADEABILITY] {sym}: BLOCKED - missing tradeability_gate_checked flag")
                 self.logger.warning(
                     "[EXEC:Tradeability] Blocked BUY %s: missing Meta tradeability gate before reservation.",
                     sym,
@@ -6630,6 +6961,8 @@ class ExecutionManager:
                     "reason": "tradeability_gate_missing",
                     "error_code": "TRADEABILITY_GATE_MISSING",
                 }
+            self.logger.critical(f"[EXEC_TRACE_3_TRADEABILITY_OK] {sym} has_payload={has_tradeability_payload}")
+
 
         # Define dust operation flags for bypass logic
         is_dust_healing_buy = bool(
@@ -7368,42 +7701,60 @@ class ExecutionManager:
                             classification = pos.get("classification", "")
                             
                             if classification == "BOT_POSITION":
-                                # Position already owned by bot - reject to prevent double-entry
-                                rej_count = 0
+                                # DUST RE-ENTRY BYPASS: if the existing position is unhealable dust
+                                # (value below the minimum position floor), allow the BUY to proceed —
+                                # this mirrors the MetaController's DUST_REENTRY_ALLOWED logic so that
+                                # a $0.23 ETH balance doesn't permanently block ETH BUY signals.
                                 try:
-                                    await self.shared_state.record_rejection(
-                                        sym, "BUY", "POSITION_ALREADY_OPEN", source="ExecutionManager"
-                                    )
-                                    rej_count = int(
-                                        self.shared_state.get_rejection_count(sym, "BUY", "POSITION_ALREADY_OPEN") or 0
-                                    )
-                                except Exception:
-                                    rej_count = 0
-                                cooldown_trigger = int(
-                                    self._cfg("POSITION_OPEN_BUY_COOLDOWN_TRIGGER", 6) or 6
-                                )
-                                cooldown_sec = float(
-                                    self._cfg("POSITION_OPEN_BUY_COOLDOWN_SEC", 120.0) or 120.0
-                                )
-                                if rej_count >= max(1, cooldown_trigger):
-                                    self._position_open_buy_block_until[sym] = time.time() + max(5.0, cooldown_sec)
-                                    self.logger.warning(
-                                        "[EM:PositionOpenCooldown] Engaged for %s BUY (%ss) after %d POSITION_ALREADY_OPEN rejections",
-                                        sym,
-                                        int(max(5.0, cooldown_sec)),
-                                        rej_count,
-                                    )
-                                self.logger.warning(
-                                    "[EM:Ownership] Blocked BUY %s: position already BOT_POSITION (prevent duplicate entry)",
-                                    sym
-                                )
-                                return {
-                                    "ok": False,
-                                    "status": "blocked",
-                                    "reason": "POSITION_ALREADY_OPEN",
-                                    "error_code": "POSITION_ALREADY_OPEN",
-                                    "reason_detail": f"position_open_rej_count_{rej_count}",
-                                }
+                                    _pos_qty = float(pos.get("quantity", 0.0) or 0.0)
+                                    _pos_price = float(pos.get("current_price", pos.get("entry_price", 0.0)) or 0.0)
+                                    _pos_value = _pos_qty * _pos_price if _pos_price > 0.0 else float(pos.get("value_usdt", 0.0) or 0.0)
+                                    _dust_floor = float(self._cfg("MIN_POSITION_VALUE_USDT", 15.0) or 15.0)
+                                    if 0.0 < _pos_value < _dust_floor:
+                                        self.logger.info(
+                                            "[EM:DustReentry] Allowing BUY %s despite BOT_POSITION: dust value=%.4f < floor=%.2f — proceeding",
+                                            sym, _pos_value, _dust_floor,
+                                        )
+                                        # Fall through to normal execution path
+                                    else:
+                                        # Position already owned by bot with real value - reject to prevent double-entry
+                                        rej_count = 0
+                                        try:
+                                            await self.shared_state.record_rejection(
+                                                sym, "BUY", "POSITION_ALREADY_OPEN", source="ExecutionManager"
+                                            )
+                                            rej_count = int(
+                                                self.shared_state.get_rejection_count(sym, "BUY", "POSITION_ALREADY_OPEN") or 0
+                                            )
+                                        except Exception:
+                                            rej_count = 0
+                                        cooldown_trigger = int(
+                                            self._cfg("POSITION_OPEN_BUY_COOLDOWN_TRIGGER", 6) or 6
+                                        )
+                                        cooldown_sec = float(
+                                            self._cfg("POSITION_OPEN_BUY_COOLDOWN_SEC", 120.0) or 120.0
+                                        )
+                                        if rej_count >= max(1, cooldown_trigger):
+                                            self._position_open_buy_block_until[sym] = time.time() + max(5.0, cooldown_sec)
+                                            self.logger.warning(
+                                                "[EM:PositionOpenCooldown] Engaged for %s BUY (%ss) after %d POSITION_ALREADY_OPEN rejections",
+                                                sym,
+                                                int(max(5.0, cooldown_sec)),
+                                                rej_count,
+                                            )
+                                        self.logger.warning(
+                                            "[EM:Ownership] Blocked BUY %s: position already BOT_POSITION value=%.4f >= floor=%.2f (prevent duplicate entry)",
+                                            sym, _pos_value, _dust_floor,
+                                        )
+                                        return {
+                                            "ok": False,
+                                            "status": "blocked",
+                                            "reason": "POSITION_ALREADY_OPEN",
+                                            "error_code": "POSITION_ALREADY_OPEN",
+                                            "reason_detail": f"position_open_rej_count_{rej_count}",
+                                        }
+                                except Exception as _dust_err:
+                                    self.logger.debug("[EM:DustReentry] Dust check error for %s: %s (falling through)", sym, _dust_err)
                             elif classification == "EXTERNAL_POSITION":
                                 # External position exists - skip but don't block entire system
                                 self.logger.info(
@@ -9363,12 +9714,18 @@ class ExecutionManager:
 
             # else: qty path (BUY without planned_quote, or SELL)
             qty = round_step(quantity, step_size)
-            # For SELL orders: if the remainder after ROUND_DOWN is below min_qty, round UP instead.
+            # For SELL orders: if the remainder after ROUND_DOWN is below dust threshold, round UP instead.
             # This prevents perpetual dust: e.g. position=0.001234, step=0.001 → ROUND_DOWN sells
-            # 0.001 and leaves 0.000234 stranded forever. Round UP to 0.002 only when remainder < min_qty.
+            # 0.001 and leaves 0.000234 stranded forever. Round UP to sell complete position.
+            # ✅ FIX: Check both quantity AND economic (notional) dust thresholds
             if side.upper() == "SELL" and step_size > 0:
                 remainder = _raw_quantity - float(qty)
-                residual_notional = max(0.0, remainder) * float(current_price or 0.0)
+                
+                # Get current price for economic dust check
+                current_price_valid = float(current_price or 0.0) > 0
+                residual_notional = remainder * float(current_price) if current_price_valid else 0.0
+                
+                # Dust thresholds
                 dust_floor_quote = float(
                     self._cfg(
                         "DUST_MIN_QUOTE_USDT",
@@ -9382,23 +9739,40 @@ class ExecutionManager:
                     ) or 1.0
                 )
                 residual_floor = max(float(min_notional or 0.0), dust_floor_quote, write_down_quote)
+                
+                # ✅ ENHANCED: Detect dust in THREE ways:
+                # 1. Quantity-based: remainder is tiny fraction of step
                 qty_residual_is_dust = remainder > 0 and remainder < max(float(min_qty), float(step_size))
-                notional_residual_is_dust = residual_notional > 0 and residual_notional < residual_floor
-                if qty_residual_is_dust or notional_residual_is_dust:
-                    qty_up = float(qty) + float(step_size)
-                    # Only round up if the position actually has that much (don't oversell)
+                
+                # 2. Notional-based: remainder < $5 USDT (economic dust floor)
+                notional_residual_is_dust = (
+                    residual_notional > 0 and 
+                    residual_notional < dust_floor_quote  # ✅ KEY FIX: Use dust_floor, not residual_floor
+                )
+                
+                # 3. Position percentage: if selling 90%+ of position, clean exit by selling 100%
+                position_pct_remaining = (remainder / _raw_quantity * 100) if _raw_quantity > 0 else 0
+                near_total_exit = position_pct_remaining > 0 and position_pct_remaining < 5.0  # < 5% remaining
+                
+                # Round up if ANY dust condition is met
+                if qty_residual_is_dust or notional_residual_is_dust or near_total_exit:
+                    # Sell entire remaining position by rounding to nearest multiple of step_size
+                    qty_up = round_step(_raw_quantity, step_size)
+                    
+                    # Safety: don't oversell (should never happen, but defensive)
                     if qty_up <= _raw_quantity + float(step_size) * 0.01:
                         self.logger.info(
                             "[EM:SellRoundUp] %s: qty ROUND_UP %.8f→%.8f to avoid dust "
-                            "(remainder=%.8f residual_notional=%.4f floor=%.4f min_qty=%.8f step=%.8f)",
+                            "(remainder=%.8f notional=%.4f < floor=%.2f | qty_dust=%s notional_dust=%s pct_exit=%.1f%%)",
                             symbol,
                             float(qty),
                             float(qty_up),
                             float(remainder),
                             float(residual_notional),
-                            float(residual_floor),
-                            float(min_qty),
-                            float(step_size),
+                            float(dust_floor_quote),
+                            qty_residual_is_dust,
+                            notional_residual_is_dust,
+                            position_pct_remaining,
                         )
                         qty = qty_up
             if max_qty > 0 and qty > max_qty:
@@ -9452,9 +9826,49 @@ class ExecutionManager:
                     taker_fee_bps=self._cfg("TAKER_FEE_BPS", 10), use_quote_amount=None
                 )
                 if not ok:
+                    self.logger.critical(f"[EXEC_BLOCK_CONTRACT_VALIDATION] {symbol}: BLOCKED - order contract validation failed qty={qty} adj_qty={adj_qty}")
                     await self._log_execution_event("order_skip", symbol, {"side": side.upper(), "reason": "order_filters_rejected"})
                     return None
+                self.logger.critical(f"[EXEC_TRACE_4a_CONTRACT_OK] {symbol} qty={qty} adj_qty={adj_qty}")
                 final_qty = float(adj_qty)
+
+            # ---------- Pre-exec diagnostic guard: prevent zero-amount submissions ----------
+            try:
+                notional = float(final_qty) * float(current_price or 0.0)
+            except Exception:
+                notional = 0.0
+
+            self.logger.critical(f"[EXEC_TRACE_4_AMOUNT] {symbol} {side.upper()} final_qty={final_qty:.8f} notional={notional:.8f} min_notional={min_notional:.8f}")
+
+            if final_qty <= 0 or notional <= 0:
+                # Collect free quote snapshot to aid debugging (best-effort)
+                q_asset = self._split_symbol_quote(symbol)
+                try:
+                    _free, _ok_rem, _why_rem = await self._get_free_quote_and_remainder_ok(q_asset, float(planned_quote or 0.0))
+                except Exception:
+                    _free, _ok_rem, _why_rem = 0.0, False, "error_fetching_free"
+
+                self.logger.critical(f"[EXEC_BLOCK_ZERO_AMOUNT] {symbol}: BLOCKED - final_qty={final_qty:.8f} notional={notional:.8f} planned_quote={planned_quote} free_quote={_free:.8f}")
+
+                await self._log_execution_event("order_skip", symbol, {
+                    "side": side.upper(),
+                    "reason": "ZERO_COMPUTED_AMOUNT",
+                    "decision_id": str(decision_id or ""),
+                    "planned_quote": float(planned_quote or 0.0),
+                    "final_qty": float(final_qty),
+                    "notional": float(notional),
+                    "free_quote": float(_free),
+                    "remainder_ok": bool(_ok_rem),
+                    "remainder_reason": str(_why_rem),
+                    "step_size": float(step_size),
+                    "min_notional": float(min_notional),
+                })
+
+                self.logger.warning(
+                    "[EM:ZERO_AMT_BLOCK] Skipping %s %s - decision=%s planned_quote=%.8f final_qty=%.8f notional=%.8f free_quote=%.8f reason=%s",
+                    symbol, side.upper(), str(decision_id or ""), float(planned_quote or 0.0), float(final_qty), float(notional), float(_free), str(_why_rem)
+                )
+                return None
             # Enforce notional floor on BUY-by-qty as well as SELL
             if side.upper() == "BUY":
                 # Per-trade cap for qty path

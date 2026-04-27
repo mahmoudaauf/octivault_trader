@@ -8,7 +8,41 @@ import time
 from functools import partial
 
 from utils.indicators import compute_ema, compute_bollinger_bands, compute_atr
-from core.agent_optimizer import load_tuned_params
+try:
+    from core.agent_optimizer import load_tuned_params as _load_tuned_params_optimizer
+    _HAS_AGENT_OPTIMIZER = True
+except Exception:
+    _load_tuned_params_optimizer = None
+    _HAS_AGENT_OPTIMIZER = False
+try:
+    from utils.tuned_params import get_tuned_params as _get_tuned_params
+    _HAS_TUNED_PARAMS = True
+except Exception:
+    _get_tuned_params = None
+    _HAS_TUNED_PARAMS = False
+try:
+    from utils.ta_indicators import calculate_volume_surge as _calc_volume_surge
+    _HAS_TA_INDICATORS = True
+except Exception:
+    _calc_volume_surge = None
+    _HAS_TA_INDICATORS = False
+
+def load_tuned_params(name):
+    """Load tuned params with fallback chain: agent_optimizer → tuned_params → {}."""
+    if _HAS_AGENT_OPTIMIZER and _load_tuned_params_optimizer is not None:
+        try:
+            result = _load_tuned_params_optimizer(name) or {}
+            if result:
+                return result
+        except Exception:
+            pass
+    if _HAS_TUNED_PARAMS and _get_tuned_params is not None:
+        try:
+            return _get_tuned_params(name) or {}
+        except Exception:
+            pass
+    return {}
+
 from core.component_status_logger import log_component_status
 from core.stubs import TradeIntent
 
@@ -434,34 +468,58 @@ class DipSniper:
             price_below_bb = latest['close'] < latest['bb_lower']
             price_below_ema = latest['close'] < latest['ema20']
             dip_thr = float(self.dip_threshold_percent or 0.0)
-            dip_deep_enough = dip_percent > dip_thr
+            dip_deep_enough = dip_percent >= dip_thr  # Changed from > to >= to catch edge cases
 
             # SAFETY TUNING (user requested):
-            # - Keep EMA as a useful directional sanity check (default hard gate).
+            # - Keep EMA as a useful directional sanity check (optional, not required).
             # - BB is a soft boost (not mandatory), to prevent total starvation.
-            require_ema = bool(self._cfg("DIPSNIPER_REQUIRE_BELOW_EMA", True))
-            min_score = int(self._cfg("DIPSNIPER_MIN_SCORE", 2) or 2)  # dip + ema, bb is optional boost
+            require_ema = bool(self._cfg("DIPSNIPER_REQUIRE_BELOW_EMA", False))  # Changed default to False
+            min_score = int(self._cfg("DIPSNIPER_MIN_SCORE", 1) or 1)  # Lowered from 2 to 1 for higher sensitivity
             score = int(dip_deep_enough) + int(price_below_ema) + int(price_below_bb)
-            condition = bool(dip_deep_enough) and (score >= max(1, min_score)) and (price_below_ema if require_ema else True)
+            
+            # P9 FIX: Also catch uptrend momentum when no dips available
+            # If price is ABOVE EMA20 (uptrend signal), emit signal
+            price_above_ema = latest['close'] > latest['ema20']
+            price_above_bb = latest['close'] > latest['bb_upper']
+            uptrend_momentum = price_above_ema  # Uptrend = price above EMA20
+            
+            # Original dip condition OR uptrend momentum
+            # Relaxed: Just need dip to be deep enough, no strict EMA requirement
+            condition = (bool(dip_deep_enough) and (score >= max(1, min_score))) or uptrend_momentum
             
             # P9 FIX: Only emit BUY signals when conditions met
             if self.enabled and condition:
                 # Confidence: primarily driven by dip depth; BB breach boosts confidence but isn't required.
                 atr = float(latest['atr'])
                 bb_lower = float(latest['bb_lower'])
+                bb_upper = float(latest['bb_upper'])
                 close = float(latest['close'])
 
+                # DIP-based confidence
                 dip_factor = 0.0
                 if dip_thr > 0:
                     dip_factor = float(np.clip((dip_percent / dip_thr) / 2.0, 0.0, 1.0))
 
                 bb_factor = 0.0
                 if atr > 0:
+                    # For dips: use lower band distance
                     bb_factor = float(np.clip((bb_lower - close) / atr, 0.0, 1.0))
 
                 ema_factor = 1.0 if price_below_ema else 0.5
-
-                base_confidence = float(np.clip((0.65 * dip_factor) + (0.35 * bb_factor), 0.0, 1.0) * ema_factor)
+                
+                # UPTREND confidence (if uptrend momentum triggered the signal)
+                if uptrend_momentum:
+                    # Distance above EMA for uptrend confidence
+                    ema20 = float(latest['ema20'])
+                    uptrend_ema_factor = 0.0 if ema20 <= 0 else float(np.clip((close - ema20) / ema20 * 100, 0.0, 1.0))
+                    # BB upper distance as bonus
+                    uptrend_bb_factor = 0.0 if atr <= 0 else float(np.clip((close - bb_upper) / atr, 0.0, 1.0))
+                    # Higher weight on EMA distance, BB is bonus
+                    base_confidence = float(np.clip(0.7 * uptrend_ema_factor + 0.3 * uptrend_bb_factor, 0.0, 1.0))
+                else:
+                    # DIP-based confidence (original logic)
+                    base_confidence = float(np.clip((0.65 * dip_factor) + (0.35 * bb_factor), 0.0, 1.0) * ema_factor)
+                
                 # Volume spike adds +10% confidence bonus
                 confidence = float(np.clip(base_confidence * (1.1 if volume_spike else 1.0), 0.0, 1.0))
                 
@@ -511,9 +569,9 @@ class DipSniper:
                     "action": "BUY",  # Kept for compatibility
                     "confidence": float(confidence),
                     "reason": (
-                        f"DipSniper: dip {dip_percent:.2f}% (thr={dip_thr:.2f}%) "
-                        f"{'below_EMA' if price_below_ema else 'above_EMA'} "
-                        f"{'below_BB' if price_below_bb else 'above_BB'} "
+                        f"DipSniper: {'uptrend momentum' if uptrend_momentum else f'dip {dip_percent:.2f}%'} "
+                        f"{'above_EMA' if price_above_ema else 'below_EMA'} "
+                        f"{'above_BB' if price_above_bb else 'below_BB'} "
                         f"score={score}/{min_score}"
                         f"{' + volume spike' if volume_spike else ''}"
                     ),
@@ -607,9 +665,9 @@ class DipSniper:
 
     @property
     def dip_threshold_percent(self) -> float:
-        # Lowered default from 2.0 to 0.8 — 2% was rarely triggered in stable markets.
+        # Ultra-sensitive mode: 0.05% threshold catches even tiny dips
         # Override via config: DIP_THRESHOLD_PERCENT = <value>
-        return float(self._cfg("DIP_THRESHOLD_PERCENT", 0.8))
+        return float(self._cfg("DIP_THRESHOLD_PERCENT", 0.05))
 
     @property
     def enabled(self) -> bool:

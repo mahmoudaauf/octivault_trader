@@ -1,0 +1,126 @@
+/Users/mauf/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-04-12 18:04:57,964 - INFO - ⚙️ Config initialized (LIVE-safe defaults). Loading .env overrides...
+2026-04-12 18:04:57,964 - WARNING - MIN_ENTRY_USDT (10.00) < MIN_POSITION_USDT (24.00). Bumping min entry to position floor.
+2026-04-12 18:04:57,964 - INFO - 🧹 Dust authority → reentry_override=True | liquidation_enabled=False
+2026-04-12 18:04:57,964 - INFO - ResolvedProfitabilityCanon exit_fee_bps=10.00 exit_slip_bps=10.00 tp_buf_bps=8.00 min_net=0.0040 tp_min=0.0100 tp_max=0.0600 tp_atr=2.50 sl_atr=1.20 entry_fee_mult=3.00 exit_fee_mult=2.50
+2026-04-12 18:04:57,964 - INFO - TPSLProfile profile=balanced rr=1.80 tp_atr=2.50 sl_atr=1.20 trail_atr=1.50 trail_activate_r=0.80 vol_low=0.0045 vol_high=0.0150
+2026-04-12 18:04:57,965 - INFO - [EC:Init] Mode: testnet=False, paper_trade=False
+2026-04-12 18:04:57,965 - INFO - [EC] API keys validated (key_len=64, secret_len=64)
+2026-04-12 18:04:57,965 - INFO - [EC] HMAC key detected — WS auth mode set to 'signature' (session.logon requires Ed25519)
+2026-04-12 18:04:59,150 - INFO - Exchange client connected.
+2026-04-12 18:04:59,836 - INFO - [EC:StartupSync] Server time synced (offset: 254ms)
+2026-04-12 18:05:00,352 - WARNING - [EC] Cannot verify authentication (might be IP restriction): APIError(code=-1022): Signature for this request is not valid.
+2026-04-12 18:05:00,694 - INFO - [EC:UserDataWS] Starting Tier 1 (WS API v3)
+2026-04-12 18:05:00,694 - INFO - [EC:UserDataWS] connecting to WebSocket API v3 user-data stream (attempt 1)
+2026-04-12 18:05:02,231 - WARNING - [EC:WS] SENDING RPC: method=userDataStream.subscribe.signature payload={"id":"octi-4afda06b-5c4b-434e-b6ab-58ce3369f99d","method":"userDataStream.subscribe.signature","params":{"apiKey":"0b5eGK24smP4nNG1NJ3uiFInkvWaUeU4YjUjvBRWiqjdggodnE9azvtMw84MzHDm","timestamp":1776006302485,"recvWindow":5000,"signature":"5fc324addffc3a9d529eb8237b0cf874956777100c809f7121e39b008c10ad2b"}}
+2026-04-12 18:05:02,232 - WARNING - [EC:WS] RPC sent successfully
+2026-04-12 18:05:02,271 - INFO - [TradingCoordinator] Initialized with SharedState
+2026-04-12 18:05:02,271 - INFO - [SS:Init] Quote asset configured: USDT
+2026-04-12 18:05:02,271 - INFO - [SS:Init] Discovery proposal stores initialized (symbol_proposals, discovery_proposals, discovery_proposals_weighted)
+2026-04-12 18:05:02,271 - INFO - [SignalManager] Signal cache initialized: max_size=1000, ttl=300.0s
+2026-04-12 18:05:02,271 - INFO - [SignalManager] Initialized with NAV source: shared_state=yes, position_count_source=no
+2026-04-12 18:05:02,271 - INFO - [MakerExecution] Initialized: enable=True nav_threshold=500.0 timeout=5.0s spread_placement=0.2
+2026-04-12 18:05:02,271 - INFO - ExecutionManager initialized with P9 configuration
+2026-04-12 18:05:02,272 - WARNING - [EM:Journal] TradeJournal auto-initialized (reason=init, log_dir=logs)
+2026-04-12 18:05:02,272 INFO [MetaController] [Meta:Init] BootstrapOrchestrator initialized: budget=1000.0
+2026-04-12 18:05:02,272 INFO [MetaController] [Meta:Init] ArbitrationEngine initialized
+2026-04-12 18:05:02,272 INFO [MetaController] [Meta:Init] LifecycleManager initialized
+2026-04-12 18:05:02,272 INFO [MetaController] [Meta:Init] Signal cache initialized: max_size=1000, ttl=300.0s
+2026-04-12 18:05:02,272 INFO [MetaController] [ModeManager:Init] Initialized with mode: BOOTSTRAP
+2026-04-12 18:05:02,272 INFO [MetaController] [Meta:Init] BalanceValidator initialized for pre-flight balance checks
+2026-04-12 18:05:02,272 - INFO - ✅ Leverage validator initialized: max_leverage=1.0x
+2026-04-12 18:05:02,272 INFO [MetaController] [Meta:Init] LeverageValidator initialized: max_leverage=1.0x
+2026-04-12 18:05:02,273 INFO [MetaController] [Meta:Init] TradingHoursValidator initialized for market hours enforcement
+2026-04-12 18:05:02,273 - INFO - AnomalyDetector initialized (min_samples=10, review_sigma=2.5)
+2026-04-12 18:05:02,273 INFO [MetaController] [Meta:Init] AnomalyDetector initialized for signal anomaly detection
+2026-04-12 18:05:02,273 - INFO - CorrelationManager initialized: max_position=25.0%, max_sector=40.0%, max_exchange=50.0%, max_correlation=0.8
+2026-04-12 18:05:02,273 INFO [MetaController] [Meta:Init] PortfolioConcentrationManager initialized for correlation analysis
+2026-04-12 18:05:02,273 INFO [MetaController] [Meta:Init] Signal batcher initialized: window=0.1s, max_batch=10
+2026-04-12 18:05:02,274 - INFO - PositionOperationValidator initialized (protect_external=True, allow_stable_trading=False)
+2026-04-12 18:05:02,274 INFO [MetaController] [Meta:Init] PositionOperationValidator initialized (safety layer)
+2026-04-12 18:05:02,274 DEBUG [MetaController] [Meta:Init] Min notional cache initialized: max_size=500, ttl=3600s
+2026-04-12 18:05:02,274 INFO [MetaController] [Meta:Init] Race condition prevention initialized: symbol locks, reservations
+2026-04-12 18:05:02,274 INFO [MetaController] [Meta:Init] Phase 6 cycle tracking initialized: consolidation_interval=300.0s, rebalancing_interval=60.0s
+2026-04-12 18:05:02,274 INFO [MetaController] [Meta:Init] Phase 6 metrics tracking initialized
+2026-04-12 18:05:02,274 INFO [MetaController] [Meta:Init] Issue #22 guard parallelization initialized: max_workers=6, timeout=2.0s
+2026-04-12 18:05:02,274 INFO [MetaController] [Meta:Init] Issue #23 signal pipeline initialized: batch_queue=50, consumers=4, queue_max=1000
+2026-04-12 18:05:02,274 INFO [MetaController] [Meta:Init] Issue #24 advanced profiling initialized: CPU, memory, bottleneck, dashboard
+2026-04-12 18:05:02,274 INFO [MetaController] [Meta:Init] Issue #25 production scaling validation initialized: load testing, resource monitoring, scaling readiness, config validation
+2026-04-12 18:05:02,275 - INFO - [SymbolRotation] Initialized: soft_lock=True duration=3600 multiplier=1.10 universe=[3-30]
+2026-04-12 18:05:02,275 INFO [MetaController] [Meta:Phase1] Symbol rotation manager initialized (soft bootstrap lock enabled)
+2026-04-12 18:05:02,275 INFO [MetaController] [Meta:Init] Planned quote baseline=30.00 (runtime quote allocation delegated to ScalingManager)
+2026-04-12 18:05:02,275 - INFO - [CapitalGovernor] Initialized with brackets: MICRO=<$500, SMALL=$500-$2000, MEDIUM=$2000-$10000, LARGE>=$10000
+2026-04-12 18:05:02,275 INFO [MetaController] [Meta:Init] Capital Governor initialized for position limiting
+2026-04-12 18:05:02,276 INFO [MetaController] [Meta:Init] Intent sink initialized (via IntentManager)
+2026-04-12 18:05:02,276 WARNING [MetaController] [Meta:Init] Using EXTERNAL SignalManager (shared with orchestrator/injector)
+2026-04-12 18:05:02,276 INFO [MetaController] [Meta:Init] SignalFusion initialized (mode=composite_edge, threshold=0.6) [ALPHA AMPLIFIER ACTIVE]
+2026-04-12 18:05:02,277 INFO [MetaController] [PolicyManager:Init] Economic guard initialized: {'enabled': True, 'min_edge_bps': 10.0, 'fallback_edge_bps': 50.0, 'fee_bps': 10.0, 'slippage_bps': 15.0, 'buffer_bps': 5.0, 'min_positive_edge_bps': 1.0, 'fee_expectancy_multiplier': 1.6, 'fee_floor_usdt': 0.15}
+2026-04-12 18:05:02,277 INFO [MetaController] [PolicyManager:Init] Phase 2 guard initialized: {'dust_ratio_trigger': 0.8, 'active_since': None, 'activation_age_sec': 300.0, 'position_grace_sec': 600.0}
+2026-04-12 18:05:02,277 INFO [MetaController] [Meta:Init] Policy manager initialized
+2026-04-12 18:05:02,277 INFO [MetaController] [Meta:Init] RotationExitAuthority initialized with Capital Governor (PHASE C)
+2026-04-12 18:05:02,278 INFO [MetaController] [Meta:Init] NAV Regime Manager initialized (MICRO_SNIPER <1000, STANDARD 1000-5000, MULTI_AGENT >=5000)
+2026-04-12 18:05:02,278 INFO [MetaController] [Meta:Init] Capital Velocity Optimizer initialized for velocity planning
+2026-04-12 18:05:02,278 INFO [MetaController] [Meta:Init] Cycles no trade counter initialized
+2026-04-12 18:05:02,278 INFO [MetaController] [Meta:Build] RECOVERY_FORCE_SELL_FIX_V2 enabled (2026-02-14).
+2026-04-12 18:05:02,278 - INFO - ModelManager initialized.
+================================================================================
+🎯 COMPREHENSIVE TRADE EXECUTION DIAGNOSTICS
+================================================================================
+Started: 2026-04-12 18:04:57.316336
+
+[PHASE 1] IMPORTING CORE MODULES
+--------------------------------------------------------------------------------
+✅ All 11 core modules imported
+
+[PHASE 2] INITIALIZING COMPONENTS
+--------------------------------------------------------------------------------
+✅ Config ready
+   Testnet: False
+   Mode: live
+   Trading Mode: live
+
+✅ Initializing ExchangeClient...
+✅ Exchange connected to LIVE Binance
+   Balance: $60.42 USDT
+
+✅ Initializing Shared State...
+✅ SharedState ready
+   Portfolio initialized
+
+✅ Initializing Signal & Risk Managers...
+✅ Signal & Risk managers ready
+
+✅ Initializing Execution Manager...
+✅ Execution manager ready
+
+✅ Initializing Meta Controller...
+✅ Meta controller ready
+
+✅ Initializing Agent Manager (19 agents)...
+✅ All 19 agents initialized
+
+✅ Initializing Monitoring Systems...
+
+❌ FATAL ERROR: __init__() got an unexpected keyword argument 'interval_seconds'
+Traceback (most recent call last):
+  File "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/🎯_COMPREHENSIVE_DIAGNOSTICS.py", line 197, in <module>
+    result = asyncio.run(run_diagnostics())
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/asyncio/base_events.py", line 642, in run_until_complete
+    return future.result()
+  File "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/🎯_COMPREHENSIVE_DIAGNOSTICS.py", line 127, in run_diagnostics
+    polling_config = PollingConfig(interval_seconds=30)
+TypeError: __init__() got an unexpected keyword argument 'interval_seconds'
+
+
+✅ Full diagnostics logged to: COMPREHENSIVE_TRADE_DIAGNOSTICS.txt
+2026-04-12 18:05:02,296 - ERROR - Unclosed connector
+connections: ['deque([(<aiohttp.client_proto.ResponseHandler object at 0x1135ef700>, 5.022869166)])']
+connector: <aiohttp.connector.TCPConnector object at 0x1135d38b0>
+2026-04-12 18:05:02,296 - ERROR - Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x1135e8880>
+2026-04-12 18:05:02,296 - ERROR - Unclosed connector
+connections: ['deque([(<aiohttp.client_proto.ResponseHandler object at 0x1135ef340>, 3.106308791)])']
+connector: <aiohttp.connector.TCPConnector object at 0x1135e8940>

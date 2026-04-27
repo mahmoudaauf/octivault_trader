@@ -51,6 +51,19 @@ from utils.volatility_adjusted_confidence import (
 
 from agents.edge_calculator import compute_agent_edge, merge_signal_with_edge  # ALPHA AMPLIFIER
 
+try:
+    from utils.ta_indicators import calculate_volume_surge as _calc_volume_surge
+    _HAS_TA_INDICATORS = True
+except Exception:
+    _HAS_TA_INDICATORS = False
+    _calc_volume_surge = None
+try:
+    from utils.tuned_params import get_tuned_params as _get_tuned_params
+    _HAS_TUNED_PARAMS = True
+except Exception:
+    _HAS_TUNED_PARAMS = False
+    _get_tuned_params = None
+
 
 
 
@@ -267,7 +280,7 @@ class TrendHunter:
             self._cfg(
                 "TREND_MIN_CONF",
                 self._cfg("TRENDHUNTER_MIN_SIGNAL_CONF",
-                    self._cfg("MIN_SIGNAL_CONF", 0.55))
+                    self._cfg("MIN_SIGNAL_CONF", 0.35))
             )
         )
 
@@ -279,9 +292,18 @@ class TrendHunter:
     def _load_tuned(self) -> Dict[str, Any]:
         try:
             from core.agent_optimizer import load_tuned_params
-            return load_tuned_params(self.name) or {}
+            result = load_tuned_params(self.name) or {}
+            if result:
+                return result
         except Exception:
-            return {}
+            pass
+        # Fallback: utils.tuned_params (symbol-agnostic agent-level params)
+        if _HAS_TUNED_PARAMS and _get_tuned_params is not None:
+            try:
+                return _get_tuned_params(self.name) or {}
+            except Exception:
+                pass
+        return {}
 
     def _ensure_model_cache_key(self, sym: str) -> None:
         if sym in self.model_cache:
@@ -374,7 +396,7 @@ class TrendHunter:
             return True  # Fallback to heuristic logic if training disabled
 
         now_ts = time.time()
-        cooldown_s = max(0.0, float(self._cfg("TREND_RETRAIN_COOLDOWN_S", 900.0) or 0.0))
+        cooldown_s = max(0.0, float(self._cfg("TREND_RETRAIN_COOLDOWN_S", 0.0) or 0.0))
         last_attempt = float(self._retrain_last_attempt_ts.get(symbol, 0.0) or 0.0)
         if cooldown_s > 0 and (now_ts - last_attempt) < cooldown_s:
             remain = max(0.0, cooldown_s - (now_ts - last_attempt))

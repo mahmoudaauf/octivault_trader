@@ -13,6 +13,18 @@ from typing import Any, Dict, List, Set, Tuple
 
 from utils.indicators import compute_ema, compute_rsi, compute_macd, compute_bollinger_bands
 try:
+    from utils.ta_indicators import calculate_volume_surge as _calc_volume_surge
+    _HAS_TA_INDICATORS = True
+except Exception:
+    _HAS_TA_INDICATORS = False
+    _calc_volume_surge = None
+try:
+    from utils.tuned_params import get_tuned_params as _get_tuned_params, get_symbol_volatility_class as _get_vol_class
+    _HAS_TUNED_PARAMS = True
+except Exception:
+    _HAS_TUNED_PARAMS = False
+    _get_tuned_params = None
+try:
     from utils.status_logger import log_component_status
 except Exception:
     def log_component_status(*args, **kwargs):
@@ -330,7 +342,7 @@ class SwingTradeHunter:
 
     def _can_launch_retrain(self, symbol: str) -> Tuple[bool, str]:
         now_ts = time.time()
-        cooldown_s = max(0.0, float(self._cfg("SWING_RETRAIN_COOLDOWN_S", 900.0) or 0.0))
+        cooldown_s = max(0.0, float(self._cfg("SWING_RETRAIN_COOLDOWN_S", 0.0) or 0.0))
         last_attempt = float(self._retrain_last_attempt_ts.get(symbol, 0.0) or 0.0)
         if cooldown_s > 0 and (now_ts - last_attempt) < cooldown_s:
             remain = max(0.0, cooldown_s - (now_ts - last_attempt))
@@ -579,7 +591,7 @@ class SwingTradeHunter:
         await inject_agent_signal(self.shared_state, self.name, symbol, signal)
 
         # Signal-only routing: actionable signals go to signal bus + collection buffer.
-        min_conf = float(getattr(self.config, 'SWING_MIN_CONFIDENCE', 0.5) or 0.5)
+        min_conf = float(getattr(self.config, 'SWING_MIN_CONFIDENCE', 0.35) or 0.35)
         if action in ['buy', 'sell'] and confidence > min_conf:
             logger.info(f"[{self.name}] ✅ SIGNAL ACTIONABLE: {symbol} action={action} conf={confidence:.2f} > min={min_conf:.2f}")
             await self._submit_signal(symbol, action.upper(), float(confidence), str(reason))
@@ -844,13 +856,37 @@ class SwingTradeHunter:
         # Original: EMA20 > EMA50 AND MACD > 0 AND RSI < 70
         # Relaxed: EMA20 > EMA50 AND RSI < 75 (removed MACD check - sometimes conflicting with price)
         
-        if ema20_val > ema50_val and rsi_val < 75:
-            logger.warning(f"[{self.name}] ✅ BUY SIGNAL for {symbol}: EMA uptrend + RSI favorable (EMA20 > EMA50, RSI < 75)")
-            return 'buy', 0.65, 'EMA uptrend detected'
-        if ema20_val < ema50_val and rsi_val > 30:
-            logger.warning(f"[{self.name}] ✅ SELL SIGNAL for {symbol}: EMA downtrend + RSI unfavorable (EMA20 < EMA50, RSI > 30)")
-            return 'sell', 0.65, 'EMA downtrend detected'
-        
+        # --- Tuned params override (symbol-specific thresholds) ---
+        rsi_buy_thresh = 75.0
+        rsi_sell_thresh = 30.0
+        base_confidence = 0.65
+        if _HAS_TUNED_PARAMS and _get_tuned_params is not None:
+            try:
+                tp = _get_tuned_params(symbol)
+                rsi_buy_thresh = float(tp.get("rsi_overbought", rsi_buy_thresh))
+                rsi_sell_thresh = float(tp.get("rsi_oversold", rsi_sell_thresh))
+                base_confidence = float(tp.get("base_confidence", base_confidence))
+            except Exception:
+                pass
+
+        # --- Volume surge confirmation ---
+        vol_confirmed = True  # default: pass if ta_indicators unavailable
+        if _HAS_TA_INDICATORS and _calc_volume_surge is not None:
+            try:
+                volumes = [float(c.get("volume", c.get("v", 0))) for c in candles[-30:]]
+                vol_confirmed = _calc_volume_surge(volumes)
+            except Exception:
+                vol_confirmed = True  # non-fatal — don't block signal
+
+        if ema20_val > ema50_val and rsi_val < rsi_buy_thresh:
+            conf = base_confidence + (0.05 if vol_confirmed else 0.0)
+            reason = 'EMA uptrend + volume surge' if vol_confirmed else 'EMA uptrend detected'
+            logger.warning(f"[{self.name}] ✅ BUY SIGNAL for {symbol}: {reason} (ema20>{ema50_val:.4f} rsi={rsi_val:.2f} vol_ok={vol_confirmed})")
+            return 'buy', round(conf, 4), reason
+        if ema20_val < ema50_val and rsi_val > rsi_sell_thresh:
+            logger.warning(f"[{self.name}] ✅ SELL SIGNAL for {symbol}: EMA downtrend + RSI unfavorable (EMA20 < EMA50, RSI > {rsi_sell_thresh})")
+            return 'sell', base_confidence, 'EMA downtrend detected'
+
         logger.warning(f"[{self.name}] ❌ HOLD for {symbol}: no clear signal")
         return 'hold', 0.0, 'No clear signal'
 

@@ -33,6 +33,27 @@ try:
 except Exception:
     MarketDataWebSocket = None  # type: ignore
 
+# ── OHLCV disk cache (reduces cold-start API calls) ──────────────────────────
+try:
+    from utils.ohlcv_cache import load_ohlcv_from_cache, save_ohlcv_to_csv, fetch_and_cache_ohlcv
+    _HAS_OHLCV_CACHE = True
+except Exception:
+    _HAS_OHLCV_CACHE = False
+
+# ── TA indicators (volume surge, RSI, EMA helpers) ────────────────────────────
+try:
+    from utils.ta_indicators import calculate_ema, calculate_rsi, calculate_volume_surge
+    _HAS_TA_INDICATORS = True
+except Exception:
+    _HAS_TA_INDICATORS = False
+
+# ── Tuned symbol params ───────────────────────────────────────────────────────
+try:
+    from utils.tuned_params import get_tuned_params, get_symbol_volatility_class
+    _HAS_TUNED_PARAMS = True
+except Exception:
+    _HAS_TUNED_PARAMS = False
+
 
 API_AUTH_ERR_CODES = {-2015, -2014}        # Invalid key/permissions/signature
 API_RATELIMIT_ERR_CODES = {-1003, -1015, -1021}   # Rate limit, too many requests, time skew
@@ -681,10 +702,35 @@ class MarketDataFeed:
             async with sem:
                 # Full window for each timeframe
                 for tf in self.timeframes:
-                    async def _fetch_ohlcv():
-                        return await ec.get_ohlcv(sym, tf, limit=self.ohlcv_limit)
-                    rows = await self._with_retries(_fetch_ohlcv, f"warmup.get_ohlcv[{sym},{tf}]")
-                    rows = self._sanitize_ohlcv(rows or [])
+                    # Try disk cache first to reduce cold-start API calls
+                    _cache_key = f"{sym}_{tf}"
+                    _cached_df = None
+                    if _HAS_OHLCV_CACHE:
+                        try:
+                            import pandas as _pd
+                            _cached_df = load_ohlcv_from_cache(_cache_key)
+                        except Exception:
+                            _cached_df = None
+                    if _cached_df is not None and len(_cached_df) >= self.ohlcv_limit // 2:
+                        # Use cached data — convert df rows to list format
+                        try:
+                            rows = _cached_df[["open", "high", "low", "close", "volume"]].values.tolist()
+                            self._logger.debug("[MDF:Cache] Loaded %d bars for %s/%s from disk cache", len(rows), sym, tf)
+                        except Exception:
+                            rows = []
+                    else:
+                        async def _fetch_ohlcv():
+                            return await ec.get_ohlcv(sym, tf, limit=self.ohlcv_limit)
+                        rows = await self._with_retries(_fetch_ohlcv, f"warmup.get_ohlcv[{sym},{tf}]")
+                        rows = self._sanitize_ohlcv(rows or [])
+                        # Persist to disk cache for next startup
+                        if rows and _HAS_OHLCV_CACHE:
+                            try:
+                                import pandas as _pd
+                                _df = _pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"])
+                                save_ohlcv_to_csv(_cache_key, _df)
+                            except Exception:
+                                pass
                     if rows:
                         await _bulk_add_ohlcv(sym, tf, rows)
 

@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import logging
 from datetime import datetime
+from typing import Optional
 import requests
 
 logger = logging.getLogger("OHLCVCache")
@@ -24,7 +25,7 @@ def save_ohlcv_to_csv(symbol: str, df: pd.DataFrame, path: str = DATA_PATH):
     logger.info(f"✅ Saved OHLCV for {symbol} to {file_path}")
 
 
-def load_ohlcv_from_cache(symbol: str, path: str = DATA_PATH) -> pd.DataFrame | None:
+def load_ohlcv_from_cache(symbol: str, path: str = DATA_PATH) -> Optional[pd.DataFrame]:
     file_path = os.path.join(path, f"{symbol}.csv")
     if os.path.exists(file_path):
         df = pd.read_csv(file_path)

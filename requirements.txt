@@ -1,0 +1,64 @@
+# Octivault Trading Bot - Python Dependencies
+# Python 3.9+ required
+
+# =========================================
+# Core Testing Framework
+# =========================================
+pytest==8.4.2
+pytest-asyncio==1.2.0
+pytest-cov==7.1.0
+pytest-timeout==2.1.0
+
+# =========================================
+# Data Processing & Analysis
+# =========================================
+pandas==2.3.3
+numpy==1.26.4
+
+# =========================================
+# ML / Model Training (required for live retraining)
+# =========================================
+scikit-learn==1.5.2
+keras==2.15.0
+tensorflow-macos==2.15.0 ; platform_system == "Darwin" and platform_machine == "arm64" and python_version < "3.12"
+tensorflow-metal==1.1.0 ; platform_system == "Darwin" and platform_machine == "arm64" and python_version < "3.12"
+tensorflow==2.15.1 ; platform_system != "Darwin" and python_version < "3.12"
+
+# =========================================
+# Exchange Integration
+# =========================================
+ccxt==4.5.48
+python-binance==1.0.36
+
+# =========================================
+# Async HTTP & Networking
+# =========================================
+aiohttp==3.13.3
+async-timeout==5.0.1
+aiohappyeyeballs==2.6.1
+
+# =========================================
+# Configuration Management
+# =========================================
+python-dotenv==1.0.0
+
+# =========================================
+# Development & Utilities
+# =========================================
+# Uncomment as needed for development
+# black==24.1.1
+# flake8==7.0.0
+# mypy==1.8.0
+# isort==5.13.2
+
+# =========================================
+# Optional: Performance & Monitoring
+# =========================================
+# psutil==6.1.0
+# prometheus-client==0.20.0
+
+# =========================================
+# Optional: Advanced Async
+# =========================================
+# aioredis==2.0.1
+# motor==3.3.2

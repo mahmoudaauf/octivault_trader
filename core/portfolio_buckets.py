@@ -154,6 +154,39 @@ class PortfolioBucketState:
     # COMPUTED PROPERTIES
     # =========================================================================
     
+    # 🔥 FIX 2: Adaptive thresholds for micro accounts
+    @staticmethod
+    def get_adaptive_thresholds(total_equity: float) -> Dict[str, float]:
+        """
+        Get adaptive healing thresholds based on account size.
+        
+        Micro accounts (<$500) have lower thresholds for faster healing.
+        """
+        if total_equity < 500:  # MICRO bracket
+            return {
+                'min_dead_to_heal': 10.0,      # Heal if > $10 in dust (was $50)
+                'dead_min_size': 5.0,           # Minimum position size to keep
+                'healing_urgency': 'HIGH',      # More aggressive
+            }
+        elif total_equity < 2000:  # SMALL bracket
+            return {
+                'min_dead_to_heal': 25.0,      # Heal if > $25
+                'dead_min_size': 10.0,
+                'healing_urgency': 'MEDIUM',
+            }
+        else:  # MEDIUM/LARGE bracket
+            return {
+                'min_dead_to_heal': 50.0,      # Heal if > $50
+                'dead_min_size': 25.0,
+                'healing_urgency': 'LOW',
+            }
+    
+    @property
+    def adaptive_healing_threshold(self) -> float:
+        """Get current healing threshold based on portfolio size"""
+        thresholds = self.get_adaptive_thresholds(self.total_equity)
+        return thresholds['min_dead_to_heal']
+    
     def get_bucket_distribution(self) -> Dict[str, float]:
         """Get % distribution across three buckets"""
         if self.total_equity == 0:
@@ -195,7 +228,8 @@ class PortfolioBucketState:
     
     def should_heal_dead_capital(self) -> bool:
         """Should we prioritize liquidating dead capital?"""
-        return self.dead_total_value > 50.0  # If > $50 in dust, heal it
+        # 🔥 FIX 2: Use adaptive threshold instead of fixed $50
+        return self.dead_total_value > self.adaptive_healing_threshold
     
     def get_healing_priority_order(self) -> List[str]:
         """Get order to liquidate dead positions (highest to lowest priority)"""

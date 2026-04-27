@@ -39,10 +39,18 @@ class DeadCapitalHealer:
         Args:
             config: Dict with configuration options
         """
+        from core.portfolio_buckets import PortfolioBucketState  # Import for adaptive thresholds
+        
         self.config = config or {}
         
+        # 🔥 FIX 2: Use adaptive thresholds based on account size
+        total_equity = self.config.get('total_equity', 500)  # Default to MICRO bracket
+        thresholds = PortfolioBucketState.get_adaptive_thresholds(total_equity)
+        
         # Healing thresholds
-        self.min_dead_to_heal = self.config.get('min_dead_to_heal', 50.0)         # Heal if > $50 in dust
+        self.min_dead_to_heal = self.config.get('min_dead_to_heal') or thresholds['min_dead_to_heal']
+        self.dead_min_size = thresholds['dead_min_size']
+        self.healing_urgency = thresholds['healing_urgency']
         self.batch_heal_enabled = self.config.get('batch_heal_enabled', True)     # Batch liquidations
         self.max_liquidations_per_cycle = self.config.get('max_liquidations', 10)  # Max 10 at a time
         
@@ -51,8 +59,10 @@ class DeadCapitalHealer:
         self.session_recovered: float = 0.0
         self.session_id: str = f"heal_{datetime.now().isoformat()}"
         
-        logger.info(f"✅ DeadCapitalHealer initialized")
+        logger.info(f"✅ DeadCapitalHealer initialized (equity=${total_equity:.0f})")
         logger.info(f"   Min dead to heal: ${self.min_dead_to_heal:.2f}")
+        logger.info(f"   Dead min size: ${self.dead_min_size:.2f}")
+        logger.info(f"   Healing urgency: {self.healing_urgency}")
         logger.info(f"   Batch healing: {self.batch_heal_enabled}")
         logger.info(f"   Max liquidations/cycle: {self.max_liquidations_per_cycle}")
     
