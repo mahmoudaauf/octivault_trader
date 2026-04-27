@@ -154,6 +154,19 @@ class ClassifiedPosition:
     management_strategy: str = "HOLD"
     dust_reason: Optional[str] = None
     
+    # EXIT-FIRST STRATEGY: Automatic exit plan fields
+    tp_price: Optional[float] = None  # Take profit price (+2.5%)
+    sl_price: Optional[float] = None  # Stop loss price (-1.5%)
+    time_exit_deadline: Optional[float] = None  # 4-hour force close timestamp
+    exit_pathway_used: Optional[str] = None  # Which pathway executed: TP, SL, TIME, or DUST
+    exit_executed_price: Optional[float] = None  # Price at which exit was executed
+    exit_executed_time: Optional[float] = None  # Timestamp when exit completed
+    
+    # Exit status flags
+    tp_executed: bool = False
+    sl_executed: bool = False
+    time_executed: bool = False
+    
     def __post_init__(self):
         if self.created_at is None:
             self.created_at = time.time()
@@ -170,7 +183,45 @@ class ClassifiedPosition:
             "created_by_agent": self.created_by_agent,
             "management_strategy": self.management_strategy,
             "dust_reason": self.dust_reason,
+            "tp_price": self.tp_price,
+            "sl_price": self.sl_price,
+            "time_exit_deadline": self.time_exit_deadline,
+            "exit_pathway_used": self.exit_pathway_used,
+            "exit_executed_price": self.exit_executed_price,
+            "exit_executed_time": self.exit_executed_time,
         }
+    
+    def set_exit_plan(self, tp: float, sl: float, time_deadline: float) -> bool:
+        """
+        Set exit plan for this position.
+        
+        Args:
+            tp: Take profit price
+            sl: Stop loss price
+            time_deadline: Timestamp for 4-hour force close
+            
+        Returns:
+            True if plan is valid, False otherwise
+        """
+        self.tp_price = tp
+        self.sl_price = sl
+        self.time_exit_deadline = time_deadline
+        return self.validate_exit_plan()
+    
+    def validate_exit_plan(self) -> bool:
+        """
+        Validate that exit plan is complete and logically sound.
+        
+        Returns:
+            True if valid, False otherwise
+        """
+        import time
+        return (
+            self.tp_price is not None and self.tp_price > self.price and
+            self.sl_price is not None and self.sl_price < self.price and
+            self.time_exit_deadline is not None and
+            time.time() < self.time_exit_deadline
+        )
     
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "ClassifiedPosition":

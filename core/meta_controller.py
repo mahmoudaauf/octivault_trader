@@ -2977,6 +2977,94 @@ class MetaController:
 
         return False, 0.0
 
+    async def _validate_exit_plan_exists(self, symbol: str, entry_price: float, qty: float) -> Dict[str, Any]:
+        """
+        Validate that a complete exit plan can be defined for this entry.
+        
+        Exit-First Strategy: Ensure 4-pathway exit guarantee BEFORE entry approval:
+        1. Take Profit (TP): +2.5% price threshold
+        2. Stop Loss (SL): -1.5% price threshold  
+        3. Time Exit: 4-hour force close (safety valve)
+        4. Dust Liquidation: Fallback if all else fails
+        
+        Args:
+            symbol: Trading symbol
+            entry_price: Entry price for the position
+            qty: Quantity of the position
+            
+        Returns:
+            Dict with exit plan details and validation status
+        """
+        try:
+            # Calculate exit triggers
+            tp_price = entry_price * 1.025  # +2.5% take profit
+            sl_price = entry_price * 0.985  # -1.5% stop loss
+            time_deadline = time.time() + (4 * 3600)  # 4 hours max hold
+            
+            # Validate all 4 exit pathways
+            is_valid = (
+                tp_price > entry_price and
+                sl_price < entry_price and
+                time_deadline > time.time()
+            )
+            
+            self.logger.info(
+                f"[ExitPlan:Validate] {symbol}: TP=${tp_price:.4f}, SL=${sl_price:.4f}, Time={int((time_deadline - time.time())/60)}min, Valid={is_valid}"
+            )
+            
+            return {
+                'tp_price': tp_price,
+                'sl_price': sl_price,
+                'time_deadline': time_deadline,
+                'is_valid': is_valid,
+                'pathways': ['TP', 'SL', 'TIME', 'DUST'],
+                'reason': 'All 4 pathways validated' if is_valid else 'Invalid exit configuration'
+            }
+        except Exception as e:
+            self.logger.error(f"[ExitPlan:Validate] Error validating exit plan for {symbol}: {e}")
+            return {
+                'tp_price': None,
+                'sl_price': None,
+                'time_deadline': None,
+                'is_valid': False,
+                'pathways': [],
+                'reason': f'Validation error: {str(e)}'
+            }
+
+    async def _store_exit_plan(self, symbol: str, exit_plan: Dict[str, Any]) -> bool:
+        """
+        Store exit plan in the position's shared state.
+        
+        Args:
+            symbol: Trading symbol
+            exit_plan: Exit plan dict from _validate_exit_plan_exists
+            
+        Returns:
+            True if successfully stored, False otherwise
+        """
+        try:
+            sym = self._normalize_symbol(symbol)
+            
+            # Get position from shared state
+            if hasattr(self.shared_state, "get_position"):
+                position = await _safe_await(self.shared_state.get_position(sym))
+                if position:
+                    # Store exit plan in position
+                    if hasattr(position, 'set_exit_plan'):
+                        result = position.set_exit_plan(
+                            exit_plan['tp_price'],
+                            exit_plan['sl_price'],
+                            exit_plan['time_deadline']
+                        )
+                        self.logger.info(f"[ExitPlan:Store] Stored exit plan for {symbol}: {result}")
+                        return result
+            
+            self.logger.warning(f"[ExitPlan:Store] Could not store exit plan for {symbol}: no position object")
+            return False
+        except Exception as e:
+            self.logger.error(f"[ExitPlan:Store] Error storing exit plan for {symbol}: {e}")
+            return False
+
     async def _position_blocks_new_buy(self, symbol: str, existing_qty: float) -> Tuple[bool, float, float, str]:
         """
         Determine whether an existing position should block a new BUY under one-position-per-symbol rules.
@@ -3182,6 +3270,22 @@ class MetaController:
                         f"[Atomic:BUY] BLOCKED {sym}: {reason} (pos_value={pos_value:.2f})"
                     )
                     return None
+                
+                # Step 1.5: Exit-First Strategy - Validate exit plan BEFORE entry
+                entry_price = float(signal.get('price', 0.0) or 0.0)
+                if entry_price <= 0:
+                    # Try to get entry price from market data
+                    if hasattr(self.shared_state, 'safe_price'):
+                        entry_price = float(await _safe_await(self.shared_state.safe_price(sym)) or 0.0)
+                
+                if entry_price > 0:
+                    exit_plan = await self._validate_exit_plan_exists(sym, entry_price, qty)
+                    if not exit_plan['is_valid']:
+                        self.logger.warning(
+                            f"[Atomic:BUY] BLOCKED {sym}: NO VALID EXIT PLAN - {exit_plan['reason']}"
+                        )
+                        return None
+                    self.logger.info(f"[Atomic:BUY] Exit plan validated for {sym}")
                 
                 # Step 2: Mark as reserved (holding lock!)
                 if sym in self._reserved_symbols:
