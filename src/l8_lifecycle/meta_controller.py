@@ -3551,16 +3551,59 @@ class MetaController:
                 
                 # Permanent dust is invisible to governance: exclude from total/dust_count used by policies.
                 total = len(sig_list) + len(dust_list)
+                sig_count = len(sig_list)
                 dust_count = len(dust_list)
+
+                # ── STRICT CAP MODE (Part B) ──
+                # When STRICT_CAP_COUNT_TRADABLE=1, promote any "dust" position whose
+                # value ≥ STRICT_CAP_MIN_VALUE_USDT (default $5) to be counted as
+                # SIGNIFICANT for capacity gating. This closes the loophole where 33
+                # wallet positions, each just below the $25 significant floor, all
+                # appear as "dust" and let the cap read "0 positions used".
+                # Dust classification semantics elsewhere (capital occupancy, dust
+                # healing, etc.) are NOT affected — only the tuple returned here.
+                try:
+                    if os.environ.get("STRICT_CAP_COUNT_TRADABLE", "0").strip().lower() in (
+                        "1", "true", "yes", "on",
+                    ):
+                        min_value = float(os.environ.get("STRICT_CAP_MIN_VALUE_USDT", "5") or 5)
+                        snap = self.shared_state.get_positions_snapshot() or {}
+                        promoted = 0
+                        for sym in dust_list:
+                            pos = snap.get(sym) or {}
+                            if not isinstance(pos, dict):
+                                continue
+                            qty = float(pos.get("quantity") or pos.get("qty") or 0.0)
+                            if qty <= 0:
+                                continue
+                            px = float(
+                                pos.get("mark_price")
+                                or pos.get("current_price")
+                                or pos.get("avg_price")
+                                or 0.0
+                            )
+                            value = float(pos.get("value_usdt") or qty * px)
+                            if value >= min_value:
+                                promoted += 1
+                        if promoted:
+                            sig_count += promoted
+                            dust_count = max(0, dust_count - promoted)
+                            self.logger.info(
+                                "[Meta:StrictCap] promoted %d tradable-dust→sig "
+                                "(value≥$%.2f) total=%d sig=%d dust=%d",
+                                promoted, min_value, total, sig_count, dust_count,
+                            )
+                except Exception as _scc_err:
+                    self.logger.debug("[Meta:StrictCap] promotion failed: %s", _scc_err)
 
                 if total > 0:
                     dust_ratio = dust_count / total
                     self.logger.debug(
                         "[Meta:PosCounts] Total=%d Sig=%d Dust=%d PermanentDust=%d Ratio=%.1f%%",
-                        total, len(sig_list), len(dust_list), len(permanent_dust_list), dust_ratio * 100
+                        total, sig_count, dust_count, len(permanent_dust_list), dust_ratio * 100
                     )
-                
-                return total, len(sig_list), dust_count
+
+                return total, sig_count, dust_count
         except ExchangeError as e:
             classification = handler.handle_exception(
                 e,
