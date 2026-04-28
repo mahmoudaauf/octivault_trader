@@ -2156,7 +2156,34 @@ class MasterSystemOrchestrator:
         if not await self.initialize_components():
             logger.error("❌ Component initialization failed")
             return False
-        
+
+        # ── STARTUP TRIM-TO-TARGET (one-shot portfolio shrinkage) ──
+        # Runs AFTER all components are wired but BEFORE the main loop begins.
+        # Disabled by default — opt in with STARTUP_TRIM_TO_TARGET=1 (and optionally
+        # STARTUP_TRIM_TARGET_COUNT=<N>, default 5). Liquidates lowest-value
+        # tradable positions until the wallet holds at most N positions.
+        try:
+            from src.l3_portfolio.portfolio_target_size_enforcer import (
+                PortfolioTargetSizeEnforcer,
+            )
+            _trim_enable = os.environ.get("STARTUP_TRIM_TO_TARGET", "0").strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+            _trim_target = int(os.environ.get("STARTUP_TRIM_TARGET_COUNT", "5") or 5)
+            _enforcer = PortfolioTargetSizeEnforcer(
+                shared_state=self.shared_state,
+                execution_manager=self.execution_manager,
+                target_count=_trim_target,
+                enable=_trim_enable and bool(self.config.live_mode),
+                logger=logger,
+            )
+            _trim_report = await _enforcer.enforce_once()
+            logger.info("[StartupTrim] report=%s", _trim_report)
+        except Exception as _trim_err:
+            logger.warning(
+                "[StartupTrim] enforcer raised (continuing without trim): %s", _trim_err
+            )
+
         self.running = True
         self.start_time = datetime.now()
         
