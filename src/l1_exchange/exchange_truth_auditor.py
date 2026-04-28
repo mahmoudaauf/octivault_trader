@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
@@ -2140,15 +2141,57 @@ class ExchangeTruthAuditor:
                 if hasattr(ss, "get_position_qty"):
                     pos_qty = float(ss.get_position_qty(sym) or 0.0)
                 if pos_qty > self.dust_threshold and hasattr(ss, "mark_position_closed"):
-                    await self._maybe_call(
-                        ss,
-                        "mark_position_closed",
-                        symbol=sym,
-                        qty=qty,
-                        price=price,
-                        reason=f"TRUTH_AUDIT:{reason}",
-                        tag="truth_auditor",
-                    )
+                    # ── WALLET-TRUTH GUARD (run-#6 fix) ──
+                    # If the live exchange wallet still holds ≥ pos_qty of the base
+                    # asset, the historical SELL we are "recovering" was already
+                    # reflected in the wallet's current free balance. Closing the
+                    # bot's position here would create a phantom-zero state that
+                    # makes agents emit SELL signals for symbols we still hold,
+                    # producing the SELL_WITHOUT_POSITION ping-pong observed in
+                    # run #6 (ETH/SOL/AVAX).
+                    skip_close = False
+                    try:
+                        if os.environ.get("TRUTH_AUDIT_WALLET_GUARD", "1").strip().lower() in (
+                            "1", "true", "yes", "on",
+                        ):
+                            balances = await self._get_exchange_balances()
+                            base_asset, _ = self._split_base_quote(sym)
+                            if balances and base_asset:
+                                bal = balances.get(base_asset) or balances.get(base_asset.upper()) or {}
+                                if isinstance(bal, dict):
+                                    wallet_free = float(
+                                        bal.get("free")
+                                        or bal.get("available")
+                                        or bal.get("total")
+                                        or 0.0
+                                    )
+                                else:
+                                    wallet_free = float(bal or 0.0)
+                                # Tolerance: 99% of pos_qty — accounts for fees/rounding
+                                if wallet_free >= (pos_qty * 0.99):
+                                    skip_close = True
+                                    self.logger.warning(
+                                        "[TruthAuditor:WalletGuard] Skipping mark_position_closed for %s "
+                                        "— wallet still holds %.10f (≥ pos_qty=%.10f). "
+                                        "Recovered SELL appears already accounted for in hydration.",
+                                        sym, wallet_free, pos_qty,
+                                    )
+                    except Exception as _wg_err:
+                        self.logger.debug(
+                            "[TruthAuditor:WalletGuard] guard check failed for %s: %s — proceeding with close",
+                            sym, _wg_err,
+                        )
+
+                    if not skip_close:
+                        await self._maybe_call(
+                            ss,
+                            "mark_position_closed",
+                            symbol=sym,
+                            qty=qty,
+                            price=price,
+                            reason=f"TRUTH_AUDIT:{reason}",
+                            tag="truth_auditor",
+                        )
             except Exception:
                 self.logger.debug("mark_position_closed fallback failed for %s", sym, exc_info=True)
 
