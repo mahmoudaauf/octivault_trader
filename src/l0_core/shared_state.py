@@ -2099,12 +2099,34 @@ class SharedState:
         # This includes free holdings like BTC, ETH, SOL that are not in positions yet
         # Formula: for each non-quote asset, value_usd = balance × price
         dust_threshold = getattr(self, "dust_min_quote_usdt", 5.0)
-        
+
+        # RUN-#10 FIX (NAV double-count): when an asset has BOTH a balance entry
+        # and a hydrated position record, the position loop below will count its
+        # value. Non-quote balances must therefore EXCLUDE assets already
+        # represented in self.positions to avoid double-counting (the position
+        # qty IS the wallet free qty under hydration). Build the position-asset
+        # set once for O(1) lookup. Without this fix, a $25 ZBT holding shows
+        # up as $50 in NAV (run-#10 reported $127.66 vs reality $102.64).
+        position_assets: set = set()
+        for _sym in self.positions.keys():
+            _s = str(_sym).upper()
+            for _q in quote_assets:
+                if _s.endswith(_q):
+                    position_assets.add(_s[: -len(_q)])
+                    break
+
         balance_values_added = 0
         for asset, balance_info in self.balances.items():
             asset_upper = asset.upper()
             # Skip quote assets (already counted above)
             if asset_upper in quote_assets:
+                continue
+            # Skip assets already represented as positions (double-count guard)
+            if asset_upper in position_assets:
+                self.logger.debug(
+                    f"[NAV] Skipping balance {asset}: position record exists "
+                    f"(will be counted in positions loop to avoid double-count)"
+                )
                 continue
             
             qty = float(balance_info.get("free", 0.0))
