@@ -5399,18 +5399,25 @@ class SharedState:
                 continue
             sym = f"{a}{quote}"
             
-            # FILTER: Verify the symbol is tradable
-            # Check against known symbols first, then verify with exchange if available
+            # TRADABILITY FLAG (Option A): keep ALL non-zero balances as positions for
+            # accurate NAV. is_exchange_tradable defaults True; if has_symbol() is
+            # available AND has loaded its exchange-info cache, use it. Otherwise
+            # fail-open (treat as tradable). Position carries `is_tradable` so
+            # downstream sell/trade logic can respect the flag.
             is_known_symbol = sym in self.symbols or sym in self.accepted_symbols
             is_exchange_tradable = True
-            
-            if self._exchange_client and hasattr(self._exchange_client, "has_symbol"):
-                is_exchange_tradable = self._exchange_client.has_symbol(sym)
-            
-            if not is_known_symbol and not is_exchange_tradable:
-                # Skip non-tradable pairs
-                self.logger.debug(f"[SS:HydratePosFromBal] Skipping non-tradable symbol {sym} for asset {a}")
-                continue
+            try:
+                if self._exchange_client and hasattr(self._exchange_client, "has_symbol"):
+                    # has_symbol() returns False both for "not tradable" AND "exchange_info
+                    # not loaded yet". To distinguish, check if exchange_info is populated.
+                    ex_info = getattr(self._exchange_client, "_exchange_info", None)
+                    if ex_info:
+                        is_exchange_tradable = bool(self._exchange_client.has_symbol(sym))
+                    # else: leave default True (fail-open during boot race)
+            except Exception:
+                is_exchange_tradable = True
+            # NOTE: We no longer skip non-tradable symbols. They are kept in positions
+            # with is_tradable=False so NAV reflects reality; sell logic must check the flag.
             prev = self.positions.get(sym, {})
             prev_qty = float(prev.get("quantity", 0.0) or 0.0)
             prev_is_mirrored = bool(prev.get("_mirrored", False))
@@ -5504,7 +5511,8 @@ class SharedState:
                     "is_significant": bool(is_significant),
                     "is_dust": not bool(is_significant),
                     "_is_dust": not bool(is_significant),
-                    "open_position": bool(is_significant),
+                    "is_tradable": bool(is_exchange_tradable),
+                    "open_position": bool(is_significant) and bool(is_exchange_tradable),
                     "state": PositionState.ACTIVE.value if is_significant else PositionState.DUST_LOCKED.value,
                     "_mirrored": mirrored_flag,
                     "classification": classification_value,
