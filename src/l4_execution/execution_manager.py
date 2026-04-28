@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from collections import deque
 import logging
 import json
+import os
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, Optional, Tuple, Union, Literal
@@ -5383,10 +5384,66 @@ class ExecutionManager:
         """
         GAP #2 FIX: Called when an order fails. Triggers pruning if capital is tight.
         This enables stale reservation cleanup to recover blocked capital.
+
+        ── INSUFFICIENT-BALANCE CIRCUIT BREAKER (run-#5 fix) ──
+        When the SAME (symbol, side) hits InsufficientBalance N times in a row,
+        force a wallet re-hydration and apply a per-(symbol,side) cooldown so
+        the bot does NOT keep retrying the same intent every loop. Prevents the
+        ETHUSDT-SELL deadlock loop seen in run #5 (137 consecutive -2010 errors).
+
+        Tunables (env):
+          INSUFF_BAL_BREAKER_THRESHOLD   default 5
+          INSUFF_BAL_BREAKER_COOLDOWN_S  default 120
         """
         try:
+            is_insuff = reason in (
+                "InsufficientBalance",
+                "InsufficientLiquidity",
+                "INSUFFICIENT_BALANCE",
+            )
+
+            # Lazy-init the breaker state
+            if not hasattr(self, "_insuff_bal_streak"):
+                self._insuff_bal_streak: dict[tuple[str, str], int] = {}
+                self._insuff_bal_cooldown_until: dict[tuple[str, str], float] = {}
+
+            key = (str(symbol or "").upper(), str(side or "").upper())
+
+            if is_insuff:
+                streak = self._insuff_bal_streak.get(key, 0) + 1
+                self._insuff_bal_streak[key] = streak
+                threshold = int(os.environ.get("INSUFF_BAL_BREAKER_THRESHOLD", "5") or 5)
+                cooldown_s = float(os.environ.get("INSUFF_BAL_BREAKER_COOLDOWN_S", "120") or 120)
+
+                if streak >= threshold:
+                    cooldown_until = time.time() + cooldown_s
+                    self._insuff_bal_cooldown_until[key] = cooldown_until
+                    self.logger.error(
+                        "[InsuffBalCircuitBreaker] %s %s tripped: %d consecutive "
+                        "InsufficientBalance — applying %.0fs cooldown and forcing wallet re-hydration",
+                        key[0], key[1], streak, cooldown_s,
+                    )
+                    # Force a wallet re-hydration to correct stale qty
+                    try:
+                        if hasattr(self.shared_state, "hydrate_positions_from_balances"):
+                            await self.shared_state.hydrate_positions_from_balances()
+                            self.logger.warning(
+                                "[InsuffBalCircuitBreaker] hydrate_positions_from_balances() complete for %s",
+                                key[0],
+                            )
+                    except Exception as _hyd_err:
+                        self.logger.warning(
+                            "[InsuffBalCircuitBreaker] hydration failed: %s", _hyd_err
+                        )
+                    # Reset streak so we don't re-fire every cycle while cooling
+                    self._insuff_bal_streak[key] = 0
+            else:
+                # Any non-insufficient outcome resets the streak
+                if key in self._insuff_bal_streak:
+                    self._insuff_bal_streak[key] = 0
+
             # If order failed due to insufficient capital, trigger immediate prune
-            if quote and reason in ("InsufficientBalance", "InsufficientLiquidity", "INSUFFICIENT_BALANCE"):
+            if quote and is_insuff:
                 try:
                     spendable = await maybe_call(self.shared_state, "get_free_usdt") or 0.0
                     if float(spendable) < (quote * 0.5):
@@ -5402,6 +5459,19 @@ class ExecutionManager:
                     self.logger.debug(f"[OrderFailed:Prune] Prune attempt failed: {e}")
         except Exception as e:
             self.logger.debug(f"[OrderFailed] Exception in _on_order_failed: {e}")
+
+    def is_insuff_bal_cooling(self, symbol: str, side: str) -> bool:
+        """
+        Public helper: returns True if (symbol, side) is currently in
+        InsufficientBalance cooldown. Callers (e.g. ExecutionManager.execute_trade)
+        can short-circuit before sending another doomed order.
+        """
+        try:
+            key = (str(symbol or "").upper(), str(side or "").upper())
+            until = getattr(self, "_insuff_bal_cooldown_until", {}).get(key, 0.0)
+            return bool(until and time.time() < until)
+        except Exception:
+            return False
 
     def _classify_execution_error(self, exception: Exception, symbol: str = "", operation: str = "") -> ExecutionError:
         if isinstance(exception, BinanceAPIException):
@@ -7009,6 +7079,28 @@ class ExecutionManager:
         # PHASE 5: Persist intent before execution (event sourcing)
         await self._persist_trade_intent(intent)
         
+        # ── INSUFFICIENT-BALANCE CIRCUIT BREAKER ──
+        # Short-circuit doomed retries: if (symbol, side) is in cooldown after
+        # repeated -2010 rejections, refuse the order without hitting the API.
+        # Liquidation/TP/SL bypasses the breaker (risk management is non-negotiable).
+        if not bool(getattr(intent, "is_liquidation", False)) and self.is_insuff_bal_cooling(
+            intent.symbol, intent.side
+        ):
+            self.logger.warning(
+                "[EM:Breaker] %s %s suppressed — insufficient-balance cooldown active",
+                intent.symbol, intent.side,
+            )
+            return {
+                "ok": False,
+                "status": "rejected",
+                "symbol": intent.symbol,
+                "side": intent.side,
+                "reason": "INSUFFICIENT_BALANCE_COOLDOWN",
+                "error_code": "INSUFFICIENT_BALANCE_COOLDOWN",
+                "executedQty": 0.0,
+                "cummulativeQuoteQty": 0.0,
+            }
+
         # Delegate to implementation
         return await self._execute_trade_impl(
             symbol=intent.symbol,
