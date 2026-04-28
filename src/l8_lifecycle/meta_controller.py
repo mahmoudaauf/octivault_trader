@@ -4335,21 +4335,29 @@ class MetaController:
         """Fee-aware profit gate for MetaController-originated SELLs."""
         strict_profit_only = bool(getattr(self.config, "STRICT_PROFIT_ONLY_SELLS", False))
 
-        # ── Heal-fix B (run-#7): auto-engage STRICT mode below NAV threshold.
-        # On micro-accounts, every "rotation/liquidation/concentration" exit
-        # bypassed the profit gate and locked in a guaranteed fee-loss
-        # (round-trip ≈ 0.3% on ~$25 notional ≈ $0.075 bleed per trade).
-        # When NAV is below HEAL_STRICT_BELOW_NAV (default $150), no exit
-        # should bypass the fee gate. Stop-loss/SL still bypasses below.
+        # ── Heal-fix B (run-#7/#8): auto-engage STRICT mode below NAV threshold.
+        # On micro-accounts, every "rotation/liquidation/concentration/forced-exit"
+        # bypass locked in a guaranteed fee-loss (round-trip ≈ 0.3% on ~$25
+        # notional ≈ $0.075 bleed per trade). When NAV is below
+        # HEAL_STRICT_BELOW_NAV (default $150), no exit may bypass the fee gate
+        # via "log-only" branches — they fall through to the real fee-aware
+        # min_profit comparison. SL/EMERGENCY still bypass below.
         try:
             heal_strict_threshold = float(os.environ.get("HEAL_STRICT_BELOW_NAV", "150") or 0.0)
             if heal_strict_threshold > 0 and not strict_profit_only:
                 _nav_now = 0.0
+                # Prefer the live attribute (run-#8 found _last_nav doesn't exist on
+                # SharedState; the maintained one is `nav`).
                 with contextlib.suppress(Exception):
-                    _nav_now = float(getattr(self.shared_state, "_last_nav", 0.0) or 0.0)
+                    _nav_now = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
                 if _nav_now <= 0:
                     with contextlib.suppress(Exception):
-                        _nav_now = float(await self.shared_state.calculate_nav())
+                        _getter = getattr(self.shared_state, "get_nav", None)
+                        if callable(_getter):
+                            _val = _getter()
+                            if hasattr(_val, "__await__"):
+                                _val = await _val
+                            _nav_now = float(_val or 0.0)
                 if 0 < _nav_now <= heal_strict_threshold:
                     strict_profit_only = True
                     self.logger.info(
@@ -11165,7 +11173,15 @@ class MetaController:
                     if heal_below_nav > 0 and len(dust_positions) >= heal_min_dust_count:
                         _nav_now = 0.0
                         with contextlib.suppress(Exception):
-                            _nav_now = float(getattr(self.shared_state, "_last_nav", 0.0) or 0.0)
+                            _nav_now = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
+                        if _nav_now <= 0:
+                            with contextlib.suppress(Exception):
+                                _getter = getattr(self.shared_state, "get_nav", None)
+                                if callable(_getter):
+                                    _val = _getter()
+                                    if hasattr(_val, "__await__"):
+                                        _val = await _val
+                                    _nav_now = float(_val or 0.0)
                         if 0 < _nav_now <= heal_below_nav:
                             _last = float(getattr(self, "_heal_dust_last_sweep_ts", 0.0) or 0.0)
                             if (time.time() - _last) >= heal_interval:

@@ -192,3 +192,128 @@ def test_heal_c_dust_sweep_skipped_when_healthy_nav():
             heal_sweep = True
     # Healthy NAV → no heal sweep, legacy returns None
     assert heal_sweep is False
+
+
+# ─── Run-#8 hardening: real-method integration ───────────────────────────
+@pytest.mark.asyncio
+async def test_heal_b_reads_nav_from_shared_state_nav_attr(monkeypatch):
+    """
+    Run-#8 regression: the prologue must read shared_state.nav (not the
+    non-existent _last_nav). Verifies via the real
+    _passes_meta_sell_profit_gate against a minimal stub.
+    """
+    monkeypatch.setenv("HEAL_STRICT_BELOW_NAV", "150")
+
+    from src.l8_lifecycle.meta_controller import MetaController
+
+    mc = MetaController.__new__(MetaController)
+
+    class _StubSS:
+        nav = 97.42                # micro-NAV — should engage STRICT
+        open_trades: dict = {}
+        positions: dict = {}
+        latest_prices: dict = {"XRPUSDT": 1.38}
+
+        async def safe_price(self, sym):
+            return 1.38
+
+    class _StubCfg:
+        STRICT_PROFIT_ONLY_SELLS = False
+        MIN_PLANNED_QUOTE_FEE_MULT = 2.5
+        MIN_PROFIT_EXIT_FEE_MULT = 2.0
+        TP_MIN_BUFFER_BPS = 0.0
+        STAGNATION_EXIT_ENABLED = False
+        STAGNATION_EXIT_MAX_LOSS_PCT = 0.0
+
+    mc.shared_state = _StubSS()
+    mc.config = _StubCfg()
+
+    captured = []
+
+    class _Logger:
+        def info(self, *a, **kw):  captured.append(("INFO", a))
+        def warning(self, *a, **kw): captured.append(("WARN", a))
+        def debug(self, *a, **kw): pass
+        def error(self, *a, **kw): pass
+        def exception(self, *a, **kw): pass
+
+    mc.logger = _Logger()
+    mc._is_forced_capacity_recovery_sell = lambda sig: False
+
+    # FORCED_EXIT signal that previously bypassed gate on micro-NAV.
+    sig = {
+        "symbol": "XRPUSDT",
+        "side": "SELL",
+        "_forced_exit": True,
+        "reason": "CAPITAL_RECOVERY_LIQUIDITY_RESTORATION",
+        "tag": "meta_exit",
+    }
+
+    # The Heal-B prologue must:
+    # 1. Read NAV from shared_state.nav  (not _last_nav)
+    # 2. Set strict_profit_only=True (NAV=$97.42 ≤ $150)
+    # 3. Log "[Meta:ProfitGate:Heal] NAV=$97.42 ≤ $150 — auto-engaging STRICT"
+    await mc._passes_meta_sell_profit_gate("XRPUSDT", sig)
+
+    heal_log_seen = any(
+        len(args) > 0 and "ProfitGate:Heal" in str(args[0])
+        for level, args in captured
+    )
+    assert heal_log_seen, (
+        "Heal-B prologue must read shared_state.nav and log the auto-engage. "
+        f"captured logs: {captured}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_heal_b_no_engage_when_nav_attr_missing_or_healthy(monkeypatch):
+    """When NAV>threshold OR shared_state has no NAV, do NOT auto-engage."""
+    monkeypatch.setenv("HEAL_STRICT_BELOW_NAV", "150")
+
+    from src.l8_lifecycle.meta_controller import MetaController
+
+    mc = MetaController.__new__(MetaController)
+
+    class _StubSS:
+        nav = 800.0  # healthy
+        open_trades: dict = {}
+        positions: dict = {}
+        latest_prices: dict = {}
+
+        async def safe_price(self, sym):
+            return 0.0
+
+    class _StubCfg:
+        STRICT_PROFIT_ONLY_SELLS = False
+        MIN_PLANNED_QUOTE_FEE_MULT = 2.5
+        MIN_PROFIT_EXIT_FEE_MULT = 2.0
+        TP_MIN_BUFFER_BPS = 0.0
+        STAGNATION_EXIT_ENABLED = False
+        STAGNATION_EXIT_MAX_LOSS_PCT = 0.0
+
+    mc.shared_state = _StubSS()
+    mc.config = _StubCfg()
+
+    captured = []
+
+    class _Logger:
+        def info(self, *a, **kw):  captured.append(("INFO", a))
+        def warning(self, *a, **kw): captured.append(("WARN", a))
+        def debug(self, *a, **kw): pass
+        def error(self, *a, **kw): pass
+        def exception(self, *a, **kw): pass
+
+    mc.logger = _Logger()
+    mc._is_forced_capacity_recovery_sell = lambda sig: False
+
+    sig = {
+        "symbol": "XRPUSDT", "side": "SELL", "_forced_exit": True,
+        "reason": "REBALANCE", "tag": "meta_exit",
+    }
+    await mc._passes_meta_sell_profit_gate("XRPUSDT", sig)
+
+    heal_log_seen = any(
+        len(args) > 0 and "ProfitGate:Heal" in str(args[0])
+        for level, args in captured
+    )
+    assert heal_log_seen is False, "Heal-B must NOT engage on healthy NAV"
