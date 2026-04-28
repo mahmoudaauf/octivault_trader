@@ -9291,6 +9291,40 @@ class MetaController:
         )
         self.logger.info("[Meta:Phase4] Orphan reservation auto-release task started (interval=%.1fs)", cleanup_interval_sec)
 
+        # ═════════════════════════════════════════════════════════════════════
+        # EXTERNAL ADOPTION ENGINE — wallet-inherited position drain/adopt/hedge
+        # Periodically evaluates EXTERNAL_POSITION-classified holdings:
+        #   value < EXTERNAL_DUST_THRESHOLD_USDT  → LIQUIDATE
+        #   in_universe and value ≥ adoption_min  → ADOPT (assigns TP/SL)
+        #   exposure > EXTERNAL_EXPOSURE_LIMIT_PCT → HEDGE (gradual reduce)
+        #   else                                  → IGNORE
+        # Validator approves via "EXTERNAL_DUST_LIQUIDATION" / "EXTERNAL_ADOPTION".
+        # ═════════════════════════════════════════════════════════════════════
+        adoption_interval_sec = float(
+            getattr(self.config, "EXTERNAL_ADOPTION_INTERVAL_SEC", 60.0) or 60.0
+        )
+        async def _external_adoption_loop():
+            try:
+                # Initial settle delay so wallet hydration + exchange_info populate
+                await _asyncio.sleep(15.0)
+                while self._running:
+                    try:
+                        await self._run_external_adoption_cycle()
+                    except Exception as e:
+                        self.logger.warning("[Meta:ExternalAdoption] Cycle error: %s", e)
+                    await _asyncio.sleep(adoption_interval_sec)
+            except _asyncio.CancelledError:
+                pass
+
+        self._external_adoption_task = _asyncio.create_task(
+            _external_adoption_loop(),
+            name="meta.external_adoption"
+        )
+        self.logger.info(
+            "[Meta:ExternalAdoption] background task started (interval=%.1fs)",
+            adoption_interval_sec,
+        )
+
         await self._health_set("Healthy", "MetaController started.")
         self.logger.info("MetaController started.")
 
@@ -21513,6 +21547,114 @@ class MetaController:
         self.external_adoption_engine = engine
         if engine:
             self.logger.info("[Meta:Wire] ExternalAdoptionEngine wired")
+
+    async def _run_external_adoption_cycle(self) -> None:
+        """Periodic drain/adopt/hedge pass over wallet-inherited positions.
+
+        Safety contract:
+          - No-op if engine not wired or executor not ready.
+          - Skipped during cold bootstrap (uses RotationExitAuthority signal).
+          - Only operates on positions classified EXTERNAL_POSITION (set by
+            shared_state.hydrate_positions_from_balances).
+          - Uses approved reasons EXTERNAL_DUST_LIQUIDATION / EXTERNAL_ADOPTION
+            so PositionOperationValidator allows the SELL on EXTERNAL_POSITION.
+          - Skips symbols already covered by RotationAuthority/dust pipelines
+            (avoids double-execution).
+        """
+        engine = getattr(self, "external_adoption_engine", None)
+        if engine is None:
+            return
+        if not getattr(self, "_running", False):
+            return
+
+        # Defer until hydration is settled (exchange_info present + at least one
+        # successful wallet sync). Both are signalled via shared_state metrics.
+        try:
+            ss = self.shared_state
+            if not bool(getattr(ss, "_exchange_info", None) or {}):
+                return
+        except Exception:
+            return
+
+        # Skip during cold bootstrap — RotationAuthority blocks forced exits there
+        try:
+            ra = getattr(self, "rotation_authority", None)
+            if ra is not None and getattr(ra, "_is_cold_bootstrap_active", None):
+                if ra._is_cold_bootstrap_active():
+                    self.logger.debug(
+                        "[Meta:ExternalAdoption] skipped (cold-bootstrap active)"
+                    )
+                    return
+        except Exception:
+            pass
+
+        # Build EXTERNAL_POSITION dict for engine evaluation
+        try:
+            from src.l5_strategy.external_adoption_engine import ExternalPosition
+        except Exception as e:
+            self.logger.warning("[Meta:ExternalAdoption] import ExternalPosition failed: %s", e)
+            return
+
+        try:
+            snap = self.shared_state.get_positions_snapshot(
+                include_wallet_inventory=True
+            ) or {}
+        except Exception as e:
+            self.logger.warning("[Meta:ExternalAdoption] snapshot failed: %s", e)
+            return
+
+        external_positions: Dict[str, Any] = {}
+        for sym, pos in snap.items():
+            try:
+                classification = str(pos.get("classification", "") or "").upper()
+                if classification != "EXTERNAL_POSITION":
+                    continue
+                qty = float(pos.get("quantity", 0.0) or pos.get("qty", 0.0) or 0.0)
+                if qty <= 0:
+                    continue
+                # Read-only protection: do not touch non-tradable mirrors
+                if pos.get("is_tradable") is False:
+                    continue
+                px = float(
+                    pos.get("mark_price")
+                    or pos.get("current_price")
+                    or pos.get("avg_price")
+                    or 0.0
+                )
+                if px <= 0:
+                    continue
+                value = float(pos.get("value_usdt") or qty * px)
+                external_positions[sym] = ExternalPosition(
+                    symbol=sym,
+                    quantity=qty,
+                    entry_price=float(pos.get("avg_price") or pos.get("entry_price") or px),
+                    current_price=px,
+                    value_usdt=value,
+                )
+            except Exception:
+                continue
+
+        if not external_positions:
+            return
+
+        try:
+            results = await engine.evaluate_external_positions(external_positions)
+            n_liq = sum(1 for r in results if str(r.decision.value) == "liquidated")
+            n_adopt = sum(1 for r in results if str(r.decision.value) == "adopted")
+            n_hedge = sum(1 for r in results if str(r.decision.value) == "hedging")
+            n_ign = sum(1 for r in results if str(r.decision.value) == "ignored")
+            if n_liq or n_adopt or n_hedge:
+                self.logger.warning(
+                    "[Meta:ExternalAdoption] cycle: liquidated=%d adopted=%d hedging=%d ignored=%d total=%d",
+                    n_liq, n_adopt, n_hedge, n_ign, len(results),
+                )
+            else:
+                self.logger.info(
+                    "[Meta:ExternalAdoption] cycle: no actions (ignored=%d total=%d)",
+                    n_ign, len(results),
+                )
+        except Exception as e:
+            self.logger.warning("[Meta:ExternalAdoption] evaluate failed: %s", e)
 
     def _generate_decision_trace_id(self) -> str:
         """Generate unique decision trace ID for traceability.

@@ -177,11 +177,11 @@ class ExternalAdoptionEngine:
 
                 # Execute decision (if applicable)
                 action_taken = None
-                if decision.mode == AdoptionMode.LIQUIDATE:
+                if decision["mode"] == AdoptionMode.LIQUIDATE:
                     action_taken = await self._execute_liquidate(symbol, position)
-                elif decision.mode == AdoptionMode.ADOPT:
+                elif decision["mode"] == AdoptionMode.ADOPT:
                     action_taken = await self._execute_adopt(symbol, position)
-                elif decision.mode == AdoptionMode.HEDGE:
+                elif decision["mode"] == AdoptionMode.HEDGE:
                     action_taken = await self._execute_hedge(symbol, position)
 
                 # Store result
@@ -376,23 +376,55 @@ class ExternalAdoptionEngine:
     # ═══════════════════════════════════════════════════════════════════
 
     async def _execute_liquidate(self, symbol: str, position: ExternalPosition) -> str:
-        """Execute liquidation of external position"""
+        """Execute liquidation of external position.
+
+        Builds a canonical TradeIntent (matches ExecutionManager.execute_trade
+        contract) tagged with an approved reason recognised by
+        PositionOperationValidator (so EXTERNAL_POSITION protection allows it).
+        """
         try:
-            if self.execution_manager:
-                result = await self.execution_manager.execute_trade(
-                    symbol=symbol,
-                    side="SELL",
-                    quantity=position.quantity,
-                    reason="external_dust_liquidation",
+            if not self.execution_manager:
+                self.logger.warning(
+                    "[ExternalAdoption] %s liquidate skipped: execution_manager not wired", symbol
                 )
-                if result.get("ok"):
-                    self.logger.info(
-                        "[EXTERNAL_ADOPTION] Liquidated dust: %s qty=%.8f value=%.2f",
-                        symbol,
-                        position.quantity,
-                        position.value_usdt,
-                    )
-                    return "liquidated"
+                return "no_executor"
+
+            # Build canonical TradeIntent (lazy import to avoid layer cycles)
+            try:
+                from src.l0_core.contracts import TradeIntent, OrderSide
+            except Exception:
+                from src.l0_core.contracts import TradeIntent  # type: ignore
+                OrderSide = None  # type: ignore
+
+            qty = float(position.quantity or 0.0)
+            if qty <= 0:
+                return "qty_zero"
+
+            intent = TradeIntent(
+                symbol=symbol,
+                side="sell",
+                quantity=qty,
+                reason="EXTERNAL_DUST_LIQUIDATION",
+                agent="external_adoption_engine",
+                tag="external_drain",
+                is_liquidation=True,  # bypass throughput / minNotional guards
+            )
+
+            result = await self.execution_manager.execute_trade(intent)
+            if isinstance(result, dict) and result.get("ok"):
+                self.logger.info(
+                    "[EXTERNAL_ADOPTION] Liquidated dust: %s qty=%.8f value=%.2f",
+                    symbol,
+                    qty,
+                    position.value_usdt,
+                )
+                return "liquidated"
+            self.logger.warning(
+                "[EXTERNAL_ADOPTION] %s liquidation rejected: %s",
+                symbol,
+                (result or {}).get("reason") if isinstance(result, dict) else result,
+            )
+            return "liquidation_rejected"
         except Exception as e:
             self.logger.error(f"[ExternalAdoption] Liquidation error for {symbol}: {e}", exc_info=True)
         return "liquidation_attempted"
@@ -449,12 +481,29 @@ class ExternalAdoptionEngine:
             return 1000.0
 
     async def _get_active_universe(self) -> set:
-        """Get set of symbols in active trading universe"""
-        if not self.shared_state:
-            return set()
+        """Get set of symbols in active trading universe.
+
+        Resolution order:
+          1. shared_state.active_symbols (live universe set by SymbolGovernor)
+          2. shared_state.config.SYMBOLS
+          3. self.config["SYMBOLS"]
+        """
         try:
-            # Try to get from shared state or config
-            return set(self.config.get("SYMBOLS", []))
+            ss = self.shared_state
+            if ss is not None:
+                # Live universe (preferred)
+                live = getattr(ss, "active_symbols", None)
+                if live:
+                    return set(live)
+                # Config fallback
+                cfg = getattr(ss, "config", None)
+                syms = getattr(cfg, "SYMBOLS", None) if cfg is not None else None
+                if syms:
+                    return set(syms)
+        except Exception:
+            pass
+        try:
+            return set(self.config.get("SYMBOLS", []) or [])
         except Exception:
             return set()
 

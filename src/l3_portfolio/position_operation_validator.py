@@ -425,6 +425,11 @@ class PositionOperationValidator:
             "CAPITAL_RECOVERY",
             "SELL_RECOVERY",
             "FLAT_PORTFOLIO_SELL_RECOVERY",
+            # ExternalAdoptionEngine paths (wallet-inherited orphan drain).
+            "EXTERNAL_DUST_LIQUIDATION",
+            "EXTERNAL_ADOPTION",
+            "EXTERNAL_HEDGE",
+            "ORPHAN_DRAIN",
         }
         return any(ar in reason_u for ar in approved_reasons)
 
