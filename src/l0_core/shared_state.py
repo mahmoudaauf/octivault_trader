@@ -1961,12 +1961,23 @@ class SharedState:
             nav = quote_free_total + quote_locked_total
         else:
             nav = quote_free_total + quote_locked_total
+            # FIX #2/#3 (NAV truthfulness): Count ALL wallet positions with valid qty>0
+            # and px>0, regardless of _mirrored flag. Excluding mirrored/EXTERNAL
+            # positions caused the $103↔$24 NAV flicker — when classifier toggled
+            # _mirrored on/off (or hydration race), positions disappeared from NAV
+            # creating the false impression of capital loss. The asset is on the
+            # exchange; the USDT was spent; it must count toward NAV.
+            #
+            # We still distinguish ownership for invested_capital accounting:
+            # mirrored/EXTERNAL positions contribute to NAV but NOT to invested_capital
+            # (which represents bot-deployed capital only). This keeps the bot's
+            # PnL math correct while making NAV reflect wallet reality.
             for sym, pos in (self.positions or {}).items():
                 qty = float((pos or {}).get("quantity", 0.0) or 0.0)
                 if qty <= 0:
                     continue
-                if bool((pos or {}).get("_mirrored", False)):
-                    continue
+
+                is_mirrored = bool((pos or {}).get("_mirrored", False))
 
                 px = float(
                     self.latest_prices.get(sym)
@@ -1982,12 +1993,14 @@ class SharedState:
                     continue
 
                 nav += pos_value
-                invested_capital += pos_value
                 included_positions += 1
 
-                avg = float((pos or {}).get("avg_price") or (pos or {}).get("entry_price") or 0.0)
-                if avg > 0:
-                    unrealized_pnl += (px - avg) * qty
+                if not is_mirrored:
+                    # Bot-managed position: contributes to invested_capital and unreal PnL
+                    invested_capital += pos_value
+                    avg = float((pos or {}).get("avg_price") or (pos or {}).get("entry_price") or 0.0)
+                    if avg > 0:
+                        unrealized_pnl += (px - avg) * qty
 
         self.nav = float(nav)
         self.portfolio_nav = float(nav)
@@ -2134,13 +2147,11 @@ class SharedState:
             qty = float(pos.get("quantity", 0.0))
             if qty <= 0: 
                 continue
-            # Wallet-mirrored positions are already represented by balance hydration
-            # and must not be counted again in the published trading NAV.
-            if bool(pos.get("_mirrored", False)):
-                self.logger.debug(
-                    f"[NAV] Skipping mirrored position {sym}: already represented by wallet state"
-                )
-                continue
+            # FIX #2/#3 (NAV truthfulness): Count mirrored positions as well.
+            # Wallet hydration sets the position QTY but does NOT add equivalent
+            # value to free_USDT, so excluding mirrored positions undercounts NAV
+            # by exactly the wallet's invested portion. Asset on exchange + USDT
+            # spent → must reflect in NAV.
             
             # PROFESSIONAL STANDARD RULE #1: Use current price ONLY
             # Never use entry price - it's historical, not current market value

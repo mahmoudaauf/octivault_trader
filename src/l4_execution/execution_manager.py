@@ -8063,7 +8063,27 @@ class ExecutionManager:
                         # Threshold Met or Downscaled (can = True)
                         execute_quote = float(gap) if reason == "OK_DOWNSCALED" else float(planned_quote)
 
-                        if policy_ctx.get("_no_downscale_planned_quote") and execute_quote != float(planned_quote) and not (intent and intent.accumulated_quote > 0):
+                        # FIX #1 (capital-clamp): Allow OK_DOWNSCALED to proceed when the downscaled
+                        # quote still satisfies exchange min_notional. The "no_downscale" guard was
+                        # designed to prevent SILENT shrinkage of intentional sizing — but when the
+                        # wallet genuinely has less than planned, blocking with EXEC_QUOTE_MISMATCH
+                        # creates a deadlock where Meta plans $25 forever against $14.60 spendable.
+                        # Downscaling to available capital is the correct and safe behavior.
+                        try:
+                            _exch_floor = float(min_notional)
+                        except Exception:
+                            _exch_floor = 0.0
+                        _legitimate_capital_downscale = (
+                            reason == "OK_DOWNSCALED"
+                            and execute_quote >= _exch_floor
+                            and execute_quote > 0.0
+                        )
+                        if (
+                            policy_ctx.get("_no_downscale_planned_quote")
+                            and execute_quote != float(planned_quote)
+                            and not (intent and intent.accumulated_quote > 0)
+                            and not _legitimate_capital_downscale
+                        ):
                             self.logger.critical(
                                 "Execution quote mismatch: Meta vs Execution (planned=%.2f execute=%.2f)",
                                 float(planned_quote), float(execute_quote)
@@ -8073,6 +8093,12 @@ class ExecutionManager:
                                 planned_quote=float(planned_quote),
                                 available_quote=float(execute_quote),
                                 min_required=float(planned_quote),
+                            )
+                        if _legitimate_capital_downscale and execute_quote != float(planned_quote):
+                            self.logger.warning(
+                                "[EM:CAPITAL_DOWNSCALE] %s BUY: planned=%.2f -> execute=%.2f "
+                                "(capital-limited, ≥ exchange_floor=%.2f) reason=%s",
+                                sym, float(planned_quote), float(execute_quote), _exch_floor, reason,
                             )
                         
                         # Apply intent aggregation if threshold is reached
