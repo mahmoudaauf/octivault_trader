@@ -170,6 +170,7 @@ FILE_LAYER_MAP: Dict[str, str] = {
     "src/l0_core/healthy.py":                   "L0",
     "src/l0_core/metrics.py":                   "L0",
     "src/l0_core/time_utils.py":                "L0",
+    "src/l0_core/bounded_cache.py":             "L0",
 
     # ==== Phase C-L2..L8 canonical paths (auto-generated from src/lN_*/) ====
     # ---- L2: l2_marketdata ----

@@ -235,62 +235,9 @@ class LiquidityPlan:
     risk_assessment: Optional[Dict[str, Any]] = None
 
 
-class BoundedCache:
-    """Thread-safe bounded cache with TTL support."""
-
-    def __init__(self, max_size: int = 1000, default_ttl: float = 300.0):
-        self._cache: Dict[str, tuple] = {}
-        self._max_size = max_size
-        self._default_ttl = default_ttl
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """Get value from cache if not expired."""
-        if key not in self._cache:
-            return default
-        value, expires_at = self._cache[key]
-        now = time.time()
-        if now > expires_at:
-            del self._cache[key]
-            return default
-        return value
-
-    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
-        """Set value in cache with TTL. Evicts the soonest-expiring entry when at capacity."""
-        now = time.time()
-        expires_at = now + (ttl or self._default_ttl)
-        if key not in self._cache and len(self._cache) >= self._max_size:
-            try:
-                oldest_key = min(self._cache, key=lambda k: self._cache[k][1])
-                del self._cache[oldest_key]
-            except (ValueError, KeyError):
-                pass
-        self._cache[key] = (value, expires_at)
-
-    def put(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
-        """Alias for set() for compatibility."""
-        self.set(key, value, ttl)
-
-    def list_all(self) -> List[Any]:
-        """Return all non-expired values."""
-        now = time.time()
-        results = []
-        expired_keys = []
-        for k, (val, exp) in list(self._cache.items()):
-            if now <= exp:
-                results.append(val)
-            else:
-                expired_keys.append(k)
-        for k in expired_keys:
-            self._cache.pop(k, None)
-        return results
-
-    def cleanup_expired(self) -> int:
-        """Remove expired entries from cache. Returns count of removed items."""
-        now = time.time()
-        expired_keys = [k for k, (_, exp) in self._cache.items() if now > exp]
-        for k in expired_keys:
-            del self._cache[k]
-        return len(expired_keys)
+# BoundedCache lives at L0 (src/l0_core/bounded_cache.py).
+# Re-exported here for backward compatibility with existing imports.
+from src.l0_core.bounded_cache import BoundedCache  # noqa: F401
 
 
 # ═════════════════════════════════════════════════════════════════════════════

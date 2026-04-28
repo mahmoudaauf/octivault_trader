@@ -158,6 +158,10 @@ class SignalFusion:
         os.makedirs(log_dir, exist_ok=True)
         self._running = False
         self._task = None
+        # Persistent lock for fusion-decision log writes; one-per-instance,
+        # not re-created per call (the previous `async with asyncio.Lock():`
+        # inside _log_decision was a no-op against concurrent writers).
+        self._log_lock = asyncio.Lock()
         
         # Load agent weights from config if available
         try:
@@ -474,7 +478,7 @@ class SignalFusion:
     async def _log_decision(self, fusion_result: dict):
         if self.log_to_file:
             try:
-                async with asyncio.Lock():  # async file-safe context
+                async with self._log_lock:  # serialize writes to fusion_log.json
                     with open(self.log_path, "a") as f:
                         f.write(json.dumps(fusion_result) + "\n")
             except Exception as e:

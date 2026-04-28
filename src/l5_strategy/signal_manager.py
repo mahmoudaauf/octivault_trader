@@ -28,9 +28,9 @@ class SignalManager:
             self.signal_cache = signal_cache
             self.logger.info("[SignalManager] Using provided signal cache")
         else:
-            # Try to use BoundedCache from meta_controller.cache, fallback to InlineBoundedCache
+            # Try to use BoundedCache from L0, fallback to InlineBoundedCache
             try:
-                from src.l8_lifecycle.meta_controller import BoundedCache
+                from src.l0_core.bounded_cache import BoundedCache
                 cache_size = int(getattr(config, 'signal_cache_max_size', 1000))
                 cache_ttl = float(getattr(config, 'signal_cache_ttl', 300.0))
                 self.signal_cache = BoundedCache(max_size=cache_size, default_ttl=cache_ttl)
