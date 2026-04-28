@@ -6928,7 +6928,7 @@ class MetaController:
                 mode = self.mode_manager.get_mode()
                 envelope = self.mode_manager.get_envelope()
                 base = float(envelope.get("confidence_floor", 0.50))  # FIXED: Use 0.50 as default (matches SOP_MATRIX)
-                self.logger.critical("[Meta:ModeConfFloor] Mode envelope read: mode=%s confidence_floor=%.3f", mode, base)
+                self.logger.info("[Meta:ModeConfFloor] Mode envelope read: mode=%s confidence_floor=%.3f", mode, base)
         except Exception as e:
             self.logger.warning("[Meta:ModeConfFloor] Failed to read mode envelope: %s. Using fallback 0.50", e)
             base = float(self._cfg("MIN_EXECUTION_CONFIDENCE", 0.50))  # FIXED: 0.45 → 0.50
@@ -6956,7 +6956,7 @@ class MetaController:
             self._mode_floor_log_count = 0
         
         if self._mode_floor_log_count < 10:  # Only log first 10 times to avoid spam
-            self.logger.critical(
+            self.logger.info(
                 "[Meta:ModeConfFloor] mode=%s base=%.3f nudge=%.3f effective=%.3f final=%.3f",
                 mode, base, nudge, effective, final_floor
             )
@@ -7482,7 +7482,7 @@ class MetaController:
                     override = max(0.0, min(1.0, float(override)))
                     # Make override application visible in the same severity band as GateDebug
                     # so operators see it in the live `trading.log` alongside CRITICAL gate messages.
-                    self.logger.critical("Applying dynamic required_conf override for %s: %s -> %s", symbol, required_conf, override)
+                    self.logger.info("Applying dynamic required_conf override for %s: %s -> %s", symbol, required_conf, override)
                     required_conf = override
         except Exception:
             # ignore loader errors
@@ -7502,7 +7502,7 @@ class MetaController:
         
         # 🔍 DIAGNOSTIC LOGGING: Show exact gate floor calculation
         # This helps identify why signals pass or fail
-        self.logger.critical(
+        self.logger.info(
             "[Meta:GateDebug:TRADEABILITY] %s BUY gate assessment: "
             "signal_conf=%.3f | required_conf=%.3f "
             "(base=%.3f mode=%.3f signal_floor=%.3f) | "
@@ -7555,7 +7555,7 @@ class MetaController:
             return False, required_conf, "hint_below_required_conf"
         
         if not passes:
-            self.logger.critical(
+            self.logger.info(
                 "[Meta:GateDebug:TRADEABILITY_REJECTED] %s BUY REJECTED: "
                 "conf=%.3f < medium_band=%.3f (required_conf=%.3f) | "
                 "reason=%s | pass=%s",
@@ -9089,7 +9089,7 @@ class MetaController:
         
         # DEBUG: Log cache state immediately after caching
         all_cached = self.signal_manager.get_all_signals()
-        self.logger.critical(
+        self.logger.info(
             "[MetaController:RECV_SIGNAL:CACHE_DEBUG] Signal just cached! Total in cache=%d. Cache object id=%s",
             len(all_cached),
             id(self.signal_cache)
@@ -10063,7 +10063,7 @@ class MetaController:
         # --- Signal Cache Cleanup: Remove expired signals at start of each cycle ---
         try:
             now_time = time.time()
-            self.logger.critical(
+            self.logger.info(
                 "[Meta:SignalCache:BEFORE_CLEANUP] Cache ID=%s TTL=%s cached_entries=%d now=%s",
                 id(self.signal_cache),
                 getattr(self.signal_cache, '_default_ttl', 'UNKNOWN'),
@@ -10071,7 +10071,7 @@ class MetaController:
                 now_time
             )
             cleaned_count = self.signal_manager.cleanup_expired_signals()
-            self.logger.critical(
+            self.logger.info(
                 "[Meta:SignalCache:AFTER_CLEANUP] Cleaned=%d remaining_entries=%d",
                 cleaned_count,
                 len(self.signal_cache._cache) if hasattr(self.signal_cache, '_cache') else 0
@@ -10171,7 +10171,7 @@ class MetaController:
                 cache_before = len(self.signal_manager.get_all_signals())
                 await self.agent_manager.collect_and_forward_signals()
                 cache_after = len(self.signal_manager.get_all_signals())
-                self.logger.critical("[Meta:FIX0] ✅ Collected agent signals | cache: %d→%d signals (added %d)", 
+                self.logger.info("[Meta:FIX0] ✅ Collected agent signals | cache: %d→%d signals (added %d)", 
                                     cache_before, cache_after, cache_after - cache_before)
         except Exception as e:
             self.logger.warning("[Meta:FIX0] Signal collection failed (non-fatal): %s", e)
@@ -10213,7 +10213,7 @@ class MetaController:
 
         # 3. Build Decision Context (Portfolio Arbitration)
         decisions = await self._build_decisions(accepted_symbols_set)
-        self.logger.critical(
+        self.logger.info(
             "[Meta:BATCHING_DIAGNOSTIC] _BUILD_DECISIONS_RETURNED: count=%d decisions=%s",
             len(decisions),
             [(d[0], d[1]) for d in decisions[:5]]  # Show first 5 for brevity
@@ -10231,7 +10231,7 @@ class MetaController:
         # ═══════════════════════════════════════════════════════════════════════════════
         try:
             decisions = await self._convert_decisions_to_metadecisions(decisions)
-            self.logger.critical(
+            self.logger.info(
                 "[Meta:DECISION_CONVERSION] ✅ Converted %d tuples to MetaDecision objects",
                 len(decisions)
             )

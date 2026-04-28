@@ -154,6 +154,7 @@ class RebalancePlan:
     validation_errors: List[str] = field(default_factory=list)
     approval_timestamp: Optional[float] = None
     execution_timestamp: Optional[float] = None
+    plan_id: str = field(default_factory=lambda: f"rebal_{int(time.time()*1000)}")
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -216,7 +217,7 @@ class RebalancingEngine:
     comprehensive validation, and detailed tracking.
     """
     
-    def __init__(self, shared_state=None, exchange_client=None, config=None, meta_controller=None):
+    def __init__(self, shared_state=None, exchange_client=None, config=None, meta_controller=None, execution_manager=None):
         """
         Initialize rebalancing engine.
         
@@ -225,11 +226,18 @@ class RebalancingEngine:
             exchange_client: ExchangeClient instance
             config: Configuration object
             meta_controller: MetaController for order submission
+            execution_manager: Optional dedicated execution manager. If None,
+                falls back to meta_controller for order routing.
         """
         self.shared_state = shared_state
         self.exchange_client = exchange_client
         self.config = config
         self.meta_controller = meta_controller
+        # Prefer explicit execution_manager; otherwise reuse meta_controller as the
+        # execution surface. RebalancingEngine treats both the same way: it calls
+        # submit_order(...) on the resolved object. If neither has submit_order,
+        # the engine logs a warning and skips execution (plan stays PENDING).
+        self.execution_manager = execution_manager or meta_controller
         self.logger = logging.getLogger(__name__)
         
         # Configuration
@@ -610,13 +618,27 @@ class RebalancingEngine:
         """
         try:
             if not self.execution_manager:
-                self.logger.error("[RebalancingEngine] No execution manager available")
+                self.logger.warning(
+                    "[RebalancingEngine] No execution manager wired — plan %s skipped (dry-run)",
+                    plan.plan_id,
+                )
                 return False
             
             if not plan.rebalance_orders:
                 self.logger.warning(f"[RebalancingEngine] No orders in plan {plan.plan_id}")
                 return True  # Empty plan is technically successful
             
+            # The execution surface MUST expose submit_order(...). MetaController and
+            # dedicated execution managers both honor this contract. If neither does,
+            # treat it as a dry-run: log clearly and report failure without raising.
+            if not hasattr(self.execution_manager, "submit_order"):
+                self.logger.warning(
+                    "[RebalancingEngine] Execution surface (%s) lacks submit_order(); "
+                    "plan %s left unexecuted (dry-run).",
+                    type(self.execution_manager).__name__, plan.plan_id,
+                )
+                return False
+
             # Submit orders to the execution manager
             submitted_orders = []
             for order in plan.rebalance_orders:

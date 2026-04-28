@@ -2627,13 +2627,15 @@ class SharedState:
             sym = f"{a}{quote_asset}"
             # Tradability check (Option A): keep ALL non-zero balances as positions
             # for accurate NAV; only flag whether bot is allowed to sell them.
-            # has_symbol() is best-effort — it can return False if exchange-info hasn't
-            # loaded yet, so we treat True as "definitely tradable" and False as
-            # "unknown/non-tradable, do not sell, but still account".
+            # Fail-open during boot race when has_symbol's exchange-info cache is
+            # not yet populated, otherwise honor it strictly.
             is_tradable = True
             if hasattr(self._exchange_client, "has_symbol"):
                 try:
-                    is_tradable = bool(self._exchange_client.has_symbol(sym))
+                    ex_info = getattr(self._exchange_client, "_exchange_info", None)
+                    if ex_info:
+                        is_tradable = bool(self._exchange_client.has_symbol(sym))
+                    # else: leave default True (fail-open during boot race)
                 except Exception:
                     is_tradable = True  # default to tradable on error
             if not is_tradable:
@@ -6479,10 +6481,11 @@ class SharedState:
         cur_qty = float(pos.get("quantity", 0.0) or 0.0)
         new_qty = max(0.0, cur_qty - exec_qty) if cur_qty > 0 and exec_qty > 0 else cur_qty
 
-        # 🔥 CRITICAL: Log position closure BEFORE modifying state
+        # Position-closure bookkeeping. Use INFO so it appears in normal ops logs
+        # without triggering CRITICAL-level alerting (this is routine state, not an alarm).
         if new_qty <= 0 and cur_qty > 0:
             logger = logging.getLogger(self.__class__.__name__)
-            logger.critical(
+            logger.info(
                 "[SS:MarkPositionClosed] POSITION FULLY CLOSED: symbol=%s cur_qty=%.10f "
                 "exec_qty=%.10f exec_price=%.8f reason=%s tag=%s",
                 sym, cur_qty, exec_qty, exec_price, reason, tag
