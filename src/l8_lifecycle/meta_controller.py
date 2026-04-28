@@ -4346,10 +4346,19 @@ class MetaController:
             heal_strict_threshold = float(os.environ.get("HEAL_STRICT_BELOW_NAV", "150") or 0.0)
             if heal_strict_threshold > 0 and not strict_profit_only:
                 _nav_now = 0.0
-                # Prefer the live attribute (run-#8 found _last_nav doesn't exist on
-                # SharedState; the maintained one is `nav`).
+                # Run-#9 fix: prefer the LIVE get_nav_quote() (sums quotes +
+                # positions at current market price). The `nav` attribute is
+                # only updated by the async `_compute_nav` rebuild flow and
+                # can be stale by ~$50+ vs reality (run-#9 showed $97.86 stale
+                # vs $153.26 live, causing Heal-B to over-engage above the
+                # threshold).
                 with contextlib.suppress(Exception):
-                    _nav_now = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
+                    _q = getattr(self.shared_state, "get_nav_quote", None)
+                    if callable(_q):
+                        _nav_now = float(_q() or 0.0)
+                if _nav_now <= 0:
+                    with contextlib.suppress(Exception):
+                        _nav_now = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
                 if _nav_now <= 0:
                     with contextlib.suppress(Exception):
                         _getter = getattr(self.shared_state, "get_nav", None)
@@ -11172,8 +11181,14 @@ class MetaController:
                     heal_interval = float(os.environ.get("HEAL_DUST_SWEEP_INTERVAL_SEC", "1800") or 1800)
                     if heal_below_nav > 0 and len(dust_positions) >= heal_min_dust_count:
                         _nav_now = 0.0
+                        # Run-#9 fix: prefer LIVE get_nav_quote() over stale `nav` attr
                         with contextlib.suppress(Exception):
-                            _nav_now = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
+                            _q = getattr(self.shared_state, "get_nav_quote", None)
+                            if callable(_q):
+                                _nav_now = float(_q() or 0.0)
+                        if _nav_now <= 0:
+                            with contextlib.suppress(Exception):
+                                _nav_now = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
                         if _nav_now <= 0:
                             with contextlib.suppress(Exception):
                                 _getter = getattr(self.shared_state, "get_nav", None)

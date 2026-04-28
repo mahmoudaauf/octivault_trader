@@ -317,3 +317,72 @@ async def test_heal_b_no_engage_when_nav_attr_missing_or_healthy(monkeypatch):
         for level, args in captured
     )
     assert heal_log_seen is False, "Heal-B must NOT engage on healthy NAV"
+
+
+@pytest.mark.asyncio
+async def test_heal_b_prefers_live_get_nav_quote_over_stale_nav_attr(monkeypatch):
+    """
+    Run-#9 regression: in run #9 logs, shared_state.nav was stale at $97.86
+    while live get_nav_quote() returned $153.26. Heal-B engaged STRICT against
+    the stale value, OVER-engaging above the $150 threshold.
+
+    This test proves the prologue prefers the LIVE get_nav_quote() so Heal-B
+    does NOT engage when actual NAV is healthy, even if the cached `nav`
+    attribute is stale and below threshold.
+    """
+    monkeypatch.setenv("HEAL_STRICT_BELOW_NAV", "150")
+
+    from src.l8_lifecycle.meta_controller import MetaController
+
+    mc = MetaController.__new__(MetaController)
+
+    class _StubSS:
+        nav = 97.86                        # STALE — would trigger Heal-B
+        open_trades: dict = {}
+        positions: dict = {}
+        latest_prices: dict = {"XRPUSDT": 1.38}
+
+        def get_nav_quote(self):           # LIVE — actual healthy NAV
+            return 153.26
+
+        async def safe_price(self, sym):
+            return 1.38
+
+    class _StubCfg:
+        STRICT_PROFIT_ONLY_SELLS = False
+        MIN_PLANNED_QUOTE_FEE_MULT = 2.5
+        MIN_PROFIT_EXIT_FEE_MULT = 2.0
+        TP_MIN_BUFFER_BPS = 0.0
+        STAGNATION_EXIT_ENABLED = False
+        STAGNATION_EXIT_MAX_LOSS_PCT = 0.0
+
+    mc.shared_state = _StubSS()
+    mc.config = _StubCfg()
+
+    captured = []
+
+    class _Logger:
+        def info(self, *a, **kw):  captured.append(("INFO", a))
+        def warning(self, *a, **kw): captured.append(("WARN", a))
+        def debug(self, *a, **kw): pass
+        def error(self, *a, **kw): pass
+        def exception(self, *a, **kw): pass
+
+    mc.logger = _Logger()
+    mc._is_forced_capacity_recovery_sell = lambda sig: False
+
+    sig = {
+        "symbol": "XRPUSDT", "side": "SELL", "_forced_exit": True,
+        "reason": "CAPITAL_RECOVERY_LIQUIDITY_RESTORATION", "tag": "meta_exit",
+    }
+    await mc._passes_meta_sell_profit_gate("XRPUSDT", sig)
+
+    heal_log_seen = any(
+        len(args) > 0 and "ProfitGate:Heal" in str(args[0])
+        for level, args in captured
+    )
+    assert heal_log_seen is False, (
+        "Heal-B must prefer LIVE get_nav_quote()=$153.26 over stale nav=$97.86. "
+        "Run-#9 bug: it engaged STRICT against the stale value. "
+        f"captured logs: {captured}"
+    )
