@@ -91,6 +91,7 @@ async def test_T1_wallet_full_skips_close(monkeypatch):
     a = _make_auditor(ss=ss, balances={"ETH": {"free": pos_qty}})
     await a._apply_recovered_fill(_order(qty=pos_qty), "missed_fill_recovery", False)
     assert ss.mark_closed_calls == [], "guard should skip close when wallet still holds pos"
+    assert ss.record_trade_calls == [], "guard should also skip record_trade for SELL (run-#7 fix)"
 
 
 @pytest.mark.asyncio
@@ -102,6 +103,7 @@ async def test_T2_wallet_99pct_tolerance_skips(monkeypatch):
     a = _make_auditor(ss=ss, balances={"ETH": {"free": pos_qty * 0.995}})
     await a._apply_recovered_fill(_order(qty=pos_qty), "missed_fill_recovery", False)
     assert ss.mark_closed_calls == [], "guard should tolerate <=1% wallet shortfall"
+    assert ss.record_trade_calls == [], "guard should also skip record_trade"
 
 
 @pytest.mark.asyncio
@@ -113,6 +115,7 @@ async def test_T3_wallet_empty_proceeds_with_close(monkeypatch):
     await a._apply_recovered_fill(_order(qty=pos_qty), "missed_fill_recovery", False)
     assert len(ss.mark_closed_calls) == 1, "real missed fill: close must proceed"
     assert ss.mark_closed_calls[0]["symbol"] == "ETHUSDT"
+    assert len(ss.record_trade_calls) == 1, "real missed fill: record_trade must run"
 
 
 @pytest.mark.asyncio
@@ -124,6 +127,7 @@ async def test_T4_flag_off_bypasses_guard(monkeypatch):
     await a._apply_recovered_fill(_order(qty=pos_qty), "missed_fill_recovery", False)
     # Legacy behavior: close even though wallet still holds qty
     assert len(ss.mark_closed_calls) == 1, "with guard disabled, legacy close must run"
+    assert len(ss.record_trade_calls) == 1, "with guard disabled, record_trade must run"
 
 
 @pytest.mark.asyncio
@@ -134,3 +138,16 @@ async def test_T5_wallet_50pct_proceeds(monkeypatch):
     a = _make_auditor(ss=ss, balances={"ETH": {"free": pos_qty * 0.5}})
     await a._apply_recovered_fill(_order(qty=pos_qty), "missed_fill_recovery", False)
     assert len(ss.mark_closed_calls) == 1, "real 50% wallet shortfall: close must proceed"
+    assert len(ss.record_trade_calls) == 1, "real 50% wallet shortfall: record_trade must run"
+
+
+@pytest.mark.asyncio
+async def test_T6_buy_side_unaffected_by_guard(monkeypatch):
+    """BUY recovery must always run record_trade (guard is SELL-only)."""
+    monkeypatch.setenv("TRUTH_AUDIT_WALLET_GUARD", "1")
+    pos_qty = 0.0108
+    ss = _StubSharedState(pos_qty=pos_qty)
+    a = _make_auditor(ss=ss, balances={"ETH": {"free": pos_qty}})  # wallet full
+    await a._apply_recovered_fill(_order(side="BUY", qty=pos_qty), "missed_fill_recovery", False)
+    assert len(ss.record_trade_calls) == 1, "BUY recovery must run record_trade regardless of wallet"
+    assert ss.mark_closed_calls == [], "BUY never calls mark_position_closed"

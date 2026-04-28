@@ -2123,77 +2123,89 @@ class ExchangeTruthAuditor:
             fee_quote = 0.0
             fee_base = float(order.get("fee_base", 0.0) or 0.0)
 
-        applied = False
-        try:
-            if hasattr(ss, "record_trade"):
-                await self._maybe_call(ss, "record_trade", sym, side, qty, price, fee_quote, fee_base, "truth_auditor")
-                applied = True
-            elif hasattr(ss, "record_fill"):
-                await self._maybe_call(ss, "record_fill", sym, side, qty, price, fee_quote=fee_quote, fee_base=fee_base)
-                applied = True
-        except Exception:
-            self.logger.error("[TruthAuditor] failed applying recovered fill %s %s", sym, side, exc_info=True)
-
+        # ── WALLET-TRUTH GUARD (run-#6/#7 fix) ──
+        # For SELL recovery, check the live exchange wallet BEFORE replaying.
+        # If the wallet still holds ≥ pos_qty of the base asset, the historical
+        # SELL we are "recovering" was already reflected in current wallet
+        # balance via boot-time hydration. Replaying record_trade(SELL) would
+        # drain the bot ledger to zero, causing agents to emit SELL signals for
+        # symbols we still hold (SELL_WITHOUT_POSITION ping-pong, run #6/#7).
+        # Guard skips BOTH record_trade AND mark_position_closed for SELL when
+        # wallet is full. BUY recovery is unaffected.
+        skip_recovery = False
         if side == "SELL":
+            try:
+                if os.environ.get("TRUTH_AUDIT_WALLET_GUARD", "1").strip().lower() in (
+                    "1", "true", "yes", "on",
+                ):
+                    pos_qty_pre = 0.0
+                    if hasattr(ss, "get_position_qty"):
+                        with contextlib.suppress(Exception):
+                            pos_qty_pre = float(ss.get_position_qty(sym) or 0.0)
+                    if pos_qty_pre > self.dust_threshold:
+                        balances = await self._get_exchange_balances()
+                        base_asset_g, _ = self._split_base_quote(sym)
+                        if balances and base_asset_g:
+                            bal = balances.get(base_asset_g) or balances.get(base_asset_g.upper()) or {}
+                            if isinstance(bal, dict):
+                                wallet_free = float(
+                                    bal.get("free")
+                                    or bal.get("available")
+                                    or bal.get("total")
+                                    or 0.0
+                                )
+                            else:
+                                wallet_free = float(bal or 0.0)
+                            # Tolerance: 99% of pos_qty — accounts for fees/rounding
+                            if wallet_free >= (pos_qty_pre * 0.99):
+                                skip_recovery = True
+                                self.logger.warning(
+                                    "[TruthAuditor:WalletGuard] Skipping SELL recovery for %s "
+                                    "(record_trade + mark_position_closed) — wallet still holds "
+                                    "%.10f (≥ pos_qty=%.10f). Historical SELL already in wallet truth.",
+                                    sym, wallet_free, pos_qty_pre,
+                                )
+            except Exception as _wg_err:
+                self.logger.debug(
+                    "[TruthAuditor:WalletGuard] guard check failed for %s: %s — proceeding",
+                    sym, _wg_err,
+                )
+
+        applied = False
+        if not skip_recovery:
+            try:
+                if hasattr(ss, "record_trade"):
+                    await self._maybe_call(ss, "record_trade", sym, side, qty, price, fee_quote, fee_base, "truth_auditor")
+                    applied = True
+                elif hasattr(ss, "record_fill"):
+                    await self._maybe_call(ss, "record_fill", sym, side, qty, price, fee_quote=fee_quote, fee_base=fee_base)
+                    applied = True
+            except Exception:
+                self.logger.error("[TruthAuditor] failed applying recovered fill %s %s", sym, side, exc_info=True)
+
+        if side == "SELL" and not skip_recovery:
             # Ensure stale open lots are finalised even if fill hooks were missed.
             try:
                 pos_qty = 0.0
                 if hasattr(ss, "get_position_qty"):
                     pos_qty = float(ss.get_position_qty(sym) or 0.0)
                 if pos_qty > self.dust_threshold and hasattr(ss, "mark_position_closed"):
-                    # ── WALLET-TRUTH GUARD (run-#6 fix) ──
-                    # If the live exchange wallet still holds ≥ pos_qty of the base
-                    # asset, the historical SELL we are "recovering" was already
-                    # reflected in the wallet's current free balance. Closing the
-                    # bot's position here would create a phantom-zero state that
-                    # makes agents emit SELL signals for symbols we still hold,
-                    # producing the SELL_WITHOUT_POSITION ping-pong observed in
-                    # run #6 (ETH/SOL/AVAX).
-                    skip_close = False
-                    try:
-                        if os.environ.get("TRUTH_AUDIT_WALLET_GUARD", "1").strip().lower() in (
-                            "1", "true", "yes", "on",
-                        ):
-                            balances = await self._get_exchange_balances()
-                            base_asset, _ = self._split_base_quote(sym)
-                            if balances and base_asset:
-                                bal = balances.get(base_asset) or balances.get(base_asset.upper()) or {}
-                                if isinstance(bal, dict):
-                                    wallet_free = float(
-                                        bal.get("free")
-                                        or bal.get("available")
-                                        or bal.get("total")
-                                        or 0.0
-                                    )
-                                else:
-                                    wallet_free = float(bal or 0.0)
-                                # Tolerance: 99% of pos_qty — accounts for fees/rounding
-                                if wallet_free >= (pos_qty * 0.99):
-                                    skip_close = True
-                                    self.logger.warning(
-                                        "[TruthAuditor:WalletGuard] Skipping mark_position_closed for %s "
-                                        "— wallet still holds %.10f (≥ pos_qty=%.10f). "
-                                        "Recovered SELL appears already accounted for in hydration.",
-                                        sym, wallet_free, pos_qty,
-                                    )
-                    except Exception as _wg_err:
-                        self.logger.debug(
-                            "[TruthAuditor:WalletGuard] guard check failed for %s: %s — proceeding with close",
-                            sym, _wg_err,
-                        )
-
-                    if not skip_close:
-                        await self._maybe_call(
-                            ss,
-                            "mark_position_closed",
-                            symbol=sym,
-                            qty=qty,
-                            price=price,
-                            reason=f"TRUTH_AUDIT:{reason}",
-                            tag="truth_auditor",
-                        )
+                    await self._maybe_call(
+                        ss,
+                        "mark_position_closed",
+                        symbol=sym,
+                        qty=qty,
+                        price=price,
+                        reason=f"TRUTH_AUDIT:{reason}",
+                        tag="truth_auditor",
+                    )
             except Exception:
                 self.logger.debug("mark_position_closed fallback failed for %s", sym, exc_info=True)
+
+        # If wallet-truth guard tripped, skip downstream TRADE_EXECUTED emit
+        # and payload publishing to keep the recovery a true no-op.
+        if skip_recovery:
+            return False
 
         # --- New: emit canonical TRADE_EXECUTED via ExecutionManager when available ---
         try:
