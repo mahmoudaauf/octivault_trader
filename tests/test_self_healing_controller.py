@@ -386,3 +386,50 @@ async def test_heal_b_prefers_live_get_nav_quote_over_stale_nav_attr(monkeypatch
         "Run-#9 bug: it engaged STRICT against the stale value. "
         f"captured logs: {captured}"
     )
+
+
+def test_get_nav_quote_skips_assets_already_mirrored_as_positions():
+    """
+    Run-#10 regression: get_nav_quote() must NOT double-count an asset that
+    appears in both `self.balances` (free) AND `self.positions` (mirrored
+    by hydrate_positions_from_balances). Run #10 reported NAV=$127.66 when
+    actual was $102.64 — the $25.02 delta was the ZBT position counted twice.
+    """
+    import importlib
+    ss_mod = importlib.import_module("src.l0_core.shared_state")
+
+    # Build a minimal SharedState-like object exercising the de-dup branch
+    class _SS:
+        # required attributes referenced by get_nav_quote()
+        quote_assets = ["USDT"]
+        quote_asset = "USDT"
+        dust_min_quote_usdt = 5.0
+        positions = {
+            "ZBTUSDT": {"quantity": 127.77, "avg_price": 0.196, "mark_price": 0.1962},
+        }
+        balances = {
+            "USDT": {"free": 37.40, "locked": 0.0},
+            "ZBT":  {"free": 127.77, "locked": 0.0},   # MIRRORED — must NOT double-count
+        }
+        latest_prices = {"ZBTUSDT": 0.1962}
+
+        # Borrow the real method
+        get_nav_quote = ss_mod.SharedState.get_nav_quote
+        # tame the logger
+        class _L:
+            def info(self, *a, **k): pass
+            def debug(self, *a, **k): pass
+            def warning(self, *a, **k): pass
+            def error(self, *a, **k): pass
+        logger = _L()
+
+    nav = _SS().get_nav_quote()
+
+    # Expected: 37.40 (USDT) + 127.77 × 0.1962 (ZBT position) = 37.40 + 25.07 = 62.47
+    # Buggy:    37.40 + 25.07 (free balance) + 25.07 (position) = 87.54  ← rejected
+    expected = 37.40 + 127.77 * 0.1962
+    assert abs(nav - expected) < 0.01, (
+        f"get_nav_quote() double-counted ZBT. expected=${expected:.2f} got=${nav:.2f}. "
+        "Run-#10 bug: same asset summed as both free balance AND position."
+    )
+

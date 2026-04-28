@@ -4346,27 +4346,25 @@ class MetaController:
             heal_strict_threshold = float(os.environ.get("HEAL_STRICT_BELOW_NAV", "150") or 0.0)
             if heal_strict_threshold > 0 and not strict_profit_only:
                 _nav_now = 0.0
-                # Run-#9 fix: prefer the LIVE get_nav_quote() (sums quotes +
-                # positions at current market price). The `nav` attribute is
-                # only updated by the async `_compute_nav` rebuild flow and
-                # can be stale by ~$50+ vs reality (run-#9 showed $97.86 stale
-                # vs $153.26 live, causing Heal-B to over-engage above the
-                # threshold).
+                # Run-#10 fix: prefer AUTHORITATIVE NAV from live exchange balances
+                # (single source of truth — cannot double-count). Fall back to
+                # local get_nav_quote() (live local computation, can double-count
+                # mirrored positions), then to the stale `nav` attribute.
                 with contextlib.suppress(Exception):
-                    _q = getattr(self.shared_state, "get_nav_quote", None)
-                    if callable(_q):
-                        _nav_now = float(_q() or 0.0)
+                    _auth = getattr(self.shared_state, "get_authoritative_nav", None)
+                    if callable(_auth):
+                        _val = _auth()
+                        if hasattr(_val, "__await__"):
+                            _val = await _val
+                        _nav_now = float(_val or 0.0)
+                if _nav_now <= 0:
+                    with contextlib.suppress(Exception):
+                        _q = getattr(self.shared_state, "get_nav_quote", None)
+                        if callable(_q):
+                            _nav_now = float(_q() or 0.0)
                 if _nav_now <= 0:
                     with contextlib.suppress(Exception):
                         _nav_now = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
-                if _nav_now <= 0:
-                    with contextlib.suppress(Exception):
-                        _getter = getattr(self.shared_state, "get_nav", None)
-                        if callable(_getter):
-                            _val = _getter()
-                            if hasattr(_val, "__await__"):
-                                _val = await _val
-                            _nav_now = float(_val or 0.0)
                 if 0 < _nav_now <= heal_strict_threshold:
                     strict_profit_only = True
                     self.logger.info(
@@ -11154,63 +11152,77 @@ class MetaController:
             # ===== TRIGGER: 3+ dust positions with accumulated value =====
             if len(dust_positions) < 3:
                 return None  # Not enough dust to consolidate
-            
+
             # Get typical min-notional (assume same across symbols)
             typical_min_notional = dust_positions[0][3] if dust_positions else 10.0
-            
+
+            # Run-#10 fix: pre-compute Heal-C readiness (NAV ≤ threshold AND
+            # dust_count ≥ heal_min). When Heal-C is ready, two legacy gates
+            # below are relaxed — they previously blocked sweeps on accounts
+            # with many tiny crumbs (<50% min-notional) AND tight capacity
+            # (used_ratio ≥ 0.80), which is exactly the failure mode we need
+            # to clean.
+            heal_ready = False
+            heal_nav = 0.0
+            heal_below_nav = 0.0
+            heal_min_dust_count = 10
+            heal_interval = 1800.0
+            try:
+                heal_below_nav = float(os.environ.get("HEAL_DUST_SWEEP_BELOW_NAV", "150") or 0.0)
+                heal_min_dust_count = int(os.environ.get("HEAL_DUST_SWEEP_MIN_COUNT", "10") or 10)
+                heal_interval = float(os.environ.get("HEAL_DUST_SWEEP_INTERVAL_SEC", "1800") or 1800)
+                if heal_below_nav > 0 and len(dust_positions) >= heal_min_dust_count:
+                    # Resolve NAV (auth → quote → stale attr)
+                    with contextlib.suppress(Exception):
+                        _auth = getattr(self.shared_state, "get_authoritative_nav", None)
+                        if callable(_auth):
+                            _val = _auth()
+                            if hasattr(_val, "__await__"):
+                                _val = await _val
+                            heal_nav = float(_val or 0.0)
+                    if heal_nav <= 0:
+                        with contextlib.suppress(Exception):
+                            _q = getattr(self.shared_state, "get_nav_quote", None)
+                            if callable(_q):
+                                heal_nav = float(_q() or 0.0)
+                    if heal_nav <= 0:
+                        with contextlib.suppress(Exception):
+                            heal_nav = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
+                    if 0 < heal_nav <= heal_below_nav:
+                        _last = float(getattr(self, "_heal_dust_last_sweep_ts", 0.0) or 0.0)
+                        if (time.time() - _last) >= heal_interval:
+                            heal_ready = True
+            except Exception as _hsw_err:
+                self.logger.debug("[Meta:Heal:DustSweep] readiness check failed: %s", _hsw_err)
+
             # Total dust should be significant (> 50% of min-notional)
-            if total_dust_value < 0.5 * typical_min_notional:
+            # — but Heal-C bypasses this on micro-NAV: every cent matters.
+            if total_dust_value < 0.5 * typical_min_notional and not heal_ready:
                 return None  # Dust too small, not worth consolidating
-            
+
             # Check portfolio capacity
             capacity = self.shared_state.get_portfolio_capacity()
             try:
                 used_ratio = (capacity["used"] / capacity["total"]) if capacity["total"] > 0 else 0.0
             except Exception:
                 used_ratio = 0.0
-            
-            # Only trigger if portfolio is tight (>= 80% full)
-            if used_ratio < 0.80:
-                # Heal-fix C (run-#7): on micro-NAV, also trigger sweep when wallet
-                # is fragmented even if capacity isn't tight. This recovers the
-                # ~$0.15 dust crumbs left after every SELL that compound into bleed.
-                heal_sweep = False
-                try:
-                    heal_below_nav = float(os.environ.get("HEAL_DUST_SWEEP_BELOW_NAV", "150") or 0.0)
-                    heal_min_dust_count = int(os.environ.get("HEAL_DUST_SWEEP_MIN_COUNT", "10") or 10)
-                    heal_interval = float(os.environ.get("HEAL_DUST_SWEEP_INTERVAL_SEC", "1800") or 1800)
-                    if heal_below_nav > 0 and len(dust_positions) >= heal_min_dust_count:
-                        _nav_now = 0.0
-                        # Run-#9 fix: prefer LIVE get_nav_quote() over stale `nav` attr
-                        with contextlib.suppress(Exception):
-                            _q = getattr(self.shared_state, "get_nav_quote", None)
-                            if callable(_q):
-                                _nav_now = float(_q() or 0.0)
-                        if _nav_now <= 0:
-                            with contextlib.suppress(Exception):
-                                _nav_now = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
-                        if _nav_now <= 0:
-                            with contextlib.suppress(Exception):
-                                _getter = getattr(self.shared_state, "get_nav", None)
-                                if callable(_getter):
-                                    _val = _getter()
-                                    if hasattr(_val, "__await__"):
-                                        _val = await _val
-                                    _nav_now = float(_val or 0.0)
-                        if 0 < _nav_now <= heal_below_nav:
-                            _last = float(getattr(self, "_heal_dust_last_sweep_ts", 0.0) or 0.0)
-                            if (time.time() - _last) >= heal_interval:
-                                heal_sweep = True
-                                self._heal_dust_last_sweep_ts = time.time()
-                                self.logger.warning(
-                                    "[Meta:Heal:DustSweep] NAV=$%.2f ≤ $%.2f, dust_count=%d ≥ %d, "
-                                    "interval_ok — engaging periodic dust consolidation.",
-                                    _nav_now, heal_below_nav, len(dust_positions), heal_min_dust_count,
-                                )
-                except Exception as _hsw_err:
-                    self.logger.debug("[Meta:Heal:DustSweep] check failed: %s", _hsw_err)
-                if not heal_sweep:
-                    return None  # Portfolio has space, no consolidation needed
+
+            # Trigger if portfolio is tight (>= 80% full) OR Heal-C is ready.
+            # Run-#10 fix: hoist Heal-C out of the `used_ratio < 0.80` arm so
+            # that a capacity-tight portfolio with stale dust can still sweep
+            # periodically. Previously Heal-C was nested INSIDE the
+            # `used_ratio < 0.80` branch and was never reached when
+            # used_ratio >= 0.80 (the common case on micro-accounts holding
+            # 2/2 active positions).
+            if used_ratio < 0.80 and not heal_ready:
+                return None  # Portfolio has space and no heal trigger
+            if heal_ready:
+                self._heal_dust_last_sweep_ts = time.time()
+                self.logger.warning(
+                    "[Meta:Heal:DustSweep] NAV=$%.2f ≤ $%.2f, dust_count=%d ≥ %d, "
+                    "total_dust=$%.2f — engaging periodic dust consolidation.",
+                    heal_nav, heal_below_nav, len(dust_positions), heal_min_dust_count, total_dust_value,
+                )
             
             # ===== CONSOLIDATION ACTION =====
             self.logger.warning(

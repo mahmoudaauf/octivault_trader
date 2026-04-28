@@ -2100,20 +2100,24 @@ class SharedState:
         # Formula: for each non-quote asset, value_usd = balance × price
         dust_threshold = getattr(self, "dust_min_quote_usdt", 5.0)
 
-        # RUN-#10 FIX (NAV double-count): when an asset has BOTH a balance entry
-        # and a hydrated position record, the position loop below will count its
-        # value. Non-quote balances must therefore EXCLUDE assets already
-        # represented in self.positions to avoid double-counting (the position
-        # qty IS the wallet free qty under hydration). Build the position-asset
-        # set once for O(1) lookup. Without this fix, a $25 ZBT holding shows
-        # up as $50 in NAV (run-#10 reported $127.66 vs reality $102.64).
-        position_assets: set = set()
-        for _sym in self.positions.keys():
-            _s = str(_sym).upper()
-            for _q in quote_assets:
-                if _s.endswith(_q):
-                    position_assets.add(_s[: -len(_q)])
-                    break
+        # Run-#10 double-count fix: when hydrate_positions_from_balances has
+        # mirrored a wallet balance into self.positions[<ASSET>USDT], the same
+        # asset is summed twice (once here as a free balance, once below as a
+        # position). Build a set of position symbols/assets that already
+        # account for the wallet quantity and skip them in this loop.
+        _positioned_assets: set = set()
+        try:
+            for _psym, _ppos in self.positions.items():
+                if float((_ppos or {}).get("quantity", 0.0) or 0.0) > 0:
+                    _ps = str(_psym).upper()
+                    _positioned_assets.add(_ps)
+                    # Strip common quote suffixes to recover the base asset
+                    for _q in quote_assets:
+                        if _ps.endswith(_q):
+                            _positioned_assets.add(_ps[: -len(_q)])
+                            break
+        except Exception:
+            _positioned_assets = set()
 
         balance_values_added = 0
         for asset, balance_info in self.balances.items():
@@ -2121,32 +2125,33 @@ class SharedState:
             # Skip quote assets (already counted above)
             if asset_upper in quote_assets:
                 continue
-            # Skip assets already represented as positions (double-count guard)
-            if asset_upper in position_assets:
+
+            # Skip if this asset is already mirrored as a position (avoid
+            # double-counting the wallet qty against the same source).
+            if asset_upper in _positioned_assets:
                 self.logger.debug(
-                    f"[NAV] Skipping balance {asset}: position record exists "
-                    f"(will be counted in positions loop to avoid double-count)"
+                    f"[NAV] Skipping balance {asset}: already counted as position"
                 )
                 continue
-            
+
             qty = float(balance_info.get("free", 0.0))
             if qty <= 0:
                 continue
-                
+
             # Get price for this asset (e.g., BTCUSDT, ETHUSDT)
             symbol = f"{asset_upper}USDT"
             px = float(self.latest_prices.get(symbol) or 0.0)
-            
+
             # Skip if no price available
             if px <= 0:
                 self.logger.debug(
                     f"[NAV] Excluding balance {asset}: no price feed for {symbol}"
                 )
                 continue
-            
+
             # Calculate value at market price
             asset_value = qty * px
-            
+
             # Include in NAV even if small (don't dust-filter holdings, only filter positions)
             nav += asset_value
             balance_values_added += 1
@@ -2229,6 +2234,76 @@ class SharedState:
         try:
             return float(self.get_nav_quote())
         except Exception:
+            return 0.0
+
+    async def get_authoritative_nav(self, max_age_sec: float = 5.0) -> float:
+        """
+        Run-#10 fix: ground-truth NAV computed from LIVE exchange balances.
+
+        Single-source-of-truth NAV that cannot double-count:
+          1. Pull current balances directly from ExchangeClient.get_account_balances()
+          2. For each non-zero balance, value = qty × latest_price[<ASSET>USDT]
+             (quote assets count at face value; non-quote priced via latest_prices)
+          3. Sum → NAV
+
+        Cached for `max_age_sec` to avoid hammering the API. Returns 0.0 on
+        any error so callers can fall back to get_nav_quote().
+        """
+        try:
+            now = time.time()
+            cache_ts = float(getattr(self, "_auth_nav_ts", 0.0) or 0.0)
+            cache_val = float(getattr(self, "_auth_nav_val", 0.0) or 0.0)
+            if cache_val > 0 and (now - cache_ts) < float(max_age_sec):
+                return cache_val
+
+            ec = getattr(self, "exchange_client", None)
+            if ec is None:
+                ec = getattr(self, "_exchange_client", None)
+            if ec is None or not hasattr(ec, "get_account_balances"):
+                return 0.0
+
+            balances = await ec.get_account_balances() or {}
+            if not isinstance(balances, dict) or not balances:
+                return 0.0
+
+            quote_assets = getattr(self, "quote_assets", None) or [
+                getattr(self, "quote_asset", "USDT").upper()
+            ]
+            if not isinstance(quote_assets, list):
+                quote_assets = [quote_assets]
+            quote_assets = [str(q).upper() for q in quote_assets]
+
+            nav = 0.0
+            for asset, bal in balances.items():
+                if not isinstance(bal, dict):
+                    continue
+                a = str(asset).upper()
+                qty = float(bal.get("free", 0.0) or 0.0) + float(bal.get("locked", 0.0) or 0.0)
+                if qty <= 0:
+                    continue
+                if a in quote_assets:
+                    nav += qty
+                    continue
+                # Look up market price; skip if unavailable
+                px = 0.0
+                for q in quote_assets:
+                    px = float(self.latest_prices.get(f"{a}{q}", 0.0) or 0.0)
+                    if px > 0:
+                        break
+                if px <= 0:
+                    continue
+                nav += qty * px
+
+            nav = float(nav)
+            self._auth_nav_ts = now
+            self._auth_nav_val = nav
+            self.logger.debug(
+                "[NAV:Authoritative] live exchange NAV=%.2f (cached %ss)",
+                nav, max_age_sec,
+            )
+            return nav
+        except Exception as e:
+            self.logger.debug("[NAV:Authoritative] failed, returning 0.0: %s", e)
             return 0.0
 
     async def get_total_equity(self) -> float:

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Run #11 launcher — NAV double-count fix + Heal-C lift (run-#10 hardening)
 set -euo pipefail
 cd "$(dirname "$0")"
 
