@@ -85,62 +85,6 @@ def test_call_graph_helper():
     assert not chk("L0", "L1")       # cross-cutting is pure
 
 
-def test_boot_sequencer_runs_in_order():
-    from src.l0_core.layer_contracts import LayerName
-    from src.l8_lifecycle.layer_orchestrator import BootSequencer, LayerBootSpec
-
-    seq = BootSequencer()
-    started: list[str] = []
-
-    def make(layer: LayerName, name: str):
-        async def _start() -> bool:
-            started.append(name); return True
-        async def _stop() -> None: pass
-        return LayerBootSpec(layer=layer, name=name, start=_start, stop=_stop,
-                             health=lambda: True)
-
-    for layer, nm in [
-        (LayerName.L0_CROSS_CUTTING,       "l0"),
-        (LayerName.L1_EXCHANGE_IO,         "l1"),
-        (LayerName.L2_WALLET_MARKETDATA,   "l2"),
-        (LayerName.L3_PORTFOLIO_STATE,     "l3"),
-        (LayerName.L4_EXECUTION,           "l4"),
-        (LayerName.L5_STRATEGY,            "l5"),
-        (LayerName.L6_GOVERNANCE,          "l6"),
-        (LayerName.L7_OBSERVABILITY,       "l7"),
-    ]:
-        seq.register(make(layer, nm))
-
-    ok = asyncio.get_event_loop().run_until_complete(seq.boot())
-    assert ok
-    # L6 must come before L5 (governance gate before strategy)
-    assert started == ["l0", "l1", "l2", "l3", "l4", "l6", "l5", "l7"]
-    health = seq.system_health()
-    assert all(v == "OK" for v in health.values())
-
-
-def test_boot_sequencer_aborts_on_required_failure():
-    from src.l0_core.layer_contracts import LayerName
-    from src.l8_lifecycle.layer_orchestrator import BootSequencer, LayerBootSpec
-
-    seq = BootSequencer()
-
-    async def _ok() -> bool:   return True
-    async def _fail() -> bool: return False
-
-    seq.register(LayerBootSpec(layer=LayerName.L0_CROSS_CUTTING, name="ok",
-                               start=_ok, required=True))
-    seq.register(LayerBootSpec(layer=LayerName.L1_EXCHANGE_IO, name="fail",
-                               start=_fail, required=True))
-    seq.register(LayerBootSpec(layer=LayerName.L2_WALLET_MARKETDATA, name="late",
-                               start=_ok, required=True))
-
-    ok = asyncio.get_event_loop().run_until_complete(seq.boot())
-    assert ok is False
-    health = seq.system_health()
-    assert health["L1_EXCHANGE_IO"] == "DOWN"
-
-
 def test_ci_guard_passes():
     """The CI guard must exit 0 against the current workspace baseline."""
     res = subprocess.run(

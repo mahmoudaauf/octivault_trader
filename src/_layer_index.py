@@ -183,7 +183,6 @@ LAYER_MODULES: Dict[str, Dict[str, str]] = {
         "watchdog":              "src.l8_lifecycle.watchdog",
         "chaos_monkey":          "src.l8_lifecycle.chaos_monkey",
         "meta_controller":       "src.l8_lifecycle.meta_controller",
-        "app_context":           "src.l8_lifecycle.app_context",
         "live_integration":      "src.l8_lifecycle.runners.live_integration",
         "component_validator":   "src.l8_lifecycle.runners.component_validator",
     },

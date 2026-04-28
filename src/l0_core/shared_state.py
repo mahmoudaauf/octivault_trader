@@ -30,8 +30,8 @@ except ImportError:
     pd = None
 
 # ---- Type-Only Imports (avoid circular imports) ----
-if TYPE_CHECKING:
-    from src.l8_lifecycle.app_context import AppContext, log_structured_error
+# (AppContext was removed in the L8 cleanup pass; runtime wiring lives in
+# 🎯_MASTER_SYSTEM_ORCHESTRATOR.py and uses a duck-typed app_ctx bag.)
 
 # ---- Module Metadata ----
 __version__ = "2.0.1"
