@@ -131,6 +131,12 @@ try:
         HAS_PERFORMANCE_MONITOR = False
 
     try:
+        from src.l7_observability.nav_attribution_monitor import NavAttributionMonitor
+        HAS_NAV_ATTRIBUTION_MONITOR = True
+    except Exception:
+        HAS_NAV_ATTRIBUTION_MONITOR = False
+
+    try:
         from src.l4_execution.profit_target_engine import ProfitTargetEngine
         HAS_PROFIT_TARGET_ENGINE = True
     except Exception:
@@ -611,6 +617,7 @@ class MasterSystemOrchestrator:
         self.recovery_engine: Optional[object] = None
         self.bootstrap_manager: Optional[object] = None
         self.performance_monitor: Optional[object] = None
+        self.nav_attribution_monitor: Optional[object] = None
         self.profit_target_engine: Optional[object] = None
         self.capital_allocator: Optional[object] = None
         self.symbol_manager: Optional[object] = None
@@ -1621,6 +1628,17 @@ class MasterSystemOrchestrator:
                 except Exception as e:
                     logger.warning(f"⚠️  PerformanceMonitor failed (optional): {e}")
 
+            # NAV Attribution Monitor — explains why NAV moves (growth vs decay)
+            if HAS_NAV_ATTRIBUTION_MONITOR:
+                try:
+                    self.nav_attribution_monitor = NavAttributionMonitor(
+                        shared_state=self.shared_state,
+                        config=self.config,
+                    )
+                    logger.info("✅ NavAttributionMonitor initialized (NAV trend + attribution)")
+                except Exception as e:
+                    logger.warning(f"⚠️  NavAttributionMonitor failed (optional): {e}")
+
             # Profit Target Engine (if available)
             if HAS_PROFIT_TARGET_ENGINE:
                 try:
@@ -2184,6 +2202,7 @@ class MasterSystemOrchestrator:
                 ("RecoveryEngine", self.recovery_engine, None),
                 ("BootstrapManager", self.bootstrap_manager, None),
                 ("PerformanceMonitor", self.performance_monitor, None),
+                ("NavAttributionMonitor", self.nav_attribution_monitor, ("start",)),
                 ("ProfitTargetEngine", self.profit_target_engine, ("start",)),
                 ("CapitalAllocator", self.capital_allocator, None),
                 ("SymbolManager", self.symbol_manager, None),
@@ -2549,6 +2568,7 @@ class MasterSystemOrchestrator:
             await self._stop_component(self.recovery_engine, "RecoveryEngine")
             await self._stop_component(self.bootstrap_manager, "BootstrapManager")
             await self._stop_component(self.performance_monitor, "PerformanceMonitor")
+            await self._stop_component(self.nav_attribution_monitor, "NavAttributionMonitor")
             await self._stop_component(self.profit_target_engine, "ProfitTargetEngine")
             await self._stop_component(self.capital_allocator, "CapitalAllocator")
             await self._stop_component(self.symbol_manager, "SymbolManager")
