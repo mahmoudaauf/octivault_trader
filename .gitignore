@@ -138,3 +138,6 @@ models/_incompatible_quarantine/
 
 # Process output captures
 *.out
+
+# Phantom core/ — was migrated to src/lN_*/ in Phase C, never recreate
+/core/

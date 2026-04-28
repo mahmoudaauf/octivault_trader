@@ -1,92 +1,181 @@
-# 📚 PHANTOM FIX - DOCUMENTATION INDEX
+# 📚 Octivault Trader — Documentation Index# 📚 PHANTOM FIX - DOCUMENTATION INDEX
 
-**Implementation Date:** April 25, 2026  
-**Status:** ✅ FULLY IMPLEMENTED  
+
+
+> Last refreshed: 2026-04-28 (post-cleanup)**Implementation Date:** April 25, 2026  
+
+> Single source of truth for navigating the docs.**Status:** ✅ FULLY IMPLEMENTED  
+
 **Total Documentation:** 5 files
 
 ---
 
+---
+
+## 🚀 Start here
+
 ## 📖 Documentation Files
 
-### 1. 🎯 **PHANTOM_FIX_SUMMARY.md** [START HERE]
-- **Type:** Executive Summary  
-- **Time to Read:** 5 minutes
-- **Contains:**
+| Doc | Purpose |
+
+|---|---|### 1. 🎯 **PHANTOM_FIX_SUMMARY.md** [START HERE]
+
+| [`00_START_HERE.md`](./00_START_HERE.md) | Onboarding — boot order, layers, key entry points |- **Type:** Executive Summary  
+
+| [`docs/architecture/PHASE_C_D_COMPLETION.md`](./docs/architecture/PHASE_C_D_COMPLETION.md) | The 8-layer migration — what, why, how to extend |- **Time to Read:** 5 minutes
+
+| [`docs/architecture/LOGICAL_LAYERED_ARCHITECTURE.md`](./docs/architecture/LOGICAL_LAYERED_ARCHITECTURE.md) | Layer responsibilities & dependency rules |- **Contains:**
+
   - Implementation overview
-  - All 5 components explained
+
+---  - All 5 components explained
+
   - Code verification results
-  - Risk assessment
+
+## 📂 Documentation tree  - Risk assessment
+
   - Deployment steps
-  - Success criteria
 
-**👉 Read this first to understand what was done**
+```  - Success criteria
 
----
+docs/
 
-### 2. ⚡ **QUICK_START_PHANTOM_FIX.md** [DEPLOYMENT CHECKLIST]
-- **Type:** Quick Reference Guide
-- **Time to Read:** 2 minutes
-- **Contains:**
-  - What was done (1 line)
-  - 5-step deployment procedure
-  - What to expect
-  - Success indicators
-  - Quick troubleshooting
+├── architecture/      System design, layer model, technical deep-dives    (22 files)**👉 Read this first to understand what was done**
 
-**👉 Use this during actual deployment**
+├── strategy/          Trading logic — buckets, BUY/SELL basis, ML, exits  (11 files)
 
----
+├── operations/        Runbooks, monitoring, deployment, dashboards        (21 files)---
 
-### 3. 📋 **PHANTOM_FIX_DEPLOYMENT_GUIDE.md** [DETAILED STEPS]
+├── deployment/        Active deployment artifacts
+
+├── guides/            How-to guides### 2. ⚡ **QUICK_START_PHANTOM_FIX.md** [DEPLOYMENT CHECKLIST]
+
+├── reference/         Glossaries, taxonomies- **Type:** Quick Reference Guide
+
+├── api/               API surface docs- **Time to Read:** 2 minutes
+
+├── INCIDENT_RUNBOOKS.md- **Contains:**
+
+└── archive/           Historical (read-only)  - What was done (1 line)
+
+    ├── sessions/        Session reports, hour-checkpoints, status snapshots  - 5-step deployment procedure
+
+    ├── investigations/  AUTO_DETECTION/CRITICAL/DIAGNOSTIC/PHASE/FIX docs  - What to expect
+
+    ├── analysis/        Backtest reports, trade post-mortems, system snapshots  - Success indicators
+
+    ├── planning/        Iteration plans, phase deployment plans  - Quick troubleshooting
+
+    └── scripts/         Retired Python/shell scripts
+
+```**👉 Use this during actual deployment**
+
+
+
+------
+
+
+
+## 🎯 Quick links by topic### 3. 📋 **PHANTOM_FIX_DEPLOYMENT_GUIDE.md** [DETAILED STEPS]
+
 - **Type:** Comprehensive Deployment Manual
-- **Time to Read:** 10 minutes
-- **Contains:**
-  - Verification commands
-  - System preparation
-  - Step-by-step startup
-  - Phantom scan triggering
-  - Real-time monitoring
+
+### Architecture- **Time to Read:** 10 minutes
+
+- [`LOGICAL_LAYERED_ARCHITECTURE`](./docs/architecture/LOGICAL_LAYERED_ARCHITECTURE.md) — the 8-layer model- **Contains:**
+
+- [`PHASE_C_D_COMPLETION`](./docs/architecture/PHASE_C_D_COMPLETION.md) — migration completion report  - Verification commands
+
+- [`LAYER_TESTING_STRATEGY`](./docs/architecture/LAYER_TESTING_STRATEGY.md) — test layout per layer  - System preparation
+
+- [`TECHNICAL_DECISION_FLOWS`](./docs/architecture/TECHNICAL_DECISION_FLOWS.md)  - Step-by-step startup
+
+- [`STATE_RECOVERY_SYSTEM`](./docs/architecture/STATE_RECOVERY_SYSTEM.md)  - Phantom scan triggering
+
+- [`SIGNAL_GENERATION_AUDIT`](./docs/architecture/SIGNAL_GENERATION_AUDIT.md)  - Real-time monitoring
+
   - Validation checklist
-  - Success scenarios (A/B/C)
-  - Troubleshooting guide
-  - Rollback procedure
-  - Monitoring commands
-  - Expected timeline
-  - Support contact
+
+### Strategy  - Success scenarios (A/B/C)
+
+- [`BASIS_FOR_BUYSELL_DECISIONS`](./docs/strategy/BASIS_FOR_BUYSELL_DECISIONS.md)  - Troubleshooting guide
+
+- [`00_THREE_BUCKET_IMPLEMENTATION`](./docs/strategy/00_THREE_BUCKET_IMPLEMENTATION.md)  - Rollback procedure
+
+- [`SYMBOL_ENTRY_EXIT_STRATEGY`](./docs/strategy/SYMBOL_ENTRY_EXIT_STRATEGY.md)  - Monitoring commands
+
+- [`LIQUIDATE_VS_REINVEST_DECISION_LOGIC`](./docs/strategy/LIQUIDATE_VS_REINVEST_DECISION_LOGIC.md)  - Expected timeline
+
+- [`REINVESTMENT_AND_COMPOUNDING_ANALYSIS`](./docs/strategy/REINVESTMENT_AND_COMPOUNDING_ANALYSIS.md)  - Support contact
+
+- [`ML_PERFORMANCE_ANALYSIS`](./docs/strategy/ML_PERFORMANCE_ANALYSIS.md)
 
 **👉 Use for detailed guidance if issues occur**
 
----
+### Operations
 
-### 4. 📊 **IMPLEMENTATION_COMPLETE.md** [TECHNICAL DETAILS]
-- **Type:** Technical Documentation
-- **Time to Read:** 8 minutes
-- **Contains:**
+- [`OPERATIONAL_QUICK_START`](./docs/operations/OPERATIONAL_QUICK_START.md)---
+
+- [`PRODUCTION_ROLLOUT_PLAN`](./docs/operations/PRODUCTION_ROLLOUT_PLAN.md)
+
+- [`BALANCE_MONITORING_QUICKSTART`](./docs/operations/BALANCE_MONITORING_QUICKSTART.md)### 4. 📊 **IMPLEMENTATION_COMPLETE.md** [TECHNICAL DETAILS]
+
+- [`OBJECTIVE_DASHBOARD`](./docs/operations/OBJECTIVE_DASHBOARD.md)- **Type:** Technical Documentation
+
+- [`MONITORING_ACTIVE`](./docs/operations/MONITORING_ACTIVE.md)- **Time to Read:** 8 minutes
+
+- [`docs/INCIDENT_RUNBOOKS.md`](./docs/INCIDENT_RUNBOOKS.md)- **Contains:**
+
   - File changes summary
-  - 4-phase architecture details
+
+---  - 4-phase architecture details
+
   - Integration points
-  - Deployment checklist
+
+## 🐍 Live entry points (root `.py`)  - Deployment checklist
+
   - Validation commands
-  - File reference table
-  - Key files reference
 
-**👉 Use for understanding technical implementation**
+| Script | Role |  - File reference table
 
----
+|---|---|  - Key files reference
 
-### 5. 📚 **PHANTOM_POSITION_FIX_IMPLEMENTED.md** [FULL REFERENCE]
-- **Type:** Complete Technical Reference
-- **Time to Read:** 15 minutes
+| `🎯_MASTER_SYSTEM_ORCHESTRATOR.py` | Top-level orchestrator |
+
+| `AUTONOMOUS_SYSTEM_STARTUP.py` | Autonomous bootstrap |**👉 Use for understanding technical implementation**
+
+| `PRODUCTION_STARTUP.py` | Production launcher |
+
+| `RUN_AUTONOMOUS_LIVE.py` | Live trading runner |---
+
+| `auto_recovery.py` | Crash/recovery helper |
+
+| `system_state_manager.py` | State persistence |### 5. 📚 **PHANTOM_POSITION_FIX_IMPLEMENTED.md** [FULL REFERENCE]
+
+| `balance_threshold_config.py` | Threshold tuning |- **Type:** Complete Technical Reference
+
+| `diagnostic_signal_flow.py` | Signal-flow diagnostic |- **Time to Read:** 15 minutes
+
 - **Contains:**
-  - Problem analysis
+
+All other code lives under `src/lN_*/` (8-layer architecture). See `src/_layer_index.py`.  - Problem analysis
+
   - Root cause explanation
-  - Solution architecture
+
+---  - Solution architecture
+
   - All code samples
-  - Configuration reference
+
+## 🗂 Archive policy  - Configuration reference
+
   - Testing procedures
-  - Monitoring logs explained
-  - Expected behavior
-  - Troubleshooting scenarios
+
+Anything under `docs/archive/` is **read-only history**. It captures completed sessions,  - Monitoring logs explained
+
+fix-investigations, deployment phases, and retired scripts. Do not import from or link to  - Expected behavior
+
+archived files in live code or current docs.  - Troubleshooting scenarios
+
 
 **👉 Use for deep technical understanding**
 
