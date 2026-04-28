@@ -179,7 +179,6 @@ LAYER_MODULES: Dict[str, Dict[str, str]] = {
     "l8_lifecycle": {
         "lifecycle_manager":     "src.l8_lifecycle.lifecycle_manager",
         "startup_orchestrator":  "src.l8_lifecycle.startup_orchestrator",
-        "layer_orchestrator":    "src.l8_lifecycle.layer_orchestrator",
         "watchdog":              "src.l8_lifecycle.watchdog",
         "chaos_monkey":          "src.l8_lifecycle.chaos_monkey",
         "meta_controller":       "src.l8_lifecycle.meta_controller",

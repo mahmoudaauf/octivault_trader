@@ -268,7 +268,6 @@ FILE_LAYER_MAP: Dict[str, str] = {
     "src/l7_observability/prometheus_exporter.py":               "L7",
     # ---- L8: l8_lifecycle ----
     "src/l8_lifecycle/chaos_monkey.py":                          "L8",
-    "src/l8_lifecycle/layer_orchestrator.py":                    "L8",
     "src/l8_lifecycle/lifecycle_manager.py":                     "L8",
     "src/l8_lifecycle/meta_controller.py":                       "L8",
     "src/l8_lifecycle/startup_orchestrator.py":                  "L8",

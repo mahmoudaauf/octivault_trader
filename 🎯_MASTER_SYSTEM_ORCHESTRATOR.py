@@ -369,12 +369,6 @@ try:
     except Exception:
         HAS_STATE_SYNCHRONIZER = False
 
-    try:
-        from src.l8_lifecycle.layer_orchestrator import LayerOrchestrator
-        HAS_LAYER_ORCHESTRATOR = True
-    except Exception:
-        HAS_LAYER_ORCHESTRATOR = False
-
     # --- Market data ---
     try:
         from src.l1_exchange.ws_market_data import WebSocketMarketData
@@ -654,7 +648,6 @@ class MasterSystemOrchestrator:
         self.portfolio_manager: Optional[object] = None
         self.state_synchronizer: Optional[object] = None
         self.state_sync_task: Optional[object] = None
-        self.layer_orchestrator: Optional[object] = None
         self.ws_market_data: Optional[object] = None
         self.prometheus_metrics: Optional[object] = None
         self.health_check_manager: Optional[object] = None
@@ -1456,21 +1449,6 @@ class MasterSystemOrchestrator:
                     logger.info("✅ StateSynchronizer started (reconciles state every %ss)", getattr(self.config, "STATE_SYNC_INTERVAL_S", 60))
                 except Exception as _ss_e:
                     logger.warning("⚠️  StateSynchronizer: %s", _ss_e)
-
-            # LAYER 8.2: LAYER ORCHESTRATOR (Wallet → Portfolio → Strategy 3-layer cycle)
-            if HAS_LAYER_ORCHESTRATOR:
-                try:
-                    self.layer_orchestrator = LayerOrchestrator(
-                        shared_state=self.shared_state,
-                        config=self.config,
-                        wallet_scanner=getattr(self, "wallet_scanner_agent", None),
-                        portfolio_manager=self.portfolio_manager,
-                        strategy_executor=self.execution_manager,
-                    )
-                    asyncio.create_task(self.layer_orchestrator.start(), name="LayerOrchestrator")
-                    logger.info("✅ LayerOrchestrator started (Wallet→Portfolio→Strategy cycle)")
-                except Exception as _lo_e:
-                    logger.warning("⚠️  LayerOrchestrator: %s", _lo_e)
 
             # LAYER 8.3: REPLAY ENGINE (deterministic event replay for analysis)
             if HAS_REPLAY_ENGINE:
