@@ -334,6 +334,7 @@ EXCLUDE_DIRS = {
     ".mypy_cache", ".pytest_cache", "models", "snapshots", "logs",
     "artifacts", "validation_outputs", "data", "state",
     "tests",                # tests cross layers intentionally
+    "archive",              # docs/archive/ — historical scripts, not live code
 }
 
 # Module-name prefixes that come from the workspace.

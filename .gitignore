@@ -135,3 +135,6 @@ models/_incompatible_quarantine/
 
 # Claude Code worktrees (sibling checkouts, not real consumers)
 .claude/
+
+# Process output captures
+*.out
