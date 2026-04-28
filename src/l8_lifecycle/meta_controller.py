@@ -4334,6 +4334,31 @@ class MetaController:
     async def _passes_meta_sell_profit_gate(self, symbol: str, sig: Dict[str, Any]) -> bool:
         """Fee-aware profit gate for MetaController-originated SELLs."""
         strict_profit_only = bool(getattr(self.config, "STRICT_PROFIT_ONLY_SELLS", False))
+
+        # ── Heal-fix B (run-#7): auto-engage STRICT mode below NAV threshold.
+        # On micro-accounts, every "rotation/liquidation/concentration" exit
+        # bypassed the profit gate and locked in a guaranteed fee-loss
+        # (round-trip ≈ 0.3% on ~$25 notional ≈ $0.075 bleed per trade).
+        # When NAV is below HEAL_STRICT_BELOW_NAV (default $150), no exit
+        # should bypass the fee gate. Stop-loss/SL still bypasses below.
+        try:
+            heal_strict_threshold = float(os.environ.get("HEAL_STRICT_BELOW_NAV", "150") or 0.0)
+            if heal_strict_threshold > 0 and not strict_profit_only:
+                _nav_now = 0.0
+                with contextlib.suppress(Exception):
+                    _nav_now = float(getattr(self.shared_state, "_last_nav", 0.0) or 0.0)
+                if _nav_now <= 0:
+                    with contextlib.suppress(Exception):
+                        _nav_now = float(await self.shared_state.calculate_nav())
+                if 0 < _nav_now <= heal_strict_threshold:
+                    strict_profit_only = True
+                    self.logger.info(
+                        "[Meta:ProfitGate:Heal] NAV=$%.2f ≤ $%.2f — auto-engaging STRICT mode (no rotation/liquidation/concentration bypass). symbol=%s",
+                        _nav_now, heal_strict_threshold, symbol,
+                    )
+        except Exception:
+            pass
+
         reason_text = " ".join([
             str(sig.get("reason") or ""),
             str(sig.get("tag") or ""),
@@ -4391,7 +4416,16 @@ class MetaController:
             or "EMERGENCY" in reason_text
             or "SL" in reason_text
         ):
-            return True
+            # Heal-fix B: SL/EMERGENCY always bypass (real risk events).
+            # On micro-NAV (auto-strict), liquidation/starvation/time-exit must
+            # still satisfy the fee gate — they're the run-#7 bleed vector.
+            if strict_profit_only and not ("EMERGENCY" in reason_text or "SL" in reason_text):
+                self.logger.info(
+                    "[Meta:ProfitGate:Heal] STRICT/micro-NAV: %s liquidation/starvation/time bypass denied. reason=%s",
+                    symbol, reason_text or sig.get("reason", "?"),
+                )
+            else:
+                return True
 
         # Resolve entry price
         entry_price = 0.0
@@ -11120,7 +11154,32 @@ class MetaController:
             
             # Only trigger if portfolio is tight (>= 80% full)
             if used_ratio < 0.80:
-                return None  # Portfolio has space, no consolidation needed
+                # Heal-fix C (run-#7): on micro-NAV, also trigger sweep when wallet
+                # is fragmented even if capacity isn't tight. This recovers the
+                # ~$0.15 dust crumbs left after every SELL that compound into bleed.
+                heal_sweep = False
+                try:
+                    heal_below_nav = float(os.environ.get("HEAL_DUST_SWEEP_BELOW_NAV", "150") or 0.0)
+                    heal_min_dust_count = int(os.environ.get("HEAL_DUST_SWEEP_MIN_COUNT", "10") or 10)
+                    heal_interval = float(os.environ.get("HEAL_DUST_SWEEP_INTERVAL_SEC", "1800") or 1800)
+                    if heal_below_nav > 0 and len(dust_positions) >= heal_min_dust_count:
+                        _nav_now = 0.0
+                        with contextlib.suppress(Exception):
+                            _nav_now = float(getattr(self.shared_state, "_last_nav", 0.0) or 0.0)
+                        if 0 < _nav_now <= heal_below_nav:
+                            _last = float(getattr(self, "_heal_dust_last_sweep_ts", 0.0) or 0.0)
+                            if (time.time() - _last) >= heal_interval:
+                                heal_sweep = True
+                                self._heal_dust_last_sweep_ts = time.time()
+                                self.logger.warning(
+                                    "[Meta:Heal:DustSweep] NAV=$%.2f ≤ $%.2f, dust_count=%d ≥ %d, "
+                                    "interval_ok — engaging periodic dust consolidation.",
+                                    _nav_now, heal_below_nav, len(dust_positions), heal_min_dust_count,
+                                )
+                except Exception as _hsw_err:
+                    self.logger.debug("[Meta:Heal:DustSweep] check failed: %s", _hsw_err)
+                if not heal_sweep:
+                    return None  # Portfolio has space, no consolidation needed
             
             # ===== CONSOLIDATION ACTION =====
             self.logger.warning(

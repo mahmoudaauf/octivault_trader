@@ -5514,6 +5514,20 @@ class SharedState:
                     mirrored_flag = True
                     classification_value = "EXTERNAL_POSITION" if is_significant else "DUST"
                 
+                # ── Heal-fix A (run-#7): hydrated positions had no entry_time, which
+                # caused MetaController._passes_min_hold to fail-open and approve
+                # holding_sec=0.0 instant-rotation exits. Stamp entry_time now so
+                # MIN_HOLD_SEC actually constrains hydrated positions. We use
+                # NOW() (not "ancient") so the bot must wait MIN_HOLD_SEC before
+                # rotating these out — preventing the run-#7 fee-bleed pattern.
+                _now_ts = time.time()
+                _existing_entry_ts = float(pos.get("entry_time") or 0.0)
+                if _existing_entry_ts <= 0:
+                    pos["entry_time"] = _now_ts
+                    pos["opened_at"] = pos.get("opened_at") or _now_ts
+                    pos["_hydrated"] = True
+                    pos["_hydrated_at"] = _now_ts
+
                 pos.update({
                     "quantity": free_qty,
                     "avg_price": avg_price,
