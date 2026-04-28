@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
-from .shared_state import SharedState, PortfolioState
+from src.l0_core.shared_state import SharedState, PortfolioState
 
 
 @dataclass

@@ -21,10 +21,10 @@ import inspect
 from src.l6_governance.adaptive_capital_engine import AdaptiveCapitalEngine
 
 if TYPE_CHECKING:
-    from .shared_state import SharedState
-    from .execution_manager import ExecutionManager
-    from .config import Config
-    from .mode_manager import ModeManager
+    from src.l0_core.shared_state import SharedState
+    from src.l4_execution.execution_manager import ExecutionManager
+    from src.l0_core.config import Config
+    from src.l6_governance.mode_manager import ModeManager
 
 
 class ScalingManager:

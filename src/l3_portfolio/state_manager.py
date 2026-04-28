@@ -155,7 +155,7 @@ class StateManager:
             fn = getattr(self.shared_state, "update_system_health", None)
             if callable(fn):
                 # RULE: Use _safe_await to handle both sync and async SharedState implementations
-                from .core_utils import _safe_await
+                from src.l0_core.core_utils import _safe_await
                 await _safe_await(fn(component=self.component_name, status=status, detail=detail))
             else:
                 if hasattr(self.shared_state, "system_health"):
@@ -167,7 +167,7 @@ class StateManager:
         try:
             fn = getattr(self.shared_state, "update_component_status", None)
             if callable(fn):
-                from .core_utils import _safe_await
+                from src.l0_core.core_utils import _safe_await
                 await _safe_await(fn(self.component_name, status, detail))
         except Exception:
             self.logger.debug("update_component_status failed.", exc_info=True)
@@ -214,7 +214,7 @@ class StateManager:
             # 3. SharedState sync
             if hasattr(self.shared_state, "update_kpi_metric"):
                 try:
-                    from .core_utils import _safe_await
+                    from src.l0_core.core_utils import _safe_await
                     await _safe_await(self.shared_state.update_kpi_metric(metric_type, value))
                 except Exception:
                     pass

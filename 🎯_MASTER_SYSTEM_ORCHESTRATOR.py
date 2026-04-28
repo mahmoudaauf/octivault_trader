@@ -710,9 +710,9 @@ class MasterSystemOrchestrator:
         logger.info("✅ API keys configured")
         checks_passed += 1
         
-        # Check 4: Directory structure
+        # Check 4: Directory structure (post-migration: 8-layer src/l*_* layout)
         checks_total += 1
-        required_dirs = ["core", "agents", "utils", "config", "logs"]
+        required_dirs = ["src", "src/l0_core", "agents", "utils", "config", "logs"]
         for dir_name in required_dirs:
             if not (project_root / dir_name).exists():
                 logger.error(f"❌ Required directory missing: {dir_name}")

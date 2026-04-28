@@ -2614,7 +2614,7 @@ class SharedState:
         invested_capital = 0.0
         unrealized_pnl = 0.0
         rebuilt_positions: Dict[str, Dict[str, Any]] = {}
-        skipped_non_tradable = []
+        non_tradable_assets = []
 
         for asset, data in balances_snapshot.items():
             a = asset.upper()
@@ -2625,11 +2625,19 @@ class SharedState:
                 continue
 
             sym = f"{a}{quote_asset}"
-            if hasattr(self._exchange_client, "has_symbol") and not self._exchange_client.has_symbol(sym):
-                skipped_non_tradable.append(sym)
-                self.logger.debug(f"[SS:AuthoritativeSync] Ignoring non-tradable asset {a} (symbol {sym})")
-
-                continue
+            # Tradability check (Option A): keep ALL non-zero balances as positions
+            # for accurate NAV; only flag whether bot is allowed to sell them.
+            # has_symbol() is best-effort — it can return False if exchange-info hasn't
+            # loaded yet, so we treat True as "definitely tradable" and False as
+            # "unknown/non-tradable, do not sell, but still account".
+            is_tradable = True
+            if hasattr(self._exchange_client, "has_symbol"):
+                try:
+                    is_tradable = bool(self._exchange_client.has_symbol(sym))
+                except Exception:
+                    is_tradable = True  # default to tradable on error
+            if not is_tradable:
+                non_tradable_assets.append(sym)
 
             price = 0.0
             try:
@@ -2648,7 +2656,10 @@ class SharedState:
             position_value = qty * avg_price if avg_price > 0 else 0.0
             significant_floor = float(await self.get_significant_position_floor(sym) or 0.0)
             is_significant = bool(position_value >= significant_floor and position_value > 0.0)
-            if is_significant:
+            # NAV truthfulness: every priced wallet asset contributes to invested_capital,
+            # regardless of significance/tradability. Significance only governs whether
+            # the bot trades the position; it does not change accounting reality.
+            if position_value > 0.0:
                 invested_capital += position_value
             rebuilt_positions[sym] = {
                 "quantity": qty,
@@ -2662,11 +2673,19 @@ class SharedState:
                 "is_significant": bool(is_significant),
                 "is_dust": not bool(is_significant),
                 "_is_dust": not bool(is_significant),
-                "open_position": bool(is_significant),
+                "is_tradable": bool(is_tradable),
+                "open_position": bool(is_significant) and bool(is_tradable),
                 "_mirrored": True,
             }
             if price > 0:
                 self.latest_prices[sym] = price
+
+        if non_tradable_assets:
+            self.logger.info(
+                f"[SS:AuthoritativeSync] {len(non_tradable_assets)} non-tradable asset(s) "
+                f"included in NAV but flagged read-only: {non_tradable_assets[:10]}"
+                + (" ..." if len(non_tradable_assets) > 10 else "")
+            )
 
         # Recompute free capital from quote balance
         quote_bal = balances_snapshot.get(quote_asset, {})
@@ -2736,8 +2755,8 @@ class SharedState:
             self.logger.warning("[SS:AuthoritativeSync] NAV rebuild failed: %s", e)
 
         log_msg = f"[SS:AuthoritativeSync] Done | positions={len(rebuilt_positions)} invested={invested_capital:.2f} free={free_capital:.2f} quote={quote_asset}"
-        if skipped_non_tradable:
-            log_msg += f" | skipped_non_tradable={len(skipped_non_tradable)} ({','.join(skipped_non_tradable[:5])}{'...' if len(skipped_non_tradable) > 5 else ''})"
+        if non_tradable_assets:
+            log_msg += f" | non_tradable={len(non_tradable_assets)} ({','.join(non_tradable_assets[:5])}{'...' if len(non_tradable_assets) > 5 else ''})"
         self.logger.warning(log_msg)
 
         return {
