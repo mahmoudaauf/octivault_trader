@@ -132,9 +132,6 @@ FILE_LAYER_MAP: Dict[str, str] = {
     # ---- L8: Lifecycle & Recovery -----------------------------------------
     "tools/diagnose_runtime.py":                "L8",
     "🎯_MASTER_SYSTEM_ORCHESTRATOR.py":         "L8",
-    "AUTONOMOUS_SYSTEM_STARTUP.py":             "L8",
-    "PRODUCTION_STARTUP.py":                    "L8",
-    "src/l8_lifecycle/runners/verify_deployment.py":      "L8",
     "src/l8_lifecycle/runners/verify_dust_fix.py":        "L8",
     "src/l8_lifecycle/runners/verify_fixes.py":           "L8",
     "src/l8_lifecycle/runners/verify_fixes_detailed.py":  "L8",
