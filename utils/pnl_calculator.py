@@ -7,7 +7,7 @@ import random
 import json
 from typing import Dict, Any, Optional
 from collections import deque
-from core.component_status_logger import ComponentStatusLogger
+from src.l0_core.component_status_logger import ComponentStatusLogger
 
 logger = logging.getLogger("PnLCalculator")
 logger.setLevel(logging.INFO)

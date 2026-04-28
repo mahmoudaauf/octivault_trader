@@ -5,19 +5,19 @@ from datetime import datetime, timedelta
 from typing import Callable, Awaitable, Any, List
 
 # ==== imports من مشروعك (عدّل المسارات لو تختلف) ====
-from core.config import Config
-from core.exchange_client import ExchangeClient
-from core.execution_manager import ExecutionManager
-from core.shared_state import SharedState
-from core.market_data_feed import MarketDataFeed
-from core.agent_manager import AgentManager
-from core.meta_controller import MetaController
-from core.tp_sl_engine import TP_SLEngine
-from core.risk_manager import RiskManager
-from core.diagnostics.system_summary import system_summary_logger
-from core.watchdog import Watchdog
-from core.heartbeat import Heartbeat
-from core.logger_utils import setup_structured_logging
+from src.l0_core.config import Config
+from src.l1_exchange.exchange_client import ExchangeClient
+from src.l4_execution.execution_manager import ExecutionManager
+from src.l0_core.shared_state import SharedState
+from src.l2_marketdata.market_data_feed import MarketDataFeed
+from src.l5_strategy.agent_manager import AgentManager
+from src.l8_lifecycle.meta_controller import MetaController
+from src.l4_execution.tp_sl_engine import TP_SLEngine
+from src.l6_governance.risk_manager import RiskManager
+from src.l7_observability.diagnostics.system_summary import system_summary_logger
+from src.l8_lifecycle.watchdog import Watchdog
+from src.l2_marketdata.heartbeat import Heartbeat
+from src.l0_core.logger_utils import setup_structured_logging
 
 # ========== إعدادات تشخيص ==========
 LIVE_MODE = True            # شغّل على Binance Live

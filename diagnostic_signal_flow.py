@@ -26,10 +26,10 @@ async def diagnose_signal_flow():
     """)
     
     try:
-        from core.shared_state import SharedState
-        from core.signal_manager import SignalManager
+        from src.l0_core.shared_state import SharedState
+        from src.l5_strategy.signal_manager import SignalManager
         from core.market_data_client import MarketDataClient
-        from core.config import TradingConfig
+        from src.l0_core.config import TradingConfig
         import logging
         
         # Setup logging

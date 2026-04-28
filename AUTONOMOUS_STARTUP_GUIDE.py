@@ -185,8 +185,8 @@ Before running in LIVE mode, verify:
 Quick verification test:
 
   python3 -c "
-from core.config import Config
-from core.exchange_client import ExchangeClient
+from src.l0_core.config import Config
+from src.l1_exchange.exchange_client import ExchangeClient
 import asyncio
 
 async def test():

@@ -39,9 +39,9 @@ except Exception:
 # =============================
 # Local Imports
 # =============================
-from core.stubs import TradeIntent, ExecOrder
-from core.model_manager import load_model as _load_model, build_model_path, safe_load_model
-from core.component_status_logger import log_component_status
+from src.l0_core.stubs import TradeIntent, ExecOrder
+from src.l5_strategy.model_manager import load_model as _load_model, build_model_path, safe_load_model
+from src.l0_core.component_status_logger import log_component_status
 from utils.indicators import compute_ema, compute_macd
 from utils.volatility_adjusted_confidence import (
     compute_heuristic_confidence,
@@ -291,7 +291,7 @@ class TrendHunter:
 
     def _load_tuned(self) -> Dict[str, Any]:
         try:
-            from core.agent_optimizer import load_tuned_params
+            from src.l5_strategy.agent_optimizer import load_tuned_params
             result = load_tuned_params(self.name) or {}
             if result:
                 return result
@@ -470,7 +470,7 @@ class TrendHunter:
             train_rows = rows[-int(max_rows):]
 
             # 3) Run Trainer in ThreadPool to avoid blocking main loop.
-            from core.model_trainer import ModelTrainer
+            from src.l5_strategy.model_trainer import ModelTrainer
             trainer = ModelTrainer(
                 symbol,
                 timeframe=self.timeframe,
@@ -589,7 +589,7 @@ class TrendHunter:
         if not accepted:
             logger.warning("[%s] ⚠️  accepted_symbols is empty! Using DEFAULT_SYMBOLS fallback...", self.name)
             try:
-                from core.bootstrap_symbols import DEFAULT_SYMBOLS
+                from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
                 accepted = DEFAULT_SYMBOLS
                 logger.warning("[%s] ✅ Using %d DEFAULT_SYMBOLS as fallback", self.name, len(DEFAULT_SYMBOLS))
             except Exception as e:

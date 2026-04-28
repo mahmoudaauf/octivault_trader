@@ -384,7 +384,7 @@ class WalletScannerAgent:
                                 price = 1.0
                         
                         # Import AssetClassification enum
-                        from core.shared_state import AssetClassification
+                        from src.l0_core.shared_state import AssetClassification
                         
                         # Convert string classification to enum
                         try:

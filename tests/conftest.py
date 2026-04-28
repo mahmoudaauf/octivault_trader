@@ -141,7 +141,7 @@ async def app_context(mock_exchange_client, mock_market_data, mock_database, moc
     Initializes with mocked external dependencies
     """
     try:
-        from core.app_context import AppContext
+        from src.l8_lifecycle.app_context import AppContext
     except ImportError:
         # If AppContext doesn't exist, create a mock
         class MockAppContext:

@@ -48,9 +48,9 @@ logger = logging.getLogger(__name__)
 
 # Import core modules
 try:
-    from core.exchange_client import ExchangeClient
-    from core.shared_state import SharedState
-    from core.polling_coordinator import PollingCoordinator, PollingConfig
+    from src.l1_exchange.exchange_client import ExchangeClient
+    from src.l0_core.shared_state import SharedState
+    from src.l1_exchange.polling_coordinator import PollingCoordinator, PollingConfig
     from dotenv import load_dotenv
 except ImportError as e:
     logger.error(f"Failed to import core modules: {e}")

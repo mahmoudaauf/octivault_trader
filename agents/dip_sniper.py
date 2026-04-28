@@ -9,7 +9,7 @@ from functools import partial
 
 from utils.indicators import compute_ema, compute_bollinger_bands, compute_atr
 try:
-    from core.agent_optimizer import load_tuned_params as _load_tuned_params_optimizer
+    from src.l5_strategy.agent_optimizer import load_tuned_params as _load_tuned_params_optimizer
     _HAS_AGENT_OPTIMIZER = True
 except Exception:
     _load_tuned_params_optimizer = None
@@ -43,8 +43,8 @@ def load_tuned_params(name):
             pass
     return {}
 
-from core.component_status_logger import log_component_status
-from core.stubs import TradeIntent
+from src.l0_core.component_status_logger import log_component_status
+from src.l0_core.stubs import TradeIntent
 
 AGENT_NAME = "DipSniper"
 logger = logging.getLogger(AGENT_NAME)
@@ -313,7 +313,7 @@ class DipSniper:
             if not accepted:
                 logger.warning(f"[{self.name}] ⚠️  accepted_symbols is empty! Using DEFAULT_SYMBOLS fallback...")
                 try:
-                    from core.bootstrap_symbols import DEFAULT_SYMBOLS
+                    from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
                     accepted = DEFAULT_SYMBOLS
                     logger.warning(f"[{self.name}] ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
                 except Exception as e:

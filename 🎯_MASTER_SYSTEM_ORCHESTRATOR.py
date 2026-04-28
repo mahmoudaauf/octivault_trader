@@ -71,85 +71,85 @@ logger = setup_logging()
 
 try:
     from dotenv import load_dotenv
-    from core.config import Config as CoreConfig
-    from core.exchange_client import ExchangeClient
-    from core.shared_state import SharedState
-    from core.polling_coordinator import PollingCoordinator, PollingConfig
-    from core.signal_manager import SignalManager
-    from core.execution_manager import ExecutionManager
-    from core.risk_manager import RiskManager
-    from core.tp_sl_engine import TPSLEngine  # ← CRITICAL: TP/SL monitoring for position management
-    from core.meta_controller import MetaController
-    from core.agent_manager import AgentManager
-    from core.market_data_feed import MarketDataFeed  # ← CRITICAL: Add market data streaming
-    from core.health_monitor import HealthMonitor
-    from core.watchdog import Watchdog
-    from core.heartbeat import Heartbeat
+    from src.l0_core.config import Config as CoreConfig
+    from src.l1_exchange.exchange_client import ExchangeClient
+    from src.l0_core.shared_state import SharedState
+    from src.l1_exchange.polling_coordinator import PollingCoordinator, PollingConfig
+    from src.l5_strategy.signal_manager import SignalManager
+    from src.l4_execution.execution_manager import ExecutionManager
+    from src.l6_governance.risk_manager import RiskManager
+    from src.l4_execution.tp_sl_engine import TPSLEngine  # ← CRITICAL: TP/SL monitoring for position management
+    from src.l8_lifecycle.meta_controller import MetaController
+    from src.l5_strategy.agent_manager import AgentManager
+    from src.l2_marketdata.market_data_feed import MarketDataFeed  # ← CRITICAL: Add market data streaming
+    from src.l7_observability.health_monitor import HealthMonitor
+    from src.l8_lifecycle.watchdog import Watchdog
+    from src.l2_marketdata.heartbeat import Heartbeat
     
     # OPTIONAL COMPONENTS (Enhanced System Features)
     try:
-        from core.recovery_engine import RecoveryEngine
+        from src.l4_execution.recovery_engine import RecoveryEngine
         HAS_RECOVERY_ENGINE = True
     except Exception:
         HAS_RECOVERY_ENGINE = False
 
     try:
-        from core.startup_orchestrator import StartupOrchestrator
+        from src.l8_lifecycle.startup_orchestrator import StartupOrchestrator
         HAS_STARTUP_ORCHESTRATOR = True
     except Exception:
         HAS_STARTUP_ORCHESTRATOR = False
         logger.warning("⚠️ StartupOrchestrator not found — state hydration will be skipped")
 
     try:
-        from core.cash_router import CashRouter
+        from src.l4_execution.cash_router import CashRouter
         HAS_CASH_ROUTER = True
     except Exception:
         HAS_CASH_ROUTER = False
 
     try:
-        from core.external_adoption_engine import ExternalAdoptionEngine
+        from src.l5_strategy.external_adoption_engine import ExternalAdoptionEngine
         HAS_EXTERNAL_ADOPTION_ENGINE = True
     except Exception:
         HAS_EXTERNAL_ADOPTION_ENGINE = False
 
     try:
-        from core.dead_capital_healer import DeadCapitalHealer
+        from src.l3_portfolio.dead_capital_healer import DeadCapitalHealer
         HAS_DEAD_CAPITAL_HEALER = True
     except Exception:
         HAS_DEAD_CAPITAL_HEALER = False
     
     try:
-        from core.bootstrap_manager import BootstrapDustBypassManager
+        from src.l3_portfolio.bootstrap_manager import BootstrapDustBypassManager
         HAS_BOOTSTRAP_MANAGER = True
     except Exception:
         HAS_BOOTSTRAP_MANAGER = False
     
     try:
-        from core.performance_monitor import PerformanceMonitor
+        from src.l7_observability.performance_monitor import PerformanceMonitor
         HAS_PERFORMANCE_MONITOR = True
     except Exception:
         HAS_PERFORMANCE_MONITOR = False
 
     try:
-        from core.profit_target_engine import ProfitTargetEngine
+        from src.l4_execution.profit_target_engine import ProfitTargetEngine
         HAS_PROFIT_TARGET_ENGINE = True
     except Exception:
         HAS_PROFIT_TARGET_ENGINE = False
     
     try:
-        from core.capital_allocator import CapitalAllocator
+        from src.l6_governance.capital_allocator import CapitalAllocator
         HAS_CAPITAL_ALLOCATOR = True
     except Exception:
         HAS_CAPITAL_ALLOCATOR = False
     
     try:
-        from core.symbol_manager import SymbolManager
+        from src.l3_portfolio.symbol_manager import SymbolManager
         HAS_SYMBOL_MANAGER = True
     except Exception:
         HAS_SYMBOL_MANAGER = False
 
     try:
-        from core.universe_rotation_engine import UniverseRotationEngine
+        from src.l3_portfolio.universe_rotation_engine import UniverseRotationEngine
         HAS_UNIVERSE_ROTATION_ENGINE = True
     except Exception:
         HAS_UNIVERSE_ROTATION_ENGINE = False
@@ -161,67 +161,67 @@ try:
         HAS_PNL_CALCULATOR = False
 
     try:
-        from core.performance_evaluator import PerformanceEvaluator
+        from src.l5_strategy.performance_evaluator import PerformanceEvaluator
         HAS_PERFORMANCE_EVALUATOR = True
     except Exception:
         HAS_PERFORMANCE_EVALUATOR = False
 
     try:
-        from core.portfolio_balancer import PortfolioBalancer
+        from src.l3_portfolio.portfolio_balancer import PortfolioBalancer
         HAS_PORTFOLIO_BALANCER = True
     except Exception:
         HAS_PORTFOLIO_BALANCER = False
 
     try:
-        from core.liquidation_orchestrator import LiquidationOrchestrator
+        from src.l4_execution.liquidation_orchestrator import LiquidationOrchestrator
         HAS_LIQUIDATION_ORCHESTRATOR = True
     except Exception:
         HAS_LIQUIDATION_ORCHESTRATOR = False
 
     try:
-        from core.alert_system import AlertSystem
+        from src.l7_observability.alert_system import AlertSystem
         HAS_ALERT_SYSTEM = True
     except Exception:
         HAS_ALERT_SYSTEM = False
 
     try:
-        from core.exchange_truth_auditor import ExchangeTruthAuditor
+        from src.l1_exchange.exchange_truth_auditor import ExchangeTruthAuditor
         HAS_EXCHANGE_TRUTH_AUDITOR = True
     except Exception:
         HAS_EXCHANGE_TRUTH_AUDITOR = False
 
     try:
-        from core.position_merger_enhanced import PositionMergerEnhanced
+        from src.l3_portfolio.position_merger_enhanced import PositionMergerEnhanced
         HAS_POSITION_MERGER_ENHANCED = True
     except Exception:
         HAS_POSITION_MERGER_ENHANCED = False
 
     try:
-        from core.rebalancing_engine import RebalancingEngine, AllocationTarget, RebalanceStrategy
+        from src.l6_governance.rebalancing_engine import RebalancingEngine, AllocationTarget, RebalanceStrategy
         HAS_REBALANCING_ENGINE = True
     except Exception:
         HAS_REBALANCING_ENGINE = False
 
     try:
-        from core.volatility_regime import VolatilityRegimeDetector
+        from src.l2_marketdata.volatility_regime import VolatilityRegimeDetector
         HAS_VOLATILITY_REGIME = True
     except Exception:
         HAS_VOLATILITY_REGIME = False
 
     try:
-        from core.compounding_engine import CompoundingEngine
+        from src.l6_governance.compounding_engine import CompoundingEngine
         HAS_COMPOUNDING_ENGINE = True
     except Exception:
         HAS_COMPOUNDING_ENGINE = False
     
     try:
-        from core.three_bucket_manager import ThreeBucketPortfolioManager
+        from src.l3_portfolio.three_bucket_manager import ThreeBucketPortfolioManager
         HAS_THREE_BUCKET_MANAGER = True
     except Exception:
         HAS_THREE_BUCKET_MANAGER = False
     
     try:
-        from core.portfolio_segmentation import PortfolioSegmentationManager
+        from src.l3_portfolio.portfolio_segmentation import PortfolioSegmentationManager
         HAS_PORTFOLIO_SEGMENTATION = True
     except Exception:
         HAS_PORTFOLIO_SEGMENTATION = False
@@ -257,171 +257,171 @@ try:
 
     # --- Contracts & constants ---
     try:
-        from core.config_constants import TimeoutConstants, RetryConstants, CapitalConstants, ConfidenceConstants, get_all_constants
+        from src.l0_core.config_constants import TimeoutConstants, RetryConstants, CapitalConstants, ConfidenceConstants, get_all_constants
         HAS_CONFIG_CONSTANTS = True
     except Exception:
         HAS_CONFIG_CONSTANTS = False
 
     try:
-        from core.config_validator import validate_config_on_startup
+        from src.l0_core.config_validator import validate_config_on_startup
         HAS_CONFIG_VALIDATOR = True
     except Exception:
         HAS_CONFIG_VALIDATOR = False
 
     try:
-        from core.contracts import TradeIntent as ContractTradeIntent, OrderSide as ContractOrderSide
+        from src.l0_core.contracts import TradeIntent as ContractTradeIntent, OrderSide as ContractOrderSide
         HAS_CONTRACTS = True
     except Exception:
         HAS_CONTRACTS = False
 
     try:
-        from core.baseline_trading_kernel import KernelState, MetaPolicy, Readiness
+        from src.l5_strategy.baseline_trading_kernel import KernelState, MetaPolicy, Readiness
         HAS_BASELINE_KERNEL = True
     except Exception:
         HAS_BASELINE_KERNEL = False
 
     try:
-        from core.layer_contracts import LayerInput, LayerOutput, WalletLayerContract, PortfolioLayerContract
+        from src.l0_core.layer_contracts import LayerInput, LayerOutput, WalletLayerContract, PortfolioLayerContract
         HAS_LAYER_CONTRACTS = True
     except Exception:
         HAS_LAYER_CONTRACTS = False
 
     # --- Market intelligence ---
     try:
-        from core.market_regime_detector import MarketRegimeDetector, MarketRegime
+        from src.l2_marketdata.market_regime_detector import MarketRegimeDetector, MarketRegime
         HAS_MARKET_REGIME_DETECTOR = True
     except Exception:
         HAS_MARKET_REGIME_DETECTOR = False
 
     try:
-        from core.market_regime_integration import RegimeAwareMediator
+        from src.l2_marketdata.market_regime_integration import RegimeAwareMediator
         HAS_REGIME_INTEGRATION = True
     except Exception:
         HAS_REGIME_INTEGRATION = False
 
     try:
-        from core.discovery_coordinator import DiscoveryCoordinator
+        from src.l3_portfolio.discovery_coordinator import DiscoveryCoordinator
         HAS_DISCOVERY_COORDINATOR = True
     except Exception:
         HAS_DISCOVERY_COORDINATOR = False
 
     # --- Capital & risk management ---
     try:
-        from core.capital_symbol_governor import CapitalSymbolGovernor
+        from src.l6_governance.capital_symbol_governor import CapitalSymbolGovernor
         HAS_CAPITAL_SYMBOL_GOVERNOR = True
     except Exception:
         HAS_CAPITAL_SYMBOL_GOVERNOR = False
 
     try:
-        from core.reserve_manager import ReserveManager
+        from src.l3_portfolio.reserve_manager import ReserveManager
         HAS_RESERVE_MANAGER = True
     except Exception:
         HAS_RESERVE_MANAGER = False
 
     # --- Execution & order management ---
     try:
-        from core.order_cache_manager import OrderCacheManager
+        from src.l1_exchange.order_cache_manager import OrderCacheManager
         HAS_ORDER_CACHE_MANAGER = True
     except Exception:
         HAS_ORDER_CACHE_MANAGER = False
 
     try:
-        from core.action_router import ActionRouter
+        from src.l4_execution.action_router import ActionRouter
         HAS_ACTION_ROUTER = True
     except Exception:
         HAS_ACTION_ROUTER = False
 
     try:
-        from core.exit_arbitrator import ExitArbitrator, get_arbitrator
+        from src.l4_execution.exit_arbitrator import ExitArbitrator, get_arbitrator
         HAS_EXIT_ARBITRATOR = True
     except Exception:
         HAS_EXIT_ARBITRATOR = False
 
     try:
-        from core.balance_sync_backoff import BalanceSyncRetryManager, BalanceSyncCoordinator
+        from src.l1_exchange.balance_sync_backoff import BalanceSyncRetryManager, BalanceSyncCoordinator
         HAS_BALANCE_SYNC_BACKOFF = True
     except Exception:
         HAS_BALANCE_SYNC_BACKOFF = False
 
     try:
-        from core.retry_manager import RetryManager
+        from src.l1_exchange.retry_manager import RetryManager
         HAS_RETRY_MANAGER = True
     except Exception:
         HAS_RETRY_MANAGER = False
 
     # --- Position & portfolio management ---
     try:
-        from core.position_manager import PositionManager
+        from src.l3_portfolio.position_manager import PositionManager
         HAS_POSITION_MANAGER = True
     except Exception:
         HAS_POSITION_MANAGER = False
 
     try:
-        from core.portfolio_manager import PortfolioManager
+        from src.l3_portfolio.portfolio_manager import PortfolioManager
         HAS_PORTFOLIO_MANAGER = True
     except Exception:
         HAS_PORTFOLIO_MANAGER = False
 
     # --- State & synchronization ---
     try:
-        from core.state_synchronizer import StateSynchronizer, StateSyncronizationTask
+        from src.l3_portfolio.state_synchronizer import StateSynchronizer, StateSyncronizationTask
         HAS_STATE_SYNCHRONIZER = True
     except Exception:
         HAS_STATE_SYNCHRONIZER = False
 
     try:
-        from core.layer_orchestrator import LayerOrchestrator
+        from src.l8_lifecycle.layer_orchestrator import LayerOrchestrator
         HAS_LAYER_ORCHESTRATOR = True
     except Exception:
         HAS_LAYER_ORCHESTRATOR = False
 
     # --- Market data ---
     try:
-        from core.ws_market_data import WebSocketMarketData
+        from src.l1_exchange.ws_market_data import WebSocketMarketData
         HAS_WS_MARKET_DATA = True
     except Exception:
         HAS_WS_MARKET_DATA = False
 
     # --- Observability ---
     try:
-        from core.prometheus_exporter import SafetyGuardMetrics, get_metrics
+        from src.l7_observability.prometheus_exporter import SafetyGuardMetrics, get_metrics
         HAS_PROMETHEUS_EXPORTER = True
     except Exception:
         HAS_PROMETHEUS_EXPORTER = False
 
     try:
-        from core.health_check_manager import HealthCheckManager
+        from src.l7_observability.health_check_manager import HealthCheckManager
         HAS_HEALTH_CHECK_MANAGER = True
     except Exception:
         HAS_HEALTH_CHECK_MANAGER = False
 
     try:
-        from core.health_endpoints import HealthEndpoints, register_health_endpoints
+        from src.l7_observability.health_endpoints import HealthEndpoints, register_health_endpoints
         HAS_HEALTH_ENDPOINTS = True
     except Exception:
         HAS_HEALTH_ENDPOINTS = False
 
     try:
-        from core.apm_instrument import APMInstrument, get_apm_instrument
+        from src.l7_observability.apm_instrument import APMInstrument, get_apm_instrument
         HAS_APM_INSTRUMENT = True
     except Exception:
         HAS_APM_INSTRUMENT = False
 
     try:
-        from core.dashboard import initialize_dashboard
+        from src.l7_observability.dashboard import initialize_dashboard
         HAS_DASHBOARD = True
     except Exception:
         HAS_DASHBOARD = False
 
     # --- Advanced / conditional ---
     try:
-        from core.replay_engine import DeterministicReplayEngine
+        from src.l3_portfolio.replay_engine import DeterministicReplayEngine
         HAS_REPLAY_ENGINE = True
     except Exception:
         HAS_REPLAY_ENGINE = False
 
     try:
-        from core.chaos_monkey import ChaosMonkey, get_chaos_monkey
+        from src.l8_lifecycle.chaos_monkey import ChaosMonkey, get_chaos_monkey
         HAS_CHAOS_MONKEY = True
     except Exception:
         HAS_CHAOS_MONKEY = False
@@ -832,7 +832,7 @@ class MasterSystemOrchestrator:
             # BOOTSTRAP: Seed default symbols if none present
             logger.info("\n[BOOTSTRAP] Seeding default symbols...")
             try:
-                from core.bootstrap_symbols import bootstrap_default_symbols
+                from src.l3_portfolio.bootstrap_symbols import bootstrap_default_symbols
                 await bootstrap_default_symbols(self.shared_state, logger)
                 logger.info("✅ Symbol bootstrap complete")
             except Exception as e:
@@ -1238,6 +1238,32 @@ class MasterSystemOrchestrator:
                 except Exception as _eae_e:
                     logger.warning("⚠️  ExternalAdoptionEngine failed: %s", _eae_e)
 
+            # ── COMPOUND GROWTH ENGINE — +2%/day target, kill-switches, reinvestment ──
+            logger.info("\n[6.45/9] COMPOUND GROWTH ENGINE")
+            try:
+                from tools.compound_engine import get_engine as _get_compound_engine
+                self.compound_growth_engine = _get_compound_engine(
+                    config=self.config,
+                    shared_state=self.shared_state,
+                )
+                # Inject into MetaController so it can read kill-switches & size multiplier
+                if hasattr(self.meta_controller, "set_compound_growth_engine"):
+                    self.meta_controller.set_compound_growth_engine(self.compound_growth_engine)
+                else:
+                    # Fallback: attach as attribute — MetaController reads it via getattr
+                    self.meta_controller.compound_growth_engine = self.compound_growth_engine
+                logger.info(
+                    "✅ CompoundGrowthEngine wired — target=+%.1f%%/day reinvest=%.0f%% "
+                    "dd_kill=%.0f%% loss_streak_kill=%d",
+                    self.compound_growth_engine.daily_target_pct * 100,
+                    self.compound_growth_engine.reinvest_rate * 100,
+                    self.compound_growth_engine.ks_daily_dd_pct * 100,
+                    self.compound_growth_engine.ks_consec_losses,
+                )
+            except Exception as _cge_err:
+                logger.warning("⚠️  CompoundGrowthEngine init failed (non-fatal): %s", _cge_err)
+                self.compound_growth_engine = None
+
             # THREE-BUCKET PORTFOLIO MANAGEMENT
             logger.info("\n[6.5/9] THREE-BUCKET PORTFOLIO MANAGEMENT")
             if HAS_THREE_BUCKET_MANAGER:
@@ -1322,7 +1348,7 @@ class MasterSystemOrchestrator:
             # LAYER 3D: Discovery Agents (Proposer System)
             logger.info("\n[7.3/9] LAYER 3D: Discovery Agents (Proposer System)")
             try:
-                from core.agent_registry import register_all_discovery_agents
+                from src.l5_strategy.agent_registry import register_all_discovery_agents
                 
                 # Create app_context-like object for discovery agents
                 class AppContext:
@@ -1437,7 +1463,7 @@ class MasterSystemOrchestrator:
                 try:
                     _replay_enabled = bool(getattr(self.config, "REPLAY_ENGINE_ENABLED", False))
                     if _replay_enabled:
-                        from core.event_store import get_event_store
+                        from src.l3_portfolio.event_store import get_event_store
                         _event_store = await get_event_store()
                         self.replay_engine = DeterministicReplayEngine(event_store=_event_store)
                         logger.info("✅ ReplayEngine initialized (deterministic event replay enabled)")
@@ -1504,7 +1530,7 @@ class MasterSystemOrchestrator:
                 try:
                     _replay_enabled = bool(getattr(self.config, "REPLAY_ENGINE_ENABLED", False))
                     if _replay_enabled:
-                        from core.event_store import get_event_store as _get_es
+                        from src.l3_portfolio.event_store import get_event_store as _get_es
                         _event_store = await _get_es()
                         self.replay_engine = DeterministicReplayEngine(event_store=_event_store)
                         logger.info("✅ ReplayEngine initialized (deterministic event replay active)")
@@ -2176,6 +2202,7 @@ class MasterSystemOrchestrator:
                 # Prefer long-running loop methods so orchestrator owns cancellation directly.
                 ("VolatilityRegimeDetector", self.volatility_regime, ("run", "run_loop", "run_forever", "start")),
                 ("CompoundingEngine", self.compounding_engine, ("run_loop", "run", "run_forever", "start")),
+                ("CompoundGrowthEngine", self.compound_growth_engine, ("run_checkpoint_loop",)),
                 ("AlertSystem", self.alert_system, None),
                 ("ExchangeTruthAuditor", self.exchange_truth_auditor, None),
                 ("PositionMergerEnhanced", self.position_merger_enhanced, None),

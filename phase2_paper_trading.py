@@ -52,8 +52,8 @@ logger = logging.getLogger(__name__)
 
 # Now import core modules
 try:
-    from core.exchange_client import ExchangeClient
-    from core.shared_state import SharedState
+    from src.l1_exchange.exchange_client import ExchangeClient
+    from src.l0_core.shared_state import SharedState
     from dotenv import load_dotenv
 except ImportError as e:
     logger.error(f"Failed to import core modules: {e}")

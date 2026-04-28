@@ -12,10 +12,10 @@ logger = logging.getLogger("BootstrapTest")
 
 async def test():
     # Import after path setup
-    from core.config import Config
-    from core.exchange_client import ExchangeClient
-    from core.shared_state import SharedState
-    from core.bootstrap_symbols import bootstrap_default_symbols
+    from src.l0_core.config import Config
+    from src.l1_exchange.exchange_client import ExchangeClient
+    from src.l0_core.shared_state import SharedState
+    from src.l3_portfolio.bootstrap_symbols import bootstrap_default_symbols
     
     logger.warning("=" * 80)
     logger.warning("BOOTSTRAP TEST")

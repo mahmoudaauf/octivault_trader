@@ -41,7 +41,7 @@ def main():
     
     # 1. Load config
     try:
-        from core.config import Config
+        from src.l0_core.config import Config
         config = Config()
         logger.info("✅ Config loaded")
     except Exception as e:
@@ -50,7 +50,7 @@ def main():
     
     # 2. Initialize exchange client
     try:
-        from core.exchange_client import ExchangeClient
+        from src.l1_exchange.exchange_client import ExchangeClient
         exchange = ExchangeClient()
         logger.info("✅ Exchange initialized")
     except Exception as e:
@@ -59,7 +59,7 @@ def main():
     
     # 3. Initialize SharedState
     try:
-        from core.shared_state import SharedState
+        from src.l0_core.shared_state import SharedState
         shared_state = SharedState()
         logger.info("✅ SharedState initialized")
     except Exception as e:
@@ -68,7 +68,7 @@ def main():
     
     # 4. Bootstrap symbols
     try:
-        from core.bootstrap_symbols import bootstrap_default_symbols
+        from src.l3_portfolio.bootstrap_symbols import bootstrap_default_symbols
         result = bootstrap_default_symbols(shared_state, logger)
         logger.info("✅ Symbols bootstrapped")
         
@@ -85,7 +85,7 @@ def main():
     
     # 5. Initialize SignalManager
     try:
-        from core.signal_manager import SignalManager
+        from src.l5_strategy.signal_manager import SignalManager
         signal_mgr = SignalManager()
         logger.info("✅ SignalManager initialized")
     except Exception as e:
@@ -94,7 +94,7 @@ def main():
     
     # 6. Get MetaController (just to verify it initializes, don't start it)
     try:
-        from core.meta_controller import MetaController
+        from src.l8_lifecycle.meta_controller import MetaController
         meta = MetaController()
         logger.info("✅ MetaController initialized (not started)")
     except Exception as e:

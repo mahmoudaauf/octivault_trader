@@ -4,8 +4,8 @@ from datetime import datetime, timedelta
 import time as _t
 from typing import Dict, List, Optional, Any, Set
 
-from core.component_status_logger import log_component_status, ComponentStatusLogger as CSL
-from core.stubs import TradeIntent, ExecOrder
+from src.l0_core.component_status_logger import log_component_status, ComponentStatusLogger as CSL
+from src.l0_core.stubs import TradeIntent, ExecOrder
 
 AGENT_NAME = "LiquidationAgent"
 

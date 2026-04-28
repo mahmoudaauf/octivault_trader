@@ -43,7 +43,7 @@ except Exception as e:
 
 print("\n[3/3] Checking agent_manager...")
 try:
-    from core.agent_manager import AgentManager
+    from src.l5_strategy.agent_manager import AgentManager
     print("✅ AgentManager imported")
 except Exception as e:
     print(f"❌ AgentManager import failed: {e}")

@@ -100,7 +100,7 @@ async def main_trading_loop(state_mgr: SystemStateManager):
     
     # Import the meta controller for actual trading
     try:
-        from core.meta_controller import MetaController
+        from src.l8_lifecycle.meta_controller import MetaController
         controller = MetaController()
         print("✅ Meta controller loaded for live trading")
     except Exception as e:

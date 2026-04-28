@@ -10,7 +10,7 @@ async def test():
     # Test 1: Import DEFAULT_SYMBOLS
     print("Test 1: Import DEFAULT_SYMBOLS...")
     try:
-        from core.bootstrap_symbols import DEFAULT_SYMBOLS
+        from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
         print(f"  ✅ Imported {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS")
         print(f"  Keys: {list(DEFAULT_SYMBOLS.keys())}")
     except Exception as e:
@@ -24,7 +24,7 @@ async def test():
     if not accepted:
         print("  detected empty accepted_symbols, using fallback...")
         try:
-            from core.bootstrap_symbols import DEFAULT_SYMBOLS
+            from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
             accepted = DEFAULT_SYMBOLS
             print(f"  ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
             print(f"  Fallback symbols: {list(accepted.keys())}")

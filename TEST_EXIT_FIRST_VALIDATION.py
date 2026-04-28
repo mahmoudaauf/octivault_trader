@@ -21,7 +21,7 @@ async def test_entry_gate_validation():
     print("="*70)
     
     try:
-        from core.meta_controller import MetaController
+        from src.l8_lifecycle.meta_controller import MetaController
         
         print("✅ MetaController imported successfully")
         print("   - _validate_exit_plan_exists() method present")
@@ -40,7 +40,7 @@ async def test_exit_monitoring():
     print("="*70)
     
     try:
-        from core.execution_manager import ExecutionManager
+        from src.l4_execution.execution_manager import ExecutionManager
         
         print("✅ ExecutionManager imported successfully")
         print("   - _monitor_and_execute_exits() method present")
@@ -62,7 +62,7 @@ async def test_position_model():
     print("="*70)
     
     try:
-        from core.shared_state import ClassifiedPosition, AssetClassification
+        from src.l0_core.shared_state import ClassifiedPosition, AssetClassification
         import time
         
         # Create a test position

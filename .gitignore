@@ -132,3 +132,6 @@ models/mlforecaster_*.pkl
 models/trendhunter_*.pkl
 models/_incompatible_quarantine/
 *.pkl
+
+# Claude Code worktrees (sibling checkouts, not real consumers)
+.claude/

@@ -34,7 +34,7 @@ class TestConsolidationException:
         - Fix: Check for existing dust position FIRST, then skip profitability for consolidation
         """
         # Setup mock MetaController
-        from core.meta_controller import MetaController
+        from src.l8_lifecycle.meta_controller import MetaController
         
         mc = MagicMock(spec=MetaController)
         mc.logger = MagicMock()
@@ -119,7 +119,7 @@ class TestConsolidationException:
         This verifies the fix doesn't break normal profitability enforcement.
         """
         # Setup mock MetaController
-        from core.meta_controller import MetaController
+        from src.l8_lifecycle.meta_controller import MetaController
         
         mc = MagicMock(spec=MetaController)
         mc.logger = MagicMock()

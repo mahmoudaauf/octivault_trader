@@ -52,7 +52,7 @@ class RealtimeMonitor:
     async def fetch_account_status(self) -> Dict[str, Any]:
         """Fetch current account status"""
         try:
-            from core.exchange_client import ExchangeClient
+            from src.l1_exchange.exchange_client import ExchangeClient
             exchange = ExchangeClient()
             await exchange.start()
             
@@ -76,7 +76,7 @@ class RealtimeMonitor:
     async def fetch_system_stats(self) -> Dict[str, Any]:
         """Fetch system statistics"""
         try:
-            from core.shared_state import SharedState
+            from src.l0_core.shared_state import SharedState
             state = SharedState()
             
             return {

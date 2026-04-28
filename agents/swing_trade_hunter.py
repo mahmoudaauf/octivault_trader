@@ -30,8 +30,8 @@ except Exception:
     def log_component_status(*args, **kwargs):
         return None
 from utils.shared_state_tools import inject_agent_signal, spread_bps as ss_spread_bps, min_notional as ss_min_notional
-from core.model_manager import safe_load_model, save_model, build_model_path
-from core.stubs import TradeIntent
+from src.l5_strategy.model_manager import safe_load_model, save_model, build_model_path
+from src.l0_core.stubs import TradeIntent
 from agents.edge_calculator import compute_agent_edge
 
 AGENT_NAME = "SwingTradeHunter"
@@ -450,7 +450,7 @@ class SwingTradeHunter:
             if not accepted:
                 logger.warning(f"[{self.name}] ⚠️  accepted_symbols is empty! Using DEFAULT_SYMBOLS fallback...")
                 try:
-                    from core.bootstrap_symbols import DEFAULT_SYMBOLS
+                    from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
                     accepted = DEFAULT_SYMBOLS
                     logger.warning(f"[{self.name}] ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
                 except Exception as e:

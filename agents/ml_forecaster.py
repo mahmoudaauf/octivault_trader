@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 import inspect  # <-- added
 
 try:
-    from core.agent_optimizer import load_tuned_params
+    from src.l5_strategy.agent_optimizer import load_tuned_params
 except Exception as _e:
     logging.getLogger("MLForecaster").warning(
         "load_tuned_params import failed; using empty tuned params fallback: %s",
@@ -24,7 +24,7 @@ except Exception as _e:
         return {}
 
 try:
-    from core.component_status_logger import log_component_status
+    from src.l0_core.component_status_logger import log_component_status
 except Exception as _e:
     logging.getLogger("MLForecaster").warning(
         "log_component_status import failed; using no-op fallback: %s",
@@ -35,7 +35,7 @@ except Exception as _e:
         return None
 
 try:
-    from core.stubs import is_fresh  # freshness gate
+    from src.l0_core.stubs import is_fresh  # freshness gate
 except Exception as _e:
     logging.getLogger("MLForecaster").warning(
         "is_fresh import failed; using permissive freshness fallback: %s",
@@ -46,7 +46,7 @@ except Exception as _e:
         return True
 
 try:
-    from core.model_trainer import ModelTrainer
+    from src.l5_strategy.model_trainer import ModelTrainer
 except Exception as _e:
     ModelTrainer = None  # type: ignore
     logging.getLogger("MLForecaster").warning(
@@ -538,7 +538,7 @@ class MLForecaster:
             # ITERATION 2 FIX: If empty, use DEFAULT_SYMBOLS as fallback
             if not result:
                 try:
-                    from core.bootstrap_symbols import DEFAULT_SYMBOLS
+                    from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
                     result = list(DEFAULT_SYMBOLS.keys())
                     self.logger.warning(f"[{self.name}] ⚠️  accepted_symbols empty! Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
                 except Exception as e:

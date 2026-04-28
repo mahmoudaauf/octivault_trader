@@ -306,7 +306,7 @@ class IPOChaser:
 
     def _load_tuned(self, key: str) -> Dict[str, Any]:
         try:
-            from core.agent_optimizer import load_tuned_params
+            from src.l5_strategy.agent_optimizer import load_tuned_params
             return load_tuned_params(key) or {}
         except Exception:
             return {}
@@ -374,7 +374,7 @@ class IPOChaser:
 
     def _model_path(self, symbol: str) -> str:
         try:
-            from core.model_manager import build_model_path
+            from src.l5_strategy.model_manager import build_model_path
             return build_model_path(self.name, symbol)
         except Exception:
             # fallback location
@@ -382,7 +382,7 @@ class IPOChaser:
 
     def _model_exists(self, path: str) -> bool:
         try:
-            from core.model_manager import model_exists
+            from src.l5_strategy.model_manager import model_exists
             return bool(model_exists(path))
         except Exception:
             return os.path.exists(path)
@@ -403,8 +403,8 @@ class IPOChaser:
             logger.warning(f"[{self.name}] pandas not available; cannot train.")
             return False
         try:
-            from core.model_trainer import ModelTrainer
-            from core.model_manager import save_model
+            from src.l5_strategy.model_trainer import ModelTrainer
+            from src.l5_strategy.model_manager import save_model
         except Exception as e:
             logger.warning(f"[{self.name}] Trainer/manager imports failed: {e}")
             return False
@@ -425,7 +425,7 @@ class IPOChaser:
 
     def _safe_load_model(self, path: str):
         try:
-            from core.model_manager import safe_load_model
+            from src.l5_strategy.model_manager import safe_load_model
             return safe_load_model(path)
         except Exception as e:
             logger.error(f"[{self.name}] safe_load_model failed: {e}")

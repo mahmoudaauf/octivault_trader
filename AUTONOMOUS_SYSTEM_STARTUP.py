@@ -113,7 +113,7 @@ class AutonomousSystemStartup:
         
         # Check 3: Configuration
         try:
-            from core.config import Config
+            from src.l0_core.config import Config
             config = Config()
             mode = "TESTNET" if config.TESTNET_MODE else "LIVE"
             self.monitor.add_check("Config", True, f"loaded ({mode} mode)")
@@ -162,17 +162,17 @@ class AutonomousSystemStartup:
         
         try:
             self.logger.info("⏳ Importing components...")
-            from core.config import Config
-            from core.exchange_client import ExchangeClient
-            from core.shared_state import SharedState
-            from core.signal_manager import SignalManager
-            from core.risk_manager import RiskManager
-            from core.execution_manager import ExecutionManager
-            from core.meta_controller import MetaController
-            from core.agent_manager import AgentManager
-            from core.tp_sl_engine import TPSLEngine
-            from core.market_data_websocket import MarketDataWebSocket
-            from core.market_data_feed import MarketDataFeed
+            from src.l0_core.config import Config
+            from src.l1_exchange.exchange_client import ExchangeClient
+            from src.l0_core.shared_state import SharedState
+            from src.l5_strategy.signal_manager import SignalManager
+            from src.l6_governance.risk_manager import RiskManager
+            from src.l4_execution.execution_manager import ExecutionManager
+            from src.l8_lifecycle.meta_controller import MetaController
+            from src.l5_strategy.agent_manager import AgentManager
+            from src.l4_execution.tp_sl_engine import TPSLEngine
+            from src.l1_exchange.market_data_websocket import MarketDataWebSocket
+            from src.l2_marketdata.market_data_feed import MarketDataFeed
             
             # Initialize config
             self.config = Config()
