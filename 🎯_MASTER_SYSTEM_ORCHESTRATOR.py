@@ -886,16 +886,30 @@ class MasterSystemOrchestrator:
                         if _se_auditor is not None:
                             self.exchange_truth_auditor = _se_auditor
                     else:
-                        logger.warning(
-                            "⚠️  StartupOrchestrator reported incomplete hydration — "
-                            "system will continue from available state"
+                        # H: Strict abort — refusing to trade with unverified state.
+                        # In real-money mode an incomplete hydration means positions/NAV/free_quote
+                        # may not match the exchange. Continuing would risk PnL drift and bad sizing.
+                        raise RuntimeError(
+                            "StartupOrchestrator returned False — capital ledger or hydration "
+                            "could not be verified. Aborting startup to prevent trading on stale state."
                         )
-                        self.recovery_engine = _se_recovery
+                except RuntimeError:
+                    # Bubble up strict-abort failures
+                    raise
                 except Exception as e:
-                    logger.warning(
-                        "⚠️  StartupOrchestrator failed (%s) — continuing with available state", e,
-                        exc_info=True,
-                    )
+                    # H: Treat unexpected exceptions as fatal in real mode; only swallow in shadow mode
+                    _shadow = bool(getattr(self.config, 'SHADOW_MODE', False))
+                    if _shadow:
+                        logger.warning(
+                            "⚠️  StartupOrchestrator failed (%s) — continuing in SHADOW mode with available state", e,
+                            exc_info=True,
+                        )
+                    else:
+                        logger.error(
+                            "💥 StartupOrchestrator failed in real mode (%s) — aborting startup", e,
+                            exc_info=True,
+                        )
+                        raise
             else:
                 logger.warning(
                     "⚠️  StartupOrchestrator or RecoveryEngine not available — "

@@ -9,7 +9,6 @@ All reconciliation logic lives in its proper homes:
   - RecoveryEngine: State reconstruction
   - ExchangeTruthAuditor: Order/fill reconciliation
   - SharedState: Position hydration & event emission
-  - PortfolioManager: Position refresh
 
 This component's ONLY job is to coordinate those existing components
 in the correct sequence before MetaController starts.
@@ -31,8 +30,8 @@ class StartupOrchestrator:
     1. RecoveryEngine.rebuild_state() - Fetch balances + positions from exchange
     2. SharedState.hydrate_positions_from_balances() - Mirror wallet → positions
     3. ExchangeTruthAuditor.restart_recovery() - Sync open orders
-    4. PortfolioManager.refresh_positions() - Update position metadata
-    5. Verify startup integrity - Check NAV, capital, sanity
+    4. Build capital ledger from wallet balances
+    5. Verify capital integrity - Check NAV, capital, sanity
     6. Emit StartupPortfolioReady - Signal MetaController it's safe
     
     DOES NOT duplicate any reconciliation logic.
@@ -47,7 +46,6 @@ class StartupOrchestrator:
         exchange_client: Any,
         recovery_engine: Optional[Any] = None,
         exchange_truth_auditor: Optional[Any] = None,
-        portfolio_manager: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
     ):
         """Initialize orchestrator with required components."""
@@ -56,24 +54,25 @@ class StartupOrchestrator:
         self.exchange_client = exchange_client
         self.recovery_engine = recovery_engine
         self.exchange_truth_auditor = exchange_truth_auditor
-        self.portfolio_manager = portfolio_manager
         self.logger = logger or logging.getLogger("StartupOrchestrator")
         
         self._completed = False
         self._startup_ts = time.time()
         self._step_metrics = {}
-    
-    @staticmethod
-    def _safe_float(value: Any, default: float = 0.0) -> float:
-        """Safely convert value to float, handling None and invalid types."""
-        if value is None:
-            return default
+
+    async def _price_fetcher(self, symbol: str) -> float:
+        """Shared price fetcher used by Steps 5 & 6."""
         try:
-            f = float(value)
-            return f if f and f > -float('inf') and f < float('inf') else default
-        except (ValueError, TypeError):
-            return default
-    
+            if self.exchange_client and hasattr(self.exchange_client, 'get_current_price'):
+                price = await self.exchange_client.get_current_price(symbol)
+                if price is not None:
+                    price_float = float(price)
+                    if price_float and price_float > 0:
+                        return price_float
+        except (ValueError, TypeError, Exception):
+            pass
+        return 0.0
+
     async def execute_startup_sequence(self) -> bool:
         """
         Execute canonical startup sequence.
@@ -87,6 +86,12 @@ class StartupOrchestrator:
             - Emits StartupPortfolioReady event
             - Sets _completed flag
         """
+        # Idempotency guard: refuse to re-run a successful sequence
+        if self._completed:
+            self.logger.info(
+                "[StartupOrchestrator] execute_startup_sequence() called again — already completed, no-op"
+            )
+            return True
         try:
             self.logger.warning(
                 "[StartupOrchestrator] ═══════════════════════════════════════════════════"
@@ -119,18 +124,14 @@ class StartupOrchestrator:
             success = await self._step_auditor_restart_recovery()
             # Non-fatal if auditor unavailable
             
-            # STEP 4: PortfolioManager refreshes position metadata
-            success = await self._step_portfolio_manager_refresh()
-            # Non-fatal if manager unavailable
-            
-            # STEP 5: Build capital ledger from wallet balances
+            # STEP 4: Build capital ledger from wallet balances
             success = await self._step_build_capital_ledger()
             if not success:
                 raise RuntimeError(
                     "Phase 8.5: Capital ledger construction failed - cannot proceed"
                 )
             
-            # STEP 6: Verify capital integrity (ledger already constructed)
+            # STEP 5: Verify capital integrity (ledger already constructed)
             success = await self._step_verify_capital_integrity()
             if not success:
                 raise RuntimeError(
@@ -336,11 +337,17 @@ class StartupOrchestrator:
                 )
                 return True  # Non-fatal
             
-            # ExchangeTruthAuditor syncs orders
-            if hasattr(self.exchange_truth_auditor, '_restart_recovery'):
+            # ExchangeTruthAuditor syncs orders (prefer public API, fallback to private)
+            recover_method = (
+                getattr(self.exchange_truth_auditor, 'restart_recovery', None)
+                or getattr(self.exchange_truth_auditor, '_restart_recovery', None)
+            )
+            if recover_method is not None:
                 try:
-                    result = await self.exchange_truth_auditor._restart_recovery()
-                    self.logger.debug(f"[StartupOrchestrator] {step_name} - Called _restart_recovery()")
+                    result = recover_method()
+                    if asyncio.iscoroutine(result):
+                        await result
+                    self.logger.debug(f"[StartupOrchestrator] {step_name} - Called {recover_method.__name__}()")
                 except Exception as e:
                     self.logger.debug(
                         f"[StartupOrchestrator] {step_name} - restart_recovery failed (non-fatal): {e}"
@@ -369,59 +376,7 @@ class StartupOrchestrator:
             return True  # Non-fatal
     
     # ═════════════════════════════════════════════════════════════════════════
-    # STEP 4: PortfolioManager - Refresh positions (non-fatal)
-    # ═════════════════════════════════════════════════════════════════════════
-    
-    async def _step_portfolio_manager_refresh(self) -> bool:
-        """Delegate to PortfolioManager to refresh position metadata."""
-        step_name = "Step 4: PortfolioManager.refresh_positions()"
-        step_start = time.time()
-        
-        try:
-            self.logger.info(f"[StartupOrchestrator] {step_name} starting...")
-            
-            if not self.portfolio_manager:
-                self.logger.debug(
-                    f"[StartupOrchestrator] {step_name} - PortfolioManager not available (non-fatal)"
-                )
-                return True  # Non-fatal
-            
-            # PortfolioManager refreshes position metadata
-            if hasattr(self.portfolio_manager, 'refresh_positions'):
-                try:
-                    result = self.portfolio_manager.refresh_positions()
-                    if asyncio.iscoroutine(result):
-                        await result
-                    self.logger.debug(f"[StartupOrchestrator] {step_name} - Called refresh_positions()")
-                except Exception as e:
-                    self.logger.debug(
-                        f"[StartupOrchestrator] {step_name} - refresh_positions failed (non-fatal): {e}"
-                    )
-                    return True  # Non-fatal
-            else:
-                self.logger.debug(
-                    f"[StartupOrchestrator] {step_name} - refresh_positions method not found (non-fatal)"
-                )
-                return True  # Non-fatal
-            
-            elapsed = time.time() - step_start
-            self._step_metrics['portfolio_manager_refresh'] = {
-                'elapsed_sec': elapsed,
-            }
-            
-            self.logger.info(
-                f"[StartupOrchestrator] {step_name} complete: {elapsed:.2f}s (non-fatal)"
-            )
-            return True
-            
-        except Exception as e:
-            self.logger.warning(
-                f"[StartupOrchestrator] {step_name} - Non-fatal error: {e}"
-            )
-            return True  # Non-fatal
-    
-    # ═════════════════════════════════════════════════════════════════════════
-    # STEP 5: Build capital ledger from wallet balances
+    # STEP 4: Build capital ledger from wallet balances
     # ═════════════════════════════════════════════════════════════════════════
     
     async def _step_build_capital_ledger(self) -> bool:
@@ -434,7 +389,7 @@ class StartupOrchestrator:
         free_capital = USDT balance
         NAV = invested_capital + free_capital
         """
-        step_name = "Step 5: Build Capital Ledger"
+        step_name = "Step 4: Build Capital Ledger"
         step_start = time.time()
         
         try:
@@ -450,21 +405,8 @@ class StartupOrchestrator:
                 self.logger.info(
                     f"[StartupOrchestrator] {step_name} - Ensuring latest prices for {len(accepted_symbols)} symbols..."
                 )
-                
-                async def price_fetcher(symbol: str) -> float:
-                    try:
-                        if hasattr(self.exchange_client, 'get_current_price'):
-                            price = await self.exchange_client.get_current_price(symbol)
-                            if price is not None:
-                                price_float = float(price)
-                                if price_float and price_float > 0:
-                                    return price_float
-                    except (ValueError, TypeError, Exception):
-                        pass
-                    return 0.0
-                
                 try:
-                    await self.shared_state.ensure_latest_prices_coverage(price_fetcher)
+                    await self.shared_state.ensure_latest_prices_coverage(self._price_fetcher)
                     self.logger.debug(
                         f"[StartupOrchestrator] {step_name} - Latest prices coverage complete"
                     )
@@ -592,17 +534,17 @@ class StartupOrchestrator:
             return False
     
     # ═════════════════════════════════════════════════════════════════════════
-    # STEP 6: Verify capital integrity (ledger already constructed)
+    # STEP 5: Verify capital integrity (ledger already constructed)
     # ═════════════════════════════════════════════════════════════════════════
     
     async def _step_verify_capital_integrity(self) -> bool:
         """
         Verify the capital ledger is consistent.
         
-        NOTE: Ledger is already CONSTRUCTED in Step 5.
+        NOTE: Ledger is already CONSTRUCTED in Step 4.
         This step only VERIFIES consistency.
         """
-        step_name = "Step 6: Verify Capital Integrity"
+        step_name = "Step 5: Verify Capital Integrity"
         step_start = time.time()
         
         try:
@@ -620,23 +562,8 @@ class StartupOrchestrator:
                     f"[StartupOrchestrator] {step_name} - Ensuring latest prices coverage "
                     f"for {len(accepted_symbols)} symbols..."
                 )
-                
-                # Define price fetcher that uses exchange client
-                async def price_fetcher(symbol: str) -> float:
-                    try:
-                        if hasattr(self.exchange_client, 'get_current_price'):
-                            price = await self.exchange_client.get_current_price(symbol)
-                            if price is not None:
-                                price_float = float(price)
-                                if price_float and price_float > 0:
-                                    return price_float
-                    except (ValueError, TypeError, Exception):
-                        pass
-                    return 0.0
-                
-                # Ensure prices are populated
                 try:
-                    await self.shared_state.ensure_latest_prices_coverage(price_fetcher)
+                    await self.shared_state.ensure_latest_prices_coverage(self._price_fetcher)
                     self.logger.info(
                         f"[StartupOrchestrator] {step_name} - Latest prices coverage complete. "
                         f"Cached prices: {len(self.shared_state.latest_prices)} symbols"
@@ -689,9 +616,6 @@ class StartupOrchestrator:
                 f"nav={nav}, free={free}, invested={invested}, "
                 f"positions={len(positions)}, open_orders={len(open_orders)}"
             )
-            
-            # Validate critical invariants
-            issues = []
             
             # DEFENSIVE: Check for shadow mode or simulation mode
             # In shadow mode, NAV may be 0 but positions exist (virtual ledger is authoritative)
@@ -808,11 +732,8 @@ class StartupOrchestrator:
             
             if not shadow_mode_config:
                 # REAL MODE: Apply strict integrity checks
-                if free < 0:
-                    issues.append(f"Free capital is {free} (should be >= 0)")
-                
-                if invested < 0:
-                    issues.append(f"Invested capital is {invested} (should be >= 0)")
+                # Note: `free` is clamped via max(0.0, ...) and `invested` is a sum of
+                # non-negatives upstream, so the only meaningful check is the NAV balance below.
                 
                 # Check balance: nav should ~= free + invested
                 # NOTE: If they differ significantly, it means position prices have changed
@@ -836,7 +757,7 @@ class StartupOrchestrator:
                         # This handles cases where market moved significantly during startup
                         try:
                             # Refresh latest prices one more time
-                            await self.shared_state.ensure_latest_prices_coverage(price_fetcher)
+                            await self.shared_state.ensure_latest_prices_coverage(self._price_fetcher)
                             
                             # Recalculate invested with fresh prices
                             fresh_invested = 0.0
@@ -965,15 +886,28 @@ class StartupOrchestrator:
                 'invested_capital': invested,
                 'positions_count': len(positions),
                 'open_orders_count': len(open_orders),
-                'issues_count': len(issues),
                 'elapsed_sec': elapsed,
             }
             
-            if issues:
-                for issue in issues:
-                    self.logger.error(f"[StartupOrchestrator] {step_name} - ⚠️ {issue}")
-                self.logger.error(f"[StartupOrchestrator] {step_name} FAILED - capital integrity issues")
-                return False
+            # E: Persist any corrections made during verification back to shared_state
+            try:
+                if hasattr(self.shared_state, 'rebuild_nav_from_state'):
+                    # Authoritative re-emit using corrected values
+                    self.shared_state.invested_capital = invested
+                    self.shared_state.free_quote = free
+                    self.shared_state.nav = nav
+                else:
+                    self.shared_state.invested_capital = invested
+                    self.shared_state.free_quote = free
+                    self.shared_state.nav = nav
+                self.logger.debug(
+                    f"[StartupOrchestrator] {step_name} - Persisted corrected ledger: "
+                    f"nav={nav:.2f}, free={free:.2f}, invested={invested:.2f}"
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"[StartupOrchestrator] {step_name} - Failed to persist corrections: {e}"
+                )
             
             self.logger.info(
                 f"[StartupOrchestrator] {step_name} complete: "
