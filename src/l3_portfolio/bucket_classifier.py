@@ -84,8 +84,31 @@ class BucketClassifier:
         # Calculate performance
         pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
         
-        # Calculate staleness
+        # Calculate staleness — coerce epoch floats/ints to datetime defensively.
+        # SharedState position snapshots may store entry_time as either a
+        # datetime, an ISO string, or a unix timestamp (float). The arithmetic
+        # below requires a datetime; coerce silently rather than crashing.
+        def _to_datetime(val):
+            if val is None:
+                return None
+            if isinstance(val, datetime):
+                return val
+            if isinstance(val, (int, float)):
+                try:
+                    return datetime.fromtimestamp(float(val))
+                except (OSError, ValueError, OverflowError):
+                    return None
+            if isinstance(val, str):
+                try:
+                    return datetime.fromisoformat(val.replace("Z", "+00:00")).replace(tzinfo=None)
+                except ValueError:
+                    return None
+            return None
+        
         now = datetime.now()
+        entry_datetime = _to_datetime(entry_datetime)
+        last_activity_datetime = _to_datetime(last_activity_datetime)
+        
         days_held = 0.0
         if entry_datetime:
             days_held = (now - entry_datetime).days
