@@ -2218,6 +2218,18 @@ class MasterSystemOrchestrator:
             if hasattr(self, "_mdf_warmup_task") and self._mdf_warmup_task is not None:
                 self.tasks.append(self._mdf_warmup_task)
                 logger.info("✅ MarketDataFeed task added to monitor loop")
+            
+            # Three-bucket portfolio management + dead-capital healing.
+            # Runs UNCONDITIONALLY (live + paper) — previously buried inside the
+            # test-only signal-injector loop, so live runs never invoked Heal-C.
+            if self.three_bucket_manager is not None:
+                self.tasks.append(
+                    asyncio.create_task(
+                        self._three_bucket_management_loop(),
+                        name="ThreeBucketManagement",
+                    )
+                )
+                logger.info("✅ ThreeBucketManagement task added (live healing loop)")
 
             if self.config.enable_signal_injector:
                 logger.warning("[Orchestrator] SignalInjector ENABLED (test mode).")
@@ -2357,6 +2369,77 @@ class MasterSystemOrchestrator:
     # ========================================================================
     # SIGNAL INJECTION (for testing MetaController execution pipeline)
     # ========================================================================
+    
+    async def _three_bucket_management_loop(self):
+        """
+        Periodic three-bucket portfolio classification + dead-capital healing.
+        
+        Runs UNCONDITIONALLY in both live and paper mode (previously this logic
+        was buried inside `_inject_signals_loop` which only runs when
+        ENABLE_SIGNAL_INJECTOR=true → in live mode, healing never fired).
+        
+        Interval: HEAL_DUST_SWEEP_INTERVAL_SEC env (default 1800s = 30 min).
+        Bucket-status logging: every 10 cycles.
+        """
+        import time
+        
+        # Wait for prerequisites with bounded retries
+        for _ in range(60):  # up to ~60 seconds
+            if self.three_bucket_manager and self.shared_state:
+                break
+            await asyncio.sleep(1)
+        
+        if not (self.three_bucket_manager and self.shared_state):
+            logger.warning("[3BucketLoop] prerequisites not ready after 60s — exiting")
+            return
+        
+        try:
+            interval_sec = float(os.getenv("HEAL_DUST_SWEEP_INTERVAL_SEC", "1800"))
+        except Exception:
+            interval_sec = 1800.0
+        # Hard floor: 60s (prevent accidental tight loops); cap: 1h
+        interval_sec = max(60.0, min(3600.0, interval_sec))
+        
+        logger.info(f"[3BucketLoop] ✅ Started — interval={interval_sec:.0f}s")
+        
+        cycle = 0
+        while self.running:
+            cycle += 1
+            try:
+                positions = await self.shared_state.get_positions_snapshot()
+                total_equity = await self.shared_state.get_total_nav()
+                
+                # Update bucket classification
+                bucket_state = await self.three_bucket_manager.update_bucket_state(
+                    positions=positions,
+                    total_equity=total_equity,
+                )
+                
+                # Heal if due
+                if self.three_bucket_manager.should_execute_healing():
+                    logger.warning(f"[3BucketLoop] 💀 cycle={cycle} executing dead-capital healing...")
+                    healing_result = await self.three_bucket_manager.execute_healing()
+                    if healing_result:
+                        logger.info(f"[3BucketLoop] ✅ Healing complete: {healing_result}")
+                
+                # Status every 10 cycles
+                if cycle % 10 == 1:
+                    try:
+                        self.three_bucket_manager.log_bucket_status()
+                        self.three_bucket_manager.log_trading_gates()
+                    except Exception as log_exc:
+                        logger.debug(f"[3BucketLoop] status-log failed: {log_exc}")
+            
+            except asyncio.CancelledError:
+                logger.info("[3BucketLoop] cancelled")
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"[3BucketLoop] cycle={cycle} update failed: {type(exc).__name__}: {exc}",
+                    exc_info=True,
+                )
+            
+            await asyncio.sleep(interval_sec)
     
     async def _inject_signals_loop(self):
         """
