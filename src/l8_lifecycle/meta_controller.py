@@ -5396,6 +5396,20 @@ class MetaController:
                     "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
                     "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
                     "MICRO_BACKTEST_INSUFFICIENT_SAMPLES,"
+                    # SELL_WITHOUT_POSITION: phantom SELL signals from agents
+                    # for symbols we don't hold (e.g. ETH/LINK/BTC after the
+                    # heal-c liquidation, or unsynced agent state). The
+                    # meta_controller GATE_DROP_NO_POSITION guard already
+                    # rejects them safely; including in deadlock-ignore
+                    # prevents repeated agent-noise from tripping
+                    # EmergencySOP → PROTECTIVE mode (run #11 attempt 14
+                    # forensics: 1287 phantom SELLs, deadlock TRIGGER fired
+                    # repeatedly with "Repeated failures detected in RECOVERY").
+                    "SELL_WITHOUT_POSITION,"
+                    # CLOSE_NOT_SUBMITTED: position-close intent that didn't
+                    # reach the exchange (e.g. coalesced with another close).
+                    # Agent-noise, not deadlock.
+                    "CLOSE_NOT_SUBMITTED,"
                     # ENTRY_POLICY_GATE = normal policy-based capacity enforcement (not a system failure).
                     # Including it in ignore list prevents PORTFOLIO_FULL / capacity cycles from
                     # falsely triggering repeated_failures=True and locking the bot in PROTECTIVE mode.

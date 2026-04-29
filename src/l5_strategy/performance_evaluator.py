@@ -230,6 +230,13 @@ class PerformanceEvaluator:
                     "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
                     "PRETRADE_EFFECT_GATE:MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD,"
                     "MICRO_BACKTEST_INSUFFICIENT_SAMPLES,"
+                    # SELL_WITHOUT_POSITION + CLOSE_NOT_SUBMITTED: agent-noise
+                    # for symbols we don't hold. The meta_controller drops
+                    # them via GATE_DROP_NO_POSITION; treating them as
+                    # PerfEval deadlocks falsely flags symbols as "stuck"
+                    # (run #11 attempt 14 forensics: ETHUSDT 31 consecutive
+                    # SELL_WITHOUT_POSITION → PerfEval:Deadlock TRIGGER).
+                    "SELL_WITHOUT_POSITION,CLOSE_NOT_SUBMITTED,"
                     "EXPECTED_MOVE_LT_ROUND_TRIP_COST,POSITION_ALREADY_OPEN"
                 ),
             )
