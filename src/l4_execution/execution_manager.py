@@ -9980,11 +9980,26 @@ class ExecutionManager:
 
             # else: qty path (BUY without planned_quote, or SELL)
             qty = round_step(quantity, step_size)
+
+            # 🩹 HEAL-C BYPASS: when the order is a Heal-C dust liquidation, we
+            # MUST NOT round qty UP. The wallet snapshot already reflects the
+            # exact dust we hold; rounding up by step_size produces a qty
+            # greater than available balance and Binance returns -2010
+            # "insufficient balance" (attempt 14 evidence: 8 of 10 heal_c
+            # orders failed via [EM:SellRoundUp] → order_not_placed).
+            #
+            # Detection: tag contains 'heal_c' (Heal-C) or 'heal_c_dust'.
+            # Effect: skip the entire round-UP block — keep the safe
+            # ROUND_DOWN qty even if the remainder is dust. Better to leave
+            # a tiny residue than to send an oversized order that fails.
+            tag_str = str(safe_tag or "").lower()
+            is_heal_c = ("heal_c" in tag_str) or ("heal-c" in tag_str)
+
             # For SELL orders: if the remainder after ROUND_DOWN is below dust threshold, round UP instead.
             # This prevents perpetual dust: e.g. position=0.001234, step=0.001 → ROUND_DOWN sells
             # 0.001 and leaves 0.000234 stranded forever. Round UP to sell complete position.
             # ✅ FIX: Check both quantity AND economic (notional) dust thresholds
-            if side.upper() == "SELL" and step_size > 0:
+            if side.upper() == "SELL" and step_size > 0 and not is_heal_c:
                 remainder = _raw_quantity - float(qty)
                 
                 # Get current price for economic dust check
