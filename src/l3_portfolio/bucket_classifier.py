@@ -14,6 +14,7 @@ Date: 2026-04-17
 """
 
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 from src.l3_portfolio.portfolio_buckets import (
@@ -42,16 +43,47 @@ class BucketClassifier:
         """
         self.config = config or {}
         
-        # Bucket thresholds
-        self.min_productive_size = self.config.get('min_productive_size', 25.0)      # $25 minimum
+        # Bucket thresholds — env overrides allow tuning without code changes.
+        # MIN_PRODUCTIVE_USDT: positions valued below this become DEAD_CAPITAL
+        # and Heal-C may liquidate them. Default $25 was correct for $1000+ NAV
+        # accounts but catastrophic for sub-$200 NAVs where every position is
+        # naturally $15–$25 (run #11 attempt 16: liquidated all 5 productive
+        # positions LINK/ETH/XRP/ADA totaling $87 because each was below $25).
+        # Lowered default to $5 (matches DUST_MIN_QUOTE_USDT exchange floor).
+        env_min = os.getenv("BUCKET_MIN_PRODUCTIVE_USDT")
+        try:
+            min_productive_default = float(env_min) if env_min else 5.0
+        except (TypeError, ValueError):
+            min_productive_default = 5.0
+        self.min_productive_size = self.config.get(
+            'min_productive_size', min_productive_default
+        )
+        # Hard safety floor: never below $2 (avoids exchange-rejected dust loops),
+        # never above $50 (avoids classifying healthy positions as dead).
+        self.min_productive_size = max(2.0, min(50.0, float(self.min_productive_size)))
+        
         self.stale_days = self.config.get('stale_days_threshold', 7)                 # 7 days
         self.performance_threshold_pct = self.config.get('performance_threshold', -15.0)  # -15%
         self.min_confidence = self.config.get('min_confidence_dead', 0.75)            # 75% to classify dead
+        
+        # Anti-churn cooldown: positions acquired within the last
+        # MIN_HOLD_BEFORE_HEAL_SEC are NEVER classified as DEAD_CAPITAL,
+        # regardless of size or staleness. Prevents the Heal-C → BUY → Heal-C
+        # ping-pong observed in attempt 16 (TrendHunter bought XRPUSDT at
+        # 17:48:22, Heal-C sold it 43 seconds later as 'dust').
+        env_hold = os.getenv("MIN_HOLD_BEFORE_HEAL_SEC")
+        try:
+            self.min_hold_before_heal_sec = float(env_hold) if env_hold else 600.0  # 10 min default
+        except (TypeError, ValueError):
+            self.min_hold_before_heal_sec = 600.0
+        # Hard floor 60s, ceiling 24h.
+        self.min_hold_before_heal_sec = max(60.0, min(86400.0, self.min_hold_before_heal_sec))
         
         logger.info(f"✅ BucketClassifier initialized")
         logger.info(f"   Min productive size: ${self.min_productive_size:.2f}")
         logger.info(f"   Stale threshold: {self.stale_days} days")
         logger.info(f"   Performance threshold: {self.performance_threshold_pct}%")
+        logger.info(f"   Min hold before heal: {self.min_hold_before_heal_sec:.0f}s")
     
     def classify_position(
         self,
@@ -137,11 +169,36 @@ class BucketClassifier:
             days_since_activity = (now - last_activity_datetime).days
         
         # =====================================================================
+        # ANTI-CHURN PROTECTION (fix #8)
+        # =====================================================================
+        # Positions held for less than min_hold_before_heal_sec are EXEMPT
+        # from DEAD_CAPITAL classification, regardless of size or staleness.
+        # This prevents the Heal-C → BUY → Heal-C ping-pong loop seen in
+        # run #11 attempt 16 where freshly-bought positions worth slightly
+        # less than the productive threshold were liquidated within a minute.
+        # Stale (RULE 2) and orphaned (RULE 3) classifications still get
+        # bypassed because they require time to develop; only RULE 1
+        # (BELOW_MIN_SIZE) and RULE 4 (FAILED_PERFORMER) and RULE 5
+        # (FRACTIONAL) are size/qty-based and benefit from a hold-window.
+        seconds_held = 0.0
+        if entry_datetime:
+            try:
+                seconds_held = max(0.0, (now - entry_datetime).total_seconds())
+            except Exception:
+                seconds_held = 0.0
+        is_freshly_acquired = (
+            entry_datetime is not None
+            and seconds_held < float(getattr(self, "min_hold_before_heal_sec", 600.0))
+        )
+        
+        # =====================================================================
         # CLASSIFICATION LOGIC
         # =====================================================================
         
         # RULE 1: Below minimum productive size → DEAD CAPITAL
-        if current_value < self.min_productive_size:
+        # ANTI-CHURN: skip this rule for freshly-acquired positions so the
+        # bot doesn't liquidate trades within the hold window.
+        if current_value < self.min_productive_size and not is_freshly_acquired:
             return PositionClassification(
                 symbol=symbol,
                 bucket=BucketType.DEAD_CAPITAL,
