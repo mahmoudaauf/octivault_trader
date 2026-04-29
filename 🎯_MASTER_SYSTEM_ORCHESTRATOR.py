@@ -2425,12 +2425,26 @@ class MasterSystemOrchestrator:
                 )
                 total_equity = await self.shared_state.get_nav()
                 
-                # Enrich missing 'value'/'current_price' with latest prices so
-                # the classifier and healer have non-zero expected_value.
+                # Enrich missing 'qty'/'value'/'current_price' with latest
+                # prices so the classifier and healer have non-zero values.
+                # Wallet-mirrored dust snapshots use 'quantity'/'free' instead
+                # of 'qty', but DeadCapitalHealer reads pos_data['qty'] directly
+                # (line 140 dead_capital_healer.py) — without a writeback every
+                # liquidation order is created with quantity=0.0 and the
+                # callback's precondition check fails for all candidates.
                 for sym, pos in positions.items():
                     if sym == "USDT":
                         continue
-                    qty = float(pos.get("qty") or pos.get("quantity") or 0)
+                    qty = float(
+                        pos.get("qty")
+                        or pos.get("quantity")
+                        or pos.get("free")
+                        or pos.get("amount")
+                        or 0
+                    )
+                    # Writeback canonical qty for downstream consumers.
+                    if qty > 0 and not pos.get("qty"):
+                        pos["qty"] = qty
                     px = float(pos.get("current_price") or pos.get("mark_price") or 0)
                     if px <= 0 and qty > 0:
                         try:
