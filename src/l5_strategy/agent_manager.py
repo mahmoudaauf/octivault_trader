@@ -341,6 +341,18 @@ class AgentManager:
         if side not in {"BUY", "SELL"}:
             return False, "invalid_side"
         if side == "SELL" and not bool(self._cfg("AGENTMGR_PREPUBLISH_GUARD_SELL", False)):
+            # SELL bypass mode — but still drop phantom SELLs for symbols we
+            # don't hold (otherwise meta_controller logs them as
+            # SELL_WITHOUT_POSITION rejections, polluting the rejection
+            # counter and triggering false DEADLOCK warnings).
+            symbol = str(intent.get("symbol") or "").replace("/", "").upper().strip()
+            if symbol and self.shared_state is not None:
+                try:
+                    qty = float(self.shared_state.get_position_qty(symbol) or 0.0)
+                    if qty <= 0:
+                        return False, "phantom_sell_no_position"
+                except Exception:
+                    pass
             return True, "sell_bypass"
 
         symbol = str(intent.get("symbol") or "").replace("/", "").upper().strip()
