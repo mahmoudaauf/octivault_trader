@@ -18,9 +18,12 @@ set +a
 env | grep -E "^(HEAL_|MIN_HOLD_|STRICT_CAP|STARTUP_TRIM|TRUTH_AUDIT)" | sort
 
 echo "=== LAUNCHING 🎯_MASTER_SYSTEM_ORCHESTRATOR.py → ${LOGFILE} ==="
-nohup python3 "🎯_MASTER_SYSTEM_ORCHESTRATOR.py" > "$LOGFILE" 2>&1 &
+# Portable detach: python's os.setsid() creates a new session, fully isolating from tty.
+# nohup ignores SIGHUP. </dev/null prevents stdin tty issues. disown removes from job table.
+nohup python3 -u -c "import os, sys; os.setsid(); os.execvp('python3', ['python3', '-u', '🎯_MASTER_SYSTEM_ORCHESTRATOR.py'])" </dev/null > "$LOGFILE" 2>&1 &
 PID=$!
+disown "$PID" 2>/dev/null || true
 echo "$PID" > "$PIDFILE"
 echo "PID=$PID"
 sleep 3
-ps -p "$PID" -o pid,etime,command | head -2
+ps -p "$PID" -o pid,ppid,etime,command | head -2
