@@ -2929,7 +2929,10 @@ class SharedState:
 
                 significant_floor = float(await self.get_significant_position_floor(symbol) or 0.0)
                 position_value = float(self._estimate_position_value_usdt(symbol, position) or 0.0)
-                self.logger.warning(
+                # Was WARNING — fired per-symbol per-classify-loop (~36 symbols × N loops/sec)
+                # producing 143K lines/2h, driving 41MB log + jetsam-kill. Debug-only now;
+                # the [DEBUG:] prefix in the message indicates intent.
+                self.logger.debug(
                     "[DEBUG:CLASSIFY] %s qty=%.8f value=%.4f floor=%.4f latest_price=%.4f avg_price=%s entry_price=%s",
                     symbol,
                     qty,
