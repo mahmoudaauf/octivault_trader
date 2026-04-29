@@ -2407,8 +2407,30 @@ class MasterSystemOrchestrator:
             cycle += 1
             try:
                 # get_positions_snapshot() is SYNC; get_nav() is ASYNC.
-                positions = self.shared_state.get_positions_snapshot()
+                # include_wallet_inventory=True so Heal-C can sweep mirrored
+                # wallet dust, not just bot-managed positions.
+                positions = self.shared_state.get_positions_snapshot(
+                    include_wallet_inventory=True,
+                )
                 total_equity = await self.shared_state.get_nav()
+                
+                # Enrich missing 'value'/'current_price' with latest prices so
+                # the classifier and healer have non-zero expected_value.
+                for sym, pos in positions.items():
+                    if sym == "USDT":
+                        continue
+                    qty = float(pos.get("qty") or pos.get("quantity") or 0)
+                    px = float(pos.get("current_price") or pos.get("mark_price") or 0)
+                    if px <= 0 and qty > 0:
+                        try:
+                            latest = await self.shared_state.get_latest_price(sym)
+                            if latest and latest > 0:
+                                px = float(latest)
+                                pos["current_price"] = px
+                        except Exception:
+                            pass
+                    if not pos.get("value") and qty > 0 and px > 0:
+                        pos["value"] = qty * px
                 
                 # Update bucket classification (SYNC)
                 bucket_state = self.three_bucket_manager.update_bucket_state(
@@ -2416,12 +2438,45 @@ class MasterSystemOrchestrator:
                     total_equity=total_equity,
                 )
                 
-                # Heal if due (SYNC method signature)
+                # Heal if due — wire execution callback so dust actually liquidates.
                 if self.three_bucket_manager.should_execute_healing():
                     logger.warning(f"[3BucketLoop] 💀 cycle={cycle} executing dead-capital healing...")
-                    healing_result = self.three_bucket_manager.execute_healing()
+                    
+                    # Capture loop reference for cross-thread/coroutine scheduling.
+                    running_loop = asyncio.get_running_loop()
+                    
+                    def _heal_execution_callback(order: Dict) -> Dict:
+                        """Sync callback: fire-and-forget async liquidation submit."""
+                        sym = order.get("symbol") or ""
+                        qty = float(order.get("quantity") or 0)
+                        expected = float(order.get("expected_value") or 0)
+                        if not (sym and qty > 0 and self.execution_manager):
+                            return {"actual_value": 0.0}
+                        try:
+                            running_loop.create_task(
+                                self.execution_manager.execute_liquidation_plan(
+                                    [{"symbol": sym, "quantity": qty, "tag": "heal_c_dust"}]
+                                ),
+                                name=f"HealC:liquidate:{sym}",
+                            )
+                            logger.info(f"[3BucketLoop] 📤 submitted SELL {sym} qty={qty:.8f} expected≈${expected:.4f}")
+                        except Exception as exc:
+                            logger.warning(
+                                f"[3BucketLoop] schedule liquidation {sym} failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            return {"actual_value": 0.0}
+                        return {"actual_value": expected}
+                    
+                    healing_result = self.three_bucket_manager.execute_healing(
+                        execution_callback=_heal_execution_callback,
+                    )
                     if healing_result:
-                        logger.info(f"[3BucketLoop] ✅ Healing complete: {healing_result}")
+                        logger.info(
+                            f"[3BucketLoop] ✅ healing complete: "
+                            f"healed={healing_result.total_positions_healed} "
+                            f"recovered≈${healing_result.total_amount_recovered:.2f}"
+                        )
                 
                 # Status every 10 cycles
                 if cycle % 10 == 1:
