@@ -757,19 +757,23 @@ class PolicyManager:
                         and shared_state is not None
                         and 0.0 < notional <= permanent_floor
                         and hasattr(shared_state, "mark_as_permanent_dust")
-                        and not _is_perm_dust  # idempotent: only emit once per symbol
                     ):
+                        # Idempotency gate: only emit RETIRE log on first transition.
+                        # Without this, the log fires every loop iter for every dust symbol
+                        # contributing to the per-minute log flood that triggers jetsam.
+                        _already_retired = _is_perm_dust  # captured above
                         shared_state.mark_as_permanent_dust(symbol)
                         if hasattr(shared_state, "dust_unhealable"):
                             shared_state.dust_unhealable = getattr(shared_state, "dust_unhealable", {})
                             shared_state.dust_unhealable[str(symbol).upper()] = "UNHEALABLE_LT_MIN_NOTIONAL"
-                        self.logger.info(
-                            "[INVARIANT:DustGuard:RETIRE] %s notional=%.4f <= permanent_floor=%.4f "
-                            "→ marked as PERMANENT_DUST to stop repeat retries.",
-                            symbol,
-                            notional,
-                            permanent_floor,
-                        )
+                        if not _already_retired:
+                            self.logger.info(
+                                "[INVARIANT:DustGuard:RETIRE] %s notional=%.4f <= permanent_floor=%.4f "
+                                "→ marked as PERMANENT_DUST to stop repeat retries.",
+                                symbol,
+                                notional,
+                                permanent_floor,
+                            )
                 except Exception:
                     self.logger.debug("[INVARIANT:DustGuard] Auto-retire path failed for %s", symbol, exc_info=True)
                 
