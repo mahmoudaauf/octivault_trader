@@ -1988,6 +1988,59 @@ class SharedState:
                 if px <= 0:
                     continue
 
+                # ──────────────────────────────────────────────────────────
+                # NAV-GROUND-TRUTH (fix #9): cross-check qty against wallet
+                # ──────────────────────────────────────────────────────────
+                # After Heal-C SELL fills (or any liquidation), the wallet
+                # balance is updated promptly via [Balance:Update] but the
+                # self.positions[sym]['quantity'] may stay at the pre-sale
+                # value until the position-close finalizer runs (which can
+                # be delayed by reconcile_delayed_fill, journal flush, etc.).
+                # During that window, NAV double-counts: free_USDT reflects
+                # the recovered cash AND positions still claim the asset.
+                #
+                # Run #11 attempt 16 evidence: free_USDT=$97.21 + 4 stale
+                # positions = bot NAV $184.27, real Binance NAV $101.67
+                # (gap $87.06 ≈ $86.93 just liquidated by Heal-C).
+                #
+                # Fix: if the wallet shows the base asset at qty 0 (or far
+                # below position qty), trust the wallet — the position is
+                # closed, just not yet finalized in self.positions.
+                #
+                # IMPORTANT: only apply the guard when the base asset is
+                # PRESENT in self.balances (i.e. wallet sync has confirmed
+                # its zero state). If the asset is missing from the
+                # balances dict entirely, we have no evidence — fall back
+                # to trusting the position cache (preserves run-#4 fix #2
+                # behavior for mirrored positions before wallet hydration).
+                base_asset = ""
+                for q in quote_assets:
+                    if sym.endswith(q):
+                        base_asset = sym[:-len(q)]
+                        break
+                if base_asset and base_asset in (self.balances or {}):
+                    bal = (self.balances or {}).get(base_asset, {}) or {}
+                    wallet_qty = float(bal.get("free", 0.0) or 0.0) + float(
+                        bal.get("locked", 0.0) or 0.0
+                    )
+                    # If wallet has materially less than position claims (>5%
+                    # missing), trust the wallet. This catches stale positions
+                    # without breaking on tiny rounding mismatches.
+                    if wallet_qty < qty * 0.95:
+                        if wallet_qty <= 0:
+                            # Wallet says zero → position is closed.
+                            self.logger.info(
+                                "[NAV:WalletGuard] %s position qty=%.8f but wallet=0 — skipping (likely post-liquidation stale cache)",
+                                sym, qty,
+                            )
+                            continue
+                        # Use wallet qty (smaller of the two).
+                        self.logger.info(
+                            "[NAV:WalletGuard] %s position qty=%.8f > wallet=%.8f — using wallet qty",
+                            sym, qty, wallet_qty,
+                        )
+                        qty = wallet_qty
+
                 pos_value = qty * px
                 if pos_value < dust_threshold:
                     continue
@@ -2193,6 +2246,42 @@ class SharedState:
                 )
                 positions_excluded_no_price += 1
                 continue
+            
+            # NAV-GROUND-TRUTH (fix #9, mirrored to rebuild_nav_from_state):
+            # Cross-check qty against wallet balance to catch stale positions
+            # whose quantities haven't been zeroed after a SELL fill.
+            # Only apply when base asset is PRESENT in self.balances (wallet
+            # has confirmed zero); if the asset is absent, fall back to
+            # trusting the position cache (preserves mirrored-position fix).
+            # See rebuild_nav_from_state for full forensics.
+            quote_assets_local = getattr(self, "quote_assets", None) or [
+                getattr(self, "quote_asset", "USDT").upper()
+            ]
+            if not isinstance(quote_assets_local, list):
+                quote_assets_local = [quote_assets_local]
+            quote_assets_local = [str(q).upper() for q in quote_assets_local]
+            base_asset = ""
+            for q in quote_assets_local:
+                if sym.endswith(q):
+                    base_asset = sym[:-len(q)]
+                    break
+            if base_asset and base_asset in (self.balances or {}):
+                bal = (self.balances or {}).get(base_asset, {}) or {}
+                wallet_qty = float(bal.get("free", 0.0) or 0.0) + float(
+                    bal.get("locked", 0.0) or 0.0
+                )
+                if wallet_qty < qty * 0.95:
+                    if wallet_qty <= 0:
+                        self.logger.info(
+                            "[NAV:WalletGuard] %s position qty=%.8f but wallet=0 — skipping (stale post-liquidation)",
+                            sym, qty,
+                        )
+                        continue
+                    self.logger.info(
+                        "[NAV:WalletGuard] %s position qty=%.8f > wallet=%.8f — using wallet qty",
+                        sym, qty, wallet_qty,
+                    )
+                    qty = wallet_qty
             
             # Calculate position value at market price
             pos_value = qty * px
