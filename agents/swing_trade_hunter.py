@@ -375,14 +375,16 @@ class SwingTradeHunter:
             self._collecting_for_agent_manager = False
 
     async def _publish_trade_intent(self, payload: Dict[str, Any]) -> bool:
-        logger.warning(f"[{self.name}] ENTERING _publish_trade_intent with payload: symbol={payload.get('symbol')} side={payload.get('side')}")
+        # Debug breadcrumbs demoted from WARNING → DEBUG. Were emitting 6 WARNING lines
+        # per publish (~12847 publishes/14min = 90 lines/sec → log flood → jetsam).
+        logger.debug(f"[{self.name}] ENTERING _publish_trade_intent with payload: symbol={payload.get('symbol')} side={payload.get('side')}")
         event_bus = getattr(self.shared_state, "event_bus", None)
-        logger.warning(f"[{self.name}] event_bus={event_bus}")
+        logger.debug(f"[{self.name}] event_bus={event_bus}")
         publish = getattr(event_bus, "publish", None) if event_bus else None
-        logger.warning(f"[{self.name}] publish method={publish}")
+        logger.debug(f"[{self.name}] publish method={publish}")
         if callable(publish):
             try:
-                logger.warning(f"[{self.name}] Calling event_bus.publish('events.trade.intent', TradeIntent(...))")
+                logger.debug(f"[{self.name}] Calling event_bus.publish('events.trade.intent', TradeIntent(...))")
                 await publish("events.trade.intent", TradeIntent(**payload))
                 logger.info(
                     "[%s] Published TradeIntent: %s %s",
@@ -390,7 +392,7 @@ class SwingTradeHunter:
                     payload.get("symbol"),
                     payload.get("side"),
                 )
-                logger.warning(f"[{self.name}] ✅ Successfully published TradeIntent")
+                logger.debug(f"[{self.name}] ✅ Successfully published TradeIntent")
                 return True
             except Exception as e:
                 logger.warning(
@@ -409,7 +411,7 @@ class SwingTradeHunter:
             try:
                 logger.warning(f"[{self.name}] Calling shared_state.emit_event('TradeIntent', ...)")
                 await emit_event("TradeIntent", dict(payload))
-                logger.warning(f"[{self.name}] ✅ Successfully emitted via fallback")
+                logger.debug(f"[{self.name}] ✅ Successfully emitted via fallback")
                 return True
             except Exception as e:
                 logger.warning(
@@ -452,7 +454,7 @@ class SwingTradeHunter:
                 try:
                     from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
                     accepted = DEFAULT_SYMBOLS
-                    logger.warning(f"[{self.name}] ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
+                    logger.debug(f"[{self.name}] ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
                 except Exception as e:
                     logger.error(f"[{self.name}] Failed to load DEFAULT_SYMBOLS fallback: {e}")
                     accepted = {}
@@ -621,7 +623,7 @@ class SwingTradeHunter:
             pass  # Non-fatal; ignore if method not available
 
     async def _submit_signal(self, symbol: str, action: str, confidence: float, reason: str) -> None:
-        logger.warning(f"[{self.name}] ENTERING _submit_signal: {symbol} {action} conf={confidence}")
+        logger.debug(f"[{self.name}] ENTERING _submit_signal: {symbol} {action} conf={confidence}")
         action_u = str(action or "").upper().strip()
         if action_u not in {"BUY", "SELL"}:
             logger.warning(f"[{self.name}] SKIPPING _submit_signal: invalid action={action_u}")
@@ -737,7 +739,7 @@ class SwingTradeHunter:
         logger.warning(f"[{self.name}] PUBLISHED TradeIntent: {symbol} {action_u}")
 
     async def _generate_signal(self, symbol):
-        logger.warning(f"[{self.name}] ENTERING _generate_signal for {symbol}")
+        logger.debug(f"[{self.name}] ENTERING _generate_signal for {symbol}")
         # ✅ FIX: Ensure market data readiness event is checked before proceeding
         # We rely on run_once() to have already verified readiness, but double-check here
         try:
@@ -881,10 +883,10 @@ class SwingTradeHunter:
         if ema20_val > ema50_val and rsi_val < rsi_buy_thresh:
             conf = base_confidence + (0.05 if vol_confirmed else 0.0)
             reason = 'EMA uptrend + volume surge' if vol_confirmed else 'EMA uptrend detected'
-            logger.warning(f"[{self.name}] ✅ BUY SIGNAL for {symbol}: {reason} (ema20>{ema50_val:.4f} rsi={rsi_val:.2f} vol_ok={vol_confirmed})")
+            logger.debug(f"[{self.name}] ✅ BUY SIGNAL for {symbol}: {reason} (ema20>{ema50_val:.4f} rsi={rsi_val:.2f} vol_ok={vol_confirmed})")
             return 'buy', round(conf, 4), reason
         if ema20_val < ema50_val and rsi_val > rsi_sell_thresh:
-            logger.warning(f"[{self.name}] ✅ SELL SIGNAL for {symbol}: EMA downtrend + RSI unfavorable (EMA20 < EMA50, RSI > {rsi_sell_thresh})")
+            logger.debug(f"[{self.name}] ✅ SELL SIGNAL for {symbol}: EMA downtrend + RSI unfavorable (EMA20 < EMA50, RSI > {rsi_sell_thresh})")
             return 'sell', base_confidence, 'EMA downtrend detected'
 
         logger.warning(f"[{self.name}] ❌ HOLD for {symbol}: no clear signal")

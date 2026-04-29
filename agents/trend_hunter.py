@@ -591,7 +591,7 @@ class TrendHunter:
             try:
                 from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
                 accepted = DEFAULT_SYMBOLS
-                logger.warning("[%s] ✅ Using %d DEFAULT_SYMBOLS as fallback", self.name, len(DEFAULT_SYMBOLS))
+                logger.debug("[%s] ✅ Using %d DEFAULT_SYMBOLS as fallback", self.name, len(DEFAULT_SYMBOLS))
             except Exception as e:
                 logger.error("[%s] Failed to load DEFAULT_SYMBOLS fallback: %s", self.name, e)
                 accepted = {}

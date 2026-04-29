@@ -315,7 +315,7 @@ class DipSniper:
                 try:
                     from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
                     accepted = DEFAULT_SYMBOLS
-                    logger.warning(f"[{self.name}] ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
+                    logger.debug(f"[{self.name}] ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
                 except Exception as e:
                     logger.error(f"[{self.name}] Failed to load DEFAULT_SYMBOLS fallback: {e}")
                     accepted = {}

@@ -2929,19 +2929,29 @@ class SharedState:
 
                 significant_floor = float(await self.get_significant_position_floor(symbol) or 0.0)
                 position_value = float(self._estimate_position_value_usdt(symbol, position) or 0.0)
-                # Was WARNING — fired per-symbol per-classify-loop (~36 symbols × N loops/sec)
-                # producing 143K lines/2h, driving 41MB log + jetsam-kill. Debug-only now;
-                # the [DEBUG:] prefix in the message indicates intent.
-                self.logger.debug(
-                    "[DEBUG:CLASSIFY] %s qty=%.8f value=%.4f floor=%.4f latest_price=%.4f avg_price=%s entry_price=%s",
-                    symbol,
-                    qty,
-                    position_value,
-                    significant_floor,
-                    float(self.latest_prices.get(self._norm_sym(symbol), 0.0) or 0.0),
-                    position.get("avg_price"),
-                    position.get("entry_price"),
-                )
+                # Was WARNING — fired per-symbol per-classify-loop. Demoted to DEBUG didn't
+                # help (DEBUG handler enabled): 788K lines/14min → 210MB log → jetsam.
+                # Now state-change-throttled: only emit when (qty, value-bucket) differ from
+                # last emit for this symbol. Buckets at $0.10 granularity to ignore micro
+                # price ticks. Cleared on shutdown / next process start.
+                _classify_cache = getattr(self, "_classify_log_cache", None)
+                if _classify_cache is None:
+                    _classify_cache = {}
+                    self._classify_log_cache = _classify_cache
+                _value_bucket = round(position_value * 10.0) / 10.0
+                _key = (qty, _value_bucket)
+                if _classify_cache.get(symbol) != _key:
+                    _classify_cache[symbol] = _key
+                    self.logger.debug(
+                        "[DEBUG:CLASSIFY] %s qty=%.8f value=%.4f floor=%.4f latest_price=%.4f avg_price=%s entry_price=%s",
+                        symbol,
+                        qty,
+                        position_value,
+                        significant_floor,
+                        float(self.latest_prices.get(self._norm_sym(symbol), 0.0) or 0.0),
+                        position.get("avg_price"),
+                        position.get("entry_price"),
+                    )
                 position["value_usdt"] = float(position_value)
                 position["significant_floor_usdt"] = float(significant_floor)
 
