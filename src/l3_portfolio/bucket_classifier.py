@@ -81,6 +81,25 @@ class BucketClassifier:
             PositionClassification with bucket and reason
         """
         
+        # Coerce numeric inputs defensively — SharedState position snapshots
+        # can hand any of these as None (especially for wallet-mirrored dust).
+        try:
+            current_value = float(current_value or 0.0)
+        except (TypeError, ValueError):
+            current_value = 0.0
+        try:
+            current_qty = float(current_qty or 0.0)
+        except (TypeError, ValueError):
+            current_qty = 0.0
+        try:
+            current_price = float(current_price or 0.0)
+        except (TypeError, ValueError):
+            current_price = 0.0
+        try:
+            entry_price = float(entry_price or 0.0)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        
         # Calculate performance
         pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
         
