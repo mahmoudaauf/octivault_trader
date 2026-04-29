@@ -2406,19 +2406,20 @@ class MasterSystemOrchestrator:
         while self.running:
             cycle += 1
             try:
-                positions = await self.shared_state.get_positions_snapshot()
-                total_equity = await self.shared_state.get_total_nav()
+                # get_positions_snapshot() is SYNC; get_nav() is ASYNC.
+                positions = self.shared_state.get_positions_snapshot()
+                total_equity = await self.shared_state.get_nav()
                 
-                # Update bucket classification
-                bucket_state = await self.three_bucket_manager.update_bucket_state(
+                # Update bucket classification (SYNC)
+                bucket_state = self.three_bucket_manager.update_bucket_state(
                     positions=positions,
                     total_equity=total_equity,
                 )
                 
-                # Heal if due
+                # Heal if due (SYNC method signature)
                 if self.three_bucket_manager.should_execute_healing():
                     logger.warning(f"[3BucketLoop] 💀 cycle={cycle} executing dead-capital healing...")
-                    healing_result = await self.three_bucket_manager.execute_healing()
+                    healing_result = self.three_bucket_manager.execute_healing()
                     if healing_result:
                         logger.info(f"[3BucketLoop] ✅ Healing complete: {healing_result}")
                 
