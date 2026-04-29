@@ -20,7 +20,9 @@ env | grep -E "^(HEAL_|MIN_HOLD_|STRICT_CAP|STARTUP_TRIM|TRUTH_AUDIT)" | sort
 echo "=== LAUNCHING 🎯_MASTER_SYSTEM_ORCHESTRATOR.py → ${LOGFILE} ==="
 # Portable detach: python's os.setsid() creates a new session, fully isolating from tty.
 # nohup ignores SIGHUP. </dev/null prevents stdin tty issues. disown removes from job table.
-nohup python3 -u -c "import os, sys; os.setsid(); os.execvp('python3', ['python3', '-u', '🎯_MASTER_SYSTEM_ORCHESTRATOR.py'])" </dev/null > "$LOGFILE" 2>&1 &
+# PYTHONFAULTHANDLER=1 → on segfault/SIGTERM/SIGKILL inheritor signals dumps stack to stderr.
+# PYTHONUNBUFFERED=1 → real-time log flush so we never lose the last lines on crash.
+nohup env PYTHONFAULTHANDLER=1 PYTHONUNBUFFERED=1 python3 -u -X faulthandler -c "import os, sys, faulthandler; faulthandler.enable(); os.setsid(); os.execvpe('python3', ['python3', '-u', '-X', 'faulthandler', '🎯_MASTER_SYSTEM_ORCHESTRATOR.py'], os.environ)" </dev/null > "$LOGFILE" 2>&1 &
 PID=$!
 disown "$PID" 2>/dev/null || true
 echo "$PID" > "$PIDFILE"

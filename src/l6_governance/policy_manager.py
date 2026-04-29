@@ -708,7 +708,21 @@ class PolicyManager:
                 # → DO NOT emit TradeIntent
                 # → Record accumulating position
                 
-                self.logger.warning(
+                # Spam-throttle: if already marked permanent dust, demote warning to debug.
+                # Otherwise this fires per-symbol per-loop (32 dust × N loops/min → log flood
+                # → jetsam-kills run after ~10 min). PERMANENT_DUST signal is preserved by
+                # the RETIRE log emitted once below.
+                _is_perm_dust = False
+                try:
+                    if shared_state is not None:
+                        _du = getattr(shared_state, "dust_unhealable", None) or {}
+                        if isinstance(_du, dict) and str(symbol).upper() in _du:
+                            _is_perm_dust = True
+                except Exception:
+                    pass
+
+                _log_block = self.logger.debug if _is_perm_dust else self.logger.warning
+                _log_block(
                     "[INVARIANT:DustGuard:BLOCK_ACCUMULATE] %s position below minNotional. "
                     "qty=%.8f price=%.2f notional=%.2f < min_notional=%.2f. "
                     "Recording as accumulating, NO TradeIntent will be emitted.",
@@ -743,6 +757,7 @@ class PolicyManager:
                         and shared_state is not None
                         and 0.0 < notional <= permanent_floor
                         and hasattr(shared_state, "mark_as_permanent_dust")
+                        and not _is_perm_dust  # idempotent: only emit once per symbol
                     ):
                         shared_state.mark_as_permanent_dust(symbol)
                         if hasattr(shared_state, "dust_unhealable"):
