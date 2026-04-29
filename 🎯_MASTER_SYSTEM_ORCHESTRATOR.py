@@ -2402,6 +2402,17 @@ class MasterSystemOrchestrator:
         
         logger.info(f"[3BucketLoop] ✅ Started — interval={interval_sec:.0f}s")
         
+        # Initial warmup: give execution_manager and other late-binding
+        # components a chance to come online before the first heal cycle.
+        try:
+            warmup_sec = float(os.getenv("HEAL_C_WARMUP_SEC", "120"))
+        except Exception:
+            warmup_sec = 120.0
+        warmup_sec = max(0.0, min(600.0, warmup_sec))
+        if warmup_sec > 0:
+            logger.info(f"[3BucketLoop] warmup {warmup_sec:.0f}s before first heal cycle")
+            await asyncio.sleep(warmup_sec)
+        
         cycle = 0
         while self.running:
             cycle += 1
@@ -2440,43 +2451,56 @@ class MasterSystemOrchestrator:
                 
                 # Heal if due — wire execution callback so dust actually liquidates.
                 if self.three_bucket_manager.should_execute_healing():
-                    logger.warning(f"[3BucketLoop] 💀 cycle={cycle} executing dead-capital healing...")
-                    
-                    # Capture loop reference for cross-thread/coroutine scheduling.
-                    running_loop = asyncio.get_running_loop()
-                    
-                    def _heal_execution_callback(order: Dict) -> Dict:
-                        """Sync callback: fire-and-forget async liquidation submit."""
-                        sym = order.get("symbol") or ""
-                        qty = float(order.get("quantity") or 0)
-                        expected = float(order.get("expected_value") or 0)
-                        if not (sym and qty > 0 and self.execution_manager):
-                            return {"actual_value": 0.0}
-                        try:
-                            running_loop.create_task(
-                                self.execution_manager.execute_liquidation_plan(
-                                    [{"symbol": sym, "quantity": qty, "tag": "heal_c_dust"}]
-                                ),
-                                name=f"HealC:liquidate:{sym}",
-                            )
-                            logger.info(f"[3BucketLoop] 📤 submitted SELL {sym} qty={qty:.8f} expected≈${expected:.4f}")
-                        except Exception as exc:
-                            logger.warning(
-                                f"[3BucketLoop] schedule liquidation {sym} failed: "
-                                f"{type(exc).__name__}: {exc}"
-                            )
-                            return {"actual_value": 0.0}
-                        return {"actual_value": expected}
-                    
-                    healing_result = self.three_bucket_manager.execute_healing(
-                        execution_callback=_heal_execution_callback,
-                    )
-                    if healing_result:
+                    # Guard: skip heal-c if execution_manager is not yet ready
+                    # (early cycles can fire before component init completes).
+                    # Without this, callback returns $0, the healer marks the
+                    # round as 'healed' anyway, and no real liquidation occurs.
+                    if not self.execution_manager:
                         logger.info(
-                            f"[3BucketLoop] ✅ healing complete: "
-                            f"healed={healing_result.total_positions_healed} "
-                            f"recovered≈${healing_result.total_amount_recovered:.2f}"
+                            f"[3BucketLoop] cycle={cycle} healing deferred — "
+                            f"execution_manager not yet ready"
                         )
+                    else:
+                        logger.warning(f"[3BucketLoop] 💀 cycle={cycle} executing dead-capital healing...")
+                        
+                        # Capture loop reference for cross-thread/coroutine scheduling.
+                        running_loop = asyncio.get_running_loop()
+                        
+                        def _heal_execution_callback(order: Dict) -> Dict:
+                            """Sync callback: fire-and-forget async liquidation submit."""
+                            sym = order.get("symbol") or ""
+                            qty = float(order.get("quantity") or 0)
+                            expected = float(order.get("expected_value") or 0)
+                            if not (sym and qty > 0 and self.execution_manager):
+                                # Force healer to mark this as failed (raise) so it
+                                # surfaces in errors[] and is retried next cycle.
+                                raise RuntimeError(f"liquidation precondition failed sym={sym} qty={qty}")
+                            try:
+                                running_loop.create_task(
+                                    self.execution_manager.execute_liquidation_plan(
+                                        [{"symbol": sym, "quantity": qty, "tag": "heal_c_dust"}]
+                                    ),
+                                    name=f"HealC:liquidate:{sym}",
+                                )
+                                logger.info(f"[3BucketLoop] 📤 submitted SELL {sym} qty={qty:.8f} expected≈${expected:.4f}")
+                            except Exception as exc:
+                                logger.warning(
+                                    f"[3BucketLoop] schedule liquidation {sym} failed: "
+                                    f"{type(exc).__name__}: {exc}"
+                                )
+                                raise
+                            return {"actual_value": expected}
+                        
+                        healing_result = self.three_bucket_manager.execute_healing(
+                            execution_callback=_heal_execution_callback,
+                        )
+                        if healing_result:
+                            logger.info(
+                                f"[3BucketLoop] ✅ healing complete: "
+                                f"healed={healing_result.total_positions_healed} "
+                                f"recovered≈${healing_result.total_amount_recovered:.2f} "
+                                f"errors={len(healing_result.errors)}"
+                            )
                 
                 # Status every 10 cycles
                 if cycle % 10 == 1:
