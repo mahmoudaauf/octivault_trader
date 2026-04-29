@@ -40,14 +40,39 @@ class ThreeBucketPortfolioManager:
         Initialize three-bucket manager.
         
         Args:
-            config: Configuration dict with threshold overrides
+            config: Configuration dict OR config-like object (OrchestratorConfig).
+                    Object configs are coerced to a dict so child components can
+                    safely call ``self.config.get(...)``.
         """
-        self.config = config or {}
+        # ------------------------------------------------------------------
+        # FIX: Coerce non-dict configs (e.g., OrchestratorConfig attribute
+        # bag) into a dict. Previously child components called ``config.get``
+        # and crashed with: "OrchestratorConfig has no attribute 'get'".
+        # ------------------------------------------------------------------
+        if config is None:
+            cfg_dict: Dict = {}
+        elif isinstance(config, dict):
+            cfg_dict = config
+        else:
+            # Build dict from public attributes (skip private/dunder/callables)
+            cfg_dict = {}
+            for attr in dir(config):
+                if attr.startswith("_"):
+                    continue
+                try:
+                    val = getattr(config, attr)
+                except Exception:
+                    continue
+                if callable(val):
+                    continue
+                cfg_dict[attr] = val
         
-        # Initialize components
-        self.classifier = BucketClassifier(config)
-        self.healer = DeadCapitalHealer(config)
-        self.healing_orchestrator = HealingOrchestrator(self.healer, config)
+        self.config = cfg_dict
+        
+        # Initialize components (now guaranteed to receive a dict)
+        self.classifier = BucketClassifier(cfg_dict)
+        self.healer = DeadCapitalHealer(cfg_dict)
+        self.healing_orchestrator = HealingOrchestrator(self.healer, cfg_dict)
         
         # State tracking
         self.current_bucket_state: Optional[PortfolioBucketState] = None

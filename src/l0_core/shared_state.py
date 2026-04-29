@@ -4692,14 +4692,27 @@ class SharedState:
 
         # CRITICAL FIX: Bootstrap deadlock prevention (Fix #4)
         # When portfolio is completely flat (no reserved capital) and balance is critically low,
-        # relax safety reserve to minimal $0.50 to allow first trade to execute
+        # relax safety reserve to a HARD FLOOR (env BOOTSTRAP_MIN_RESERVE_USDT, default $2.00)
+        # to allow first trade to execute, BUT never below that floor — protects user's
+        # min-reserve policy intent (Q2: "USDT shouldn't drop to 0").
         spendable_with_full_reserve = available - reserved - max(available * rr, mr)
         
         if reserved == 0 and spendable_with_full_reserve < 5.0 and available > 5.0:
-            # Flat portfolio with starved capital: use minimal reserve ($0.50) instead of full
-            # This allows the first BUY to execute when startup has consumed all capital via safety reserves
-            self.logger.info(f"[SS:BootstrapFix] Flat portfolio with capital starvation. Using minimal reserve. Available: ${available:.2f} → Spendable: ${max(0.0, available - reserved - 0.50):.2f}")
-            return max(0.0, available - reserved - 0.50)
+            # Flat portfolio with starved capital: use bootstrap floor instead of full reserve.
+            # Default $2.00 floor (was $0.50 — too low; let USDT drain on every cycle).
+            try:
+                bootstrap_floor = float(getattr(self.config, "BOOTSTRAP_MIN_RESERVE_USDT", 2.00) or 2.00)
+            except Exception:
+                bootstrap_floor = 2.00
+            bootstrap_floor = max(0.50, bootstrap_floor)  # never below 0.50 absolute
+            spendable = max(0.0, available - reserved - bootstrap_floor)
+            self.logger.info(
+                f"[SS:BootstrapFix] Flat portfolio with capital starvation. "
+                f"Using bootstrap reserve floor=${bootstrap_floor:.2f} "
+                f"(full policy reserve would leave only ${spendable_with_full_reserve:.2f} spendable). "
+                f"Available: ${available:.2f} → Spendable: ${spendable:.2f}"
+            )
+            return spendable
         
         safety_reserve = max(available * rr, mr)
         return max(0.0, available - reserved - safety_reserve)
