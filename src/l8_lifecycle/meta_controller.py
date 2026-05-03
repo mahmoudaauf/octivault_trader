@@ -7939,9 +7939,9 @@ class MetaController:
             expected_move_pct_norm = 0.0
             skip_expected_net_gate = True
 
-        fee_bps = float(self._cfg("CR_FEE_BPS", 10.0) or 10.0)
-        slip_bps = float(self._cfg("CR_PRICE_SLIPPAGE_BPS", 10.0) or 10.0)
-        buffer_bps = float(self._cfg("PRETRADE_EFFECT_BUFFER_BPS", 5.0) or 5.0)
+        fee_bps = float(self._cfg("CR_FEE_BPS", 2.0) or 2.0)
+        slip_bps = float(self._cfg("CR_PRICE_SLIPPAGE_BPS", 2.0) or 2.0)
+        buffer_bps = float(self._cfg("PRETRADE_EFFECT_BUFFER_BPS", 1.0) or 1.0)
         round_trip_cost_pct = ((fee_bps * 2.0) + (slip_bps * 2.0) + buffer_bps) / 10000.0
 
         directional_expected_move_pct = (
