@@ -2254,40 +2254,34 @@ class MasterSystemOrchestrator:
         self.start_time = datetime.now()
         
         # ════════════════════════════════════════════════════════════════════════
-        # AUTO-RECOVERY TRIGGER: If high dust ratio in MICRO_SNIPER mode,
-        # automatically enable RECOVERY mode to accelerate dust healing.
-        # This unlocks the LiquidationAgent which is normally blocked in MICRO_SNIPER.
+        # AUTO-RECOVERY TRIGGER: Detect dust trap and enable RECOVERY mode.
+        # This unlocks LiquidationAgent dust healing normally blocked in MICRO_SNIPER.
         # ════════════════════════════════════════════════════════════════════════
         try:
-            if self.meta_controller and hasattr(self.meta_controller, 'mode_manager'):
+            # Simple check: if we have a lot of positions, assume dust trap
+            positions_snapshot = self.shared_state.get_positions_snapshot() or {}
+            pos_count = len([p for p in positions_snapshot.values() if p and float((p or {}).get('qty', 0.0) or 0.0) > 0])
+            
+            logger.warning("[Auto-Recovery] Startup check: %d positions detected", pos_count)
+            
+            # If high dust burden (>10 positions in MICRO_SNIPER), enable RECOVERY
+            if pos_count >= 10 and self.meta_controller and hasattr(self.meta_controller, 'mode_manager'):
                 regime = self.meta_controller.regime_manager.get_regime() if hasattr(self.meta_controller, 'regime_manager') else ""
+                logger.warning("[Auto-Recovery] Regime check: regime=%s", regime)
+                
                 if str(regime).upper() == "MICRO_SNIPER":
-                    # Check dust ratio
-                    total, sig_count, dust_count = await self.meta_controller._classify_positions_by_size()
-                    if total > 0:
-                        dust_ratio = dust_count / total
-                        logger.info(
-                            "[Auto-Recovery] MICRO_SNIPER mode detected: total=%d sig=%d dust=%d ratio=%.1f%%",
-                            total, sig_count, dust_count, dust_ratio * 100
-                        )
-                        if dust_ratio > 0.80 and dust_count >= 10:
-                            # High dust burden detected - enable RECOVERY mode
-                            logger.warning(
-                                "🚨 [Auto-Recovery] Dust trap detected! ratio=%.1f%% (>80%%), dust_count=%d (>=10) "
-                                "→ Enabling RECOVERY mode to accelerate dust liquidation",
-                                dust_ratio * 100, dust_count
-                            )
-                            success = self.meta_controller.mode_manager.set_mode(
-                                "RECOVERY", 
-                                force=True, 
-                                reason="dust_trap_auto_heal"
-                            )
-                            if success:
-                                logger.info("✅ [Auto-Recovery] Successfully switched to RECOVERY mode")
-                            else:
-                                logger.warning("⚠️  [Auto-Recovery] Mode switch returned False")
+                    logger.warning(
+                        "🚨 [Auto-Recovery] Dust trap detected! (>=10 positions in MICRO_SNIPER) "
+                        "→ Enabling RECOVERY mode to accelerate dust liquidation"
+                    )
+                    success = self.meta_controller.mode_manager.set_mode(
+                        "RECOVERY", 
+                        force=True, 
+                        reason="dust_trap_auto_heal"
+                    )
+                    logger.warning("[Auto-Recovery] Mode switch result: success=%s", success)
         except Exception as _auto_recovery_err:
-            logger.warning("[Auto-Recovery] Trigger check failed (continuing): %s", _auto_recovery_err)
+            logger.warning("[Auto-Recovery] Trigger check failed (continuing): %s", _auto_recovery_err, exc_info=True)
         
         logger.info("\n" + "=" * 80)
         logger.info("PHASE 2: RUNNING TRADING SYSTEM")
