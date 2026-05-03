@@ -2253,6 +2253,42 @@ class MasterSystemOrchestrator:
         self.running = True
         self.start_time = datetime.now()
         
+        # ════════════════════════════════════════════════════════════════════════
+        # AUTO-RECOVERY TRIGGER: If high dust ratio in MICRO_SNIPER mode,
+        # automatically enable RECOVERY mode to accelerate dust healing.
+        # This unlocks the LiquidationAgent which is normally blocked in MICRO_SNIPER.
+        # ════════════════════════════════════════════════════════════════════════
+        try:
+            if self.meta_controller and hasattr(self.meta_controller, 'mode_manager'):
+                regime = self.meta_controller.regime_manager.get_regime() if hasattr(self.meta_controller, 'regime_manager') else ""
+                if str(regime).upper() == "MICRO_SNIPER":
+                    # Check dust ratio
+                    total, sig_count, dust_count = await self.meta_controller._classify_positions_by_size()
+                    if total > 0:
+                        dust_ratio = dust_count / total
+                        logger.info(
+                            "[Auto-Recovery] MICRO_SNIPER mode detected: total=%d sig=%d dust=%d ratio=%.1f%%",
+                            total, sig_count, dust_count, dust_ratio * 100
+                        )
+                        if dust_ratio > 0.80 and dust_count >= 10:
+                            # High dust burden detected - enable RECOVERY mode
+                            logger.warning(
+                                "🚨 [Auto-Recovery] Dust trap detected! ratio=%.1f%% (>80%%), dust_count=%d (>=10) "
+                                "→ Enabling RECOVERY mode to accelerate dust liquidation",
+                                dust_ratio * 100, dust_count
+                            )
+                            success = self.meta_controller.mode_manager.set_mode(
+                                "RECOVERY", 
+                                force=True, 
+                                reason="dust_trap_auto_heal"
+                            )
+                            if success:
+                                logger.info("✅ [Auto-Recovery] Successfully switched to RECOVERY mode")
+                            else:
+                                logger.warning("⚠️  [Auto-Recovery] Mode switch returned False")
+        except Exception as _auto_recovery_err:
+            logger.warning("[Auto-Recovery] Trigger check failed (continuing): %s", _auto_recovery_err)
+        
         logger.info("\n" + "=" * 80)
         logger.info("PHASE 2: RUNNING TRADING SYSTEM")
         logger.info("=" * 80)
