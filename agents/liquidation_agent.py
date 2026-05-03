@@ -86,7 +86,7 @@ class LiquidationAgent:
     @property
     def min_notional_dust_factor(self) -> float: return float(self._cfg("LIQ_DUST_FACTOR", 1.2))
     @property
-    def min_hold_sec(self) -> float: return float(self._cfg("LIQ_MIN_HOLD_SEC", 90.0))
+    def min_hold_sec(self) -> float: return float(self._cfg("LIQ_MIN_HOLD_SEC", 10.0))  # Reduced from 90s for faster dust cleanup
 
     def _parse_ts(self, val: Any) -> float:
         if isinstance(val, datetime):
@@ -178,7 +178,7 @@ class LiquidationAgent:
     # -----------------------------
     async def scheduler(self):
         """Main loop managing internal hygiene (Triggers B, C)."""
-        interval = float(self._cfg("LIQ_SCHED_INTERVAL_SEC", 30))
+        interval = float(self._cfg("LIQ_SCHED_INTERVAL_SEC", 10))  # Reduced from 30s for more frequent checks
         while True:
             try:
                 await self._refresh_universe()
