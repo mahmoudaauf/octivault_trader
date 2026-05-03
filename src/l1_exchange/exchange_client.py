@@ -3083,6 +3083,84 @@ class ExchangeClient:
         """Delegate to place_market_order so circuit breaker and normalization are applied."""
         return await self.place_market_order(symbol, "BUY", quote=quote_amount, tag=tag)
 
+    @staticmethod
+    def _client_order_id_fragment(value: Any, *, limit: int) -> str:
+        raw = str(value or "")
+        frag = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in raw)
+        frag = frag.strip("_-")
+        return frag[: max(0, int(limit))]
+
+    def _make_live_client_order_id(
+        self,
+        *,
+        ts_ms: int,
+        side: str,
+        tag: str = "",
+        client_order_id_hint: Optional[str] = None,
+    ) -> str:
+        """
+        Build a fresh Binance client order id for each live submit.
+
+        Higher layers historically passed deterministic ids such as
+        ETHUSDT:SELL:...; reusing those lets an old exchange order be
+        recovered as if it belonged to the current submit. Keep the hint only
+        as a compact fingerprint, never as the actual id.
+        """
+        side_char = (str(side or "X").upper()[:1] or "X")
+        hint = str(client_order_id_hint or tag or "meta")
+        hint_hash = hashlib.sha1(hint.encode("utf-8", errors="ignore")).hexdigest()[:8]
+        tag_frag = self._client_order_id_fragment(tag or "meta", limit=7) or "meta"
+        return f"octi{ts_ms % 10_000_000_000:010d}{uuid.uuid4().hex[:6]}{side_char}{hint_hash}{tag_frag}"[:36]
+
+    @staticmethod
+    def _raw_order_time_ms(raw: Optional[dict]) -> int:
+        if not isinstance(raw, dict):
+            return 0
+        best = 0
+        for key in ("transactTime", "updateTime", "workingTime", "time"):
+            try:
+                val = raw.get(key)
+                if val is None:
+                    continue
+                best = max(best, int(float(val)))
+            except Exception:
+                continue
+        return int(best)
+
+    def _validate_recovered_order_for_submit(
+        self,
+        raw: Optional[dict],
+        *,
+        submit_started_ms: int,
+        expected_symbol: str,
+        expected_side: str,
+        expected_client_order_id: str,
+        stale_grace_ms: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        if not isinstance(raw, dict) or not raw:
+            return False, "missing_recovered_order"
+
+        raw_cid = str(raw.get("clientOrderId") or raw.get("origClientOrderId") or "")
+        if raw_cid != str(expected_client_order_id):
+            return False, f"client_order_id_mismatch:{raw_cid or 'missing'}"
+
+        raw_sym = str(raw.get("symbol") or "").upper()
+        if raw_sym and raw_sym != str(expected_symbol or "").upper():
+            return False, f"symbol_mismatch:{raw_sym}"
+
+        raw_side = str(raw.get("side") or "").upper()
+        if raw_side and raw_side != str(expected_side or "").upper():
+            return False, f"side_mismatch:{raw_side}"
+
+        order_ms = self._raw_order_time_ms(raw)
+        grace_ms = int(stale_grace_ms if stale_grace_ms is not None else self.config.get("ORDER_RECOVERY_FRESHNESS_GRACE_MS", 30_000) or 30_000)
+        grace_ms = max(0, min(grace_ms, 300_000))
+        if order_ms <= 0:
+            return False, "missing_recovered_order_timestamp"
+        if order_ms < int(submit_started_ms) - grace_ms:
+            return False, f"stale_recovered_order:{order_ms}<submit:{submit_started_ms}"
+        return True, "fresh"
+
     async def place_market_order(
         self,
         symbol: str,
@@ -3121,12 +3199,15 @@ class ExchangeClient:
         min_notional = float(filters.get("min_notional", 0))
         step_size = str(filters.get("step_size", "0.000001"))
 
-        # Build idempotent clientOrderId with tag
         ts_ms = int(time.time() * 1000)
-        # Binance newClientOrderId only allows: A-Z, a-z, 0-9, underscore, hyphen
-        # Replace '/' with '_' to avoid ExternalAPIError
-        safe_tag = (tag or 'meta_unknown').replace("/", "_")
-        base_coid = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in (clientOrderId or f"octi-{ts_ms}-{safe_tag}"))[:36]
+        safe_tag = self._client_order_id_fragment(tag or "meta_unknown", limit=24) or "meta_unknown"
+        base_coid = self._make_live_client_order_id(
+            ts_ms=ts_ms,
+            side=side,
+            tag=safe_tag,
+            client_order_id_hint=clientOrderId,
+        )
+        submit_started_ms = ts_ms
 
         # Circuit breaker check (submit)
         if not self._submit_breaker.allow():
@@ -3176,6 +3257,7 @@ class ExchangeClient:
             except Exception:
                 ref_px = px
 
+            submit_started_ms = int(time.time() * 1000)
             raw = await self._request("POST", "/api/v3/order", payload, signed=True, api="spot_api")
             self._submit_breaker.record(True)
             status = str((raw or {}).get("status", "")).upper()
@@ -3226,6 +3308,30 @@ class ExchangeClient:
                     if qraw is None:
                         raise RuntimeError("order_status_unknown")
                     self._query_breaker.record(True)
+                    is_current, recovery_reason = self._validate_recovered_order_for_submit(
+                        qraw,
+                        submit_started_ms=submit_started_ms,
+                        expected_symbol=sym,
+                        expected_side=side,
+                        expected_client_order_id=base_coid,
+                    )
+                    if not is_current:
+                        await self._emit_summary(
+                            "ORDER_STATUS_STALE_IGNORED",
+                            symbol=sym,
+                            side=side,
+                            tag=tag,
+                            status="REJECTED",
+                            reason=recovery_reason,
+                            error_code="STALE_ORDER_STATUS_RECOVERY",
+                        )
+                        return self._normalize_exec_result(
+                            base_coid,
+                            {"status": "REJECTED", "clientOrderId": base_coid},
+                            False,
+                            error_code="STALE_ORDER_STATUS_RECOVERY",
+                            error_msg=recovery_reason,
+                        )
                     q_status = str((qraw or {}).get("status", "")).upper()
                     q_status_ok = q_status in ("FILLED", "PARTIALLY_FILLED")
                     res = self._normalize_exec_result(base_coid, qraw, q_status_ok)

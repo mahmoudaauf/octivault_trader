@@ -201,6 +201,27 @@ class WebSocketMarketData:
             self._symbols_subscribed.update(new_symbols)
             self._logger.info(f"[WS:Subscribe] Added {new_symbols}, total={len(self._symbols_subscribed)}")
 
+    async def _get_fallback_symbols(self) -> List[str]:
+        """
+        Get fallback symbols from bootstrap defaults if accepted_symbols is empty.
+        This is a safety mechanism to prevent WebSocket from hanging.
+        """
+        try:
+            # First try to get from bootstrap_default_symbols
+            from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
+            if DEFAULT_SYMBOLS:
+                symbols = list(DEFAULT_SYMBOLS.keys())
+                self._logger.info(f"[WS:Fallback] Using {len(symbols)} bootstrap symbols: {symbols[:5]}...")
+                return symbols
+        except Exception as e:
+            self._logger.debug(f"[WS:Fallback] Failed to load bootstrap symbols: {e}")
+        
+        # Hardcoded fallback if everything else fails
+        hardcoded = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+        self._logger.warning(f"[WS:Fallback] Using hardcoded symbols: {hardcoded}")
+        return hardcoded
+
+
     async def _ws_main_loop(self) -> None:
         """
         Main WebSocket connection loop with reconnection logic.
@@ -216,6 +237,26 @@ class WebSocketMarketData:
         while self._running and reconnect_attempts < self.max_reconnect_attempts:
             try:
                 self._logger.info(f"[WS:Connect] Connecting (attempt {reconnect_attempts + 1}/{self.max_reconnect_attempts})")
+                
+                # === FIX: Auto-subscribe to available accepted_symbols ===
+                # Try to get symbols from SharedState if not already subscribed
+                if not self._symbols_subscribed:
+                    try:
+                        accepted = getattr(self.shared_state, "accepted_symbols", {})
+                        if accepted and isinstance(accepted, dict):
+                            syms = list(accepted.keys())
+                            if syms:
+                                await self.subscribe(syms)
+                                self._logger.info(f"[WS:AutoSubscribe] Subscribed to {len(syms)} symbols from accepted_symbols")
+                    except Exception as e:
+                        self._logger.debug(f"[WS:AutoSubscribe] Failed to get symbols: {e}")
+                
+                # === FIX: Use fallback symbols if still empty ===
+                if not self._symbols_subscribed:
+                    fallback_syms = await self._get_fallback_symbols()
+                    if fallback_syms:
+                        await self.subscribe(fallback_syms)
+                        self._logger.warning(f"[WS:Fallback] Subscribed to {len(fallback_syms)} fallback symbols")
                 
                 # Get binance client
                 binance_client = await self._get_binance_client()
@@ -263,7 +304,10 @@ class WebSocketMarketData:
                                 pass
                             
                             if msg:
-                                await self._handle_message(msg)
+                                try:
+                                    await self._handle_message(msg)
+                                except Exception as msg_err:
+                                    self._logger.debug(f"[WS:MsgHandle] Error: {msg_err}")
                         
                         except asyncio.TimeoutError:
                             self._logger.warning("[WS:Timeout] No message for 60s, reconnecting...")
@@ -271,9 +315,20 @@ class WebSocketMarketData:
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:
-                            self._logger.error(f"[WS:MsgErr] Message processing failed: {e}")
-                            # Continue processing other messages
-                            continue
+                            error_msg = str(e).lower()
+                            # If read loop is closed, break to reconnect
+                            if "read loop has been closed" in error_msg or "closed" in error_msg:
+                                self._logger.info(f"[WS:Closed] Connection closed, reconnecting...")
+                                break
+                            elif "disconnected" in error_msg:
+                                self._logger.info(f"[WS:Disconnect] WebSocket disconnected")
+                                break
+                            else:
+                                # For other transient errors, log only once per 10 errors
+                                if reconnect_attempts % 10 == 0:
+                                    self._logger.debug(f"[WS:MsgErr] Error: {str(e)[:100]}")
+                                # Continue for other transient errors
+                                continue
                 
                 self._ws_stream = None
             

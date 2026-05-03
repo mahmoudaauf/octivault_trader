@@ -256,7 +256,14 @@ class LiquidationAgent:
                 roi = float(pos.get("roi", 0.0))
                 candidates.append({"symbol": sym, "qty": qty, "value": qty * price, "roi": roi})
             
-            candidates.sort(key=lambda x: x["roi"]) # Worst ROI first
+            # FIX #Q1: Liquidate experimental symbols FIRST (before proven symbols)
+            # Sort by: (1) is_proven (False first = experimental first), (2) ROI (worst first)
+            def sort_key(cand):
+                is_proven = self.shared_state.is_symbol_proven(cand["symbol"]) if self.shared_state else False
+                return (is_proven, cand["roi"])  # False < True, so experimental symbols come first
+            
+            candidates.sort(key=sort_key)
+            
             for cand in candidates:
                 if freed >= needed_quote: break
                 if not self._passes_min_hold(cand["symbol"]):

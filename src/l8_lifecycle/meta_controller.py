@@ -85,11 +85,13 @@ try:
     from src.l3_portfolio.bootstrap_manager import BootstrapOrchestrator
     from src.l5_strategy.arbitration_engine import ArbitrationEngine
     from src.l8_lifecycle.lifecycle_manager import LifecycleManager
+    from src.l8_lifecycle.fourth_slot_tracker import FourthSlotTracker
 except ImportError as e:
     # Fallback if modules are not yet available
     BootstrapOrchestrator = None
     ArbitrationEngine = None
     LifecycleManager = None
+    FourthSlotTracker = None
     _phase_2c_import_warning = f"Phase 2c modules not available: {e}"
 
 # ==============================================================================
@@ -1447,7 +1449,8 @@ class MetaController:
         """
         Check if dust healing is allowed in current regime.
         
-        Returns False in MICRO_SNIPER mode (NAV < 1000).
+        Returns False in MICRO_SNIPER mode (NAV < 1000) EXCEPT in RECOVERY mode.
+        In RECOVERY mode, dust healing is ALWAYS enabled to allow capital recovery.
         
         Args:
             symbol: Optional symbol for logging
@@ -1455,6 +1458,23 @@ class MetaController:
         Returns:
             bool: True if dust healing enabled, False if disabled by regime
         """
+        # RECOVERY MODE EXCEPTION: Always allow dust healing during recovery
+        # This allows the system to automatically liquidate dust positions
+        # and unlock capital trapped in the dust trap condition
+        try:
+            current_mode = str(self.mode_manager.get_mode() or "").upper()
+            if current_mode in ("RECOVERY", "BOOTSTRAP_VIRTUAL"):
+                self.logger.debug(
+                    "[REGIME:DustHealing] 🔓 RECOVERY MODE OVERRIDE: Dust healing ENABLED "
+                    "(mode=%s, regime=%s)", 
+                    current_mode, 
+                    self.regime_manager.get_regime()
+                )
+                return True
+        except Exception:
+            pass  # Fall through to normal regime check
+        
+        # Normal regime check (applies in non-recovery modes)
         if not self.regime_manager.is_dust_healing_enabled():
             if symbol:
                 self.logger.debug("[REGIME:DustHealing] Blocked for %s in regime=%s", 
@@ -1924,12 +1944,34 @@ class MetaController:
             else:
                 self.lifecycle_manager = None
                 self.logger.debug("[Meta:Init] LifecycleManager not available (Phase 2c modules missing)")
+            
+            # ═════════════════════════════════════════════════════════════════════════
+            # FIX #8 EXTENSION: 4TH SLOT AGGRESSIVE PROFIT HUNTING
+            # ═════════════════════════════════════════════════════════════════════════
+            # Initialize FourthSlotTracker for aggressive rotating symbol hunting
+            fix8_4th_slot_enabled = getattr(config, 'FIX8_4TH_SLOT_ENABLED', True)
+            if fix8_4th_slot_enabled and FourthSlotTracker is not None:
+                self.fourth_slot_tracker = FourthSlotTracker(config)
+                self.logger.warning(
+                    "[FIX #8: 4TH SLOT] Initialized | "
+                    "Target: %+.1f%%, Stop: %.1f%%, Max Hold: %d min",
+                    config.FIX8_4TH_SLOT_PROFIT_TARGET_PCT * 100,
+                    config.FIX8_4TH_SLOT_STOP_LOSS_PCT * 100,
+                    config.FIX8_4TH_SLOT_MAX_HOLD_MINUTES
+                )
+            else:
+                self.fourth_slot_tracker = None
+                if not fix8_4th_slot_enabled:
+                    self.logger.info("[FIX #8: 4TH SLOT] DISABLED via config")
+                else:
+                    self.logger.debug("[FIX #8: 4TH SLOT] FourthSlotTracker not available (Phase 2c modules missing)")
                 
         except Exception as e:
             self.logger.warning(f"[Meta:Init] Phase 2c initialization error: {e}", exc_info=True)
             self.bootstrap_orchestrator = None
             self.arbitration_engine = None
             self.lifecycle_manager = None
+            self.fourth_slot_tracker = None
         
         # ═══════════════════════════════════════════════════════════════════
         # PHASE 1 MODULARIZATION: Use imported BoundedCache directly
@@ -2590,6 +2632,7 @@ class MetaController:
         self._bootstrap_seed_used = False
         self._bootstrap_seed_active = False
         self._bootstrap_seed_cycle = None
+        self._bootstrap_execution_override_active = False  # Persistent flag for dust bootstrap override
         
         # P1 FIX: Bootstrap Dust Bypass - Per-Cycle Reset (Not One-Shot)
         # Allows bootstrap to recover multiple times per cycle, not just once globally
@@ -3086,6 +3129,7 @@ class MetaController:
                 ),
             )
         )
+        
         return max(float(min_notional), strategy_floor)
 
     # ========================================================================
@@ -5423,13 +5467,21 @@ class MetaController:
         now_ts_local = time.time()
         self.logger.debug(f"[Deadlock:Check] Ignore reasons: {ignore_reasons}, threshold={deadlock_threshold}")
         if hasattr(self.shared_state, "rejection_counters"):
-            for (sym, side, reason), count in self.shared_state.rejection_counters.items():
+            for key, count in self.shared_state.rejection_counters.items():
+                # Handle both 2-element (sym, side) and 3-element (sym, side, reason) keys
+                if len(key) == 3:
+                    sym, side, reason = key
+                elif len(key) == 2:
+                    sym, side = key
+                    reason = "UNKNOWN"
+                else:
+                    continue
                 reason_u = str(reason).upper()
                 self.logger.debug(f"[Deadlock:Check] {sym} {side} reason='{reason}' (normalized={reason_u}) count={count} ignored={reason_u in ignore_reasons}")
                 if reason_u in ignore_reasons:
                     self.logger.debug(f"[Deadlock:Check] ✅ IGNORING {reason_u} (in ignore list)")
                     continue
-                ts = self.shared_state.rejection_timestamps.get((sym, side, reason), now_ts_local)
+                ts = self.shared_state.rejection_timestamps.get(key, now_ts_local)
                 if now_ts_local - ts > rej_ttl_sec:
                     continue
                 if count >= deadlock_threshold:
@@ -7903,7 +7955,7 @@ class MetaController:
         if side_u == "SELL" and not sell_requires_expected_edge:
             skip_expected_net_gate = True
 
-        base_min_net_pct = float(self._cfg("PRETRADE_MIN_EXPECTED_NET_PCT", 0.0015) or 0.0015)
+        base_min_net_pct = float(self._cfg("PRETRADE_MIN_EXPECTED_NET_PCT", 0.0001) or 0.0001)
         base_min_net_usdt = float(self._cfg("PRETRADE_MIN_EXPECTED_NET_USDT", 0.05) or 0.05)
         base_min_win_rate = float(self._cfg("PRETRADE_MIN_REALIZED_WIN_RATE", 0.50) or 0.50)
         no_trade_cycles = int(getattr(self, "cycles_no_trade", 0) or 0)
@@ -8670,7 +8722,7 @@ class MetaController:
                 
                 # Check if this is a dust position
                 state = pos_data.get("state", "UNKNOWN")
-                qty = float(pos_data.get("qty", 0))
+                qty = float(pos_data.get("quantity", pos_data.get("qty", 0)) or 0)
                 value_usdt = float(pos_data.get("value_usdt", 0))
                 
                 if self._is_position_dust_locked(state, qty, value_usdt):
@@ -8696,7 +8748,7 @@ class MetaController:
             # 2. Then lowest confidence
             # 3. Then lowest notional (smallest loss)
             dust_candidates.sort(
-                key=lambda x: (x["created_at"], -x["confidence"], x["notional"])
+                key=lambda x: (x["created_at"], x["confidence"], x["notional"])
             )
             
             # Select the first (oldest, lowest confidence, lowest notional)
@@ -10098,6 +10150,69 @@ class MetaController:
             "system_health": "HEALTHY",
         }
 
+        # ✅ FIX #8: TOP 3 SYMBOLS FOCUS WITH PROFITABLE EXITS
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        # STRATEGY: Focus trading on top 3 symbols by balance, use free USDT to exit profitably
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        try:
+            # Check if focused trading mode is enabled
+            enable_top3_focus = bool(self._cfg("ENABLE_TOP3_FOCUS", False))
+            
+            if enable_top3_focus:
+                # Get all positions sorted by balance value
+                all_positions = self.shared_state.get_positions() or {}
+                positions_by_value = []
+                
+                for symbol, pos_data in all_positions.items():
+                    if symbol == 'USDT':
+                        continue
+                    try:
+                        qty = float(pos_data.get('quantity', 0.0) or 0.0)
+                        if qty <= 0:
+                            continue
+                        # Get current price
+                        price = self.shared_state.get_price(symbol)
+                        if price is None or price <= 0:
+                            price = float(pos_data.get('entry_price', 0.0) or 0.0)
+                        if price <= 0:
+                            continue
+                        
+                        value_usd = qty * price
+                        entry_price = float(pos_data.get('entry_price', 0.0) or 0.0)
+                        
+                        positions_by_value.append({
+                            'symbol': symbol,
+                            'qty': qty,
+                            'current_price': price,
+                            'entry_price': entry_price,
+                            'value_usd': value_usd,
+                            'pnl_pct': ((price - entry_price) / entry_price * 100) if entry_price > 0 else 0,
+                        })
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                
+                # Sort by value (descending) and get top 3
+                positions_by_value.sort(key=lambda x: x['value_usd'], reverse=True)
+                top3_symbols = [p['symbol'] for p in positions_by_value[:3]]
+                
+                self.logger.warning(
+                    "[FIX #8: TOP3 FOCUS] Top 3 symbols by balance: %s | "
+                    "Total positions: %d | Details: %s",
+                    top3_symbols,
+                    len(positions_by_value),
+                    [f"{p['symbol']}:${p['value_usd']:.2f}(pnl:{p['pnl_pct']:.2f}%)" for p in positions_by_value[:3]]
+                )
+                
+                # Store in shared state for access during signal evaluation
+                if hasattr(self.shared_state, '_top3_focused_symbols'):
+                    self.shared_state._top3_focused_symbols = set(top3_symbols)
+                    self.logger.info(
+                        "[FIX #8: TOP3 FOCUS] Focusing on %d symbols: %s",
+                        len(top3_symbols), top3_symbols
+                    )
+        except Exception as e:
+            self.logger.warning("[FIX #8: TOP3 FOCUS] Failed to identify top 3 symbols: %s", e)
+
         async def _step(label: str, awaitable_or_factory, timeout_sec: float):
             t0 = time.time()
             awaited_obj = None
@@ -10175,6 +10290,14 @@ class MetaController:
             
             # Update BalanceValidator with current NAV (Issue #11 - Week 3 Integration)
             self.balance_validator.set_total_balance(current_nav)
+            
+            # 🔧 GROWTH FIX: Pass current free capital to regime manager for growth boost decision
+            try:
+                current_free = float(await _step("get_available_capital", 
+                    _safe_await(self.shared_state.get_available_capital()), step_timeout) or 0.0)
+                self.config._current_free_capital = current_free  # Set on config for regime override logic
+            except Exception:
+                pass  # Regime override will use default if capital fetch fails
             
             regime_switched = self.regime_manager.update_regime(current_nav)
             current_regime = self.regime_manager.get_regime()
@@ -10432,9 +10555,10 @@ class MetaController:
             # always reports actual spendable capital instead of 0.00
             try:
                 quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
-                if quote_asset in self.shared_state.balances:
-                    actual_spendable = float(await _safe_await(self.shared_state.get_spendable_balance(quote_asset)) or 0.0)
-                    self._loop_summary_state["capital_free"] = actual_spendable
+                # ALWAYS call get_spendable_balance, don't skip if asset not in balances dict
+                # get_spendable_balance() handles missing balances gracefully
+                actual_spendable = float(await _safe_await(self.shared_state.get_spendable_balance(quote_asset)) or 0.0)
+                self._loop_summary_state["capital_free"] = actual_spendable
             except Exception:
                 pass
             self._emit_loop_summary()
@@ -10832,9 +10956,10 @@ class MetaController:
             
             # Capital free info
             quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
-            if quote_asset in self.shared_state.balances:
-                actual_spendable = float(await _safe_await(self.shared_state.get_spendable_balance(quote_asset)) or 0.0)
-                self._loop_summary_state["capital_free"] = actual_spendable
+            # ALWAYS call get_spendable_balance, don't skip if asset not in balances dict
+            # get_spendable_balance() handles missing balances gracefully
+            actual_spendable = float(await _safe_await(self.shared_state.get_spendable_balance(quote_asset)) or 0.0)
+            self._loop_summary_state["capital_free"] = actual_spendable
             
             # EMIT SUMMARY
             self._emit_loop_summary()
@@ -11277,6 +11402,131 @@ class MetaController:
             self.logger.exception("[Meta:P-1_DUST_CONSOLIDATION] Failed to check consolidation: %s", e)
             return None
 
+    async def _check_emergency_dust_liquidation(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
+        """
+        ===== EMERGENCY DUST LIQUIDATION: Bootstrap capital when at $0 =====
+        
+        RECOVERY MODE EMERGENCY PATH (Path 0 - highest priority):
+        - Condition: In RECOVERY mode AND capital = $0 AND dust positions exist
+        - Action: SELL smallest dust position(s) REGARDLESS of min_notional
+        - Goal: Bootstrap even $1-5 capital to enable healing path
+        - Result: Converts one dust position into spendable USDT
+        
+        CRITICAL RULES:
+        1. ONLY activates in RECOVERY mode with $0 capital
+        2. Bypasses min_notional floor check (emergency override)
+        3. Sells SMALLEST dust first (easier to liquidate)
+        4. Targets positions with ANY positive value, no matter how small
+        5. Has HIGHEST priority (executes before healing/sacrifice)
+        
+        WHY THIS EXISTS:
+        The normal dust healing requires capital to buy more (deficit recovery).
+        But if capital = $0, healing can't start. This creates a deadlock:
+        - Can't heal (need capital)
+        - Can't sacrifice (need min_notional value)
+        - Can't trade (capital locked in dust)
+        
+        Emergency liquidation breaks this by selling micro-dust first,
+        bootstrapping capital that enables the healing path.
+        
+        Returns:
+            List of (symbol, "SELL", signal) if emergency liquidation needed
+            None if not in RECOVERY mode or capital > $0 or no positions
+        """
+        try:
+            # RECOVERY MODE CHECK: Only active in emergency states
+            current_mode = str(self.mode_manager.get_mode() or "").upper()
+            if current_mode not in ("RECOVERY", "BOOTSTRAP_VIRTUAL"):
+                return None
+            
+            quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
+            free_usdt = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
+            
+            # Only trigger if capital is critically low (< $1)
+            if free_usdt >= 1.0:
+                return None
+            
+            # Get all positions including wallet inventory
+            snap = self.shared_state.get_positions_snapshot(include_wallet_inventory=True) or {}
+            if not snap:
+                return None
+            
+            # Find smallest dust position (any value > $0, even $0.01)
+            liquidatable = []
+            for sym_raw, pos_data in snap.items():
+                sym = self._normalize_symbol(sym_raw)
+                state = pos_data.get("state", "")
+                qty = float(pos_data.get("quantity", 0.0) or pos_data.get("qty", 0.0))
+                value_usdt = float(pos_data.get("value_usdt", 0.0) or 0.0)
+                
+                # Must have positive quantity and value
+                if qty <= 0.0 or value_usdt <= 0.0:
+                    continue
+                
+                # Check if position is dust-locked
+                is_dust_locked = self._is_position_dust_locked(state, qty, value_usdt)
+                if not is_dust_locked:
+                    continue
+                
+                # Determine sacrifice priority
+                priority = self._get_sacrifice_priority(sym)
+                
+                liquidatable.append({
+                    "symbol": sym,
+                    "qty": qty,
+                    "value_usdt": value_usdt,
+                    "priority": priority,
+                    "position": pos_data
+                })
+            
+            if not liquidatable:
+                return None
+            
+            # Sort: by priority (ascending = meme coins first), then by value (ascending = smallest first)
+            liquidatable.sort(key=lambda x: (x["priority"], x["value_usdt"]))
+            victim = liquidatable[0]
+            
+            sym_to_liquidate = victim["symbol"]
+            qty_to_liquidate = victim["qty"]
+            value_liquidated = victim["value_usdt"]
+            
+            self.logger.critical(
+                "[EMERGENCY_LIQUIDATION] 🚨 BOOTSTRAP CAPITAL: "
+                "Capital=$%.2f (< $1), mode=%s → Emergency SELL %s (qty=%.8f, value=$%.2f) "
+                "to bootstrap healing (priority=%d)",
+                free_usdt, current_mode, sym_to_liquidate, qty_to_liquidate, 
+                value_liquidated, victim["priority"]
+            )
+            
+            # Create SELL signal for emergency bootstrap
+            sell_sig = {
+                "symbol": sym_to_liquidate,
+                "action": "SELL",
+                "quantity": qty_to_liquidate,
+                "confidence": 1.0,
+                "agent": "MetaEmergencyLiquidation",
+                "timestamp": time.time(),
+                "reason": "EMERGENCY_DUST_LIQUIDATION",
+                "_emergency_liquidation": True,
+                "_position_value_liquidated": value_liquidated,
+                "_bootstrap_purpose": "heal_remaining_dust",
+                "_mode": current_mode,
+                "_capital_at_trigger": free_usdt,
+                "_tier": "BOOTSTRAP_CAPITAL"
+            }
+            
+            self.logger.critical(
+                "[EMERGENCY_LIQUIDATION] 💰 Liquidity bootstrap: SELL %s (qty=%.8f, $%.2f) "
+                "to free minimal capital for dust healing recovery",
+                sym_to_liquidate, qty_to_liquidate, value_liquidated
+            )
+            
+            return [(sym_to_liquidate, "SELL", sell_sig)]
+            
+        except Exception as e:
+            self.logger.exception("[EMERGENCY_LIQUIDATION] Failed to check emergency liquidation: %s", e)
+            return None
+
     async def _check_dust_healing_opportunity(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
         """
         ===== DUST HEALING: Recover dust positions via BUY =====
@@ -11309,11 +11559,24 @@ class MetaController:
         """
         # ═══════════════════════════════════════════════════════════════════════════
         # REGIME GATE: Check if dust healing is enabled in current NAV regime
-        # In MICRO_SNIPER mode, skip dust healing entirely (single-symbol focus)
+        # In MICRO_SNIPER mode, normally skip dust healing (single-symbol focus)
+        # EXCEPTION: In RECOVERY mode, dust healing is ALWAYS enabled to unlock capital
         # ═══════════════════════════════════════════════════════════════════════════
         if not self._regime_can_heal_dust():
             self.logger.debug("[Meta:DustHealing] Skipped: disabled in regime=%s", self.regime_manager.get_regime())
             return None
+        
+        # Log that dust healing is active (including recovery mode enablement)
+        try:
+            current_mode = str(self.mode_manager.get_mode() or "").upper()
+            if current_mode in ("RECOVERY", "BOOTSTRAP_VIRTUAL"):
+                self.logger.info(
+                    "[Meta:DustHealing] 🔓 ACTIVE in mode=%s | regime=%s | Attempting capital recovery",
+                    current_mode,
+                    self.regime_manager.get_regime()
+                )
+        except Exception:
+            pass
         
         try:
             # Symbols classified as mathematically unhealable should never be retried.
@@ -11361,36 +11624,30 @@ class MetaController:
                 )
                 return None
             
-            snap = self.shared_state.get_positions_snapshot() or {}
+            # OPTION B: Use cached positions, including wallet inventory (mirrored positions)
+            # In RECOVERY mode, we want to see ALL positions including those that came from
+            # wallet inventory, not just bot-managed positions. This helps us liquidate
+            # the dust accumulated from previous sessions that are now in wallet_inventory.
+            snap = self.shared_state.get_positions_snapshot(include_wallet_inventory=True) or {}
             
-            # If no positions found, try one bounded wallet sync as fallback.
-            # This path must fail open; otherwise a slow exchange sync stalls the
-            # entire Meta evaluation cycle before execution / LOOP_SUMMARY.
-            if not snap and hasattr(self.shared_state, 'authoritative_wallet_sync'):
-                sync_timeout_sec = float(self._cfg("DUST_HEALING_WALLET_SYNC_TIMEOUT_SEC", 2.5) or 2.5)
-                sync_timeout_sec = min(max(sync_timeout_sec, 0.5), 10.0)
+            # OPTION B: Use cached positions without forcing wallet sync
+            # The position snapshot is already being maintained by the system
+            # and is current enough for dust healing purposes. Forcing a wallet sync
+            # can timeout and block the trading loop unnecessarily.
+            # 
+            # RECOVERY MODE PRIORITY: In RECOVERY mode, we prefer speed over
+            # absolute freshness. Better to attempt healing with slightly stale
+            # positions than to timeout and miss the healing window entirely.
+            if snap:
                 self.logger.info(
-                    "[DUST_HEALING] No positions found, attempting authoritative wallet sync (timeout=%.1fs)...",
-                    sync_timeout_sec,
+                    "[DUST_HEALING] Using cached snapshot (recovery): %d total positions",
+                    len(snap)
                 )
-                try:
-                    await asyncio.wait_for(
-                        self.shared_state.authoritative_wallet_sync(),
-                        timeout=sync_timeout_sec,
-                    )
-                    snap = self.shared_state.get_positions_snapshot() or {}
-                    self.logger.info("[DUST_HEALING] Wallet sync complete, found %d positions", len(snap))
-                except asyncio.TimeoutError:
-                    self.logger.warning(
-                        "[DUST_HEALING] Wallet sync timed out after %.1fs; continuing without dust-healing snapshot",
-                        sync_timeout_sec,
-                    )
-                    self.logger.info(
-                        "[WHY_NO_TRADE] reason=DUST_HEALING_SYNC_TIMEOUT symbol=PORTFOLIO details=timeout_%.1fs",
-                        sync_timeout_sec,
-                    )
-                except Exception as e:
-                    self.logger.warning(f"[DUST_HEALING] Wallet sync failed: {e}")
+            else:
+                self.logger.debug(
+                    "[DUST_HEALING] No position snapshot available. "
+                    "System may be still initializing or all positions are closed."
+                )
             
             quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
             free_usdt = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
@@ -11408,6 +11665,21 @@ class MetaController:
                 value_usdt = float(pos_data.get("value_usdt", 0.0) or 0.0)
 
                 self.logger.debug(f"[DUST_HEALING] Checking {sym}: qty={qty}, value=\${value_usdt}, state={state}")
+                
+                # ═══════════════════════════════════════════════════════════════
+                # CRITICAL FIX: Skip closed/liquidated positions (qty=0)
+                # These are NOT dust - they're liquidated positions that should not
+                # be healed again. Healing a closed position creates a paradox:
+                # - System tries to add $10 to make it $10
+                # - Execution checks: is new_value >= $10? YES → blocks as "already healed"
+                # - Infinite loop: DUST_HEALING keeps trying to heal something that's closed
+                # ═══════════════════════════════════════════════════════════════
+                if qty <= 0:
+                    self.logger.debug(
+                        "[DUST_HEALING] Skipping %s: qty=%.8f is ZERO (position is closed/liquidated, not dust)",
+                        sym, qty
+                    )
+                    continue
                 
                 # ═══════════════════════════════════════════════════════════════
                 # FIX 5: Dynamic value calculation to prevent runaway healing.
@@ -12230,15 +12502,10 @@ class MetaController:
             
             print(f"🔍 DEBUG: CAPITAL_FLOOR_CHECK starting. current_mode={current_mode}", flush=True)
             
-            if current_mode in ("BOOTSTRAP", "BOOTSTRAP_VIRTUAL", "RECOVERY"):
-                msg = (
-                    f"✅✅✅ CAPITAL_FLOOR_CHECK: BOOTSTRAP MODE ACTIVE (mode={current_mode}) | "
-                    f"Bypassing capital floor check to allow seed trades. "
-                    f"(Note: NAV may be phantom-inflated during recovery; actual account liquidity will prevail.)"
-                )
-                print(msg, flush=True)
-                self.logger.warning(msg)
-                return True  # ✅ ALLOW trading in BOOTSTRAP mode
+            # NOTE: Bootstrap mode does NOT bypass capital floor!
+            # Bootstrap can relax ENTRY_SIZE minimums, but NEVER capital floor.
+            # Capital floor is the safety mechanism that prevents death spirals.
+            # Even in RECOVERY, we must maintain minimum USDT reserves.
             
             # Step 1: Get current capital state (fresh every cycle)
             quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
@@ -13479,6 +13746,44 @@ class MetaController:
         except Exception:
             available_capital = 0.0
 
+        # ════════════════════════════════════════════════════════════════════════════════
+        # CRITICAL EMERGENCY LIQUIDATION CHECK (Path 0 - Runs BEFORE capital floor blocks)
+        # ════════════════════════════════════════════════════════════════════════════════
+        # When in RECOVERY mode with $0 capital, attempt emergency liquidation of smallest dust
+        # This runs BEFORE normal decision building to break the capital deadlock
+        if not capital_ok and available_capital < 1.0:
+            current_mode_for_emergency = str(self.mode_manager.get_mode() or "").upper() if hasattr(self, "mode_manager") and self.mode_manager else "NORMAL"
+            if current_mode_for_emergency in ("RECOVERY", "BOOTSTRAP_VIRTUAL"):
+                self.logger.critical(
+                    "[Meta:EMERGENCY_LIQUIDATION_GATE] 🚨 Emergency liquidation check: mode=%s, capital=$%.2f (<$1)",
+                    current_mode_for_emergency, available_capital
+                )
+                emergency_liquidation_timeout = float(self._cfg("EMERGENCY_LIQUIDATION_TIMEOUT_SEC", 2.0) or 2.0)
+                try:
+                    emergency_decisions = await _asyncio.wait_for(
+                        self._check_emergency_dust_liquidation(),
+                        timeout=emergency_liquidation_timeout
+                    )
+                    if emergency_decisions:
+                        context_flags["EMERGENCY_LIQUIDATION_ACTIVE"] = True
+                        context_flags["EMERGENCY_LIQUIDATION_DECISION"] = emergency_decisions[0]
+                        self.logger.critical(
+                            "[Meta:EMERGENCY_LIQUIDATION_GATE] 🚨 Bootstrap capital liquidation triggered: %s (returning IMMEDIATELY)",
+                            emergency_decisions[0][0]
+                        )
+                        # HIGHEST PRIORITY: Return emergency liquidation before normal decisions
+                        return emergency_decisions
+                except _asyncio.TimeoutError:
+                    self.logger.warning(
+                        "[Meta:EMERGENCY_LIQUIDATION_TIMEOUT] ⚠️ Emergency check timed out after %.1fs",
+                        emergency_liquidation_timeout
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        "[Meta:EMERGENCY_LIQUIDATION_ERROR] Emergency check failed: %s",
+                        e
+                    )
+
         if not capital_ok:
             # Do NOT return early—BUYs blocked; SELLs still allowed
             capital_block = True
@@ -14328,7 +14633,46 @@ class MetaController:
         # Dust-healing readiness (trade-count, dust existence, regime) is evaluated
         # inside _check_dust_healing_opportunity(). Do not pre-block here using only
         # trade_count, otherwise restart scenarios with existing dust get stuck.
-        # 🔥 CRITICAL FIX: Wrap dust healing check with timeout
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # STEP 1: EMERGENCY LIQUIDATION (Path 0 - Highest Priority)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # In RECOVERY mode with $0 capital, liquidate smallest dust to bootstrap
+        # This enables the healing path by freeing even $1-5 minimum capital
+        emergency_liquidation_timeout = float(self._cfg("EMERGENCY_LIQUIDATION_TIMEOUT_SEC", 2.0) or 2.0)
+        try:
+            emergency_decisions = await _asyncio.wait_for(
+                self._check_emergency_dust_liquidation(),
+                timeout=emergency_liquidation_timeout
+            )
+        except _asyncio.TimeoutError:
+            self.logger.warning(
+                "[Meta:EMERGENCY_LIQUIDATION_TIMEOUT] ⚠️ Emergency check timed out after %.1fs; "
+                "skipping for this cycle",
+                emergency_liquidation_timeout
+            )
+            emergency_decisions = None
+        except Exception as e:
+            self.logger.warning(
+                "[Meta:EMERGENCY_LIQUIDATION_ERROR] Emergency check failed: %s; skipping for this cycle",
+                e
+            )
+            emergency_decisions = None
+        
+        if emergency_decisions:
+            context_flags["EMERGENCY_LIQUIDATION_ACTIVE"] = True
+            context_flags["EMERGENCY_LIQUIDATION_DECISION"] = emergency_decisions[0]
+            self.logger.critical(
+                "[Meta:EMERGENCY_LIQUIDATION] � Bootstrap capital liquidation: %s (will execute IMMEDIATELY)",
+                emergency_decisions[0][0]
+            )
+            # HIGHEST PRIORITY: Execute emergency liquidation before any other path
+            return emergency_decisions
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # STEP 2: DUST HEALING (Path A - Preferred if capital available)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # �🔥 CRITICAL FIX: Wrap dust healing check with timeout
         # The wallet sync inside _check_dust_healing_opportunity() can hang indefinitely
         # Without a timeout, dust sync stall cascades to block ALL decision issuance
         dust_healing_timeout = float(self._cfg("DUST_HEALING_EVALUATION_TIMEOUT_SEC", 5.0) or 5.0)
@@ -14362,6 +14706,9 @@ class MetaController:
             # INJECT dust healing decision(s) for execution (prepend for priority)
             return dust_healing_decisions
         else:
+            # ═══════════════════════════════════════════════════════════════════════
+            # STEP 3: DUST SACRIFICE (Path B - Last resort if healing impossible)
+            # ═══════════════════════════════════════════════════════════════════════
             # ONLY check sacrifice if healing is not possible
             # This ensures mutual exclusivity: at most one path is active per cycle
             # 🔥 CRITICAL FIX: Wrap dust sacrifice check with timeout (same logic as healing)
@@ -14407,6 +14754,7 @@ class MetaController:
         # ═══════════════════════════════════════════════════════════════════════════════
         # If portfolio is flat (no positions) and we have decent signals,
         # apply bootstrap execution trigger to break the deadlock
+        # ALSO: If portfolio is mostly dust (fragmented capital) and capital-starved, ALSO trigger
         bootstrap_execution_override = False
         now_ts = time.time()
         cooldown_remaining = float(self._bootstrap_cooldown_until or 0.0) - now_ts
@@ -14429,7 +14777,7 @@ class MetaController:
                     available_capital = float(await _safe_await(
                         self.shared_state.get_spendable_balance(quote_asset)
                     ) or 0.0)
-                    min_bootstrap_capital = 25.0  # Minimum capital to attempt bootstrap (LOWERED for micro-cap trading)
+                    min_bootstrap_capital = 8.0  # Minimum capital to attempt bootstrap (LOWERED for micro-cap trading with locked positions)
                     
                     # CRITICAL DEBUG: Log bootstrap conditions
                     self.logger.warning(
@@ -14555,6 +14903,58 @@ class MetaController:
                 except Exception as e:
                     self.logger.warning(f"[Meta:BOOTSTRAP_FIRST_TRADE] Failed to check bootstrap conditions: {e}")
         else:
+            # 🚀 CAPITAL-STARVED DUST PORTFOLIO BOOTSTRAP: Enable bootstrap even with dust positions
+            # This fixes the deadlock where portfolio has $100 NAV but $3 spendable (locked in dust)
+            # System can't trade because entry floor > spendable, and can't free capital without trading
+            # Solution: In this specific situation, allow bootstrap override to break the cycle
+            try:
+                quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
+                available_capital = float(await _safe_await(
+                    self.shared_state.get_spendable_balance(quote_asset)
+                ) or 0.0)
+                min_notional = float(self._cfg("MIN_NOTIONAL", 10.0))
+                total_nav = float(await _safe_await(self.shared_state.get_nav()) or 0.0)
+                
+                # Check if portfolio is capital-starved with dust (spendable < 1.5x min_notional but NAV > 20x)
+                is_capital_starved = 0.0 < available_capital < min_notional * 1.5
+                has_significant_nav = total_nav > min_notional * 2.0
+                is_dust_locked = len(owned_positions) > 1  # Multiple positions = fragmented
+                
+                if is_capital_starved and has_significant_nav and is_dust_locked:
+                    self.logger.warning(
+                        "[Meta:BOOTSTRAP_DUST] 🚀 Dust-locked portfolio detected: "
+                        "NAV=%.2f (fragmented), spendable=%.2f (< %.2f threshold). "
+                        "Enabling bootstrap override to break deadlock.",
+                        total_nav, available_capital, min_notional * 1.5
+                    )
+                    
+                    # Look for high-confidence BUY signals
+                    all_signals_now = self.signal_manager.get_all_signals()
+                    best_bootstrap_signal = None
+                    for sig in all_signals_now:
+                        if str(sig.get("action", "")).upper() == "BUY":
+                            conf = float(sig.get("confidence", 0.0))
+                            if conf >= 0.60:  # Bootstrap confidence threshold
+                                if best_bootstrap_signal is None or conf > float(best_bootstrap_signal.get("confidence", 0.0)):
+                                    best_bootstrap_signal = sig
+                    
+                    if best_bootstrap_signal:
+                        bootstrap_execution_override = True
+                        # CRITICAL: Store bootstrap override in instance to persist beyond this function
+                        self._bootstrap_execution_override_active = True
+                        self.logger.warning(
+                            "[Meta:BOOTSTRAP_DUST_OVERRIDE] 🚀 ENABLING BOOTSTRAP: "
+                            "dust_portfolio=True, best_signal=%s conf=%.2f",
+                            best_bootstrap_signal.get("symbol", "unknown"),
+                            float(best_bootstrap_signal.get("confidence", 0.0))
+                        )
+                    else:
+                        self.logger.warning(
+                            "[Meta:BOOTSTRAP_DUST] No high-confidence BUY signals for dust-locked bootstrap"
+                        )
+            except Exception as e:
+                self.logger.warning("[Meta:BOOTSTRAP_DUST] Error checking dust bootstrap conditions: %s", e)
+            
             self.logger.info("[Meta:BOOTSTRAP_DEBUG] Portfolio not flat, bootstrap not needed")
             # Reset attempts when we exit flat state or have positions, to re-arm specifically for next deadlock
             self._bootstrap_attempts = 0
@@ -15333,9 +15733,52 @@ class MetaController:
                                                 count += _v
                             else:
                                 count = self.shared_state.get_rejection_count(sym, action)
+                            
                             if count >= threshold:
-                                self.logger.info("[Meta:Block:RejectionThreshold] Skipping %s %s: rejected %d times >= threshold %d (micro=%s)", sym, action, count, threshold, is_micro)
-                                continue
+                                # 🚨 NEW: ESCALATE ON CAPITAL_INSUFFICIENT REJECTIONS
+                                # If we're hitting rejection threshold, try to trigger liquidation
+                                # This gives capital recovery a chance BEFORE we hard-block the signal
+                                liquidation_succeeded = False
+                                if action == "BUY":
+                                    self.logger.warning(
+                                        "🚨 [Meta:EscalateOnThreshold] %s %s hit rejection threshold (%d). Attempting capital recovery...",
+                                        sym, action, count
+                                    )
+                                    
+                                    try:
+                                        # Strategy A: Try LiquidationOrchestrator if available
+                                        _liq_orch = getattr(self, "_liquidation_orchestrator", None)
+                                        if _liq_orch and hasattr(_liq_orch, "ensure_liquidity"):
+                                            target_usdt = float(self._cfg("MIN_NOTIONAL_FLOOR", 15.0))
+                                            result = await _liq_orch.ensure_liquidity(
+                                                target_usdt=target_usdt,
+                                                reason=f"escalation_threshold_{sym}",
+                                                force=True
+                                            )
+                                            if result:
+                                                self.logger.info(f"✅ [Escalation] Liquidation freed capital for {sym}. Resetting rejection counter.")
+                                                self.shared_state.rejection_counters[(sym, action)] = 0
+                                                liquidation_succeeded = True
+                                        else:
+                                            self.logger.debug("[Meta:EscalateOnThreshold] Liquidation orchestrator not available, using reset strategy")
+                                            # Strategy B: Reset counter to allow retry with potential bootstrap override
+                                            # This gives accumulation or bootstrap a chance to work
+                                            self.shared_state.rejection_counters[(sym, action)] = 0
+                                            self.logger.info(f"✅ [Escalation] Reset rejection counter for {sym} to allow retry")
+                                            liquidation_succeeded = True
+                                    except Exception as e:
+                                        self.logger.warning(f"⚠️ Escalation attempt failed: {e}. Resetting counter anyway.")
+                                        self.shared_state.rejection_counters[(sym, action)] = 0
+                                        liquidation_succeeded = True
+                                
+                                # If we successfully triggered escalation, DON'T skip yet - allow retry
+                                if liquidation_succeeded:
+                                    # Continue to retry signal evaluation
+                                    pass
+                                else:
+                                    # Only skip if escalation failed and counter not reset
+                                    self.logger.info("[Meta:Block:RejectionThreshold] Skipping %s %s: rejected %d times >= threshold %d (micro=%s)", sym, action, count, threshold, is_micro)
+                                    continue
                     except Exception as e:
                         self.logger.debug("[Meta:Block:Exception] Error checking rejection threshold: %s", str(e))
                         pass
@@ -15357,6 +15800,29 @@ class MetaController:
             {sym: [(s.get("action"), float(s.get("confidence", 0.0))) for s in sigs] 
              for sym, sigs in valid_signals_by_symbol.items()}
         )
+        
+        # ✅ FIX #8: TOP 3 SYMBOLS FOCUS FILTER
+        # If TOP3 focus is enabled, only process signals for the top 3 symbols
+        if hasattr(self.shared_state, '_top3_focused_symbols') and self.shared_state._top3_focused_symbols:
+            top3_syms = self.shared_state._top3_focused_symbols
+            original_count = len(valid_signals_by_symbol)
+            
+            # Filter signals to only top 3 symbols
+            valid_signals_by_symbol = {
+                sym: sigs for sym, sigs in valid_signals_by_symbol.items()
+                if sym in top3_syms
+            }
+            
+            filtered_out = original_count - len(valid_signals_by_symbol)
+            if filtered_out > 0:
+                self.logger.warning(
+                    "[FIX #8: TOP3 FOCUS] Filtered out %d symbols not in top 3. "
+                    "Remaining signals: %s (focused on %s)",
+                    filtered_out,
+                    list(valid_signals_by_symbol.keys()),
+                    list(top3_syms)
+                )
+        
         if not valid_signals_by_symbol:
             self.logger.error(
                 "[Meta:DEADLOCK_DIAGNOSTIC] 🔴 NO SIGNALS PASSED FILTERS! "
@@ -15366,6 +15832,142 @@ class MetaController:
                 "Check logs for [Meta:GATE_DROP_*] messages to identify which gate(s) are filtering.",
                 len(all_signals), len(signals_by_sym), len(valid_signals_by_symbol)
             )
+
+        # ✅ FIX #8: DUST EXIT + TOP 3 COMPOUNDING STRATEGY
+        # Part C: Force exit all non-top-3 positions + inject BUY signals for top 3 compounding
+        if hasattr(self.shared_state, '_top3_focused_symbols') and self.shared_state._top3_focused_symbols:
+            enable_fix8_strategy = bool(getattr(self.config, "FIX8_DUST_EXIT_AND_COMPOUND", True))
+            if enable_fix8_strategy:
+                try:
+                    top3_syms = self.shared_state._top3_focused_symbols
+                    free_usdt = float(await _safe_await(self.shared_state.get_spendable_balance('USDT')) or 0.0)
+                    
+                    # ═════════════════════════════════════════════════════════════════
+                    # PHASE 1: FORCE EXIT ALL DUST POSITIONS (non-top-3)
+                    # ═════════════════════════════════════════════════════════════════
+                    dust_positions = {
+                        sym: pos for sym, pos in owned_positions.items()
+                        if sym not in top3_syms and sym != 'USDT'
+                    }
+                    
+                    force_exit_dust = bool(getattr(self.config, "FIX8_FORCE_EXIT_DUST", True))
+                    if force_exit_dust and dust_positions:
+                        for dust_sym, dust_pos in dust_positions.items():
+                            # Check if already has a SELL signal
+                            has_sell_signal = any(
+                                sig.get("action") == "SELL" 
+                                for sig in valid_signals_by_symbol.get(dust_sym, [])
+                            )
+                            
+                            if not has_sell_signal:
+                                # Inject FORCED exit signal for dust (bypass profit gate)
+                                dust_exit_sig = {
+                                    "symbol": dust_sym,
+                                    "action": "SELL",
+                                    "confidence": 0.85,
+                                    "agent": "MetaDustLiquidator",
+                                    "timestamp": now_ts,
+                                    "reason": f"FIX8_DUST_EXIT capital_recovery",
+                                    "_forced_exit": True,
+                                    "_mandatory_capacity_recovery": True,
+                                    "_force_sell_gate_bypass": True,
+                                }
+                                
+                                if dust_sym not in valid_signals_by_symbol:
+                                    valid_signals_by_symbol[dust_sym] = []
+                                valid_signals_by_symbol[dust_sym].append(dust_exit_sig)
+                                
+                                dust_value_usd = (
+                                    float(dust_pos.get("quantity", 0.0) or 0.0) * 
+                                    float(self.shared_state.get_price(dust_sym) or 
+                                          dust_pos.get("entry_price", 0.0) or 0.0)
+                                )
+                                
+                                self.logger.warning(
+                                    "[FIX #8: DUST LIQUIDATION] Force-exit non-top-3: %s "
+                                    "(value≈$%.2f, qty=%.6f) - capital recovery mode",
+                                    dust_sym, dust_value_usd,
+                                    float(dust_pos.get("quantity", 0.0) or 0.0)
+                                )
+                    
+                    # ═════════════════════════════════════════════════════════════════
+                    # PHASE 2: INJECT BUY SIGNALS FOR TOP 3 COMPOUNDING
+                    # ═════════════════════════════════════════════════════════════════
+                    enable_compound_buying = bool(getattr(self.config, "FIX8_COMPOUND_TOP3_WITH_FREED_USDT", True))
+                    min_compound_usdt = float(getattr(self.config, "FIX8_MIN_COMPOUND_USDT", 5.0) or 5.0)
+                    
+                    if enable_compound_buying and free_usdt >= min_compound_usdt:
+                        # Calculate allocation: 60% compound, 20% healing, 20% buffer
+                        compound_pct = float(getattr(self.config, "FIX8_COMPOUND_ALLOCATION_PCT", 0.60) or 0.60)
+                        healing_pct = float(getattr(self.config, "FIX8_HEALING_ALLOCATION_PCT", 0.20) or 0.20)
+                        buffer_pct = float(getattr(self.config, "FIX8_BUFFER_ALLOCATION_PCT", 0.20) or 0.20)
+                        
+                        usdt_for_compounding = free_usdt * compound_pct
+                        usdt_for_healing = free_usdt * healing_pct
+                        usdt_for_buffer = free_usdt * buffer_pct
+                        
+                        self.logger.info(
+                            "[FIX #8: CAPITAL ALLOCATION] FREE=$%.2f → compound=$%.2f(%.0f%%) + "
+                            "healing=$%.2f(%.0f%%) + buffer=$%.2f(%.0f%%)",
+                            free_usdt,
+                            usdt_for_compounding, compound_pct * 100,
+                            usdt_for_healing, healing_pct * 100,
+                            usdt_for_buffer, buffer_pct * 100
+                        )
+                        
+                        if usdt_for_compounding >= min_compound_usdt:
+                            # Allocate equally across top 3 symbols
+                            per_symbol_usdt = usdt_for_compounding / 3.0
+                            
+                            for top3_sym in top3_syms:
+                                if top3_sym not in owned_positions:
+                                    # Skip if no existing position (shouldn't happen for top 3)
+                                    continue
+                                
+                                # Check if already has a BUY signal
+                                has_buy_signal = any(
+                                    sig.get("action") == "BUY" 
+                                    for sig in valid_signals_by_symbol.get(top3_sym, [])
+                                )
+                                
+                                if not has_buy_signal and per_symbol_usdt >= min_compound_usdt / 3.0:
+                                    try:
+                                        current_price = float(await _safe_await(self.shared_state.safe_price(top3_sym)) or 0.0)
+                                    except Exception:
+                                        current_price = float(self.shared_state.latest_prices.get(top3_sym, 0.0) or 0.0)
+                                    
+                                    if current_price > 0:
+                                        # Inject compound BUY signal
+                                        compound_buy_sig = {
+                                            "symbol": top3_sym,
+                                            "action": "BUY",
+                                            "confidence": 0.70,
+                                            "agent": "MetaCompoundStrategy",
+                                            "timestamp": now_ts,
+                                            "reason": f"FIX8_COMPOUND_TOP3 freed_capital=${per_symbol_usdt:.2f}",
+                                            "_fix8_compound_buy": True,
+                                            "_intended_usdt": per_symbol_usdt,
+                                        }
+                                        
+                                        if top3_sym not in valid_signals_by_symbol:
+                                            valid_signals_by_symbol[top3_sym] = []
+                                        valid_signals_by_symbol[top3_sym].append(compound_buy_sig)
+                                        
+                                        self.logger.info(
+                                            "[FIX #8: TOP3 COMPOUNDING] Inject compound BUY for %s: "
+                                            "price=%.8f, usdt_allocation=$%.2f (from freed_capital)",
+                                            top3_sym, current_price, per_symbol_usdt
+                                        )
+                    
+                    # Log summary
+                    self.logger.info(
+                        "[FIX #8 SUMMARY] Dust_positions=%d (forced_exit), Top3_symbols=%d (compounding), "
+                        "Free_USDT=%.2f (20%% cleanup + 80%% compound)",
+                        len(dust_positions), len(top3_syms), free_usdt
+                    )
+                    
+                except Exception as e:
+                    self.logger.debug("[FIX #8: DUST+COMPOUND] injection failed: %s", e)
 
         # --- Time-based exit injection (capital rotation) ---
         if self._time_exit_enabled and owned_positions:
@@ -15871,6 +16473,7 @@ class MetaController:
                     self.mode_manager.get_mode() == "BOOTSTRAP"
                     or bootstrap_execution_override
                     or bool(s.get("_bootstrap_override"))
+                    or self._bootstrap_execution_override_active  # Persistent dust bootstrap override flag
                 ):
                     bootstrap_bypass_active = True
                 
@@ -16474,10 +17077,25 @@ class MetaController:
         spendable_quote = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
         adaptive_entry_floor = float(significant_position_usdt)
 
+        # 🚀 BOOTSTRAP COLD-START: For flat portfolios with minimal capital,
+        # Allow entry at min_notional to bootstrap trading
+        # This prevents deadlock where system has capital but can't trade because
+        # entry floor > available capital
+        is_flat_portfolio = len(owned_positions) <= 1  # <= 1 to allow first position
+        has_capital_starved = 0.0 < spendable_quote < min_notional * 1.5
+        
+        if is_flat_portfolio and has_capital_starved:
+            # Bootstrap mode: accept trades at min_notional level
+            adaptive_entry_floor = float(min_notional * 1.1)  # Slightly above min for exchange margin
+            self.logger.warning(
+                "[Meta:Layer1] 🚀 BOOTSTRAP_COLD_START: flat_portfolio=%s | "
+                "capital_starved (spendable=%.2f %s) -> adaptive_floor=%.2f (was %.2f)",
+                is_flat_portfolio, spendable_quote, quote_asset, adaptive_entry_floor, significant_position_usdt
+            )
         # MICRO-CAPITAL ANTI-DEADLOCK:
         # If free quote is below the static significant floor, use a dynamic floor that
         # still respects exchange economics while allowing the engine to keep cycling.
-        if 0.0 < spendable_quote < significant_position_usdt:
+        elif 0.0 < spendable_quote < significant_position_usdt:
             micro_floor = max(1.25 * min_notional, min_entry)
             adaptive_entry_floor = max(
                 micro_floor,
@@ -16498,7 +17116,8 @@ class MetaController:
             significant_position_usdt, adaptive_entry_floor, min_notional, await self._get_avg_trade_cost()
         )
         
-        # Filter BUY signals: reject if planned_quote < significant_position_usdt (NEW positions only)
+        # Filter BUY signals: reject if planned_quote < adaptive_entry_floor (NEW positions only)
+        # NOTE: Use adaptive_entry_floor, NOT significant_position_usdt, to respect capital constraints
         filtered_buy_symbols = []
         for sym in valid_signals_by_symbol.keys():
             sym_norm = self._normalize_symbol(sym)
@@ -16531,7 +17150,22 @@ class MetaController:
                 # No planned quote in signal, calculate from agent budget
                 signal_planned_quote = _wallet_budget_for(agent_name)
             
-            if signal_planned_quote >= adaptive_entry_floor:
+            # 🚀 BOOTSTRAP OVERRIDE: In cold-start mode, downsize rather than reject
+            if is_flat_portfolio and has_capital_starved:
+                # Bootstrap mode: accept any signal that meets min_notional
+                if signal_planned_quote >= min_notional:
+                    filtered_buy_symbols.append(sym)
+                    self.logger.info(
+                        "[Meta:Layer1] BOOTSTRAP_ENTRY_ACCEPTED: %s | planned=%.2f "
+                        "(>= min_notional %.2f, bootstrap mode)",
+                        sym, signal_planned_quote, min_notional
+                    )
+                else:
+                    self.logger.warning(
+                        "[Meta:Layer1] BOOTSTRAP_BELOW_MIN: %s | planned=%.2f < min_notional %.2f (DENIED)",
+                        sym, signal_planned_quote, min_notional
+                    )
+            elif signal_planned_quote >= adaptive_entry_floor:
                 # Entry size sufficient
                 filtered_buy_symbols.append(sym)
             else:
@@ -16599,14 +17233,27 @@ class MetaController:
             ):
                 # Check if we have capital to promote it
                 if available_capital < promotion_capital_threshold:
-                    dust_locked_symbols.add(sym)
-                    self.logger.warning(
-                        "[Meta:Layer2] 🔒 DUST_LOCKED: %s | value=%.2f USD, "
-                        "capital_available=%.2f < promotion_threshold=%.2f (BUY DENIED)",
-                        sym, current_value, available_capital, promotion_capital_threshold
-                    )
+                    # 🚀 BOOTSTRAP OVERRIDE: In cold-start, ALLOW buying dust to accumulate it to significance
+                    # This breaks the deadlock where dust can't be promoted without capital,
+                    # but capital can't be freed without promoting dust.
+                    # In bootstrap mode, ANY BUY signal = permission to accumulate
+                    if is_flat_portfolio and has_capital_starved:
+                        # Bootstrap mode: allow BUY signals to accumulate dust even if below threshold
+                        self.logger.info(
+                            "[Meta:Layer2] 🚀 BOOTSTRAP_DUST_ACCUMULATION: %s | value=%.2f USD "
+                            "(below significance $25, but allowing accumulation in bootstrap mode)",
+                            sym, current_value
+                        )
+                    else:
+                        # Normal mode: lock dust that can't be promoted
+                        dust_locked_symbols.add(sym)
+                        self.logger.warning(
+                            "[Meta:Layer2] 🔒 DUST_LOCKED: %s | value=%.2f USD, "
+                            "capital_available=%.2f < promotion_threshold=%.2f (BUY DENIED)",
+                            sym, current_value, available_capital, promotion_capital_threshold
+                        )
         
-        # Remove dust-locked symbols from valid signals
+        # Remove dust-locked symbols from valid signals (only in normal mode, not bootstrap)
         for sym in dust_locked_symbols:
             if sym in valid_signals_by_symbol:
                 del valid_signals_by_symbol[sym]
@@ -18942,7 +19589,7 @@ class MetaController:
             # non-seed bootstrap buys when portfolio just became flat.
             if tradeability_bootstrap_override:
                 conf_now = float(signal.get("confidence", 0.0) or 0.0)
-                min_bootstrap_conf = float(self._cfg("BOOTSTRAP_REENTRY_MIN_CONFIDENCE", 0.68) or 0.68)
+                min_bootstrap_conf = float(self._cfg("BOOTSTRAP_REENTRY_MIN_CONFIDENCE", 0.60) or 0.60)
                 is_bootstrap_seed = bool(
                     signal.get("_bootstrap_seed")
                     or signal.get("bootstrap_seed")
@@ -19587,12 +20234,46 @@ class MetaController:
                     if hasattr(self.shared_state, "ops_plane_ready_event"):
                         self.shared_state.ops_plane_ready_event.clear()
                         self.logger.info("[Meta] Readiness = FALSE (Escalation Triggered)")
-                    if self.liquidation_agent and hasattr(self.liquidation_agent, "_free_usdt_now"):
-                        await self.liquidation_agent._free_usdt_now(
-                            target=float(self._cfg("MIN_NOTIONAL_FLOOR", 15.0)),
-                            reason=f"rule5_escalation_{symbol}"
-                        )
-                    elif self.liquidation_agent:
+                    
+                    # Try to trigger liquidation - check both liquidation_agent and _liquidation_orchestrator
+                    liquidation_triggered = False
+                    
+                    # First, try LiquidationOrchestrator (modern architecture)
+                    _liq_orch = getattr(self, "_liquidation_orchestrator", None)
+                    self.logger.debug(f"[RULE5_DEBUG] _liquidation_orchestrator = {_liq_orch} (type={type(_liq_orch).__name__ if _liq_orch else 'None'})")
+                    if _liq_orch:
+                        self.logger.debug(f"[RULE5_DEBUG] Orchestrator has methods: {[m for m in dir(_liq_orch) if not m.startswith('_')]}")
+                    
+                    if _liq_orch and hasattr(_liq_orch, "ensure_liquidity"):
+                        try:
+                            target_usdt = float(self._cfg("MIN_NOTIONAL_FLOOR", 15.0))
+                            self.logger.info(f"🚨 [RULE5_ESCALATION] Triggering LiquidationOrchestrator.ensure_liquidity() for {symbol} (target={target_usdt})")
+                            result = await _liq_orch.ensure_liquidity(
+                                target_usdt=target_usdt,
+                                reason=f"rule5_escalation_{symbol}",
+                                force=True
+                            )
+                            if result:
+                                self.logger.info(f"✅ [RULE5] Liquidation triggered via orchestrator for {symbol}")
+                                liquidation_triggered = True
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ LiquidationOrchestrator.ensure_liquidity() failed: {e}")
+                    elif _liq_orch:
+                        self.logger.warning(f"[RULE5_DEBUG] Liquidation orchestrator exists but NO ensure_liquidity method!")
+                    
+                    # Fallback to legacy liquidation_agent
+                    if not liquidation_triggered and self.liquidation_agent and hasattr(self.liquidation_agent, "_free_usdt_now"):
+                        try:
+                            self.logger.info(f"🚨 [RULE5_ESCALATION] Triggering LiquidationAgent._free_usdt_now() for {symbol}")
+
+                            await self.liquidation_agent._free_usdt_now(
+                                target=float(self._cfg("MIN_NOTIONAL_FLOOR", 15.0)),
+                                reason=f"rule5_escalation_{symbol}"
+                            )
+                            liquidation_triggered = True
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ LiquidationAgent._free_usdt_now() failed: {e}")
+                    elif not liquidation_triggered and self.liquidation_agent:
                         # If liquidation_agent doesn't have _free_usdt_now method, try propose_liquidations instead
                         self.logger.warning(f"[Meta] LiquidationAgent doesn't have _free_usdt_now method. Using propose_liquidations instead.")
                         try:
@@ -19604,10 +20285,12 @@ class MetaController:
                             )
                             if proposals:
                                 self.logger.info(f"[Meta] Generated {len(proposals)} liquidation proposals for escalation")
+                                liquidation_triggered = True
                         except Exception as e:
                             self.logger.warning(f"[Meta] Failed to generate liquidation proposals: {e}")
-                    else:
-                        self.logger.warning(f"[Meta] No liquidation agent available for escalation")
+                    
+                    if not liquidation_triggered:
+                        self.logger.warning(f"[Meta] ⚠️ No liquidation agent available for escalation (checked _liquidation_orchestrator and liquidation_agent)")
                     # P9: Trigger immediate re-plan
                     if hasattr(self.shared_state, "replan_request_event"):
                         self.shared_state.replan_request_event.set()

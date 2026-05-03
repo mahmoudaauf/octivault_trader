@@ -30,7 +30,7 @@ def load_ohlcv_from_cache(symbol: str, path: str = DATA_PATH) -> Optional[pd.Dat
     if os.path.exists(file_path):
         df = pd.read_csv(file_path)
         logger.info(f"📥 Loaded cached OHLCV for {symbol}")
-        return df
+        return df  # type: ignore
     logger.warning(f"⚠️ No cached OHLCV found for {symbol}")
     return None
 

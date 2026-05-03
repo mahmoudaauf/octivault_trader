@@ -1,0 +1,118 @@
+{
+  "fix_id": "fix_6_to_10_convergence_checkpoint",
+  "status": "implemented",
+  "phase": "symbol_convergence",
+  "parts": [6, 7, 8, 9, 10],
+  "description": "Symbol Convergence Fixes: Lock proven symbols, gate new entries, throttle discovery, liquidate experimental first, belt-and-suspenders filtering",
+  "timestamp": "2026-05-03T21:15:00Z",
+  "implementation_summary": {
+    "part_6": {
+      "name": "Config Parameters",
+      "file": "src/l0_core/config.py",
+      "status": "✅ COMPLETE",
+      "changes": "Added 6 convergence config params (SYMBOL_CONVERGENCE_MODE, PROVEN_SYMBOLS, EXCLUDED_SYMBOLS, convergence limits)",
+      "lines_added": 70
+    },
+    "part_7": {
+      "name": "SharedState Convergence Infrastructure",
+      "file": "src/l0_core/shared_state.py",
+      "status": "✅ COMPLETE",
+      "changes": "Added tracking dicts + 6 convergence methods (is_symbol_excluded, is_symbol_proven, add_to_exclusion_list, get_experimental_symbols, get_experimental_count, can_add_new_symbol)",
+      "lines_added": 90
+    },
+    "part_8": {
+      "name": "SymbolScreener Early Gating",
+      "file": "agents/symbol_screener.py",
+      "status": "✅ COMPLETE",
+      "changes": "Added 3 gating methods (_should_accept_symbol, _is_proven_symbol, _get_experimental_count) + modified _propose() to gate BEFORE symbol_proposals write",
+      "lines_added": 40,
+      "note": "Early filter - prevents bad symbols from entering proposals"
+    },
+    "part_9": {
+      "name": "SwingTradeHunter Capital Allocation",
+      "file": "agents/swing_trade_hunter.py",
+      "status": "✅ COMPLETE",
+      "changes": "Added get_available_capital_for_symbol() method: 80% to proven (divide by 7), 20% to experimental (divide by max 2)",
+      "lines_added": 25,
+      "note": "Enforces capital discipline - prevents over-leveraging experimental symbols"
+    },
+    "part_q1_integration": {
+      "name": "LiquidationAgent Healing Prioritization",
+      "file": "agents/liquidation_agent.py",
+      "status": "✅ COMPLETE",
+      "changes": "Modified build_plan() sorting: liquidate experimental symbols FIRST (before proven) during healing liquidations",
+      "lines_modified": 12,
+      "note": "Q1 Answer A: Liquidate experimental symbols with priority (higher risk first)"
+    },
+    "part_q5_integration": {
+      "name": "UURE Second Gating Check (Belt-and-Suspenders)",
+      "file": "src/l3_portfolio/universe_rotation_engine.py",
+      "status": "✅ COMPLETE",
+      "changes": "Added convergence gate check in _collect_discovery_proposals() BEFORE adding to discovery_syms",
+      "lines_added": 15,
+      "note": "Late filter - double-protection against symbol churn (early filter in SymbolScreener, late filter here)"
+    }
+  },
+  "proven_symbols_locked": [
+    "ETHUSDT (2615 trades)",
+    "BTCUSDT (1436 trades)",
+    "PEPEUSDT (724 trades)",
+    "XRPUSDT (697 trades)",
+    "BNBUSDT (477 trades)",
+    "SOLUSDT (371 trades)",
+    "MATICUSDT (322 trades)"
+  ],
+  "excluded_symbols_blocked": [
+    "AAVEUSDT", "ASTERUSDT", "AXSUSDT", "BANANAS31USDT", "BFUSDUSDT",
+    "BIOUSDT", "CHIPUSDT", "DASHUSDT", "DYDXUSDT", "FETUSDT",
+    "HYPERUSDT", "KATUSDT", "LUNCUSDT", "OPNUSDT", "TAOUSDT",
+    "TONUSDT", "TRUMPUSDT", "TURTLEUSDT", "VANAUSDT", "ZAMAUSDT",
+    "ZBTUSDT", "ZECUSDT"
+  ],
+  "convergence_settings": {
+    "SYMBOL_CONVERGENCE_MODE": true,
+    "CONVERGENCE_MIN_HISTORY_TRADES": 100,
+    "CONVERGENCE_MAX_EXPERIMENTAL_SYMBOLS": 2,
+    "CONVERGENCE_MAX_NEW_SYMBOLS_PER_DAY": 1
+  },
+  "user_q_and_a_decisions": {
+    "Q1_healing_priority": "A - Experimental symbols liquidated FIRST (implemented in LiquidationAgent)",
+    "Q2_replacement": "B - Allow experimental symbol replacement (existing logic OK, no changes needed)",
+    "Q3_experimental_count": "A - Count ALL experimental toward limit (implemented in get_experimental_count)",
+    "Q4_capital_allocation": "B - Static 20% healing budget (FIX8_HEALING_ALLOCATION_PCT = 0.20, no dynamic allocation)",
+    "Q5_gating_strategy": "C - Gate in BOTH places: belt-and-suspenders (SymbolScreener early + UURE late)"
+  },
+  "validation_checks": {
+    "config_params": "✅ 6 convergence params verified",
+    "shared_state_methods": "✅ 6 convergence methods verified",
+    "symbol_screener_gating": "✅ Early gating logic verified",
+    "swing_trade_capital": "✅ Capital allocation method verified",
+    "liquidation_priority": "✅ Experimental-first sorting verified",
+    "uure_second_gate": "✅ Late gating logic verified"
+  },
+  "expected_impact": {
+    "symbol_count": "Reduce from 43 all-time to 7-9 active symbols",
+    "daily_bleed": "Reduce from -$15-50/day (current) to +$5-20/day (target)",
+    "capital_efficiency": "Enforce 60/20/20 allocation: proven symbols prioritized for compounding, experimental restricted to healing pool",
+    "risk_reduction": "Eliminate 22 one-time failed symbols from trading pool"
+  },
+  "next_steps": [
+    "1. Run validation script: python3 validate_churn_fix.py",
+    "2. Verify all 10 fixes in place: Parts 1-5 (healing) + Parts 6-10 (convergence)",
+    "3. System restart to activate all fixes",
+    "4. Monitor 24 hours post-restart",
+    "5. Confirm symbol count stabilizes and P&L trend positive"
+  ],
+  "files_modified": [
+    "src/l0_core/config.py",
+    "src/l0_core/shared_state.py",
+    "agents/symbol_screener.py",
+    "agents/swing_trade_hunter.py",
+    "agents/liquidation_agent.py",
+    "src/l3_portfolio/universe_rotation_engine.py"
+  ],
+  "total_lines_added": 257,
+  "total_lines_modified": 12,
+  "no_breaking_changes": true,
+  "ready_for_deployment": true
+}

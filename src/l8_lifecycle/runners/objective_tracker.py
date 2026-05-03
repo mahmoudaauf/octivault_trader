@@ -134,7 +134,8 @@ def score_gates(cp: Dict[str, Any], ofc: Dict[str, Any]) -> List[Dict[str, Any]]
     return gates
 
 
-def _rolling_pace_pct(cps: List[dict], hours: int) -> float | None:
+from typing import Optional
+def _rolling_pace_pct(cps: List[dict], hours: int) -> Optional[float]:
     if len(cps) < 2:
         return None
     last = cps[-1]
@@ -150,7 +151,7 @@ def _rolling_pace_pct(cps: List[dict], hours: int) -> float | None:
     return (last_bal - base) / base * 100.0
 
 
-def _session_change_pct(cps: List[dict]) -> float | None:
+def _session_change_pct(cps: List[dict]) -> Optional[float]:
     if len(cps) < 1:
         return None
     first_bal = _bal(cps[0])
@@ -160,7 +161,7 @@ def _session_change_pct(cps: List[dict]) -> float | None:
     return (last_bal - first_bal) / first_bal * 100.0
 
 
-def _max_drawdown_pct(cps: List[dict]) -> float | None:
+def _max_drawdown_pct(cps: List[dict]) -> Optional[float]:
     bals = [_bal(c) for c in cps]
     bals = [b for b in bals if b]
     if not bals:
@@ -184,7 +185,7 @@ def _last_checkpoint_metrics(cps: List[dict]) -> Dict[str, float]:
     return out
 
 
-def _knob_convergence(ofc: Dict[str, Any]) -> Dict[str, Any] | None:
+def _knob_convergence(ofc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     hist = ofc.get("history_tail") or []
     if len(hist) < 3:
         return None
@@ -200,7 +201,7 @@ def _knob_convergence(ofc: Dict[str, Any]) -> Dict[str, Any] | None:
     return {"sigma": var ** 0.5, "n": len(series)}
 
 
-def _parse_ts(c: dict) -> datetime | None:
+def _parse_ts(c: dict) -> Optional[datetime]:
     ts = c.get("timestamp")
     if not ts:
         return None
@@ -210,7 +211,7 @@ def _parse_ts(c: dict) -> datetime | None:
         return None
 
 
-def _bal(c: dict) -> float | None:
+def _bal(c: dict) -> Optional[float]:
     m = (c.get("checks", {}).get("profit", {}) or {}).get("metrics", {}) or {}
     b = m.get("balance")
     return float(b) if b not in (None, 0, 0.0) else None

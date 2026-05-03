@@ -18,6 +18,12 @@ class SymbolScreener:
         - Secondary: SymbolManager/SharedState proposals (immediate trading if available)
         - Don't call propose_symbol immediately - let UURE decide via rotation cycle
         """
+        # ✅ FIX #7: SYMBOL CONVERGENCE GATING (Part 1 - SymbolScreener gate)
+        # Belt-and-suspenders: Gate here AND in UURE integration (prevents bad symbols from entering proposals)
+        if not await self._should_accept_symbol(symbol):
+            logger.warning(f"[SymbolScreener] 🚫 {symbol} BLOCKED by convergence gating (experimental limit or excluded)")
+            return False
+        
         # ✅ FIX #8 PART 2: Write to symbol_proposals for UURE discovery integration
         # This ensures UURE can see discovery candidates during _collect_discovery_proposals()
         # This is the PRIMARY path - UURE will decide whether to add to accepted_symbols
@@ -281,6 +287,40 @@ class SymbolScreener:
             logger.debug("[SymbolScreener] Failed to build wallet exclude set", exc_info=True)
         return exclude
 
+    # ---------- FIX #7: SYMBOL CONVERGENCE GATING ----------
+    
+    async def _should_accept_symbol(self, symbol: str) -> bool:
+        """
+        Gate new symbols based on convergence rules.
+        Prevents trading untested symbols during healing cycles.
+        
+        FIX #7 - Symbol Screener Gating
+        Returns True if symbol should be allowed into accepted_symbols
+        """
+        if self.shared_state is None:
+            return True  # Fallback: if no shared state, allow all
+        
+        # Check if convergence mode is enabled
+        convergence_enabled = await self.shared_state.can_add_new_symbol(symbol)
+        
+        if not convergence_enabled:
+            logger.debug(f"[SymbolScreener] {symbol} blocked by convergence rules")
+            return False
+        
+        return True
+    
+    def _is_proven_symbol(self, symbol: str) -> bool:
+        """Check if symbol is in proven symbols list."""
+        if self.shared_state is None:
+            return False
+        return self.shared_state.is_symbol_proven(symbol)
+    
+    def _get_experimental_count(self) -> int:
+        """Get count of experimental (non-proven) symbols currently active."""
+        if self.shared_state is None:
+            return 0
+        return self.shared_state.get_experimental_count()
+
     async def _atr_pct(self, symbol: str, price: float) -> float:
         if price <= 0:
             return 0.0
@@ -464,10 +504,66 @@ class SymbolScreener:
     async def _process_and_add_symbols(self, candidates: List[Dict[str, Any]]):
         """
         Propose candidate symbols to SymbolManager / SharedState.
+        
+        ✅ FIX #7: DISCOVERY CAPITAL GATE
+        - Only propose NEW symbols if we have meaningful capital to trade them
+        - Prevents unlimited symbol expansion and dust position creation
+        - Checks: existing accepted_symbols count + free capital
         """
         if candidates:
             symbols_only = [str(item.get("symbol", "")) for item in candidates]
             logger.info(f"📊 Candidate symbols found: {symbols_only}")
+            
+            # ✅ FIX #7: Check if we have capital for new positions before proposing symbols
+            try:
+                # Get current universe size
+                current_universe = set()
+                if self.shared_state and hasattr(self.shared_state, 'get_accepted_symbols'):
+                    curr = await self.shared_state.get_accepted_symbols() if hasattr(self.shared_state, 'get_accepted_symbols') else {}
+                    if not asyncio.iscoroutine(curr):
+                        current_universe = set(curr.keys()) if isinstance(curr, dict) else set()
+                
+                # Get free capital
+                free_usdt = float(await self.shared_state.get_spendable_balance('USDT') or 0.0) if self.shared_state else 0.0
+                
+                # Get minimum entry size (same as MetaController uses)
+                min_entry = float(self._cfg("MIN_ENTRY_USDT", self._cfg("SAFE_ENTRY_USDT", 12.0)))
+                min_significant = float(self._cfg("MIN_SIGNIFICANT_POSITION_USDT", 
+                                                  self._cfg("MIN_SIGNIFICANT_USD", 
+                                                  self._cfg("SIGNIFICANT_POSITION_USDT", 25.0))))
+                
+                # Calculate how many new positions we can afford
+                # Allow discovery only if: (1) new capacity exists, OR (2) we have capital
+                max_universe = int(self._cfg("MAX_UNIVERSE_SYMBOLS", 30))
+                max_positions = int(self._cfg("MAX_POSITIONS_TOTAL", 2))
+                
+                new_universe_size = len(current_universe) + len([c for c in candidates if self._normalize_symbol(c.get("symbol", "")) not in current_universe])
+                can_afford_new_position = free_usdt >= min_significant * 1.5  # 1.5x safety margin
+                has_universe_capacity = new_universe_size < max_universe
+                
+                logger.info(
+                    "[SymbolScreener] 🔍 FIX #7 DISCOVERY GATE CHECK: "
+                    "current_universe=%d max=%d | free_USDT=%.2f min_entry=%.2f | "
+                    "can_afford_new=%s universe_capacity=%s",
+                    len(current_universe), max_universe, free_usdt, min_significant,
+                    can_afford_new_position, has_universe_capacity
+                )
+                
+                # If we can't afford new positions AND universe is full, don't propose
+                if not can_afford_new_position and not has_universe_capacity:
+                    logger.warning(
+                        "[SymbolScreener] ❌ FIX #7 DISCOVERY BLOCKED: "
+                        "Insufficient capital (%.2f USDT < %.2f needed) AND universe full (%d/%d). "
+                        "Not proposing %d new symbols to prevent dust.",
+                        free_usdt, min_significant * 1.5, len(current_universe), max_universe,
+                        len(candidates)
+                    )
+                    return  # Skip discovery entirely
+                
+            except Exception as e:
+                logger.debug(f"[SymbolScreener] FIX #7 capital check failed (non-fatal): {e}")
+                # Continue anyway on error (fail-safe to discovery enabled)
+            
             accepted = 0
             for item in candidates:
                 symbol = self._normalize_symbol(item.get("symbol", ""))

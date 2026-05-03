@@ -300,7 +300,8 @@ def iter_python_files(root: Path) -> Iterable[Path]:
                 yield Path(dirpath) / fn
 
 
-def module_to_path(modname: str) -> str | None:
+from typing import Optional
+def module_to_path(modname: str) -> Optional[str]:
     """Convert dotted module name to a relpath key in FILE_LAYER_MAP, if any."""
     parts = modname.split(".")
     if not parts or parts[0] not in WORKSPACE_TOP_LEVEL:

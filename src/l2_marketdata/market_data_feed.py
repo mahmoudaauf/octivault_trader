@@ -149,6 +149,7 @@ class MarketDataFeed:
         self.max_retry_backoff_sec: float = float(_cfg("max_retry_backoff_sec", max_retry_backoff_sec))
         self.max_retry_attempts: int = int(_cfg("max_retry_attempts", 6))
         self.min_bars_required: int = int(_cfg("min_bars_required", min_bars_required))
+        self._logger.info("[MDF] OHLCV limit=%d min_bars_required=%d timeframes=%s", self.ohlcv_limit, self.min_bars_required, self.timeframes)
         self.readiness_emit: bool = bool(_cfg("readiness_emit", readiness_emit))
         self.per_symbol_readiness: bool = bool(_cfg("per_symbol_readiness", per_symbol_readiness))
         self._declared_ready: bool = False
@@ -230,10 +231,56 @@ class MarketDataFeed:
     # -------------------- utils --------------------
 
     @staticmethod
-    def _sanitize_ohlcv(rows: Iterable[Iterable[float]]) -> List[List[float]]:
-        rows = [r for r in rows if r is not None and len(r) >= 6]
-        rows.sort(key=lambda r: float(r[0]))
-        return [[float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in rows]
+    def _timeframe_to_seconds(timeframe: str) -> int:
+        tf = str(timeframe or "").strip().lower()
+        if tf.endswith("m"):
+            return int(float(tf[:-1]) * 60)
+        if tf.endswith("h"):
+            return int(float(tf[:-1]) * 3600)
+        if tf.endswith("d"):
+            return int(float(tf[:-1]) * 86400)
+        if tf.endswith("w"):
+            return int(float(tf[:-1]) * 604800)
+        return 60
+
+    def _sanitize_ohlcv(self, rows: Iterable[Iterable[float]], timeframe: Optional[str] = None) -> List[List[float]]:
+        cleaned: List[List[float]] = []
+        for r in rows or []:
+            if r is None or len(r) < 6:
+                continue
+            try:
+                ts = float(r[0])
+                o = float(r[1])
+                h = float(r[2])
+                l = float(r[3])
+                c = float(r[4])
+                v = float(r[5])
+            except Exception:
+                continue
+            if not all(math.isfinite(x) for x in (ts, o, h, l, c, v)):
+                continue
+            if ts <= 0 or o <= 0 or h <= 0 or l <= 0 or c <= 0 or v < 0:
+                continue
+            if h < l:
+                continue
+            if not (l <= o <= h and l <= c <= h):
+                continue
+            cleaned.append([ts, o, h, l, c, v])
+        cleaned.sort(key=lambda r: r[0])
+        if timeframe and len(cleaned) >= 2:
+            interval = self._timeframe_to_seconds(timeframe)
+            if interval > 0:
+                gaps = []
+                for prev, curr in zip(cleaned, cleaned[1:]):
+                    delta = curr[0] - prev[0]
+                    if delta > interval * 1.5:
+                        gaps.append(delta)
+                if gaps:
+                    self._logger.warning(
+                        "[MDF] Detected %d gap(s) in OHLCV for timeframe=%s: max_gap=%.0fs, expected=%ds",
+                        len(gaps), timeframe, max(gaps), interval,
+                    )
+        return cleaned
 
     @staticmethod
     async def _maybe_await(val):
@@ -722,7 +769,7 @@ class MarketDataFeed:
                         async def _fetch_ohlcv():
                             return await ec.get_ohlcv(sym, tf, limit=self.ohlcv_limit)
                         rows = await self._with_retries(_fetch_ohlcv, f"warmup.get_ohlcv[{sym},{tf}]")
-                        rows = self._sanitize_ohlcv(rows or [])
+                        rows = self._sanitize_ohlcv(rows or [], tf)
                         # Persist to disk cache for next startup
                         if rows and _HAS_OHLCV_CACHE:
                             try:
@@ -824,7 +871,7 @@ class MarketDataFeed:
                 async def _fetch_ohlcv():
                     return await ec.get_ohlcv(sym, tf, limit=self.ohlcv_limit)
                 rows = await self._with_retries(_fetch_ohlcv, f"accept.get_ohlcv[{sym},{tf}]")
-                rows = self._sanitize_ohlcv(rows or [])
+                rows = self._sanitize_ohlcv(rows or [], tf)
                 for r in rows:
                     bar = {"ts": float(r[0]), "o": float(r[1]), "h": float(r[2]), "l": float(r[3]), "c": float(r[4]), "v": float(r[5])}
                     await self._maybe_await(self.shared_state.add_ohlcv(sym, tf, bar))
@@ -891,6 +938,15 @@ class MarketDataFeed:
             if new_symbols:
                 self._logger.info("[MDF] accepted-symbol delta detected; backfill=%s", new_symbols)
                 await self._schedule_symbol_backfill(new_symbols)
+                
+                # === FIX: Subscribe WebSocket to new symbols ===
+                if self.websocket_feed and hasattr(self.websocket_feed, 'subscribe'):
+                    try:
+                        await self.websocket_feed.subscribe(new_symbols)
+                        self._logger.info(f"[MDF] WebSocket subscribed to {len(new_symbols)} new symbols")
+                    except Exception as e:
+                        self._logger.debug(f"[MDF] Failed to subscribe WebSocket: {e}")
+            
             self._known_symbols = current_symbols
 
             # 🔎 1) Log symbols at every cycle
@@ -1052,7 +1108,7 @@ class MarketDataFeed:
                     async def _fetch_tail():
                         return await ec.get_ohlcv(sym, tf, limit=3)
                     rows = await self._with_retries(_fetch_tail, f"poll.get_ohlcv[{sym},{tf}]")
-                    rows = self._sanitize_ohlcv(rows or [])
+                    rows = self._sanitize_ohlcv(rows or [], tf)
                     for r in rows:
                         bar = {
                             "ts": float(r[0]),

@@ -1,0 +1,93 @@
+{
+  "session": {
+    "id": "6hour-session-20260501-171746",
+    "type": "6-hour-production-run",
+    "duration_hours": 6,
+    "duration_seconds": 21600,
+    "start_time": "2026-05-01T17:17:46+03:00",
+    "expected_end_time": "2026-05-01T23:17:46+03:00",
+    "timezone": "EEST"
+  },
+  "process": {
+    "pid": 62926,
+    "status": "running",
+    "command": "python3 🎯_MASTER_SYSTEM_ORCHESTRATOR.py",
+    "cpu_percent": 3.3,
+    "memory_mb": 585,
+    "uptime_seconds": 165
+  },
+  "cleanup": {
+    "checkpoints_cleared": true,
+    "files_removed": [
+      "state/checkpoint.json",
+      "checkpoint_metrics.json",
+      "logs/checkpoints*.log",
+      "logs/session_checkpoints*.log",
+      "/tmp/octivault_live.log"
+    ],
+    "total_files_removed": 12
+  },
+  "system": {
+    "symbols_tracked": 10,
+    "symbols": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "BNBUSDT",
+      "SOLUSDT",
+      "XRPUSDT",
+      "ADAUSDT",
+      "LINKUSDT",
+      "DOGEUSDT",
+      "AVAXUSDT",
+      "PEPEUSDT"
+    ],
+    "bootstrap_complete": true,
+    "trading_active": true,
+    "real_time_balance_tracking": true,
+    "real_time_symbol_monitoring": true
+  },
+  "logs": {
+    "session_log": "/tmp/octivault_6hour_session.log",
+    "live_activity_log": "/tmp/octivault_live.log",
+    "master_log": "/tmp/octivault_master_orchestrator.log"
+  },
+  "tools": {
+    "restart_script": "/tmp/run_6hour_session.sh",
+    "monitor_script": "monitor_6hour_session.sh",
+    "report_generator": "generate_session_report.sh",
+    "reference_guide": "6HOUR_SESSION_REFERENCE.md"
+  },
+  "monitoring_commands": {
+    "live_activity": "tail -f /tmp/octivault_live.log",
+    "key_metrics_only": "tail -f /tmp/octivault_live.log | grep -E \"LOOP_SUMMARY|TRADE_AUDIT|NAV=\"",
+    "trades": "tail -f /tmp/octivault_live.log | grep \"TRADE_AUDIT\"",
+    "nav_updates": "tail -f /tmp/octivault_live.log | grep \"NAV=\"",
+    "check_process": "ps aux | grep 62926 | grep -v grep"
+  },
+  "control_commands": {
+    "stop": "kill 62926",
+    "restart_new_session": "/tmp/run_6hour_session.sh",
+    "check_status": "ps aux | grep MASTER_SYSTEM_ORCHESTRATOR | grep -v grep"
+  },
+  "analysis_commands": {
+    "count_loops": "grep -c \"LOOP_SUMMARY\" /tmp/octivault_live.log",
+    "count_trades": "grep -c \"TRADE_AUDIT\" /tmp/octivault_live.log",
+    "get_latest_nav": "tail -1 /tmp/octivault_live.log | grep -oP 'NAV=\\K[0-9.]+'",
+    "get_initial_nav": "grep \"NAV=\" /tmp/octivault_live.log | head -1 | grep -oP 'NAV=\\K[0-9.]+'"
+  },
+  "expected_behavior": {
+    "balance_sync_frequency_seconds": "2-3",
+    "symbol_monitoring_frequency_seconds": "2-3",
+    "feedback_tuning_frequency_minutes": 15,
+    "loop_frequency_seconds": "2-3",
+    "trade_execution_latency_seconds": "< 1"
+  },
+  "notes": [
+    "All checkpoints cleared - fresh start with no residual state",
+    "System will auto-shutdown exactly at 23:17:46 EEST",
+    "No manual intervention required - fully autonomous",
+    "Real-time balance tracking verified working",
+    "All 10 symbols continuously monitored",
+    "Profit compounding and feedback system active"
+  ]
+}

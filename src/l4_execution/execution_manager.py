@@ -100,9 +100,16 @@ async def validate_order_request(*, side: str, qty: float, price: float,
         step = float(filters.step_size or 0.0)
         price_safe = price if price > 0 else 1.0
         
+        # FIX #2: ADD SLIPPAGE MODEL - Account for 0.1% execution slippage
+        # BUY orders: price moves UP by slippage (worse fill)
+        # SELL orders: price moves DOWN by slippage (worse fill)
+        SLIPPAGE_BPS = 10  # 0.1% = 10 basis points
+        slippage_multiplier = 1.0 + (SLIPPAGE_BPS / 10000.0) if side.upper() == "BUY" else 1.0 - (SLIPPAGE_BPS / 10000.0)
+        price_with_slippage = price_safe * slippage_multiplier
+        
         # Calculate minimum required quote to meet notional floor
         min_required_quote = max(use_quote_amount, min_required_notional)
-        estimated_qty = min_required_quote / price_safe
+        estimated_qty = min_required_quote / price_with_slippage
 
         if step > 0:
             # Round UP to ensure we meet min_notional constraint
@@ -117,13 +124,14 @@ async def validate_order_request(*, side: str, qty: float, price: float,
         if qty < float(filters.min_qty):
             return False, 0.0, 0.0, "QTY_LT_MIN"
 
-        final_notional = qty * price
+        # Use slippaged price for final notional calculation
+        final_notional = qty * price_with_slippage
         
         # Final validation: notional must meet minimum
         if final_notional < min_required_notional:
             return False, 0.0, 0.0, "NOTIONAL_LT_MIN_AFTER_ROUNDING"
 
-        # Spend amount is recalculated based on rounded-up qty
+        # Spend amount is recalculated based on rounded-up qty with slippage
         spend = final_notional
         return True, float(qty), spend, "OK"
     else:
@@ -1206,21 +1214,29 @@ class ExecutionManager:
             status = str(merged.get("status", "")).upper()
             exec_qty = self._safe_float(merged.get("executedQty") or merged.get("executed_qty"), 0.0)
             if status in ("FILLED", "PARTIALLY_FILLED") and exec_qty > 0:
-                post_fill = await self._ensure_post_fill_handled(
-                    symbol=sym,
-                    side="SELL",
-                    order=merged,
-                    tier=tier,
-                    tag=str(tag or ""),
-                )
-                await self._finalize_sell_post_fill(
-                    symbol=sym,
-                    order=merged,
-                    tag=str(tag or ""),
-                    post_fill=post_fill,
-                    policy_ctx={"reason": "delayed_fill_recovery"},
-                    tier=tier,
-                )
+                # ✅ IDEMPOTENCY FIX: Check if finalization already done before attempting
+                if not self._sell_finalize_already_done(symbol=sym, order=merged):
+                    post_fill = await self._ensure_post_fill_handled(
+                        symbol=sym,
+                        side="SELL",
+                        order=merged,
+                        tier=tier,
+                        tag=str(tag or ""),
+                    )
+                    await self._finalize_sell_post_fill(
+                        symbol=sym,
+                        order=merged,
+                        tag=str(tag or ""),
+                        post_fill=post_fill,
+                        policy_ctx={"reason": "delayed_fill_recovery"},
+                        tier=tier,
+                    )
+                else:
+                    self.logger.info(
+                        "[EM:DelayedFillRecover:ALREADY_DONE] Skipping duplicate finalization for %s order_id=%s (already finalized)",
+                        sym,
+                        str(merged.get("orderId") or merged.get("order_id") or "n/a"),
+                    )
                 with contextlib.suppress(Exception):
                     await self._audit_post_fill_accounting(
                         symbol=sym,
@@ -1567,9 +1583,9 @@ class ExecutionManager:
         order: Dict[str, Any],
         tag: str = "",
         duplicate_attempt: bool = False,
-    ) -> None:
+    ) -> bool:
         if not isinstance(order, dict):
-            return
+            return False
 
         sym = self._norm_symbol(symbol)
         key = str(order.get("_sell_finalize_key") or "").strip() or self._sell_finalize_key(sym, order)
@@ -1618,7 +1634,7 @@ class ExecutionManager:
                     )
                     row["dup_reported"] = True
             self._audit_sell_finalize_invariant(now=now)
-            return
+            return False
 
         if int(row.get("fill_seen", 0) or 0) <= 0:
             self._sell_finalize_stats["finalize_without_fill"] = int(self._sell_finalize_stats.get("finalize_without_fill", 0) or 0) + 1
@@ -1634,7 +1650,9 @@ class ExecutionManager:
                 row["missing_fill_reported"] = True
 
         if already_finalized:
-            self._sell_finalize_stats["duplicate_finalize"] = int(self._sell_finalize_stats.get("duplicate_finalize", 0) or 0) + 1
+            # FIX #1: Only count duplicate once (already incremented above if it was a duplicate_attempt)
+            if not duplicate_attempt:
+                self._sell_finalize_stats["duplicate_finalize"] = int(self._sell_finalize_stats.get("duplicate_finalize", 0) or 0) + 1
             if not bool(row.get("dup_reported")):
                 self.logger.error(
                     "[EM:SellFinalizeAssert] Duplicate SELL close finalization key=%s symbol=%s order_id=%s client_order_id=%s tag=%s",
@@ -1645,13 +1663,24 @@ class ExecutionManager:
                     row.get("tag") or "",
                 )
                 row["dup_reported"] = True
+            first_finalize = False
         else:
             row["finalized"] = 1
             row["finalized_ts"] = now
             self._sell_finalize_stats["finalized"] = int(self._sell_finalize_stats.get("finalized", 0) or 0) + 1
             row["dup_reported"] = False
+            first_finalize = True
 
         self._audit_sell_finalize_invariant(now=now)
+        return bool(first_finalize)
+
+    def _sell_finalize_already_done(self, *, symbol: str, order: Dict[str, Any]) -> bool:
+        if not isinstance(order, dict):
+            return False
+        sym = self._norm_symbol(symbol)
+        key = str(order.get("_sell_finalize_key") or "").strip() or self._sell_finalize_key(sym, order)
+        row = self._sell_finalize_state.get(key)
+        return isinstance(row, dict) and int(row.get("finalized", 0) or 0) > 0
 
     def _audit_sell_finalize_invariant(self, *, now: Optional[float] = None, force_log: bool = False) -> None:
         now_ts = float(now if now is not None else time.time())
@@ -1741,10 +1770,12 @@ class ExecutionManager:
             return
         
         sym = self._norm_symbol(symbol)
-        order_id = str(order.get("orderId") or order.get("order_id") or "")
+        order_id = str(order.get("orderId") or order.get("exchange_order_id") or order.get("order_id") or "")
+        finalize_key = str(order.get("_sell_finalize_key") or "").strip() or self._sell_finalize_key(sym, order)
+        order["_sell_finalize_key"] = finalize_key
         
         # --- OPTION 1: Check finalization result cache ---
-        cache_key = f"{sym}:{order_id}"
+        cache_key = finalize_key
         now_ts = time.time()
         
         # Prune expired cache entries
@@ -1784,6 +1815,21 @@ class ExecutionManager:
         status = str(order.get("status", "")).upper()
         exec_qty = self._safe_float(order.get("executedQty") or order.get("executed_qty"), 0.0)
         if status not in ("FILLED", "PARTIALLY_FILLED") or exec_qty <= 0:
+            return
+
+        if self._sell_finalize_already_done(symbol=sym, order=order):
+            with contextlib.suppress(Exception):
+                self._track_sell_finalize(
+                    symbol=sym,
+                    order=order,
+                    tag=str(tag or ""),
+                    duplicate_attempt=True,
+                )
+            self.logger.debug(
+                "[SELL_FINALIZE:Idempotent] Skipped duplicate finalization for %s key=%s",
+                sym,
+                finalize_key,
+            )
             return
 
         # Ensure post-fill processing has actually run. callers may pass an empty dict,
@@ -6348,6 +6394,12 @@ class ExecutionManager:
             
             est_notional = est_units * price_f
             
+            # FIX P10: Check affordability using POST-STEP-ROUNDING notional
+            # The actual amount we'll spend is est_notional (after qty rounding), not qa (before rounding)
+            # This prevents false INSUFFICIENT_QUOTE_FOR_ACCUMULATION rejections when step_size rounding
+            # would reduce the actual cost below what we have available.
+            # IMPORTANT: est_notional may be slightly less than qa due to step-size rounding down!
+            
             # Check if this executable chunk meets minNotional (SKIP in bootstrap/accumulate modes, but NEVER for dust healing)
             exchange_floor = float(min_notional)  # NOT min_required
             if not bypass_min_notional and est_notional < exchange_floor:
@@ -6370,16 +6422,18 @@ class ExecutionManager:
                 gap = Decimal(str(exchange_floor)) - Decimal(str(est_notional))
                 return (False, gap.max(Decimal("0")), "DUST_OPERATION_LT_MIN_NOTIONAL")
 
-
-            gross_needed = qa * (Decimal("1") + taker_fee) * headroom
-            if spendable_dec < gross_needed - eps:
+            # P10 FIX: Use est_notional (post-rounding) instead of qa (pre-rounding) for affordability check
+            # est_notional is what we'll ACTUALLY spend after step size rounding
+            gross_needed_est = Decimal(str(est_notional)) * (Decimal("1") + taker_fee) * headroom
+            gross_needed = gross_needed_est  # Keep for compatibility with later code
+            if spendable_dec < gross_needed_est - eps:
                 # Point 3: Dynamic Resizing (Downscaling)
                 # If we have less than planned, but enough for minNotional, we downscale.
                 max_qa = spendable_dec / ((Decimal("1") + taker_fee) * headroom)
                 # QUOTE UPGRADE: Instead of rejecting, allow downscaling to what we can afford
                 # (Previously: if no_downscale_planned_quote=True, would reject)
                 if max_qa >= Decimal(str(exchange_floor)) or bypass_min_notional:
-                    self.logger.info(f"[EM] Dynamic Resizing: Downscaling {qa} -> {max_qa:.2f} to fit spendable {spendable_dec:.2f}")
+                    self.logger.info(f"[EM] Dynamic Resizing: Downscaling {qa} -> {max_qa:.2f} to fit spendable {spendable_dec:.2f} (est_notional was {est_notional:.2f})")
                     return (True, max_qa, "OK_DOWNSCALED")
                 else:
                     # Point 2: Accumulation Pivot
@@ -6892,21 +6946,29 @@ class ExecutionManager:
                 
                 if is_fill:
                     # Handle post-fill and finalize in single call sequence
-                    post_fill = await self._ensure_post_fill_handled(
-                        symbol=sym,
-                        side="SELL",
-                        order=res,
-                        tier=None,
-                        tag=str(tag or "tp_sl"),
-                    )
-                    await self._finalize_sell_post_fill(
-                        symbol=sym,
-                        order=res,
-                        tag=str(tag or "tp_sl"),
-                        post_fill=post_fill,
-                        policy_ctx={"exit_reason": reason_text, "reason": reason_text},
-                        tier=None,
-                    )
+                    # ✅ IDEMPOTENCY FIX: Check if finalization already done before attempting
+                    if not self._sell_finalize_already_done(symbol=sym, order=res):
+                        post_fill = await self._ensure_post_fill_handled(
+                            symbol=sym,
+                            side="SELL",
+                            order=res,
+                            tier=None,
+                            tag=str(tag or "tp_sl"),
+                        )
+                        await self._finalize_sell_post_fill(
+                            symbol=sym,
+                            order=res,
+                            tag=str(tag or "tp_sl"),
+                            post_fill=post_fill,
+                            policy_ctx={"exit_reason": reason_text, "reason": reason_text},
+                            tier=None,
+                        )
+                    else:
+                        self.logger.info(
+                            "[EM:CLOSE_FINALIZE:ALREADY_DONE] Skipping duplicate finalization for %s order_id=%s (already finalized)",
+                            sym,
+                            str(res.get("orderId") or res.get("order_id") or "n/a"),
+                        )
 
                     if force_finalize:
                         await self._force_finalize_position(sym, reason_text)
@@ -7696,17 +7758,25 @@ class ExecutionManager:
                     if bool(self._cfg("STRICT_ACCOUNTING_INTEGRITY", False)):
                         raise
 
-                try:
-                    await self._finalize_sell_post_fill(
-                        symbol=sym,
-                        order=merged,
-                        tag=str(clean_tag or ""),
-                        post_fill=merged.get("_post_fill_result") or {},
-                        policy_ctx=policy_ctx,
-                        tier=tier,
+                # ✅ IDEMPOTENCY FIX: Check if finalization already done before attempting
+                if not self._sell_finalize_already_done(symbol=sym, order=merged):
+                    try:
+                        await self._finalize_sell_post_fill(
+                            symbol=sym,
+                            order=merged,
+                            tag=str(clean_tag or ""),
+                            post_fill=merged.get("_post_fill_result") or {},
+                            policy_ctx=policy_ctx,
+                            tier=tier,
+                        )
+                    except Exception:
+                        self.logger.error("[EM:LIQ_FINALIZE_CRASH] %s: canonical SELL finalization failed", sym, exc_info=True)
+                else:
+                    self.logger.info(
+                        "[EM:LIQ_FINALIZE:ALREADY_DONE] Skipping duplicate finalization for %s order_id=%s (already finalized)",
+                        sym,
+                        str(merged.get("orderId") or merged.get("order_id") or "n/a"),
                     )
-                except Exception:
-                    self.logger.error("[EM:LIQ_FINALIZE_CRASH] %s: canonical SELL finalization failed", sym, exc_info=True)
 
                 try:
                     await self._audit_post_fill_accounting(
@@ -8576,14 +8646,22 @@ class ExecutionManager:
                         self.logger.debug("[EM] open_position finalize failed for %s", sym, exc_info=True)
 
                 if side == "sell":
-                    await self._finalize_sell_post_fill(
-                        symbol=sym,
-                        order=raw,
-                        tag=str(tag_raw or ""),
-                        post_fill=post_fill,
-                        policy_ctx=policy_ctx,
-                        tier=tier,
-                    )
+                    # ✅ IDEMPOTENCY FIX: Check if finalization already done before attempting
+                    if not self._sell_finalize_already_done(symbol=sym, order=raw):
+                        await self._finalize_sell_post_fill(
+                            symbol=sym,
+                            order=raw,
+                            tag=str(tag_raw or ""),
+                            post_fill=post_fill,
+                            policy_ctx=policy_ctx,
+                            tier=tier,
+                        )
+                    else:
+                        self.logger.info(
+                            "[EM:FINALIZE:ALREADY_DONE] Skipping duplicate finalization for %s order_id=%s (already finalized)",
+                            sym,
+                            str(raw.get("orderId") or raw.get("order_id") or "n/a"),
+                        )
 
                 try:
                     await self._audit_post_fill_accounting(
@@ -8691,14 +8769,22 @@ class ExecutionManager:
                             tier=tier,
                             tag=str(tag_raw or ""),
                         )
-                        await self._finalize_sell_post_fill(
-                            symbol=sym,
-                            order=raw,
-                            tag=str(tag_raw or ""),
-                            post_fill=recovered_post_fill,
-                            policy_ctx=policy_ctx,
-                            tier=tier,
-                        )
+                        # ✅ IDEMPOTENCY FIX: Check if finalization already done before attempting
+                        if not self._sell_finalize_already_done(symbol=sym, order=raw):
+                            await self._finalize_sell_post_fill(
+                                symbol=sym,
+                                order=raw,
+                                tag=str(tag_raw or ""),
+                                post_fill=recovered_post_fill,
+                                policy_ctx=policy_ctx,
+                                tier=tier,
+                            )
+                        else:
+                            self.logger.info(
+                                "[EM:SELL_RECOVERY:ALREADY_DONE] Skipping duplicate finalization for %s order_id=%s (already finalized)",
+                                sym,
+                                str(raw.get("orderId") or raw.get("order_id") or "n/a"),
+                            )
                         recovered_sell_fill = True
                         self.logger.warning(
                             "[EM:SELL_EXCEPTION_RECOVERY] symbol=%s status=%s qty=%.8f order_id=%s",
@@ -8871,10 +8957,18 @@ class ExecutionManager:
                             symbol=sym, side="SELL", order=merged,
                             tier=None, tag=str(tag or ""),
                         )
-                        await self._finalize_sell_post_fill(
-                            symbol=sym, order=merged, tag=str(tag or ""),
-                            post_fill=lp_post, policy_ctx=policy_ctx, tier=None,
-                        )
+                        # ✅ IDEMPOTENCY FIX: Check if finalization already done before attempting
+                        if not self._sell_finalize_already_done(symbol=sym, order=merged):
+                            await self._finalize_sell_post_fill(
+                                symbol=sym, order=merged, tag=str(tag or ""),
+                                post_fill=lp_post, policy_ctx=policy_ctx, tier=None,
+                            )
+                        else:
+                            self.logger.info(
+                                "[EM:LIQUIDPLAN:ALREADY_DONE] Skipping duplicate finalization for %s order_id=%s (already finalized)",
+                                sym,
+                                str(merged.get("orderId") or merged.get("order_id") or "n/a"),
+                            )
                     except Exception:
                         self.logger.error("[EM:LiqPlan:FINALIZE_CRASH] %s", sym, exc_info=True)
                 else:
@@ -9150,14 +9244,22 @@ class ExecutionManager:
                         tag=str(tag or ""),
                     )
                     if side.upper() == "SELL":
-                        await self._finalize_sell_post_fill(
-                            symbol=symbol,
-                            order=order_res,
-                            tag=str(tag or ""),
-                            post_fill=post_fill,
-                            policy_ctx=None,
-                            tier=None,
-                        )
+                        # ✅ IDEMPOTENCY FIX: Check if finalization already done before attempting
+                        if not self._sell_finalize_already_done(symbol=symbol, order=order_res):
+                            await self._finalize_sell_post_fill(
+                                symbol=symbol,
+                                order=order_res,
+                                tag=str(tag or ""),
+                                post_fill=post_fill,
+                                policy_ctx=None,
+                                tier=None,
+                            )
+                        else:
+                            self.logger.info(
+                                "[EM:BUY_QTY_DIRECT:ALREADY_DONE] Skipping duplicate finalization for %s order_id=%s (already finalized)",
+                                symbol,
+                                str(order_res.get("orderId") or order_res.get("order_id") or "n/a"),
+                            )
                 except Exception as e:
                     self.logger.error(f"[POST_FILL_CRASH_DIRECT_PATH] {symbol}: {e}", exc_info=True)
 
@@ -9427,14 +9529,22 @@ class ExecutionManager:
                         tag=str(tag or ""),
                     )
                     if side.upper() == "SELL":
-                        await self._finalize_sell_post_fill(
-                            symbol=symbol,
-                            order=order_res,
-                            tag=str(tag or ""),
-                            post_fill=post_fill,
-                            policy_ctx=None,
-                            tier=None,
-                        )
+                        # ✅ IDEMPOTENCY FIX: Check if finalization already done before attempting
+                        if not self._sell_finalize_already_done(symbol=symbol, order=order_res):
+                            await self._finalize_sell_post_fill(
+                                symbol=symbol,
+                                order=order_res,
+                                tag=str(tag or ""),
+                                post_fill=post_fill,
+                                policy_ctx=None,
+                                tier=None,
+                            )
+                        else:
+                            self.logger.info(
+                                "[EM:BUY_QUOTE_DIRECT:ALREADY_DONE] Skipping duplicate finalization for %s order_id=%s (already finalized)",
+                                symbol,
+                                str(order_res.get("orderId") or order_res.get("order_id") or "n/a"),
+                            )
                 except Exception as e:
                     self.logger.error(
                         f"[POST_FILL_CRASH_QUOTE_PATH] {symbol}: {e}",
@@ -10311,14 +10421,22 @@ class ExecutionManager:
                         order["_post_fill_result"] = dict(post_fill)
                         order["_post_fill_done"] = True
                     if side.upper() == "SELL":
-                        await self._finalize_sell_post_fill(
-                            symbol=symbol,
-                            order=order,
-                            tag=str(safe_tag or ""),
-                            post_fill=post_fill,
-                            policy_ctx=None,
-                            tier=None,
-                        )
+                        # ✅ IDEMPOTENCY FIX: Check if finalization already done before attempting
+                        if not self._sell_finalize_already_done(symbol=symbol, order=order):
+                            await self._finalize_sell_post_fill(
+                                symbol=symbol,
+                                order=order,
+                                tag=str(safe_tag or ""),
+                                post_fill=post_fill,
+                                policy_ctx=None,
+                                tier=None,
+                            )
+                        else:
+                            self.logger.info(
+                                "[EM:CANONICAL:ALREADY_DONE] Skipping duplicate finalization for %s order_id=%s (already finalized)",
+                                symbol,
+                                str(order.get("orderId") or order.get("order_id") or "n/a"),
+                            )
                 return order
         finally:
             # Release semaphore if acquired

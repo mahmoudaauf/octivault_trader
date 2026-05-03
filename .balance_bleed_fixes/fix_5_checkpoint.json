@@ -1,0 +1,16 @@
+{
+  "fix_number": 5,
+  "status": "COMPLETED",
+  "timestamp": 1777828212.030717,
+  "details": {
+    "changes": [
+      "BUFFER_CAPITAL_TARGET_PCT = 0.20",
+      "BUFFER_CAPITAL_REBALANCE_TRIGGER_PCT = 0.10",
+      "BUFFER_REBUILD_STRATEGY = 'liquidate_oldest_first'"
+    ],
+    "current_state": "$2.73 free (3.2%)",
+    "target_state": "$17+ free (20%)",
+    "benefit": "Prevents forced healing when portfolio is fully deployed",
+    "timeline": "Rebuild gradually over 3-5 trading cycles"
+  }
+}

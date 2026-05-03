@@ -1,0 +1,16 @@
+{
+  "fix_number": 4,
+  "status": "COMPLETED",
+  "timestamp": 1777828212.029654,
+  "details": {
+    "changes": [
+      "MAX_AVERAGING_ENTRIES_PER_HOUR = 1",
+      "MIN_TIME_BETWEEN_AVERAGING_SEC = 1800",
+      "MAX_SYMBOL_CONCENTRATION_PCT = 0.30",
+      "REQUIRE_TECHNICAL_SIGNAL_FOR_AVERAGING = True"
+    ],
+    "benefit": "Reduce AIXBTUSDT from 1,082 units (41%) \u2192 600-700 units (25-30%)",
+    "risk_reduction": "50% reduction in correlation risk",
+    "example_prevention": "Prevents Trade #9 (2 min after Trade #8)"
+  }
+}

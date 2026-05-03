@@ -1,0 +1,11 @@
+{
+  "fix_number": 2,
+  "status": "COMPLETED",
+  "timestamp": 1777828212.0278242,
+  "details": {
+    "change": "Added MIN_HOLD_TIME_BEFORE_HEALING_SEC = 1800",
+    "hold_time_minutes": 30,
+    "expected_savings": "$9.60/day (prevent early liquidations)",
+    "example_prevention": "Trade #2 (BNB): -$0.60 loss at 30 min hold"
+  }
+}

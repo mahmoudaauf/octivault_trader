@@ -82,6 +82,7 @@ try:
     from src.l8_lifecycle.meta_controller import MetaController
     from src.l5_strategy.agent_manager import AgentManager
     from src.l2_marketdata.market_data_feed import MarketDataFeed  # ← CRITICAL: Add market data streaming
+    from src.l2_marketdata.balance_sync import BalanceSync  # ← CRITICAL: Real-time balance updates
     from src.l7_observability.health_monitor import HealthMonitor
     from src.l8_lifecycle.watchdog import Watchdog
     from src.l2_marketdata.heartbeat import Heartbeat
@@ -350,6 +351,12 @@ try:
         HAS_BALANCE_SYNC_BACKOFF = False
 
     try:
+        from src.l2_marketdata.balance_cache_updater import BalanceCacheUpdater, create_and_start_balance_updater
+        HAS_BALANCE_CACHE_UPDATER = True
+    except Exception:
+        HAS_BALANCE_CACHE_UPDATER = False
+
+    try:
         from src.l1_exchange.retry_manager import RetryManager
         HAS_RETRY_MANAGER = True
     except Exception:
@@ -608,6 +615,7 @@ class MasterSystemOrchestrator:
         self.meta_controller: Optional[MetaController] = None
         self.agent_manager: Optional[AgentManager] = None
         self.market_data_feed: Optional[MarketDataFeed] = None  # ← CRITICAL: Real-time market data
+        self.balance_sync: Optional[BalanceSync] = None  # ← CRITICAL: Real-time balance updates from Binance
         self.polling_coordinator: Optional[PollingCoordinator] = None
         self.health_monitor: Optional[HealthMonitor] = None
         self.watchdog: Optional[Watchdog] = None
@@ -650,6 +658,7 @@ class MasterSystemOrchestrator:
         self.action_router: Optional[object] = None
         self.exit_arbitrator: Optional[object] = None
         self.balance_sync_coordinator: Optional[object] = None
+        self.balance_cache_updater: Optional[object] = None
         self.retry_manager: Optional[object] = None
         self.position_manager: Optional[object] = None
         self.portfolio_manager: Optional[object] = None
@@ -812,6 +821,24 @@ class MasterSystemOrchestrator:
                     logger.info("✅ BalanceSyncCoordinator initialized")
                 except Exception as _bsb_e:
                     logger.warning("⚠️  BalanceSyncCoordinator: %s", _bsb_e)
+
+            # LAYER 2.1B: REAL-TIME BALANCE CACHE UPDATER (immediately updates balance when capital arrives)
+            if HAS_BALANCE_CACHE_UPDATER:
+                try:
+                    self.balance_cache_updater = BalanceCacheUpdater(
+                        shared_state=self.shared_state,
+                        exchange_client=self.exchange_client,
+                        config=self.config,
+                    )
+                    # Start monitoring in background
+                    asyncio.create_task(
+                        self.balance_cache_updater.start_monitoring(),
+                        name="BalanceCacheUpdater"
+                    )
+                    logger.info("✅ BalanceCacheUpdater started (real-time balance cache monitoring active)")
+                    logger.info("   📊 When capital arrives on Binance, trading will begin within seconds!")
+                except Exception as _bcu_e:
+                    logger.warning("⚠️  BalanceCacheUpdater: %s", _bcu_e)
 
             # LAYER 2.2: PROMETHEUS METRICS (observability)
             if HAS_PROMETHEUS_EXPORTER:
@@ -1034,6 +1061,20 @@ class MasterSystemOrchestrator:
             await asyncio.sleep(6)  # 6s warm-up — allows initial bars to arrive
             logger.info("✅ MarketDataFeed warm-up complete")
 
+            # LAYER 2.85: BALANCE SYNC — Real-time balance updates from Binance
+            try:
+                self.balance_sync = BalanceSync(
+                    shared_state=self.shared_state,
+                    exchange_client=self.exchange_client,
+                    update_interval_sec=3.0,  # Fetch balance every 3 seconds
+                    logger_obj=logger,
+                )
+                await self.balance_sync.start()
+                logger.info("✅ BalanceSync started (real-time balance updates every 3s)")
+            except Exception as _bs_e:
+                logger.warning("⚠️  BalanceSync: %s (trading will continue with stale balance)", _bs_e)
+                self.balance_sync = None
+
             # LAYER 2.9: WEBSOCKET MARKET DATA (real-time price + kline streams)
             if HAS_WS_MARKET_DATA:
                 try:
@@ -1190,6 +1231,16 @@ class MasterSystemOrchestrator:
                 signal_manager=self.signal_manager  # CRITICAL: Share the same SignalManager so injected signals are visible!
             )
             logger.info(f"✅ MetaController initialized")
+            
+            # CLEANUP: Clear rejection counters from previous runs to unblock trading
+            logger.info("[BOOTSTRAP_CLEANUP] Clearing rejection counters accumulated from previous runs...")
+            try:
+                # Clear all rejection counters to reset any deadlock state from prior sessions
+                old_total = sum(self.shared_state.rejection_counters.values())
+                self.shared_state.rejection_counters.clear()
+                logger.info(f"✅ Rejection counters cleared (was tracking {old_total} rejections, now=0)")
+            except Exception as _clear_e:
+                logger.warning(f"⚠️  Failed to clear rejection counters: {_clear_e}")
 
             # LAYER 6.1: REGIME-AWARE MEDIATOR (wires MarketRegimeDetector → MetaController/AgentManager/CapitalAllocator)
             if HAS_MARKET_REGIME_DETECTOR and HAS_REGIME_INTEGRATION and self.market_regime_detector is not None:
@@ -1299,11 +1350,26 @@ class MasterSystemOrchestrator:
                         if isinstance((self.shared_state.balances or {}).get("USDT"), dict)
                         else (self.shared_state.balances or {}).get("USDT", 50.0)
                     )
-                    self.dead_capital_healer = DeadCapitalHealer(config={
+                    # Check for environment variable override for minimum dead capital threshold
+                    _min_dead_override = None
+                    try:
+                        _min_dead_env = os.getenv("DEAD_CAPITAL_MIN_THRESHOLD", "").strip()
+                        if _min_dead_env:
+                            _min_dead_override = float(_min_dead_env)
+                    except Exception:
+                        pass
+                    
+                    _healer_config = {
                         "total_equity": max(50.0, _usdt_now),
                         "batch_heal_enabled": True,
                         "max_liquidations": 5,
-                    })
+                    }
+                    # Apply environment override if provided
+                    if _min_dead_override is not None:
+                        _healer_config["min_dead_to_heal"] = _min_dead_override
+                        logger.info(f"[INIT] Applied DEAD_CAPITAL_MIN_THRESHOLD override: ${_min_dead_override:.2f}")
+                    
+                    self.dead_capital_healer = DeadCapitalHealer(config=_healer_config)
                     # Wire into ThreeBucketManager if available
                     if self.three_bucket_manager is not None and hasattr(
                         self.three_bucket_manager, "set_dead_capital_healer"
@@ -2761,6 +2827,7 @@ class MasterSystemOrchestrator:
         # Shutdown components
         try:
             await self._stop_component(self.tp_sl_engine, "TPSLEngine")
+            await self._stop_component(self.balance_sync, "BalanceSync")
             await self._stop_component(self.market_data_feed, "MarketDataFeed")
             await self._stop_component(self.polling_coordinator, "PollingCoordinator")
             await self._stop_component(self.meta_controller, "MetaController")

@@ -128,7 +128,10 @@ class MicroSniperConfig:
     MAX_TRADES_PER_DAY = 3  # Maximum 3 trades per calendar day
     
     # Position sizing
-    POSITION_SIZE_PCT_NAV = 0.30  # Use up to 30% of NAV per position
+    # FIX #4: REDUCE POSITION SIZE from 30% to 15% (safer for $100 account with slippage)
+    # Old: $25-30 per trade = 25-30% of NAV (over-leveraged)
+    # New: $15 per trade = 15% of NAV (more conservative with execution slippage)
+    POSITION_SIZE_PCT_NAV = 0.15  # Use up to 15% of NAV per position
     
     # Disabled features
     ROTATION_ENABLED = False  # Disable symbol rotation
@@ -349,7 +352,20 @@ class RegimeManager:
         raw_micro_max = getattr(self.config, "CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS", None)
         if raw_micro_max is None:
             raw_micro_max = os.getenv("CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS")
+        
+        # 🔧 GROWTH FIX: If capital recovered well (>$50), allow higher position limit for sustainable growth
+        # This enables portfolio rotation and prevents "portfolio full" deadlock after recovery
         micro_max_pos = _coerce_int(raw_micro_max, default=default_max_pos, minimum=1)
+        if hasattr(self.config, "CAPITAL_RECOVERED_THRESHOLD"):
+            recovered_threshold = float(getattr(self.config, "CAPITAL_RECOVERED_THRESHOLD", 50.0) or 50.0)
+            current_free_capital = getattr(self.config, "_current_free_capital", 0.0)
+            if current_free_capital > recovered_threshold and micro_max_pos <= 2:
+                # Increase to allow sustainable growth when capital is available
+                micro_max_pos = 3
+                self.logger.debug(
+                    "[NAVRegime:GrowthBoost] Capital recovered (%.2f > %.2f threshold), boosting micro_max_pos to %d",
+                    current_free_capital, recovered_threshold, micro_max_pos
+                )
 
         raw_rotation = getattr(self.config, "CAPITAL_MICRO_ALLOW_ROTATION", None)
         if raw_rotation is None:

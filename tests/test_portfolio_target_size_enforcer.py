@@ -32,7 +32,8 @@ class _FakeSharedState:
 
 
 class _FakeExecutionManager:
-    def __init__(self, sell_symbols: set | None = None) -> None:
+    from typing import Optional
+    def __init__(self, sell_symbols: Optional[set] = None) -> None:
         self.calls: list[list[dict]] = []
         # Symbols that should be considered "sold" after execute_liquidation_plan
         self._sell_symbols = sell_symbols

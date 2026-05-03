@@ -1,0 +1,11 @@
+{
+  "fix_number": 1,
+  "status": "COMPLETED",
+  "timestamp": 1777828212.0268679,
+  "details": {
+    "change": "ADAPTIVE_IDLE_TIME_SEC: 1800 \u2192 5400",
+    "interval_minutes": 90,
+    "expected_cycles_per_day": 12,
+    "expected_savings": "$28.80/day \u2192 $8.64/day (70% reduction)"
+  }
+}

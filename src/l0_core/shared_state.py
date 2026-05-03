@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import math
 from datetime import datetime
 from decimal import getcontext
 from collections import deque, defaultdict
@@ -22,6 +23,8 @@ from functools import wraps
 from typing import Any, Dict, List, Set, Tuple, Optional, Callable, TypedDict, TYPE_CHECKING
 from dataclasses import dataclass, asdict, is_dataclass
 from enum import Enum
+import os
+import json
 
 # ---- Optional Third-Party Imports ----
 try:
@@ -971,6 +974,41 @@ class _SharedStateEventBus:
 
 class SharedState:
 
+    def save_positions_to_disk(self):
+        """Persist positions and NAV to disk."""
+        try:
+            data = {
+                "positions": self.positions,
+                "nav": self.nav,
+                "portfolio_nav": self.portfolio_nav,
+                "total_equity": self.total_equity,
+                "total_equity_usdt": self.total_equity_usdt,
+                "free_quote": self.free_quote,
+                "invested_capital": self.invested_capital,
+            }
+            with open(self._positions_nav_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            self.logger.info(f"[SharedState] Positions/NAV saved to {self._positions_nav_file}")
+        except Exception as e:
+            self.logger.warning(f"[SharedState] Failed to save positions/NAV: {e}")
+
+    def load_positions_from_disk(self):
+        """Load positions and NAV from disk if available."""
+        try:
+            if os.path.exists(self._positions_nav_file):
+                with open(self._positions_nav_file, 'r') as f:
+                    data = json.load(f)
+                self.positions = data.get("positions", {})
+                self.nav = data.get("nav", 0.0)
+                self.portfolio_nav = data.get("portfolio_nav", 0.0)
+                self.total_equity = data.get("total_equity", 0.0)
+                self.total_equity_usdt = data.get("total_equity_usdt", 0.0)
+                self.free_quote = data.get("free_quote", 0.0)
+                self.invested_capital = data.get("invested_capital", 0.0)
+                self.logger.info(f"[SharedState] Positions/NAV loaded from {self._positions_nav_file}")
+        except Exception as e:
+            self.logger.warning(f"[SharedState] Failed to load positions/NAV: {e}")
+
     # ---- Compatibility helpers (TPSLEngine/Watchdog) ----
     def update_timestamp(self, component: str) -> None:
         """
@@ -1312,6 +1350,11 @@ class SharedState:
         self.last_exit_ts: Dict[str, float] = {}
         self.last_exit_source: Dict[str, str] = {}
 
+        # Persistent state file for positions and NAV
+        import os
+        self._positions_nav_file = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../state/positions_nav.json'))
+        self.load_positions_from_disk()
+
         # Quote asset (used by spendable-quote helpers)
         # Canonical quote asset from config
         self.quote_asset: str = str(getattr(config, 'quote_asset', 'USDT')).upper() if config else 'USDT'
@@ -1434,6 +1477,27 @@ class SharedState:
 
         # 🔄 LIGHTWEIGHT SIGNAL OUTCOME TRACKING
         self._signal_outcomes = []  # List of signal outcome records for periodic evaluation
+
+        # ---------- FIX #6-10: SYMBOL CONVERGENCE TRACKING ----------
+        # Track when symbols were added for throttling (Part 9)
+        self.new_symbol_timestamps: Dict[str, float] = {}  # symbol -> timestamp
+        self.symbol_add_dates: Dict[str, str] = {}  # symbol -> date (YYYY-MM-DD)
+        
+        # Excluded symbols that should never be proposed
+        self.excluded_symbols_runtime: Dict[str, str] = {}  # symbol -> reason
+        
+        # Symbol convergence state
+        self.symbol_convergence_state = {
+            'mode_enabled': getattr(config, 'SYMBOL_CONVERGENCE_MODE', True),
+            'proven_symbols': getattr(config, 'PROVEN_SYMBOLS', {}),
+            'excluded_symbols': getattr(config, 'EXCLUDED_SYMBOLS', {}),
+            'max_experimental': getattr(config, 'CONVERGENCE_MAX_EXPERIMENTAL_SYMBOLS', 2),
+            'max_new_per_day': getattr(config, 'CONVERGENCE_MAX_NEW_SYMBOLS_PER_DAY', 1),
+        }
+        
+        self.logger.info(f"[SS:Init] Symbol Convergence initialized: mode={self.symbol_convergence_state['mode_enabled']}, "
+                        f"proven={len(self.symbol_convergence_state['proven_symbols'])}, "
+                        f"excluded={len(self.symbol_convergence_state['excluded_symbols'])}")
 
         # Liquidity reservations
         self._quote_reservations = {}
@@ -1694,14 +1758,16 @@ class SharedState:
         """
         sym = symbol.upper()
         target_side = side.upper()
-
         def _safe_float(value: Any, default: float = 0.0) -> float:
             try:
                 return float(value)
             except Exception:
                 return float(default)
 
-        default_min_conf = _safe_float(self._cfg("MIN_CONFIDENCE_TO_TRADE", 0.5), 0.5)
+        # FIX #3: REDUCED ML CONFIDENCE THRESHOLD 
+        # Changed from 0.5 to 0.75 to filter out low-confidence signals that lost money
+        # 0.65 confidence signals (like BABYUSDT) were losing money, need higher bar
+        default_min_conf = _safe_float(self._cfg("MIN_CONFIDENCE_TO_TRADE", 0.75), 0.75)
         now_ts = time.time()
 
         def _signal_matches(sig: Any, allow_side_fallback: bool) -> bool:
@@ -2193,9 +2259,30 @@ class SharedState:
 
             # Get price for this asset (e.g., BTCUSDT, ETHUSDT)
             symbol = f"{asset_upper}USDT"
+            # FIX: Try multiple sources for price
+            # 1. latest_prices (real-time feed)
+            # 2. _price_cache (WebSocket cache tuple)
+            # 3. Position entry price (last known price)
             px = float(self.latest_prices.get(symbol) or 0.0)
+            
+            # Fallback to WebSocket cache if latest_prices empty
+            if px <= 0:
+                cache = getattr(self, "_price_cache", {})
+                if isinstance(cache, dict) and symbol in cache:
+                    price_tuple = cache.get(symbol)
+                    if isinstance(price_tuple, (tuple, list)) and len(price_tuple) >= 1:
+                        px = float(price_tuple[0])
+            
+            # Fallback to entry price from any position with this asset
+            if px <= 0:
+                for pos_sym, pos_info in (self.positions or {}).items():
+                    if pos_sym.startswith(asset_upper):
+                        entry_px = float((pos_info or {}).get("entry_price", 0.0) or 0.0)
+                        if entry_px > 0:
+                            px = entry_px
+                            break
 
-            # Skip if no price available
+            # Skip if no price available after all attempts
             if px <= 0:
                 self.logger.debug(
                     f"[NAV] Excluding balance {asset}: no price feed for {symbol}"
@@ -2237,6 +2324,18 @@ class SharedState:
             # Never use entry price - it's historical, not current market value
             # Try latest_prices first, then mark_price (updated at trade time)
             px = float(self.latest_prices.get(sym) or pos.get("mark_price") or 0.0)
+            
+            # FIX: If latest_prices empty, try WebSocket cache and then entry price
+            if px <= 0:
+                cache = getattr(self, "_price_cache", {})
+                if isinstance(cache, dict) and sym in cache:
+                    price_tuple = cache.get(sym)
+                    if isinstance(price_tuple, (tuple, list)) and len(price_tuple) >= 1:
+                        px = float(price_tuple[0])
+            
+            # Last resort: use entry price if current price unavailable
+            if px <= 0:
+                px = float(pos.get("entry_price", 0.0) or 0.0)
             
             # PROFESSIONAL STANDARD RULE #3: Exclude positions with no price feed
             if px <= 0:
@@ -3649,6 +3748,67 @@ class SharedState:
     def _norm_tf(self, timeframe: str) -> str:
         return str(timeframe or "").strip().lower()
 
+    # ---------- FIX #6-10: SYMBOL CONVERGENCE METHODS ----------
+    
+    def is_symbol_excluded(self, symbol: str) -> bool:
+        """Check if symbol is on exclusion list (tested and failed)."""
+        sym = self._norm_sym(symbol)
+        
+        # Check runtime exclusion list first
+        if sym in self.excluded_symbols_runtime:
+            return True
+        
+        # Check config exclusion list
+        if sym in self.symbol_convergence_state.get('excluded_symbols', {}):
+            return True
+        
+        return False
+    
+    def is_symbol_proven(self, symbol: str) -> bool:
+        """Check if symbol is in the proven winners list."""
+        sym = self._norm_sym(symbol)
+        return sym in self.symbol_convergence_state.get('proven_symbols', {})
+    
+    def add_to_exclusion_list(self, symbol: str, reason: str):
+        """Add symbol to runtime exclusion list (persistent until restart)."""
+        sym = self._norm_sym(symbol)
+        self.excluded_symbols_runtime[sym] = reason
+        self.logger.info(f"[SymbolConvergence] Excluded {sym}: {reason}")
+    
+    def get_experimental_symbols(self) -> List[str]:
+        """Get list of experimental (non-proven) symbols currently in accepted_symbols."""
+        proven = self.symbol_convergence_state.get('proven_symbols', {})
+        experimental = [sym for sym in self.accepted_symbols.keys() if sym not in proven]
+        return experimental
+    
+    def get_experimental_count(self) -> int:
+        """Count current experimental symbols."""
+        return len(self.get_experimental_symbols())
+    
+    async def can_add_new_symbol(self, symbol: str) -> bool:
+        """Check if symbol can be added based on convergence rules."""
+        if not self.symbol_convergence_state.get('mode_enabled', True):
+            return True  # Convergence mode disabled
+        
+        sym = self._norm_sym(symbol)
+        
+        # Never add excluded symbols
+        if self.is_symbol_excluded(sym):
+            return False
+        
+        # Always allow proven symbols
+        if self.is_symbol_proven(sym):
+            return True
+        
+        # Check experimental limit (for non-proven symbols)
+        experimental_count = self.get_experimental_count()
+        max_experimental = self.symbol_convergence_state.get('max_experimental', 2)
+        
+        if experimental_count >= max_experimental:
+            return False  # At or over limit
+        
+        return True
+
     def _get_dynamic_significant_floor(self) -> float:
         """
         ALIGNMENT FIX: Calculate dynamic significant floor based on risk-based trade sizing.
@@ -4189,18 +4349,30 @@ class SharedState:
         key = (sym, tf)
         norm: List[OHLCVBar] = []
         for r in ohlcv_data or []:
-            if {"ts","o","h","l","c","v"} <= r.keys():
-                norm.append(OHLCVBar(ts=float(r["ts"]), o=float(r["o"]), h=float(r["h"]), l=float(r["l"]), c=float(r["c"]), v=float(r["v"])) )
-            else:
-                ts = float(r.get("ts") or r.get("timestamp") or r.get("time") or 0.0)
-                norm.append(OHLCVBar(
-                    ts=ts,
-                    o=float(r.get("o") or r.get("open") or 0.0),
-                    h=float(r.get("h") or r.get("high") or 0.0),
-                    l=float(r.get("l") or r.get("low")  or 0.0),
-                    c=float(r.get("c") or r.get("close") or 0.0),
-                    v=float(r.get("v") or r.get("volume") or 0.0),
-                ))
+            try:
+                if {"ts","o","h","l","c","v"} <= set(r.keys()):
+                    ts = float(r["ts"])
+                    o = float(r["o"])
+                    h = float(r["h"])
+                    l = float(r["l"])
+                    c = float(r["c"])
+                    v = float(r["v"])
+                else:
+                    ts = float(r.get("ts") or r.get("timestamp") or r.get("time") or 0.0)
+                    o = float(r.get("o") or r.get("open") or 0.0)
+                    h = float(r.get("h") or r.get("high") or 0.0)
+                    l = float(r.get("l") or r.get("low") or 0.0)
+                    c = float(r.get("c") or r.get("close") or 0.0)
+                    v = float(r.get("v") or r.get("volume") or 0.0)
+                if not all(math.isfinite(x) for x in (ts, o, h, l, c, v)):
+                    continue
+                if ts <= 0 or o <= 0 or h <= 0 or l <= 0 or c <= 0 or v < 0:
+                    continue
+                if h < l or not (l <= o <= h and l <= c <= h):
+                    continue
+                norm.append(OHLCVBar(ts=ts, o=o, h=h, l=l, c=c, v=v))
+            except Exception:
+                continue
         norm.sort(key=lambda x: x["ts"])
         async with self._lock_context("market_data"):
             legacy_key = (symbol, timeframe)
@@ -4218,6 +4390,9 @@ class SharedState:
             }
         if norm:
             await self.update_latest_price(sym, norm[-1]["c"])
+        else:
+            # Reject invalid market data payloads to avoid bad rows in shared state.
+            return
         # Do not set MarketDataReady here; rely on coverage check
         await self._maybe_set_market_data_ready()
 
@@ -4779,27 +4954,33 @@ class SharedState:
         
         reserved = sum(float(r.get("amount", 0.0)) for r in cleaned_reservations)
 
-        # CRITICAL FIX: Bootstrap deadlock prevention (Fix #4)
-        # When portfolio is completely flat (no reserved capital) and balance is critically low,
-        # relax safety reserve to a HARD FLOOR (env BOOTSTRAP_MIN_RESERVE_USDT, default $2.00)
-        # to allow first trade to execute, BUT never below that floor — protects user's
-        # min-reserve policy intent (Q2: "USDT shouldn't drop to 0").
+        # PRODUCTION FIX V2: Aggressive capital mobilization for small accounts
+        # Problem: On restart, accounts < $50 get trapped with only $6-10 spendable
+        # while needing $10 minimum for first trade.
+        # Solution: Adaptively reduce reserve ratio for small accounts
+        # - Accounts < $50: Use 5% reserve instead of 10%
+        # - Accounts < $25: Use $1.00 floor instead of 10%
+        # This enables trading without starvation.
+        
         spendable_with_full_reserve = available - reserved - max(available * rr, mr)
         
-        if reserved == 0 and spendable_with_full_reserve < 5.0 and available > 5.0:
-            # Flat portfolio with starved capital: use bootstrap floor instead of full reserve.
-            # Default $2.00 floor (was $0.50 — too low; let USDT drain on every cycle).
-            try:
-                bootstrap_floor = float(getattr(self.config, "BOOTSTRAP_MIN_RESERVE_USDT", 2.00) or 2.00)
-            except Exception:
-                bootstrap_floor = 2.00
-            bootstrap_floor = max(0.50, bootstrap_floor)  # never below 0.50 absolute
-            spendable = max(0.0, available - reserved - bootstrap_floor)
+        # Apply aggressive capital mobilization for small accounts
+        if reserved == 0 and available < 50.0 and available > 2.0:
+            # Small account: reduce reserve to enable trading
+            if available < 25.0:
+                # Micro accounts: use fixed $1.00 floor
+                min_reserve = 1.00
+                policy_desc = "micro account"
+            else:
+                # Small accounts ($25-50): use 5% reserve instead of 10%
+                min_reserve = max(available * 0.05, 0.50)
+                policy_desc = "small account (5%)"
+            
+            spendable = max(0.0, available - reserved - min_reserve)
             self.logger.info(
-                f"[SS:BootstrapFix] Flat portfolio with capital starvation. "
-                f"Using bootstrap reserve floor=${bootstrap_floor:.2f} "
-                f"(full policy reserve would leave only ${spendable_with_full_reserve:.2f} spendable). "
-                f"Available: ${available:.2f} → Spendable: ${spendable:.2f}"
+                f"[SS:ProductionCapital] {policy_desc} (${available:.2f}). "
+                f"Reserve: ${min_reserve:.2f} (vs policy={max(available * rr, mr):.2f}). "
+                f"Spendable: ${spendable:.2f}"
             )
             return spendable
         

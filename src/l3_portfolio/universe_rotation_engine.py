@@ -889,6 +889,20 @@ class UniverseRotationEngine:
                         if reject:
                             filtered_counts[reason] = filtered_counts.get(reason, 0) + 1
                             continue
+                        
+                        # FIX #Q5 PART 2: Belt-and-suspenders gating - second check in UURE
+                        # Prevent bad symbols from entering accepted_symbols even if they passed SymbolScreener
+                        if self.ss and hasattr(self.ss, 'can_add_new_symbol'):
+                            try:
+                                can_add = await self.ss.can_add_new_symbol(sym)
+                                if not can_add:
+                                    filtered_counts["convergence_gate"] = filtered_counts.get("convergence_gate", 0) + 1
+                                    self.logger.debug(f"[UURE] 🚫 CONVERGENCE GATE: Symbol {sym} blocked by convergence rules")
+                                    continue
+                            except Exception as e:
+                                self.logger.debug(f"[UURE] Convergence gate check error for {sym}: {e}")
+                                # If check fails, allow symbol to proceed (fail-open)
+                        
                         discovery_syms.add(sym)
                         if isinstance(prop, dict):
                             existing = proposal_snapshot.get(sym, {}) or {}

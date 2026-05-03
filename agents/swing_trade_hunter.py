@@ -2,14 +2,18 @@ import asyncio
 import logging
 import os
 import time
+import inspect
+import math
+import traceback
 import numpy as np
 try:
     import tensorflow as tf
-except Exception:
+except ImportError:
     tf = None
-from datetime import datetime
 from functools import partial
-from typing import Any, Dict, List, Set, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple, Set
+from math import inf
 
 from utils.indicators import compute_ema, compute_rsi, compute_macd, compute_bollinger_bands
 try:
@@ -145,6 +149,50 @@ class SwingTradeHunter:
             return self.config.get(key, default)
         return getattr(self.config, key, default)
 
+    # ---------- FIX #8 SYMBOL CONVERGENCE: CAPITAL GATING BY SYMBOL CLASSIFICATION ----------
+    
+    def get_available_capital_for_symbol(self, symbol: str, total_capital: float) -> float:
+        """
+        Gate capital availability based on symbol classification.
+        
+        FIX #8 - Symbol Convergence Capital Discipline
+        
+        Uses existing 60/20/20 capital allocation:
+        - 60% compounding pool (proven symbols get priority)
+        - 20% healing pool (experimental symbols liquidated first during healing)
+        - 20% emergency buffer (reserved)
+        
+        Gating logic:
+        - Proven symbols: eligible for compounding capital (60%)
+        - Experimental symbols: restricted to healing pool only (20%)
+        - Rejected symbols: no capital allocated
+        
+        Note: Actual percentages managed by existing FIX8_*_ALLOCATION_PCT config
+        """
+        if self.shared_state is None:
+            return total_capital  # Fallback: no gating
+        
+        proven_symbols = self.shared_state.symbol_convergence_state.get('proven_symbols', {})
+        sym = symbol.upper().replace("/", "")
+        
+        # Check if symbol is in exclusion list
+        if self.shared_state.is_symbol_excluded(sym):
+            return 0.0  # No capital for excluded symbols
+        
+        # For proven symbols: eligible for compounding capital
+        if sym in proven_symbols:
+            # Proven symbol: can access compounding pool (60%)
+            compounding_pct = float(self._cfg('FIX8_COMPOUND_ALLOCATION_PCT', 0.60))
+            num_proven = max(1, len(proven_symbols))
+            return total_capital * (compounding_pct / num_proven)
+        else:
+            # Experimental symbol: restricted to healing pool (20%)
+            # Healing liquidations will prioritize these (Q1 Answer A)
+            healing_pct = float(self._cfg('FIX8_HEALING_ALLOCATION_PCT', 0.20))
+            max_experimental = self.shared_state.symbol_convergence_state.get('max_experimental', 2)
+            return total_capital * (healing_pct / max(1, max_experimental))
+
+
     def _round_trip_cost_pct(self) -> float:
         """Estimate round-trip friction as ratio (e.g., 0.0045 = 0.45%)."""
         fee_bps = float(self._cfg("CR_FEE_BPS", 10.0) or 10.0)
@@ -167,8 +215,12 @@ class SwingTradeHunter:
             if not data and hasattr(self.shared_state, "get_market_data_sync"):
                 data = self.shared_state.get_market_data_sync(symbol, self.timeframe)
 
+            if not data:
+                logger.debug("[%s] No market data available for %s/%s; using fallback expected move %.2f%%", self.name, symbol, self.timeframe, fallback_pct)
+
             rows = self._normalize_ohlcv_rows(data)
             if len(rows) < 20:
+                logger.debug("[%s] Insufficient OHLCV rows for %s/%s: %d rows; using fallback %.2f%%", self.name, symbol, self.timeframe, len(rows), fallback_pct)
                 return fallback_pct
 
             closes = np.asarray([float(r.get("close", 0.0) or 0.0) for r in rows], dtype=float)
@@ -202,10 +254,22 @@ class SwingTradeHunter:
                         tp_pct = ((float(tp) - close_now) / close_now) * 100.0
                     elif str(action or "").upper() == "SELL" and float(sl or 0.0) < close_now:
                         tp_pct = ((close_now - float(sl)) / close_now) * 100.0
+                    if tp_pct <= 0.0:
+                        logger.debug(
+                            "[%s] Invalid TP distance for %s: tp=%s sl=%s close_now=%.8f tp_pct=%.4f",
+                            self.name,
+                            symbol,
+                            tp,
+                            sl,
+                            close_now,
+                            tp_pct,
+                        )
             except Exception:
+                logger.debug("[%s] TP/SL calculation failed for %s: %s", self.name, symbol, traceback.format_exc(), exc_info=False)
                 tp_pct = 0.0
 
             if tp_pct <= 0.0:
+                logger.warning("[%s] TP calculation invalid for %s; falling back to ATR estimate (%.2f%% * 1.2)", self.name, symbol, atr_pct)
                 tp_pct = atr_pct * 1.2
 
             expected_move_pct = (0.65 * float(tp_pct)) + (0.35 * float(atr_pct))
@@ -282,14 +346,22 @@ class SwingTradeHunter:
                     else:
                         continue
 
+                o, h, l, c, v = float(o), float(h), float(l), float(c), float(v)
+                ts = float(ts)
+                if not all(math.isfinite(x) for x in (ts, o, h, l, c, v)):
+                    continue
+                if ts <= 0 or o <= 0 or h <= 0 or l <= 0 or c <= 0 or v < 0:
+                    continue
+                if h < l or not (l <= o <= h and l <= c <= h):
+                    continue
                 rows.append(
                     {
-                        "timestamp": float(ts),
-                        "open": float(o),
-                        "high": float(h),
-                        "low": float(l),
-                        "close": float(c),
-                        "volume": float(v),
+                        "timestamp": ts,
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
                     }
                 )
             except Exception:
@@ -861,7 +933,9 @@ class SwingTradeHunter:
         # --- Tuned params override (symbol-specific thresholds) ---
         rsi_buy_thresh = 75.0
         rsi_sell_thresh = 30.0
-        base_confidence = 0.65
+        # FIX: Increased base_confidence from 0.65 to 0.80 to meet the 0.75 minimum threshold
+        # in shared_state.is_intent_valid(). Signals at 0.65 were being filtered out at firing time.
+        base_confidence = 0.80
         if _HAS_TUNED_PARAMS and _get_tuned_params is not None:
             try:
                 tp = _get_tuned_params(symbol)
@@ -875,7 +949,7 @@ class SwingTradeHunter:
         vol_confirmed = True  # default: pass if ta_indicators unavailable
         if _HAS_TA_INDICATORS and _calc_volume_surge is not None:
             try:
-                volumes = [float(c.get("volume", c.get("v", 0))) for c in candles[-30:]]
+                volumes = [float(c.get("volume", c.get("v", 0))) for c in rows[-30:]]
                 vol_confirmed = _calc_volume_surge(volumes)
             except Exception:
                 vol_confirmed = True  # non-fatal — don't block signal

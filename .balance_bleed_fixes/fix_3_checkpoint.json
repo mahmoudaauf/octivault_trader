@@ -1,0 +1,11 @@
+{
+  "fix_number": 3,
+  "status": "COMPLETED",
+  "timestamp": 1777828212.028791,
+  "details": {
+    "config_added": "HEALING_EXIT_LIMIT_OFFSET_PCT = 0.005",
+    "benefit": "Convert -$0.60 losses into +$0.10 gains",
+    "example": "BNBUSDT: Entry $619.29 \u2192 Limit sell $623.20 (not market $620.14)",
+    "expected_savings": "$9.60-11.20/day"
+  }
+}
