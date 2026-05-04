@@ -100,7 +100,7 @@ class CapitalAllocator:
             self.shared_wallet_mode = bool(shared_wallet_raw)
         
         # Critical Logic Gap: Define targets for NAV-based and Cash-based allocation
-        self.target_exposure_pct = float(ca_cfg.get("TARGET_EXPOSURE_PCT", 0.20))
+        self.target_exposure_pct = float(ca_cfg.get("TARGET_EXPOSURE_PCT", 0.60))  # 60/20/20 split: 60% trading
         self.target_quote_pool_ratio = float(ca_cfg.get("TARGET_QUOTE_POOL_RATIO", 0.25))
         
         tiers = ca_cfg.get("TIERS", {}) or {}
@@ -761,21 +761,21 @@ class CapitalAllocator:
 
         # P9 MANDATORY: Bootstrap Reserve Guard (I1 + I2 Invariant)
         # If in bootstrap (flat portfolio), enforce minimum reserve before allocation
-        # PRIORITY 2 FIX (EMERGENCY OVERRIDE): Use account-aware reserve scaling
-        # Default to 2.0 USDT for small accounts (< 10 USDT spendable)
-        default_bootstrap_reserve = 2.0  # EMERGENCY: Reduced from 15.0 for account compatibility
+        # 60/20/20 FIX: Bootstrap reserve is now 20% of NAV (aligned with capital policy)
+        default_bootstrap_reserve = 2.0  # Fallback if NAV unavailable
         try:
-            # Get min_notional from risk manager for dynamic calculation
-            min_notional = float(getattr(self.risk, "min_notional_usdt", 4.0))  # Reduced default
-            default_bootstrap_reserve = min_notional / 2.0  # Half of min notional
-            # SAFETY: Cap reserve at 30% of spendable to prevent deadlock
-            spendable = await self._free_usdt()
-            if spendable > 0:
-                max_allowed_reserve = spendable * 0.30
-                default_bootstrap_reserve = min(default_bootstrap_reserve, max_allowed_reserve)
-            self.logger.debug(f"[Allocator:Bootstrap] Calculated reserve: min_notional={min_notional:.2f} -> reserve={default_bootstrap_reserve:.2f}")
+            # Calculate bootstrap reserve as 20% of NAV (60/20/20 split policy)
+            _nav_for_bootstrap = await self._nav_quote()
+            if _nav_for_bootstrap > 0:
+                default_bootstrap_reserve = _nav_for_bootstrap * 0.20  # 20% of NAV for 60/20/20
+                self.logger.debug(f"[Allocator:Bootstrap] 60/20/20 reserve calculated: NAV={_nav_for_bootstrap:.2f} × 0.20 = reserve={default_bootstrap_reserve:.2f}")
+            else:
+                # Fallback: if NAV unknown, use min_notional heuristic
+                min_notional = float(getattr(self.risk, "min_notional_usdt", 4.0))
+                default_bootstrap_reserve = min_notional / 2.0
+                self.logger.debug(f"[Allocator:Bootstrap] NAV unavailable, using min_notional fallback: {default_bootstrap_reserve:.2f}")
         except Exception:
-            pass  # Use default
+            self.logger.debug(f"[Allocator:Bootstrap] NAV fetch failed, using default: {default_bootstrap_reserve:.2f}")
         
         bootstrap_reserve_usdt = float(self._cfg("BOOTSTRAP_RESERVE_USDT", default_bootstrap_reserve))
         effective_bootstrap_reserve = max(float(bootstrap_reserve_usdt), float(keep_free))

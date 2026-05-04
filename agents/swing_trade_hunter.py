@@ -931,11 +931,11 @@ class SwingTradeHunter:
         # Relaxed: EMA20 > EMA50 AND RSI < 75 (removed MACD check - sometimes conflicting with price)
         
         # --- Tuned params override (symbol-specific thresholds) ---
-        rsi_buy_thresh = 75.0
-        rsi_sell_thresh = 30.0
-        # FIX: Increased base_confidence from 0.65 to 0.80 to meet the 0.75 minimum threshold
-        # in shared_state.is_intent_valid(). Signals at 0.65 were being filtered out at firing time.
-        base_confidence = 0.80
+        rsi_buy_thresh = 60.0
+        rsi_sell_thresh = 40.0
+        # FIX: Increased base_confidence from 0.65 to 0.85 for higher signal quality
+        # Requirement: only high-confidence signals (0.85+) are generated
+        base_confidence = 0.85
         if _HAS_TUNED_PARAMS and _get_tuned_params is not None:
             try:
                 tp = _get_tuned_params(symbol)
@@ -945,16 +945,16 @@ class SwingTradeHunter:
             except Exception:
                 pass
 
-        # --- Volume surge confirmation ---
-        vol_confirmed = True  # default: pass if ta_indicators unavailable
+        # --- Volume surge confirmation (MANDATORY) ---
+        vol_confirmed = False  # default: fail without confirmation (eliminates fake breakouts)
         if _HAS_TA_INDICATORS and _calc_volume_surge is not None:
             try:
                 volumes = [float(c.get("volume", c.get("v", 0))) for c in rows[-30:]]
                 vol_confirmed = _calc_volume_surge(volumes)
             except Exception:
-                vol_confirmed = True  # non-fatal — don't block signal
+                vol_confirmed = False  # fail-closed: no volume data = no signal
 
-        if ema20_val > ema50_val and rsi_val < rsi_buy_thresh:
+        if ema20_val > ema50_val and rsi_val < rsi_buy_thresh and vol_confirmed:
             conf = base_confidence + (0.05 if vol_confirmed else 0.0)
             reason = 'EMA uptrend + volume surge' if vol_confirmed else 'EMA uptrend detected'
             logger.debug(f"[{self.name}] ✅ BUY SIGNAL for {symbol}: {reason} (ema20>{ema50_val:.4f} rsi={rsi_val:.2f} vol_ok={vol_confirmed})")

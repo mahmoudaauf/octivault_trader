@@ -11,9 +11,9 @@ sys.path.insert(0, str(project_root))
 async def force_balance_sync():
     """Force a complete balance reload from Binance"""
     try:
+        from dotenv import load_dotenv
         from src.l0_core.shared_state import SharedState
         from src.l1_exchange.exchange_client import ExchangeClient
-        from dotenv import load_dotenv
         
         load_dotenv()
         

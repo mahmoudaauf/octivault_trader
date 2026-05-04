@@ -1,6 +1,6 @@
 # OctiVault Trader — Specs Kit
 
-**Version:** 1.0 | **Date:** 2026-05-04 | **Author:** Auto-generated from codebase
+**Version:** 1.1 | **Date:** 2026-05-04 | **Author:** Verified against source — cross-checked all enums, layer deps, metrics, boot sequence
 
 ---
 
@@ -21,6 +21,10 @@
 13. [Deployment & Operations](#13-deployment--operations)
 14. [ML Model Specification](#14-ml-model-specification)
 15. [Known Invariants & Guard Rails](#15-known-invariants--guard-rails)
+16. [Trading Cycle Decision Flow](#16-trading-cycle-decision-flow)
+17. [Exit-First Strategy](#17-exit-first-strategy)
+18. [Incident Runbooks](#18-incident-runbooks)
+19. [Tools Reference](#19-tools-reference)
 
 ---
 
@@ -66,23 +70,30 @@ L0  Core             config, contracts, shared_state, error_types, layer_contrac
 
 Higher layers may call lower layers. Lateral calls (same layer) are allowed only within L0. Cross-layer upward calls (low calling high) are **forbidden**. Enforced at import time via `src/l0_core/layer_contracts.py`.
 
-```
+```python
+# src/l0_core/layer_contracts.py — exact values
 ALLOWED_DEPENDENCIES = {
-    "l8_lifecycle":    {"l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"},
-    "l7_observability":{"l0", "l1", "l2", "l3"},
-    "l6_governance":   {"l0", "l1", "l2", "l3", "l4", "l5"},
-    "l5_strategy":     {"l0", "l1", "l2", "l3", "l4"},
-    "l4_execution":    {"l0", "l1", "l2", "l3"},
-    "l3_portfolio":    {"l0", "l1", "l2"},
-    "l2_marketdata":   {"l0", "l1"},
-    "l1_exchange":     {"l0"},
-    "l0_core":         {},
+    "L0": set(),                                          # pure utilities
+    "L1": {"L0"},
+    "L2": {"L0", "L1"},
+    "L3": {"L0", "L2"},          # skips L1 — exchange I/O cached inside L3
+    "L4": {"L0", "L1", "L3"},    # skips L2 — market data cached in L3
+    "L5": {"L0", "L3"},          # pure decisions — no market/exchange calls
+    "L6": {"L0", "L3", "L5"},    # read-only governance
+    "L7": {"L0", "L1", "L2", "L3", "L4", "L5", "L6"},   # read-only observability
+    "L8": {"L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"},  # boots everything
 }
 ```
+
+Critical non-obvious skips:
+- **L3 skips L1**: Portfolio never calls exchange directly; uses data already fetched by L2
+- **L4 skips L2**: Execution reads market data from L3 state, not live feeds
+- **L5 skips L1/L2/L4**: Strategy is pure signal logic — zero I/O dependency
 
 ### 2.3 Boot Sequence
 
 ```
+# High-level layer init order
 1. L0  Config loaded & validated
 2. L0  SharedState instantiated
 3. L1  ExchangeClient connected (REST auth verified)
@@ -93,6 +104,21 @@ ALLOWED_DEPENDENCIES = {
 8. L6  RiskManager, CapitalAllocator initialized
 9. L7  HealthMonitor, PerformanceMonitor started
 10. L8  MetaController enters main trading loop
+```
+
+**Detailed startup steps** (`StartupOrchestrator.execute_startup_sequence`):
+
+```
+_step_recovery_engine_rebuild()        # RecoveryEngine rebuilds positions from event log
+_step_hydrate_positions()              # SharedState loads positions from exchange balances
+_step_clear_stale_quote_reservations() # Clears any orphaned quote locks
+_step_liquidate_legacy_positions()     # Sells positions from previous run not in current strategy
+_step_aggressive_exchange_liquidation()# Force-exits stuck orders if needed
+_step_auditor_restart_recovery()       # ExchangeTruthAuditor syncs open orders vs. local state
+_step_build_capital_ledger()           # Reconstructs capital ledger from wallet snapshot
+_step_verify_capital_integrity()       # Asserts NAV matches exchange truth
+_emit_state_rebuilt_event()            # Broadcasts portfolio-ready to all subscribers
+_emit_startup_ready_event()            # System enters trading mode
 ```
 
 ---
@@ -121,9 +147,63 @@ class SharedState:
     component_status: dict[str, ComponentStatus]
 ```
 
-**`HealthCode`** enum values: `OK`, `DEGRADED`, `CRITICAL`, `HALTED`
+**`HealthCode`** — `src/l0_core/shared_state.py`
+```python
+class HealthCode(Enum):
+    OK    = "ok"
+    WARN  = "warn"
+    ERROR = "error"
+```
 
-**`DustClass`** enum values: `CLEAN`, `MICRO_DUST`, `HARD_DUST`, `LOCKED`
+**`DustClass`** — formal dust lifecycle taxonomy
+```python
+class DustClass(Enum):
+    TRADABLE                 = "TRADABLE"                  # tradeable position
+    NEAR_DUST                = "NEAR_DUST"                 # approaching dust threshold
+    DUST                     = "DUST"                      # below min notional
+    RECOVERABLE_DUST         = "RECOVERABLE_DUST"          # can be sold if price recovers
+    PERMANENT_WRITE_DOWN_DUST = "PERMANENT_WRITE_DOWN_DUST" # economically unrecoverable
+```
+
+**`PositionState`** — position lifecycle state
+```python
+class PositionState(Enum):
+    ACTIVE      = "ACTIVE"
+    DUST_LOCKED = "DUST_LOCKED"
+    LIQUIDATING = "LIQUIDATING"
+```
+
+**`AssetClassification`** — three-layer capital accounting
+```python
+class AssetClassification(Enum):
+    BOT_POSITION      = "BOT_POSITION"      # created by trading strategy
+    EXTERNAL_POSITION = "EXTERNAL_POSITION" # pre-existing / external deposit
+    DUST              = "DUST"              # below MIN_ECONOMIC_TRADE_USDT
+    STABLE            = "STABLE"            # stablecoins (USDT, FDUSD, etc.)
+    RECOVERY          = "RECOVERY"          # from previous run restart
+```
+
+**`ExecutionResult`**
+```python
+class ExecutionResult(Enum):
+    FILLED   = "FILLED"
+    PARTIAL  = "PARTIAL"
+    REJECTED = "REJECTED"
+    BLOCKED  = "BLOCKED"
+```
+
+**`Component`** — registered health-check components
+```python
+class Component(Enum):
+    MARKET_DATA_FEED = "MarketDataFeed"
+    EXECUTION_MANAGER = "ExecutionManager"
+    META_CONTROLLER   = "MetaController"
+    AGENT_MANAGER     = "AgentManager"
+    RISK_MANAGER      = "RiskManager"
+    PNL_CALCULATOR    = "PnLCalculator"
+    PERFORMANCE_MON   = "PerformanceEvaluator"
+    APP_CONTEXT       = "AppContext"
+```
 
 ---
 
@@ -159,9 +239,9 @@ async def start_user_data_stream() -> None      # 3-tier: WS-API → listenKey �
 
 | Tier | URL | Auth |
 |------|-----|------|
-| 1 | `wss://ws-api.binance.com/ws-api/v3` | HMAC signature (default) / Ed25519 session.logon |
-| 2 | `wss://stream.binance.com/ws/{listenKey}` | listenKey in URL |
-| 3 | REST polling | `_user_data_polling_loop`, every 2 s |
+| 1 | `wss://ws-api.binance.com:443/ws-api/v3` | HMAC signature (default) / Ed25519 session.logon |
+| 2 | `wss://stream.binance.com:9443/ws/{listenKey}` | listenKey in URL |
+| 3 | REST polling | `_user_data_polling_loop` fallback |
 
 Set `BINANCE_API_TYPE=ED25519` to use session.logon (tier 1, Ed25519 path).
 
@@ -227,24 +307,29 @@ Raises `InsufficientBalanceError` (circuit-broken after N failures), `OrderValid
 ### `TradeIntent` (L0 contract)
 
 ```python
+# src/l0_core/contracts.py
 @dataclass
 class TradeIntent:
-    symbol:           str
-    side:             OrderSide            # BUY | SELL
-    quote:            Optional[float]      # USDT amount (buy side)
-    quantity:         Optional[float]      # asset qty (sell side)
-    confidence:       Optional[float]      # 0.0–1.0
-    reason:           str = ""
-    agent:            str = ""
-    tag:              str = ""
-    ts_ms:            int  = <now>
+    # --- Set by agents ---
+    symbol:         str
+    side:           Union[OrderSide, str] = OrderSide.BUY   # normalised to OrderSide on init
+    quote:          Optional[float] = None    # USDT amount to spend (buy side)
+    quantity:       Optional[float] = None    # asset qty to sell (sell side)
+    confidence:     Optional[float] = None    # 0.0–1.0
+    reason:         str = ""
+    agent:          str = ""
+    tag:            str = ""
+    ts_ms:          int = field(default_factory=lambda: int(time.time() * 1000))
 
-    # Stamped by MetaController before execution
-    trace_id:         Optional[str] = None
-    tier:             Optional[str] = None  # "compound"|"healing"|"buffer"|"4th_slot"
-    is_liquidation:   bool = False
-    policy_context:   Optional[dict] = None
+    # --- Stamped by MetaController / ExecutionManager (agents must NOT set these) ---
+    planned_quote:  Optional[float] = None    # resolved quote after capital allocation
+    trace_id:       Optional[str] = None
+    tier:           Optional[str] = None      # "BOT_POSITION"|"RECOVERY"|"DUST_RECOVERY"
+    is_liquidation: bool = False
+    policy_context: Optional[dict] = None
 ```
+
+Note: `side` accepts both `OrderSide` enum and plain string; the constructor normalises to `OrderSide.BUY`/`OrderSide.SELL` (lowercase values `"buy"`/`"sell"`).
 
 ### `Position`
 
@@ -482,12 +567,15 @@ The 4th slot (in addition to the 3 compound positions) is a high-turnover aggres
 
 ### Dust classification
 
-| Class | Condition | Action |
-|-------|-----------|--------|
-| `CLEAN` | value ≥ min notional and tradable | normal |
-| `MICRO_DUST` | value < min notional, > $1 | accumulate or ignore |
-| `HARD_DUST` | value < $1 or locked | `DeadCapitalHealer` |
-| `LOCKED` | exchange-locked / order pending | wait + retry |
+Uses `DustClass` enum (see §3 L0). Policy mapping:
+
+| `DustClass` value | Condition | Action |
+|-------------------|-----------|--------|
+| `TRADABLE` | value ≥ min notional, no lock | normal trading |
+| `NEAR_DUST` | approaching dust threshold | monitor, no new buy |
+| `DUST` | below min notional | `DeadCapitalHealer` sweep |
+| `RECOVERABLE_DUST` | can be sold if price recovers slightly | schedule retry sell |
+| `PERMANENT_WRITE_DOWN_DUST` | economically unrecoverable | write off, no action |
 
 `DeadCapitalHealer` runs a sweep cycle every `DEAD_CAPITAL_HEAL_INTERVAL_SEC` seconds, attempting to liquidate up to `max_liquidations` positions per cycle (default: 50 after Fix #5).
 
@@ -544,7 +632,7 @@ Every order is tagged with a `trace_id` (UUID4). `OrderCacheManager` rejects dup
 3. `MAX_ACTIVE_SYMBOLS` — already at cap
 4. `MIN_NOTIONAL_USDT` — order too small for exchange
 5. `InsufficientBalanceError` circuit breaker — N consecutive failures → halt 10 min
-6. `HealthCode.CRITICAL` or `HALTED` — all trading suspended
+6. `HealthCode.ERROR` on any tracked `Component` — all trading suspended
 
 ### Capital governor
 
@@ -571,21 +659,48 @@ Every order is tagged with a `trace_id` (UUID4). `OrderCacheManager` rejects dup
 | MarketDataFeed | 30 s | No candle in 60 s |
 | MetaController | 15 s | Loop stalled > 30 s |
 
-`HealthMonitor` aggregates component statuses into system `HealthCode`. Transitions:
-- Any `CRITICAL` component → system `DEGRADED`
-- 2+ `CRITICAL` or MetaController `CRITICAL` → system `HALTED`
+`HealthMonitor` aggregates `Component` statuses into system `HealthCode`. Transitions:
+- Any component → `HealthCode.WARN` → system `WARN`
+- Any component → `HealthCode.ERROR` → system `ERROR`, trading suspended
 
 ### Metrics exported (Prometheus)
 
+`SafetyGuardMetrics` — `src/l7_observability/prometheus_exporter.py`
+
+**Safety Guard metrics**
+
 | Metric | Type | Labels |
 |--------|------|--------|
-| `octivault_nav_usdt` | Gauge | — |
-| `octivault_open_positions` | Gauge | — |
-| `octivault_fills_total` | Counter | symbol, side |
-| `octivault_order_latency_ms` | Histogram | symbol |
-| `octivault_pnl_usdt` | Gauge | symbol |
-| `octivault_agent_confidence` | Gauge | agent, symbol |
-| `octivault_health_code` | Gauge | component |
+| `balance_validation_total` | Counter | symbol, status |
+| `balance_validation_latency_seconds` | Histogram | — |
+| `balance_validation_approval_rate` | Gauge | — |
+| `leverage_validation_total` | Counter | symbol, status |
+| `leverage_validation_latency_seconds` | Histogram | — |
+| `leverage_validation_approval_rate` | Gauge | — |
+| `current_max_leverage` | Gauge | — |
+| `hours_validation_total` | Counter | symbol, status |
+| `hours_validation_latency_seconds` | Histogram | — |
+| `hours_validation_approval_rate` | Gauge | — |
+| `anomaly_detection_total` | Counter | status |
+| `anomaly_detection_latency_seconds` | Histogram | — |
+| `anomaly_detection_rate` | Gauge | — |
+| `anomaly_signals_in_history` | Gauge | — |
+| `correlation_validation_total` | Counter | symbol, status |
+| `correlation_validation_latency_seconds` | Histogram | — |
+| `correlation_validation_approval_rate` | Gauge | — |
+| `active_positions_count` | Gauge | — |
+| `max_concentration_ratio` | Gauge | — |
+
+**Execution metrics**
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `trades_executed_total` | Counter | symbol, side, guard_status |
+| `execution_latency_seconds` | Histogram | — |
+| `guard_latency_seconds` | Histogram | — |
+| `overall_approval_rate` | Gauge | — |
+
+`guard_status` label values: `all_passed`, `rejected_by_balance`, `rejected_by_leverage`, `rejected_by_hours`, `rejected_by_anomaly`, `rejected_by_correlation`
 
 ### Distributed tracing
 
@@ -766,10 +881,191 @@ These must hold at all times or the system will malfunction silently.
 
 8. **pytest-asyncio strict mode**: All async tests require `@pytest.mark.asyncio`. Missing the decorator causes the test to be collected but not awaited, silently passing without executing.
 
-9. **Dust classification before rotation**: `DeadCapitalHealer` and `PortfolioManager` must classify dust before any rotation decision. Skipping classification allows `HARD_DUST` positions to be counted as tradable capital.
+9. **Dust classification before rotation**: `DeadCapitalHealer` and `PortfolioManager` must classify dust (`DustClass`) before any rotation decision. Skipping classification allows `DUST`/`NEAR_DUST` positions to be counted as tradable capital.
 
 10. **Reconnect counter**: `reconnect_user_data_stream` has an early return if `_has_signed_credentials()` is False (paper mode). The reconnect counter is NOT incremented in that case. Do not rely on the counter in paper mode.
 
 ---
 
-*End of OctiVault Trader Specs Kit v1.0*
+## 16. Trading Cycle Decision Flow
+
+`MetaController` runs a tight loop. Each tick executes these stages in order. Any failed guard short-circuits to END without executing later stages.
+
+```
+START CYCLE
+│
+├─ [1] Tick increment + cycle timer
+│
+├─ [2] Drain market events
+│       Process price updates, fills, position snapshots, metrics
+│
+├─ [3] Guard evaluation (all 6 must pass)
+│   ├─ Guard 1 — Market Data Ready?    price exists + age < 5 s  → else SKIP CYCLE
+│   ├─ Guard 2 — Balances Available?   USDT > 0 + free > MIN_CAPITAL  → else TRIGGER RECOVERY
+│   ├─ Guard 3 — Ops Plane Ready?      ExchangeClient functional + orders succeeding  → else HALT
+│   ├─ Guard 4 — Trading Hours Valid?  within allowed window, no maintenance  → else SKIP CYCLE
+│   ├─ Guard 5 — Position Constraints? total open < regime_max + concentration < limit  → else SKIP
+│   └─ Guard 6 — Capital Adequacy?     free capital ≥ MIN_CAPITAL, no forced recovery active  → else TRIGGER RECOVERY
+│
+├─ [4] Signal intake & filtering
+│       confidence ≥ 0.50 + age < 60 s + deduplicate (1 BUY + 1 SELL per symbol, highest conf)
+│
+├─ [5] Batch collection & sorting
+│       Collect up to 50 signals, sort by confidence descending
+│
+└─ [6] Per-signal arbitration (6 gates)
+    ├─ GATE 1 — Lifecycle state check   symbol not in ROTATION_PENDING/DUST_HEALING conflict
+    ├─ GATE 2 — Portfolio health check  position count < regime_max, dust ratio < threshold
+    ├─ GATE 3 — Capital availability    free_quote = (balance - reserve) - allocated ≥ MIN_ENTRY_QUOTE
+    ├─ GATE 4 — Economic gate (anti-churn)
+    │           round_trip_cost = (2×taker_fee) + (2×slippage) ≈ 0.50%
+    │           min_profitable_move = 0.55%  →  expected_alpha must exceed this
+    ├─ GATE 5 — Signal confidence gate
+    │           MICRO_SNIPER: ≥ 0.50 | STANDARD: ≥ 0.55 | MULTI_AGENT: ≥ 0.60
+    └─ GATE 6 — Regime gating
+                MICRO_SNIPER (NAV < $1 000): max 1 position, no rotation, no dust healing
+                STANDARD (NAV $1 000–$5 000): max 2 positions
+                MULTI_AGENT (NAV > $5 000): max active symbols = MAX_ACTIVE_SYMBOLS
+```
+
+---
+
+## 17. Exit-First Strategy
+
+**Core principle**: The system must plan the full exit before entering any position. Entering without a defined exit is how capital becomes permanently locked.
+
+### Exit pathways (every position must have all three)
+
+| Pathway | Trigger | Notes |
+|---------|---------|-------|
+| Take-profit (TP) | price ≥ entry × (1 + tp_pct) | captured by `TPSLEngine` |
+| Stop-loss (SL) | price ≤ entry × (1 - sl_pct) | mandatory, not optional |
+| Time exit | position age > max_hold_minutes | prevents indefinite holding |
+
+### Capital release guarantee
+
+Before `ExecutionManager.place_order()` fires a BUY:
+1. `planned_quote` is set on `TradeIntent` (capital committed)
+2. TP/SL parameters are recorded in `TPSLEngine` state
+3. Time-exit deadline is registered in `FourthSlotTracker` (4th slot) or `PositionManager`
+
+If any of these three registrations fail, the BUY is rejected.
+
+### Anti-deadlock invariant
+
+Capital must always have a path back to USDT. The sequence:
+
+```
+TP fires → market SELL → USDT freed → available for next trade     ✓
+SL fires → market SELL → USDT freed (at a loss)                    ✓
+Time exit fires → market SELL → USDT freed                         ✓
+No exit registered → position can grow to DUST → capital locked     ✗  (blocked by entry guard)
+```
+
+---
+
+## 18. Incident Runbooks
+
+### System Hung / Trading Stalled
+
+**Symptoms**: No fills for > 15 min, logs show `MetaController stalled`, `HealthCode.ERROR`
+
+```bash
+# 1. Check system status
+python3 check_status.py
+
+# 2. Check for execution deadlock
+python3 diagnose_execution_blocker.py
+
+# 3. If deadlock confirmed:
+python3 fix_execution_deadlock.py
+
+# 4. Restart with monitoring
+./start_trading_with_monitoring.sh
+```
+
+### Capital Stuck as Dust
+
+**Symptoms**: NAV far below USDT balance, many `DUST` / `RECOVERABLE_DUST` positions, healer not recovering
+
+```bash
+# 1. Diagnose healer state
+python3 diagnose_healing.py
+
+# 2. Force manual sweep (up to 50 positions)
+python3 force_liquidate_dust.py
+
+# 3. Force balance re-sync after liquidations
+python3 force_balance_sync.py
+```
+
+### Balance Out of Sync
+
+**Symptoms**: `InsufficientBalance` errors despite sufficient NAV, circuit breaker tripping
+
+```bash
+python3 force_balance_sync.py
+python3 check_balance.py
+```
+
+### Database / State Corruption
+
+**Symptoms**: `sqlite3` errors, `/ready` returns `"database": false`, state file corrupted
+
+```bash
+# Check disk space first (most common cause)
+df -h .
+
+# Check state file integrity
+ls -lh state/
+sqlite3 state/octivault.db "PRAGMA integrity_check;"
+
+# If corrupted: system will rebuild from exchange truth on restart
+# StartupOrchestrator._step_recovery_engine_rebuild() handles this automatically
+./start_trading_with_monitoring.sh
+```
+
+### Symbol Churn (Excessive Rotation)
+
+**Symptoms**: Same symbol being bought and sold repeatedly within minutes, PnL bleeding to fees
+
+```bash
+python3 validate_churn_fix.py
+# Check CHURN_COOLDOWN_SEC in .env — should be ≥ 300
+```
+
+---
+
+## 19. Tools Reference
+
+All tools under `tools/`. Run from project root.
+
+| Tool | Purpose | Usage |
+|------|---------|-------|
+| `detect_balance_symbols.py` | Scan wallet + classify all positions | `python3 tools/detect_balance_symbols.py` (live) or `--mock` |
+| `diagnose_runtime.py` | Full smoke-test of all layers against live exchange | `python3 tools/diagnose_runtime.py` |
+| `exit_metrics.py` | Analyse TP/SL exit performance | `python3 tools/exit_metrics.py` |
+| `compound_engine.py` | Inspect 60/20/20 capital allocation state | `python3 tools/compound_engine.py` |
+| `recover_missing_sells.py` | Detect and re-issue missing sell orders | `python3 tools/recover_missing_sells.py` |
+| `next_level_tpsl_analysis.py` | Deep-dive TP/SL parameter analysis | `python3 tools/next_level_tpsl_analysis.py` |
+| `monitor_6h_session.py` | Real-time 6-hour session monitor | `python3 tools/monitor_6h_session.py` |
+| `live_monitor_snapshot.sh` | One-shot system snapshot | `bash tools/live_monitor_snapshot.sh` |
+| `check_sell_marker_coverage.sh` | Verify all positions have sell markers | `bash tools/check_sell_marker_coverage.sh` |
+
+**Tool pattern** (how to add a new tool that needs real data):
+
+```python
+from src.l0_core.config import Config
+from src.l0_core.shared_state import SharedState
+from src.l1_exchange.exchange_client import ExchangeClient
+
+config = Config()
+shared_state = SharedState(config=config)
+exchange = ExchangeClient(config=config, shared_state=shared_state)
+
+# then use exchange.get_account_balances(), exchange.get_all_tickers(), etc.
+```
+
+---
+
+*End of OctiVault Trader Specs Kit v1.1*

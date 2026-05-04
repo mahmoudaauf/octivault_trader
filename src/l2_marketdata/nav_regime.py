@@ -128,14 +128,14 @@ class MicroSniperConfig:
     MAX_TRADES_PER_DAY = 3  # Maximum 3 trades per calendar day
     
     # Position sizing
-    # FIX #4: REDUCE POSITION SIZE from 30% to 15% (safer for $100 account with slippage)
-    # Old: $25-30 per trade = 25-30% of NAV (over-leveraged)
-    # New: $15 per trade = 15% of NAV (more conservative with execution slippage)
-    POSITION_SIZE_PCT_NAV = 0.15  # Use up to 15% of NAV per position
+    # FIX #4: REDUCE POSITION SIZE from 15% to 10% (extends runway to profitability)
+    # With 40.7% win rate and negative expectancy, tighter sizing prevents rapid drawdown
+    # Reduces per-trade capital allocation to allow strategy improvements to take effect
+    POSITION_SIZE_PCT_NAV = 0.10  # Use up to 10% of NAV per position
     
     # Disabled features
     ROTATION_ENABLED = False  # Disable symbol rotation
-    DUST_HEALING_ENABLED = False  # Disable dust healing trades
+    DUST_HEALING_ENABLED = True  # ✅ FIX: Re-enable dust healing (critical for capital recovery when dust accumulates)
     CAPITAL_RESERVATIONS_ENABLED = False  # Bypass reservation logic
     
     # Economic gate for small accounts

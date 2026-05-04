@@ -135,9 +135,9 @@ async def main():
     
     try:
         # Import after path is set
-        from src.l0_core.exchange_client import ExchangeClient
+        from src.l1_exchange.exchange_client import ExchangeClient
         from src.l0_core.shared_state import SharedState
-        from src.l0_core.config import CoreConfig
+        from src.l0_core.config import Config as CoreConfig
         from src.l4_execution.execution_manager import ExecutionManager
         
         # Initialize components

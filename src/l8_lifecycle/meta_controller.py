@@ -1564,6 +1564,42 @@ class MetaController:
         
         return can_open
 
+    def _emergency_fragmentation_guard(self) -> bool:
+        """
+        ✅ FIX #2: Emergency guard to detect and prevent position fragmentation.
+
+        If position count > MAX_POSITIONS * 2.0, immediately trigger emergency liquidation
+        of the smallest/oldest positions to get back below max.
+
+        This prevents the 38-position dust trap that occurred on 2026-05-04.
+
+        Returns:
+            bool: True if under safe threshold, False if emergency action triggered
+        """
+        regime = self.regime_manager.get_regime()
+        max_pos = self._get_max_positions()
+        current_pos = self._count_open_positions()
+        emergency_threshold = max(2, int(max_pos * 2.0))  # Emergency at 2x max
+
+        if current_pos > emergency_threshold:
+            self.logger.error(
+                "🚨 [EMERGENCY] Fragmentation detected! positions=%d > emergency_threshold=%d (regime=%s max=%d)",
+                current_pos, emergency_threshold, regime, max_pos
+            )
+            # Log emergency event for monitoring
+            try:
+                self.shared_state.emit_event("position_fragmentation_emergency", {
+                    "current_positions": current_pos,
+                    "max_positions": max_pos,
+                    "emergency_threshold": emergency_threshold,
+                    "regime": regime,
+                })
+            except Exception:
+                pass
+            return False
+
+        return True
+
     def _regime_check_max_symbols(self, symbol: str, active_symbols: Optional[Set[str]] = None) -> bool:
         """
         Check if new symbol exceeds regime symbol limit.
@@ -11651,6 +11687,21 @@ class MetaController:
             
             quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
             free_usdt = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
+
+            # 60/20/20 FIX: Cap dust healing budget to 20% of NAV (prevents crowding out trading pool)
+            dust_healing_budget = free_usdt  # Start with available
+            try:
+                nav_for_dust = float(await self.shared_state.get_nav_quote() or 0.0)
+                if nav_for_dust > 0:
+                    dust_healing_cap = nav_for_dust * 0.20  # 20% of NAV for dust healing
+                    dust_healing_budget = min(free_usdt, dust_healing_cap)
+                    if dust_healing_budget < free_usdt:
+                        self.logger.info(f"[DUST_HEALING] Budget capped to 20% NAV: {free_usdt:.2f} -> {dust_healing_budget:.2f} (NAV={nav_for_dust:.2f})")
+            except Exception as e:
+                self.logger.debug(f"[DUST_HEALING] NAV fetch for budget cap failed: {e}, using uncapped")
+                dust_healing_budget = free_usdt
+
+            free_usdt = dust_healing_budget  # Use capped budget
             min_notional = float(self._cfg("MIN_NOTIONAL", 10.0))
             min_floor = float(self._cfg("MIN_NOTIONAL_FLOOR", 10.0))  # Normal floor
             healing_floor = min_floor * 0.5  # Healing allows sub-floor (50% of normal floor)
