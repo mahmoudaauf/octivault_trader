@@ -24,8 +24,22 @@ from urllib.parse import urlencode
 from pathlib import Path
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
 import requests
+from requests.adapters import HTTPAdapter
 
 getcontext().prec = 28
+_SESSION = requests.Session()
+_SESSION.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=4, max_retries=3))
+
+
+def _http(method: str, url: str, headers=None, timeout=20, attempts=3):
+    last = None
+    for i in range(attempts):
+        try:
+            return _SESSION.request(method, url, headers=headers or {}, timeout=timeout)
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (i + 1))
+    raise last
 
 # ─── Config ────────────────────────────────────────────────────────────────
 ENV = {}
@@ -65,14 +79,16 @@ def _signed(method: str, path: str, params: dict | None = None) -> dict:
     sig = hmac.new(SEC.encode(), qs.encode(), hashlib.sha256).hexdigest()
     headers = {"X-MBX-APIKEY": KEY}
     url = f"{URL}{path}?{qs}&signature={sig}"
-    r = requests.request(method, url, headers=headers, timeout=15)
+    r = _http(method, url, headers=headers)
     if r.status_code >= 400:
         raise RuntimeError(f"{method} {path} → HTTP {r.status_code}: {r.text[:400]}")
     return r.json()
 
 
 def _public(path: str, params: dict | None = None) -> dict:
-    r = requests.get(f"{URL}{path}", params=params or {}, timeout=15)
+    qs = urlencode(params or {})
+    url = f"{URL}{path}" + (f"?{qs}" if qs else "")
+    r = _http("GET", url)
     r.raise_for_status()
     return r.json()
 
@@ -86,19 +102,24 @@ def get_prices() -> dict[str, float]:
 
 
 def get_exchange_info(symbols: list[str]) -> dict[str, dict]:
-    info = _public("/api/v3/exchangeInfo", {"symbols": json.dumps(symbols)})
     out = {}
-    for s in info.get("symbols", []):
-        flt = {f["filterType"]: f for f in s.get("filters", [])}
-        out[s["symbol"]] = {
-            "tickSize": Decimal(flt.get("PRICE_FILTER", {}).get("tickSize", "0.01")),
-            "stepSize": Decimal(flt.get("LOT_SIZE", {}).get("stepSize", "0.0001")),
-            "minQty": Decimal(flt.get("LOT_SIZE", {}).get("minQty", "0")),
-            "minNotional": Decimal(
-                flt.get("NOTIONAL", flt.get("MIN_NOTIONAL", {})).get("minNotional", "5")
-            ),
-            "ocoAllowed": s.get("ocoAllowed", True),
-        }
+    for sym in symbols:
+        try:
+            info = _public("/api/v3/exchangeInfo", {"symbol": sym})
+        except Exception as e:
+            print(f"   ⚠ exchangeInfo {sym}: {e}")
+            continue
+        for s in info.get("symbols", []):
+            flt = {f["filterType"]: f for f in s.get("filters", [])}
+            out[s["symbol"]] = {
+                "tickSize": Decimal(flt.get("PRICE_FILTER", {}).get("tickSize", "0.01")),
+                "stepSize": Decimal(flt.get("LOT_SIZE", {}).get("stepSize", "0.0001")),
+                "minQty": Decimal(flt.get("LOT_SIZE", {}).get("minQty", "0")),
+                "minNotional": Decimal(
+                    flt.get("NOTIONAL", flt.get("MIN_NOTIONAL", {})).get("minNotional", "5")
+                ),
+                "ocoAllowed": s.get("ocoAllowed", True),
+            }
     return out
 
 

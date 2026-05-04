@@ -13512,6 +13512,15 @@ class MetaController:
         # This allows bootstrap to recover multiple times per cycle instead of exhausting escape after first use
         self._bootstrap_dust_bypass.reset_cycle()
 
+        # CRITICAL FIX: Sync real-time balance EVERY loop cycle (not every 5 minutes)
+        # This ensures capital floor checks, allocations, and position sizing use fresh balance data
+        try:
+            if hasattr(self.shared_state, "sync_authoritative_balance"):
+                await self.shared_state.sync_authoritative_balance(force=True)
+                self.logger.debug("[Meta:RealTimeBalance] Synced authoritative balance from exchange")
+        except Exception as e:
+            self.logger.warning("[Meta:RealTimeBalance] Balance sync failed (non-blocking): %s", e)
+
         # 1. Authoritative Flat Check (Authoritative Source for Governance)
         is_flat = await self._check_portfolio_flat()
         
