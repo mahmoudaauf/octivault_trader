@@ -144,6 +144,12 @@ async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
     all_signals = await engines.situation.get_all_signals()
     understand_complete = True
 
+    # Helper: safely extract value from dict or object
+    def get_value(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
     # ──────────────────────────────────────────────────────────────────
     # PHASE 3: DECIDE
     # ──────────────────────────────────────────────────────────────────
@@ -189,6 +195,8 @@ async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
     # PHASE 5: RECOVER / OBSERVE
     # ──────────────────────────────────────────────────────────────────
     health_report = await engines.operations.get_health_report()
+    nav_val = get_value(portfolio_snapshot, "nav_usdt", 0.0)
+    regime_val = get_value(market_regime, "overall_health", "unknown")
     await engines.operations.log_event(
         "cycle_complete",
         {
@@ -199,24 +207,36 @@ async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
             "num_signals": len(all_signals),
             "num_decisions": len(trading_decisions),
             "num_executed": len(executed_orders),
-            "nav_usdt": portfolio_snapshot.nav_usdt,
-            "market_regime": market_regime.overall_health if market_regime else "unknown",
+            "nav_usdt": nav_val,
+            "market_regime": regime_val,
         },
     )
     recover_complete = True
+
+    # Extract health status (handle both dict and object)
+    if isinstance(health_report, dict):
+        health_status_val = health_report.get("overall_status", "UNKNOWN")
+    elif hasattr(health_report, "overall_status"):
+        health_status_val = (
+            health_report.overall_status.value
+            if hasattr(health_report.overall_status, "value")
+            else str(health_report.overall_status)
+        )
+    else:
+        health_status_val = "UNKNOWN"
 
     # Return cycle telemetry
     return {
         "duration_ms": (time.perf_counter() - cycle_start) * 1000,
         "num_prices": len(market_prices),
-        "num_balances": len(account_state.get("balances", {})),
-        "nav_usdt": portfolio_snapshot.nav_usdt,
+        "num_balances": len(account_state.get("balances", {}))
+        if isinstance(account_state, dict)
+        else len(getattr(account_state, "balances", {})),
+        "nav_usdt": nav_val,
         "num_signals": len(all_signals),
         "num_decisions": len(trading_decisions),
         "num_executed": len(executed_orders),
-        "health_status": health_report.overall_status.value
-        if hasattr(health_report.overall_status, "value")
-        else str(health_report.overall_status),
+        "health_status": health_status_val,
         "read_phase_ok": read_complete,
         "understand_phase_ok": understand_complete,
         "decide_phase_ok": decide_complete,
