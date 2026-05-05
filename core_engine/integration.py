@@ -248,16 +248,34 @@ class CoreEngineIntegration:
         logger.info("✅ All engines wired successfully")
 
 
-async def create_app_context() -> dict[str, Any]:
+async def create_app_context(production: bool = False) -> dict[str, Any]:
     """
     Create application context with all L0-L8 components.
 
-    This would normally import and instantiate all components from their modules.
-    For now, returns a placeholder dict for integration testing.
+    Modes
+    -----
+    production=False (default): returns an empty dict — engines run in
+        mock mode via graceful degradation. Used for dry-run / structural
+        smoke tests.
+
+    production=True: delegates to `core_engine.production_bridge` which
+        reuses the legacy `MasterSystemOrchestrator` to construct all ~50
+        L0–L8 components, then maps them to app_ctx keys. This is the
+        Phase 8.1 path for real telemetry.
 
     Returns:
-        app_ctx: Dict with all components wired
+        app_ctx: Dict with all components wired (or empty in mock mode)
     """
+    if production:
+        try:
+            from core_engine.production_bridge import build_production_app_ctx
+
+            app_ctx, _orch = await build_production_app_ctx()
+            return app_ctx
+        except Exception as e:
+            logger.error(f"❌ Production bridge failed: {e!r} — falling back to mock context")
+            # Fall through to empty context (mock mode) on bridge failure
+
     app_ctx: dict[str, Any] = {}
 
     logger.info("📦 Creating app context with all L0-L8 components...")
@@ -335,13 +353,17 @@ async def wire_engines(app_ctx: dict[str, Any]) -> None:
 
 
 # Convenience function for quick setup
-async def setup_core_engines() -> dict[str, Any]:
+async def setup_core_engines(production: bool = False) -> dict[str, Any]:
     """
     Setup: create context → wire engines → return ready app_ctx
+
+    Args:
+        production: If True, build a production app_ctx via the
+            legacy-orchestrator bridge. Default False = mock mode.
 
     Returns:
         app_ctx: Ready-to-use application context
     """
-    app_ctx = await create_app_context()
+    app_ctx = await create_app_context(production=production)
     await wire_engines(app_ctx)
     return app_ctx

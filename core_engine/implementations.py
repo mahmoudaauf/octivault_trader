@@ -11,10 +11,21 @@ Methods are designed to be swapped into the engine classes.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await if coroutine, otherwise return value as-is.
+
+    Bridges sync legacy methods with async façade engines.
+    """
+    if inspect.iscoroutine(value) or inspect.isawaitable(value):
+        return await value
+    return value
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -172,32 +183,51 @@ class SituationEngineImpl:
         }
 
         if not portfolio_manager:
-            logger.warning("⚠️ portfolio_manager not available")
-            return snapshot
+            logger.debug("portfolio_manager not available — using balance fallbacks")
+        else:
+            try:
+                # Call portfolio_manager methods
+                if hasattr(portfolio_manager, "get_nav"):
+                    snapshot["nav_usdt"] = await _maybe_await(portfolio_manager.get_nav())
 
-        try:
-            # Call portfolio_manager methods
-            if hasattr(portfolio_manager, "get_nav"):
-                snapshot["nav_usdt"] = await portfolio_manager.get_nav()
+                if hasattr(portfolio_manager, "get_positions"):
+                    positions = await _maybe_await(portfolio_manager.get_positions())
+                    snapshot["active_positions"] = len(positions) if positions else 0
 
-            if hasattr(portfolio_manager, "get_positions"):
-                positions = await portfolio_manager.get_positions()
-                snapshot["active_positions"] = len(positions)
+                if hasattr(portfolio_manager, "get_pnl"):
+                    pnl = await _maybe_await(portfolio_manager.get_pnl())
+                    snapshot["total_p_and_l"] = pnl
+                    if snapshot["nav_usdt"] > 0:
+                        snapshot["total_p_and_l_pct"] = (pnl / snapshot["nav_usdt"]) * 100
 
-            if hasattr(portfolio_manager, "get_pnl"):
-                pnl = await portfolio_manager.get_pnl()
-                snapshot["total_p_and_l"] = pnl
-                if snapshot["nav_usdt"] > 0:
-                    snapshot["total_p_and_l_pct"] = (pnl / snapshot["nav_usdt"]) * 100
+                if hasattr(portfolio_manager, "get_capital_allocated"):
+                    snapshot["locked_capital"] = await _maybe_await(
+                        portfolio_manager.get_capital_allocated()
+                    )
 
-            if hasattr(portfolio_manager, "get_capital_allocated"):
-                snapshot["locked_capital"] = await portfolio_manager.get_capital_allocated()
+                if hasattr(portfolio_manager, "get_capital_available"):
+                    snapshot["available_capital"] = await _maybe_await(
+                        portfolio_manager.get_capital_available()
+                    )
 
-            if hasattr(portfolio_manager, "get_capital_available"):
-                snapshot["available_capital"] = await portfolio_manager.get_capital_available()
+            except Exception as e:
+                logger.error(f"❌ Error getting portfolio snapshot: {e}")
 
-        except Exception as e:
-            logger.error(f"❌ Error getting portfolio snapshot: {e}")
+        # ── NAV fallback chain (production bridge): if portfolio_manager
+        # didn't yield a NAV, fall through to balance_manager → shared_state.
+        if snapshot["nav_usdt"] <= 0:
+            balance_manager = app_ctx.get("balance_manager")
+            if balance_manager is not None:
+                nav_candidate = getattr(balance_manager, "last_nav", 0.0) or 0.0
+                if nav_candidate > 0:
+                    snapshot["nav_usdt"] = float(nav_candidate)
+
+        if snapshot["nav_usdt"] <= 0:
+            shared_state = app_ctx.get("shared_state")
+            if shared_state is not None:
+                nav_candidate = getattr(shared_state, "nav", 0.0) or 0.0
+                if nav_candidate > 0:
+                    snapshot["nav_usdt"] = float(nav_candidate)
 
         return snapshot
 
@@ -217,17 +247,21 @@ class SituationEngineImpl:
             return signals
 
         try:
-            if hasattr(signal_manager, "get_signals"):
-                signals = await signal_manager.get_signals(symbol)
+            # Legacy signal_manager exposes sync get_all_signals() and
+            # get_signals_for_symbol(); newer impls may be async — handle both.
+            if symbol and hasattr(signal_manager, "get_signals_for_symbol"):
+                signals = await _maybe_await(signal_manager.get_signals_for_symbol(symbol))
+            elif hasattr(signal_manager, "get_signals"):
+                signals = await _maybe_await(signal_manager.get_signals(symbol))
             elif hasattr(signal_manager, "get_all_signals"):
-                signals = await signal_manager.get_all_signals()
-                if symbol:
+                signals = await _maybe_await(signal_manager.get_all_signals())
+                if symbol and signals:
                     signals = [s for s in signals if s.get("symbol") == symbol]
 
         except Exception as e:
             logger.error(f"❌ Error getting signals: {e}")
 
-        return signals
+        return signals or []
 
     @staticmethod
     async def get_fused_signal(app_ctx: dict[str, Any], symbol: str) -> dict[str, Any] | None:
