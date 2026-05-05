@@ -51,7 +51,8 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Optional
+
 
 # ------------------------------- timeouts -----------------------------------
 async def _with_timeout(coro, sec: float = 8.0):
@@ -60,9 +61,10 @@ async def _with_timeout(coro, sec: float = 8.0):
     except asyncio.TimeoutError:
         return None
 
+
 # ------------------------------ normalizers ---------------------------------
-def _normalize_balances(raw) -> Dict[str, Dict[str, float]]:
-    out: Dict[str, Dict[str, float]] = {}
+def _normalize_balances(raw) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
     if raw is None:
         return out
     if isinstance(raw, dict):
@@ -84,25 +86,30 @@ def _normalize_balances(raw) -> Dict[str, Dict[str, float]]:
             out[a] = {"free": free, "locked": locked, "total": free + locked}
     return out
 
-def _normalize_positions(raw) -> Dict[str, Dict[str, Any]]:
+
+def _normalize_positions(raw) -> dict[str, dict[str, Any]]:
     if raw is None:
         return {}
     if isinstance(raw, dict):
-        return {
-            str(k).upper().replace("/", ""): v
-            for k, v in raw.items()
-        }
-    out: Dict[str, Dict[str, Any]] = {}
+        return {str(k).upper().replace("/", ""): v for k, v in raw.items()}
+    out: dict[str, dict[str, Any]] = {}
     if isinstance(raw, list):
         for p in raw:
             sym = (p.get("symbol") or p.get("asset") or "").upper().replace("/", "")
             if not sym:
                 continue
-            qty = float(p.get("current_qty") or p.get("qty") or p.get("positionAmt") or p.get("size") or 0)
+            qty = float(
+                p.get("current_qty") or p.get("qty") or p.get("positionAmt") or p.get("size") or 0
+            )
             side = (p.get("side") or ("SHORT" if qty < 0 else "LONG")).upper()
             entry = float(p.get("entry_price") or p.get("entryPrice") or 0)
-            mult  = float(p.get("contract_multiplier") or p.get("multiplier") or 1.0)
-            out[sym] = {"side": side, "current_qty": qty, "entry_price": entry, "contract_multiplier": mult}
+            mult = float(p.get("contract_multiplier") or p.get("multiplier") or 1.0)
+            out[sym] = {
+                "side": side,
+                "current_qty": qty,
+                "entry_price": entry,
+                "contract_multiplier": mult,
+            }
     return out
 
 
@@ -120,7 +127,6 @@ def _now_iso() -> str:
 
 # ------------------------------- main engine --------------------------------
 class RecoveryEngine:
-
     async def load_snapshot(self):
         """Load SharedState from database snapshot."""
         if not hasattr(self, "db") or not hasattr(self, "ss"):
@@ -157,23 +163,31 @@ class RecoveryEngine:
             self.logger.setLevel(logging.INFO)
 
         self.rcfg = RecoveryConfig(
-            verify_integrity=bool(config.get("VERIFY_INTEGRITY", True) if hasattr(config, 'get') else getattr(config, 'VERIFY_INTEGRITY', True)),
-            min_symbols_for_md_ready=int(config.get("MIN_SYMBOLS_FOR_MD_READY", 1) if hasattr(config, 'get') else getattr(config, 'MIN_SYMBOLS_FOR_MD_READY', 1)),
+            verify_integrity=bool(
+                config.get("VERIFY_INTEGRITY", True)
+                if hasattr(config, "get")
+                else getattr(config, "VERIFY_INTEGRITY", True)
+            ),
+            min_symbols_for_md_ready=int(
+                config.get("MIN_SYMBOLS_FOR_MD_READY", 1)
+                if hasattr(config, "get")
+                else getattr(config, "MIN_SYMBOLS_FOR_MD_READY", 1)
+            ),
         )
 
-    async def run(self, symbols: Optional[List[str]] = None):
+    async def run(self, symbols: Optional[list[str]] = None):
         """
         Main entry point for background recovery/monitoring.
         For now, runs one rebuild pass and exits, unless a loop is desired.
         """
         try:
-             self.logger.info("RecoveryEngine run() called.")
-             if hasattr(self, "rebuild_state"):
-                 await self.rebuild_state()
-             else:
-                 self.logger.warning("rebuild_state method missing in RecoveryEngine.")
+            self.logger.info("RecoveryEngine run() called.")
+            if hasattr(self, "rebuild_state"):
+                await self.rebuild_state()
+            else:
+                self.logger.warning("rebuild_state method missing in RecoveryEngine.")
         except Exception as e:
-             self.logger.error(f"Recovery run failed: {e}", exc_info=True)
+            self.logger.error(f"Recovery run failed: {e}", exc_info=True)
 
     # --------------------------- telemetry / events ---------------------------
     async def _emit_health(self, status: str, message: str) -> None:
@@ -192,10 +206,12 @@ class RecoveryEngine:
             # Don’t break recovery due to telemetry issues
             self.logger.debug("HealthStatus emit failed", exc_info=True)
 
-    async def _emit_event(self, name: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    async def _emit_event(self, name: str, payload: Optional[dict[str, Any]] = None) -> None:
         try:
             if self.sstools and hasattr(self.sstools, "emit_event"):
-                await _maybe_await(self.sstools.emit_event(name, payload or {"timestamp": _now_iso()}))
+                await _maybe_await(
+                    self.sstools.emit_event(name, payload or {"timestamp": _now_iso()})
+                )
             elif hasattr(self.ss, "emit_event"):
                 await _maybe_await(self.ss.emit_event(name, payload or {"timestamp": _now_iso()}))
         except Exception:
@@ -209,7 +225,7 @@ class RecoveryEngine:
                 pascal = "".join(part.capitalize() for part in key.split("_"))
                 keys.add(pascal)
             else:
-                snake = "".join(["_"+c.lower() if c.isupper() else c for c in key]).lstrip("_")
+                snake = "".join(["_" + c.lower() if c.isupper() else c for c in key]).lstrip("_")
                 keys.add(snake)
             for k in keys:
                 if hasattr(self.ss, "set_readiness_flag"):
@@ -220,7 +236,7 @@ class RecoveryEngine:
             self.logger.debug(f"_set_readiness({key}) failed", exc_info=True)
 
     # ------------------------------- loaders ---------------------------------
-    def _load_snapshot(self) -> Optional[Dict[str, Any]]:
+    def _load_snapshot(self) -> Optional[dict[str, Any]]:
         try:
             if self.db and hasattr(self.db, "load_last_snapshot"):
                 snap = self.db.load_last_snapshot()
@@ -231,19 +247,19 @@ class RecoveryEngine:
             self.logger.warning("[Recovery] Failed loading snapshot from DB", exc_info=True)
         return None
 
-    async def _load_live(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    async def _load_live(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """
         Fetch balances and positions using 3-strategy cascade (institutional architecture).
-        
+
         Strategy 1: Try SharedState memory (WebSocket-updated, zero latency)
         Strategy 2: Fall back to DB snapshot (persisted, no API call)
         Strategy 3: REST API only if explicitly configured (minimize API calls)
-        
+
         Returns (balances, positions_by_symbol) with light normalization.
         """
-        balances: Dict[str, Any] = {}
-        positions: Dict[str, Any] = {}
-        
+        balances: dict[str, Any] = {}
+        positions: dict[str, Any] = {}
+
         # ========== STRATEGY 1: SharedState Memory (WebSocket-updated) ==========
         try:
             # Check if SharedState has recent balances from WebSocket
@@ -251,10 +267,12 @@ class RecoveryEngine:
                 memory_balances = self.ss.balances
                 if isinstance(memory_balances, dict) and memory_balances:
                     balances = _normalize_balances(memory_balances)
-                    self.logger.info("[Recovery] ✅ Strategy 1: Balances loaded from SharedState memory (WebSocket-updated)")
+                    self.logger.info(
+                        "[Recovery] ✅ Strategy 1: Balances loaded from SharedState memory (WebSocket-updated)"
+                    )
         except Exception:
             self.logger.debug("[Recovery] Strategy 1 (SharedState balances) failed", exc_info=True)
-        
+
         # Check if SharedState has recent positions from WebSocket
         if not positions:
             try:
@@ -262,10 +280,14 @@ class RecoveryEngine:
                     memory_positions = self.ss.positions
                     if isinstance(memory_positions, dict) and memory_positions:
                         positions = _normalize_positions(memory_positions)
-                        self.logger.info("[Recovery] ✅ Strategy 1: Positions loaded from SharedState memory (WebSocket-updated)")
+                        self.logger.info(
+                            "[Recovery] ✅ Strategy 1: Positions loaded from SharedState memory (WebSocket-updated)"
+                        )
             except Exception:
-                self.logger.debug("[Recovery] Strategy 1 (SharedState positions) failed", exc_info=True)
-        
+                self.logger.debug(
+                    "[Recovery] Strategy 1 (SharedState positions) failed", exc_info=True
+                )
+
         # ========== STRATEGY 2: Database Snapshot (persisted, no API call) ==========
         if not balances:
             try:
@@ -274,10 +296,12 @@ class RecoveryEngine:
                     snapshot_balances = snapshot.get("balances")
                     if snapshot_balances:
                         balances = _normalize_balances(snapshot_balances)
-                        self.logger.info("[Recovery] ✅ Strategy 2: Balances loaded from DB snapshot")
+                        self.logger.info(
+                            "[Recovery] ✅ Strategy 2: Balances loaded from DB snapshot"
+                        )
             except Exception:
                 self.logger.debug("[Recovery] Strategy 2 (snapshot balances) failed", exc_info=True)
-        
+
         if not positions:
             try:
                 snapshot = self._load_snapshot()
@@ -285,10 +309,14 @@ class RecoveryEngine:
                     snapshot_positions = snapshot.get("positions")
                     if snapshot_positions:
                         positions = _normalize_positions(snapshot_positions)
-                        self.logger.info("[Recovery] ✅ Strategy 2: Positions loaded from DB snapshot")
+                        self.logger.info(
+                            "[Recovery] ✅ Strategy 2: Positions loaded from DB snapshot"
+                        )
             except Exception:
-                self.logger.debug("[Recovery] Strategy 2 (snapshot positions) failed", exc_info=True)
-        
+                self.logger.debug(
+                    "[Recovery] Strategy 2 (snapshot positions) failed", exc_info=True
+                )
+
         # ========== STRATEGY 3: REST API (only if configured, minimizes API calls) ==========
         allow_rest = getattr(self.config, "RECOVERY_ALLOW_REST", False)
         if allow_rest:
@@ -298,10 +326,14 @@ class RecoveryEngine:
                     if hasattr(self.ex, "get_balances"):
                         b = await _with_timeout(self.ex.get_balances())
                         balances = _normalize_balances(b)
-                        self.logger.info("[Recovery] ✅ Strategy 3: Balances loaded via REST API (configured)")
+                        self.logger.info(
+                            "[Recovery] ✅ Strategy 3: Balances loaded via REST API (configured)"
+                        )
                 except Exception:
-                    self.logger.warning("[Recovery] Strategy 3 (REST balances) failed", exc_info=True)
-            
+                    self.logger.warning(
+                        "[Recovery] Strategy 3 (REST balances) failed", exc_info=True
+                    )
+
             # Positions via REST (only if configured)
             if not positions:
                 try:
@@ -313,18 +345,24 @@ class RecoveryEngine:
                     if getter:
                         p = await _with_timeout(getter())
                         positions = _normalize_positions(p)
-                        self.logger.info("[Recovery] ✅ Strategy 3: Positions loaded via REST API (configured)")
+                        self.logger.info(
+                            "[Recovery] ✅ Strategy 3: Positions loaded via REST API (configured)"
+                        )
                 except Exception:
-                    self.logger.warning("[Recovery] Strategy 3 (REST positions) failed", exc_info=True)
+                    self.logger.warning(
+                        "[Recovery] Strategy 3 (REST positions) failed", exc_info=True
+                    )
         else:
             # REST not configured - log that we're not using it
             if not balances or not positions:
-                self.logger.info("[Recovery] ⚠️  RECOVERY_ALLOW_REST=False (institutional mode): Skipping REST fallback, using memory+DB only")
-        
+                self.logger.info(
+                    "[Recovery] ⚠️  RECOVERY_ALLOW_REST=False (institutional mode): Skipping REST fallback, using memory+DB only"
+                )
+
         return balances, positions
 
     # ------------------------------ calculators ------------------------------
-    async def _recompute_unrealized(self, positions: Dict[str, Any]) -> float:
+    async def _recompute_unrealized(self, positions: dict[str, Any]) -> float:
         """Compute unrealized PnL using provided pnl_calculator or a simple fallback.
         Returns total unrealized PnL in quote currency (float).
         """
@@ -332,7 +370,9 @@ class RecoveryEngine:
             if self.pnl_calc and hasattr(self.pnl_calc, "compute_unrealized"):
                 # expect: compute_unrealized(positions, prices) -> float
                 prices = await self._latest_prices(list(positions.keys()))
-                return float(await _maybe_await(self.pnl_calc.compute_unrealized(positions, prices)))
+                return float(
+                    await _maybe_await(self.pnl_calc.compute_unrealized(positions, prices))
+                )
         except Exception:
             self.logger.debug("[Recovery] pnl_calc path failed; using fallback", exc_info=True)
 
@@ -359,37 +399,37 @@ class RecoveryEngine:
             self.logger.debug("[Recovery] fallback unrealized failed", exc_info=True)
         return float(unreal)
 
-    async def _latest_prices(self, symbols: List[str]) -> Dict[str, float]:
+    async def _latest_prices(self, symbols: list[str]) -> dict[str, float]:
         """
         Fetch latest prices using 3-strategy cascade (institutional architecture).
-        
+
         Strategy 1: SharedState memory (WebSocket prices, zero latency, zero API calls)
         Strategy 2: Database snapshot (persisted prices, no API call)
         Strategy 3: REST API (only if explicitly configured, minimizes API calls)
-        
+
         Returns {symbol: price, ...} dict with prices for requested symbols.
         """
-        out: Dict[str, float] = {}
+        out: dict[str, float] = {}
         if not symbols:
             return out
-        
-        async def fetch_sym_cascading(s: str) -> Tuple[str, Optional[float]]:
+
+        async def fetch_sym_cascading(s: str) -> tuple[str, Optional[float]]:
             """Fetch price for symbol using 3-strategy cascade."""
             try:
                 px = None
-                
+
                 # ===== STRATEGY 1: SharedState memory (WebSocket-updated prices) =====
                 if hasattr(self.ss, "prices") and self.ss.prices:
                     px = self.ss.prices.get(s.upper())
                     if px:
                         return s, float(px)
-                
+
                 # ===== STRATEGY 2: sstools safe_price (may use snapshot) =====
                 if self.sstools and hasattr(self.sstools, "safe_price"):
                     px = await _maybe_await(self.sstools.safe_price(s))
                     if px:
                         return s, float(px)
-                
+
                 # ===== STRATEGY 3: Database snapshot (persisted prices) =====
                 if not px:
                     try:
@@ -401,7 +441,7 @@ class RecoveryEngine:
                                 return s, float(px)
                     except Exception:
                         pass
-                
+
                 # ===== STRATEGY 4: REST API (only if explicitly configured) =====
                 allow_rest = getattr(self.config, "RECOVERY_ALLOW_REST", False)
                 if allow_rest and not px:
@@ -409,29 +449,31 @@ class RecoveryEngine:
                         px = await _with_timeout(self.ex.get_current_price(s))
                         if px:
                             return s, float(px)
-                
+
                 return s, None
             except Exception as e:
                 self.logger.debug(f"[Recovery] Price fetch for {s} failed: {e}")
                 return s, None
-        
+
         # Fetch all prices in parallel
-        pairs = await asyncio.gather(*[fetch_sym_cascading(s) for s in symbols], return_exceptions=False)
+        pairs = await asyncio.gather(
+            *[fetch_sym_cascading(s) for s in symbols], return_exceptions=False
+        )
         for s, px in pairs:
             if px:
                 out[s] = px
-        
+
         # Log which symbols we couldn't find
         missing = [s for s in symbols if s not in out]
         if missing:
             self.logger.debug(f"[Recovery] Could not get prices for: {missing}")
-        
+
         return out
 
     # ------------------------------- integrity -------------------------------
-    async def verify_integrity(self) -> Tuple[bool, List[str]]:
+    async def verify_integrity(self) -> tuple[bool, list[str]]:
         """Lightweight integrity verification. Returns (ok, problems)."""
-        problems: List[str] = []
+        problems: list[str] = []
         try:
             # accepted symbols
             symbols = getattr(self.ss, "accepted_symbols", None) or {}
@@ -468,51 +510,61 @@ class RecoveryEngine:
         return (len(problems) == 0, problems)
 
     # ------------------------------- applying --------------------------------
-    async def _apply_balances(self, balances: Dict[str, Any]) -> None:
+    async def _apply_balances(self, balances: dict[str, Any]) -> None:
         try:
             normalized = _normalize_balances(balances)
             if normalized and hasattr(self.ss, "update_balances"):
                 await _maybe_await(self.ss.update_balances(normalized))
             elif normalized is not None:
-                setattr(self.ss, "balances", normalized)
+                self.ss.balances = normalized
 
-            nonzero = normalized and any(float(v.get("total", 0) or v.get("free", 0) or 0) > 0 for v in normalized.values())
+            nonzero = normalized and any(
+                float(v.get("total", 0) or v.get("free", 0) or 0) > 0 for v in normalized.values()
+            )
             if nonzero:
                 await self._set_readiness("BalancesReady", True)
-                await self._emit_event("BalancesReady", {"timestamp": _now_iso(), "source": "recovery"})
+                await self._emit_event(
+                    "BalancesReady", {"timestamp": _now_iso(), "source": "recovery"}
+                )
             else:
                 self.logger.info("[Recovery] Balances empty/zero; not marking BalancesReady")
 
             try:
-                quote   = getattr(self.ss, "quote_asset", "USDT").upper()
+                quote = getattr(self.ss, "quote_asset", "USDT").upper()
                 free_usdt = float(normalized.get(quote, {}).get("free", 0.0))
                 target_free_usdt = 0.0
                 cap = getattr(self.config, "capital", None) or getattr(self.config, "CAPITAL", None)
                 if cap:
-                    target_free_usdt = float(getattr(cap, "target_free_usdt", getattr(cap, "TARGET_FREE_USDT", 0.0)) or 0.0)
+                    target_free_usdt = float(
+                        getattr(cap, "target_free_usdt", getattr(cap, "TARGET_FREE_USDT", 0.0))
+                        or 0.0
+                    )
                 if not target_free_usdt:
                     ss_cfg = getattr(self.ss, "config", None)
                     if ss_cfg and hasattr(ss_cfg, "target_free_usdt"):
-                        target_free_usdt = float(getattr(ss_cfg, "target_free_usdt") or 0.0)
+                        target_free_usdt = float(ss_cfg.target_free_usdt or 0.0)
                 rec = getattr(self.config, "RECOVERY", None)
                 if not target_free_usdt and rec and "TARGET_FREE_USDT" in rec:
                     target_free_usdt = float(rec["TARGET_FREE_USDT"] or 0.0)
 
                 ready = free_usdt >= target_free_usdt
                 await self._set_readiness("FreeUSDTReady", ready)
-                await self._emit_event("FreeUSDTReady", {
-                    "timestamp": _now_iso(),
-                    "source": "recovery",
-                    "free_usdt": free_usdt,
-                    "target_free_usdt": target_free_usdt,
-                    "ready": ready
-                })
+                await self._emit_event(
+                    "FreeUSDTReady",
+                    {
+                        "timestamp": _now_iso(),
+                        "source": "recovery",
+                        "free_usdt": free_usdt,
+                        "target_free_usdt": target_free_usdt,
+                        "ready": ready,
+                    },
+                )
             except Exception:
                 self.logger.debug("[Recovery] FreeUSDTReady check failed", exc_info=True)
         except Exception:
             self.logger.warning("[Recovery] Failed applying balances", exc_info=True)
 
-    async def _apply_positions(self, positions: Dict[str, Any]) -> None:
+    async def _apply_positions(self, positions: dict[str, Any]) -> None:
         if not positions:
             return
         try:
@@ -525,20 +577,27 @@ class RecoveryEngine:
                 if isinstance(sspos, dict):
                     sspos.update(positions)
                 else:
-                    setattr(self.ss, "positions", positions)
+                    self.ss.positions = positions
         except Exception:
             self.logger.warning("[Recovery] Failed applying positions", exc_info=True)
 
-    async def _apply_symbols_if_missing(self, candidate_symbols: List[str]) -> None:
+    async def _apply_symbols_if_missing(self, candidate_symbols: list[str]) -> None:
         try:
             current = getattr(self.ss, "accepted_symbols", None)
             if not current and candidate_symbols:
-                m = {s.upper().replace("/", ""): {"source": "recovery"} for s in candidate_symbols if s}
+                m = {
+                    s.upper().replace("/", ""): {"source": "recovery"}
+                    for s in candidate_symbols
+                    if s
+                }
                 if hasattr(self.ss, "set_accepted_symbols"):
                     await _maybe_await(self.ss.set_accepted_symbols(m))
                 else:
-                    setattr(self.ss, "accepted_symbols", m)
-                await self._emit_event("AcceptedSymbolsReady", {"count": len(m), "timestamp": _now_iso(), "source": "recovery"})
+                    self.ss.accepted_symbols = m
+                await self._emit_event(
+                    "AcceptedSymbolsReady",
+                    {"count": len(m), "timestamp": _now_iso(), "source": "recovery"},
+                )
                 await self._set_readiness("AcceptedSymbolsReady", True)
         except Exception:
             self.logger.debug("[Recovery] apply_symbols_if_missing failed", exc_info=True)
@@ -553,39 +612,49 @@ class RecoveryEngine:
             symbols_map = getattr(self.ss, "accepted_symbols", None) or {}
             syms = list(symbols_map.keys())
             if not syms:
-                self.logger.info("[Recovery] No accepted symbols available for MarketDataReady check")
+                self.logger.info(
+                    "[Recovery] No accepted symbols available for MarketDataReady check"
+                )
                 return
             want = max(1, self.rcfg.min_symbols_for_md_ready)
             have = 0
             for s in syms:
                 px = None
-                
+
                 # ===== STRATEGY 1: SharedState memory (WebSocket-updated) =====
                 if hasattr(self.ss, "prices") and self.ss.prices:
                     px = self.ss.prices.get(s.upper())
-                
+
                 # ===== STRATEGY 2: sstools safe_price =====
                 if not px and self.sstools and hasattr(self.sstools, "safe_price"):
                     px = await _maybe_await(self.sstools.safe_price(s))
-                
+
                 # ===== STRATEGY 3: REST API (only if configured) =====
                 if not px:
                     allow_rest = getattr(self.config, "RECOVERY_ALLOW_REST", False)
                     if allow_rest and hasattr(self.ex, "get_current_price"):
                         px = await _with_timeout(self.ex.get_current_price(s))
-                
+
                 if px:
                     have += 1
                 if have >= want:
-                    await self._emit_event("MarketDataReady", {"timestamp": _now_iso(), "source": "recovery", "count": have})
+                    await self._emit_event(
+                        "MarketDataReady",
+                        {"timestamp": _now_iso(), "source": "recovery", "count": have},
+                    )
                     await self._set_readiness("MarketDataReady", True)
                     return
-            self.logger.info("[Recovery] MarketDataReady not set (have_prices=%d, need=%d, total_symbols=%d)", have, want, len(syms))
+            self.logger.info(
+                "[Recovery] MarketDataReady not set (have_prices=%d, need=%d, total_symbols=%d)",
+                have,
+                want,
+                len(syms),
+            )
         except Exception:
             self.logger.debug("[Recovery] mark MarketDataReady failed", exc_info=True)
 
     # ------------------------------- public API -------------------------------
-    async def rebuild_state(self) -> Dict[str, Any]:
+    async def rebuild_state(self) -> dict[str, Any]:
         """Rebuild state from DB snapshot or live queries; recompute NAV/unrealized; set phase gates."""
         await self._emit_health("Starting", "Recovery begin")
         try:
@@ -599,9 +668,9 @@ class RecoveryEngine:
             await self.ss.load_pending_intents_from_db()
 
         snapshot = self._load_snapshot()
-        balances: Dict[str, Any] = {}
-        positions: Dict[str, Any] = {}
-        accepted_symbols: List[str] = []
+        balances: dict[str, Any] = {}
+        positions: dict[str, Any] = {}
+        accepted_symbols: list[str] = []
 
         if snapshot:
             balances = snapshot.get("balances") or {}

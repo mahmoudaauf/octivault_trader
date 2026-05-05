@@ -1,7 +1,7 @@
 # Repository Cleanup - 5-Minute Fix
 
-**Time to execute:** 5 minutes  
-**Effort level:** Minimal  
+**Time to execute:** 5 minutes
+**Effort level:** Minimal
 **Impact:** Makes repo feel clean and organized
 
 ---
@@ -199,10 +199,10 @@ Your repo will be **clean, organized, and ready** for:
 
 ---
 
-**Status:** Ready to execute  
+**Status:** Ready to execute
 **Recommendation:** Run this cleanup now, before deploying Phase 2 fixes
 
 ---
 
-For detailed analysis, see: REPO_DIRTY_ANALYSIS.md  
+For detailed analysis, see: REPO_DIRTY_ANALYSIS.md
 For comprehensive cleanup guide, see: REPO_CLEANUP_ANALYSIS.md

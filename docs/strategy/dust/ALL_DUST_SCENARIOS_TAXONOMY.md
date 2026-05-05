@@ -1,7 +1,7 @@
 # 🧹 ALL DUST SCENARIOS - COMPLETE TAXONOMY
 
-**Purpose:** Catalog every possible dust position scenario  
-**Date:** April 27, 2026  
+**Purpose:** Catalog every possible dust position scenario
+**Date:** April 27, 2026
 **Scope:** Entry, detection, handling, recovery, liquidation
 
 ---
@@ -40,8 +40,8 @@ Fill: 0.00035 × $41,300 = $14.45
 Result: DUST ($14.45 < $20)
 ```
 
-**Probability:** HIGH (very common)  
-**Recovery:** Possible if market recovers 38%+  
+**Probability:** HIGH (very common)
+**Recovery:** Possible if market recovers 38%+
 **Liquidation:** Forced at 20%+ loss if triggered
 
 ---
@@ -64,8 +64,8 @@ Fill: 0.00026 BTC @ $42,500 = $11.05
 Result: DUST ($11.05 < $20)
 ```
 
-**Probability:** MEDIUM (after losses)  
-**Recovery:** Difficult, capital too small  
+**Probability:** MEDIUM (after losses)
+**Recovery:** Difficult, capital too small
 **Liquidation:** Likely triggered immediately
 
 ---
@@ -90,8 +90,8 @@ Fill: 0.0003 × $42,500 = $12.75
 Result: DUST ($12.75 < $20)
 ```
 
-**Probability:** LOW (but systematic)  
-**Recovery:** Depends on price recovery  
+**Probability:** LOW (but systematic)
+**Recovery:** Depends on price recovery
 **Liquidation:** Potential if dust accumulates
 
 ---
@@ -114,8 +114,8 @@ Net: $14.875 - $0.015 = $14.86
 Result: DUST ($14.86 < $20)
 ```
 
-**Probability:** VERY HIGH (affects all trades)  
-**Recovery:** Needs 34% price recovery  
+**Probability:** VERY HIGH (affects all trades)
+**Recovery:** Needs 34% price recovery
 **Liquidation:** Common trigger
 
 ---
@@ -144,8 +144,8 @@ Market recovers: +8%
 Result: Position now worth $21.60 (NOT dust!)
 ```
 
-**Probability:** LOW (but recovers quickly)  
-**Recovery:** YES (market usually recovers)  
+**Probability:** LOW (but recovers quickly)
+**Recovery:** YES (market usually recovers)
 **Liquidation:** Avoided if market bounces
 
 ---
@@ -175,8 +175,8 @@ Entry 3: Capital even less, dust even worse
 Repeat: More dust each cycle
 ```
 
-**Probability:** VERY HIGH (after losses)  
-**Recovery:** Difficult, spiral downward  
+**Probability:** VERY HIGH (after losses)
+**Recovery:** Difficult, spiral downward
 **Liquidation:** Triggered when accumulates
 
 ---
@@ -206,8 +206,8 @@ Dust ratio: 87%
 More liquidation triggered
 ```
 
-**Probability:** MEDIUM (gate should prevent this)  
-**Recovery:** No, will be liquidated  
+**Probability:** MEDIUM (gate should prevent this)
+**Recovery:** No, will be liquidated
 **Liquidation:** Immediate (5+ minutes)
 
 ---
@@ -234,8 +234,8 @@ Fill: 0.00048 × $41,225 = $19.79
 Result: DUST ($19.79 < $20) - barely!
 ```
 
-**Probability:** LOW but impactful  
-**Recovery:** Depends on gap direction  
+**Probability:** LOW but impactful
+**Recovery:** Depends on gap direction
 **Liquidation:** Triggered if accumulated
 
 ---
@@ -258,8 +258,8 @@ Fill: 0.00028 × $42,500 = $11.90
 Result: DUST ($11.90 < $20)
 ```
 
-**Probability:** LOW (not common on Binance)  
-**Recovery:** Depends on additional fills  
+**Probability:** LOW (not common on Binance)
+**Recovery:** Depends on additional fills
 **Liquidation:** Likely if not completed
 
 ---
@@ -285,8 +285,8 @@ Real fill: 0.00047 × $41,800 = $19.65
 Result: DUST ($19.65 < $20)
 ```
 
-**Probability:** MEDIUM (if data lag exists)  
-**Recovery:** Possible with price recovery  
+**Probability:** MEDIUM (if data lag exists)
+**Recovery:** Possible with price recovery
 **Liquidation:** If detected during dust phase
 
 ---
@@ -312,8 +312,8 @@ Time: 13:05:30
 └─ Dust registry updated
 ```
 
-**Detection Time:** Immediate  
-**State:** DUST_LOCKED (correct state)  
+**Detection Time:** Immediate
+**State:** DUST_LOCKED (correct state)
 **Action:** Wait for recovery or liquidation phase
 
 ---
@@ -339,8 +339,8 @@ Time: 13:10:00 - Portfolio scan
 └─ Dust registry updated
 ```
 
-**Detection Time:** 4+ minutes delayed  
-**State:** Briefly unclassified  
+**Detection Time:** 4+ minutes delayed
+**State:** Briefly unclassified
 **Action:** Eventually liquidated in next phase
 
 ---
@@ -369,8 +369,8 @@ Time: 13:25:00
 └─ Removed from dust registry
 ```
 
-**Detection Time:** At recovery price > $20  
-**State:** Changed from DUST_LOCKED to ACTIVE  
+**Detection Time:** At recovery price > $20
+**State:** Changed from DUST_LOCKED to ACTIVE
 **Action:** Can now be traded normally
 
 ---
@@ -397,8 +397,8 @@ System check: This will NEVER recover
 └─ Close: Write down as loss
 ```
 
-**Detection Time:** Periodic review  
-**State:** PERMANENT_DUST (irreversible)  
+**Detection Time:** Periodic review
+**State:** PERMANENT_DUST (irreversible)
 **Action:** Close/liquidate immediately
 
 ---
@@ -426,8 +426,8 @@ Detection: YES, dust detected
 Action: HOLD (can't liquidate during halt)
 ```
 
-**Detection Time:** Immediate  
-**State:** DUST_LOCKED but FROZEN  
+**Detection Time:** Immediate
+**State:** DUST_LOCKED but FROZEN
 **Action:** Liquidate when market resumes
 
 ---
@@ -458,8 +458,8 @@ Age check: Wait 5 minutes
 Action: Liquidate at 5+ minutes
 ```
 
-**Duration:** 5+ minutes  
-**Ratio:** 100%  
+**Duration:** 5+ minutes
+**Ratio:** 100%
 **Trigger:** IMMEDIATE (next cycle after 5 min)
 
 ---
@@ -490,8 +490,8 @@ Hour 2:05
 └─ Dust ratio: 1/1 = 100% (if liquidation failed)
 ```
 
-**Duration:** 1-2 hours  
-**Ratio:** 50% → 67% → 100%  
+**Duration:** 1-2 hours
+**Ratio:** 50% → 67% → 100%
 **Trigger:** When exceeds 60%
 
 ---
@@ -514,8 +514,8 @@ Second 15: Dust ratio check triggered
 Second 300: Phase 2 liquidation starts
 ```
 
-**Duration:** 5+ minutes (must wait 300s)  
-**Ratio:** 50% → 100% (instantly)  
+**Duration:** 5+ minutes (must wait 300s)
+**Ratio:** 50% → 100% (instantly)
 **Trigger:** After 5 minute gate passes
 
 ---
@@ -555,8 +555,8 @@ Time 15 min:
 └─ Phase 2: Can deactivate
 ```
 
-**Duration:** 15+ minutes  
-**Ratio:** 100% → 50% (after recovery)  
+**Duration:** 15+ minutes
+**Ratio:** 100% → 50% (after recovery)
 **Recovery:** YES if price moves 40%+
 
 ---
@@ -586,8 +586,8 @@ Dust count: 5 → 6
 Liquidation: New dust also liquidated
 ```
 
-**Duration:** 5+ minutes until liquidation  
-**Ratio:** Increases by 1 position  
+**Duration:** 5+ minutes until liquidation
+**Ratio:** Increases by 1 position
 **Result:** New dust immediately scheduled for liquidation
 
 ---
@@ -618,8 +618,8 @@ Results:
 └─ Dust 3: $15 → $14.70 (loss $0.30)
 ```
 
-**Loss per position:** 1-3%  
-**Total capital lost:** $0.75 (1.5%)  
+**Loss per position:** 1-3%
+**Total capital lost:** $0.75 (1.5%)
 **Time:** Immediate after 5 min wait
 
 ---
@@ -646,8 +646,8 @@ Action:
 Result: Capital recovered, fresh dust kept for recovery
 ```
 
-**Loss:** Only on mature dust  
-**Capital recovered:** ~$30.70 (from 2 positions)  
+**Loss:** Only on mature dust
+**Capital recovered:** ~$30.70 (from 2 positions)
 **Fresh dust:** Kept for potential recovery
 
 ---
@@ -677,8 +677,8 @@ Market hits TP: Sell at $21 profit
 Result: Position exited profitably!
 ```
 
-**Exit price:** $21  
-**Profit:** $7 (33% gain)  
+**Exit price:** $21
+**Profit:** $7 (33% gain)
 **Result:** Converts dust to profit
 
 ---
@@ -708,8 +708,8 @@ Action: SELL at $13.30
 Result: Preserve $13.30 vs potential $12 loss
 ```
 
-**Liquidation price:** $13.30 (vs could be $12)  
-**Loss prevented:** ~$1.30  
+**Liquidation price:** $13.30 (vs could be $12)
+**Loss prevented:** ~$1.30
 **Rationale:** Accept small loss to avoid bigger loss
 
 ---
@@ -741,8 +741,8 @@ Action: SELL on bounce at $14.84
 Result: Recover capital faster, reduce exposure
 ```
 
-**Liquidation price:** $14.84 (vs $14)  
-**Capital recovered:** +$0.84 better  
+**Liquidation price:** $14.84 (vs $14)
+**Capital recovered:** +$0.84 better
 **Timing:** Requires active monitoring
 
 ---
@@ -772,8 +772,8 @@ Proceeds: ~$112 (including slippage)
 Result: Recover capital, accept losses
 ```
 
-**Liquidation:** All dust at once  
-**Capital recovered:** ~$112 from $120 dust  
+**Liquidation:** All dust at once
+**Capital recovered:** ~$112 from $120 dust
 **Loss:** -$8 (6.7%)
 
 ---
@@ -802,8 +802,8 @@ Cycle 2:
 Repeat: Capital shrinking each cycle ($0.50 loss per cycle)
 ```
 
-**Pattern:** Liquidate → Enter → Dust → Repeat  
-**Capital decay:** -$0.50 per cycle  
+**Pattern:** Liquidate → Enter → Dust → Repeat
+**Capital decay:** -$0.50 per cycle
 **Duration:** Continuous
 
 ---
@@ -835,8 +835,8 @@ Status: ACTIVE (no longer dust)
 Result: Can now trade normally
 ```
 
-**Recovery price needed:** > $20 / 0.00035 = $57,143  
-**Price movement needed:** +34% from original  
+**Recovery price needed:** > $20 / 0.00035 = $57,143
+**Price movement needed:** +34% from original
 **Duration:** Could take days/weeks
 
 ---
@@ -867,8 +867,8 @@ Average price: $34/0.00085 = $40
 Status: ACTIVE (total > $20)
 ```
 
-**Capital added:** $20  
-**Total position:** $34  
+**Capital added:** $20
+**Total position:** $34
 **Result:** Rescue from dust by adding capital
 
 ---
@@ -896,8 +896,8 @@ Rebalance:
 Result: Consolidated dust into active position
 ```
 
-**Capital: Moved:** $25 from SOLANA to ETHUSDT  
-**Dust status:** Resolved  
+**Capital: Moved:** $25 from SOLANA to ETHUSDT
+**Dust status:** Resolved
 **Portfolio:** 1 active instead of 1 dust + 1 active
 
 ---
@@ -937,8 +937,8 @@ Week 6: Market +45% total
     └─ Status: ACTIVE ✓
 ```
 
-**Time needed:** 6 weeks  
-**Price movement needed:** +45%  
+**Time needed:** 6 weeks
+**Price movement needed:** +45%
 **Capital required:** None (passive recovery)
 
 ---
@@ -968,8 +968,8 @@ Action: TP triggered → Position closes
 Recover capital: $14.50 (lose $0.375 from dust)
 ```
 
-**Exit price:** $14.50  
-**Gain:** +$0.50 (+3.6%)  
+**Exit price:** $14.50
+**Gain:** +$0.50 (+3.6%)
 **Duration:** Could be hours/days
 
 ---
@@ -999,8 +999,8 @@ Swap back: $14.00 USDT → 0.00035 ETHUSDT
 Position: $19.60 worth (still dust but better)
 ```
 
-**Capital preserved:** $14 exactly  
-**Volatility reduced:** Converted to stablecoin  
+**Capital preserved:** $14 exactly
+**Volatility reduced:** Converted to stablecoin
 **Timing:** Can optimize entry back
 
 ---
@@ -1030,8 +1030,8 @@ Status: PERMANENT_DUST (irreversible)
 Result: Write down as permanent loss
 ```
 
-**Capital lost:** $14 (permanent)  
-**Recovery:** Impossible  
+**Capital lost:** $14 (permanent)
+**Recovery:** Impossible
 **Action:** Close as dead capital
 
 ---
@@ -1059,8 +1059,8 @@ Result: PHANTOM DUST (invalid state)
 Action: Clean up, mark as CLOSED
 ```
 
-**Capital: Lost?:** $14 unrecovered (unclear state)  
-**Status:** Requires manual intervention  
+**Capital: Lost?:** $14 unrecovered (unclear state)
+**Status:** Requires manual intervention
 **Recovery:** Possible via account history
 
 ---
@@ -1088,8 +1088,8 @@ Value: -$0.35 (negative)
 Result: Dust in reverse
 ```
 
-**Capital at risk:** Unlimited (short)  
-**Loss:** -$0.35 (and could get worse)  
+**Capital at risk:** Unlimited (short)
+**Loss:** -$0.35 (and could get worse)
 **Recovery:** Must cover short
 
 ---
@@ -1119,8 +1119,8 @@ Proceeds: $13.72
 Result: Position liquidated, capital recovered
 ```
 
-**Loss:** -$0.28 (2%)  
-**Recovery:** Capital received ($13.72)  
+**Loss:** -$0.28 (2%)
+**Recovery:** Capital received ($13.72)
 **Duration:** Instant (forced)
 
 ---
@@ -1150,8 +1150,8 @@ When resumed: Position worth $14.70
 Result: Dust could have recovered but frozen
 ```
 
-**Capital trapped:** $14  
-**Opportunity lost:** Market moved +5%  
+**Capital trapped:** $14
+**Opportunity lost:** Market moved +5%
 **Action:** Liquidate when market resumes
 
 ---
@@ -1181,8 +1181,8 @@ Account margin: Falls below 5% threshold
 Result: Forced liquidation (cascade)
 ```
 
-**Initial loss:** -$0.42  
-**Risk:** Cascade liquidation of other positions  
+**Initial loss:** -$0.42
+**Risk:** Cascade liquidation of other positions
 **Outcome:** Amplified losses
 
 ---
@@ -1212,8 +1212,8 @@ Position: Back to $14.875 (DUST again)
 Result: Brief moment of recovery, missed opportunity
 ```
 
-**Recovery seen:** $22.31 (3 seconds)  
-**Permanent recovery:** No  
+**Recovery seen:** $22.31 (3 seconds)
+**Permanent recovery:** No
 **Opportunity:** Extremely difficult to catch
 
 ---
@@ -1242,8 +1242,8 @@ Recombine:
 Better strategy: Combine into $20+ position
 ```
 
-**After split:** 2 dust positions  
-**After recombine:** 1 dust position  
+**After split:** 2 dust positions
+**After recombine:** 1 dust position
 **Recovery:** Possible if combined > $20
 
 ---
@@ -1273,8 +1273,8 @@ Metrics:
 └─ Status: HEALTHY ✓
 ```
 
-**Dust ratio:** 0%  
-**Liquidation risk:** None  
+**Dust ratio:** 0%
+**Liquidation risk:** None
 **Trading ability:** Full
 
 ---
@@ -1303,8 +1303,8 @@ Metrics:
 └─ Status: CAUTION ⚠️
 ```
 
-**Dust ratio:** 26%  
-**Liquidation risk:** Low  
+**Dust ratio:** 26%
+**Liquidation risk:** Low
 **Trading ability:** Reduced capital
 
 ---
@@ -1334,8 +1334,8 @@ Metrics:
 └─ Status: CRITICAL ⛔
 ```
 
-**Dust ratio:** 70%  
-**Liquidation risk:** HIGH (Phase 2 active)  
+**Dust ratio:** 70%
+**Liquidation risk:** HIGH (Phase 2 active)
 **Trading ability:** Severely limited
 
 ---
@@ -1364,8 +1364,8 @@ Metrics:
 └─ Status: EMERGENCY 🔥
 ```
 
-**Dust ratio:** 100%  
-**Liquidation risk:** IMMEDIATE  
+**Dust ratio:** 100%
+**Liquidation risk:** IMMEDIATE
 **Trading ability:** Frozen (can only liquidate)
 
 ---
@@ -1394,8 +1394,8 @@ Metrics:
 └─ Status: IMPROVING ✓
 ```
 
-**Dust ratio:** 100% → 47% (recovering)  
-**Liquidation risk:** Decreasing  
+**Dust ratio:** 100% → 47% (recovering)
+**Liquidation risk:** Decreasing
 **Trading ability:** Improving
 
 ---
@@ -1426,8 +1426,8 @@ Portfolio (after Phase 2):
 └─ Status: RESET
 ```
 
-**Dust ratio:** 100% → 0%  
-**Capital recovered:** $44.35  
+**Dust ratio:** 100% → 0%
+**Capital recovered:** $44.35
 **Duration:** Seconds to minutes
 
 ---
@@ -1455,8 +1455,8 @@ Metrics:
 └─ Status: FRAGMENTED 🧩
 ```
 
-**Dust ratio:** 100%+ (all positions small)  
-**Liquidation risk:** Continuous  
+**Dust ratio:** 100%+ (all positions small)
+**Liquidation risk:** Continuous
 **Trading ability:** Can't enter $20+ positions
 
 ---
@@ -1482,7 +1482,7 @@ Metrics:
 
 ### Most Common Scenarios
 1. **Normal slippage dust** - Happens on nearly every trade
-2. **Fee-induced dust** - Affects all trades 
+2. **Fee-induced dust** - Affects all trades
 3. **Cascade dust** - After losses, capital shrinks
 4. **Liquidation phase** - Triggered regularly when dust > 60%
 

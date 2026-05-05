@@ -1,7 +1,7 @@
 # 🔍 Hardcoded Symbols Audit Report
 
-**Report Date**: April 23, 2026  
-**Audit Type**: Code search for hardcoded symbol references  
+**Report Date**: April 23, 2026
+**Audit Type**: Code search for hardcoded symbol references
 **Status**: ⚠️ **FOUND - But Managed Appropriately**
 
 ---
@@ -22,9 +22,9 @@
 
 ### Location 1: `core/bootstrap_symbols.py` - MAIN FALLBACK ⭐
 
-**File**: `/core/bootstrap_symbols.py`  
-**Purpose**: Bootstrap symbols when discovery fails  
-**Type**: Centralized fallback configuration  
+**File**: `/core/bootstrap_symbols.py`
+**Purpose**: Bootstrap symbols when discovery fails
+**Type**: Centralized fallback configuration
 **Can Be Overridden**: YES ✅
 
 ```python
@@ -64,9 +64,9 @@ DEFAULT_SYMBOLS = {
 
 ### Location 2: `utils/tuned_params.py` - PARAMETER TUNING
 
-**File**: `/utils/tuned_params.py`  
-**Purpose**: Symbol-specific hyperparameter tuning  
-**Type**: Performance optimization  
+**File**: `/utils/tuned_params.py`
+**Purpose**: Symbol-specific hyperparameter tuning
+**Type**: Performance optimization
 **Can Be Overridden**: YES (via function parameter)
 
 ```python
@@ -105,16 +105,16 @@ symbol_params = {
 
 ### Location 3: `REALTIME_SESSION_MONITOR.py` - MONITORING REGEX
 
-**File**: `/REALTIME_SESSION_MONITOR.py` (line 52)  
-**Purpose**: Pattern matching for log analysis  
-**Type**: Monitoring/diagnostics  
+**File**: `/REALTIME_SESSION_MONITOR.py` (line 52)
+**Purpose**: Pattern matching for log analysis
+**Type**: Monitoring/diagnostics
 **Can Be Overridden**: YES
 
 ```python
 position_pattern = r'LINKUSDT|ETHUSDT|BTCUSDT|DOGEUSDT|SOLUSDT'
 ```
 
-**Purpose**: Extract position data from logs for real-time monitoring  
+**Purpose**: Extract position data from logs for real-time monitoring
 **Why Hardcoded Here**: Used for diagnostics during specific monitoring session, not core logic
 
 ---
@@ -126,7 +126,7 @@ position_pattern = r'LINKUSDT|ETHUSDT|BTCUSDT|DOGEUSDT|SOLUSDT'
 - `phase3_live_trading.py` (lines 214, 243-244)
 - `TEST_FALLBACK.py`
 
-**Purpose**: Testing and diagnostics only  
+**Purpose**: Testing and diagnostics only
 **Impact on Production**: NONE - these are test/debug files
 
 **Examples**:
@@ -172,20 +172,20 @@ Priority 4: DEFAULT_SYMBOLS (fallback - lowest priority)
 def _build_seed_symbols(shared_state, logger):
     cfg = getattr(shared_state, "config", None)
     raw_syms = []
-    
+
     if cfg is not None:
         raw_syms = cfg.get("SYMBOLS", []) or []  # Priority 1
-    
+
     if not raw_syms:
         try:
             if hasattr(shared_state, "_cfg"):
                 raw_syms = shared_state._cfg("SYMBOLS", [])  # Priority 3
         except Exception:
             raw_syms = []
-    
+
     if not raw_syms:
         raw_syms = os.getenv("SYMBOLS", "") or ""  # Priority 2
-    
+
     # Finally fallback to DEFAULT_SYMBOLS  # Priority 4
 ```
 

@@ -153,14 +153,14 @@ Result: should_execute_healing() returns TRUE
 $ python3 diagnose_healing.py
   Free USDT: $15.00
   Positions: 38
-  
+
 # Wait 5 minutes with fix applied...
 
 # After
 $ python3 diagnose_healing.py
   Free USDT: $62.45     ← UP $47!
   Positions: 8          ← DOWN 30!
-  
+
 # Success! Now bot can trade with $60+ free capital
 ```
 

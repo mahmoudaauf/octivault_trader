@@ -125,17 +125,17 @@ allow_entry_below_significant_floor: bool = False  # guard to prevent new dust c
 async def _check_entry_floor_guard(self, symbol: str, quote_amount: float) -> Tuple[bool, str]:
     """
     Guard: Prevent opening new trades below significant floor unless explicitly allowed.
-    
+
     Args:
         symbol: Trading pair
         quote_amount: Entry amount in quote asset (USDT)
-    
+
     Returns:
         (is_allowed, reason_message)
     """
     significant_floor = float(getattr(self.config, "SIGNIFICANT_POSITION_FLOOR", 20.0))
     allow_below_floor = bool(getattr(self.shared_state, "allow_entry_below_significant_floor", False))
-    
+
     # Check if entry would be below significant floor
     if quote_amount < significant_floor:
         if not allow_below_floor:
@@ -153,7 +153,7 @@ async def _check_entry_floor_guard(self, symbol: str, quote_amount: float) -> Tu
             )
             self.logger.info(reason)
             return True, reason
-    
+
     return True, "Entry floor check passed"
 ```
 
@@ -221,12 +221,12 @@ self.dust_liquidation_enabled = getattr(config, "dust_liquidation_enabled", True
 def test_dust_liquidation_flag_consistency():
     config = Config()
     shared_state = SharedState(config=config)
-    
+
     # Check consistency
     assert hasattr(config, "dust_liquidation_enabled")
     assert hasattr(shared_state, "dust_liquidation_enabled")
     assert config.dust_liquidation_enabled == shared_state.dust_liquidation_enabled
-    
+
     # Check env override works
     os.environ["DUST_LIQUIDATION_ENABLED"] = "true"
     config2 = Config()
@@ -241,13 +241,13 @@ async def test_entry_floor_guard():
     allowed, reason = await em._check_entry_floor_guard("BTCUSDT", 15.0)
     assert allowed == False
     assert "below significant floor" in reason
-    
+
     # Test 2: Entry below floor with override → ALLOWED
     shared_state.allow_entry_below_significant_floor = True
     allowed, reason = await em._check_entry_floor_guard("BTCUSDT", 15.0)
     assert allowed == True
     assert "override enabled" in reason
-    
+
     # Test 3: Entry above floor → ALLOWED
     allowed, reason = await em._check_entry_floor_guard("BTCUSDT", 25.0)
     assert allowed == True
@@ -351,4 +351,3 @@ After implementation:
 **Review Required**: Code review + 1-hour integration test
 **Deployment**: After passing Phase 2 testing
 **Rollback Plan**: Revert commits 1-6 in reverse order
-

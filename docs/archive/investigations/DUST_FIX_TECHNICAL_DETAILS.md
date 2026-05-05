@@ -1,16 +1,16 @@
 # Dust Fix - Exact Changes Made
 
 ## Summary
-**Problem**: System creates and traps dust positions in infinite loops  
-**Solution**: 3-layer dust prevention + stuck-dust detection safety net  
-**Files Changed**: 1 file (`execution_manager.py`)  
+**Problem**: System creates and traps dust positions in infinite loops
+**Solution**: 3-layer dust prevention + stuck-dust detection safety net
+**Files Changed**: 1 file (`execution_manager.py`)
 **Lines Modified**: ~100 lines across 3 sections
 
 ---
 
 ## Change #1: Enhanced Dust Detection Logic
 
-**Location**: `/core/execution_manager.py` lines 9365-9430  
+**Location**: `/core/execution_manager.py` lines 9365-9430
 **Severity**: CRITICAL - This is the main fix
 
 ### Before (Old Code - Too Lenient)
@@ -25,7 +25,7 @@ if qty_residual_is_dust or notional_residual_is_dust:
         qty = qty_up
 ```
 
-**Problem**: 
+**Problem**:
 - Uses `residual_floor = max(min_notional, dust_floor_quote, write_down_quote)`
 - This is too high - allows micro-positions through
 - Doesn't check if we're selling 95%+ anyway (just finish the job)
@@ -34,7 +34,7 @@ if qty_residual_is_dust or notional_residual_is_dust:
 ```python
 # New: THREE independent dust detection mechanisms
 
-# Get current price for economic dust check  
+# Get current price for economic dust check
 current_price_valid = float(current_price or 0.0) > 0
 residual_notional = remainder * float(current_price) if current_price_valid else 0.0
 
@@ -46,9 +46,9 @@ residual_floor = max(float(min_notional or 0.0), dust_floor_quote, write_down_qu
 # 1. Quantity-based: remainder is tiny fraction of step
 qty_residual_is_dust = remainder > 0 and remainder < max(float(min_qty), float(step_size))
 
-# 2. ✅ NEW - Notional-based: remainder < $5 USDT (economic dust floor)  
+# 2. ✅ NEW - Notional-based: remainder < $5 USDT (economic dust floor)
 notional_residual_is_dust = (
-    residual_notional > 0 and 
+    residual_notional > 0 and
     residual_notional < dust_floor_quote  # ← KEY FIX: Use dust_floor, not residual_floor
 )
 
@@ -59,7 +59,7 @@ near_total_exit = position_pct_remaining > 0 and position_pct_remaining < 5.0
 # Round up if ANY dust condition is met
 if qty_residual_is_dust or notional_residual_is_dust or near_total_exit:
     qty_up = round_step(_raw_quantity, step_size)  # ← Changed: sell ENTIRE position
-    
+
     if qty_up <= _raw_quantity + float(step_size) * 0.01:
         self.logger.info(
             "[EM:SellRoundUp] %s: qty ROUND_UP %.8f→%.8f to avoid dust "
@@ -87,7 +87,7 @@ if qty_residual_is_dust or notional_residual_is_dust or near_total_exit:
 
 ## Change #2: Dust Tracking Initialization
 
-**Location**: `/core/execution_manager.py` lines 2110-2114  
+**Location**: `/core/execution_manager.py` lines 2110-2114
 **Severity**: MEDIUM - Safety net layer
 
 ### Added to `__init__` method:
@@ -109,7 +109,7 @@ self._dust_exit_minimum_usdt = float(self._cfg("DUST_EXIT_MINIMUM_USDT", 5.0) or
 
 ## Change #3: Stuck-Dust Detection Method
 
-**Location**: `/core/execution_manager.py` lines 3463-3520  
+**Location**: `/core/execution_manager.py` lines 3463-3520
 **Severity**: MEDIUM - Safety net automatic trigger
 
 ### New Method Added:
@@ -117,19 +117,19 @@ self._dust_exit_minimum_usdt = float(self._cfg("DUST_EXIT_MINIMUM_USDT", 5.0) or
 async def _detect_stuck_dust_position(self, symbol: str, current_price: float, remainder_qty: float) -> bool:
     """
     ✅ DUST TRAP DETECTION: Check if we're in a loop of stuck dust exits.
-    
+
     Problem: Partial exits can leave micro-remainder that never fully exits.
     If we see the same remainder 3+ times, we declare it "stuck dust" and need forced liquidation.
-    
+
     Returns: True if stuck dust detected (should force liquidate), False otherwise
     """
     if not self._dust_detection_enabled or remainder_qty <= 0:
         return False
-    
+
     try:
         sym = self._norm_symbol(symbol)
         now = time.time()
-        
+
         # Get or create dust tracker for this symbol
         if sym not in self._dust_position_tracker:
             self._dust_position_tracker[sym] = {
@@ -139,20 +139,20 @@ async def _detect_stuck_dust_position(self, symbol: str, current_price: float, r
                 "economic_threshold": current_price * remainder_qty if current_price > 0 else 0
             }
             return False
-        
+
         tracker = self._dust_position_tracker[sym]
         last_remainder = tracker.get("last_remainder", 0.0)
         stuck_count = tracker.get("stuck_count", 0)
-        
+
         # ✅ Loop detection: if remainder hasn't changed (floating point equal)
         if abs(remainder_qty - last_remainder) < 1e-10:  # Effectively equal
             stuck_count += 1
             tracker["stuck_count"] = stuck_count
             tracker["last_check_ts"] = now
-            
+
             # Calculate economic value of stuck dust
             economic_value = current_price * remainder_qty if current_price > 0 else 0
-            
+
             if stuck_count >= self._dust_stuck_threshold_cycles:
                 self.logger.warning(
                     "[DUST_TRAP] %s: Stuck on remainder %.8f (%s USDT) for %d cycles. "
@@ -170,10 +170,10 @@ async def _detect_stuck_dust_position(self, symbol: str, current_price: float, r
             tracker["last_remainder"] = remainder_qty
             tracker["last_check_ts"] = now
             tracker["economic_threshold"] = current_price * remainder_qty if current_price > 0 else 0
-    
+
     except Exception as e:
         self.logger.debug(f"[DUST_DETECTION_ERROR] {symbol}: {e}")
-    
+
     return False  # Not stuck
 ```
 
@@ -213,12 +213,12 @@ async def _detect_stuck_dust_position(self, symbol: str, current_price: float, r
 grep -n "notional_residual_is_dust" /core/execution_manager.py
 # Output: Line 9391 should show the THREE checks
 
-# 2. Verify initialization 
+# 2. Verify initialization
 grep -n "_dust_position_tracker" /core/execution_manager.py
 # Output: Should show lines 2110, 3471, etc.
 
 # 3. Verify method exists
-grep -n "_detect_stuck_dust_position" /core/execution_manager.py  
+grep -n "_detect_stuck_dust_position" /core/execution_manager.py
 # Output: Lines 3463-3520
 ```
 
@@ -287,4 +287,3 @@ Or manually edit `execution_manager.py` lines 9365-9430 back to original.
 3. 📊 **Monitor logs** for dust fix in action
 4. ✔️ **Validate** after 100+ cycles
 5. 📈 **Track improvements** in capital efficiency
-

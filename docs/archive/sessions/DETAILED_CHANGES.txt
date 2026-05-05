@@ -38,7 +38,7 @@ AFTER:
         if (...):
             liquidity_restore_sig["_bypass_min_hold"] = True  # ← ADDED
             if not self._safe_passes_min_hold(  # ← MODIFIED
-                liquidity_restore_sig.get("symbol"), 
+                liquidity_restore_sig.get("symbol"),
                 bypass=True
             ):
                 return []
@@ -62,11 +62,11 @@ AFTER:
     def _safe_passes_min_hold(self, symbol: Optional[str], bypass: bool = False) -> bool:
         """
         Safe wrapper for _passes_min_hold that handles AttributeError gracefully.
-        
+
         Args:
             symbol: Position symbol to check
             bypass: If True, skip min-hold check (for forced recovery exits)
-        
+
         Returns:
             True if exit is allowed, False if min-hold blocks it.
             Fail-open: if method doesn't exist, return True (allow the exit).
@@ -78,7 +78,7 @@ AFTER:
                 symbol
             )
             return True
-        
+
         try:
             if hasattr(self, "_passes_min_hold") and callable(...):
                 return self._passes_min_hold(symbol)
@@ -111,7 +111,7 @@ CHANGE 2 - Override Precedence Logic Refactoring (Lines ~313-340)
 ────────────────────────────────────────────────────────────────────────────────
 BEFORE:
     force_rotation = bool(...)
-    
+
     if owned_positions:
         if should_restrict and not force_rotation:
             # Block rotation
@@ -124,7 +124,7 @@ AFTER:
     PRECEDENCE: force_rotation flag overrides MICRO bracket restrictions.  ← ADDED
     """
     force_rotation = bool(...)
-    
+
     if owned_positions and not force_rotation:  ← CLARIFIED
         # PHASE C check: Only apply MICRO bracket restriction if NOT forced
         if should_restrict:
@@ -139,7 +139,7 @@ AFTER:
                 reason or "no_reason",
             )
 
-Impact: 
+Impact:
   • Clear precedence: MICRO check only applies if NOT forced
   • Explicit override branch
   • Enhanced logging with emoji indicator
@@ -170,7 +170,7 @@ MIN_ENTRY_QUOTE_USDT=25          (was 10)  ← PRIMARY CHANGE
 EMIT_BUY_QUOTE=25                (was 10)
 META_MICRO_SIZE_USDT=25          (was 10)
 
-Impact: 
+Impact:
   • All entry sizing aligned to 25 USDT floor
   • Config intent now explicit
   • Eliminates runtime normalization need
@@ -209,7 +209,7 @@ AFTER:
             required_entry_floor,
         )
 
-Impact: 
+Impact:
   • Enhanced logging provides context
   • Clarifies floor alignment strategy
   • Easier to monitor in logs

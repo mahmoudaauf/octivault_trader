@@ -1,7 +1,7 @@
 # 🎯 Strategy Parameter Optimization Guide
 
-**Document Version:** 1.0  
-**Date:** 2026-05-04  
+**Document Version:** 1.0
+**Date:** 2026-05-04
 **Status:** Analysis Complete - Ready for Implementation
 
 ---
@@ -165,7 +165,7 @@ POSITION_SIZE_PCT_NAV = 0.15  # 15% per position (aggressive for micro)
 # NEW - More Conservative:
 POSITION_SIZE_PCT_NAV = 0.10  # 10% per position for MICRO_SNIPER regime
 
-# Rationale: 
+# Rationale:
 # - Micro account: $83 NAV → 15% = $12.45 per trade
 # - With 40% win rate and $0.27 avg loss, breakeven requires 60%+ win rate
 # - Reducing to 10% = $8.30 per trade allows surviving longer until strategy improves
@@ -305,11 +305,11 @@ C3_Retraining_Schedule:
 Day 1: Implement Phase A (all quick wins)
        ↓ Run 2-4 hour session
        ↓ Measure new win rate
-       
+
 Day 2: If WR < 50%, implement Phase B (formula adjustments)
        ↓ Run 2-4 hour session
        ↓ Validate improvements
-       
+
 Day 3: If WR > 55%, scale up position size gradually
        ↓ Confirm NAV growth sustainable
        ↓ Add Phase C enhancements
@@ -356,7 +356,7 @@ Day 3: If WR > 55%, scale up position size gradually
 
 ### Scenario 2: Phase A + B (Full Optimization)
 - Win Rate: 53-58%
-- Time to Profitability: 8-12 trades  
+- Time to Profitability: 8-12 trades
 - NAV Target: $90 → $100+ in 4 hours
 
 ### Scenario 3: All Phases (Full System)

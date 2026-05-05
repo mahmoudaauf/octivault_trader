@@ -34,15 +34,15 @@ async def load_shared_state_snapshot(self) -> dict:
     try:
         query = "SELECT value FROM app_state WHERE key = 'shared_state_snapshot'"
         rows = await self.fetch_all(query)
-        
+
         if rows:
             row = rows[0]
             snapshot_json = dict(row).get('value', '{}')
             snapshot = json.loads(snapshot_json) if snapshot_json else {}
-            
+
             self.logger.debug(f"Loaded shared state snapshot from database: {list(snapshot.keys())}")
             return snapshot
-        
+
         # If no snapshot exists, return empty structure
         self.logger.debug("No shared state snapshot found in database, returning empty structure")
         return {
@@ -98,10 +98,10 @@ async def save_shared_state_snapshot(self, snapshot: dict):
     try:
         # Apply default_serializer for datetime and other non-serializable objects
         snapshot_json = json.dumps(snapshot, default=default_serializer)
-        
+
         query = "INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)"
         params = ('shared_state_snapshot', snapshot_json)
-        
+
         await self.insert_row(query, params)
         self.logger.debug(f"Shared state snapshot saved to database: {list(snapshot.keys())}")
     except Exception as e:
@@ -127,13 +127,13 @@ async def save_shared_state_snapshot(self, snapshot: dict):
 async def get_current_volatility_regime(self) -> VolatilityRegime:
     """
     Determine current market volatility regime.
-    
+
     In production, would connect to:
     - VIX data
     - Recent drawdown magnitude
     - Price volatility metrics
     - Market microstructure signals
-    
+
     For now, returns NORMAL as default.
     """
     # TODO: Implement actual volatility detection
@@ -146,13 +146,13 @@ async def get_current_volatility_regime(self) -> VolatilityRegime:
 async def get_current_volatility_regime(self) -> VolatilityRegime:
     """
     Determine current market volatility regime.
-    
+
     In production, would connect to:
     - VIX data
     - Recent drawdown magnitude
     - Price volatility metrics
     - Market microstructure signals
-    
+
     For now, returns NORMAL as default.
     """
     # Volatility detection logic:
@@ -160,24 +160,24 @@ async def get_current_volatility_regime(self) -> VolatilityRegime:
     # 2. Monitor recent portfolio drawdown
     # 3. Assess recent trade outcomes and slippage
     # 4. Use heuristic thresholds to classify regime
-    
+
     try:
         # Placeholder: In production, would analyze:
         # - Recent price swings (ATR, standard deviation)
         # - Portfolio drawdown metrics
         # - Trade execution costs (slippage)
-        
+
         # For now, use a simple heuristic:
         # If we have excessive realizing losses recently, escalate regime
         current_cash = await self.get_current_free_cash()
         total_nav = await self.get_total_portfolio_value()
-        
+
         if total_nav > 0:
             cash_ratio = current_cash / total_nav
             # If cash ratio drops below 8%, signal elevated volatility perception
             if cash_ratio < 0.08:
                 return VolatilityRegime.ELEVATED
-        
+
         # Default to normal market conditions
         return VolatilityRegime.NORMAL
     except Exception as e:
@@ -252,16 +252,16 @@ return True
 ```python
 async with self._lock:
     plan.rebalance_status = RebalanceStatus.EXECUTING
-    
+
     # TODO: Implement actual execution
     # This would involve:
     # 1. Submitting orders to MetaController or ExecutionManager
     # 2. Tracking execution status
     # 3. Verifying fills
-    
+
     plan.rebalance_status = RebalanceStatus.COMPLETED
     plan.execution_timestamp = time.time()
-    
+
     # Update metrics
     self.metrics.total_rebalances += 1
     self.metrics.successful_rebalances += 1
@@ -271,14 +271,14 @@ async with self._lock:
 ```python
 async with self._lock:
     plan.rebalance_status = RebalanceStatus.EXECUTING
-    
+
     # Execute rebalancing orders
     execution_success = await self._execute_rebalancing_orders(plan)
-    
+
     if execution_success:
         plan.rebalance_status = RebalanceStatus.COMPLETED
         plan.execution_timestamp = time.time()
-        
+
         # Update metrics
         self.metrics.total_rebalances += 1
         self.metrics.successful_rebalances += 1
@@ -297,12 +297,12 @@ async with self._lock:
 async def _execute_rebalancing_orders(self, plan: RebalancePlan) -> bool:
     """
     Execute rebalancing orders via the execution manager.
-    
+
     This implements the order submission, tracking, and verification.
-    
+
     Args:
         plan: Rebalance plan with orders to execute
-        
+
     Returns:
         bool: True if execution succeeded, False otherwise
     """
@@ -310,11 +310,11 @@ async def _execute_rebalancing_orders(self, plan: RebalancePlan) -> bool:
         if not self.execution_manager:
             self.logger.error("[RebalancingEngine] No execution manager available")
             return False
-        
+
         if not plan.rebalance_orders:
             self.logger.warning(f"[RebalancingEngine] No orders in plan {plan.plan_id}")
             return True  # Empty plan is technically successful
-        
+
         # Submit orders to the execution manager
         submitted_orders = []
         for order in plan.rebalance_orders:
@@ -328,21 +328,21 @@ async def _execute_rebalancing_orders(self, plan: RebalancePlan) -> bool:
                     price=order.price,
                     client_order_id=order.order_id
                 )
-                
+
                 if result:
                     submitted_orders.append(order.order_id)
                     self.logger.debug(f"[RebalancingEngine] Submitted order {order.order_id}: {order.symbol} {order.side}")
                 else:
                     self.logger.warning(f"[RebalancingEngine] Failed to submit order {order.order_id}")
                     return False
-                    
+
             except Exception as e:
                 self.logger.error(f"[RebalancingEngine] Error submitting order {order.order_id}: {e}")
                 return False
-        
+
         self.logger.info(f"[RebalancingEngine] Successfully submitted {len(submitted_orders)} orders for plan {plan.plan_id}")
         return True
-        
+
     except Exception as e:
         self.logger.error(f"[RebalancingEngine] Error executing rebalancing orders: {e}", exc_info=True)
         return False
@@ -367,17 +367,17 @@ async def _execute_rebalancing_orders(self, plan: RebalancePlan) -> bool:
 ```python
 async with self._lock:
     proposal.merge_status = MergeStatus.EXECUTING
-    
+
     # TODO: Implement actual merge execution
     # This would involve:
     # 1. Placing sell orders for source positions at market price
     # 2. Placing single buy order for consolidated position
     # 3. Updating position records
     # 4. Tracking execution timestamp
-    
+
     proposal.merge_status = MergeStatus.COMPLETED
     proposal.execution_timestamp = time.time()
-    
+
     # Update metrics
     self.metrics.total_merges_completed += 1
 ```
@@ -386,14 +386,14 @@ async with self._lock:
 ```python
 async with self._lock:
     proposal.merge_status = MergeStatus.EXECUTING
-    
+
     # Execute merge by consolidating positions
     execution_success = await self._execute_merge_consolidation(proposal)
-    
+
     if execution_success:
         proposal.merge_status = MergeStatus.COMPLETED
         proposal.execution_timestamp = time.time()
-        
+
         # Update metrics
         self.metrics.total_merges_completed += 1
 ```
@@ -411,16 +411,16 @@ async with self._lock:
 async def _execute_merge_consolidation(self, proposal: MergeProposal) -> bool:
     """
     Execute the merge by consolidating positions.
-    
+
     Process:
     1. Sell source positions at market price
     2. Buy consolidated position
     3. Update position records
     4. Track execution timestamp
-    
+
     Args:
         proposal: Merge proposal to execute
-        
+
     Returns:
         bool: True if successful, False otherwise
     """
@@ -428,9 +428,9 @@ async def _execute_merge_consolidation(self, proposal: MergeProposal) -> bool:
         if not self.execution_manager:
             self.logger.error("[PositionMergerEnhanced] No execution manager available")
             return False
-        
+
         symbol = proposal.symbol
-        
+
         # Step 1: Liquidate source positions
         self.logger.debug(f"[PositionMergerEnhanced] Liquidating {len(proposal.source_positions)} source positions")
         for src_pos in proposal.source_positions:
@@ -447,7 +447,7 @@ async def _execute_merge_consolidation(self, proposal: MergeProposal) -> bool:
                     self.logger.warning(f"[PositionMergerEnhanced] Failed to liquidate {src_pos.symbol}")
             except Exception as e:
                 self.logger.error(f"[PositionMergerEnhanced] Error liquidating {src_pos.symbol}: {e}")
-        
+
         # Step 2: Execute consolidated buy order
         self.logger.debug(f"[PositionMergerEnhanced] Buying consolidated position: {symbol} x {proposal.total_quantity}")
         try:
@@ -464,11 +464,11 @@ async def _execute_merge_consolidation(self, proposal: MergeProposal) -> bool:
         except Exception as e:
             self.logger.error(f"[PositionMergerEnhanced] Error buying consolidated position: {e}")
             return False
-        
+
         self.logger.info(f"[PositionMergerEnhanced] Successfully executed merge for {symbol}: "
                        f"consolidated {len(proposal.source_positions)} positions")
         return True
-        
+
     except Exception as e:
         self.logger.error(f"[PositionMergerEnhanced] Error executing merge consolidation: {e}", exc_info=True)
         return False

@@ -1,7 +1,7 @@
 # ⚡ QUICK ACTION GUIDE - Enable Trading
 
-**Current Issue:** Kill-switch blocking trades (portfolio protection mode)  
-**Solution:** Enable dust consolidation  
+**Current Issue:** Kill-switch blocking trades (portfolio protection mode)
+**Solution:** Enable dust consolidation
 **Time to Resume:** ~15-20 minutes
 
 ---

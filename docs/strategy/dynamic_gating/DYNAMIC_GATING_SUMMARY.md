@@ -135,22 +135,22 @@ else:  # STEADY_STATE
 
 ### BOOTSTRAP Phase (Strict Gates)
 ```
-[Meta:DynamicGating] phase=BOOTSTRAP, should_relax=False, gated_reasons=[], 
+[Meta:DynamicGating] phase=BOOTSTRAP, should_relax=False, gated_reasons=[],
                      success_rate=0.0%, attempts=0/2
 [LOOP_SUMMARY] decision=NONE ← No signals being generated
 ```
 
 ### INITIALIZATION Phase (Before Threshold)
 ```
-[Meta:Gating] Recorded execution: attempted=True, successful=False, 
+[Meta:Gating] Recorded execution: attempted=True, successful=False,
               total_attempts=1, total_fills=0, recent_success_rate=0.0%
-[Meta:DynamicGating] phase=INITIALIZATION, should_relax=False, 
+[Meta:DynamicGating] phase=INITIALIZATION, should_relax=False,
                      gated_reasons=[], success_rate=0.0%, attempts=1/2
 ```
 
 ### INITIALIZATION Phase (Gates Relaxing)
 ```
-[Meta:Gating] Recorded execution: attempted=True, successful=True, 
+[Meta:Gating] Recorded execution: attempted=True, successful=True,
               total_attempts=2, total_fills=1, recent_success_rate=50.0%
 [Meta:DynamicGating] phase=INITIALIZATION, should_relax=True ← GATES RELAX!
                      gated_reasons=[], success_rate=50.0%, attempts=2/2
@@ -160,7 +160,7 @@ else:  # STEADY_STATE
 
 ### STEADY_STATE Phase
 ```
-[Meta:DynamicGating] phase=STEADY_STATE, should_relax=True, 
+[Meta:DynamicGating] phase=STEADY_STATE, should_relax=True,
                      gated_reasons=[], success_rate=75.0%, attempts=15/50
 [LOOP_SUMMARY] trade_opened=True, pnl=+7.50 ← Profit accumulating
 ```
@@ -284,4 +284,3 @@ System is working correctly when you see:
 - ✅ Within 24 hours, reach `pnl=+10.00+` or higher
 
 ---
-

@@ -9,11 +9,11 @@
 
 The auto-liquidation mechanism **DOES exist** and is **FULLY IMPLEMENTED** across 5 components:
 
-1. ✅ **DeadCapitalHealer** - Identifies dust positions  
-2. ✅ **ThreeBucketManager** - Orchestrates liquidation cycles  
-3. ✅ **Three-Bucket Loop** - Runs in background every 30 minutes  
-4. ✅ **ExecutionManager** - Submits SELL orders to Binance  
-5. ✅ **Adaptive Thresholds** - Determines when to liquidate  
+1. ✅ **DeadCapitalHealer** - Identifies dust positions
+2. ✅ **ThreeBucketManager** - Orchestrates liquidation cycles
+3. ✅ **Three-Bucket Loop** - Runs in background every 30 minutes
+4. ✅ **ExecutionManager** - Submits SELL orders to Binance
+5. ✅ **Adaptive Thresholds** - Determines when to liquidate
 
 **BUT** it's blocked by decision gates that don't trigger for your account:
 - **Gate 1:** Need $100+ in dust to liquidate, you have $80 → **BLOCKED**
@@ -110,11 +110,11 @@ def should_heal(self, bucket_state: PortfolioBucketState) -> bool:
     # Gate 1: Dust threshold
     if bucket_state.dead_total_value > self.min_dead_to_heal:  # $80 > $100?
         return True  # ← YOUR ACCOUNT: NO
-    
+
     # Gate 2: Operating cash danger
     if bucket_state.operating_cash_usdt < bucket_state.operating_cash_danger_zone:  # $15 < $12?
         return True  # ← YOUR ACCOUNT: NO
-    
+
     return False  # ← YOUR ACCOUNT GETS HERE
 ```
 

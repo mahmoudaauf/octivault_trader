@@ -3,23 +3,31 @@ StateManager subsystem extracted from MetaController.
 Handles liveness, cooldowns, health, and system state transitions.
 """
 
-import time
 import asyncio as _asyncio
-from typing import Optional, Dict, Any
+import time
 from collections import defaultdict
+from typing import Any
 
 # Component Status Logger
 try:
     from src.l0_core.component_status_logger import ComponentStatusLogger as CSL
 except ImportError:
+
     class CSL:
         """Component Status Logger stub for environments without CSL available."""
+
         @staticmethod
-        def set_status(*a, **k): pass
+        def set_status(*a, **k):
+            pass
+
         @staticmethod
-        async def heartbeat(*a, **k): pass
+        async def heartbeat(*a, **k):
+            pass
+
         @staticmethod
-        def log_status(*a, **k): pass
+        def log_status(*a, **k):
+            pass
+
 
 class StateManager:
     def __init__(self, shared_state, config, logger, component_name: str = "StateManager"):
@@ -44,14 +52,14 @@ class StateManager:
             "last_executed_tick": 0,
             "deadlock_detected": False,
             "hourly_target_usdt": 20.0,
-            "error_count_by_type": defaultdict(int)
+            "error_count_by_type": defaultdict(int),
         }
         self._performance_lock = _asyncio.Lock()
-        
+
         # Policy modifiers (Soft Controllers)
         self.policy_modifiers = {"cooldown_nudge": 0.0}
 
-    def set_policy_modifiers(self, modifiers: Dict[str, Any]):
+    def set_policy_modifiers(self, modifiers: dict[str, Any]):
         """Set policy modifiers for soft control."""
         if modifiers:
             self.policy_modifiers.update(modifiers)
@@ -78,9 +86,9 @@ class StateManager:
             if symbol and side:
                 cooldown_key = f"{symbol}_{side}"
                 last_ts = self._last_execution_ts.get(cooldown_key, 0)
-                
+
                 # Base cooldown + Policy Nudge
-                base_cooldown = getattr(self.config, 'EXECUTION_COOLDOWN_SEC', 60)
+                base_cooldown = getattr(self.config, "EXECUTION_COOLDOWN_SEC", 60)
                 nudge = self.policy_modifiers.get("cooldown_nudge", 0.0)
                 cooldown_sec = max(0.0, base_cooldown + nudge)
 
@@ -88,12 +96,12 @@ class StateManager:
                     return False, f"COOLDOWN_ACTIVE_{cooldown_sec:.1f}s"
 
             # Check global execution rate limits
-            max_attempts = getattr(self.config, 'MAX_EXECUTION_ATTEMPTS_PER_CYCLE', 5)
+            max_attempts = getattr(self.config, "MAX_EXECUTION_ATTEMPTS_PER_CYCLE", 5)
             if self._execution_attempts_this_cycle >= max_attempts:
                 return False, f"MAX_ATTEMPTS_EXCEEDED_{max_attempts}"
 
             # Check circuit breaker
-            if hasattr(self.shared_state, 'is_circuit_breaker_open'):
+            if hasattr(self.shared_state, "is_circuit_breaker_open"):
                 if await self.shared_state.is_circuit_breaker_open():
                     return False, "CIRCUIT_BREAKER_OPEN"
 
@@ -120,7 +128,7 @@ class StateManager:
                     self.shared_state.system_health["StateManager"] = {
                         "status": status,
                         "detail": detail,
-                        "ts": time.time()
+                        "ts": time.time(),
                     }
         except Exception:
             self.logger.debug("Fallback update_system_health failed.", exc_info=True)
@@ -131,7 +139,7 @@ class StateManager:
             return False
 
         last_ts = self._last_execution_ts.get(symbol, 0)
-        cooldown_sec = getattr(self.config, 'SYMBOL_COOLDOWN_SEC', 300)
+        cooldown_sec = getattr(self.config, "SYMBOL_COOLDOWN_SEC", 300)
 
         return time.time() - last_ts < cooldown_sec
 
@@ -142,7 +150,7 @@ class StateManager:
             "last_execution_ts": self._last_execution_ts.copy(),
             "cooldowns": self._execution_cooldowns.copy(),
             "kpi_metrics": dict(self._kpi_metrics),  # Convert defaultdict to regular dict
-            "timestamp": time.time()
+            "timestamp": time.time(),
         }
 
     async def _health_set(self, status: str, detail: str) -> None:
@@ -156,18 +164,24 @@ class StateManager:
             if callable(fn):
                 # RULE: Use _safe_await to handle both sync and async SharedState implementations
                 from src.l0_core.core_utils import _safe_await
+
                 await _safe_await(fn(component=self.component_name, status=status, detail=detail))
             else:
                 if hasattr(self.shared_state, "system_health"):
                     if not isinstance(self.shared_state.system_health, dict):
                         self.shared_state.system_health = {}
-                    self.shared_state.system_health[self.component_name] = {"status": status, "detail": detail, "ts": time.time()}
+                    self.shared_state.system_health[self.component_name] = {
+                        "status": status,
+                        "detail": detail,
+                        "ts": time.time(),
+                    }
         except Exception:
             self.logger.debug("Fallback update_system_health failed.", exc_info=True)
         try:
             fn = getattr(self.shared_state, "update_component_status", None)
             if callable(fn):
                 from src.l0_core.core_utils import _safe_await
+
                 await _safe_await(fn(self.component_name, status, detail))
         except Exception:
             self.logger.debug("update_component_status failed.", exc_info=True)
@@ -187,9 +201,11 @@ class StateManager:
         except Exception:
             self.logger.debug("_health_set fallback failed in heartbeat.", exc_info=True)
 
-    async def _update_kpi_metrics(self, metric_type: str, value: float = 1.0, symbol: str = "") -> None:
+    async def _update_kpi_metrics(
+        self, metric_type: str, value: float = 1.0, symbol: str = ""
+    ) -> None:
         """Update KPI metrics aligned with SharedState tracking and global metrics."""
-        async with getattr(self, '_performance_lock', _asyncio.Lock()):
+        async with getattr(self, "_performance_lock", _asyncio.Lock()):
             # 1. Internal tracking
             if metric_type == "realized_pnl":
                 self._kpi_metrics["total_realized_pnl"] += value
@@ -204,6 +220,7 @@ class StateManager:
             # 2. Global metrics reporting
             try:
                 from src.l0_core.metrics import increment_counter, record_value
+
                 if metric_type == "realized_pnl":
                     record_value("realized_pnl", value)
                 else:
@@ -215,6 +232,7 @@ class StateManager:
             if hasattr(self.shared_state, "update_kpi_metric"):
                 try:
                     from src.l0_core.core_utils import _safe_await
+
                     await _safe_await(self.shared_state.update_kpi_metric(metric_type, value))
                 except Exception:
                     pass

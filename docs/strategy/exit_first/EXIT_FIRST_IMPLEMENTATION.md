@@ -13,11 +13,11 @@ async def _approve_entry_with_exit_plan(self, symbol: str, entry_price: float, e
     ONLY approve entry if ALL 4 exit pathways are viable.
     This prevents entering positions that could deadlock.
     """
-    
+
     # Calculate exit prices
     tp_price = entry_price * 1.025  # +2.5% take profit
     sl_price = entry_price * 0.985  # -1.5% stop loss
-    
+
     # Validation checks
     checks = {
         "tp_defined": tp_price > entry_price,
@@ -29,11 +29,11 @@ async def _approve_entry_with_exit_plan(self, symbol: str, entry_price: float, e
         "dust_viability": self._can_create_and_liquidate_dust(entry_size * 0.5),
         "capital_available": self.available_balance >= entry_size,
     }
-    
+
     # Log the approval reason
     all_passed = all(checks.values())
     self._log_entry_decision(symbol, entry_price, entry_size, checks, all_passed)
-    
+
     return all_passed
 ```
 
@@ -41,23 +41,23 @@ async def _approve_entry_with_exit_plan(self, symbol: str, entry_price: float, e
 ```python
 async def execute_entry(self, symbol: str, entry_price: float, entry_size: float):
     """Store the exit plan BEFORE opening position"""
-    
+
     # Validate exit plan exists
     if not await self._approve_entry_with_exit_plan(symbol, entry_price, entry_size):
         return False  # Reject entry
-    
+
     # Calculate and store exit plan
     tp_price = entry_price * 1.025
     sl_price = entry_price * 0.985
     time_exit_deadline = time.time() + (4 * 3600)  # 4 hours from now
-    
+
     # Create position object with exit plan attached
     position = {
         "symbol": symbol,
         "entry_price": entry_price,
         "entry_size": entry_size,
         "entry_time": time.time(),
-        
+
         # EXIT PLAN (stored at entry time)
         "tp_price": tp_price,
         "sl_price": sl_price,
@@ -67,10 +67,10 @@ async def execute_entry(self, symbol: str, entry_price: float, entry_size: float
         "time_executed": False,
         "exit_pathway": None,
     }
-    
+
     # Now execute the entry
     result = await self.executor.buy(symbol, entry_size, entry_price)
-    
+
     return result
 ```
 
@@ -85,48 +85,48 @@ async def execute_entry(self, symbol: str, entry_price: float, entry_size: float
 async def monitor_and_execute_exits(self):
     """
     Continuously monitor positions and execute exits when conditions met.
-    
+
     Priority order:
     1. Take Profit (capture gains first)
-    2. Stop Loss (cut losses second)  
+    2. Stop Loss (cut losses second)
     3. Time-Based Exit (safety valve at 4h)
     4. Dust Liquidation (emergency fallback)
     """
-    
+
     while True:
         try:
             # Get all active positions
             positions = self.shared_state.get_active_positions()
-            
+
             for pos in positions:
                 # Get current price
                 current_price = await self.price_feed.get_current_price(pos['symbol'])
-                
+
                 # CHECK 1: Take Profit triggered?
                 if current_price >= pos['tp_price'] and not pos['tp_executed']:
                     await self._execute_tp_exit(pos, current_price)
                     continue
-                
+
                 # CHECK 2: Stop Loss triggered?
                 if current_price <= pos['sl_price'] and not pos['sl_executed']:
                     await self._execute_sl_exit(pos, current_price)
                     continue
-                
+
                 # CHECK 3: Time exit triggered?
                 time_elapsed = time.time() - pos['entry_time']
                 if time_elapsed > (4 * 3600) and not pos['time_executed']:
                     await self._execute_time_exit(pos, current_price)
                     continue
-                
+
                 # CHECK 4: Should route to dust liquidation?
                 pos_value = current_price * pos['quantity']
                 if pos_value < 10.0 and not pos['dust_routed']:
                     await self._route_to_dust_liquidation(pos)
                     continue
-            
+
             # Sleep before next check
             await asyncio.sleep(10)  # Check every 10 seconds
-        
+
         except Exception as e:
             logger.error(f"Exit monitoring error: {e}")
             await asyncio.sleep(30)
@@ -143,13 +143,13 @@ async def _execute_tp_exit(self, pos: dict, current_price: float):
             price=current_price,
             order_type="MARKET"
         )
-        
+
         if result['status'] == 'FILLED':
             pos['tp_executed'] = True
             pos['exit_pathway'] = 'TAKE_PROFIT'
             pos['exit_price'] = current_price
             pos['exit_time'] = time.time()
-            
+
             profit = (current_price - pos['entry_price']) * pos['quantity']
             logger.info(f"✅ TP EXIT {pos['symbol']}: +${profit:.2f}")
     except Exception as e:
@@ -164,13 +164,13 @@ async def _execute_sl_exit(self, pos: dict, current_price: float):
             price=current_price,
             order_type="MARKET"
         )
-        
+
         if result['status'] == 'FILLED':
             pos['sl_executed'] = True
             pos['exit_pathway'] = 'STOP_LOSS'
             pos['exit_price'] = current_price
             pos['exit_time'] = time.time()
-            
+
             loss = (pos['entry_price'] - current_price) * pos['quantity']
             logger.warning(f"⚠️ SL EXIT {pos['symbol']}: -${loss:.2f}")
     except Exception as e:
@@ -185,13 +185,13 @@ async def _execute_time_exit(self, pos: dict, current_price: float):
             price=current_price,
             order_type="MARKET"
         )
-        
+
         if result['status'] == 'FILLED':
             pos['time_executed'] = True
             pos['exit_pathway'] = 'TIME_BASED'
             pos['exit_price'] = current_price
             pos['exit_time'] = time.time()
-            
+
             hold_time = pos['exit_time'] - pos['entry_time']
             pnl = (current_price - pos['entry_price']) * pos['quantity']
             logger.info(f"🔒 TIME EXIT {pos['symbol']}: {hold_time/3600:.1f}h, ${pnl:.2f}")
@@ -215,30 +215,30 @@ async def _route_to_dust_liquidation(self, pos: dict):
 ```python
 class Position:
     # ... existing fields ...
-    
+
     def __init__(self, symbol: str, quantity: float, entry_price: float):
         # ... existing init ...
-        
+
         # EXIT PLAN (added at entry time)
         self.tp_price: Optional[float] = None           # Take profit price
         self.sl_price: Optional[float] = None           # Stop loss price
         self.time_exit_deadline: Optional[float] = None # 4h deadline
-        
+
         self.tp_executed: bool = False
         self.sl_executed: bool = False
         self.time_executed: bool = False
         self.dust_routed: bool = False
-        
+
         self.exit_pathway: Optional[str] = None         # Which exit triggered
         self.exit_price: Optional[float] = None
         self.exit_time: Optional[float] = None
-    
+
     def set_exit_plan(self, tp_price: float, sl_price: float, time_deadline: float):
         """Set the exit plan for this position"""
         self.tp_price = tp_price
         self.sl_price = sl_price
         self.time_exit_deadline = time_deadline
-    
+
     def validate_exit_plan(self) -> bool:
         """Verify that exit plan is properly configured"""
         return all([
@@ -248,19 +248,19 @@ class Position:
             self.tp_price > self.entry_price,  # TP should be above entry
             self.sl_price < self.entry_price,  # SL should be below entry
         ])
-    
+
     def check_exit_trigger(self, current_price: float) -> Optional[str]:
         """Check which exit condition (if any) is triggered"""
-        
+
         if current_price >= self.tp_price:
             return "TAKE_PROFIT"
-        
+
         if current_price <= self.sl_price:
             return "STOP_LOSS"
-        
+
         if time.time() > self.time_exit_deadline:
             return "TIME_BASED"
-        
+
         return None
 ```
 
@@ -272,41 +272,41 @@ class Position:
 
 **Add this method:**
 ```python
-def _log_entry_decision(self, symbol: str, entry_price: float, entry_size: float, 
+def _log_entry_decision(self, symbol: str, entry_price: float, entry_size: float,
                         checks: dict, approved: bool):
     """Log detailed entry decision with all 4 exit pathways"""
-    
+
     tp_price = entry_price * 1.025
     sl_price = entry_price * 0.985
-    
+
     log_msg = f"""
     ═══════════════════════════════════════════════════════════
     ENTRY DECISION: {symbol} @ ${entry_price}
     ═══════════════════════════════════════════════════════════
-    
+
     Position Size: ${entry_size}
-    
+
     EXIT PLAN VERIFICATION:
     ├─ TP Pathway: ${tp_price:.2f} (+2.5%) - {'✅' if checks['tp_defined'] else '❌'}
     ├─ SL Pathway: ${sl_price:.2f} (-1.5%) - {'✅' if checks['sl_defined'] else '❌'}
     ├─ Time Pathway: 4 hours max hold - {'✅' if checks['time_window'] else '❌'}
     └─ Dust Pathway: Emergency liquidation viable - {'✅' if checks['dust_viability'] else '❌'}
-    
+
     SIGNAL QUALITY:
     ├─ Win Rate: {checks.get('signal_quality_rate', '?')}% - {'✅' if checks['signal_quality'] else '❌'}
     ├─ Recent Trades: {checks.get('recent_trades', '?')} - Check trend
     └─ Confidence: {checks.get('signal_confidence', '?')}
-    
+
     CAPITAL CHECK:
     ├─ Available: ${self.available_balance:.2f}
     ├─ Required: ${entry_size:.2f} - {'✅' if checks['capital_available'] else '❌'}
     └─ Utilization: {(entry_size/self.total_balance)*100:.1f}%
-    
+
     FINAL DECISION: {'✅ APPROVED' if approved else '❌ REJECTED'}
-    
+
     ═══════════════════════════════════════════════════════════
     """
-    
+
     logger.info(log_msg)
 ```
 
@@ -320,7 +320,7 @@ def _log_entry_decision(self, symbol: str, entry_price: float, entry_size: float
 ```python
 class ExitMetricsTracker:
     """Track exit pathway distribution and effectiveness"""
-    
+
     def __init__(self):
         self.exit_stats = {
             "TAKE_PROFIT": {"count": 0, "total_profit": 0, "avg_hold_time": 0},
@@ -328,22 +328,22 @@ class ExitMetricsTracker:
             "TIME_BASED": {"count": 0, "pnl": 0, "avg_hold_time": 0},
             "DUST_ROUTED": {"count": 0, "total_dust": 0},
         }
-    
+
     def record_exit(self, exit_pathway: str, entry_price: float, exit_price: float,
                    quantity: float, hold_time: float):
         """Record an exit and update statistics"""
-        
+
         pnl = (exit_price - entry_price) * quantity
-        
+
         if exit_pathway == "TAKE_PROFIT":
             self.exit_stats["TAKE_PROFIT"]["count"] += 1
             self.exit_stats["TAKE_PROFIT"]["total_profit"] += pnl
             self.exit_stats["TAKE_PROFIT"]["avg_hold_time"] = (
-                (self.exit_stats["TAKE_PROFIT"]["avg_hold_time"] * 
+                (self.exit_stats["TAKE_PROFIT"]["avg_hold_time"] *
                  (self.exit_stats["TAKE_PROFIT"]["count"] - 1) + hold_time) /
                 self.exit_stats["TAKE_PROFIT"]["count"]
             )
-        
+
         elif exit_pathway == "STOP_LOSS":
             self.exit_stats["STOP_LOSS"]["count"] += 1
             self.exit_stats["STOP_LOSS"]["total_loss"] += abs(pnl)
@@ -352,7 +352,7 @@ class ExitMetricsTracker:
                  (self.exit_stats["STOP_LOSS"]["count"] - 1) + hold_time) /
                 self.exit_stats["STOP_LOSS"]["count"]
             )
-        
+
         elif exit_pathway == "TIME_BASED":
             self.exit_stats["TIME_BASED"]["count"] += 1
             self.exit_stats["TIME_BASED"]["pnl"] += pnl
@@ -361,16 +361,16 @@ class ExitMetricsTracker:
                  (self.exit_stats["TIME_BASED"]["count"] - 1) + hold_time) /
                 self.exit_stats["TIME_BASED"]["count"]
             )
-    
+
     def get_exit_distribution(self) -> dict:
         """Returns exit pathway distribution percentages"""
         total_exits = sum(self.exit_stats[p]["count"] for p in self.exit_stats)
-        
+
         return {
             pathway: (self.exit_stats[pathway]["count"] / total_exits * 100)
             for pathway in self.exit_stats
         }
-    
+
     def print_summary(self):
         """Print exit metrics summary"""
         dist = self.get_exit_distribution()
@@ -476,4 +476,3 @@ Exit-First Strategy Validation:
 - Next trade enters at 12:30 PM
 - Pattern repeats 8+ times per day
 - Account grows steadily
-

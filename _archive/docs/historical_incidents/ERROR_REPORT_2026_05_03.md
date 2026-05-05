@@ -1,5 +1,5 @@
 # 🚨 Error & Silent Error Report
-**Date:** May 3, 2026  
+**Date:** May 3, 2026
 **Generated:** Comprehensive system error audit
 
 ---
@@ -7,8 +7,8 @@
 ## 🔴 CRITICAL ERRORS (Will Prevent Execution)
 
 ### 1. **Type Annotation Errors in `execution_manager.py`**
-**Severity:** CRITICAL  
-**Files:** `src/l4_execution/execution_manager.py`  
+**Severity:** CRITICAL
+**Files:** `src/l4_execution/execution_manager.py`
 **Lines:** 5773, 5788
 
 ```python
@@ -30,8 +30,8 @@ intent_override: Optional[PendingPositionIntent] = None,  # Line 5788
 ---
 
 ### 2. **Missing Import in `swing_trade_hunter.py`**
-**Severity:** CRITICAL  
-**File:** `agents/swing_trade_hunter.py`  
+**Severity:** CRITICAL
+**File:** `agents/swing_trade_hunter.py`
 **Line:** 32
 
 ```python
@@ -48,8 +48,8 @@ from utils.status_logger import log_component_status  # ❌ UNRESOLVED
 ---
 
 ### 3. **Missing Dependencies in Master Orchestrator**
-**Severity:** CRITICAL  
-**File:** `🎯_MASTER_SYSTEM_ORCHESTRATOR.py`  
+**Severity:** CRITICAL
+**File:** `🎯_MASTER_SYSTEM_ORCHESTRATOR.py`
 **Lines:** 1562-1563
 
 ```python
@@ -67,7 +67,7 @@ from fastapi import FastAPI as _FastAPI  # ❌ NOT INSTALLED
 ---
 
 ### 4. **Invalid Filename with Special Characters**
-**Severity:** CRITICAL  
+**Severity:** CRITICAL
 **File:** `🎯_MASTER_SYSTEM_ORCHESTRATOR.py` (emoji in filename)
 
 ```python
@@ -88,8 +88,8 @@ from 🎯_MASTER_SYSTEM_ORCHESTRATOR import MasterSystemOrchestrator  # INVALID 
 ## 🟠 MAJOR RUNTIME ERRORS (Silent Failures)
 
 ### 5. **TrendHunter Missing Implementation**
-**Severity:** MAJOR (Silent Error)  
-**File:** `agents/trend_hunter.py`  
+**Severity:** MAJOR (Silent Error)
+**File:** `agents/trend_hunter.py`
 **Pattern in logs:**
 
 ```
@@ -114,7 +114,7 @@ from 🎯_MASTER_SYSTEM_ORCHESTRATOR import MasterSystemOrchestrator  # INVALID 
 ---
 
 ### 6. **Deadlock Detection - PRETRADE_EFFECT_GATE:NET_PCT_BELOW_THRESHOLD**
-**Severity:** CRITICAL (Cascading Silent Failure)  
+**Severity:** CRITICAL (Cascading Silent Failure)
 **Pattern in logs:**
 
 ```
@@ -140,7 +140,7 @@ ERROR [PerformanceEvaluator] [PerfEval:Deadlock] DEADLOCK: Symbol stuck with 132
 
 **Impact on System:**
 - ✅ Generates signals: Working
-- ✅ Signal caching: Working  
+- ✅ Signal caching: Working
 - ✅ Market data: Working
 - ❌ **Trade execution**: COMPLETELY BLOCKED (132 rejections)
 - ❌ **Portfolio**: Stuck in cash (not deploying capital)
@@ -158,7 +158,7 @@ The system doesn't crash. It appears "healthy" in logs:
 ---
 
 ### 7. **Performance Evaluator Deadlock Warning (Not Critical but Important)**
-**Severity:** MAJOR  
+**Severity:** MAJOR
 **In logs:**
 
 ```
@@ -172,7 +172,7 @@ The system doesn't crash. It appears "healthy" in logs:
 ## 🟡 SILENT ERRORS (System Running But Not Optimal)
 
 ### 8. **Missing Required Imports in Utility Scripts**
-**Severity:** MEDIUM  
+**Severity:** MEDIUM
 **Files:**
 - `diagnose_healing.py` - line 23: Missing `src.l0_core.exchange_client`
 - `force_liquidate_dust.py` - line 138: Missing `src.l0_core.exchange_client`
@@ -182,14 +182,14 @@ The system doesn't crash. It appears "healthy" in logs:
 ---
 
 ### 9. **Log File Size Growing Unbounded**
-**Severity:** MEDIUM  
+**Severity:** MEDIUM
 **Evidence:**
 ```
 ./logs/agents/dipsniper.log      -  9.0M (abnormally large)
 ./logs/agents/trendhunter.log    - 53M  (extremely large!)
 ```
 
-**Issue:** 
+**Issue:**
 - Logs are not rotating (or rotation is broken)
 - TrendHunter log is 53MB with repeated warnings
 - Disk space will fill up over time
@@ -203,7 +203,7 @@ The system doesn't crash. It appears "healthy" in logs:
 ---
 
 ### 10. **Empty Log Files**
-**Severity:** LOW  
+**Severity:** LOW
 **Evidence:**
 ```
 ./logs/agents/swingtradehunter.log  - 0B (empty!)
@@ -235,7 +235,7 @@ The system doesn't crash. It appears "healthy" in logs:
 23:01:33 → MetaController: "Signal cached" ✓
 23:01:33 → RiskManager: "Expected profit = 0.04%" ❌
 23:01:33 → Gate: "0.04% < 0.06% threshold → BLOCKED"
-          
+
 23:01:38 → SwingTradeHunter: "BUY BTCUSDT (confidence=0.65)" (same signal again)
 23:01:38 → MetaController: "Signal cached" ✓
 23:01:38 → RiskManager: "Expected profit = 0.04%" ❌

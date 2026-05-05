@@ -22,7 +22,7 @@ The hardcoded symbols in `bootstrap_symbols.py` are merely a **fallback** when t
 
 ## 1. SymbolManager - Core Dynamic Discovery
 
-**File**: `core/symbol_manager.py` (1,162 lines)  
+**File**: `core/symbol_manager.py` (1,162 lines)
 **Purpose**: Real-time symbol discovery and validation from exchange
 
 ### Key Features
@@ -34,30 +34,30 @@ async def initialize_symbols(self) -> None:
     """
     # Step 1: Run all discovery agents
     discovered = await self.run_discovery_agents()
-    
+
     # Step 2: Pre-filter candidates
     prelim_map = self.filter_pipeline(discovered)
-    
+
     # Step 3: Validate each symbol
     validated = await self._validate_symbols_concurrently()
-    
+
     # Step 4: Safety guard against universe collapse
     if len(validated) > 10 and len(current) <= 1:
         "🛡️ PANIC GUARD: Refusing collapse of healthy universe"
         return
-    
+
     # Step 5: Commit to SharedState
     await self._safe_set_accepted_symbols(validated)
 ```
 
 ### What It Discovers
 
-✅ **Format Validation**: Ensures symbol matches pair pattern (e.g., `XXXUSDT`)  
-✅ **Exchange Status**: Only TRADING symbols, spot trading allowed  
-✅ **Volume Filters**: Minimum 24h volume threshold (configurable)  
-✅ **Base/Quote Validation**: Quote asset must be BASE_CURRENCY (USDT)  
-✅ **Leveraged Token Filter**: Excludes BULL/BEAR/UP/DOWN tokens  
-✅ **Blacklist Support**: Config-driven symbol exclusion  
+✅ **Format Validation**: Ensures symbol matches pair pattern (e.g., `XXXUSDT`)
+✅ **Exchange Status**: Only TRADING symbols, spot trading allowed
+✅ **Volume Filters**: Minimum 24h volume threshold (configurable)
+✅ **Base/Quote Validation**: Quote asset must be BASE_CURRENCY (USDT)
+✅ **Leveraged Token Filter**: Excludes BULL/BEAR/UP/DOWN tokens
+✅ **Blacklist Support**: Config-driven symbol exclusion
 
 ### Configuration-Driven
 
@@ -76,7 +76,7 @@ discovery_accept_new_symbols = True             # Allow new additions
 
 ## 2. DiscoveryCoordinator - Multi-Agent Aggregation
 
-**File**: `core/discovery_coordinator.py` (535 lines)  
+**File**: `core/discovery_coordinator.py` (535 lines)
 **Purpose**: Centralize proposals from multiple discovery agents
 
 ### Architecture
@@ -103,7 +103,7 @@ SymbolManager._collect_candidates()
 async def collect_and_deduplicate(self) -> Dict[str, Dict[str, Any]]:
     """
     Collects proposals from all agents and deduplicates.
-    
+
     Returns:
         { "BTCUSDT": {"source": "screener", "confidence": 0.85}, ... }
     """
@@ -137,10 +137,10 @@ DISCOVERY_QUALITY_THRESHOLD = 0.3           # Confidence floor
 
 ### What It Does
 
-✅ **Regime Detection**: Identifies market mood (BULLISH, BEARISH, NEUTRAL)  
-✅ **Volume Anomalies**: Finds symbols with unusual trading activity  
-✅ **Trend Detection**: Discovers trending assets dynamically  
-✅ **Volatility Adaptation**: Adjusts screening based on market volatility  
+✅ **Regime Detection**: Identifies market mood (BULLISH, BEARISH, NEUTRAL)
+✅ **Volume Anomalies**: Finds symbols with unusual trading activity
+✅ **Trend Detection**: Discovers trending assets dynamically
+✅ **Volatility Adaptation**: Adjusts screening based on market volatility
 
 ### Example Logic
 
@@ -149,11 +149,11 @@ DISCOVERY_QUALITY_THRESHOLD = 0.3           # Confidence floor
 if regime == "BULLISH":
     # Look for strong gainers
     candidates = get_symbols_with_gains(gain_threshold=2%)
-    
+
 elif regime == "BEARISH":
     # Look for recovery opportunities
     candidates = get_symbols_with_losses(loss_threshold=5%)
-    
+
 elif regime == "NEUTRAL":
     # Look for mean reversion plays
     candidates = get_symbols_with_volatility(vol_min=2%, vol_max=5%)
@@ -167,10 +167,10 @@ elif regime == "NEUTRAL":
 
 ### What It Does
 
-✅ **Portfolio Analysis**: Scans your holdings for tradable assets  
-✅ **Regime-Adaptive Intervals**: Adjusts scan frequency by market conditions  
-✅ **Allocation-Based Selection**: Prioritizes high-capital symbols  
-✅ **Profit Lock Opportunities**: Finds symbols near take-profit levels  
+✅ **Portfolio Analysis**: Scans your holdings for tradable assets
+✅ **Regime-Adaptive Intervals**: Adjusts scan frequency by market conditions
+✅ **Allocation-Based Selection**: Prioritizes high-capital symbols
+✅ **Profit Lock Opportunities**: Finds symbols near take-profit levels
 
 ### Configuration
 
@@ -189,10 +189,10 @@ WALLET_SCAN_INTERVAL_CALM = 600        # 10 minutes in calm market
 
 ### What It Does
 
-✅ **New Listing Detection**: Identifies newly added pairs  
-✅ **Volatility Awareness**: Waits for liquidity before trading  
-✅ **Listing Time Tracking**: Records when pair was listed  
-✅ **Volume Validation**: Ensures minimum volume before entry  
+✅ **New Listing Detection**: Identifies newly added pairs
+✅ **Volatility Awareness**: Waits for liquidity before trading
+✅ **Listing Time Tracking**: Records when pair was listed
+✅ **Volume Validation**: Ensures minimum volume before entry
 
 ### Configuration
 
@@ -207,7 +207,7 @@ IPO_VOLATILITY_THRESHOLD = 3.0         # Max volatility %
 
 ## 6. SymbolRotation - Dynamic Symbol Cycling
 
-**File**: `core/symbol_rotation.py` (307 lines)  
+**File**: `core/symbol_rotation.py` (307 lines)
 **Purpose**: Automatically rotate trading symbols based on performance
 
 ### Key Feature: Soft Bootstrap Lock
@@ -255,15 +255,15 @@ MIN_ACTIVE_SYMBOLS = 3              # Always at least 3
 
 ## 7. CapitalSymbolGovernor - Smart Allocation
 
-**File**: `core/capital_symbol_governor.py`  
+**File**: `core/capital_symbol_governor.py`
 **Purpose**: Dynamically allocate symbols based on available capital
 
 ### What It Does
 
-✅ **Capital-Aware Selection**: Chooses symbols based on available funds  
-✅ **Position Limiting**: Enforces max concurrent positions per symbol  
-✅ **Micro/Small/Mid Bracket Detection**: Adjusts position sizing  
-✅ **Rotation Based on Capital**: Rotates symbols as capital fluctuates  
+✅ **Capital-Aware Selection**: Chooses symbols based on available funds
+✅ **Position Limiting**: Enforces max concurrent positions per symbol
+✅ **Micro/Small/Mid Bracket Detection**: Adjusts position sizing
+✅ **Rotation Based on Capital**: Rotates symbols as capital fluctuates
 
 ### Decision Logic
 
@@ -274,11 +274,11 @@ total_capital = get_total_balance()
 if total_capital < $100:
     # Micro bracket - 2-3 symbols max
     active_symbols = select_3_best_symbols()
-    
+
 elif total_capital < $1000:
     # Small bracket - 4-5 symbols
     active_symbols = select_5_best_symbols()
-    
+
 elif total_capital > $10000:
     # Mid bracket - 8-10 symbols
     active_symbols = select_10_best_symbols()

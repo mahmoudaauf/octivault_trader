@@ -1,14 +1,14 @@
 # 🔧 IMPLEMENTATION GUIDE: Symbol Churn Fix (Parts 6-10)
 
-**Execution Time:** ~35-45 minutes  
-**Complexity:** Medium (5 files to edit)  
+**Execution Time:** ~35-45 minutes
+**Complexity:** Medium (5 files to edit)
 **Risk Level:** Low (gating logic only, no core trade changes)
 
 ---
 
 ## PART 6: Add Proven Symbols to Config
 
-**File:** `src/l0_core/config.py`  
+**File:** `src/l0_core/config.py`
 **Lines:** Around line 600-650 (in capital allocation section)
 
 **Add this block:**
@@ -48,7 +48,7 @@ python3 -c "from src.l0_core.config import Config; c = Config(); print(f'PROVEN:
 
 ## PART 7: Add Symbol Gating to SymbolScreener
 
-**File:** `agents/symbol_screener.py`  
+**File:** `agents/symbol_screener.py`
 **Location:** After the `_propose()` method
 
 **Add this method:**
@@ -58,7 +58,7 @@ def _should_accept_symbol(self, symbol: str) -> bool:
     """
     Gate new symbols based on convergence rules.
     Prevents trading untested symbols during healing cycles.
-    
+
     FIX #7 - Symbol Screener Gating
     """
     # Import here to avoid circular imports
@@ -67,30 +67,30 @@ def _should_accept_symbol(self, symbol: str) -> bool:
         cfg = Config()
     except:
         return True  # Fallback to old behavior if config load fails
-    
+
     # Is convergence mode enabled?
     if not getattr(cfg, 'SYMBOL_CONVERGENCE_MODE', False):
         return True  # Old behavior: accept all symbols
-    
+
     # Is it a proven winner?
     proven = getattr(cfg, 'PROVEN_SYMBOLS', {})
     if symbol in proven:
         return True  # Always accept proven symbols
-    
+
     # Check if symbol is on exclusion list
     if symbol in getattr(cfg, 'EXCLUDED_SYMBOLS', {}):
         return False  # Never propose excluded symbols
-    
+
     # Count current experimental (non-proven) symbols in accepted list
     current_experimental = [
         s for s in self.accepted_symbols
         if s not in proven
     ]
-    
+
     max_experimental = getattr(cfg, 'CONVERGENCE_MAX_EXPERIMENTAL_SYMBOLS', 2)
     if len(current_experimental) >= max_experimental:
         return False  # Already at max experiments
-    
+
     # New symbol: check quality metrics
     try:
         atr_pct = self._atr_pct(symbol)
@@ -98,7 +98,7 @@ def _should_accept_symbol(self, symbol: str) -> bool:
             return False
     except:
         pass
-    
+
     # Seems reasonable - allow (but limited to 1-2 concurrent)
     return True
 
@@ -110,13 +110,13 @@ def _propose(self, **kwargs):
     """
     # Original proposal logic (from parent class)
     proposals = super()._propose(**kwargs)  # Call original
-    
+
     # Filter proposals through gating logic
     gated_proposals = {}
     for symbol, data in proposals.items():
         if self._should_accept_symbol(symbol):
             gated_proposals[symbol] = data
-    
+
     return gated_proposals
 ```
 
@@ -129,7 +129,7 @@ python3 -c "from agents.symbol_screener import SymbolScreener; ss = SymbolScreen
 
 ## PART 8: Add Capital Allocation by Symbol Quality
 
-**File:** Agent files (e.g., `agents/swing_trade_hunter.py` or main trading loop)  
+**File:** Agent files (e.g., `agents/swing_trade_hunter.py` or main trading loop)
 **Location:** In `get_position_size()` or `calculate_capital_allocation()` method
 
 **Add or modify:**
@@ -138,19 +138,19 @@ python3 -c "from agents.symbol_screener import SymbolScreener; ss = SymbolScreen
 def get_available_capital_for_symbol(self, symbol: str, total_capital: float) -> float:
     """
     Allocate capital based on whether symbol is proven or experimental.
-    
+
     FIX #8 - Capital Allocation Discipline
     """
     from src.l0_core.config import Config
-    
+
     cfg = Config()
     proven = getattr(cfg, 'PROVEN_SYMBOLS', {})
-    
+
     # 80% of capital goes to proven symbols
     allocation_proven = 0.80
     # 20% of capital goes to experimental symbols
     allocation_experimental = 0.20
-    
+
     if symbol in proven:
         # Proven symbols share 80% equally
         num_proven = len(proven)
@@ -178,7 +178,7 @@ position_size = capital_for_symbol / entry_price
 
 ## PART 9: Add New Symbol Throttling
 
-**File:** `agents/symbol_screener.py`  
+**File:** `agents/symbol_screener.py`
 **Location:** In `__init__()` and modify `discover_new_symbols()` method
 
 **Add to `__init__()`:**
@@ -195,39 +195,39 @@ self.symbol_add_dates = {}  # symbol -> date added
 def discover_new_symbols(self, **kwargs):
     """
     Discover new symbols with daily throttling.
-    
+
     FIX #9 - New Symbol Throttling
     """
     from src.l0_core.config import Config
     from datetime import datetime, timedelta
-    
+
     cfg = Config()
     max_per_day = getattr(cfg, 'CONVERGENCE_MAX_NEW_SYMBOLS_PER_DAY', 1)
-    
+
     # Count how many NEW symbols were added today
     today = datetime.now().date()
     new_today = sum(
         1 for sym, date_added in self.symbol_add_dates.items()
         if date_added == today
     )
-    
+
     # If we've hit the daily limit, don't discover new symbols
     if new_today >= max_per_day:
         # Log and return empty
         self.logger.info(f"Daily new symbol limit hit ({max_per_day}/day)")
         return {}
-    
+
     # Otherwise, proceed with discovery (but limited to 1)
     candidates = self._find_candidates(**kwargs)
     new_candidates = [s for s in candidates if s not in self.accepted_symbols]
-    
+
     # Only return 1 new symbol
     if new_candidates:
         selected = new_candidates[0]
         self.new_symbol_timestamps[selected] = datetime.now()
         self.symbol_add_dates[selected] = today
         return {selected: candidates[selected]}
-    
+
     return {}
 ```
 
@@ -235,7 +235,7 @@ def discover_new_symbols(self, **kwargs):
 
 ## PART 10: Create Exclusion List
 
-**File:** `src/l0_core/config.py`  
+**File:** `src/l0_core/config.py`
 **Location:** Near the proven symbols (around line 600-650)
 
 **Add this block:**
@@ -313,9 +313,9 @@ def validate():
     print("=" * 80)
     print("VALIDATING SYMBOL CHURN FIXES (Parts 6-10)")
     print("=" * 80)
-    
+
     errors = []
-    
+
     # Check Part 6: Config
     print("\n[Part 6] Checking config.py...")
     try:
@@ -329,7 +329,7 @@ def validate():
     except Exception as e:
         errors.append(f"Part 6 failed: {e}")
         print(f"   ❌ {e}")
-    
+
     # Check Part 7: SymbolScreener
     print("\n[Part 7] Checking symbol_screener.py...")
     try:
@@ -340,7 +340,7 @@ def validate():
     except Exception as e:
         errors.append(f"Part 7 failed: {e}")
         print(f"   ❌ {e}")
-    
+
     # Check Part 8: Capital allocation
     print("\n[Part 8] Checking capital allocation...")
     try:
@@ -348,7 +348,7 @@ def validate():
         print("   ⚠️  Manual check required - look for get_available_capital_for_symbol() method")
     except Exception as e:
         print(f"   ⚠️  {e}")
-    
+
     # Check Part 9: Throttling
     print("\n[Part 9] Checking throttling...")
     try:
@@ -359,7 +359,7 @@ def validate():
     except Exception as e:
         errors.append(f"Part 9 failed: {e}")
         print(f"   ❌ {e}")
-    
+
     # Check Part 10: Exclusion
     print("\n[Part 10] Checking exclusion list...")
     try:
@@ -371,7 +371,7 @@ def validate():
     except Exception as e:
         errors.append(f"Part 10 failed: {e}")
         print(f"   ❌ {e}")
-    
+
     print("\n" + "=" * 80)
     if errors:
         print(f"❌ VALIDATION FAILED ({len(errors)} errors)")
@@ -429,7 +429,7 @@ python3 validate_churn_fix.py
    # Kill current process
    pkill -f "master_orchestrator.py"
    sleep 5
-   
+
    # Start fresh
    python3 master_orchestrator.py
    ```
@@ -441,7 +441,6 @@ python3 validate_churn_fix.py
 
 ---
 
-**Status:** Ready for implementation  
-**Time Estimate:** 35-45 minutes  
+**Status:** Ready for implementation
+**Time Estimate:** 35-45 minutes
 **Expected Gain:** +$5-15/day (from reducing symbol churn)
-

@@ -79,7 +79,7 @@ Flow Now:
 
 No More Hanging!
 ├─ WebSocket connects immediately
-├─ Market data flows continuously  
+├─ Market data flows continuously
 ├─ Trade pipeline active
 └─ Zero initialization delays
 ```

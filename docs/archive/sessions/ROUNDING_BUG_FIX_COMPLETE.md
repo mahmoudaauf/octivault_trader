@@ -1,15 +1,15 @@
 # ROUNDING BUG FIX - COMPLETED
 
-**Date:** April 28, 2026  
-**Status:** ✅ FIXED  
+**Date:** April 28, 2026
+**Status:** ✅ FIXED
 **Commit:** [Pending - see below]
 
 ---
 
 ## 🎯 THE BUG
 
-**Location:** `core/execution_manager.py`, lines 9850-9920  
-**Symptom:** When detecting dust during SELL, system logs "ROUND_UP" but doesn't actually round up  
+**Location:** `core/execution_manager.py`, lines 9850-9920
+**Symptom:** When detecting dust during SELL, system logs "ROUND_UP" but doesn't actually round up
 **Result:** Position 210.898 DOGE sold as 210.0 DOGE, leaving 0.898 DOGE stuck
 
 **Log from 00:10:06.851:**
@@ -27,7 +27,7 @@
 
 ### **Issue #1: `round_step()` function always rounds DOWN**
 
-**File:** `core/execution_manager.py`, line 41  
+**File:** `core/execution_manager.py`, line 41
 **Code:**
 ```python
 def round_step(value: float, step: float) -> float:
@@ -43,7 +43,7 @@ When dust is detected, code tries to call `round_step(_raw_quantity, step_size)`
 
 ### **Issue #2: Dust rounding logic calls without direction**
 
-**File:** `core/execution_manager.py`, line 9915  
+**File:** `core/execution_manager.py`, line 9915
 **Code:**
 ```python
 qty_up = round_step(_raw_quantity, step_size)  # Always rounds DOWN!
@@ -71,18 +71,18 @@ def round_step(value: float, step: float) -> float:
 def round_step(value: float, step: float, direction: str = "down") -> float:
     """
     Round a value to the nearest multiple of step_size.
-    
+
     Args:
         value: The value to round
         step: The step size (e.g., 0.00001 for DOGE)
         direction: "down" (ROUND_DOWN) or "up" (ROUND_UP)
-    
+
     Returns:
         Rounded value
     """
     if step <= 0:
         return float(value)
-    
+
     rounding_mode = ROUND_UP if direction.lower() == "up" else ROUND_DOWN
     q = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=rounding_mode)
     return float(q * Decimal(str(step)))
@@ -108,7 +108,7 @@ if qty_residual_is_dust or notional_residual_is_dust or near_total_exit:
 if qty_residual_is_dust or notional_residual_is_dust or near_total_exit:
     # 🎯 FIX: Actually round UP to include the dust remainder
     qty_up = round_step(_raw_quantity, step_size, direction="up")  # FIXED: Rounds UP
-    
+
     # Safety: ensure we're actually rounding UP
     if qty_up >= _raw_quantity and qty_up <= _raw_quantity + float(step_size) * 1.1:
         self.logger.info(...)
@@ -210,13 +210,13 @@ def test_round_step_with_direction():
     # Test rounding DOWN (default)
     assert round_step(210.898, 1.0) == 210.0
     assert round_step(210.898, 1.0, direction="down") == 210.0
-    
+
     # Test rounding UP (new)
     assert round_step(210.898, 1.0, direction="up") == 211.0
-    
+
     # Test with DOGE step size
     assert round_step(0.898, 0.001, direction="up") == 0.899
-    
+
     # Edge case: already aligned
     assert round_step(210.0, 1.0, direction="up") == 210.0
     assert round_step(210.0, 1.0, direction="down") == 210.0
@@ -282,7 +282,7 @@ grep "EM:SellRoundUp:ERROR" logs/system_*.log
 
 ## 🚀 NEXT STEPS
 
-1. **Commit this fix:** 
+1. **Commit this fix:**
    ```bash
    git add core/execution_manager.py
    git commit -m "Fix: Rounding bug in DUST exit - now actually rounds UP to include dust"
@@ -307,4 +307,3 @@ grep "EM:SellRoundUp:ERROR" logs/system_*.log
 | **Breaking Changes** | ❌ NONE | All existing calls still work |
 | **Testing Needed** | ✅ YES | Unit + integration tests recommended |
 | **Production Ready** | ✅ AFTER TESTING | Ready once tests pass |
-

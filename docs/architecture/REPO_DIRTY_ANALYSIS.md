@@ -50,7 +50,7 @@ Untracked files (not staged):
   models/mlforecaster_AAVEUSDT_5m_metadata.pkl
   models/mlforecaster_APTUSDT_5m_metadata.pkl
   ... (35+ mlforecaster files)
-  
+
   models/trendhunter_BTCUSDT_5m_metadata.pkl
   models/trendhunter_ETHUSDT_5m_metadata.pkl
   ... (65+ trendhunter files)
@@ -211,5 +211,5 @@ The "dirty" feeling is from:
 
 ---
 
-**Generated:** April 24, 2026  
+**Generated:** April 24, 2026
 **Next Step:** Run cleanup script or see REPO_CLEANUP_ANALYSIS.md for detailed guide

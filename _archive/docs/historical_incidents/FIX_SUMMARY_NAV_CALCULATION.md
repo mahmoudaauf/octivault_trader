@@ -2,14 +2,14 @@
 
 ## Problem Statement
 **The bot couldn't grow capital because:**
-1. ✅ WebSocket market data was hanging with "No symbols to subscribe, waiting..."  
+1. ✅ WebSocket market data was hanging with "No symbols to subscribe, waiting..."
 2. ✅ Real-time balance updates were missing (bot tracking $99.57, actual $103.91)
 3. ❌ **[CRITICAL] NAV calculation was broken** - Only counting USDT, ignoring all other assets
 
 ## Root Cause Analysis
 
 ### Issue #1: WebSocket Initialization Gap
-**Symptom:** Bot stuck on `[WS:Connect] No symbols to subscribe, waiting...`  
+**Symptom:** Bot stuck on `[WS:Connect] No symbols to subscribe, waiting...`
 **Root Cause:** `_symbols_subscribed` set was empty, no auto-subscription from SharedState
 
 **Fix Applied:** Three-layer WebSocket subscription
@@ -22,9 +22,9 @@
 
 ---
 
-### Issue #2: Stale Balance Tracking  
-**Symptom:** Bot showed $99.55, actual account had $103.91 (+$4.36 missing)  
-**Root Cause:** Balance was fetched once at startup and never updated  
+### Issue #2: Stale Balance Tracking
+**Symptom:** Bot showed $99.55, actual account had $103.91 (+$4.36 missing)
+**Root Cause:** Balance was fetched once at startup and never updated
 
 **Fix Applied:** Real-time balance synchronization module
 ```python
@@ -37,12 +37,12 @@
 
 ---
 
-### Issue #3: **[CRITICAL] NAV Calculation Bug**  
-**Symptom:** `get_nav_quote()` calculating NAV = $20.02 instead of $103.90  
+### Issue #3: **[CRITICAL] NAV Calculation Bug**
+**Symptom:** `get_nav_quote()` calculating NAV = $20.02 instead of $103.90
 **Root Cause:** Function tried to look up prices in `latest_prices` dict, which was EMPTY
 - It would iterate through BTC, ETH, DOGE, etc.
 - Call `latest_prices.get("BTCUSDT")` → Returns 0.0 (not in dict)
-- Skips asset with log "no price feed for BTCUSDT"  
+- Skips asset with log "no price feed for BTCUSDT"
 - Result: NAV = only USDT free balance = $20.02
 
 **The Money Disappeared:** All $83.88 of invested capital was being ignored!
@@ -51,13 +51,13 @@
 ```python
 # When calculating NAV for each asset:
 # 1. Try: latest_prices dict (real-time feed)
-# 2. Try: _price_cache (WebSocket cache tuple) 
+# 2. Try: _price_cache (WebSocket cache tuple)
 # 3. Try: Position entry price (last known price)
 # 4. Skip: Only if ALL three sources empty
 
 # Result: NAV now correctly includes:
 # - $20.02 USDT free
-# - $26 ETH position  
+# - $26 ETH position
 # - $15 DOGE position
 # - ... all other asset positions
 # = $103.90 total
@@ -114,7 +114,7 @@ Cycle 2 (After 15 min):
   - NAV: $93.10 + $11.00 + holdings = $104.10 ✅ GREW $0.20
   - Signal: SELL DOGEUSDT (target reached)
   - Execute: Sell 100 DOGE @ $0.110 = $11.00 recovered
-  
+
 After Trade:
   - NAV: $104.10 USDT + holdings = $104.10 ✅ CAPITAL LOCKED IN
   - Profit: $0.20 ✓ Successful trade
@@ -170,7 +170,7 @@ After Trade:
 ### Test 1: WebSocket Connection ✅
 ```
 ✓ WebSocket connects to Binance
-✓ Auto-subscribes to 10 trading symbols  
+✓ Auto-subscribes to 10 trading symbols
 ✓ Receives price updates
 ✓ Handles disconnections gracefully
 ```
@@ -199,7 +199,7 @@ After: Bot sees $103.90 (100% visibility)
 Asset breakdown:
   - USDT free: $20.02
   - BTC holdings: ~$2.50 value
-  - ETH holdings: ~$26.00 value  
+  - ETH holdings: ~$26.00 value
   - DOGE holdings: ~$53.00 value
   - Other: ~$2.38 value
   Total: $103.90 ✓
@@ -225,7 +225,7 @@ bash check_balance_growth.sh
 
 # Shows current growth status
 # Starting Balance: $103.85
-# Current Balance:  $103.90  
+# Current Balance:  $103.90
 # ✅ GROWING: +$0.05 (+0.05%)
 ```
 
@@ -236,7 +236,7 @@ bash check_balance_growth.sh
 With these three fixes in place, the bot can now:
 
 1. **See Real-Time Prices** ← WebSocket fix
-2. **Know Current Balance** ← BalanceSync fix  
+2. **Know Current Balance** ← BalanceSync fix
 3. **Calculate Accurate NAV** ← NAV calculation fix
 
 **Result:** Capital can now grow through profitable trades!

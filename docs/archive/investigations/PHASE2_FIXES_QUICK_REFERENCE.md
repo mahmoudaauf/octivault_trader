@@ -87,21 +87,21 @@ python3 verify_fixes_detailed.py
 ```
 [Meta:SafeMinHold] Bypassing min-hold check for forced recovery exit: ETHUSDT
 ```
-When: Capital drops below strategic reserve  
+When: Capital drops below strategic reserve
 Frequency: 1-3 times per hour if capital is strained
 
 ### Pattern 2: Fix #2 Active (Rotation Override)
 ```
 [REA:authorize_rotation] ⚠️ MICRO restriction OVERRIDDEN for BTCUSDT due to forced rotation
 ```
-When: MICRO account needs to rotate  
+When: MICRO account needs to rotate
 Frequency: Every 5-30 minutes if in MICRO regime
 
 ### Pattern 3: Fix #3 Active (Entry Sizing)
 ```
 [Execution] Submitting BUY order: ETHUSDT @ quantity 0.05 (quote: 25.00)
 ```
-When: Any BUY order  
+When: Any BUY order
 Frequency: 3-12 times per hour (depending on regime)
 
 ---
@@ -161,14 +161,14 @@ curl http://localhost:8000/positions
 
 ## ✨ SUCCESS INDICATORS
 
-✅ Bot starts without errors  
-✅ Initialization completes in 60-90 seconds  
-✅ First BUY order within 5-10 minutes  
-✅ Entry size consistently ~25 USDT  
-✅ No repeated error messages  
-✅ Trading cycles visible in logs  
-✅ Recovery exits when capital drops  
-✅ Rotation overrides when needed  
+✅ Bot starts without errors
+✅ Initialization completes in 60-90 seconds
+✅ First BUY order within 5-10 minutes
+✅ Entry size consistently ~25 USDT
+✅ No repeated error messages
+✅ Trading cycles visible in logs
+✅ Recovery exits when capital drops
+✅ Rotation overrides when needed
 
 ---
 
@@ -213,9 +213,9 @@ Ready for production! 🚀
 
 ---
 
-**Version:** Quick Reference v1.0  
-**Status:** ✅ READY TO USE  
-**Date:** April 27, 2026  
+**Version:** Quick Reference v1.0
+**Status:** ✅ READY TO USE
+**Date:** April 27, 2026
 
-**Last Updated:** 20:40 UTC  
-**Created:** April 27, 2026  
+**Last Updated:** 20:40 UTC
+**Created:** April 27, 2026

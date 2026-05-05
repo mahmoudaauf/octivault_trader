@@ -1,7 +1,7 @@
 # Fix Execution Summary
 
-**Date:** 2024 (Session 3)  
-**Status:** ✅ ALL FIXES APPLIED SUCCESSFULLY  
+**Date:** 2024 (Session 3)
+**Status:** ✅ ALL FIXES APPLIED SUCCESSFULLY
 **Syntax Verification:** ✅ PASSED
 
 ---
@@ -26,8 +26,8 @@ base_min_net_pct = float(self._cfg("PRETRADE_MIN_EXPECTED_NET_PCT", 0.0001) or 0
   - Threshold: 0.15% (0.0015)
   - Market offering: 0.04%
   - Result: 100% rejection rate for 40+ minutes
-  
-- **Root Cause:** 
+
+- **Root Cause:**
   - Line 8087: `min_net_pct = max(0.0005, min(0.01, base_min_net_pct * adapt_mult))`
   - With zero performance data: `adapt_mult = 1.0`
   - Therefore: `min_net_pct = 0.0015` (effectively)
@@ -37,7 +37,7 @@ base_min_net_pct = float(self._cfg("PRETRADE_MIN_EXPECTED_NET_PCT", 0.0001) or 0
   - Lower base threshold from 0.15% → 0.01%
   - New calculation: `min_net_pct = 0.0001 * 1.0 = 0.0001` (0.01%)
   - Even with lower bound of 0.0005, now allows market's 0.04%
-  
+
 - **Safety Mechanisms Preserved:**
   - Line 8087 still has floor of 0.0005 (0.05%)
   - Line 8087 still has ceiling of 0.01% (1%)
@@ -235,4 +235,3 @@ If system does not start trading after restart:
 2. Verify: PRETRADE_EFFECT_GATE is passing (grep for "passes" in logs)
 3. Check: expected_net_pct values in debug output
 4. Revert Fix #1 temporarily: Change 0.0001 back to 0.0015 to test
-

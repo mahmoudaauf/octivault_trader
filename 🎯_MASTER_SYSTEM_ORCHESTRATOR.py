@@ -33,11 +33,11 @@ import asyncio
 import inspect
 import logging
 import os
-import sys
 import signal
-from pathlib import Path
-from typing import Optional, Dict, Any
+import sys
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 # Add project to path
 project_root = Path(__file__).parent
@@ -47,21 +47,20 @@ sys.path.insert(0, str(project_root))
 # LOGGING SETUP
 # ============================================================================
 
+
 def setup_logging():
     """Configure comprehensive logging"""
     log_dir = Path("/tmp")
     log_file = log_dir / "octivault_master_orchestrator.log"
-    
+
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s [%(levelname)-8s] %(name)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
+        format="%(asctime)s [%(levelname)-8s] %(name)s - %(message)s",
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)],
     )
-    
+
     return logging.getLogger(__name__)
+
 
 logger = setup_logging()
 
@@ -71,32 +70,41 @@ logger = setup_logging()
 
 try:
     from dotenv import load_dotenv
+
     from src.l0_core.config import Config as CoreConfig
-    from src.l1_exchange.exchange_client import ExchangeClient
     from src.l0_core.shared_state import SharedState
-    from src.l1_exchange.polling_coordinator import PollingCoordinator, PollingConfig
-    from src.l5_strategy.signal_manager import SignalManager
-    from src.l4_execution.execution_manager import ExecutionManager
-    from src.l6_governance.risk_manager import RiskManager
-    from src.l4_execution.tp_sl_engine import TPSLEngine  # ← CRITICAL: TP/SL monitoring for position management
-    from src.l4_execution.safety_order_manager import SafetyOrderManager  # ← CRITICAL: Exchange-native OCO protection
-    from src.l8_lifecycle.meta_controller import MetaController
-    from src.l5_strategy.agent_manager import AgentManager
-    from src.l2_marketdata.market_data_feed import MarketDataFeed  # ← CRITICAL: Add market data streaming
+    from src.l1_exchange.exchange_client import ExchangeClient
+    from src.l1_exchange.polling_coordinator import PollingConfig, PollingCoordinator
     from src.l2_marketdata.balance_sync import BalanceSync  # ← CRITICAL: Real-time balance updates
-    from src.l7_observability.health_monitor import HealthMonitor
-    from src.l8_lifecycle.watchdog import Watchdog
     from src.l2_marketdata.heartbeat import Heartbeat
-    
+    from src.l2_marketdata.market_data_feed import (
+        MarketDataFeed,  # ← CRITICAL: Add market data streaming
+    )
+    from src.l4_execution.execution_manager import ExecutionManager
+    from src.l4_execution.safety_order_manager import (
+        SafetyOrderManager,  # ← CRITICAL: Exchange-native OCO protection
+    )
+    from src.l4_execution.tp_sl_engine import (
+        TPSLEngine,  # ← CRITICAL: TP/SL monitoring for position management
+    )
+    from src.l5_strategy.agent_manager import AgentManager
+    from src.l5_strategy.signal_manager import SignalManager
+    from src.l6_governance.risk_manager import RiskManager
+    from src.l7_observability.health_monitor import HealthMonitor
+    from src.l8_lifecycle.meta_controller import MetaController
+    from src.l8_lifecycle.watchdog import Watchdog
+
     # OPTIONAL COMPONENTS (Enhanced System Features)
     try:
         from src.l4_execution.recovery_engine import RecoveryEngine
+
         HAS_RECOVERY_ENGINE = True
     except Exception:
         HAS_RECOVERY_ENGINE = False
 
     try:
         from src.l8_lifecycle.startup_orchestrator import StartupOrchestrator
+
         HAS_STARTUP_ORCHESTRATOR = True
     except Exception:
         HAS_STARTUP_ORCHESTRATOR = False
@@ -104,132 +112,158 @@ try:
 
     try:
         from src.l4_execution.cash_router import CashRouter
+
         HAS_CASH_ROUTER = True
     except Exception:
         HAS_CASH_ROUTER = False
 
     try:
         from src.l5_strategy.external_adoption_engine import ExternalAdoptionEngine
+
         HAS_EXTERNAL_ADOPTION_ENGINE = True
     except Exception:
         HAS_EXTERNAL_ADOPTION_ENGINE = False
 
     try:
         from src.l3_portfolio.dead_capital_healer import DeadCapitalHealer
+
         HAS_DEAD_CAPITAL_HEALER = True
     except Exception:
         HAS_DEAD_CAPITAL_HEALER = False
-    
+
     try:
         from src.l3_portfolio.bootstrap_manager import BootstrapDustBypassManager
+
         HAS_BOOTSTRAP_MANAGER = True
     except Exception:
         HAS_BOOTSTRAP_MANAGER = False
-    
+
     try:
         from src.l7_observability.performance_monitor import PerformanceMonitor
+
         HAS_PERFORMANCE_MONITOR = True
     except Exception:
         HAS_PERFORMANCE_MONITOR = False
 
     try:
         from src.l7_observability.nav_attribution_monitor import NavAttributionMonitor
+
         HAS_NAV_ATTRIBUTION_MONITOR = True
     except Exception:
         HAS_NAV_ATTRIBUTION_MONITOR = False
 
     try:
         from src.l4_execution.profit_target_engine import ProfitTargetEngine
+
         HAS_PROFIT_TARGET_ENGINE = True
     except Exception:
         HAS_PROFIT_TARGET_ENGINE = False
-    
+
     try:
         from src.l6_governance.capital_allocator import CapitalAllocator
+
         HAS_CAPITAL_ALLOCATOR = True
     except Exception:
         HAS_CAPITAL_ALLOCATOR = False
-    
+
     try:
         from src.l3_portfolio.symbol_manager import SymbolManager
+
         HAS_SYMBOL_MANAGER = True
     except Exception:
         HAS_SYMBOL_MANAGER = False
 
     try:
         from src.l3_portfolio.universe_rotation_engine import UniverseRotationEngine
+
         HAS_UNIVERSE_ROTATION_ENGINE = True
     except Exception:
         HAS_UNIVERSE_ROTATION_ENGINE = False
 
     try:
         from utils.pnl_calculator import PnLCalculator
+
         HAS_PNL_CALCULATOR = True
     except Exception:
         HAS_PNL_CALCULATOR = False
 
     try:
         from src.l5_strategy.performance_evaluator import PerformanceEvaluator
+
         HAS_PERFORMANCE_EVALUATOR = True
     except Exception:
         HAS_PERFORMANCE_EVALUATOR = False
 
     try:
         from src.l3_portfolio.portfolio_balancer import PortfolioBalancer
+
         HAS_PORTFOLIO_BALANCER = True
     except Exception:
         HAS_PORTFOLIO_BALANCER = False
 
     try:
         from src.l4_execution.liquidation_orchestrator import LiquidationOrchestrator
+
         HAS_LIQUIDATION_ORCHESTRATOR = True
     except Exception:
         HAS_LIQUIDATION_ORCHESTRATOR = False
 
     try:
         from src.l7_observability.alert_system import AlertSystem
+
         HAS_ALERT_SYSTEM = True
     except Exception:
         HAS_ALERT_SYSTEM = False
 
     try:
         from src.l1_exchange.exchange_truth_auditor import ExchangeTruthAuditor
+
         HAS_EXCHANGE_TRUTH_AUDITOR = True
     except Exception:
         HAS_EXCHANGE_TRUTH_AUDITOR = False
 
     try:
         from src.l3_portfolio.position_merger_enhanced import PositionMergerEnhanced
+
         HAS_POSITION_MERGER_ENHANCED = True
     except Exception:
         HAS_POSITION_MERGER_ENHANCED = False
 
     try:
-        from src.l6_governance.rebalancing_engine import RebalancingEngine, AllocationTarget, RebalanceStrategy
+        from src.l6_governance.rebalancing_engine import (
+            AllocationTarget,
+            RebalanceStrategy,
+            RebalancingEngine,
+        )
+
         HAS_REBALANCING_ENGINE = True
     except Exception:
         HAS_REBALANCING_ENGINE = False
 
     try:
         from src.l2_marketdata.volatility_regime import VolatilityRegimeDetector
+
         HAS_VOLATILITY_REGIME = True
     except Exception:
         HAS_VOLATILITY_REGIME = False
 
     try:
         from src.l6_governance.compounding_engine import CompoundingEngine
+
         HAS_COMPOUNDING_ENGINE = True
     except Exception:
         HAS_COMPOUNDING_ENGINE = False
-    
+
     try:
         from src.l3_portfolio.three_bucket_manager import ThreeBucketPortfolioManager
+
         HAS_THREE_BUCKET_MANAGER = True
     except Exception:
         HAS_THREE_BUCKET_MANAGER = False
-    
+
     try:
         from src.l3_portfolio.portfolio_segmentation import PortfolioSegmentationManager
+
         HAS_PORTFOLIO_SEGMENTATION = True
     except Exception:
         HAS_PORTFOLIO_SEGMENTATION = False
@@ -241,74 +275,106 @@ try:
     # --- Utility helpers ---
     try:
         from utils.logging_setup import setup_logging as util_setup_logging
+
         HAS_UTIL_LOGGING = True
     except Exception:
         HAS_UTIL_LOGGING = False
 
     try:
         from utils.ta_indicators import calculate_ema, calculate_rsi, calculate_volume_surge
+
         HAS_TA_INDICATORS = True
     except Exception:
         HAS_TA_INDICATORS = False
 
     try:
-        from utils.ohlcv_cache import load_ohlcv_from_cache, save_ohlcv_to_csv, fetch_and_cache_ohlcv
+        from utils.ohlcv_cache import (
+            fetch_and_cache_ohlcv,
+            load_ohlcv_from_cache,
+            save_ohlcv_to_csv,
+        )
+
         HAS_OHLCV_CACHE = True
     except Exception:
         HAS_OHLCV_CACHE = False
 
     try:
-        from utils.tuned_params import get_tuned_params, get_symbol_volatility_class, get_adaptive_learning_rate
+        from utils.tuned_params import (
+            get_adaptive_learning_rate,
+            get_symbol_volatility_class,
+            get_tuned_params,
+        )
+
         HAS_TUNED_PARAMS = True
     except Exception:
         HAS_TUNED_PARAMS = False
 
     # --- Contracts & constants ---
     try:
-        from src.l0_core.config_constants import TimeoutConstants, RetryConstants, CapitalConstants, ConfidenceConstants, get_all_constants
+        from src.l0_core.config_constants import (
+            CapitalConstants,
+            ConfidenceConstants,
+            RetryConstants,
+            TimeoutConstants,
+            get_all_constants,
+        )
+
         HAS_CONFIG_CONSTANTS = True
     except Exception:
         HAS_CONFIG_CONSTANTS = False
 
     try:
         from src.l0_core.config_validator import validate_config_on_startup
+
         HAS_CONFIG_VALIDATOR = True
     except Exception:
         HAS_CONFIG_VALIDATOR = False
 
     try:
-        from src.l0_core.contracts import TradeIntent as ContractTradeIntent, OrderSide as ContractOrderSide
+        from src.l0_core.contracts import OrderSide as ContractOrderSide
+        from src.l0_core.contracts import TradeIntent as ContractTradeIntent
+
         HAS_CONTRACTS = True
     except Exception:
         HAS_CONTRACTS = False
 
     try:
         from src.l5_strategy.baseline_trading_kernel import KernelState, MetaPolicy, Readiness
+
         HAS_BASELINE_KERNEL = True
     except Exception:
         HAS_BASELINE_KERNEL = False
 
     try:
-        from src.l0_core.layer_contracts import LayerInput, LayerOutput, WalletLayerContract, PortfolioLayerContract
+        from src.l0_core.layer_contracts import (
+            LayerInput,
+            LayerOutput,
+            PortfolioLayerContract,
+            WalletLayerContract,
+        )
+
         HAS_LAYER_CONTRACTS = True
     except Exception:
         HAS_LAYER_CONTRACTS = False
 
     # --- Market intelligence ---
     try:
-        from src.l2_marketdata.market_regime_detector import MarketRegimeDetector, MarketRegime
+        from src.l2_marketdata.market_regime_detector import MarketRegime, MarketRegimeDetector
+
         HAS_MARKET_REGIME_DETECTOR = True
     except Exception:
         HAS_MARKET_REGIME_DETECTOR = False
 
     try:
         from src.l2_marketdata.market_regime_integration import RegimeAwareMediator
+
         HAS_REGIME_INTEGRATION = True
     except Exception:
         HAS_REGIME_INTEGRATION = False
 
     try:
         from src.l3_portfolio.discovery_coordinator import DiscoveryCoordinator
+
         HAS_DISCOVERY_COORDINATOR = True
     except Exception:
         HAS_DISCOVERY_COORDINATOR = False
@@ -316,12 +382,14 @@ try:
     # --- Capital & risk management ---
     try:
         from src.l6_governance.capital_symbol_governor import CapitalSymbolGovernor
+
         HAS_CAPITAL_SYMBOL_GOVERNOR = True
     except Exception:
         HAS_CAPITAL_SYMBOL_GOVERNOR = False
 
     try:
         from src.l3_portfolio.reserve_manager import ReserveManager
+
         HAS_RESERVE_MANAGER = True
     except Exception:
         HAS_RESERVE_MANAGER = False
@@ -329,36 +397,48 @@ try:
     # --- Execution & order management ---
     try:
         from src.l1_exchange.order_cache_manager import OrderCacheManager
+
         HAS_ORDER_CACHE_MANAGER = True
     except Exception:
         HAS_ORDER_CACHE_MANAGER = False
 
     try:
         from src.l4_execution.action_router import ActionRouter
+
         HAS_ACTION_ROUTER = True
     except Exception:
         HAS_ACTION_ROUTER = False
 
     try:
         from src.l4_execution.exit_arbitrator import ExitArbitrator, get_arbitrator
+
         HAS_EXIT_ARBITRATOR = True
     except Exception:
         HAS_EXIT_ARBITRATOR = False
 
     try:
-        from src.l1_exchange.balance_sync_backoff import BalanceSyncRetryManager, BalanceSyncCoordinator
+        from src.l1_exchange.balance_sync_backoff import (
+            BalanceSyncCoordinator,
+            BalanceSyncRetryManager,
+        )
+
         HAS_BALANCE_SYNC_BACKOFF = True
     except Exception:
         HAS_BALANCE_SYNC_BACKOFF = False
 
     try:
-        from src.l2_marketdata.balance_cache_updater import BalanceCacheUpdater, create_and_start_balance_updater
+        from src.l2_marketdata.balance_cache_updater import (
+            BalanceCacheUpdater,
+            create_and_start_balance_updater,
+        )
+
         HAS_BALANCE_CACHE_UPDATER = True
     except Exception:
         HAS_BALANCE_CACHE_UPDATER = False
 
     try:
         from src.l1_exchange.retry_manager import RetryManager
+
         HAS_RETRY_MANAGER = True
     except Exception:
         HAS_RETRY_MANAGER = False
@@ -366,12 +446,14 @@ try:
     # --- Position & portfolio management ---
     try:
         from src.l3_portfolio.position_manager import PositionManager
+
         HAS_POSITION_MANAGER = True
     except Exception:
         HAS_POSITION_MANAGER = False
 
     try:
         from src.l3_portfolio.portfolio_manager import PortfolioManager
+
         HAS_PORTFOLIO_MANAGER = True
     except Exception:
         HAS_PORTFOLIO_MANAGER = False
@@ -379,6 +461,7 @@ try:
     # --- State & synchronization ---
     try:
         from src.l3_portfolio.state_synchronizer import StateSynchronizer, StateSyncronizationTask
+
         HAS_STATE_SYNCHRONIZER = True
     except Exception:
         HAS_STATE_SYNCHRONIZER = False
@@ -386,6 +469,7 @@ try:
     # --- Market data ---
     try:
         from src.l1_exchange.ws_market_data import WebSocketMarketData
+
         HAS_WS_MARKET_DATA = True
     except Exception:
         HAS_WS_MARKET_DATA = False
@@ -393,30 +477,35 @@ try:
     # --- Observability ---
     try:
         from src.l7_observability.prometheus_exporter import SafetyGuardMetrics, get_metrics
+
         HAS_PROMETHEUS_EXPORTER = True
     except Exception:
         HAS_PROMETHEUS_EXPORTER = False
 
     try:
         from src.l7_observability.health_check_manager import HealthCheckManager
+
         HAS_HEALTH_CHECK_MANAGER = True
     except Exception:
         HAS_HEALTH_CHECK_MANAGER = False
 
     try:
         from src.l7_observability.health_endpoints import HealthEndpoints, register_health_endpoints
+
         HAS_HEALTH_ENDPOINTS = True
     except Exception:
         HAS_HEALTH_ENDPOINTS = False
 
     try:
         from src.l7_observability.apm_instrument import APMInstrument, get_apm_instrument
+
         HAS_APM_INSTRUMENT = True
     except Exception:
         HAS_APM_INSTRUMENT = False
 
     try:
         from src.l7_observability.dashboard import initialize_dashboard
+
         HAS_DASHBOARD = True
     except Exception:
         HAS_DASHBOARD = False
@@ -424,12 +513,14 @@ try:
     # --- Advanced / conditional ---
     try:
         from src.l3_portfolio.replay_engine import DeterministicReplayEngine
+
         HAS_REPLAY_ENGINE = True
     except Exception:
         HAS_REPLAY_ENGINE = False
 
     try:
         from src.l8_lifecycle.chaos_monkey import ChaosMonkey, get_chaos_monkey
+
         HAS_CHAOS_MONKEY = True
     except Exception:
         HAS_CHAOS_MONKEY = False
@@ -444,9 +535,10 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================================
 
+
 class OrchestratorConfig:
     """Configuration for master orchestrator"""
-    
+
     def __init__(self):
         # Load full production config once and use it as a fallback source.
         # This keeps orchestrator lightweight while preserving all core knobs.
@@ -479,22 +571,40 @@ class OrchestratorConfig:
         self.QUOTE_MIN_RESERVE = self.quote_min_reserve
         # Signal injector is useful for paper tests, but dangerous in live mode.
         default_injector = "true" if self.paper_trading else "false"
-        self.enable_signal_injector = os.getenv("ENABLE_SIGNAL_INJECTOR", default_injector).lower() == "true"
+        self.enable_signal_injector = (
+            os.getenv("ENABLE_SIGNAL_INJECTOR", default_injector).lower() == "true"
+        )
         # Optional advanced portfolio engines (off by default; enable explicitly).
-        self.enable_volatility_regime = os.getenv("ENABLE_VOLATILITY_REGIME", "false").lower() == "true"
-        self.enable_compounding_engine = os.getenv("ENABLE_COMPOUNDING_ENGINE", "false").lower() == "true"
+        self.enable_volatility_regime = (
+            os.getenv("ENABLE_VOLATILITY_REGIME", "false").lower() == "true"
+        )
+        self.enable_compounding_engine = (
+            os.getenv("ENABLE_COMPOUNDING_ENGINE", "false").lower() == "true"
+        )
         self.enable_alert_system = os.getenv("ENABLE_ALERT_SYSTEM", "false").lower() == "true"
-        self.enable_exchange_truth_auditor = os.getenv("ENABLE_EXCHANGE_TRUTH_AUDITOR", "false").lower() == "true"
+        self.enable_exchange_truth_auditor = (
+            os.getenv("ENABLE_EXCHANGE_TRUTH_AUDITOR", "false").lower() == "true"
+        )
         self.truth_auditor_mode = os.getenv("TRUTH_AUDITOR_MODE", "continuous").lower()
-        self.enable_position_merger_enhanced = os.getenv("ENABLE_POSITION_MERGER_ENHANCED", "false").lower() == "true"
-        self.enable_rebalancing_engine = os.getenv("ENABLE_REBALANCING_ENGINE", "false").lower() == "true"
+        self.enable_position_merger_enhanced = (
+            os.getenv("ENABLE_POSITION_MERGER_ENHANCED", "false").lower() == "true"
+        )
+        self.enable_rebalancing_engine = (
+            os.getenv("ENABLE_REBALANCING_ENGINE", "false").lower() == "true"
+        )
         self.position_merger_interval_sec = float(os.getenv("POSITION_MERGER_INTERVAL_SEC", "300"))
         self.rebalancing_engine_loop_sec = float(os.getenv("REBALANCING_ENGINE_LOOP_SEC", "300"))
-        self.rebalancing_engine_strategy = os.getenv("REBALANCING_ENGINE_STRATEGY", "DRIFT_THRESHOLD").upper()
-        self.enable_universe_rotation = os.getenv("ENABLE_UNIVERSE_ROTATION", "true").lower() == "true"
+        self.rebalancing_engine_strategy = os.getenv(
+            "REBALANCING_ENGINE_STRATEGY", "DRIFT_THRESHOLD"
+        ).upper()
+        self.enable_universe_rotation = (
+            os.getenv("ENABLE_UNIVERSE_ROTATION", "true").lower() == "true"
+        )
         self.uure_interval_sec = float(os.getenv("UURE_INTERVAL_SEC", "300"))
         # Profit discipline mode: force non-emergency SELLs to pass fee-aware profit gate.
-        self.STRICT_PROFIT_ONLY_SELLS = os.getenv("STRICT_PROFIT_ONLY_SELLS", "false").lower() == "true"
+        self.STRICT_PROFIT_ONLY_SELLS = (
+            os.getenv("STRICT_PROFIT_ONLY_SELLS", "false").lower() == "true"
+        )
         # Capital governor thresholds (forwarded to MetaController/CapitalGovernor).
         self.CAPITAL_MICRO_THRESHOLD = float(os.getenv("CAPITAL_MICRO_THRESHOLD", "500"))
         self.CAPITAL_SMALL_THRESHOLD = float(os.getenv("CAPITAL_SMALL_THRESHOLD", "2000"))
@@ -512,32 +622,34 @@ class OrchestratorConfig:
         if base is not None and hasattr(base, name):
             return getattr(base, name)
         raise AttributeError(f"{self.__class__.__name__} has no attribute '{name}'")
-        
+
     def validate(self) -> bool:
         """Validate configuration consistency"""
         logger.info("Validating configuration...")
-        
+
         if self.testnet_mode and not self.paper_trading:
             logger.error("❌ TESTNET_MODE=True but PAPER_TRADING=false")
             logger.error("   Either set TESTNET_MODE=False for real trading")
             logger.error("   Or set PAPER_TRADING=true for testnet")
             return False
-        
+
         if not self.live_mode and not self.paper_trading:
             logger.error("❌ LIVE_MODE=False and PAPER_TRADING=false")
             logger.error("   Must choose either live or paper mode")
             return False
-        
+
         if not (0.0 < self.capital_floor_pct < 1.0):
             logger.error("❌ CAPITAL_FLOOR_PCT must be between 0 and 1")
             return False
-        
+
         if not (0.0 <= self.quote_reserve_ratio < 1.0):
             logger.error("❌ QUOTE_RESERVE_RATIO must be between 0 and <1")
             return False
-        
-        mode_str = "🔴 LIVE TRADING" if self.live_mode else (
-            "📝 PAPER TRADING" if self.paper_trading else "❓ UNKNOWN"
+
+        mode_str = (
+            "🔴 LIVE TRADING"
+            if self.live_mode
+            else ("📝 PAPER TRADING" if self.paper_trading else "❓ UNKNOWN")
         )
         logger.info(f"✅ Mode: {mode_str}")
         logger.info(f"✅ Duration: {self.duration_hours} hours")
@@ -549,9 +661,15 @@ class OrchestratorConfig:
             self.quote_min_reserve,
         )
         logger.info(f"✅ Spendable reserve ratio: {self.quote_reserve_ratio * 100.0:.1f}%")
-        logger.info(f"✅ Signal injector: {'ENABLED' if self.enable_signal_injector else 'DISABLED'}")
-        logger.info(f"✅ Volatility regime: {'ENABLED' if self.enable_volatility_regime else 'DISABLED'}")
-        logger.info(f"✅ Compounding engine: {'ENABLED' if self.enable_compounding_engine else 'DISABLED'}")
+        logger.info(
+            f"✅ Signal injector: {'ENABLED' if self.enable_signal_injector else 'DISABLED'}"
+        )
+        logger.info(
+            f"✅ Volatility regime: {'ENABLED' if self.enable_volatility_regime else 'DISABLED'}"
+        )
+        logger.info(
+            f"✅ Compounding engine: {'ENABLED' if self.enable_compounding_engine else 'DISABLED'}"
+        )
         logger.info(f"✅ Alert system: {'ENABLED' if self.enable_alert_system else 'DISABLED'}")
         logger.info(
             "✅ Exchange truth auditor: %s (%s)",
@@ -578,17 +696,19 @@ class OrchestratorConfig:
             "✅ Strict profit-only sells: %s",
             "ENABLED" if self.STRICT_PROFIT_ONLY_SELLS else "DISABLED",
         )
-        
+
         return True
+
 
 # ============================================================================
 # MASTER ORCHESTRATOR
 # ============================================================================
 
+
 class MasterSystemOrchestrator:
     """
     Unified entry point for complete trading system.
-    
+
     Initialization Sequence:
     1. Verify prerequisites
     2. Initialize Layer 1: ExchangeClient
@@ -601,11 +721,11 @@ class MasterSystemOrchestrator:
     9. Initialize monitoring: HealthMonitor, Watchdog, Heartbeat
     10. Start all components concurrently
     """
-    
+
     def __init__(self):
         self.config = OrchestratorConfig()
         self.logger = logging.getLogger(__name__)
-        
+
         # Components (initialized in order)
         self.exchange_client: Optional[ExchangeClient] = None
         self.shared_state: Optional[SharedState] = None
@@ -613,16 +733,20 @@ class MasterSystemOrchestrator:
         self.risk_manager: Optional[RiskManager] = None
         self.execution_manager: Optional[ExecutionManager] = None
         self.tp_sl_engine: Optional[TPSLEngine] = None  # ← CRITICAL: TP/SL monitoring for exits
-        self.safety_order_manager: Optional[SafetyOrderManager] = None  # ← CRITICAL: Exchange-native OCO protection
+        self.safety_order_manager: Optional[
+            SafetyOrderManager
+        ] = None  # ← CRITICAL: Exchange-native OCO protection
         self.meta_controller: Optional[MetaController] = None
         self.agent_manager: Optional[AgentManager] = None
         self.market_data_feed: Optional[MarketDataFeed] = None  # ← CRITICAL: Real-time market data
-        self.balance_sync: Optional[BalanceSync] = None  # ← CRITICAL: Real-time balance updates from Binance
+        self.balance_sync: Optional[
+            BalanceSync
+        ] = None  # ← CRITICAL: Real-time balance updates from Binance
         self.polling_coordinator: Optional[PollingCoordinator] = None
         self.health_monitor: Optional[HealthMonitor] = None
         self.watchdog: Optional[Watchdog] = None
         self.heartbeat: Optional[Heartbeat] = None
-        
+
         # OPTIONAL COMPONENTS (Enhanced Features)
         self.recovery_engine: Optional[object] = None
         self.bootstrap_manager: Optional[object] = None
@@ -672,32 +796,32 @@ class MasterSystemOrchestrator:
         self.apm_instrument: Optional[object] = None
         self.chaos_monkey: Optional[object] = None
         self.replay_engine: Optional[object] = None
-        
+
         # Tracking
         self.start_time: Optional[datetime] = None
         self.running = False
         self.tasks: list = []
-        
+
     # ========================================================================
     # PREREQUISITE CHECKS
     # ========================================================================
-    
+
     def check_prerequisites(self) -> bool:
         """Check all prerequisites before initializing system"""
         logger.info("=" * 80)
         logger.info("PHASE 0: PREREQUISITE CHECKS")
         logger.info("=" * 80)
-        
+
         checks_passed = 0
         checks_total = 0
-        
+
         # Check 1: Configuration valid
         checks_total += 1
         if not self.config.validate():
             logger.error("❌ Configuration validation failed")
             return False
         checks_passed += 1
-        
+
         # Check 2: Live trading approval (if live mode)
         checks_total += 1
         if self.config.live_mode:
@@ -711,13 +835,13 @@ class MasterSystemOrchestrator:
         else:
             logger.info("✅ Paper trading mode - no approval needed")
             checks_passed += 1
-        
+
         # Check 3: API keys configured
         checks_total += 1
         api_key = os.getenv("BINANCE_API_KEY")
         api_secret_hmac = os.getenv("BINANCE_API_SECRET_HMAC")
         api_secret_ed25519 = os.getenv("BINANCE_API_SECRET_ED25519")
-        
+
         if not api_key:
             logger.error("❌ BINANCE_API_KEY not configured")
             return False
@@ -727,7 +851,7 @@ class MasterSystemOrchestrator:
             return False
         logger.info("✅ API keys configured")
         checks_passed += 1
-        
+
         # Check 4: Directory structure (post-migration: 8-layer src/l*_* layout)
         checks_total += 1
         required_dirs = ["src", "src/l0_core", "agents", "utils", "config", "logs"]
@@ -737,28 +861,28 @@ class MasterSystemOrchestrator:
                 return False
         logger.info("✅ Directory structure valid")
         checks_passed += 1
-        
+
         logger.info(f"\n✅ Prerequisite checks: {checks_passed}/{checks_total} PASSED\n")
         return True
-    
+
     # ========================================================================
     # COMPONENT INITIALIZATION
     # ========================================================================
-    
+
     async def initialize_components(self) -> bool:
         """Initialize all components in dependency order"""
         try:
             logger.info("=" * 80)
             logger.info("PHASE 1: COMPONENT INITIALIZATION")
             logger.info("=" * 80)
-            
+
             # LAYER 1: Exchange Integration
             logger.info("\n[1/9] LAYER 1: Exchange Integration (ExchangeClient)")
             self.exchange_client = ExchangeClient()
             await self.exchange_client.start()  # ← CRITICAL: Start the session
             balance = await self.exchange_client.get_spot_balances()
-            usdt_balance = balance.get('USDT', {}).get('free', 0)
-            logger.info(f"✅ ExchangeClient initialized")
+            usdt_balance = balance.get("USDT", {}).get("free", 0)
+            logger.info("✅ ExchangeClient initialized")
             logger.info(f"   Real balance: ${usdt_balance:.2f} USDT")
 
             # LAYER 1.5: CONFIG VALIDATION & CONSTANTS
@@ -793,25 +917,29 @@ class MasterSystemOrchestrator:
                         injection_rate=float(getattr(self.config, "CHAOS_MONKEY_RATE", 0.01)),
                     )
                     if _chaos_enabled:
-                        logger.warning("⚠️  ChaosMonkey ACTIVE (injection_rate=%.2f) — resilience testing mode", float(getattr(self.config, "CHAOS_MONKEY_RATE", 0.01)))
+                        logger.warning(
+                            "⚠️  ChaosMonkey ACTIVE (injection_rate=%.2f) — resilience testing mode",
+                            float(getattr(self.config, "CHAOS_MONKEY_RATE", 0.01)),
+                        )
                     else:
-                        logger.info("✅ ChaosMonkey initialized (disabled — enable with CHAOS_MONKEY_ENABLED=true)")
+                        logger.info(
+                            "✅ ChaosMonkey initialized (disabled — enable with CHAOS_MONKEY_ENABLED=true)"
+                        )
                 except Exception as _cm_e:
                     logger.warning("⚠️  ChaosMonkey: %s", _cm_e)
 
             # LAYER 2: Shared State
             logger.info("\n[2/9] LAYER 2: Shared State (Central Hub)")
             self.shared_state = SharedState(
-                config=self.config,
-                exchange_client=self.exchange_client
+                config=self.config, exchange_client=self.exchange_client
             )
             # Enforce reserve policy in canonical spendable-balance path.
             self.shared_state.config.quote_asset = self.config.quote_asset
             self.shared_state.config.quote_reserve_ratio = self.config.quote_reserve_ratio
             self.shared_state.config.quote_min_reserve = self.config.quote_min_reserve
             self.shared_state.balances["USDT"] = {"free": usdt_balance, "locked": 0}
-            logger.info(f"✅ SharedState initialized")
-            logger.info(f"   Portfolio synced from exchange")
+            logger.info("✅ SharedState initialized")
+            logger.info("   Portfolio synced from exchange")
 
             # LAYER 2.1: BALANCE SYNC BACKOFF (wraps authoritative balance calls)
             if HAS_BALANCE_SYNC_BACKOFF:
@@ -834,11 +962,14 @@ class MasterSystemOrchestrator:
                     )
                     # Start monitoring in background
                     asyncio.create_task(
-                        self.balance_cache_updater.start_monitoring(),
-                        name="BalanceCacheUpdater"
+                        self.balance_cache_updater.start_monitoring(), name="BalanceCacheUpdater"
                     )
-                    logger.info("✅ BalanceCacheUpdater started (real-time balance cache monitoring active)")
-                    logger.info("   📊 When capital arrives on Binance, trading will begin within seconds!")
+                    logger.info(
+                        "✅ BalanceCacheUpdater started (real-time balance cache monitoring active)"
+                    )
+                    logger.info(
+                        "   📊 When capital arrives on Binance, trading will begin within seconds!"
+                    )
                 except Exception as _bcu_e:
                     logger.warning("⚠️  BalanceCacheUpdater: %s", _bcu_e)
 
@@ -854,7 +985,10 @@ class MasterSystemOrchestrator:
             if HAS_APM_INSTRUMENT:
                 try:
                     self.apm_instrument = get_apm_instrument()
-                    logger.info("✅ APMInstrument initialized (tracing=%s)", self.apm_instrument.enabled if self.apm_instrument else False)
+                    logger.info(
+                        "✅ APMInstrument initialized (tracing=%s)",
+                        self.apm_instrument.enabled if self.apm_instrument else False,
+                    )
                 except Exception as _apm_e:
                     logger.warning("⚠️  APMInstrument: %s", _apm_e)
 
@@ -862,10 +996,15 @@ class MasterSystemOrchestrator:
             logger.info("\n[BOOTSTRAP] Seeding default symbols...")
             try:
                 from src.l3_portfolio.bootstrap_symbols import bootstrap_default_symbols
+
                 await bootstrap_default_symbols(self.shared_state, logger)
                 logger.info("✅ Symbol bootstrap complete")
             except Exception as e:
-                logger.warning("⚠️ Symbol bootstrap failed (will retry during agent startup): %s", e, exc_info=True)
+                logger.warning(
+                    "⚠️ Symbol bootstrap failed (will retry during agent startup): %s",
+                    e,
+                    exc_info=True,
+                )
 
             # ────────────────────────────────────────────────────────────────
             # LAYER 2.5: STATE HYDRATION — StartupOrchestrator
@@ -909,7 +1048,9 @@ class MasterSystemOrchestrator:
                     )
                     _hydration_ok = await self.startup_orchestrator.execute_startup_sequence()
                     if _hydration_ok:
-                        logger.info("✅ StartupOrchestrator complete — positions hydrated, state ready")
+                        logger.info(
+                            "✅ StartupOrchestrator complete — positions hydrated, state ready"
+                        )
                         # Store the pre-built recovery engine so optional section reuses it
                         self.recovery_engine = _se_recovery
                         if _se_auditor is not None:
@@ -927,15 +1068,17 @@ class MasterSystemOrchestrator:
                     raise
                 except Exception as e:
                     # H: Treat unexpected exceptions as fatal in real mode; only swallow in shadow mode
-                    _shadow = bool(getattr(self.config, 'SHADOW_MODE', False))
+                    _shadow = bool(getattr(self.config, "SHADOW_MODE", False))
                     if _shadow:
                         logger.warning(
-                            "⚠️  StartupOrchestrator failed (%s) — continuing in SHADOW mode with available state", e,
+                            "⚠️  StartupOrchestrator failed (%s) — continuing in SHADOW mode with available state",
+                            e,
                             exc_info=True,
                         )
                     else:
                         logger.error(
-                            "💥 StartupOrchestrator failed in real mode (%s) — aborting startup", e,
+                            "💥 StartupOrchestrator failed in real mode (%s) — aborting startup",
+                            e,
                             exc_info=True,
                         )
                         raise
@@ -952,7 +1095,10 @@ class MasterSystemOrchestrator:
             # missing timestamps that default to now) don't trigger repeated_failures=True
             # → PROTECTIVE mode on the very first MetaController tick.
             try:
-                if hasattr(self.shared_state, "rejection_counters") and self.shared_state.rejection_counters:
+                if (
+                    hasattr(self.shared_state, "rejection_counters")
+                    and self.shared_state.rejection_counters
+                ):
                     cleared = len(self.shared_state.rejection_counters)
                     self.shared_state.rejection_counters.clear()
                     if hasattr(self.shared_state, "rejection_timestamps"):
@@ -960,7 +1106,7 @@ class MasterSystemOrchestrator:
                     logger.info(
                         "✅ [RejCounters] Cleared %d stale cross-session rejection counter(s) to prevent "
                         "false PROTECTIVE mode trigger at startup",
-                        cleared
+                        cleared,
                     )
             except Exception as _rce:
                 logger.warning("⚠️  [RejCounters] Could not clear rejection counters: %s", _rce)
@@ -969,38 +1115,56 @@ class MasterSystemOrchestrator:
             # skipped from cycle 1, without needing a failed SELL attempt first.
             try:
                 import json as _json
-                _dust_bl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots", "dust_blacklist.json")
+
+                _dust_bl_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "snapshots", "dust_blacklist.json"
+                )
                 if os.path.exists(_dust_bl_path):
-                    with open(_dust_bl_path, "r") as _f:
+                    with open(_dust_bl_path) as _f:
                         _dust_bl = _json.load(_f)
                     if _dust_bl and isinstance(_dust_bl, dict):
-                        if not hasattr(self.shared_state, "dust_unhealable") or self.shared_state.dust_unhealable is None:
+                        if (
+                            not hasattr(self.shared_state, "dust_unhealable")
+                            or self.shared_state.dust_unhealable is None
+                        ):
                             self.shared_state.dust_unhealable = {}
                         self.shared_state.dust_unhealable.update(_dust_bl)
                         logger.info(
                             "✅ [DustBlacklist] Pre-seeded %d symbol(s) as UNHEALABLE_LT_MIN_NOTIONAL: %s",
-                            len(_dust_bl), list(_dust_bl.keys())
+                            len(_dust_bl),
+                            list(_dust_bl.keys()),
                         )
             except Exception as _dbl_err:
-                logger.warning("⚠️  [DustBlacklist] Failed to load dust_blacklist.json: %s", _dbl_err)
+                logger.warning(
+                    "⚠️  [DustBlacklist] Failed to load dust_blacklist.json: %s", _dbl_err
+                )
 
             # ── Allow entries below significant floor so dust-deduction on existing
             # micro-positions never blocks a valid BUY (overrides config default).
             try:
                 self.shared_state.allow_entry_below_significant_floor = True
-                logger.info("✅ [EntryFloor] allow_entry_below_significant_floor=True set on shared_state")
+                logger.info(
+                    "✅ [EntryFloor] allow_entry_below_significant_floor=True set on shared_state"
+                )
             except Exception as _efe:
-                logger.warning("⚠️  [EntryFloor] Could not set allow_entry_below_significant_floor: %s", _efe)
+                logger.warning(
+                    "⚠️  [EntryFloor] Could not set allow_entry_below_significant_floor: %s", _efe
+                )
 
             # ── Lower the capital floor ratio from 20% to 10% so $22+ free USDT
             # is enough to proceed with $15 trades.  calculate_capital_floor()
             # reads from shared_state.dynamic_config first, so this takes effect
             # immediately without a restart or .env change.
             try:
-                if not hasattr(self.shared_state, "dynamic_config") or self.shared_state.dynamic_config is None:
+                if (
+                    not hasattr(self.shared_state, "dynamic_config")
+                    or self.shared_state.dynamic_config is None
+                ):
                     self.shared_state.dynamic_config = {}
                 self.shared_state.dynamic_config["CAPITAL_FLOOR_PCT"] = 0.10
-                logger.info("✅ [CapFloor] CAPITAL_FLOOR_PCT=0.10 injected into dynamic_config (was 0.20)")
+                logger.info(
+                    "✅ [CapFloor] CAPITAL_FLOOR_PCT=0.10 injected into dynamic_config (was 0.20)"
+                )
             except Exception as _cfe:
                 logger.warning("⚠️  [CapFloor] Could not set CAPITAL_FLOOR_PCT: %s", _cfe)
 
@@ -1035,12 +1199,16 @@ class MasterSystemOrchestrator:
                 # config.pyc may not have STARTUP_MODE_OVERRIDE — inject it directly.
                 if not getattr(self.config, "STARTUP_MODE_OVERRIDE", None):
                     self.config.STARTUP_MODE_OVERRIDE = "RECOVERY"
-                    logger.info("✅ [StartupMode] STARTUP_MODE_OVERRIDE=RECOVERY injected into config")
+                    logger.info(
+                        "✅ [StartupMode] STARTUP_MODE_OVERRIDE=RECOVERY injected into config"
+                    )
                 # Raise the PROTECTIVE→RECOVERY drawdown threshold so accounts with historical
                 # realized losses can still exit PROTECTIVE mode.
                 if not getattr(self.config, "PROTECTIVE_DD_STABLE_THRESHOLD", None):
                     self.config.PROTECTIVE_DD_STABLE_THRESHOLD = 50.0
-                    logger.info("✅ [StartupMode] PROTECTIVE_DD_STABLE_THRESHOLD=50.0 injected into config")
+                    logger.info(
+                        "✅ [StartupMode] PROTECTIVE_DD_STABLE_THRESHOLD=50.0 injected into config"
+                    )
             except Exception as _sme:
                 logger.warning("⚠️  [StartupMode] Could not patch startup mode attrs: %s", _sme)
 
@@ -1074,7 +1242,9 @@ class MasterSystemOrchestrator:
                 await self.balance_sync.start()
                 logger.info("✅ BalanceSync started (real-time balance updates every 3s)")
             except Exception as _bs_e:
-                logger.warning("⚠️  BalanceSync: %s (trading will continue with stale balance)", _bs_e)
+                logger.warning(
+                    "⚠️  BalanceSync: %s (trading will continue with stale balance)", _bs_e
+                )
                 self.balance_sync = None
 
             # LAYER 2.9: WEBSOCKET MARKET DATA (real-time price + kline streams)
@@ -1102,35 +1272,33 @@ class MasterSystemOrchestrator:
                         config=self.config,
                         logger=logger,
                     )
-                    logger.info("✅ MarketRegimeDetector initialized (ADX/RSI/ATR regime detection)")
+                    logger.info(
+                        "✅ MarketRegimeDetector initialized (ADX/RSI/ATR regime detection)"
+                    )
                 except Exception as _mrd_e:
                     logger.warning("⚠️  MarketRegimeDetector: %s", _mrd_e)
 
             # LAYER 3B: Signal & Risk Management
             logger.info("\n[3/9] LAYER 3B: Signal Manager")
             self.signal_manager = SignalManager(
-                config=self.config,
-                logger=logger,
-                shared_state=self.shared_state
+                config=self.config, logger=logger, shared_state=self.shared_state
             )
-            logger.info(f"✅ SignalManager initialized")
-            
+            logger.info("✅ SignalManager initialized")
+
             logger.info("\n[4/9] LAYER 4: Risk Manager")
             self.risk_manager = RiskManager(
-                shared_state=self.shared_state,
-                config=self.config,
-                logger=logger
+                shared_state=self.shared_state, config=self.config, logger=logger
             )
-            logger.info(f"✅ RiskManager initialized")
-            
+            logger.info("✅ RiskManager initialized")
+
             # LAYER 5: Execution Manager
             logger.info("\n[5/9] LAYER 5: Execution Manager")
             self.execution_manager = ExecutionManager(
                 shared_state=self.shared_state,
                 exchange_client=self.exchange_client,
-                config=self.config
+                config=self.config,
             )
-            logger.info(f"✅ ExecutionManager initialized")
+            logger.info("✅ ExecutionManager initialized")
 
             # LAYER 5.1: ORDER CACHE MANAGER (local order tracking, reduces API polling)
             if HAS_ORDER_CACHE_MANAGER:
@@ -1138,7 +1306,10 @@ class MasterSystemOrchestrator:
                     self.order_cache_manager = OrderCacheManager(
                         shared_state=self.shared_state,
                         exchange_client=self.exchange_client,
-                        config={"reconciliation_interval_sec": 30.0, "stale_order_timeout_sec": 300.0},
+                        config={
+                            "reconciliation_interval_sec": 30.0,
+                            "stale_order_timeout_sec": 300.0,
+                        },
                         logger_=logger,
                     )
                     asyncio.create_task(self.order_cache_manager.start(), name="OrderCacheManager")
@@ -1158,7 +1329,9 @@ class MasterSystemOrchestrator:
             if HAS_EXIT_ARBITRATOR:
                 try:
                     self.exit_arbitrator = get_arbitrator()
-                    logger.info("✅ ExitArbitrator initialized (priority: RISK>TP_SL>SIGNAL>ROTATION>REBALANCE)")
+                    logger.info(
+                        "✅ ExitArbitrator initialized (priority: RISK>TP_SL>SIGNAL>ROTATION>REBALANCE)"
+                    )
                 except Exception as _ea_e:
                     logger.warning("⚠️  ExitArbitrator: %s", _ea_e)
 
@@ -1171,7 +1344,10 @@ class MasterSystemOrchestrator:
                         exchange_client=self.exchange_client,
                     )
                     asyncio.create_task(self.position_manager.start(), name="PositionManager")
-                    logger.info("✅ PositionManager started (exchange position sync every %ss)", getattr(self.config, "POSITION_SYNC_INTERVAL_S", 20))
+                    logger.info(
+                        "✅ PositionManager started (exchange position sync every %ss)",
+                        getattr(self.config, "POSITION_SYNC_INTERVAL_S", 20),
+                    )
                 except Exception as _pm_e:
                     logger.warning("⚠️  PositionManager: %s", _pm_e)
 
@@ -1207,14 +1383,14 @@ class MasterSystemOrchestrator:
                     shared_state=self.shared_state,
                     config=self.config,
                     execution_manager=self.execution_manager,
-                    logger=logger
+                    logger=logger,
                 )
-                logger.info(f"✅ TPSLEngine initialized")
+                logger.info("✅ TPSLEngine initialized")
             except Exception as e:
                 logger.error(f"❌ TPSLEngine initialization failed: {e}", exc_info=True)
                 logger.warning("⚠️  System will continue without TP/SL monitoring (HIGH RISK)")
                 self.tp_sl_engine = None
-            
+
             # LAYER 5C: Safety Order Manager (Exchange-Native OCO Protection)
             # Complements TPSLEngine: posts REAL orders on Binance so SL/TP
             # survives bot crashes / network loss / process restarts.
@@ -1232,50 +1408,60 @@ class MasterSystemOrchestrator:
                 logger.error(f"❌ SafetyOrderManager init failed: {e}", exc_info=True)
                 logger.warning("⚠️  System continues without exchange-native SL (MEDIUM RISK)")
                 self.safety_order_manager = None
-            
+
             # LAYER 3B: Meta Controller (decisions)
             logger.info("\n[6/9] LAYER 3B: Meta Controller (Decision Engine)")
-            
+
             # 🔥 CRITICAL FIX: Disable ProfitLock on first run (no realized PnL yet)
             # ProfitLock prevents trading when there are no profits to compound
             # This is appropriate for experienced systems with P&L history,
             # but blocks execution on bootstrap. Will be enabled after first profitable trade.
-            setattr(self.config, "PROFIT_LOCK_REENTRY_ENABLED", False)
+            self.config.PROFIT_LOCK_REENTRY_ENABLED = False
             logger.info("[6/9] 🔥 DISABLED ProfitLock (will enable after first profit)")
-            
+
             self.meta_controller = MetaController(
                 shared_state=self.shared_state,
                 execution_manager=self.execution_manager,
                 exchange_client=self.exchange_client,
                 config=self.config,
-                signal_manager=self.signal_manager  # CRITICAL: Share the same SignalManager so injected signals are visible!
+                signal_manager=self.signal_manager,  # CRITICAL: Share the same SignalManager so injected signals are visible!
             )
-            logger.info(f"✅ MetaController initialized")
-            
+            logger.info("✅ MetaController initialized")
+
             # CLEANUP: Clear rejection counters from previous runs to unblock trading
-            logger.info("[BOOTSTRAP_CLEANUP] Clearing rejection counters accumulated from previous runs...")
+            logger.info(
+                "[BOOTSTRAP_CLEANUP] Clearing rejection counters accumulated from previous runs..."
+            )
             try:
                 # Clear all rejection counters to reset any deadlock state from prior sessions
                 old_total = sum(self.shared_state.rejection_counters.values())
                 self.shared_state.rejection_counters.clear()
-                logger.info(f"✅ Rejection counters cleared (was tracking {old_total} rejections, now=0)")
+                logger.info(
+                    f"✅ Rejection counters cleared (was tracking {old_total} rejections, now=0)"
+                )
             except Exception as _clear_e:
                 logger.warning(f"⚠️  Failed to clear rejection counters: {_clear_e}")
 
             # LAYER 6.1: REGIME-AWARE MEDIATOR (wires MarketRegimeDetector → MetaController/AgentManager/CapitalAllocator)
-            if HAS_MARKET_REGIME_DETECTOR and HAS_REGIME_INTEGRATION and self.market_regime_detector is not None:
+            if (
+                HAS_MARKET_REGIME_DETECTOR
+                and HAS_REGIME_INTEGRATION
+                and self.market_regime_detector is not None
+            ):
                 try:
                     self.regime_mediator = RegimeAwareMediator(
                         config=self.config,
                         market_regime_detector=self.market_regime_detector,
                         meta_controller=self.meta_controller,
-                        agent_manager=None,         # wired below after AgentManager init
-                        capital_allocator=None,     # wired below after CapitalAllocator init
+                        agent_manager=None,  # wired below after AgentManager init
+                        capital_allocator=None,  # wired below after CapitalAllocator init
                         execution_manager=self.execution_manager,
                         logger=logger,
                     )
                     asyncio.create_task(self.regime_mediator.start(), name="RegimeAwareMediator")
-                    logger.info("✅ RegimeAwareMediator started (regime→agent weights→capital allocation)")
+                    logger.info(
+                        "✅ RegimeAwareMediator started (regime→agent weights→capital allocation)"
+                    )
                 except Exception as _rmed_e:
                     logger.warning("⚠️  RegimeAwareMediator: %s", _rmed_e)
 
@@ -1287,7 +1473,9 @@ class MasterSystemOrchestrator:
                         config=self.config,
                         logger=logger,
                     )
-                    logger.info("✅ CapitalSymbolGovernor initialized (dynamic symbol cap based on equity)")
+                    logger.info(
+                        "✅ CapitalSymbolGovernor initialized (dynamic symbol cap based on equity)"
+                    )
                 except Exception as _csg_e:
                     logger.warning("⚠️  CapitalSymbolGovernor: %s", _csg_e)
 
@@ -1298,8 +1486,10 @@ class MasterSystemOrchestrator:
                         self.meta_controller.set_exit_arbitrator(self.exit_arbitrator)
                         logger.info("✅ ExitArbitrator wired into MetaController")
                     else:
-                        logger.info("✅ ExitArbitrator available (MetaController will use it via shared reference)")
-                        setattr(self.meta_controller, "_exit_arbitrator", self.exit_arbitrator)
+                        logger.info(
+                            "✅ ExitArbitrator available (MetaController will use it via shared reference)"
+                        )
+                        self.meta_controller._exit_arbitrator = self.exit_arbitrator
                 except Exception as _eaw_e:
                     logger.warning("⚠️  ExitArbitrator wiring: %s", _eaw_e)
 
@@ -1308,7 +1498,7 @@ class MasterSystemOrchestrator:
                 try:
                     _eae_cfg = {
                         "EXTERNAL_DUST_THRESHOLD_USDT": 10.0,
-                        "EXTERNAL_ADOPTION_MIN_USDT": 5.0,   # low threshold — adopt small positions
+                        "EXTERNAL_ADOPTION_MIN_USDT": 5.0,  # low threshold — adopt small positions
                         "EXTERNAL_EXPOSURE_LIMIT_PCT": 0.40,
                         "EXTERNAL_HEDGE_SPEED_PCT": 5.0,
                     }
@@ -1319,7 +1509,9 @@ class MasterSystemOrchestrator:
                         config=_eae_cfg,
                     )
                     self.meta_controller.set_external_adoption_engine(self.external_adoption_engine)
-                    logger.info("✅ ExternalAdoptionEngine wired — existing holdings will be managed")
+                    logger.info(
+                        "✅ ExternalAdoptionEngine wired — existing holdings will be managed"
+                    )
                 except Exception as _eae_e:
                     logger.warning("⚠️  ExternalAdoptionEngine failed: %s", _eae_e)
 
@@ -1327,6 +1519,7 @@ class MasterSystemOrchestrator:
             logger.info("\n[6.45/9] COMPOUND GROWTH ENGINE")
             try:
                 from tools.compound_engine import get_engine as _get_compound_engine
+
                 self.compound_growth_engine = _get_compound_engine(
                     config=self.config,
                     shared_state=self.shared_state,
@@ -1378,7 +1571,7 @@ class MasterSystemOrchestrator:
                             _min_dead_override = float(_min_dead_env)
                     except Exception:
                         pass
-                    
+
                     _healer_config = {
                         "total_equity": max(50.0, _usdt_now),
                         "batch_heal_enabled": True,
@@ -1387,8 +1580,10 @@ class MasterSystemOrchestrator:
                     # Apply environment override if provided
                     if _min_dead_override is not None:
                         _healer_config["min_dead_to_heal"] = _min_dead_override
-                        logger.info(f"[INIT] Applied DEAD_CAPITAL_MIN_THRESHOLD override: ${_min_dead_override:.2f}")
-                    
+                        logger.info(
+                            f"[INIT] Applied DEAD_CAPITAL_MIN_THRESHOLD override: ${_min_dead_override:.2f}"
+                        )
+
                     self.dead_capital_healer = DeadCapitalHealer(config=_healer_config)
                     # Wire into ThreeBucketManager if available
                     if self.three_bucket_manager is not None and hasattr(
@@ -1400,15 +1595,13 @@ class MasterSystemOrchestrator:
                         logger.info("✅ DeadCapitalHealer initialized (standalone)")
                 except Exception as _dch_e:
                     logger.warning("⚠️  DeadCapitalHealer failed: %s", _dch_e)
-            
+
             # CAPITAL RECYCLING: Portfolio Segmentation
             logger.info("\n[6.6/9] CAPITAL RECYCLING: Portfolio Segmentation")
             if HAS_PORTFOLIO_SEGMENTATION:
                 try:
                     self.segmentation_manager = PortfolioSegmentationManager(
-                        config=self.config,
-                        shared_state=self.shared_state,
-                        logger=logger
+                        config=self.config, shared_state=self.shared_state, logger=logger
                     )
                     logger.info("✅ PortfolioSegmentationManager initialized")
                 except Exception as e:
@@ -1416,7 +1609,7 @@ class MasterSystemOrchestrator:
                     self.segmentation_manager = None
             else:
                 logger.warning("⚠️  PortfolioSegmentationManager import failed")
-            
+
             # LAYER 3A: Agent Manager
             logger.info("\n[7/9] LAYER 3A: Agent Manager")
             self.agent_manager = AgentManager(
@@ -1429,7 +1622,7 @@ class MasterSystemOrchestrator:
             )
             # Defensive rebind: keep AgentManager and MetaController explicitly linked.
             self.agent_manager.meta_controller = self.meta_controller
-            logger.info(f"✅ AgentManager initialized")
+            logger.info("✅ AgentManager initialized")
 
             # SymbolManager must be initialized before discovery registration so
             # proposer agents (e.g., IPOChaser) receive a live symbol_manager.
@@ -1439,21 +1632,23 @@ class MasterSystemOrchestrator:
                         exchange_client=self.exchange_client,
                         shared_state=self.shared_state,
                         config=self.config,
-                        logger=logger
+                        logger=logger,
                     )
                     logger.info("✅ SymbolManager initialized (pre-wired for discovery)")
                 except Exception as e:
-                    logger.warning(f"⚠️  SymbolManager pre-wire failed (discovery quality reduced): {e}")
-            
+                    logger.warning(
+                        f"⚠️  SymbolManager pre-wire failed (discovery quality reduced): {e}"
+                    )
+
             # LAYER 3D: Discovery Agents (Proposer System)
             logger.info("\n[7.3/9] LAYER 3D: Discovery Agents (Proposer System)")
             try:
                 from src.l5_strategy.agent_registry import register_all_discovery_agents
-                
+
                 # Create app_context-like object for discovery agents
                 class AppContext:
                     pass
-                
+
                 app_ctx = AppContext()
                 app_ctx.shared_state = self.shared_state
                 app_ctx.config = self.config
@@ -1462,16 +1657,16 @@ class MasterSystemOrchestrator:
                 app_ctx.execution_manager = self.execution_manager
                 app_ctx.meta_controller = self.meta_controller
                 app_ctx.tp_sl_engine = None
-                
+
                 # Register all discovery/proposer agents
                 register_all_discovery_agents(self.agent_manager, app_ctx)
-                
+
                 discovery_agents = self.agent_manager.get_discovery_agents()
                 logger.info(f"✅ Discovery Agents registered: {len(discovery_agents)} agents")
                 for agent in discovery_agents:
-                    agent_name = agent.name if hasattr(agent, 'name') else agent.__class__.__name__
+                    agent_name = agent.name if hasattr(agent, "name") else agent.__class__.__name__
                     logger.info(f"   • {agent_name}")
-                    
+
             except Exception as e:
                 logger.warning(f"⚠️  Discovery agents registration failed (non-fatal): {e}")
                 logger.warning("   System will continue with strategy agents only")
@@ -1484,7 +1679,9 @@ class MasterSystemOrchestrator:
                         config=self.config,
                         logger=logger,
                     )
-                    logger.info("✅ DiscoveryCoordinator initialized (deduplication + quality gating for proposals)")
+                    logger.info(
+                        "✅ DiscoveryCoordinator initialized (deduplication + quality gating for proposals)"
+                    )
                 except Exception as _dc_e:
                     logger.warning("⚠️  DiscoveryCoordinator: %s", _dc_e)
 
@@ -1510,21 +1707,21 @@ class MasterSystemOrchestrator:
                 logger.warning("⚠️  MarketDataFeed fallback init (warm-up was skipped)")
             else:
                 logger.info("✅ MarketDataFeed already running (warm-up complete)")
-            
+
             # Synchronization: Polling Coordinator
             logger.info("\n[8/9] SYNCHRONIZATION: Polling Coordinator")
             polling_config = PollingConfig(
                 balance_interval_sec=self.config.polling_interval_sec,
                 open_orders_interval_sec=self.config.polling_interval_sec,
                 position_interval_sec=self.config.polling_interval_sec,
-                health_cadence_sec=5.0
+                health_cadence_sec=5.0,
             )
             self.polling_coordinator = PollingCoordinator(
                 exchange_client=self.exchange_client,
                 shared_state=self.shared_state,
-                config=polling_config
+                config=polling_config,
             )
-            logger.info(f"✅ PollingCoordinator initialized")
+            logger.info("✅ PollingCoordinator initialized")
             logger.info(f"   Sync interval: {self.config.polling_interval_sec}s")
 
             # LAYER 8.1: STATE SYNCHRONIZER (reconciles SharedState vs component state)
@@ -1539,7 +1736,10 @@ class MasterSystemOrchestrator:
                         interval_sec=float(getattr(self.config, "STATE_SYNC_INTERVAL_S", 60.0)),
                     )
                     asyncio.create_task(self.state_sync_task.start(), name="StateSynchronizer")
-                    logger.info("✅ StateSynchronizer started (reconciles state every %ss)", getattr(self.config, "STATE_SYNC_INTERVAL_S", 60))
+                    logger.info(
+                        "✅ StateSynchronizer started (reconciles state every %ss)",
+                        getattr(self.config, "STATE_SYNC_INTERVAL_S", 60),
+                    )
                 except Exception as _ss_e:
                     logger.warning("⚠️  StateSynchronizer: %s", _ss_e)
 
@@ -1549,11 +1749,16 @@ class MasterSystemOrchestrator:
                     _replay_enabled = bool(getattr(self.config, "REPLAY_ENGINE_ENABLED", False))
                     if _replay_enabled:
                         from src.l3_portfolio.event_store import get_event_store
+
                         _event_store = await get_event_store()
                         self.replay_engine = DeterministicReplayEngine(event_store=_event_store)
-                        logger.info("✅ ReplayEngine initialized (deterministic event replay enabled)")
+                        logger.info(
+                            "✅ ReplayEngine initialized (deterministic event replay enabled)"
+                        )
                     else:
-                        logger.info("ℹ️  ReplayEngine available (disabled — enable with REPLAY_ENGINE_ENABLED=true)")
+                        logger.info(
+                            "ℹ️  ReplayEngine available (disabled — enable with REPLAY_ENGINE_ENABLED=true)"
+                        )
                 except Exception as _re_e:
                     logger.warning("⚠️  ReplayEngine: %s", _re_e)
 
@@ -1562,15 +1767,17 @@ class MasterSystemOrchestrator:
             self.health_monitor = HealthMonitor()
             self.watchdog = Watchdog(shared_state=self.shared_state)
             self.heartbeat = Heartbeat(shared_state=self.shared_state)
-            logger.info(f"✅ HealthMonitor initialized")
-            logger.info(f"✅ Watchdog initialized")
-            logger.info(f"✅ Heartbeat initialized")
+            logger.info("✅ HealthMonitor initialized")
+            logger.info("✅ Watchdog initialized")
+            logger.info("✅ Heartbeat initialized")
 
             # LAYER 9.1: HEALTH CHECK MANAGER (structured health probes)
             if HAS_HEALTH_CHECK_MANAGER:
                 try:
                     self.health_check_manager = HealthCheckManager()
-                    logger.info("✅ HealthCheckManager initialized (structured component health probes)")
+                    logger.info(
+                        "✅ HealthCheckManager initialized (structured component health probes)"
+                    )
                 except Exception as _hcm_e:
                     logger.warning("⚠️  HealthCheckManager: %s", _hcm_e)
 
@@ -1581,15 +1788,24 @@ class MasterSystemOrchestrator:
                     if _health_port > 0:
                         import uvicorn
                         from fastapi import FastAPI as _FastAPI
+
                         _health_app = _FastAPI(title="OctiVault Health")
                         register_health_endpoints(_health_app)
                         asyncio.create_task(
-                            asyncio.to_thread(uvicorn.run, _health_app, host="0.0.0.0", port=_health_port, log_level="warning"),
+                            asyncio.to_thread(
+                                uvicorn.run,
+                                _health_app,
+                                host="0.0.0.0",
+                                port=_health_port,
+                                log_level="warning",
+                            ),
                             name="HealthEndpoints",
                         )
                         logger.info("✅ HealthEndpoints serving on port %d", _health_port)
                     else:
-                        logger.info("ℹ️  HealthEndpoints available (set HEALTH_ENDPOINT_PORT=<port> to activate)")
+                        logger.info(
+                            "ℹ️  HealthEndpoints available (set HEALTH_ENDPOINT_PORT=<port> to activate)"
+                        )
                 except Exception as _he_e:
                     logger.warning("⚠️  HealthEndpoints: %s", _he_e)
 
@@ -1606,7 +1822,9 @@ class MasterSystemOrchestrator:
                         )
                         logger.info("✅ Dashboard initialized on port %d", _dash_port)
                     else:
-                        logger.info("ℹ️  Dashboard available (set DASHBOARD_PORT=<port> to activate)")
+                        logger.info(
+                            "ℹ️  Dashboard available (set DASHBOARD_PORT=<port> to activate)"
+                        )
                 except Exception as _dash_e:
                     logger.warning("⚠️  Dashboard: %s", _dash_e)
 
@@ -1616,17 +1834,22 @@ class MasterSystemOrchestrator:
                     _replay_enabled = bool(getattr(self.config, "REPLAY_ENGINE_ENABLED", False))
                     if _replay_enabled:
                         from src.l3_portfolio.event_store import get_event_store as _get_es
+
                         _event_store = await _get_es()
                         self.replay_engine = DeterministicReplayEngine(event_store=_event_store)
-                        logger.info("✅ ReplayEngine initialized (deterministic event replay active)")
+                        logger.info(
+                            "✅ ReplayEngine initialized (deterministic event replay active)"
+                        )
                     else:
-                        logger.info("ℹ️  ReplayEngine available (set REPLAY_ENGINE_ENABLED=true to activate)")
+                        logger.info(
+                            "ℹ️  ReplayEngine available (set REPLAY_ENGINE_ENABLED=true to activate)"
+                        )
                 except Exception as _re_e:
                     logger.warning("⚠️  ReplayEngine: %s", _re_e)
 
             # OPTIONAL COMPONENTS: Enhanced System Features
             logger.info("\n[OPTIONAL] ENHANCED FEATURES: Optional Components")
-            
+
             # Symbol Manager (if available)
             if HAS_SYMBOL_MANAGER:
                 if self.symbol_manager is None:
@@ -1635,7 +1858,7 @@ class MasterSystemOrchestrator:
                             exchange_client=self.exchange_client,
                             shared_state=self.shared_state,
                             config=self.config,
-                            logger=logger
+                            logger=logger,
                         )
                         logger.info("✅ SymbolManager initialized (optional)")
                     except Exception as e:
@@ -1673,7 +1896,7 @@ class MasterSystemOrchestrator:
                     )
             else:
                 logger.info("ℹ️  UniverseRotationEngine disabled by feature flag")
-            
+
             # Recovery Engine (if available)
             # RecoveryEngine requires: config, shared_state, exchange_client, database_manager, [optional: sstools, pnl_calculator, logger]
             if HAS_RECOVERY_ENGINE:
@@ -1685,12 +1908,12 @@ class MasterSystemOrchestrator:
                         database_manager=None,  # Graceful fallback: RecoveryEngine will skip DB snapshot
                         sstools=None,
                         pnl_calculator=None,
-                        logger=logger
+                        logger=logger,
                     )
                     logger.info("✅ RecoveryEngine initialized (optional)")
                 except Exception as e:
                     logger.warning(f"⚠️  RecoveryEngine failed (optional): {e}")
-            
+
             # Bootstrap Manager (if available)
             if HAS_BOOTSTRAP_MANAGER:
                 try:
@@ -1698,7 +1921,7 @@ class MasterSystemOrchestrator:
                     logger.info("✅ BootstrapManager initialized (optional)")
                 except Exception as e:
                     logger.warning(f"⚠️  BootstrapManager failed (optional): {e}")
-            
+
             # Performance Monitor (if available)
             # PerformanceMonitor requires: cfg, shared_state, [optional: sstools, db, logger]
             if HAS_PERFORMANCE_MONITOR:
@@ -1708,7 +1931,7 @@ class MasterSystemOrchestrator:
                         shared_state=self.shared_state,
                         sstools=None,
                         db=None,
-                        logger=logger
+                        logger=logger,
                     )
                     logger.info("✅ PerformanceMonitor initialized (optional)")
                 except Exception as e:
@@ -1744,7 +1967,7 @@ class MasterSystemOrchestrator:
                     logger.info("✅ ProfitTargetEngine initialized (optional)")
                 except Exception as e:
                     logger.warning(f"⚠️  ProfitTargetEngine failed (optional): {e}")
-            
+
             # Capital Allocator (if available)
             # CapitalAllocator requires: config, shared_state, risk_manager, [optional: sstools, logger, profit_target_engine, strategy_manager, agent_manager, liquidation_agent]
             if HAS_CAPITAL_ALLOCATOR:
@@ -1757,8 +1980,10 @@ class MasterSystemOrchestrator:
                         logger=logger,
                         profit_target_engine=self.profit_target_engine,
                         strategy_manager=None,
-                        agent_manager=self.agent_manager if hasattr(self, 'agent_manager') else None,
-                        liquidation_agent=None
+                        agent_manager=self.agent_manager
+                        if hasattr(self, "agent_manager")
+                        else None,
+                        liquidation_agent=None,
                     )
                     logger.info("✅ CapitalAllocator initialized (optional)")
                     # Wire CapitalAllocator into RegimeAwareMediator now that it exists
@@ -1828,9 +2053,14 @@ class MasterSystemOrchestrator:
                                 config=self.config,
                                 execution_manager=self.execution_manager,
                             )
-                            logger.info("✅ CashRouter initialized (dust sweep + stablecoin redemption active)")
+                            logger.info(
+                                "✅ CashRouter initialized (dust sweep + stablecoin redemption active)"
+                            )
                         except Exception as _cr_e:
-                            logger.warning("⚠️  CashRouter init failed (%s) — LiquidationOrchestrator will run without it", _cr_e)
+                            logger.warning(
+                                "⚠️  CashRouter init failed (%s) — LiquidationOrchestrator will run without it",
+                                _cr_e,
+                            )
                     else:
                         logger.warning("⚠️  CashRouter not available — dust sweep chain disabled")
 
@@ -1838,7 +2068,7 @@ class MasterSystemOrchestrator:
                         shared_state=self.shared_state,
                         liquidation_agent=liquidation_agent,
                         execution_manager=self.execution_manager,
-                        cash_router=self.cash_router,          # ← now wired
+                        cash_router=self.cash_router,  # ← now wired
                         meta_controller=self.meta_controller,
                         position_manager=None,
                         risk_manager=self.risk_manager,
@@ -1855,21 +2085,27 @@ class MasterSystemOrchestrator:
                         logger.info("✅ LiquidationOrchestrator wired into MetaController")
                     else:
                         # Attribute injection fallback
-                        self.meta_controller._liquidation_orchestrator = self.liquidation_orchestrator
-                        logger.info("✅ LiquidationOrchestrator injected into MetaController (attr)")
+                        self.meta_controller._liquidation_orchestrator = (
+                            self.liquidation_orchestrator
+                        )
+                        logger.info(
+                            "✅ LiquidationOrchestrator injected into MetaController (attr)"
+                        )
 
                     # Start async monitoring loop
                     if self.liquidation_orchestrator:
                         try:
                             asyncio.create_task(
                                 self.liquidation_orchestrator._async_start(),
-                                name="liquidation_orchestrator_main"
+                                name="liquidation_orchestrator_main",
                             )
                             logger.info("✅ LiquidationOrchestrator started (async loop active)")
                         except Exception as e:
                             logger.warning(f"⚠️  LiquidationOrchestrator async start failed: {e}")
                 except Exception as e:
-                    logger.warning(f"⚠️  LiquidationOrchestrator failed (optional): {e}", exc_info=True)
+                    logger.warning(
+                        f"⚠️  LiquidationOrchestrator failed (optional): {e}", exc_info=True
+                    )
 
             # Volatility Regime Detector (feature-flagged, if available)
             if self.config.enable_volatility_regime:
@@ -1946,7 +2182,9 @@ class MasterSystemOrchestrator:
                             mode=self.config.truth_auditor_mode,
                         )
                         if hasattr(self.exchange_truth_auditor, "set_execution_manager"):
-                            self.exchange_truth_auditor.set_execution_manager(self.execution_manager)
+                            self.exchange_truth_auditor.set_execution_manager(
+                                self.execution_manager
+                            )
                         logger.info(
                             "✅ ExchangeTruthAuditor initialized (optional, mode=%s)",
                             self.config.truth_auditor_mode,
@@ -1998,13 +2236,13 @@ class MasterSystemOrchestrator:
                     )
             else:
                 logger.info("ℹ️  RebalancingEngine disabled by feature flag")
-            
+
             logger.info("\n" + "=" * 80)
             logger.info("✅ ALL COMPONENTS INITIALIZED SUCCESSFULLY")
             logger.info("=" * 80)
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ Component initialization failed: {e}", exc_info=True)
             return False
@@ -2058,7 +2296,11 @@ class MasterSystemOrchestrator:
                         try:
                             await asyncio.wait_for(maybe, timeout=10.0)
                         except asyncio.TimeoutError:
-                            logger.warning("⚠️  %s %s timed out after 10s; continuing shutdown", name, method_name)
+                            logger.warning(
+                                "⚠️  %s %s timed out after 10s; continuing shutdown",
+                                name,
+                                method_name,
+                            )
                     logger.info("✅ %s shutdown", name)
                 except Exception as e:
                     logger.warning("⚠️  %s %s failed: %s", name, method_name, e, exc_info=True)
@@ -2118,8 +2360,13 @@ class MasterSystemOrchestrator:
             try:
                 positions, prices = await self._snapshot_positions_prices()
                 if positions and prices:
-                    report = await self.position_merger_enhanced.run_consolidation_cycle(positions, prices)
-                    if getattr(report, "proposals_generated", 0) > 0 or getattr(report, "proposals_executed", 0) > 0:
+                    report = await self.position_merger_enhanced.run_consolidation_cycle(
+                        positions, prices
+                    )
+                    if (
+                        getattr(report, "proposals_generated", 0) > 0
+                        or getattr(report, "proposals_executed", 0) > 0
+                    ):
                         logger.info(
                             "🧩 PositionMergerEnhanced cycle: proposals=%s executed=%s errors=%d",
                             getattr(report, "proposals_generated", 0),
@@ -2138,8 +2385,12 @@ class MasterSystemOrchestrator:
         Periodically run RebalancingEngine auto-rebalance checks.
         """
         interval = max(1.0, float(getattr(self.config, "rebalancing_engine_loop_sec", 300.0)))
-        strategy_name = str(getattr(self.config, "rebalancing_engine_strategy", "DRIFT_THRESHOLD")).upper()
-        logger.info("⚖️ RebalancingEngine loop started (interval=%.1fs strategy=%s)", interval, strategy_name)
+        strategy_name = str(
+            getattr(self.config, "rebalancing_engine_strategy", "DRIFT_THRESHOLD")
+        ).upper()
+        logger.info(
+            "⚖️ RebalancingEngine loop started (interval=%.1fs strategy=%s)", interval, strategy_name
+        )
 
         strategy = None
         if HAS_REBALANCING_ENGINE:
@@ -2153,7 +2404,11 @@ class MasterSystemOrchestrator:
                     continue
 
                 if not getattr(self.rebalancing_engine, "target_allocation", {}):
-                    symbols = [s for s, p in positions.items() if float(p.get("quantity", 0.0)) > 0 and prices.get(s, 0.0) > 0]
+                    symbols = [
+                        s
+                        for s, p in positions.items()
+                        if float(p.get("quantity", 0.0)) > 0 and prices.get(s, 0.0) > 0
+                    ]
                     if symbols:
                         eq_weight = 1.0 / len(symbols)
                         if HAS_REBALANCING_ENGINE:
@@ -2162,7 +2417,10 @@ class MasterSystemOrchestrator:
                                 for s in symbols
                             }
                             self.rebalancing_engine.set_target_allocation(targets)
-                            logger.info("⚖️ RebalancingEngine seeded equal-weight targets for %d symbols", len(symbols))
+                            logger.info(
+                                "⚖️ RebalancingEngine seeded equal-weight targets for %d symbols",
+                                len(symbols),
+                            )
 
                 plan = await self.rebalancing_engine.auto_rebalance(
                     positions=positions,
@@ -2212,7 +2470,9 @@ class MasterSystemOrchestrator:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning("⚠️  UniverseRotationEngine %s cycle failed: %s", stage, e, exc_info=True)
+                logger.warning(
+                    "⚠️  UniverseRotationEngine %s cycle failed: %s", stage, e, exc_info=True
+                )
 
         # Immediate cycle on startup so proposals are consumed quickly.
         await _run_once("startup")
@@ -2227,18 +2487,18 @@ class MasterSystemOrchestrator:
                 logger.warning("⚠️  UniverseRotationEngine loop error: %s", e, exc_info=True)
 
         logger.info("🌐 UniverseRotationEngine loop stopped")
-    
+
     # ========================================================================
     # SYSTEM EXECUTION
     # ========================================================================
-    
+
     async def run_system(self) -> bool:
         """Run complete trading system"""
-        
+
         if not self.check_prerequisites():
             logger.error("❌ Prerequisite checks failed")
             return False
-        
+
         if not await self.initialize_components():
             logger.error("❌ Component initialization failed")
             return False
@@ -2252,8 +2512,12 @@ class MasterSystemOrchestrator:
             from src.l3_portfolio.portfolio_target_size_enforcer import (
                 PortfolioTargetSizeEnforcer,
             )
+
             _trim_enable = os.environ.get("STARTUP_TRIM_TO_TARGET", "0").strip().lower() in (
-                "1", "true", "yes", "on",
+                "1",
+                "true",
+                "yes",
+                "on",
             )
             _trim_target = int(os.environ.get("STARTUP_TRIM_TARGET_COUNT", "5") or 5)
             _enforcer = PortfolioTargetSizeEnforcer(
@@ -2266,13 +2530,11 @@ class MasterSystemOrchestrator:
             _trim_report = await _enforcer.enforce_once()
             logger.info("[StartupTrim] report=%s", _trim_report)
         except Exception as _trim_err:
-            logger.warning(
-                "[StartupTrim] enforcer raised (continuing without trim): %s", _trim_err
-            )
+            logger.warning("[StartupTrim] enforcer raised (continuing without trim): %s", _trim_err)
 
         self.running = True
         self.start_time = datetime.now()
-        
+
         # ════════════════════════════════════════════════════════════════════════
         # AUTO-RECOVERY TRIGGER: Detect dust trap and enable RECOVERY mode.
         # This unlocks LiquidationAgent dust healing normally blocked in MICRO_SNIPER.
@@ -2280,29 +2542,45 @@ class MasterSystemOrchestrator:
         try:
             # Simple check: if we have a lot of positions, assume dust trap
             positions_snapshot = self.shared_state.get_positions_snapshot() or {}
-            pos_count = len([p for p in positions_snapshot.values() if p and float((p or {}).get('qty', 0.0) or 0.0) > 0])
-            
+            pos_count = len(
+                [
+                    p
+                    for p in positions_snapshot.values()
+                    if p and float((p or {}).get("qty", 0.0) or 0.0) > 0
+                ]
+            )
+
             logger.warning("[Auto-Recovery] Startup check: %d positions detected", pos_count)
-            
+
             # If high dust burden (>10 positions in MICRO_SNIPER), enable RECOVERY
-            if pos_count >= 10 and self.meta_controller and hasattr(self.meta_controller, 'mode_manager'):
-                regime = self.meta_controller.regime_manager.get_regime() if hasattr(self.meta_controller, 'regime_manager') else ""
+            if (
+                pos_count >= 10
+                and self.meta_controller
+                and hasattr(self.meta_controller, "mode_manager")
+            ):
+                regime = (
+                    self.meta_controller.regime_manager.get_regime()
+                    if hasattr(self.meta_controller, "regime_manager")
+                    else ""
+                )
                 logger.warning("[Auto-Recovery] Regime check: regime=%s", regime)
-                
+
                 if str(regime).upper() == "MICRO_SNIPER":
                     logger.warning(
                         "🚨 [Auto-Recovery] Dust trap detected! (>=10 positions in MICRO_SNIPER) "
                         "→ Enabling RECOVERY mode to accelerate dust liquidation"
                     )
                     success = self.meta_controller.mode_manager.set_mode(
-                        "RECOVERY", 
-                        force=True, 
-                        reason="dust_trap_auto_heal"
+                        "RECOVERY", force=True, reason="dust_trap_auto_heal"
                     )
                     logger.warning("[Auto-Recovery] Mode switch result: success=%s", success)
         except Exception as _auto_recovery_err:
-            logger.warning("[Auto-Recovery] Trigger check failed (continuing): %s", _auto_recovery_err, exc_info=True)
-        
+            logger.warning(
+                "[Auto-Recovery] Trigger check failed (continuing): %s",
+                _auto_recovery_err,
+                exc_info=True,
+            )
+
         logger.info("\n" + "=" * 80)
         logger.info("PHASE 2: RUNNING TRADING SYSTEM")
         logger.info("=" * 80)
@@ -2310,32 +2588,41 @@ class MasterSystemOrchestrator:
         logger.info(f"Duration: {self.config.duration_hours} hours")
         logger.info(f"Mode: {'🔴 LIVE TRADING' if self.config.live_mode else '📝 PAPER TRADING'}")
         logger.info("=" * 80 + "\n")
-        
+
         try:
             # DEBUG: Pre-task creation state
-            logger.warning("[DEBUG] About to create tasks. self.running=%s, signal_manager=%s, shared_state=%s", 
-                          self.running, self.signal_manager is not None, self.shared_state is not None)
-            
+            logger.warning(
+                "[DEBUG] About to create tasks. self.running=%s, signal_manager=%s, shared_state=%s",
+                self.running,
+                self.signal_manager is not None,
+                self.shared_state is not None,
+            )
+
             # Create tasks for all components
             # NOTE: MarketDataFeed is already running from the [2.8/9] warm-up step.
             # Do NOT create a second task for it — that would spawn a duplicate stream.
             self.tasks = [
                 asyncio.create_task(self.polling_coordinator.start(), name="PollingCoordinator"),
                 # market_data_feed already running — task tracked in _mdf_task above
-                asyncio.create_task(self.tp_sl_engine.start(), name="TPSLEngine") if self.tp_sl_engine else None,
-                asyncio.create_task(self.safety_order_manager.start(), name="SafetyOrderManager") if self.safety_order_manager else None,
+                asyncio.create_task(self.tp_sl_engine.start(), name="TPSLEngine")
+                if self.tp_sl_engine
+                else None,
+                asyncio.create_task(self.safety_order_manager.start(), name="SafetyOrderManager")
+                if self.safety_order_manager
+                else None,
                 asyncio.create_task(self.meta_controller.start(), name="MetaController"),
                 asyncio.create_task(self.agent_manager.start(), name="AgentManager"),
                 asyncio.create_task(self.watchdog.run(), name="Watchdog"),
                 asyncio.create_task(self.heartbeat.run(), name="Heartbeat"),
                 asyncio.create_task(self._inject_signals_loop(), name="SignalInjector")
-                if self.config.enable_signal_injector else None,
+                if self.config.enable_signal_injector
+                else None,
             ]
             # Add the MarketDataFeed warm-up task to the monitored set
             if hasattr(self, "_mdf_warmup_task") and self._mdf_warmup_task is not None:
                 self.tasks.append(self._mdf_warmup_task)
                 logger.info("✅ MarketDataFeed task added to monitor loop")
-            
+
             # Three-bucket portfolio management + dead-capital healing.
             # Runs UNCONDITIONALLY (live + paper) — previously buried inside the
             # test-only signal-injector loop, so live runs never invoked Heal-C.
@@ -2352,7 +2639,7 @@ class MasterSystemOrchestrator:
                 logger.warning("[Orchestrator] SignalInjector ENABLED (test mode).")
             else:
                 logger.info("[Orchestrator] SignalInjector disabled (production-safe).")
-            
+
             # Add optional component tasks (supports start/run_forever/run/run_loop).
             optional_components = [
                 ("RecoveryEngine", self.recovery_engine, None),
@@ -2367,8 +2654,16 @@ class MasterSystemOrchestrator:
                 ("PortfolioBalancer", self.portfolio_balancer, None),
                 ("LiquidationOrchestrator", self.liquidation_orchestrator, None),
                 # Prefer long-running loop methods so orchestrator owns cancellation directly.
-                ("VolatilityRegimeDetector", self.volatility_regime, ("run", "run_loop", "run_forever", "start")),
-                ("CompoundingEngine", self.compounding_engine, ("run_loop", "run", "run_forever", "start")),
+                (
+                    "VolatilityRegimeDetector",
+                    self.volatility_regime,
+                    ("run", "run_loop", "run_forever", "start"),
+                ),
+                (
+                    "CompoundingEngine",
+                    self.compounding_engine,
+                    ("run_loop", "run", "run_forever", "start"),
+                ),
                 ("CompoundGrowthEngine", self.compound_growth_engine, ("run_checkpoint_loop",)),
                 ("AlertSystem", self.alert_system, None),
                 ("ExchangeTruthAuditor", self.exchange_truth_auditor, None),
@@ -2377,7 +2672,9 @@ class MasterSystemOrchestrator:
                 ("UniverseRotationEngine", self.universe_rotation_engine, None),
             ]
             for comp_name, comp, lifecycle_methods in optional_components:
-                self._launch_optional_component(comp, comp_name, lifecycle_methods=lifecycle_methods)
+                self._launch_optional_component(
+                    comp, comp_name, lifecycle_methods=lifecycle_methods
+                )
 
             # Components without native run loops are orchestrated here.
             if self.position_merger_enhanced is not None:
@@ -2404,32 +2701,36 @@ class MasterSystemOrchestrator:
                     )
                 )
                 logger.info("✅ UniverseRotationEngine task added (orchestrator loop)")
-            
+
             # Filter out None tasks
             self.tasks = [t for t in self.tasks if t is not None]
-            
+
             # DEBUG: Post-task creation verification
             logger.warning("[DEBUG] Created %d tasks:", len(self.tasks))
             for t in self.tasks:
-                logger.warning("[DEBUG]   - %s: done=%s, cancelled=%s", t.get_name(), t.done(), t.cancelled())
-            
+                logger.warning(
+                    "[DEBUG]   - %s: done=%s, cancelled=%s", t.get_name(), t.done(), t.cancelled()
+                )
+
             # Calculate duration in seconds
             duration_seconds = self.config.duration_hours * 3600
-            logger.info(f"⏱️  System will run for {self.config.duration_hours} hours ({duration_seconds}s)")
+            logger.info(
+                f"⏱️  System will run for {self.config.duration_hours} hours ({duration_seconds}s)"
+            )
             logger.info("🟢 All components now running concurrently...")
-            
+
             # Keep system running for full duration, allowing components to fail/restart without killing system
             try:
                 start_time = asyncio.get_event_loop().time()
                 elapsed = 0
                 loop_count = 0
                 logged_tasks = set()  # Track which tasks we've already logged
-                
+
                 while elapsed < duration_seconds:
                     loop_count += 1
                     remaining = duration_seconds - elapsed
                     check_timeout = min(5.0, remaining)  # Check every 5 seconds
-                    
+
                     # Monitor tasks for failures - allows us to log but NOT exit
                     # Guard: if all tasks are already done asyncio.wait() returns
                     # instantly with no sleep → busy-loop that floods the log.
@@ -2440,9 +2741,7 @@ class MasterSystemOrchestrator:
                         done, pending = set(), set()
                     else:
                         done, pending = await asyncio.wait(
-                            active_tasks,
-                            timeout=check_timeout,
-                            return_when=asyncio.FIRST_COMPLETED
+                            active_tasks, timeout=check_timeout, return_when=asyncio.FIRST_COMPLETED
                         )
 
                     # Log any NEWLY completed tasks (only once per task)
@@ -2452,7 +2751,9 @@ class MasterSystemOrchestrator:
                             try:
                                 exc = task.exception()
                                 if exc:
-                                    logger.error(f"❌ Task {task.get_name()} failed with: {type(exc).__name__}: {exc}")
+                                    logger.error(
+                                        f"❌ Task {task.get_name()} failed with: {type(exc).__name__}: {exc}"
+                                    )
                             except (asyncio.CancelledError, asyncio.InvalidStateError):
                                 pass
 
@@ -2461,64 +2762,69 @@ class MasterSystemOrchestrator:
                     hours_remaining = (duration_seconds - elapsed) / 3600
 
                     if loop_count % 12 == 0:  # Log every ~60 seconds (12 * 5s checks)
-                        logger.info(f"⏱️  Running... ({elapsed/3600:.2f}h elapsed, {hours_remaining:.2f}h remaining) | Active tasks: {len(active_tasks)}")
-                
-                logger.info(f"\n✅ Trading session duration ({self.config.duration_hours}h) complete")
+                        logger.info(
+                            f"⏱️  Running... ({elapsed/3600:.2f}h elapsed, {hours_remaining:.2f}h remaining) | Active tasks: {len(active_tasks)}"
+                        )
+
+                logger.info(
+                    f"\n✅ Trading session duration ({self.config.duration_hours}h) complete"
+                )
                 logger.info("🛑 Initiating graceful shutdown...")
-                
+
             except asyncio.TimeoutError:
-                logger.info(f"\n✅ Trading session duration ({self.config.duration_hours}h) complete (timeout)")
+                logger.info(
+                    f"\n✅ Trading session duration ({self.config.duration_hours}h) complete (timeout)"
+                )
                 logger.info("🛑 Initiating graceful shutdown...")
-            
+
             return True
-            
+
         except KeyboardInterrupt:
             logger.info("\n🛑 SHUTDOWN REQUESTED (Ctrl+C)")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ System error: {e}", exc_info=True)
             return False
-            
+
         finally:
             await self.shutdown()
-    
+
     # ========================================================================
     # SIGNAL INJECTION (for testing MetaController execution pipeline)
     # ========================================================================
-    
+
     async def _three_bucket_management_loop(self):
         """
         Periodic three-bucket portfolio classification + dead-capital healing.
-        
+
         Runs UNCONDITIONALLY in both live and paper mode (previously this logic
         was buried inside `_inject_signals_loop` which only runs when
         ENABLE_SIGNAL_INJECTOR=true → in live mode, healing never fired).
-        
+
         Interval: HEAL_DUST_SWEEP_INTERVAL_SEC env (default 1800s = 30 min).
         Bucket-status logging: every 10 cycles.
         """
-        import time
-        
+
         # Wait for prerequisites with bounded retries
         for _ in range(60):  # up to ~60 seconds
             if self.three_bucket_manager and self.shared_state:
                 break
             await asyncio.sleep(1)
-        
+
         if not (self.three_bucket_manager and self.shared_state):
             logger.warning("[3BucketLoop] prerequisites not ready after 60s — exiting")
             return
-        
+
         try:
             interval_sec = float(os.getenv("HEAL_DUST_SWEEP_INTERVAL_SEC", "1800"))
         except Exception:
             interval_sec = 1800.0
         # Hard floor: 60s (prevent accidental tight loops); cap: 1h
         interval_sec = max(60.0, min(3600.0, interval_sec))
-        
+
         logger.info(f"[3BucketLoop] ✅ Started — interval={interval_sec:.0f}s")
-        
+
         # Initial warmup: give execution_manager and other late-binding
         # components a chance to come online before the first heal cycle.
         try:
@@ -2529,7 +2835,7 @@ class MasterSystemOrchestrator:
         if warmup_sec > 0:
             logger.info(f"[3BucketLoop] warmup {warmup_sec:.0f}s before first heal cycle")
             await asyncio.sleep(warmup_sec)
-        
+
         cycle = 0
         while self.running:
             cycle += 1
@@ -2541,7 +2847,7 @@ class MasterSystemOrchestrator:
                     include_wallet_inventory=True,
                 )
                 total_equity = await self.shared_state.get_nav()
-                
+
                 # Enrich missing 'qty'/'value'/'current_price' with latest
                 # prices so the classifier and healer have non-zero values.
                 # Wallet-mirrored dust snapshots use 'quantity'/'free' instead
@@ -2573,13 +2879,13 @@ class MasterSystemOrchestrator:
                             pass
                     if not pos.get("value") and qty > 0 and px > 0:
                         pos["value"] = qty * px
-                
+
                 # Update bucket classification (SYNC)
                 bucket_state = self.three_bucket_manager.update_bucket_state(
                     positions=positions,
                     total_equity=total_equity,
                 )
-                
+
                 # Heal if due — wire execution callback so dust actually liquidates.
                 if self.three_bucket_manager.should_execute_healing():
                     # Guard: skip heal-c if execution_manager is not yet ready
@@ -2592,12 +2898,14 @@ class MasterSystemOrchestrator:
                             f"execution_manager not yet ready"
                         )
                     else:
-                        logger.warning(f"[3BucketLoop] 💀 cycle={cycle} executing dead-capital healing...")
-                        
+                        logger.warning(
+                            f"[3BucketLoop] 💀 cycle={cycle} executing dead-capital healing..."
+                        )
+
                         # Capture loop reference for cross-thread/coroutine scheduling.
                         running_loop = asyncio.get_running_loop()
-                        
-                        def _heal_execution_callback(order: Dict) -> Dict:
+
+                        def _heal_execution_callback(order: dict) -> dict:
                             """Sync callback: fire-and-forget async liquidation submit."""
                             sym = order.get("symbol") or ""
                             qty = float(order.get("quantity") or 0)
@@ -2605,7 +2913,9 @@ class MasterSystemOrchestrator:
                             if not (sym and qty > 0 and self.execution_manager):
                                 # Force healer to mark this as failed (raise) so it
                                 # surfaces in errors[] and is retried next cycle.
-                                raise RuntimeError(f"liquidation precondition failed sym={sym} qty={qty}")
+                                raise RuntimeError(
+                                    f"liquidation precondition failed sym={sym} qty={qty}"
+                                )
                             try:
                                 running_loop.create_task(
                                     self.execution_manager.execute_liquidation_plan(
@@ -2613,7 +2923,9 @@ class MasterSystemOrchestrator:
                                     ),
                                     name=f"HealC:liquidate:{sym}",
                                 )
-                                logger.info(f"[3BucketLoop] 📤 submitted SELL {sym} qty={qty:.8f} expected≈${expected:.4f}")
+                                logger.info(
+                                    f"[3BucketLoop] 📤 submitted SELL {sym} qty={qty:.8f} expected≈${expected:.4f}"
+                                )
                             except Exception as exc:
                                 logger.warning(
                                     f"[3BucketLoop] schedule liquidation {sym} failed: "
@@ -2621,7 +2933,7 @@ class MasterSystemOrchestrator:
                                 )
                                 raise
                             return {"actual_value": expected}
-                        
+
                         healing_result = self.three_bucket_manager.execute_healing(
                             execution_callback=_heal_execution_callback,
                         )
@@ -2632,7 +2944,7 @@ class MasterSystemOrchestrator:
                                 f"recovered≈${healing_result.total_amount_recovered:.2f} "
                                 f"errors={len(healing_result.errors)}"
                             )
-                
+
                 # Status every 10 cycles
                 if cycle % 10 == 1:
                     try:
@@ -2640,7 +2952,7 @@ class MasterSystemOrchestrator:
                         self.three_bucket_manager.log_trading_gates()
                     except Exception as log_exc:
                         logger.debug(f"[3BucketLoop] status-log failed: {log_exc}")
-            
+
             except asyncio.CancelledError:
                 logger.info("[3BucketLoop] cancelled")
                 raise
@@ -2649,46 +2961,56 @@ class MasterSystemOrchestrator:
                     f"[3BucketLoop] cycle={cycle} update failed: {type(exc).__name__}: {exc}",
                     exc_info=True,
                 )
-            
+
             await asyncio.sleep(interval_sec)
-    
+
     async def _inject_signals_loop(self):
         """
         Inject high-confidence test signals into the signal manager.
         This bypasses agents and tests if MetaController can execute.
         """
-        import time
         import sys
-        
+        import time
+
         # IMMEDIATE DEBUG - this should be first log
         msg = "[SignalInjector] 🚀 Task started! signal_manager=%s, shared_state=%s, running=%s" % (
-            self.signal_manager is not None, self.shared_state is not None, self.running)
+            self.signal_manager is not None,
+            self.shared_state is not None,
+            self.running,
+        )
         logger.warning(msg)
         print(msg, file=sys.stderr)
-        
+
         # Wait for shared_state and signal_manager (but not too long)
         if not self.signal_manager or not self.shared_state:
-            logger.error("[SignalInjector] ❌ Components not ready! signal_manager=%s, shared_state=%s", 
-                          self.signal_manager, self.shared_state)
+            logger.error(
+                "[SignalInjector] ❌ Components not ready! signal_manager=%s, shared_state=%s",
+                self.signal_manager,
+                self.shared_state,
+            )
             return
-        
+
         logger.warning("[SignalInjector] ✅ Components ready, starting injection loop")
-        
+
         try:
-            symbols = list((await self.shared_state.get_accepted_symbols()).keys()) if self.shared_state else []
+            symbols = (
+                list((await self.shared_state.get_accepted_symbols()).keys())
+                if self.shared_state
+                else []
+            )
             if not symbols:
                 logger.warning("[SignalInjector] No symbols available for injection")
                 return
-            
+
             logger.warning("[SignalInjector] Got %d symbols: %s", len(symbols), symbols)
-            
+
             cycle = 0
             injected_count = 0
-            
+
             while self.running:
                 cycle += 1
                 now = time.time()
-                
+
                 # Inject BUY signal for each symbol
                 for symbol in symbols:
                     signal = {
@@ -2698,10 +3020,10 @@ class MasterSystemOrchestrator:
                         "timestamp": now,
                         "quote": 10.0,
                     }
-                    
+
                     if self.signal_manager.receive_signal("TEST_INJECTOR", symbol, signal):
                         injected_count += 1
-                
+
                 # ═══════════════════════════════════════════════════════════════
                 # THREE-BUCKET PORTFOLIO MANAGEMENT
                 # ═══════════════════════════════════════════════════════════════
@@ -2710,25 +3032,24 @@ class MasterSystemOrchestrator:
                         # Get current portfolio state
                         positions = await self.shared_state.get_positions_snapshot()
                         total_equity = await self.shared_state.get_total_nav()
-                        
+
                         # Update bucket classification
                         bucket_state = await self.three_bucket_manager.update_bucket_state(
-                            positions=positions,
-                            total_equity=total_equity
+                            positions=positions, total_equity=total_equity
                         )
-                        
+
                         # Check if healing should execute
                         if self.three_bucket_manager.should_execute_healing():
                             logger.warning("💀 Executing dead capital healing cycle...")
                             healing_result = await self.three_bucket_manager.execute_healing()
                             if healing_result:
                                 logger.info(f"✅ Healing complete: {healing_result}")
-                        
+
                         # Log status every 10 cycles
                         if cycle % 10 == 0:
                             self.three_bucket_manager.log_bucket_status()
                             self.three_bucket_manager.log_trading_gates()
-                        
+
                         # =====================================================================
                         # CAPITAL RECYCLING: Analyze portfolio state
                         # =====================================================================
@@ -2736,7 +3057,7 @@ class MasterSystemOrchestrator:
                             try:
                                 # Get portfolio segmentation
                                 segmentation = await self.segmentation_manager.segment_portfolio()
-                                
+
                                 # Log portfolio health (every 10 cycles)
                                 if cycle % 10 == 0:
                                     logger.info(
@@ -2751,17 +3072,17 @@ class MasterSystemOrchestrator:
                                         f"├─ Fragmentation: {segmentation.fragmentation_index:.1f}/100\n"
                                         f"└─ Dust Ratio: {segmentation.dust_ratio_pct:.2f}%"
                                     )
-                                    
+
                                     # Log immediate recycling actions
                                     if segmentation.immediate_actions:
                                         for action in segmentation.immediate_actions:
                                             logger.info(f"🔄 RECYCLING ACTION: {action}")
-                                    
+
                                     # Log strategic recommendations
                                     if segmentation.strategic_recommendations:
                                         for rec in segmentation.strategic_recommendations:
                                             logger.info(f"💡 STRATEGY: {rec}")
-                                    
+
                                     # Log capital efficiency metrics (every 20 cycles)
                                     if cycle % 20 == 0:
                                         logger.info(
@@ -2774,13 +3095,13 @@ class MasterSystemOrchestrator:
                                             f"├─ Dust Ratio: {segmentation.dust_ratio_pct:.2f}%\n"
                                             f"└─ Position Count: {len(segmentation.holdings)}"
                                         )
-                            
+
                             except Exception as e:
                                 logger.debug(f"Portfolio segmentation analysis failed: {e}")
-                        
+
                         # Get trading decision gates
                         gates = self.three_bucket_manager.get_trading_decision_gates()
-                        
+
                         # CHECK: Can we trade new positions?
                         all_gates_pass = all(passed for passed, _ in gates.values())
                         if not all_gates_pass:
@@ -2788,29 +3109,33 @@ class MasterSystemOrchestrator:
                             for gate_name, (passed, reason) in gates.items():
                                 if not passed:
                                     logger.warning(f"   ❌ {gate_name}: {reason}")
-                    
+
                     except Exception as e:
                         logger.warning(f"⚠️  Three-bucket update failed: {e}", exc_info=True)
-                
+
                 # Log every 1 cycle (every 2 seconds)
                 all_signals = self.signal_manager.get_all_signals()
                 logger.info(
                     "[SignalInjector] Cycle %d: Injected | Cache: %d signals | Total: %d injected",
-                    cycle, len(all_signals), injected_count
+                    cycle,
+                    len(all_signals),
+                    injected_count,
                 )
-                
+
                 # Wait before next cycle (inject every 2 seconds)
                 await asyncio.sleep(2)
-        
+
         except Exception as e:
             logger.error("[SignalInjector] Error: %s", e, exc_info=True)
         finally:
-            logger.info(f"[SignalInjector] ✅ Ended after {cycle} cycles, {injected_count} signals injected")
-    
+            logger.info(
+                f"[SignalInjector] ✅ Ended after {cycle} cycles, {injected_count} signals injected"
+            )
+
     # ========================================================================
     # SHUTDOWN
     # ========================================================================
-    
+
     # ──────────────────────────────────────────────────────────────────────────
     # Rejection counter persistence (survives restarts — prevents deadlock reset)
     # ──────────────────────────────────────────────────────────────────────────
@@ -2828,6 +3153,7 @@ class MasterSystemOrchestrator:
             serialisable = {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in counters.items()}
             with open(self._REJECTION_PERSIST_FILE, "w") as fh:
                 import json as _json
+
                 _json.dump(serialisable, fh)
             logger.info("[Persist] Rejection counters saved (%d entries)", len(serialisable))
         except Exception as e:
@@ -2839,6 +3165,7 @@ class MasterSystemOrchestrator:
             if self.shared_state is None or not self._REJECTION_PERSIST_FILE.exists():
                 return
             import json as _json
+
             with open(self._REJECTION_PERSIST_FILE) as fh:
                 serialisable = _json.load(fh)
             counters = getattr(self.shared_state, "rejection_counters", None)
@@ -2851,7 +3178,10 @@ class MasterSystemOrchestrator:
                     key = (parts[0], parts[1], parts[2])
                     counters[key] = int(count)
                     loaded += 1
-            logger.info("[Persist] Rejection counters restored (%d entries) — deadlock-relief state preserved", loaded)
+            logger.info(
+                "[Persist] Rejection counters restored (%d entries) — deadlock-relief state preserved",
+                loaded,
+            )
         except Exception as e:
             logger.debug("[Persist] Could not load rejection counters: %s", e)
 
@@ -2865,16 +3195,16 @@ class MasterSystemOrchestrator:
         self._save_rejection_counters()
 
         self.running = False
-        
+
         # Cancel all tasks
         for task in self.tasks:
             if not task.done():
                 task.cancel()
-        
+
         # Wait for tasks to finish
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
-        
+
         # Shutdown components
         try:
             await self._stop_component(self.tp_sl_engine, "TPSLEngine")
@@ -2908,51 +3238,54 @@ class MasterSystemOrchestrator:
             await self._stop_component(self.three_bucket_manager, "ThreeBucketPortfolioManager")
             await self._stop_component(self.segmentation_manager, "PortfolioSegmentationManager")
             await self._stop_component(self.exchange_client, "ExchangeClient")
-            
+
             if self.execution_manager:
                 logger.info("Closing all positions...")
                 # TODO: Close all open positions
                 logger.info("✅ All positions closed")
-            
+
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
-        
+
         # Print final statistics
         if self.start_time:
             uptime = (datetime.now() - self.start_time).total_seconds() / 3600
             logger.info(f"\nUptime: {uptime:.2f} hours")
-        
+
         logger.info("=" * 80)
         logger.info("✅ SYSTEM SHUTDOWN COMPLETE")
         logger.info("=" * 80)
-    
+
     # ========================================================================
     # SIGNAL HANDLERS
     # ========================================================================
-    
+
     def handle_signal(self, signum, frame):
         """Handle system signals (SIGTERM, SIGINT)"""
         logger.info(f"Received signal {signum}")
         if self.running:
             asyncio.create_task(self.shutdown())
 
+
 # ============================================================================
 # MAIN ENTRY POINT
 # ============================================================================
 
+
 async def main():
     """Main entry point"""
-    
+
     # Register signal handlers
     orchestrator = MasterSystemOrchestrator()
     signal.signal(signal.SIGINT, orchestrator.handle_signal)
     signal.signal(signal.SIGTERM, orchestrator.handle_signal)
-    
+
     # Run system
     success = await orchestrator.run_system()
-    
+
     # Return appropriate exit code
     sys.exit(0 if success else 1)
+
 
 if __name__ == "__main__":
     try:

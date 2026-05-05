@@ -14,7 +14,7 @@ if not ops_plane_ready: BLOCK ALL
 
 **Proposed Solution**: Dynamic gates that adapt based on:
 - System warm-up phase (0-5 min) → Strict gating
-- Initialization phase (5-20 min) → Relaxed gating  
+- Initialization phase (5-20 min) → Relaxed gating
 - Steady state (20+ min) → Risk-based gating
 - Execution success rate → Confidence-based gating
 - Capital utilization → Allocation-based gating
@@ -34,11 +34,11 @@ From our diagnostics:
 
 ```python
 gated_reasons = []
-if not snap.get("market_data_ready", True): 
+if not snap.get("market_data_ready", True):
     gated_reasons.append("MarketData")
-if not snap.get("balances_ready", True): 
+if not snap.get("balances_ready", True):
     gated_reasons.append("Balances")
-if not snap.get("ops_plane_ready", True): 
+if not snap.get("ops_plane_ready", True):
     gated_reasons.append("OpsPlane")
 
 if gated_reasons:
@@ -64,7 +64,7 @@ if gated_reasons:
 ```python
 class SystemPhase:
     BOOTSTRAP = "bootstrap"      # 0-5 minutes
-    INITIALIZATION = "init"      # 5-20 minutes  
+    INITIALIZATION = "init"      # 5-20 minutes
     STEADY_STATE = "steady"      # 20+ minutes
     ERROR_RECOVERY = "error"     # After errors
 
@@ -101,12 +101,12 @@ if success_rate > 80%:
     # System is executing well → Relax gates
     allow_normal_buys = True
     confidence_threshold = 0.50 (was 0.60)
-    
+
 elif success_rate > 50%:
     # System working but imperfect → Medium gates
-    allow_normal_buys = True  
+    allow_normal_buys = True
     confidence_threshold = 0.65
-    
+
 else:
     # System struggling → Keep strict gates
     allow_normal_buys = False
@@ -131,13 +131,13 @@ else:
 ```python
 def compute_dynamic_confidence_threshold():
     """Adjust confidence threshold based on system health"""
-    
+
     base_threshold = 0.55
-    
+
     # Factor 1: Execution health (0 to -0.15)
     fill_rate = recent_fills / recent_attempts
     health_adjustment = -0.15 * (1 - fill_rate)  # Perfect = -0.15, Poor = 0
-    
+
     # Factor 2: Capital utilization (0 to +0.10)
     capital_deployed = portfolio_value / total_capital
     if capital_deployed > 0.7:
@@ -146,17 +146,17 @@ def compute_dynamic_confidence_threshold():
         capital_adjustment = -0.05  # Underdeployed
     else:
         capital_adjustment = 0
-    
+
     # Factor 3: PnL trend (0 to ±0.10)
     pnl_change = (current_pnl - previous_pnl) / abs(previous_pnl + 0.01)
     pnl_adjustment = -0.10 * pnl_change  # Good PnL = lower threshold
-    
+
     # Factor 4: Recent errors (0 to +0.15)
     error_rate = recent_errors / recent_loops
     error_adjustment = +0.15 * error_rate
-    
+
     threshold = base_threshold + health_adjustment + capital_adjustment + pnl_adjustment + error_adjustment
-    
+
     # Clamp to reasonable range
     return max(0.40, min(0.80, threshold))
 ```
@@ -178,13 +178,13 @@ class DynamicGatingSystem:
     def __init__(self):
         self.system_start_time = time.time()
         self.phase = SystemPhase.BOOTSTRAP
-        
+
         # Metrics tracking
         self.recent_attempts = deque(maxlen=50)  # Last 50 loops
         self.recent_fills = deque(maxlen=50)
         self.recent_errors = deque(maxlen=50)
         self.recent_pnls = deque(maxlen=10)
-        
+
     def update_phase(self):
         elapsed = (time.time() - self.system_start_time) / 60
         if elapsed < 5:
@@ -193,7 +193,7 @@ class DynamicGatingSystem:
             self.phase = SystemPhase.INITIALIZATION
         else:
             self.phase = SystemPhase.STEADY_STATE
-            
+
     def record_loop_result(self, exec_attempted, exec_result, pnl):
         if exec_attempted:
             self.recent_attempts.append(1)
@@ -231,11 +231,11 @@ if gated_reasons:
 ```python
 def _compute_dynamic_confidence_threshold(self):
     """Compute adaptive confidence threshold based on system health"""
-    
+
     # Phase 1: Bootstrap → strict
     if self.phase == SystemPhase.BOOTSTRAP:
         return 0.70
-    
+
     # Phase 2: Initialization → based on success rate
     elif self.phase == SystemPhase.INITIALIZATION:
         success_rate = len(self.recent_fills) / max(len(self.recent_attempts), 1)
@@ -245,7 +245,7 @@ def _compute_dynamic_confidence_threshold(self):
             return 0.60
         else:
             return 0.70
-    
+
     # Phase 3: Steady state → comprehensive health-based
     else:
         return self._compute_steady_state_threshold()
@@ -301,7 +301,7 @@ Result: TRADES EXECUTE, PnL ACCUMULATES
 ## RISK MITIGATION
 
 **Risk**: Over-relaxing gates could cause losses
-**Mitigation**: 
+**Mitigation**:
 - Conservative thresholds (0.40-0.80, default 0.55)
 - Never allow infinite capital allocation
 - Always allow SELL/liquidation (risk management)

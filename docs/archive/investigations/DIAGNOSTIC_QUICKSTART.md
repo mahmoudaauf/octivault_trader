@@ -16,7 +16,7 @@
 The 900-Second Retrain Cooldown
 └─ agents/trend_hunter.py (Line 377)
    └─ agents/swing_trade_hunter.py (Line 333)
-   
+
 This prevents signals from:
 ├─ Being generated more than 4 times per hour
 ├─ Adapting to market changes faster than 15 minutes

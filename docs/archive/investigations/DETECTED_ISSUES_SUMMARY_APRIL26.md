@@ -1,8 +1,8 @@
 # 🔴 DETECTED ISSUES SUMMARY - APRIL 26, 2026
 
-**Generated:** April 26, 2026  
-**System Status:** OPERATIONAL (with significant limitations)  
-**Total Issues Found:** 12 Critical/High Priority  
+**Generated:** April 26, 2026
+**System Status:** OPERATIONAL (with significant limitations)
+**Total Issues Found:** 12 Critical/High Priority
 **PnL Status:** $0.00 (no profitable trades executing)
 
 ---
@@ -21,8 +21,8 @@
 ## 🔴 CRITICAL ISSUES (Blocking Trading)
 
 ### 1. **Gate System Over-Enforcement - TOO RESTRICTIVE**
-**Status:** ACTIVE - Preventing all trades  
-**Severity:** CRITICAL  
+**Status:** ACTIVE - Preventing all trades
+**Severity:** CRITICAL
 **Impact:** 6 signals generated but 0 trades executed
 
 #### The Problem:
@@ -59,7 +59,7 @@ Gate 2: POSITION LIMITS ✓ PASSING
 ├─ Current: 0
 ├─ Status: Portfolio is FLAT (can trade)
 
-Gate 3: CAPITAL FLOOR ✓ PASSING  
+Gate 3: CAPITAL FLOOR ✓ PASSING
 ├─ Required: $20.76 (17.4% of balance)
 ├─ Available: $49.73 (41%)
 ├─ Status: Sufficient capital
@@ -81,8 +81,8 @@ Gate 3: CAPITAL FLOOR ✓ PASSING
 ---
 
 ### 2. **Phantom Position Handling - System Lockup Risk**
-**Status:** DEPLOYED but FRAGILE  
-**Severity:** CRITICAL  
+**Status:** DEPLOYED but FRAGILE
+**Severity:** CRITICAL
 **Impact:** Can freeze entire trading loop for 50+ minutes
 
 #### The Problem:
@@ -120,7 +120,7 @@ Scenario D: Exchange Error Ignored
 if qty <= 0.0:
     detect_phantom_position()
 
-# Repair Scenario A: ✓ Works  
+# Repair Scenario A: ✓ Works
 sync_from_exchange()
 
 # Repair Scenario B: ✓ Works
@@ -142,8 +142,8 @@ delete_from_local_state()
 ---
 
 ### 3. **Bootstrap Mechanism Can Lock Indefinitely**
-**Status:** DEPLOYED but UNCLEAR CYCLE DEFINITION  
-**Severity:** CRITICAL  
+**Status:** DEPLOYED but UNCLEAR CYCLE DEFINITION
+**Severity:** CRITICAL
 **Impact:** May trap capital in dust liquidation loops
 
 #### The Problem:
@@ -156,7 +156,7 @@ delete_from_local_state()
 class BootstrapDustBypassManager:
     # Original: One-shot only
     # Current: Per-cycle reset
-    
+
     # BUT: What defines a "cycle"?
     # ❌ Not clearly specified
     # ❌ Could be seconds or forever
@@ -180,8 +180,8 @@ class BootstrapDustBypassManager:
 ---
 
 ### 4. **Position Tracking Sync Issues - ROOT OF PHANTOM PROBLEM**
-**Status:** FUNDAMENTAL ARCHITECTURE ISSUE  
-**Severity:** CRITICAL  
+**Status:** FUNDAMENTAL ARCHITECTURE ISSUE
+**Severity:** CRITICAL
 **Impact:** Local state divergence from exchange causes cascading failures
 
 #### The Problem:
@@ -236,8 +236,8 @@ Result: MISMATCH → Cascading failures
 ## 🟠 HIGH PRIORITY ISSUES (Limiting Performance)
 
 ### 5. **Signal Generation Quality Unknown**
-**Status:** 6 SIGNALS GENERATED, 0 TRADES EXECUTED  
-**Severity:** HIGH  
+**Status:** 6 SIGNALS GENERATED, 0 TRADES EXECUTED
+**Severity:** HIGH
 **Impact:** Can't measure if agents are profitable
 
 #### The Problem:
@@ -282,8 +282,8 @@ Metrics Collected:
 ---
 
 ### 6. **Capital Allocation Too Conservative**
-**Status:** ACTIVE - LIMITING UPSIDE  
-**Severity:** HIGH  
+**Status:** ACTIVE - LIMITING UPSIDE
+**Severity:** HIGH
 **Impact:** Compounding stalled, slow profit growth
 
 #### The Problem:
@@ -333,8 +333,8 @@ Expected with optimization:
 ---
 
 ### 7. **No Automated Recovery from Crashes**
-**Status:** MANUAL RECOVERY ONLY  
-**Severity:** HIGH  
+**Status:** MANUAL RECOVERY ONLY
+**Severity:** HIGH
 **Impact:** Requires human intervention to restart after crashes
 
 #### The Problem:
@@ -387,8 +387,8 @@ Result: Perfect detection ✓ but ZERO recovery ❌
 ---
 
 ### 8. **No Orchestrator Signal Injection Issue**
-**Status:** DISCOVERED RECENTLY  
-**Severity:** HIGH  
+**Status:** DISCOVERED RECENTLY
+**Severity:** HIGH
 **Impact:** System not executing trades even with good signals
 
 #### The Problem:
@@ -415,8 +415,8 @@ Result: Perfect detection ✓ but ZERO recovery ❌
 ## 🟡 MEDIUM PRIORITY ISSUES (Code Quality)
 
 ### 9. **TODO/FIXME Comments Not Resolved**
-**Status:** 8 Files with TODO markers  
-**Severity:** MEDIUM  
+**Status:** 8 Files with TODO markers
+**Severity:** MEDIUM
 
 Files needing review:
 - `core/external_adoption_engine.py` (1 TODO)
@@ -427,15 +427,15 @@ Files needing review:
 - `core/position_merger_enhanced.py` (1 TODO)
 
 ### 10. **Print Statements in Core Modules**
-**Status:** 2 CORE FILES USING PRINT()  
-**Severity:** MEDIUM  
+**Status:** 2 CORE FILES USING PRINT()
+**Severity:** MEDIUM
 
 Files needing logging upgrade:
 - `core/phases.py`
 - `core/portfolio_segmentation.py`
 
 ### 11. **Archived Files Not Cleaned Up**
-**Status:** 4 FILES IN _archived/ WITH SYNTAX ERRORS  
+**Status:** 4 FILES IN _archived/ WITH SYNTAX ERRORS
 **Severity:** MEDIUM (non-critical)
 
 Located in `core/_archived/`:

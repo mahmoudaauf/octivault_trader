@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 NAV Regime Engine (MICRO_SNIPER Mode for Small Capital)
 
@@ -78,8 +77,7 @@ FILE DEPENDENCIES:
 import logging
 import os
 import time
-from typing import Dict, Any, Optional, Set
-from enum import Enum
+from typing import Any, Optional
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -109,6 +107,7 @@ def _coerce_int(value: Any, default: int, minimum: int = 1) -> int:
 
 class NAVRegime:
     """NAV-based regime constants."""
+
     MICRO_SNIPER = "MICRO_SNIPER"
     STANDARD = "STANDARD"
     MULTI_AGENT = "MULTI_AGENT"
@@ -116,56 +115,62 @@ class NAVRegime:
 
 class MicroSniperConfig:
     """Configuration for MICRO_SNIPER mode (NAV < 1000)."""
-    
+
     # Position limits
     MAX_OPEN_POSITIONS = 1  # Only 1 concurrent trade
     MAX_ACTIVE_SYMBOLS = 1  # Only 1 asset at a time
-    
+
     # Quality gates
     MIN_EXPECTED_MOVE_PCT = 1.0  # 1.0% minimum move required
-    MIN_CONFIDENCE = 0.50  # 🔧 FIX: Lowered from 0.70 to 0.50 to allow high-quality signals (0.75+) to execute
+    MIN_CONFIDENCE = (
+        0.50  # 🔧 FIX: Lowered from 0.70 to 0.50 to allow high-quality signals (0.75+) to execute
+    )
     MIN_HOLD_TIME_SEC = 600  # 10 minutes minimum holding period
     MAX_TRADES_PER_DAY = 3  # Maximum 3 trades per calendar day
-    
+
     # Position sizing
     # FIX #4: REDUCE POSITION SIZE from 15% to 10% (extends runway to profitability)
     # With 40.7% win rate and negative expectancy, tighter sizing prevents rapid drawdown
     # Reduces per-trade capital allocation to allow strategy improvements to take effect
     POSITION_SIZE_PCT_NAV = 0.10  # Use up to 10% of NAV per position
-    
+
     # Disabled features
     ROTATION_ENABLED = False  # Disable symbol rotation
-    DUST_HEALING_ENABLED = True  # ✅ FIX: Re-enable dust healing (critical for capital recovery when dust accumulates)
+    DUST_HEALING_ENABLED = (
+        True  # ✅ FIX: Re-enable dust healing (critical for capital recovery when dust accumulates)
+    )
     CAPITAL_RESERVATIONS_ENABLED = False  # Bypass reservation logic
-    
+
     # Economic gate for small accounts
     # For MICRO accounts: target TP ≈ 1.8% – 2.5% to overcome fees
     # Fee structure: 0.2% taker × 2 (entry + exit) + ~0.3% slippage = 0.7% friction minimum
     # Therefore minimum profitable move should be ~2.0% to ensure positive EV
-    MIN_PROFITABLE_MOVE_PCT = 2.0  # Increased from 0.55% to account for fees dominating on small accounts
+    MIN_PROFITABLE_MOVE_PCT = (
+        2.0  # Increased from 0.55% to account for fees dominating on small accounts
+    )
 
 
 class StandardConfig:
     """Configuration for STANDARD mode (1000 <= NAV < 5000)."""
-    
+
     # Position limits
     MAX_OPEN_POSITIONS = 2  # Conservative: 2 concurrent trades
     MAX_ACTIVE_SYMBOLS = 3  # Up to 3 symbols
-    
+
     # Quality gates
     MIN_EXPECTED_MOVE_PCT = 0.50  # Relaxed vs MICRO
     MIN_CONFIDENCE = 0.55  # 🔧 FIX: Lowered from 0.65 to 0.55
     MIN_HOLD_TIME_SEC = 300  # 5 minutes
     MAX_TRADES_PER_DAY = 6  # Moderate trade frequency
-    
+
     # Position sizing
     POSITION_SIZE_PCT_NAV = 0.25
-    
+
     # Enabled features (defaults, controlled elsewhere)
     ROTATION_ENABLED = True
     DUST_HEALING_ENABLED = True
     CAPITAL_RESERVATIONS_ENABLED = True
-    
+
     # Economic gate for mid-size accounts
     # STANDARD accounts: higher min profitable move than MULTI_AGENT
     # Still need to overcome ~0.7% friction, target 1.2% – 1.5%
@@ -174,25 +179,25 @@ class StandardConfig:
 
 class MultiAgentConfig:
     """Configuration for MULTI_AGENT mode (NAV >= 5000)."""
-    
+
     # Position limits
     MAX_OPEN_POSITIONS = 3  # Full multi-asset
     MAX_ACTIVE_SYMBOLS = 5  # Aggressive universe
-    
+
     # Quality gates
     MIN_EXPECTED_MOVE_PCT = 0.30  # Full sensitivity
     MIN_CONFIDENCE = 0.45  # 🔧 FIX: Lowered from 0.60 to 0.45
     MIN_HOLD_TIME_SEC = 180  # Normal scaling
     MAX_TRADES_PER_DAY = 20  # Unrestricted
-    
+
     # Position sizing
     POSITION_SIZE_PCT_NAV = 0.20  # Standard allocation
-    
+
     # Enabled features (full architecture)
     ROTATION_ENABLED = True
     DUST_HEALING_ENABLED = True
     CAPITAL_RESERVATIONS_ENABLED = True
-    
+
     # Economic gate for large accounts
     # MULTI_AGENT accounts: sufficient NAV to absorb friction more effectively
     # Can operate with lower minimum profitable move
@@ -207,10 +212,10 @@ def get_nav_regime(
 ) -> str:
     """
     Determine regime based on live NAV.
-    
+
     Args:
         nav: Net Asset Value in USDT
-        
+
     Returns:
         str: NAVRegime constant (MICRO_SNIPER, STANDARD, or MULTI_AGENT)
     """
@@ -227,13 +232,13 @@ def get_nav_regime(
         return NAVRegime.MULTI_AGENT
 
 
-def get_regime_config(regime: str) -> Dict[str, Any]:
+def get_regime_config(regime: str) -> dict[str, Any]:
     """
     Get regime configuration as dict.
-    
+
     Args:
         regime: Regime constant from NAVRegime
-        
+
     Returns:
         dict: Configuration for regime with all rules
     """
@@ -243,7 +248,7 @@ def get_regime_config(regime: str) -> Dict[str, Any]:
         config_class = StandardConfig
     else:  # MULTI_AGENT
         config_class = MultiAgentConfig
-    
+
     return {
         "regime": regime,
         "max_open_positions": config_class.MAX_OPEN_POSITIONS,
@@ -263,13 +268,13 @@ def get_regime_config(regime: str) -> Dict[str, Any]:
 class RegimeManager:
     """
     Tracks regime state and provides logging.
-    
+
     Integrates with MetaController to:
     1. Query current regime at cycle start
     2. Detect regime switches
     3. Log regime state changes
     """
-    
+
     def __init__(self, logger: Optional[logging.Logger] = None, config: Optional[Any] = None):
         self.logger = logger or logging.getLogger("NAVRegime")
         self.config = config
@@ -292,7 +297,9 @@ class RegimeManager:
             self.multi_agent_threshold = self.micro_threshold * 2.0
 
         self.current_regime = NAVRegime.MULTI_AGENT  # Default assume large account
-        self.current_config = self._apply_runtime_overrides(get_regime_config(NAVRegime.MULTI_AGENT))
+        self.current_config = self._apply_runtime_overrides(
+            get_regime_config(NAVRegime.MULTI_AGENT)
+        )
         self.last_regime_switch_ts = time.time()
         self.regime_switch_count = 0
         self._trades_executed_today = 0
@@ -303,14 +310,14 @@ class RegimeManager:
             self.multi_agent_threshold,
             self.multi_agent_threshold,
         )
-    
+
     def update_regime(self, nav: float) -> bool:
         """
         Update regime based on live NAV. Returns True if regime switched.
-        
+
         Args:
             nav: Current NAV from SharedState
-            
+
         Returns:
             bool: True if regime changed, False if same regime
         """
@@ -319,23 +326,26 @@ class RegimeManager:
             micro_threshold=self.micro_threshold,
             multi_agent_threshold=self.multi_agent_threshold,
         )
-        regime_switched = (new_regime != self.current_regime)
-        
+        regime_switched = new_regime != self.current_regime
+
         if regime_switched:
             old_regime = self.current_regime
             self.current_regime = new_regime
             self.current_config = self._apply_runtime_overrides(get_regime_config(new_regime))
             self.last_regime_switch_ts = time.time()
             self.regime_switch_count += 1
-            
+
             self.logger.info(
                 "[REGIME_SWITCH] NAV=%.2f USD: %s → %s (switch_count=%d)",
-                nav, old_regime, new_regime, self.regime_switch_count
+                nav,
+                old_regime,
+                new_regime,
+                self.regime_switch_count,
             )
-        
+
         return regime_switched
 
-    def _apply_runtime_overrides(self, base_config: Dict[str, Any]) -> Dict[str, Any]:
+    def _apply_runtime_overrides(self, base_config: dict[str, Any]) -> dict[str, Any]:
         """
         Apply runtime micro-capital overrides so NAV regime gates stay aligned with
         adaptive capital-governor settings.
@@ -349,22 +359,28 @@ class RegimeManager:
         default_max_symbols = int(cfg.get("max_active_symbols", default_max_pos) or default_max_pos)
         default_rotation = bool(cfg.get("rotation_enabled", False))
 
-        raw_micro_max = getattr(self.config, "CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS", None)
+        raw_micro_max = getattr(
+            self.config, "CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS", None
+        )
         if raw_micro_max is None:
             raw_micro_max = os.getenv("CAPITAL_MICRO_ADAPTIVE_MAX_CONCURRENT_POSITIONS")
-        
+
         # 🔧 GROWTH FIX: If capital recovered well (>$50), allow higher position limit for sustainable growth
         # This enables portfolio rotation and prevents "portfolio full" deadlock after recovery
         micro_max_pos = _coerce_int(raw_micro_max, default=default_max_pos, minimum=1)
         if hasattr(self.config, "CAPITAL_RECOVERED_THRESHOLD"):
-            recovered_threshold = float(getattr(self.config, "CAPITAL_RECOVERED_THRESHOLD", 50.0) or 50.0)
+            recovered_threshold = float(
+                getattr(self.config, "CAPITAL_RECOVERED_THRESHOLD", 50.0) or 50.0
+            )
             current_free_capital = getattr(self.config, "_current_free_capital", 0.0)
             if current_free_capital > recovered_threshold and micro_max_pos <= 2:
                 # Increase to allow sustainable growth when capital is available
                 micro_max_pos = 3
                 self.logger.debug(
                     "[NAVRegime:GrowthBoost] Capital recovered (%.2f > %.2f threshold), boosting micro_max_pos to %d",
-                    current_free_capital, recovered_threshold, micro_max_pos
+                    current_free_capital,
+                    recovered_threshold,
+                    micro_max_pos,
                 )
 
         raw_rotation = getattr(self.config, "CAPITAL_MICRO_ALLOW_ROTATION", None)
@@ -395,91 +411,93 @@ class RegimeManager:
             )
 
         return cfg
-    
+
     def get_regime(self) -> str:
         """Get current regime."""
         return self.current_regime
-    
-    def get_config(self) -> Dict[str, Any]:
+
+    def get_config(self) -> dict[str, Any]:
         """Get current regime configuration."""
         return self.current_config
-    
+
     def get_max_positions(self) -> int:
         """Get max open positions for current regime."""
         return self.current_config["max_open_positions"]
-    
+
     def get_max_symbols(self) -> int:
         """Get max active symbols for current regime."""
         return self.current_config["max_active_symbols"]
-    
+
     def get_min_move(self) -> float:
         """Get minimum expected_move_pct for current regime."""
         return self.current_config["min_expected_move_pct"]
-    
+
     def get_min_confidence(self) -> float:
         """Get minimum confidence for current regime."""
         return self.current_config["min_confidence"]
-    
+
     def get_min_hold_time(self) -> float:
         """Get minimum hold time in seconds for current regime."""
         return self.current_config["min_hold_time_sec"]
-    
+
     def get_max_trades_per_day(self) -> int:
         """Get max trades per day for current regime."""
         return self.current_config["max_trades_per_day"]
-    
+
     def is_micro_sniper(self) -> bool:
         """Check if in MICRO_SNIPER regime."""
         return self.current_regime == NAVRegime.MICRO_SNIPER
-    
+
     def is_standard(self) -> bool:
         """Check if in STANDARD regime."""
         return self.current_regime == NAVRegime.STANDARD
-    
+
     def is_multi_agent(self) -> bool:
         """Check if in MULTI_AGENT regime."""
         return self.current_regime == NAVRegime.MULTI_AGENT
-    
+
     def is_rotation_enabled(self) -> bool:
         """Check if rotation is enabled in current regime."""
         return self.current_config["rotation_enabled"]
-    
+
     def is_dust_healing_enabled(self) -> bool:
         """Check if dust healing is enabled in current regime."""
         return self.current_config["dust_healing_enabled"]
-    
+
     def is_capital_reservations_enabled(self) -> bool:
         """Check if capital reservations are enabled in current regime."""
         return self.current_config["capital_reservations_enabled"]
-    
+
     def increment_daily_trade_count(self) -> None:
         """Increment daily trade counter (call when trade executed)."""
         import datetime
+
         today_utc = datetime.datetime.utcnow().date()
-        
+
         # Reset counter if date changed
         if self._last_trade_day_utc != today_utc:
             self._trades_executed_today = 0
             self._last_trade_day_utc = today_utc
-        
+
         self._trades_executed_today += 1
-    
+
     def get_daily_trade_count(self) -> int:
         """Get trades executed today (UTC)."""
         import datetime
+
         today_utc = datetime.datetime.utcnow().date()
-        
+
         # Reset if date changed
         if self._last_trade_day_utc != today_utc:
             self._trades_executed_today = 0
             self._last_trade_day_utc = today_utc
-        
+
         return self._trades_executed_today
-    
+
     def can_execute_trade_today(self) -> bool:
         """Check if daily trade limit reached."""
         return self.get_daily_trade_count() < self.get_max_trades_per_day()
-    
+
     def reset_daily_counter(self) -> None:
         """Manually reset daily trade counter (e.g., at system restart)."""
         self._trades_executed_today = 0

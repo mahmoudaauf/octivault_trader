@@ -31,10 +31,10 @@ qty = round_step(quantity, step_size)
 if side.upper() == "SELL" and step_size > 0:
     remainder = _raw_quantity - float(qty)
     residual_notional = max(0.0, remainder) * float(current_price or 0.0)
-    
+
     # Only rounds UP if remainder is TINY (< min_qty)
     qty_residual_is_dust = remainder > 0 and remainder < max(float(min_qty), float(step_size))
-    
+
     # ❌ PROBLEM: This doesn't catch all dust cases!
     if qty_residual_is_dust:
         # Round up to sell everything
@@ -68,14 +68,14 @@ Example with BTC/USDT:
 # For SELL orders: ensure we're exiting COMPLETELY
 if side.upper() == "SELL" and step_size > 0:
     remainder = _raw_quantity - float(qty)
-    
+
     # ✅ FIX: Check remainder in USDT/economic terms, not just quantity
     current_price_valid = float(current_price or 0.0) > 0
     residual_notional = remainder * float(current_price) if current_price_valid else 0.0
-    
+
     # Dust threshold: ANY remainder < $5 USDT should be sold with position
     dust_threshold_usdt = 5.0  # Configurable: DUST_EXIT_MINIMUM_USDT
-    
+
     # ✅ Condition: Sell everything if remainder notional < dust threshold
     if residual_notional > 0 and residual_notional < dust_threshold_usdt:
         # Round up to sell complete position
@@ -97,18 +97,18 @@ async def _should_sell_remainder(self, symbol: str, remainder_qty: float) -> boo
     If same remainder as last cycle, must liquidate forcefully.
     """
     last_remainder = self._sell_remainder_tracking.get(symbol, 0.0)
-    
+
     # ✅ Loop detection: same remainder 3+ times = stuck dust
     if abs(remainder_qty - last_remainder) < 1e-8:  # Floating point equal
         stuck_count = getattr(self, f"_stuck_dust_count_{symbol}", 0) + 1
         setattr(self, f"_stuck_dust_count_{symbol}", stuck_count)
-        
+
         if stuck_count >= 3:
             self.logger.warning(f"[DUST_TRAP] {symbol}: Stuck on remainder {remainder_qty:.8f}")
             return True  # Force liquidation
     else:
         setattr(self, f"_stuck_dust_count_{symbol}", 0)
-    
+
     self._sell_remainder_tracking[symbol] = remainder_qty
     return False
 ```
@@ -127,7 +127,7 @@ async def _force_liquidate_dust_position(self, symbol: str, current_price: float
         qty = await self._get_sellable_qty(symbol)
         if qty <= 0:
             return None
-        
+
         # Sell entire position, ignore min_notional
         order = await self._place_market_order_core(
             symbol,
@@ -137,10 +137,10 @@ async def _force_liquidate_dust_position(self, symbol: str, current_price: float
             is_liquidation=True,  # Bypass normal validation
             bypass_min_notional=True  # Allow tiny positions
         )
-        
+
         if order and order.get("ok"):
             self.logger.info(f"[DUST_FORCED_EXIT] {symbol}: Liquidated {qty:.8f}")
-        
+
         return order
     except Exception as e:
         self.logger.error(f"[DUST_LIQUIDATION_FAILED] {symbol}: {e}")
@@ -159,24 +159,24 @@ async def _validate_position_clean_exit(self, symbol: str) -> bool:
     Returns False if position needs cleanup.
     """
     qty = await self._get_sellable_qty(symbol)
-    
+
     if qty <= 0:
         return True  # Clean exit, ready for new trade
-    
+
     # Has position - check if it's dust
     current_price = await self._get_current_price(symbol)
     if current_price <= 0:
         return False  # Can't price it
-    
+
     notional = qty * current_price
     dust_threshold = 5.0  # $5 minimum position
-    
+
     if notional < dust_threshold:
         self.logger.warning(f"[DUST_DETECTED] {symbol}: {notional:.2f} USDT remaining")
         # Force liquidate
         await self._force_liquidate_dust_position(symbol, current_price)
         return False  # Retry needed
-    
+
     return True  # Position is meaningful, okay to add more
 ```
 
@@ -251,4 +251,3 @@ FORCE_LIQUIDATE_DUST_ENABLED = True    # Enable aggressive dust cleanup
 - Verify all positions fully exit
 - Measure capital efficiency improvement
 ```
-

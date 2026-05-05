@@ -80,5 +80,5 @@ tail -f logs/*.logpath
 
 ---
 
-**Full Details:** See `FIXES_COMPLETE_COMPREHENSIVE.md`  
+**Full Details:** See `FIXES_COMPLETE_COMPREHENSIVE.md`
 **Next Steps:** See `FIXES_READY_RESTART.md`

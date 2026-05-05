@@ -1,9 +1,9 @@
 # EXIT-FIRST STRATEGY: INTEGRATION ARCHITECTURE
 **Not Isolated - Fully Wired Into 226-Script Ecosystem**
 
-**Date:** April 27, 2026  
-**Status:** Integration-Ready  
-**Scope:** All 226 scripts, core layers, and monitoring systems  
+**Date:** April 27, 2026
+**Status:** Integration-Ready
+**Scope:** All 226 scripts, core layers, and monitoring systems
 
 ---
 
@@ -86,7 +86,7 @@ LAYER 6: OPERATIONAL INTERFACE
 
 **Current State:**
 ```python
-async def _position_blocks_new_buy(self, symbol: str, existing_qty: float) 
+async def _position_blocks_new_buy(self, symbol: str, existing_qty: float)
     → Tuple[bool, float, float, str]:
     """
     Returns:
@@ -153,14 +153,14 @@ async def _monitor_and_execute_exits(self):
         for symbol in self.positions_with_exit_plans:
             current_price = await self._get_current_price(symbol)
             exit_plan = self.positions[symbol].exit_plan
-            
+
             if current_price >= exit_plan.tp_price:
                 await self._execute_tp_exit(symbol, exit_plan)
             elif current_price <= exit_plan.sl_price:
                 await self._execute_sl_exit(symbol, exit_plan)
             elif time.time() > exit_plan.time_deadline:
                 await self._execute_time_exit(symbol, exit_plan)
-        
+
         await asyncio.sleep(10)  # Check every 10 seconds
 ```
 
@@ -201,25 +201,25 @@ DUST_ROUTED = "DUST_ROUTED"
 # ADD to SharedState Position fields:
 class Position:
     # ... existing fields ...
-    
+
     # NEW: Exit plan fields (Exit-First Strategy)
     exit_plan_id: str  # Unique ID for audit trail
     tp_price: Optional[float] = None  # Take profit trigger
     sl_price: Optional[float] = None  # Stop loss trigger
     time_exit_deadline: Optional[float] = None  # Unix timestamp
     dust_liquidation_path: Optional[str] = None  # Route if needed
-    
+
     # Exit execution flags
     tp_executed: bool = False
     sl_executed: bool = False
     time_executed: bool = False
     dust_routed: bool = False
-    
+
     # Exit metadata
     exit_pathway_used: Optional[str] = None  # Which exit fired
     exit_executed_price: Optional[float] = None  # Actual exit price
     exit_executed_time: Optional[float] = None  # When it executed
-    
+
     # Methods
     def set_exit_plan(self, tp: float, sl: float, time_deadline: float) -> bool:
         """Set all 3 exit pathways. Returns True if valid."""
@@ -227,7 +227,7 @@ class Position:
         self.sl_price = sl
         self.time_exit_deadline = time_deadline
         return self.validate_exit_plan()
-    
+
     def validate_exit_plan(self) -> bool:
         """Check all 4 pathways viable before entry."""
         return (
@@ -236,12 +236,12 @@ class Position:
             and self.time_exit_deadline is not None
             and time.time() < self.time_exit_deadline
         )
-    
+
     def check_exit_trigger(self, current_price: float) -> Optional[str]:
         """Check if any exit should trigger. Returns exit type or None."""
         if self.tp_executed or self.sl_executed or self.time_executed:
             return None  # Already exited
-        
+
         if current_price >= self.tp_price:
             return "TP"
         elif current_price <= self.sl_price:
@@ -271,8 +271,8 @@ class Position:
 **Current State:**
 ```python
 class CapitalAllocator:
-    def calculate_entry_size(self, 
-        available: float, 
+    def calculate_entry_size(self,
+        available: float,
         signal_strength: float,
         market_regime: str) -> float:
         """Calculate position size based on capital and signal."""
@@ -330,7 +330,7 @@ class DustLiquidationAgent:
 async def _route_to_dust_liquidation(self, position_id: str):
     """Fourth exit pathway for stuck positions."""
     position = self.positions[position_id]
-    
+
     # Call existing dust liquidation agent
     liquidated = await self.dust_agent.liquidate_position(
         symbol=position.symbol,
@@ -338,12 +338,12 @@ async def _route_to_dust_liquidation(self, position_id: str):
         reason="EXIT_FIRST_TIMEOUT",
         aggressiveness=0.8  # Accept 0.8% slippage
     )
-    
+
     if liquidated:
         position.dust_routed = True
         position.exit_pathway_used = "DUST"
         await self._record_exit_event(position_id, "DUST")
-    
+
     return liquidated
 ```
 
@@ -369,7 +369,7 @@ async def _route_to_dust_liquidation(self, position_id: str):
 class PositionManager:
     async def open_position(self, symbol: str, qty: float, entry_price: float) -> Position:
         """Open a new position."""
-    
+
     async def close_position(self, position_id: str) -> bool:
         """Close an existing position."""
 ```
@@ -442,14 +442,14 @@ class ExecutionManager:
 # INSIDE ExecutionManager.run(), ADD this task:
 async def run(self):
     """Main event loop with exit monitoring."""
-    
+
     # Existing tasks
     task1 = asyncio.create_task(self._process_pending_trades())
     task2 = asyncio.create_task(self._check_existing_positions())
-    
+
     # NEW: Continuous exit monitoring
     task3 = asyncio.create_task(self._monitor_and_execute_exits())
-    
+
     await asyncio.gather(task1, task2, task3)
 
 # NEW continuous exit monitoring task
@@ -461,24 +461,24 @@ async def _monitor_and_execute_exits(self):
     while self.is_running:
         try:
             all_positions = await self.shared_state.get_all_positions()
-            
+
             for position in all_positions:
                 if not position.exit_plan_defined:
                     continue  # Skip positions without exit plans
-                
+
                 current_price = await self.market_data.get_current_price(position.symbol)
                 exit_type = position.check_exit_trigger(current_price)
-                
+
                 if exit_type == "TP":
                     await self._execute_tp_exit(position, current_price)
                 elif exit_type == "SL":
                     await self._execute_sl_exit(position, current_price)
                 elif exit_type == "TIME":
                     await self._execute_time_exit(position)
-                
+
         except Exception as e:
             logger.error(f"Error in exit monitoring: {e}", exc_info=True)
-        
+
         await asyncio.sleep(10)  # Check every 10 seconds
 ```
 
@@ -506,7 +506,7 @@ async def _monitor_and_execute_exits(self):
 # NEW FILE: tools/exit_metrics.py
 class ExitMetricsTracker:
     """Tracks exit pathway usage and performance."""
-    
+
     def __init__(self):
         self.tp_exits = 0
         self.sl_exits = 0
@@ -517,7 +517,7 @@ class ExitMetricsTracker:
         self.time_profit = 0.0
         self.dust_recovered = 0.0
         self.exit_times = []
-    
+
     def record_exit(self, exit_type: str, pnl: float, hold_time_sec: float):
         """Record an exit event."""
         if exit_type == "TP":
@@ -532,9 +532,9 @@ class ExitMetricsTracker:
         elif exit_type == "DUST":
             self.dust_routes += 1
             self.dust_recovered += pnl
-        
+
         self.exit_times.append(hold_time_sec)
-    
+
     def get_distribution(self) -> Dict[str, float]:
         """Get exit pathway distribution percentages."""
         total = self.tp_exits + self.sl_exits + self.time_exits + self.dust_routes
@@ -546,23 +546,23 @@ class ExitMetricsTracker:
             'time_pct': self.time_exits / total * 100,
             'dust_pct': self.dust_routes / total * 100,
         }
-    
+
     def print_summary(self):
         """Print metrics to console."""
         dist = self.get_distribution()
         avg_time = statistics.mean(self.exit_times) if self.exit_times else 0
-        
+
         print(f"""
         EXIT METRICS SUMMARY
         ====================
         Total Exits: {self.tp_exits + self.sl_exits + self.time_exits + self.dust_routes}
-        
+
         Exit Distribution:
           TP Exits:   {self.tp_exits} ({dist.get('tp_pct', 0):.1f}%) → +${self.tp_profit:.2f}
           SL Exits:   {self.sl_exits} ({dist.get('sl_pct', 0):.1f}%) → ${self.sl_loss:.2f}
           Time Exits: {self.time_exits} ({dist.get('time_pct', 0):.1f}%) → +${self.time_profit:.2f}
           Dust Route: {self.dust_routes} ({dist.get('dust_pct', 0):.1f}%) → +${self.dust_recovered:.2f}
-        
+
         Average Hold Time: {avg_time:.0f} seconds
         """)
 
@@ -571,17 +571,17 @@ class ExecutionManager:
     def __init__(self):
         # ... existing init ...
         self.exit_metrics = ExitMetricsTracker()
-    
+
     async def _execute_tp_exit(self, position, price):
         # ... execute logic ...
         pnl = (price - position.entry_price) * position.qty
         self.exit_metrics.record_exit("TP", pnl, hold_time)
-    
+
     async def _execute_sl_exit(self, position, price):
         # ... execute logic ...
         pnl = (price - position.entry_price) * position.qty
         self.exit_metrics.record_exit("SL", pnl, hold_time)
-    
+
     # Similar for TIME and DUST exits
 ```
 

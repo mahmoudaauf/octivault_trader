@@ -2,9 +2,9 @@
 
 ## Current Status: 🟢 **OPERATIONAL WITH ACTIVE ISSUE**
 
-**Process:** ✅ Running (PID 27344)  
-**Runtime:** ~3 minutes  
-**Capital:** $97.76 NAV ($5.49 free, $92+ locked in positions)  
+**Process:** ✅ Running (PID 27344)
+**Runtime:** ~3 minutes
+**Capital:** $97.76 NAV ($5.49 free, $92+ locked in positions)
 **Mode:** Live Trading ✅
 
 ---
@@ -60,7 +60,7 @@ Gap: -$4.56 (insufficient)
 Result: REJECTED with RULE5_ESCALATION
 ```
 
-**Root Cause:** 
+**Root Cause:**
 - System has many open positions from previous trading
 - Most capital ($92+) is locked in existing trades
 - Only $5.49 free USDT available

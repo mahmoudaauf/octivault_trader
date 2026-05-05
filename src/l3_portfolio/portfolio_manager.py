@@ -1,18 +1,20 @@
 __all__ = ["PortfolioManager"]
 
-import logging
 import asyncio
-import time
 import json
+import logging
+import time
 from datetime import datetime
-from typing import Dict, Any, Optional
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
-from src.l0_core.stubs import maybe_await, maybe_call
+from decimal import Decimal, InvalidOperation
+from typing import Any, Optional
+
+from src.l0_core.stubs import maybe_call
 
 logger = logging.getLogger("PortfolioManager")
 
 # --- Global Helpers ---
 STABLECOIN_1to1 = {"USDT", "FDUSD", "TUSD", "BUSD", "USDC"}  # extend as needed
+
 
 def _safe_emit_event(ss, name: str, payload: dict) -> None:
     """
@@ -28,6 +30,7 @@ def _safe_emit_event(ss, name: str, payload: dict) -> None:
         # No running loop → run inline once
         asyncio.run(ss.emit_event(name, payload))
 
+
 def _d(val, q="0.00000001"):
     """
     Safely convert a value to a Decimal, or return a default Decimal(q) on error.
@@ -37,23 +40,27 @@ def _d(val, q="0.00000001"):
     except Exception:
         return Decimal(q)
 
+
 def _iso_now() -> str:
     """Return current timestamp in ISO format."""
     return datetime.utcnow().isoformat()
 
+
 def _emit_health(ss: Any, status: str, message: str):
     """Emit a health status event safely from sync contexts."""
     try:
-        _safe_emit_event(ss, "HealthStatus", {
-            "source": "PortfolioManager", "status": status, "message": message
-        })
+        _safe_emit_event(
+            ss, "HealthStatus", {"source": "PortfolioManager", "status": status, "message": message}
+        )
     except Exception:
         pass
 
 
 # --- PortfolioManager Class ---
 class PortfolioManager:
-    def __init__(self, config, shared_state, exchange_client, database_manager, notification_manager=None):
+    def __init__(
+        self, config, shared_state, exchange_client, database_manager, notification_manager=None
+    ):
         self.config = config
         self.shared_state = shared_state
         self.exchange_client = exchange_client
@@ -64,16 +71,16 @@ class PortfolioManager:
         self.logger.info("PortfolioManager (Treasury & Asset Management) initialized.")
 
         self.last_portfolio_audit_time: Optional[float] = None
-        self._run_lock = asyncio.Lock()               # prevent overlapping loops
+        self._run_lock = asyncio.Lock()  # prevent overlapping loops
         # Lazy initialization via properties below
-        self._last_alert_ts: float = 0.0              # throttle alerting
+        self._last_alert_ts: float = 0.0  # throttle alerting
         self._base_ccy = getattr(config, "BASE_CURRENCY", "USDT")
 
     # ------------- Dust classification -------------
     async def _is_dust(self, asset: str, amount: Decimal, price: Optional[Decimal]) -> bool:
         """
         Check if position is dust (notional < MIN_ECONOMIC_TRADE_USDT).
-        
+
         Uses unified dust threshold from config for consistency across all layers.
         Fail-safe: any classification uncertainty returns True (dust) to protect the system.
         """
@@ -100,7 +107,7 @@ class PortfolioManager:
 
             notional = float(amount) * float(price)
             return notional < min_usdt
-            
+
         except Exception:
             # Any classification failure → dust (fail-safe)
             return True
@@ -125,7 +132,11 @@ class PortfolioManager:
                 px = None
 
         # Fallback to ExchangeClient
-        if px is None and self.exchange_client and hasattr(self.exchange_client, "get_current_price"):
+        if (
+            px is None
+            and self.exchange_client
+            and hasattr(self.exchange_client, "get_current_price")
+        ):
             try:
                 res = self.exchange_client.get_current_price(symbol)
                 px = (await res) if asyncio.iscoroutine(res) else res
@@ -158,13 +169,13 @@ class PortfolioManager:
     async def _fetch_positions(self) -> dict:
         """
         Fetch positions from SharedState snapshot (local cache, NOT exchange).
-        
+
         ARCHITECTURE:
           - SOURCE: SharedState (kept in sync by PositionManager)
           - PURPOSE: Portfolio analysis, NAV computation, UI display
           - COST: Cheap (in-memory lookup)
           - LATENCY: Milliseconds
-        
+
         NOTE: For live exchange reconciliation, see _fetch_and_update_open_positions().
         That method fetches directly from exchange and updates SharedState.
         This method reads the cached snapshot for efficiency.
@@ -182,7 +193,7 @@ class PortfolioManager:
         return {}
 
     # ===== Calculations =====
-    async def _compute_nav(self, balances: Dict[str, Dict[str, float]]) -> float:
+    async def _compute_nav(self, balances: dict[str, dict[str, float]]) -> float:
         """
         Robust NAV with:
           - 1:1 stablecoin handling
@@ -197,7 +208,7 @@ class PortfolioManager:
         equity = _d("0")
         # SharedState stores {free, locked}; derive total
         base_info = balances.get(base, {}) if balances else {}
-        cash = _d((base_info.get("free", 0.0) or 0.0)) + _d((base_info.get("locked", 0.0) or 0.0))
+        cash = _d(base_info.get("free", 0.0) or 0.0) + _d(base_info.get("locked", 0.0) or 0.0)
 
         breakdown = {
             "base_cash_total": str(cash),
@@ -234,7 +245,7 @@ class PortfolioManager:
                 breakdown["missing_price_assets"].append(asset)
                 self.logger.debug("No price for %s; skipping NAV contribution.", symbol)
                 continue
-            
+
             price_d = _d(px)
 
             value = total * price_d
@@ -255,7 +266,7 @@ class PortfolioManager:
 
         breakdown["dust_total"] = str(dust_total)
         # Tradable equity = base cash + stablecoins + non-dust assets
-        tradable_equity = (equity - dust_total)
+        tradable_equity = equity - dust_total
         breakdown["tradable_equity"] = str(tradable_equity)
 
         # Optional "blocked_equity" concept: everything not immediately tradable
@@ -277,7 +288,11 @@ class PortfolioManager:
         # Optional: info-level summary once per loop
         self.logger.info(
             "[NAV] cash=%s %s | tradable=%s | dust=%s | equity=%s",
-            cash, base, breakdown["tradable_equity"], breakdown["dust_total"], nav_float
+            cash,
+            base,
+            breakdown["tradable_equity"],
+            breakdown["dust_total"],
+            nav_float,
         )
         return nav_float
 
@@ -374,25 +389,27 @@ class PortfolioManager:
         _emit_health(ss, "Running", "Snapshot updated")
         self.logger.info(
             "Portfolio snapshot: NAV=%.2f balances=%d positions=%d",
-            payload["nav_quote"], len(balances or {}), len(positions or {})
+            payload["nav_quote"],
+            len(balances or {}),
+            len(positions or {}),
         )
         return payload
-    
+
     # ===== Internal helpers (I/O) =====
     async def _fetch_and_update_open_positions(self):
         """
         Fetch positions directly from EXCHANGE and update SharedState.
-        
+
         ARCHITECTURE:
           - SOURCE: Exchange API (authoritative, live data)
           - PURPOSE: Reconciliation, gap detection, recovery
           - COST: API call (network roundtrip)
           - LATENCY: 100-500ms
-        
+
         NOTE: This is a synchronization method, NOT used by run_once().
         Used separately for periodic reconciliation or recovery if needed.
         For normal portfolio updates, see _fetch_positions() (reads SharedState cache).
-        
+
         Accepts two common formats:
           A) {"<SYMBOL>": {"qty": 0.5}, ...}
           B) {"BTC": {"free":..., "locked":...}, ...}  → maps to symbol with qty
@@ -401,9 +418,9 @@ class PortfolioManager:
         raw = raw or {}
 
         # Normalize → bulk map: { "<SYMBOL>": {qty, side, avg_price, entry_ts, mark_price, notional} }
-        bulk: Dict[str, Dict[str, Any]] = {}
+        bulk: dict[str, dict[str, Any]] = {}
 
-        async def _normalize(sym: str, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        async def _normalize(sym: str, rec: dict[str, Any]) -> Optional[dict[str, Any]]:
             """
             Robust position normalization from varied broker/exchange shapes.
             Required out: qty (Decimal), side (LONG/SHORT), avg_price, mark_price, notional.
@@ -503,11 +520,17 @@ class PortfolioManager:
             tasks = [self.shared_state.update_position(sym, rec) for sym, rec in bulk.items()]
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        self.logger.debug("Open positions reconciled: %d active, %d closed.", len(curr_syms), len(missing))
+        self.logger.debug(
+            "Open positions reconciled: %d active, %d closed.", len(curr_syms), len(missing)
+        )
 
     async def _save_portfolio_snapshot(self):
         try:
-            balances = self.shared_state.get_balance_snapshot() if hasattr(self.shared_state, "get_balance_snapshot") else {}
+            balances = (
+                self.shared_state.get_balance_snapshot()
+                if hasattr(self.shared_state, "get_balance_snapshot")
+                else {}
+            )
             # Prefer the same source the UI/summary uses for consistency
             if hasattr(self.shared_state, "get_positions_snapshot"):
                 open_positions = self.shared_state.get_positions_snapshot() or {}
@@ -589,6 +612,7 @@ class PortfolioManager:
             except Exception:
                 # never fail the loop on alert errors
                 self.logger.debug("Notification send failed.", exc_info=True)
+
     # ------------- dynamic properties -------------
     def _cfg(self, key: str, default: Any = None) -> Any:
         # 1. Check SharedState for live/dynamic overrides

@@ -4,7 +4,7 @@
 
 THIS DOCUMENT GUIDES THE INTEGRATION OF:
 1. bootstrap_manager.py
-2. arbitration_engine.py  
+2. arbitration_engine.py
 3. lifecycle_manager.py
 4. state_synchronizer.py
 5. retry_manager.py
@@ -13,7 +13,6 @@ THIS DOCUMENT GUIDES THE INTEGRATION OF:
 INTO: core/meta_controller.py
 """
 
-import sys
 from datetime import datetime
 
 PHASE_2c_STATUS = {
@@ -33,7 +32,8 @@ PHASE_2c_STATUS = {
     "estimated_duration_hours": "2-3",
 }
 
-print(f"""
+print(
+    f"""
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║                                                                            ║
 ║               PHASE 2C - METACONTROLLER INTEGRATION STARTED                ║
@@ -122,7 +122,8 @@ Checklist:
 ☐ Code coverage maintained
 
 ═════════════════════════════════════════════════════════════════════════════
-""")
+"""
+)
 
 if __name__ == "__main__":
     print("Phase 2c integration guide loaded.")

@@ -1,8 +1,8 @@
 # ⚠️ CRITICAL: 0.898 DOGE DUST STILL STUCK - ROOT CAUSE ANALYSIS
 
-**Date:** April 28, 2026  
-**Issue:** 0.898 DOGE ($0.088 USDT) still trapped in position after SELL execution  
-**Status:** 🚨 **STUCK DUST - NOT LIQUIDATED**  
+**Date:** April 28, 2026
+**Issue:** 0.898 DOGE ($0.088 USDT) still trapped in position after SELL execution
+**Status:** 🚨 **STUCK DUST - NOT LIQUIDATED**
 **Severity:** CRITICAL
 
 ---
@@ -22,7 +22,7 @@ After the SELL order at 00:10:07, the system shows:
 
 **The Exchange Says:**
 ```
-[EC:Polling:Balance] DOGE changed: 
+[EC:Polling:Balance] DOGE changed:
   free=0.89800000 ← 0.898 DOGE in free balance on Binance
 ```
 
@@ -40,7 +40,7 @@ Look at this log entry from 00:10:06.851:
 ```
 [EM:SellRoundUp] DOGEUSDT: qty ROUND_UP
 210.00000000→210.00000000 to avoid dust
-(remainder=0.89800000 notional=0.0880 < floor=5.00 | 
+(remainder=0.89800000 notional=0.0880 < floor=5.00 |
 qty_dust=True notional_dust=True pct_exit=0.4%)
 ```
 
@@ -95,7 +95,7 @@ ANALYSIS:
 
 ### **00:10:06.852 - Order Validation**
 ```
-[EXEC_TRACE_4_AMOUNT] DOGEUSDT SELL 
+[EXEC_TRACE_4_AMOUNT] DOGEUSDT SELL
 final_qty=210.00000000 ← Using the WRONG qty (without dust)
 notional=20.57370000
 ```
@@ -117,14 +117,14 @@ Problem: Only filled 210.0, not 210.898!
 
 ### **00:10:08.612 - Post-Fill Accounting Shows the Dust**
 ```
-[ACCOUNTING_AUDIT] 
+[ACCOUNTING_AUDIT]
 position_qty: 0.8979999999999961 ← THE DUST IS STILL THERE
 status_field: "DUST"
 ```
 
 ### **00:10:08.649 - Quantity Mismatch Detected**
 ```
-[EM:QtyResync] DOGEUSDT 
+[EM:QtyResync] DOGEUSDT
 local_qty=0.0000000000 ← System thought position was closed
 exchange_qty=0.8980000000 ← But exchange shows 0.898 DOGE!
 reason=SELL_FILLED_SYNC
@@ -134,7 +134,7 @@ This is the alarm: **Sync mismatch detected!**
 
 ### **00:10:22.062 - Exchange Confirms Dust Remains**
 ```
-[EC:Polling:Balance] DOGE changed: 
+[EC:Polling:Balance] DOGE changed:
 free=0.89800000 (was 210.89800000) ← Confirmed: 0.898 DOGE trapped
 ```
 
@@ -298,4 +298,3 @@ But it **failed to execute** the solution:
 5. **Test thoroughly** - Ensure no more dust deadlock scenarios
 
 This is a HIGH PRIORITY issue because it shows the dust detection works but the execution path is broken.
-

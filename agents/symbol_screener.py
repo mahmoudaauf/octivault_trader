@@ -1,18 +1,18 @@
+import asyncio
 import logging
 import time
-import asyncio
-from typing import List, Dict, Any, Tuple, Optional
 from math import inf
+from typing import Any, Optional
 
 logger = logging.getLogger("SymbolScreener")
 
-class SymbolScreener:
 
-    async def _propose(self, symbol: str, *, source: str, metadata: Dict[str, Any]) -> bool:
+class SymbolScreener:
+    async def _propose(self, symbol: str, *, source: str, metadata: dict[str, Any]) -> bool:
         """
         Try SymbolManager.propose_symbol → SharedState.propose_symbol → fallback to stash.
         Always returns a boolean 'accepted' (True/False).
-        
+
         ✅ FIX #9: Discovery-first approach
         - Primary: Write to symbol_proposals (UURE reads these in next rotation)
         - Secondary: SymbolManager/SharedState proposals (immediate trading if available)
@@ -21,24 +21,30 @@ class SymbolScreener:
         # ✅ FIX #7: SYMBOL CONVERGENCE GATING (Part 1 - SymbolScreener gate)
         # Belt-and-suspenders: Gate here AND in UURE integration (prevents bad symbols from entering proposals)
         if not await self._should_accept_symbol(symbol):
-            logger.warning(f"[SymbolScreener] 🚫 {symbol} BLOCKED by convergence gating (experimental limit or excluded)")
+            logger.warning(
+                f"[SymbolScreener] 🚫 {symbol} BLOCKED by convergence gating (experimental limit or excluded)"
+            )
             return False
-        
+
         # ✅ FIX #8 PART 2: Write to symbol_proposals for UURE discovery integration
         # This ensures UURE can see discovery candidates during _collect_discovery_proposals()
         # This is the PRIMARY path - UURE will decide whether to add to accepted_symbols
         if self.shared_state is not None:
-            self.shared_state.symbol_proposals = getattr(self.shared_state, "symbol_proposals", {}) or {}
+            self.shared_state.symbol_proposals = (
+                getattr(self.shared_state, "symbol_proposals", {}) or {}
+            )
             self.shared_state.symbol_proposals[str(symbol).upper()] = {
                 "symbol": str(symbol).upper(),
                 "source": source,
                 "metadata": dict(metadata or {}),
                 "ts": time.time(),
             }
-            logger.info(f"[SymbolScreener] ✅ Proposed {symbol} to symbol_proposals for UURE processing")
+            logger.info(
+                f"[SymbolScreener] ✅ Proposed {symbol} to symbol_proposals for UURE processing"
+            )
             # Return True to indicate proposal was accepted into the buffer
             return True
-        
+
         logger.warning(f"[SymbolScreener] No proposal store available for {symbol}.")
         return False
 
@@ -47,7 +53,9 @@ class SymbolScreener:
         try:
             if not self.exchange_client:
                 return True  # nothing we can verify here
-            if getattr(self, 'require_trading_status', True) and hasattr(self.exchange_client, "symbol_info"):
+            if getattr(self, "require_trading_status", True) and hasattr(
+                self.exchange_client, "symbol_info"
+            ):
                 info = self.exchange_client.symbol_info(symbol)
                 info = await info if asyncio.iscoroutine(info) else info
                 if not info:
@@ -73,19 +81,31 @@ class SymbolScreener:
                             except Exception:
                                 min_notional = None
                             break
-                cap = float(getattr(self, 'max_per_trade_usdt', 100.0))
+                cap = float(getattr(self, "max_per_trade_usdt", 100.0))
                 if min_notional is not None and min_notional > cap:
-                    logger.info("[SymbolScreener] %s MIN_NOTIONAL %.4f exceeds cap %.2f; skipping.", symbol, min_notional, cap)
+                    logger.info(
+                        "[SymbolScreener] %s MIN_NOTIONAL %.4f exceeds cap %.2f; skipping.",
+                        symbol,
+                        min_notional,
+                        cap,
+                    )
                     return False
             return True
         except Exception:
             logger.debug("[SymbolScreener] prefilter failed for %s", symbol, exc_info=True)
             return False
 
-    agent_type = "discovery"           # Mark as discovery agent
+    agent_type = "discovery"  # Mark as discovery agent
     name = "SymbolScreener"
 
-    def __init__(self, shared_state: Any, exchange_client: Any = None, config: Any = None, symbol_manager: Any = None, **kwargs):
+    def __init__(
+        self,
+        shared_state: Any,
+        exchange_client: Any = None,
+        config: Any = None,
+        symbol_manager: Any = None,
+        **kwargs,
+    ):
         self.shared_state = shared_state
         self.exchange_client = exchange_client
         self.config = config
@@ -94,9 +114,9 @@ class SymbolScreener:
 
         # optional defensive wiring if constructed early:
         if self.exchange_client is None and hasattr(shared_state, "exchange_client"):
-            self.exchange_client = getattr(shared_state, "exchange_client")
+            self.exchange_client = shared_state.exchange_client
         if self.symbol_manager is None and hasattr(shared_state, "symbol_manager"):
-            self.symbol_manager = getattr(shared_state, "symbol_manager")
+            self.symbol_manager = shared_state.symbol_manager
 
         # Lazy initialization via properties below
 
@@ -226,13 +246,14 @@ class SymbolScreener:
             try:
                 t.cancel()
                 try:
-                    await asyncio.wait_for(t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0)))
+                    await asyncio.wait_for(
+                        t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0))
+                    )
                 except asyncio.CancelledError:
                     pass
             except Exception:
                 logger.debug("[SymbolScreener] stop wait failed", exc_info=True)
         logger.info("[SymbolScreener] stopped.")
-
 
     def _normalize_symbol(self, symbol: str) -> str:
         return str(symbol or "").replace("/", "").upper()
@@ -252,20 +273,30 @@ class SymbolScreener:
 
     async def _build_exclude_set(self) -> set:
         exclude = {self._normalize_symbol(x) for x in self.symbol_exclude_list}
-        
+
         # ✅ FIX #10: Exclude accepted_symbols from discovery
         # Discovery should find NEW symbols, not re-propose existing universe
         # This prevents SymbolScreener from proposing BTC, ETH, BNB when they're already trading
         if self.shared_state:
             try:
-                current_universe = await self.shared_state.get_accepted_symbols() if hasattr(self.shared_state, 'get_accepted_symbols') else {}
+                current_universe = (
+                    await self.shared_state.get_accepted_symbols()
+                    if hasattr(self.shared_state, "get_accepted_symbols")
+                    else {}
+                )
                 if not asyncio.iscoroutine(current_universe):
-                    accepted_syms = {self._normalize_symbol(x) for x in current_universe.keys()} if isinstance(current_universe, dict) else set()
+                    accepted_syms = (
+                        {self._normalize_symbol(x) for x in current_universe.keys()}
+                        if isinstance(current_universe, dict)
+                        else set()
+                    )
                     exclude.update(accepted_syms)
-                    logger.debug(f"[SymbolScreener] Excluding {len(accepted_syms)} accepted symbols from discovery: {list(accepted_syms)[:5]}...")
+                    logger.debug(
+                        f"[SymbolScreener] Excluding {len(accepted_syms)} accepted symbols from discovery: {list(accepted_syms)[:5]}..."
+                    )
             except Exception as e:
                 logger.debug(f"[SymbolScreener] Failed to get accepted symbols for exclusion: {e}")
-        
+
         if not self.exchange_client:
             return exclude
         try:
@@ -288,33 +319,33 @@ class SymbolScreener:
         return exclude
 
     # ---------- FIX #7: SYMBOL CONVERGENCE GATING ----------
-    
+
     async def _should_accept_symbol(self, symbol: str) -> bool:
         """
         Gate new symbols based on convergence rules.
         Prevents trading untested symbols during healing cycles.
-        
+
         FIX #7 - Symbol Screener Gating
         Returns True if symbol should be allowed into accepted_symbols
         """
         if self.shared_state is None:
             return True  # Fallback: if no shared state, allow all
-        
+
         # Check if convergence mode is enabled
         convergence_enabled = await self.shared_state.can_add_new_symbol(symbol)
-        
+
         if not convergence_enabled:
             logger.debug(f"[SymbolScreener] {symbol} blocked by convergence rules")
             return False
-        
+
         return True
-    
+
     def _is_proven_symbol(self, symbol: str) -> bool:
         """Check if symbol is in proven symbols list."""
         if self.shared_state is None:
             return False
         return self.shared_state.is_symbol_proven(symbol)
-    
+
     def _get_experimental_count(self) -> int:
         """Get count of experimental (non-proven) symbols currently active."""
         if self.shared_state is None:
@@ -340,12 +371,12 @@ class SymbolScreener:
     async def _passes_regime_filter(self, symbol: str) -> bool:
         """
         Filter candidates by market regime (regime-aware discovery).
-        
+
         ⚠️ DISCOVERY PHILOSOPHY:
           Discovery should find candidates broadly.
           Regime filtering is applied at EXECUTION time, not discovery.
           This allows full universe evaluation before capping trades.
-        
+
         Returns True if symbol passes regime filter, False otherwise.
         """
         try:
@@ -355,51 +386,61 @@ class SymbolScreener:
             enable_regime_filter = bool(self._cfg("SYMBOL_SCREENER_REGIME_FILTER", False))
             if not enable_regime_filter:
                 return True  # Disabled, allow all
-            
+
             # Get volatility regime for the symbol (1h preferred)
             if hasattr(self.shared_state, "get_volatility_regime"):
                 try:
-                    regime_result = self.shared_state.get_volatility_regime(symbol, timeframe="1h", max_age_seconds=300)
-                    regime_result = await regime_result if asyncio.iscoroutine(regime_result) else regime_result
-                    
+                    regime_result = self.shared_state.get_volatility_regime(
+                        symbol, timeframe="1h", max_age_seconds=300
+                    )
+                    regime_result = (
+                        await regime_result if asyncio.iscoroutine(regime_result) else regime_result
+                    )
+
                     if isinstance(regime_result, dict):
                         regime = str(regime_result.get("regime", "normal")).lower()
                         confidence = float(regime_result.get("confidence", 0.0))
-                        
+
                         # Reject low/sideways unless confidence is very high
                         if regime in ("low", "sideways"):
                             if confidence < 0.8:
                                 logger.debug(
                                     "[SymbolScreener] %s rejected: regime=%s (confidence=%.2f < 0.8)",
-                                    symbol, regime, confidence
+                                    symbol,
+                                    regime,
+                                    confidence,
                                 )
                                 return False
-                        
+
                         return True
                 except Exception as e:
                     logger.debug(f"[SymbolScreener] Regime check failed for {symbol}: {e}")
                     return True  # Safe default: allow on error
-            
+
             return True  # No regime detector available
-        
+
         except Exception as e:
             logger.debug(f"[SymbolScreener] Unexpected error in regime filter for {symbol}: {e}")
             return True  # Safe default
 
-
     async def _evaluate_candidate(
-        self, symbol: str, quote_volume: float, pct_change: float, last_price: float, sem: asyncio.Semaphore
-    ) -> Optional[Dict[str, Any]]:
+        self,
+        symbol: str,
+        quote_volume: float,
+        pct_change: float,
+        last_price: float,
+        sem: asyncio.Semaphore,
+    ) -> Optional[dict[str, Any]]:
         async with sem:
             if not await self._prefilter_symbol(symbol):
                 return None
             atr_pct = float(await self._atr_pct(symbol, last_price) or 0.0)
-            
+
             # ✅ PHASE 2a: REGIME FILTERING
             # Add regime-aware filtering to improve proposal quality
             if not await self._passes_regime_filter(symbol):
                 return None
-            
+
             return {
                 "symbol": symbol,
                 "quote_volume": float(quote_volume),
@@ -408,7 +449,7 @@ class SymbolScreener:
                 "last_price": float(last_price),
             }
 
-    async def _perform_scan(self) -> List[Dict[str, Any]]:
+    async def _perform_scan(self) -> list[dict[str, Any]]:
         """
         Volatility-driven candidate scan:
           1) Top liquid symbols by 24h quote volume
@@ -429,7 +470,7 @@ class SymbolScreener:
                 return []
 
             combined_exclude_set = await self._build_exclude_set()
-            liquid: List[Tuple[str, float, float, float]] = []
+            liquid: list[tuple[str, float, float, float]] = []
             for ticker in tickers:
                 symbol = self._normalize_symbol(ticker.get("symbol", ""))
                 if not symbol or not symbol.endswith(self.base_currency):
@@ -457,14 +498,15 @@ class SymbolScreener:
 
             sem = asyncio.Semaphore(self.atr_concurrency)
             tasks = [
-                self._evaluate_candidate(sym, vol, pct, px, sem)
-                for sym, vol, pct, px in top_liquid
+                self._evaluate_candidate(sym, vol, pct, px, sem) for sym, vol, pct, px in top_liquid
             ]
             evaluated = await asyncio.gather(*tasks, return_exceptions=True)
             parsed = [x for x in evaluated if isinstance(x, dict)]
-            atr_filtered = [x for x in parsed if float(x.get("atr_pct", 0.0) or 0.0) >= self.min_atr_pct]
+            atr_filtered = [
+                x for x in parsed if float(x.get("atr_pct", 0.0) or 0.0) >= self.min_atr_pct
+            ]
 
-            selected: List[Dict[str, Any]]
+            selected: list[dict[str, Any]]
             if atr_filtered:
                 atr_filtered.sort(
                     key=lambda x: (
@@ -501,15 +543,15 @@ class SymbolScreener:
             logger.error(f"❌ SymbolScreener scan error: {e}", exc_info=True)
             return []
 
-    async def _process_and_add_symbols(self, candidates: List[Dict[str, Any]]):
+    async def _process_and_add_symbols(self, candidates: list[dict[str, Any]]):
         """
         Propose candidate symbols to SymbolManager / SharedState.
-        
+
         ✅ FIX #7: DISCOVERY CAPITAL GATE
         - Only propose NEW symbols if we have meaningful capital to trade them
         - Prevents unlimited symbol expansion and dust position creation
         - Checks: existing accepted_symbols count + free capital
-        
+
         ✅ FIX #3: DISCOVERY GATE RELAXATION (MICRO ACCOUNT ADAPTATION)
         - Relaxed capital thresholds for micro accounts (NAV < $500)
         - Allow discovery at 70% of min_entry instead of 1.5x multiplier
@@ -519,43 +561,66 @@ class SymbolScreener:
         if candidates:
             symbols_only = [str(item.get("symbol", "")) for item in candidates]
             logger.info(f"📊 Candidate symbols found: {symbols_only}")
-            
+
             # ✅ FIX #3: Check if we have capital for new positions before proposing symbols
             try:
                 # Get current universe size
                 current_universe = set()
-                if self.shared_state and hasattr(self.shared_state, 'get_accepted_symbols'):
-                    curr = await self.shared_state.get_accepted_symbols() if hasattr(self.shared_state, 'get_accepted_symbols') else {}
+                if self.shared_state and hasattr(self.shared_state, "get_accepted_symbols"):
+                    curr = (
+                        await self.shared_state.get_accepted_symbols()
+                        if hasattr(self.shared_state, "get_accepted_symbols")
+                        else {}
+                    )
                     if not asyncio.iscoroutine(curr):
                         current_universe = set(curr.keys()) if isinstance(curr, dict) else set()
-                
+
                 # Get free capital
-                free_usdt = float(await self.shared_state.get_spendable_balance('USDT') or 0.0) if self.shared_state else 0.0
-                
+                free_usdt = (
+                    float(await self.shared_state.get_spendable_balance("USDT") or 0.0)
+                    if self.shared_state
+                    else 0.0
+                )
+
                 # Get NAV to determine if this is a micro account
                 nav = 0.0
                 try:
-                    if self.shared_state and hasattr(self.shared_state, 'get_nav'):
+                    if self.shared_state and hasattr(self.shared_state, "get_nav"):
                         nav_result = self.shared_state.get_nav()
-                        nav = float(await nav_result if asyncio.iscoroutine(nav_result) else nav_result or 0.0)
+                        nav = float(
+                            await nav_result
+                            if asyncio.iscoroutine(nav_result)
+                            else nav_result or 0.0
+                        )
                 except Exception:
                     pass
-                
+
                 is_micro_account = nav < 500.0  # FIX #3: Define micro as NAV < $500
-                
+
                 # Get minimum entry size (same as MetaController uses)
                 min_entry = float(self._cfg("MIN_ENTRY_USDT", self._cfg("SAFE_ENTRY_USDT", 12.0)))
-                min_significant = float(self._cfg("MIN_SIGNIFICANT_POSITION_USDT", 
-                                                  self._cfg("MIN_SIGNIFICANT_USD", 
-                                                  self._cfg("SIGNIFICANT_POSITION_USDT", 25.0))))
-                
+                min_significant = float(
+                    self._cfg(
+                        "MIN_SIGNIFICANT_POSITION_USDT",
+                        self._cfg(
+                            "MIN_SIGNIFICANT_USD", self._cfg("SIGNIFICANT_POSITION_USDT", 25.0)
+                        ),
+                    )
+                )
+
                 # Calculate how many new positions we can afford
                 # Allow discovery only if: (1) new capacity exists, OR (2) we have capital
                 max_universe = int(self._cfg("MAX_UNIVERSE_SYMBOLS", 30))
                 max_positions = int(self._cfg("MAX_POSITIONS_TOTAL", 2))
-                
-                new_universe_size = len(current_universe) + len([c for c in candidates if self._normalize_symbol(c.get("symbol", "")) not in current_universe])
-                
+
+                new_universe_size = len(current_universe) + len(
+                    [
+                        c
+                        for c in candidates
+                        if self._normalize_symbol(c.get("symbol", "")) not in current_universe
+                    ]
+                )
+
                 # ✅ FIX #3: Adaptive capital requirement based on account size
                 # Micro accounts: need 70% of min_entry (discovery priority over perfect capital alignment)
                 # Standard accounts: need 1.5x multiplier for safety margin
@@ -565,20 +630,26 @@ class SymbolScreener:
                 else:
                     capital_requirement = min_significant * 1.5
                     requirement_label = "STANDARD (1.5x)"
-                
+
                 can_afford_new_position = free_usdt >= capital_requirement
                 has_universe_capacity = new_universe_size < max_universe
-                
+
                 logger.warning(
                     "[SymbolScreener] 🔍 FIX #3 DISCOVERY GATE CHECK: "
                     "NAV=%.2f (micro=%s) | "
                     "current_universe=%d max=%d | free_USDT=%.2f required=%.2f (%s) | "
                     "can_afford_new=%s universe_capacity=%s",
-                    nav, is_micro_account,
-                    len(current_universe), max_universe, free_usdt, capital_requirement, requirement_label,
-                    can_afford_new_position, has_universe_capacity
+                    nav,
+                    is_micro_account,
+                    len(current_universe),
+                    max_universe,
+                    free_usdt,
+                    capital_requirement,
+                    requirement_label,
+                    can_afford_new_position,
+                    has_universe_capacity,
                 )
-                
+
                 # ✅ FIX #3: Only block discovery if BOTH conditions fail
                 # (Don't block just because we're slightly under capital - still allow discovery)
                 if not has_universe_capacity and new_universe_size >= max_universe:
@@ -586,24 +657,26 @@ class SymbolScreener:
                         "[SymbolScreener] ❌ FIX #3 DISCOVERY BLOCKED: "
                         "Universe FULL (%d/%d symbols). "
                         "Can still add if accepted_symbols rotates.",
-                        new_universe_size, max_universe
+                        new_universe_size,
+                        max_universe,
                     )
                     # CHANGED: Don't return here - allow proposals even if universe full
                     # They just won't be activated until a symbol rotates out
-                
+
                 # Log capital situation
                 if not can_afford_new_position:
                     logger.warning(
                         "[SymbolScreener] ⚠️ FIX #3 LOW CAPITAL: "
                         "Only %.2f USDT free (need %.2f). "
                         "Will still propose symbols for future rotation when capital available.",
-                        free_usdt, capital_requirement
+                        free_usdt,
+                        capital_requirement,
                     )
-                
+
             except Exception as e:
                 logger.debug(f"[SymbolScreener] FIX #3 capital check failed (non-fatal): {e}")
                 # Continue anyway on error (fail-safe to discovery enabled)
-            
+
             accepted = 0
             for item in candidates:
                 symbol = self._normalize_symbol(item.get("symbol", ""))
@@ -622,18 +695,24 @@ class SymbolScreener:
                         source=self.name,
                         metadata={
                             "24h_quote_volume": float(item.get("quote_volume", 0.0) or 0.0),
-                            "24h_percent_change": float(item.get("price_change_percent", 0.0) or 0.0),
+                            "24h_percent_change": float(
+                                item.get("price_change_percent", 0.0) or 0.0
+                            ),
                             "atr_pct": float(item.get("atr_pct", 0.0) or 0.0),
                             "atr_timeframe": self.atr_timeframe,
                         },
                     )
                     if accepted_flag:
                         accepted += 1
-                        logger.warning(f"[SymbolScreener] ✅ PROPOSED: {symbol} (buffered for UURE discovery)")
+                        logger.warning(
+                            f"[SymbolScreener] ✅ PROPOSED: {symbol} (buffered for UURE discovery)"
+                        )
                     else:
                         logger.warning(f"[SymbolScreener] ❌ Proposal failed: {symbol}")
                 except Exception as e:
-                    logger.error(f"Failed to propose symbol {symbol} via _propose: {e}", exc_info=True)
+                    logger.error(
+                        f"Failed to propose symbol {symbol} via _propose: {e}", exc_info=True
+                    )
             logger.warning(
                 "[SymbolScreener] Proposal complete: %d/%d symbols proposed to buffer.",
                 accepted,
@@ -669,7 +748,9 @@ class SymbolScreener:
         """
         Continuous loop for periodic symbol screening.
         """
-        logger.info(f"Starting continuous run_loop for SymbolScreener with interval {self.screener_loop_interval} seconds.")
+        logger.info(
+            f"Starting continuous run_loop for SymbolScreener with interval {self.screener_loop_interval} seconds."
+        )
         while not self._stop_event.is_set():
             try:
                 await self.run_once()
@@ -679,7 +760,7 @@ class SymbolScreener:
                 break
             except Exception as e:
                 logger.exception(f"[{self.name}] Error in run_loop: {e}")
-                await asyncio.sleep(10) # Sleep for a short period before retrying after an error
+                await asyncio.sleep(10)  # Sleep for a short period before retrying after an error
 
     async def run_discovery(self):
         """
@@ -696,12 +777,13 @@ class SymbolScreener:
         except Exception as e:
             logger.error(f"❌ Error during run_discovery: {e}", exc_info=True)
 
-
     async def start_periodic_screening(self):
         """
         Starts the continuous periodic screening process for trending symbols.
         This method is now superseded by run_loop() for continuous operation.
         It is kept for backward compatibility if needed, but run_loop() is preferred.
         """
-        logger.warning("start_periodic_screening is deprecated. Please use run_loop() for continuous operation.")
-        await self.run_loop() # Delegate to run_loop for consistency
+        logger.warning(
+            "start_periodic_screening is deprecated. Please use run_loop() for continuous operation."
+        )
+        await self.run_loop()  # Delegate to run_loop for consistency

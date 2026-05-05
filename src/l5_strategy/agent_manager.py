@@ -1,6 +1,4 @@
-
 # core/agent_manager.py
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 """
@@ -8,17 +6,17 @@ AgentManager — Central agent registry and orchestrator for Octivault Trader
 ... (see full docstring below)
 """
 
+import asyncio as _asyncio  # single asyncio import (aliased)
+import importlib
+import inspect
 import logging
 import os
-import inspect
 import time
-import importlib
-import asyncio as _asyncio  # single asyncio import (aliased)
-from typing import Dict, List, Any, Optional, TYPE_CHECKING
-import json
 from datetime import datetime
+from typing import Any, Optional
 
 from src.l0_core.component_status_logger import ComponentStatusLogger
+
 # HealthStatus import removed - not used after P9 refactor
 try:
     from src.l0_core.health import update_health
@@ -26,9 +24,11 @@ except ImportError:
     try:
         from src.l0_core.healthy import update_health
     except ImportError:
+
         async def update_health(shared_state, component_name, status, detail=""):
             """Fallback stub for update_health"""
             pass
+
 
 try:
     from src.l5_strategy.model_manager import ModelManager
@@ -46,12 +46,14 @@ except Exception as _e:
                 "TradeIntent is missing. Expected in core.stubs "
                 "or core.baseline_trading_kernel. Please ensure the canonical module is present."
             )
+
     TradeIntent = _MissingTradeIntent()  # type: ignore
 
 try:
     from src.l5_strategy.agent_registry import AGENT_CLASS_MAP, AGENT_IMPORT_ERRORS
 except Exception:
     from src.l5_strategy.agent_registry import AGENT_CLASS_MAP
+
     AGENT_IMPORT_ERRORS = {}
 
 logger = logging.getLogger("AgentManager")
@@ -60,7 +62,7 @@ if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
     _log_path = "logs/core/agent_manager.log"
     os.makedirs(os.path.dirname(_log_path), exist_ok=True)
     _fh = logging.FileHandler(_log_path)
-    _fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.addHandler(_fh)
 logger.setLevel(logging.INFO)
 logger.propagate = False  # avoid duplicate logs in root logger
@@ -93,7 +95,9 @@ class AgentManager:
             try:
                 await self.auto_register_agents()
             except Exception as e:
-                self.logger.error("AgentManager: failed to auto-register agents: %s", e, exc_info=True)
+                self.logger.error(
+                    "AgentManager: failed to auto-register agents: %s", e, exc_info=True
+                )
                 # Do NOT set _started — allow the caller to retry start().
                 return
 
@@ -101,7 +105,9 @@ class AgentManager:
         try:
             await self.bootstrap_symbol_universe()
         except Exception as e:
-            self.logger.warning("[Bootstrap] Symbol universe population failed: %s", e, exc_info=True)
+            self.logger.warning(
+                "[Bootstrap] Symbol universe population failed: %s", e, exc_info=True
+            )
             # Continue anyway - lazy loading in strategy agents will retry
 
         # Only mark started after registration has succeeded so retry is possible.
@@ -117,29 +123,29 @@ class AgentManager:
         Run discovery agents ONCE to populate the initial symbol universe.
         If discovery fails or returns no symbols, fallback to default symbols.
         This ensures strategy agents can access symbols when they call generate_signals().
-        
+
         ✅ Fixes: SwingTradeHunter, TrendHunter, DipSniper 0 symbols issue
         ✅ Timing: Called during startup BEFORE strategy agents run
         ✅ Fallback: Uses default symbols if discovery fails
         """
         self.logger.info("[Bootstrap] Populating symbol universe from discovery agents...")
-        
+
         populated = False
         discovery_count = 0
-        
+
         # Get discovery agents
         discovery_agent_instances = self.get_discovery_agents()
-        
+
         if not discovery_agent_instances:
             self.logger.debug("[Bootstrap] No discovery agents registered")
         else:
             # Run each discovery agent once
             for agent in discovery_agent_instances:
-                agent_name = getattr(agent, 'name', agent.__class__.__name__)
-                if not hasattr(agent, 'run_once'):
+                agent_name = getattr(agent, "name", agent.__class__.__name__)
+                if not hasattr(agent, "run_once"):
                     self.logger.debug(f"[Bootstrap] Agent {agent_name} has no run_once() method")
                     continue
-                
+
                 try:
                     self.logger.info(f"[Bootstrap] Running discovery: {agent_name}")
                     result = agent.run_once()
@@ -149,25 +155,30 @@ class AgentManager:
                     populated = True
                     discovery_count += 1
                 except Exception as e:
-                    self.logger.warning(f"[Bootstrap] Discovery failed for {agent_name}: {e}", exc_info=True)
+                    self.logger.warning(
+                        f"[Bootstrap] Discovery failed for {agent_name}: {e}", exc_info=True
+                    )
                     continue
-        
+
         # Verify symbols were populated
         try:
             syms = self.shared_state.get_accepted_symbols()
             if inspect.iscoroutine(syms):
                 syms = await syms
-            
+
             if isinstance(syms, dict):
                 sym_count = len(syms)
             else:
                 sym_count = len(list(syms or []))
-            
+
             # If still empty, use fallback
             if sym_count == 0:
-                self.logger.warning("[Bootstrap] ⚠️ Symbol universe is EMPTY after discovery! Applying fallback...")
+                self.logger.warning(
+                    "[Bootstrap] ⚠️ Symbol universe is EMPTY after discovery! Applying fallback..."
+                )
                 try:
                     from src.l3_portfolio.bootstrap_symbols import bootstrap_default_symbols
+
                     result = await bootstrap_default_symbols(self.shared_state, self.logger)
                     if result:
                         syms = self.shared_state.get_accepted_symbols()
@@ -175,22 +186,25 @@ class AgentManager:
                             syms = await syms
                         if isinstance(syms, dict):
                             sym_count = len(syms)
-                        self.logger.info(f"[Bootstrap] ✅ Fallback: Seeded {sym_count} default symbols")
+                        self.logger.info(
+                            f"[Bootstrap] ✅ Fallback: Seeded {sym_count} default symbols"
+                        )
                 except Exception as e:
                     self.logger.error(f"[Bootstrap] Fallback failed: {e}", exc_info=True)
             else:
-                self.logger.info(f"[Bootstrap] ✅ Symbol universe populated: {sym_count} symbols from {discovery_count} agents")
+                self.logger.info(
+                    f"[Bootstrap] ✅ Symbol universe populated: {sym_count} symbols from {discovery_count} agents"
+                )
         except Exception as e:
             self.logger.warning(f"[Bootstrap] Could not verify symbols: {e}")
 
-    
     def __init__(
         self,
         shared_state,
         market_data,
         execution_manager,
         config,
-        symbols: Optional[List[str]] = None,
+        symbols: Optional[list[str]] = None,
         tp_sl_engine=None,
         market_data_feed=None,
         model_manager=None,
@@ -207,19 +221,23 @@ class AgentManager:
         self.symbols = symbols if symbols is not None else []
         self.tp_sl_engine = tp_sl_engine
         self.market_data_feed = market_data_feed
-        self.model_manager = model_manager if model_manager is not None else (ModelManager(self.config) if ModelManager else None)
+        self.model_manager = (
+            model_manager
+            if model_manager is not None
+            else (ModelManager(self.config) if ModelManager else None)
+        )
         self.meta_controller = meta_controller
         self.symbol_manager = symbol_manager
         self.exchange_client = exchange_client
         self.database_manager = database_manager
         self.agent_schedule = agent_schedule
 
-        self.agents: Dict[str, Any] = {}
+        self.agents: dict[str, Any] = {}
         self.discovery_agents = []
         self.logger = logger
         self._started = False
-        self._tasks: Dict[str, _asyncio.Task] = {}
-        self._manager_tasks: Dict[str, _asyncio.Task] = {}  # health/tick/run_all_agents
+        self._tasks: dict[str, _asyncio.Task] = {}
+        self._manager_tasks: dict[str, _asyncio.Task] = {}  # health/tick/run_all_agents
         self._strategies_prepared = False  # New flag
         self._strategies_started = False  # New flag
         # Tunables
@@ -227,8 +245,12 @@ class AgentManager:
         self._agent_timeout_s = float(getattr(self.config, "AGENTMGR_AGENT_TIMEOUT_S", 10.0))
         self._restart_on_crash = bool(getattr(self.config, "AGENTMGR_ENABLE_RESTART", True))
         self._restart_backoff_min = float(getattr(self.config, "AGENTMGR_RESTART_BACKOFF_MIN", 2.0))
-        self._restart_backoff_max = float(getattr(self.config, "AGENTMGR_RESTART_BACKOFF_MAX", 60.0))
-        self._market_data_ready_timeout_s = float(getattr(self.config, "AGENTMGR_MARKETDATA_READY_TIMEOUT_S", 180.0))
+        self._restart_backoff_max = float(
+            getattr(self.config, "AGENTMGR_RESTART_BACKOFF_MAX", 60.0)
+        )
+        self._market_data_ready_timeout_s = float(
+            getattr(self.config, "AGENTMGR_MARKETDATA_READY_TIMEOUT_S", 180.0)
+        )
         raw_retrain_interval = float(
             getattr(
                 self.config,
@@ -273,8 +295,8 @@ class AgentManager:
             or 3600.0
         )
         self._last_symbols_refresh_t = 0.0
-        self._accepted_symbols_cache: List[str] = []
-        self._last_agent_log_t: Dict[str, float] = {}  # Per-agent logging throttle (Issue 2)
+        self._accepted_symbols_cache: list[str] = []
+        self._last_agent_log_t: dict[str, float] = {}  # Per-agent logging throttle (Issue 2)
         self._last_empty_intent_log_t = 0.0
         self._empty_intent_log_interval_s = float(
             getattr(self.config, "AGENTMGR_EMPTY_INTENT_LOG_INTERVAL_S", 60.0)
@@ -286,10 +308,10 @@ class AgentManager:
         self._optional_import_log_interval_s = float(
             getattr(self.config, "AGENTMGR_OPTIONAL_IMPORT_LOG_INTERVAL_S", 300.0)
         )
-        self._last_optional_import_log_ts: Dict[str, float] = {}
+        self._last_optional_import_log_ts: dict[str, float] = {}
         # Cached _MetaAdapter — stateless wrapper, safe to create once per meta_controller.
         self._meta_adapter: Optional[Any] = None
-        
+
         # Watchdog periodic status reporting
         self._signal_counter = 0
         self._last_watchdog_report_ts = time.time()
@@ -301,7 +323,7 @@ class AgentManager:
             return self.config.get(key, default)
         return getattr(self.config, key, default)
 
-    def _resolve_intent_planned_quote(self, intent: Dict[str, Any]) -> float:
+    def _resolve_intent_planned_quote(self, intent: dict[str, Any]) -> float:
         """Best-effort planned quote resolver for pre-publish viability checks."""
         if not isinstance(intent, dict):
             return 0.0
@@ -321,7 +343,7 @@ class AgentManager:
         )
         return max(0.0, fallback)
 
-    def _passes_prepublish_viability_gate(self, intent: Dict[str, Any]) -> tuple[bool, str]:
+    def _passes_prepublish_viability_gate(self, intent: dict[str, Any]) -> tuple[bool, str]:
         """
         Manager-side pre-publish viability gate.
         Reuses MetaController's existing pretrade effect gate instead of duplicating logic.
@@ -363,7 +385,7 @@ class AgentManager:
         if planned_quote <= 0.0:
             return False, "invalid_quote"
 
-        signal: Dict[str, Any] = {
+        signal: dict[str, Any] = {
             "action": side,
             "confidence": float(intent.get("confidence", 0.0) or 0.0),
             "reason": str(intent.get("rationale") or intent.get("reason") or ""),
@@ -406,7 +428,8 @@ class AgentManager:
             if (
                 side == "BUY"
                 and bool(self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_RELAX_ENABLED", True))
-                and reason_u in {
+                and reason_u
+                in {
                     "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD",
                     "MICRO_BACKTEST_AVG_NET_BELOW_THRESHOLD",
                     "MICRO_BACKTEST_INSUFFICIENT_SAMPLES",
@@ -420,7 +443,8 @@ class AgentManager:
                     rej_getter = getattr(self.shared_state, "get_rejection_count", None)
                     if callable(rej_getter):
                         bt_rejections += int(
-                            rej_getter(symbol, "BUY", "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD") or 0
+                            rej_getter(symbol, "BUY", "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD")
+                            or 0
                         )
                         bt_rejections += int(
                             rej_getter(symbol, "BUY", "MICRO_BACKTEST_AVG_NET_BELOW_THRESHOLD") or 0
@@ -471,7 +495,8 @@ class AgentManager:
                     self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_MIN_CONF_DECAY_PER_STEP", 0.02) or 0.02
                 )
                 min_exp_move = float(
-                    self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_MIN_EXPECTED_MOVE_PCT", 0.0030) or 0.0030
+                    self._cfg("AGENTMGR_PREPUBLISH_DEADLOCK_MIN_EXPECTED_MOVE_PCT", 0.0030)
+                    or 0.0030
                 )
 
                 confidence = max(0.0, min(1.0, float(signal.get("confidence", 0.0) or 0.0)))
@@ -515,12 +540,14 @@ class AgentManager:
             )
             return True, "gate_error_allow"
 
-    async def _filter_intents_prepublish(self, intents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _filter_intents_prepublish(
+        self, intents: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         """Filter BUY intents through pretrade viability before publishing to Meta/event bus."""
         if not intents:
             return []
 
-        filtered: List[Dict[str, Any]] = []
+        filtered: list[dict[str, Any]] = []
         dropped = 0
         for intent in intents:
             ok, reason = self._passes_prepublish_viability_gate(intent)
@@ -569,9 +596,17 @@ class AgentManager:
     # --- Meta signal adapter so all agents have a consistent API ---
     class _MetaAdapter:
         """Thin wrapper that guarantees submit_signal/submit_agent_signal exist for agents."""
+
         def __init__(self, meta):
             self._meta = meta
-        async def submit_signal(self, agent_name: str, symbol: str, signal: Dict[str, Any], confidence: Optional[float]=None):
+
+        async def submit_signal(
+            self,
+            agent_name: str,
+            symbol: str,
+            signal: dict[str, Any],
+            confidence: Optional[float] = None,
+        ):
             # Prefer native shim if Meta has it; fall back to receive_signal
             if hasattr(self._meta, "submit_signal"):
                 return await self._meta.submit_signal(agent_name, symbol, signal, confidence)
@@ -579,61 +614,91 @@ class AgentManager:
             if confidence is not None:
                 payload["confidence"] = confidence
             return await self._meta.receive_signal(agent_name, symbol, payload)
-        async def submit_agent_signal(self, agent_name: str, symbol: str, action: Dict[str, Any], confidence: float):
+
+        async def submit_agent_signal(
+            self, agent_name: str, symbol: str, action: dict[str, Any], confidence: float
+        ):
             if hasattr(self._meta, "submit_agent_signal"):
                 return await self._meta.submit_agent_signal(agent_name, symbol, action, confidence)
             payload = dict(action or {})
             payload["confidence"] = confidence
             return await self._meta.receive_signal(agent_name, symbol, payload)
+
         def __getattr__(self, name):
             # Expose the rest of MetaController transparently (e.g., evaluate_signals, start, etc.)
             return getattr(self._meta, name)
 
-    async def emit_to_meta(self, *, agent_name: str, symbol: str, action: str, confidence: float,
-                           quote: Optional[float]=None, quantity: Optional[float]=None,
-                           horizon_hours: Optional[float]=None, extra: Optional[Dict[str, Any]]=None):
+    async def emit_to_meta(
+        self,
+        *,
+        agent_name: str,
+        symbol: str,
+        action: str,
+        confidence: float,
+        quote: Optional[float] = None,
+        quantity: Optional[float] = None,
+        horizon_hours: Optional[float] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ):
         """
         Optional manager-level emitter agents can call instead of touching meta directly.
         Normalizes payload and forwards to meta adapter.
         """
         if not self.meta_controller:
-            self.logger.warning("[AgentManager] No MetaController set; dropping signal %s %s", symbol, action)
+            self.logger.warning(
+                "[AgentManager] No MetaController set; dropping signal %s %s", symbol, action
+            )
             return
         sym = (symbol or "").replace("/", "").upper()
         payload = dict(extra or {})
         payload["action"] = (action or "").upper()
         payload["confidence"] = float(confidence)
-        if quote is not None: payload["quote"] = float(quote)
-        if quantity is not None: payload["quantity"] = float(quantity)
-        if horizon_hours is not None: payload["horizon_hours"] = float(horizon_hours)
+        if quote is not None:
+            payload["quote"] = float(quote)
+        if quantity is not None:
+            payload["quantity"] = float(quantity)
+        if horizon_hours is not None:
+            payload["horizon_hours"] = float(horizon_hours)
         try:
             if self._meta_adapter is None:
                 self._meta_adapter = self._MetaAdapter(self.meta_controller)
             adapter = self._meta_adapter
             await adapter.submit_signal(agent_name, sym, payload, payload.get("confidence"))
-            self.logger.info("[AgentEmit] %s %s conf=%.2f%s%s",
-                             sym, payload["action"], payload["confidence"],
-                             f" quote={payload.get('quote'):.2f}" if "quote" in payload else "",
-                             f" qty={payload.get('quantity'):.6f}" if "quantity" in payload else "")
+            self.logger.info(
+                "[AgentEmit] %s %s conf=%.2f%s%s",
+                sym,
+                payload["action"],
+                payload["confidence"],
+                f" quote={payload.get('quote'):.2f}" if "quote" in payload else "",
+                f" qty={payload.get('quantity'):.6f}" if "quantity" in payload else "",
+            )
         except Exception as e:
-            self.logger.warning("[AgentManager] emit_to_meta failed for %s: %s", sym, e, exc_info=True)
+            self.logger.warning(
+                "[AgentManager] emit_to_meta failed for %s: %s", sym, e, exc_info=True
+            )
 
-    async def submit_trade_intents(self, intents: List[Dict[str, Any]]):
+    async def submit_trade_intents(self, intents: list[dict[str, Any]]):
         """
         Bind Agent→Meta pipe through the event bus.
         Strategists publish canonical TradeIntent payloads on:
           events.trade.intent
         """
         if not intents:
-            self.logger.warning("[AgentManager:SUBMIT] submit_trade_intents called with empty list - no-op")
+            self.logger.warning(
+                "[AgentManager:SUBMIT] submit_trade_intents called with empty list - no-op"
+            )
             return
 
-        self.logger.warning("[AgentManager:SUBMIT] Publishing %d intents to event_bus", len(intents))
+        self.logger.warning(
+            "[AgentManager:SUBMIT] Publishing %d intents to event_bus", len(intents)
+        )
 
         event_bus = getattr(self.shared_state, "event_bus", None)
         publish = getattr(event_bus, "publish", None)
         if not callable(publish):
-            self.logger.warning("submit_trade_intents called but shared_state.event_bus.publish is unavailable.")
+            self.logger.warning(
+                "submit_trade_intents called but shared_state.event_bus.publish is unavailable."
+            )
             return
 
         published = 0
@@ -645,11 +710,15 @@ class AgentManager:
                 await publish("events.trade.intent", ti)
                 published += 1
             except Exception as e:
-                self.logger.warning("Failed to publish trade intent event for %s: %s", getattr(ti, "symbol", "?"), e)
+                self.logger.warning(
+                    "Failed to publish trade intent event for %s: %s", getattr(ti, "symbol", "?"), e
+                )
 
         if published > 0:
             self.logger.info("[AgentManager] Published %d trade intent events", published)
-            self.logger.warning("[AgentManager:SUBMIT] ✓ Published %d intents to event_bus", published)
+            self.logger.warning(
+                "[AgentManager:SUBMIT] ✓ Published %d intents to event_bus", published
+            )
 
     def _coerce_trade_intent(self, raw: Any) -> Optional[TradeIntent]:
         """Best-effort conversion into canonical TradeIntent."""
@@ -679,7 +748,7 @@ class AgentManager:
                 "_atr_pct",
                 "atr_pct",
             ]
-            policy_ctx: Dict[str, Any] = {}
+            policy_ctx: dict[str, Any] = {}
             if isinstance(raw.get("policy_context"), dict):
                 policy_ctx.update(raw.get("policy_context"))
             for k in passthrough_keys:
@@ -714,16 +783,22 @@ class AgentManager:
             self.logger.debug("[AgentManager:NORMALIZE] 0 raw signals from %s", agent_name)
             return intents
         if raw == {}:
-            self.logger.debug("[AgentManager:NORMALIZE] 0 raw signals from %s (empty dict)", agent_name)
+            self.logger.debug(
+                "[AgentManager:NORMALIZE] 0 raw signals from %s (empty dict)", agent_name
+            )
             return intents
         if raw is False or raw == 0 or raw == "":
-            self.logger.debug("[AgentManager:NORMALIZE] 0 raw signals from %s (falsey=%r)", agent_name, raw)
+            self.logger.debug(
+                "[AgentManager:NORMALIZE] 0 raw signals from %s (falsey=%r)", agent_name, raw
+            )
             return intents
         if isinstance(raw, dict):
             raw = [raw]
         elif not isinstance(raw, (list, tuple, set)):
             raw = [raw]
-        self.logger.debug("[AgentManager:NORMALIZE] Normalizing %d raw signals from %s", len(raw), agent_name)
+        self.logger.debug(
+            "[AgentManager:NORMALIZE] Normalizing %d raw signals from %s", len(raw), agent_name
+        )
         for s in raw:
             # Handle canonical TradeIntent objects directly (previously dropped silently).
             if isinstance(TradeIntent, type) and isinstance(s, TradeIntent):
@@ -754,7 +829,8 @@ class AgentManager:
             if not isinstance(s, dict):
                 self.logger.debug(
                     "[_normalize_to_intents] Agent '%s' yielded non-dict, non-TradeIntent item (%s); skipping.",
-                    agent_name, type(s).__name__,
+                    agent_name,
+                    type(s).__name__,
                 )
                 continue
             sym = (s.get("symbol") or s.get("sym") or "").replace("/", "").upper()
@@ -770,7 +846,9 @@ class AgentManager:
                 "agent": agent_name,
                 "confidence": max(0.0, min(1.0, float(s.get("confidence") or 0.0))),
                 "rationale": s.get("reason") or s.get("rationale"),
-                "ts": float(s.get("ts") or s.get("timestamp") or time.time()),  # CRITICAL: Intent freshness
+                "ts": float(
+                    s.get("ts") or s.get("timestamp") or time.time()
+                ),  # CRITICAL: Intent freshness
                 "ttl_sec": int(s.get("ttl_sec") or 30),
                 "tag": f"strategy/{agent_name}",
                 "budget_required": (act == "buy"),
@@ -804,10 +882,14 @@ class AgentManager:
         if raw and not intents:
             self.logger.warning(
                 "[_normalize_to_intents] Agent '%s' provided %d raw signals but NONE passed normalization. First item: %s",
-                agent_name, len(raw), raw[0] if raw else "N/A",
+                agent_name,
+                len(raw),
+                raw[0] if raw else "N/A",
             )
         if intents:
-            self.logger.info("[AgentManager:NORMALIZE] ✓ Normalized %d intents from %s", len(intents), agent_name)
+            self.logger.info(
+                "[AgentManager:NORMALIZE] ✓ Normalized %d intents from %s", len(intents), agent_name
+            )
         return intents
 
     async def collect_and_forward_signals(self):
@@ -817,24 +899,30 @@ class AgentManager:
         now_ts = time.time()
         if (now_ts - self._last_watchdog_report_ts) >= self._watchdog_report_interval_s:
             await self._report_watchdog_status(
-                "Operational",
-                f"Processed {self._signal_counter} signal batches"
+                "Operational", f"Processed {self._signal_counter} signal batches"
             )
             self._last_watchdog_report_ts = now_ts
-        
-        self.logger.debug("[AgentManager] Signal Collection Tick. SharedState ID: %d, Meta ID: %d", id(self.shared_state), id(self.meta_controller))
+
+        self.logger.debug(
+            "[AgentManager] Signal Collection Tick. SharedState ID: %d, Meta ID: %d",
+            id(self.shared_state),
+            id(self.meta_controller),
+        )
         batch = []
         strategy_agents = [
             (name, agent)
             for name, agent in list(self.agents.items())
-            if getattr(agent, "agent_type", None) != "discovery" and hasattr(agent, "generate_signals")
+            if getattr(agent, "agent_type", None) != "discovery"
+            and hasattr(agent, "generate_signals")
         ]
-        
+
         # 🔥 CRITICAL DEBUG: Log if no strategy agents found
         if not strategy_agents:
-            self.logger.warning("[AgentManager] ⚠️ NO STRATEGY AGENTS FOUND! registered_agents=%s agent_types=%s", 
-                               list(self.agents.keys()),
-                               {n: getattr(a, "agent_type", "unknown") for n, a in self.agents.items()})
+            self.logger.warning(
+                "[AgentManager] ⚠️ NO STRATEGY AGENTS FOUND! registered_agents=%s agent_types=%s",
+                list(self.agents.keys()),
+                {n: getattr(a, "agent_type", "unknown") for n, a in self.agents.items()},
+            )
         if not strategy_agents:
             now_ts = time.time()
             retry_interval = max(5.0, float(self._strategy_autoregister_retry_interval_s or 60.0))
@@ -854,7 +942,8 @@ class AgentManager:
                 strategy_agents = [
                     (name, agent)
                     for name, agent in list(self.agents.items())
-                    if getattr(agent, "agent_type", None) != "discovery" and hasattr(agent, "generate_signals")
+                    if getattr(agent, "agent_type", None) != "discovery"
+                    and hasattr(agent, "generate_signals")
                 ]
 
         for name, agent in strategy_agents:
@@ -864,7 +953,7 @@ class AgentManager:
 
             # Call generate_signals() exactly once per tick
             try:
-                fn = getattr(agent, "generate_signals")
+                fn = agent.generate_signals
                 res = fn()
                 if inspect.isawaitable(res):
                     res = await res
@@ -876,14 +965,23 @@ class AgentManager:
                     raw_count = len(res)
                 else:
                     raw_count = 1
-                self.logger.debug("[%s] generate_signals() returned %d raw signals.", name, raw_count)
+                self.logger.debug(
+                    "[%s] generate_signals() returned %d raw signals.", name, raw_count
+                )
                 intents = self._normalize_to_intents(name, res)
                 if intents:
                     batch.extend(intents)
                     symbol_count = len(getattr(agent, "symbols", []))
-                    self.logger.info("[%s] Normalized %d intents (scanned %d symbols)", name, len(intents), symbol_count)
+                    self.logger.info(
+                        "[%s] Normalized %d intents (scanned %d symbols)",
+                        name,
+                        len(intents),
+                        symbol_count,
+                    )
                 elif res:
-                    self.logger.warning("[%s] FAILED to normalize any of the %d signals.", name, len(res))
+                    self.logger.warning(
+                        "[%s] FAILED to normalize any of the %d signals.", name, len(res)
+                    )
             except _asyncio.CancelledError:
                 if self._task_cancel_requested():
                     raise
@@ -905,12 +1003,14 @@ class AgentManager:
 
             await self.submit_trade_intents(publish_batch)
             self.logger.info("Submitted %d TradeIntents to Meta", len(publish_batch))
-            
+
             # 🔥 CRITICAL DEBUG: Log submission
-            self.logger.warning("[AgentManager:BATCH] Submitted batch of %d intents: %s", 
-                               len(publish_batch),
-                               [f"{i.get('agent')}:{i.get('symbol')}" for i in publish_batch])
-            
+            self.logger.warning(
+                "[AgentManager:BATCH] Submitted batch of %d intents: %s",
+                len(publish_batch),
+                [f"{i.get('agent')}:{i.get('symbol')}" for i in publish_batch],
+            )
+
             # 🔥 CRITICAL FIX: DIRECT PATH TO METACONTROLLER
             # Don't wait for event bus drain - forward signals directly to MetaController
             # This ensures signals reach the signal_cache IMMEDIATELY
@@ -952,11 +1052,18 @@ class AgentManager:
                         await self.meta_controller.receive_signal(agent, symbol, signal)
                         direct_count += 1
                     except Exception as e:
-                        self.logger.debug("[AgentManager] Direct signal forward failed for %s from %s: %s", 
-                                        intent.get("symbol"), agent, e)
-                
+                        self.logger.debug(
+                            "[AgentManager] Direct signal forward failed for %s from %s: %s",
+                            intent.get("symbol"),
+                            agent,
+                            e,
+                        )
+
                 if direct_count > 0:
-                    self.logger.info("[AgentManager:DIRECT] Forwarded %d signals directly to MetaController.signal_cache", direct_count)
+                    self.logger.info(
+                        "[AgentManager:DIRECT] Forwarded %d signals directly to MetaController.signal_cache",
+                        direct_count,
+                    )
         else:
             now_ts = time.time()
             interval = max(5.0, float(self._empty_intent_log_interval_s or 60.0))
@@ -969,7 +1076,6 @@ class AgentManager:
                     strategy_names,
                     len(self.agents),
                 )
-
 
     def register_agent(self, agent):
         """Adds an agent instance to the manager's registry."""
@@ -1004,7 +1110,8 @@ class AgentManager:
 
         if filter_types is not None:
             agent_class_items = [
-                (name, cls) for name, cls in agent_class_items
+                (name, cls)
+                for name, cls in agent_class_items
                 if getattr(cls, "agent_type", None) in filter_types
             ]
             self.logger.info(f"Filtered to agent types: {filter_types}")
@@ -1023,7 +1130,7 @@ class AgentManager:
             "database_manager": self.database_manager,
             "agent_schedule": self.agent_schedule,
         }
-        
+
         # Debug: Log dependency availability
         self.logger.debug(
             "[AgentManager] Dependency check: model_manager=%s (is None: %s), "
@@ -1047,9 +1154,11 @@ class AgentManager:
                 self.logger.info(f"🔍 Preparing to register agent: {agent_name}")
 
                 sig = inspect.signature(agent_class.__init__)
-                accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                accepts_kwargs = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
                 accepted_params = set(sig.parameters.keys()) - {"self"}
-                
+
                 # Debug: Log the signature analysis
                 if agent_name == "MLForecaster":
                     self.logger.debug(
@@ -1067,11 +1176,16 @@ class AgentManager:
                         if k not in injected_args:
                             injected_args[k] = v
 
-                if getattr(agent_class, "agent_type", "") == "strategy" and "symbols" in accepted_params:
+                if (
+                    getattr(agent_class, "agent_type", "") == "strategy"
+                    and "symbols" in accepted_params
+                ):
                     symbol_list = await self._get_accepted_symbols_list()
                     injected_args["symbols"] = symbol_list
-                    self.logger.info(f"[AgentManager] Preparing to register agent '{agent_name}' with {len(symbol_list)} symbols")
-                
+                    self.logger.info(
+                        f"[AgentManager] Preparing to register agent '{agent_name}' with {len(symbol_list)} symbols"
+                    )
+
                 # Enhanced logging for debugging
                 has_model_mgr = "model_manager" in injected_args
                 self.logger.info(
@@ -1085,7 +1199,7 @@ class AgentManager:
                         f"accepts_kwargs={accepts_kwargs}, "
                         f"accepted_params={accepted_params}"
                     )
-                
+
                 agent = agent_class(**injected_args)
                 self.logger.info(f"✅ Instantiated agent: {agent_name}")
 
@@ -1096,24 +1210,32 @@ class AgentManager:
                     # If agent already had a meta_controller, replace only if it's missing the expected methods.
                     existing = getattr(agent, "meta_controller", None)
                     needs_adapter = (
-                        existing is None or
-                        not hasattr(existing, "submit_signal") or
-                        not hasattr(existing, "submit_agent_signal")
+                        existing is None
+                        or not hasattr(existing, "submit_signal")
+                        or not hasattr(existing, "submit_agent_signal")
                     )
                     if needs_adapter:
                         agent.meta_controller = adapted
                         self.logger.info(f"🔗 Injected MetaAdapter into agent '{agent_name}'")
                     else:
-                        self.logger.info(f"🔗 Agent '{agent_name}' already has compatible meta_controller")
+                        self.logger.info(
+                            f"🔗 Agent '{agent_name}' already has compatible meta_controller"
+                        )
                 else:
-                    self.logger.warning(f"⚠️ No MetaController set; agent '{agent_name}' will not be able to emit trades.")
+                    self.logger.warning(
+                        f"⚠️ No MetaController set; agent '{agent_name}' will not be able to emit trades."
+                    )
 
                 self.register_agent(agent)
-                num_symbols = len(getattr(agent, 'symbols', []) or [])
+                num_symbols = len(getattr(agent, "symbols", []) or [])
                 if num_symbols == 0 and getattr(agent_class, "agent_type", "") == "strategy":
-                    self.logger.warning(f"⚠️ CRITICAL: Strategy agent '{agent_name}' registered with 0 symbols! " 
-                                       f"It will not trade until tick_all_once() populates the symbol cache.")
-                    self.logger.warning(f"   This usually means discovery hasn't finalized symbols yet.")
+                    self.logger.warning(
+                        f"⚠️ CRITICAL: Strategy agent '{agent_name}' registered with 0 symbols! "
+                        f"It will not trade until tick_all_once() populates the symbol cache."
+                    )
+                    self.logger.warning(
+                        "   This usually means discovery hasn't finalized symbols yet."
+                    )
                 else:
                     self.logger.info(f"📦 Registered agent {agent_name} with {num_symbols} symbols")
                 registered += 1
@@ -1121,20 +1243,25 @@ class AgentManager:
             except Exception as e:
                 # CRITICAL: Log full error details to diagnose registration failures
                 self.logger.critical(
-                    f"❌ REGISTRATION FAILED FOR '{agent_name}': {type(e).__name__}: {str(e)}",
-                    exc_info=True
+                    f"❌ REGISTRATION FAILED FOR '{agent_name}': {type(e).__name__}: {e!s}",
+                    exc_info=True,
                 )
                 # Also log simplified version for easier grep
                 import traceback
-                tb_lines = traceback.format_exc().split('\n')
-                self.logger.critical(f"[AGENT_REGISTRATION_FAILURE] {agent_name}: {tb_lines[-3] if len(tb_lines) > 2 else str(e)}")
+
+                tb_lines = traceback.format_exc().split("\n")
+                self.logger.critical(
+                    f"[AGENT_REGISTRATION_FAILURE] {agent_name}: {tb_lines[-3] if len(tb_lines) > 2 else str(e)}"
+                )
                 failures += 1
 
         self.logger.info(f"✅ Final Registered Agents: {list(self.agents.keys())}")
-        self.logger.info(f"🧩 AgentManager registration summary: registered={registered}, failures={failures}")
+        self.logger.info(
+            f"🧩 AgentManager registration summary: registered={registered}, failures={failures}"
+        )
         if registered == 0:
             raise RuntimeError("AgentManager: No strategy agents registered")
-        
+
         self._strategies_prepared = True  # Set flag after successful registration
 
     def _ensure_optional_agent_classes(self) -> None:
@@ -1176,7 +1303,9 @@ class AgentManager:
                 include_trace=True,
             )
 
-    def _log_optional_import_issue(self, key: str, message: str, include_trace: bool = False) -> None:
+    def _log_optional_import_issue(
+        self, key: str, message: str, include_trace: bool = False
+    ) -> None:
         now_ts = time.time()
         interval = max(10.0, float(self._optional_import_log_interval_s or 300.0))
         last_ts = float(self._last_optional_import_log_ts.get(key, 0.0) or 0.0)
@@ -1262,10 +1391,10 @@ class AgentManager:
         This is used when you directly pass agent instances from AppContext.
         """
         if not getattr(agent, "agent_type", None):
-            setattr(agent, "agent_type", "discovery")
+            agent.agent_type = "discovery"
 
         if not hasattr(agent, "name") or not getattr(agent, "name", None):
-            setattr(agent, "name", agent.__class__.__name__)
+            agent.name = agent.__class__.__name__
 
         existing_name_index = None
         for idx, existing in enumerate(self.discovery_agents):
@@ -1281,7 +1410,9 @@ class AgentManager:
         # Keep the canonical registry consistent so startup checks, bootstrap,
         # and task launch logic see discovery agents too.
         self.agents[agent.name] = agent
-        self.logger.info(f"📥 Registered discovery agent: {agent.__class__.__name__} ({agent.name})")
+        self.logger.info(
+            f"📥 Registered discovery agent: {agent.__class__.__name__} ({agent.name})"
+        )
 
     async def run_discovery_agents(self):
         """
@@ -1294,7 +1425,9 @@ class AgentManager:
                 # Spawn as independent tasks to avoid blocking the manager
                 _asyncio.create_task(agent.run_loop(), name=f"Discovery:{agent.__class__.__name__}")
             else:
-                self.logger.warning(f"⚠️ Discovery Agent {agent.__class__.__name__} has no async run_loop(). Skipping.")
+                self.logger.warning(
+                    f"⚠️ Discovery Agent {agent.__class__.__name__} has no async run_loop(). Skipping."
+                )
 
     async def run_discovery_agents_once(self):
         """
@@ -1302,19 +1435,23 @@ class AgentManager:
         Logs how many symbols were proposed and accepted per agent.
         """
         self.logger.info("🚀 Running discovery agents once (Phase 3)...")
-        
+
         for agent in self.discovery_agents:
             agent_name = agent.__class__.__name__
-            before = set(self.shared_state.symbol_proposals.keys()) 
-            
+            before = set(self.shared_state.symbol_proposals.keys())
+
             try:
                 if hasattr(agent, "run_once") and _asyncio.iscoroutinefunction(agent.run_once):
                     await agent.run_once()
                     after = set(self.shared_state.symbol_proposals.keys())
                     proposed = after - before
-                    self.logger.info(f"✅ {agent_name} proposed {len(proposed)} new symbols: {list(proposed)}")
+                    self.logger.info(
+                        f"✅ {agent_name} proposed {len(proposed)} new symbols: {list(proposed)}"
+                    )
                 else:
-                    self.logger.warning(f"⚠️ Discovery Agent {agent.__class__.__name__} does not have an async run_once() method. Skipping.")
+                    self.logger.warning(
+                        f"⚠️ Discovery Agent {agent.__class__.__name__} does not have an async run_once() method. Skipping."
+                    )
             except Exception as e:
                 self.logger.exception(f"❌ {agent_name} failed to run_once(): {e}")
 
@@ -1326,15 +1463,22 @@ class AgentManager:
         ready_event = getattr(self.shared_state, "market_data_ready_event", None)
         if ready_event and hasattr(ready_event, "wait"):
             try:
-                await _asyncio.wait_for(ready_event.wait(), timeout=self._market_data_ready_timeout_s)
+                await _asyncio.wait_for(
+                    ready_event.wait(), timeout=self._market_data_ready_timeout_s
+                )
             except _asyncio.TimeoutError:
-                self.logger.warning("⚠️ Market data readiness timed out after %.1fs — proceeding anyway.", self._market_data_ready_timeout_s)
+                self.logger.warning(
+                    "⚠️ Market data readiness timed out after %.1fs — proceeding anyway.",
+                    self._market_data_ready_timeout_s,
+                )
         else:
             self.logger.info("ℹ️ No market_data_ready_event found; proceeding without wait.")
 
         # Behavioral Change 2: Allocation must precede symbol activation (Point 2)
         # We wait for OpsPlaneReady or at least an authoritative budget before starting trading agents.
-        self.logger.info("⏳ Waiting for Capital Allocation (OpsPlaneReady) before activating agents...")
+        self.logger.info(
+            "⏳ Waiting for Capital Allocation (OpsPlaneReady) before activating agents..."
+        )
         ops_ready = getattr(self.shared_state, "ops_plane_ready_event", None)
         if ops_ready:
             try:
@@ -1342,9 +1486,16 @@ class AgentManager:
                 await _asyncio.wait_for(ops_ready.wait(), timeout=ops_timeout)
                 self.logger.info("✅ Capital assigned; proceeding with agent activation.")
             except _asyncio.TimeoutError:
-                self.logger.warning("⚠️ OpsPlaneReady timed out; checking if we have any budget anyway.")
-                if not hasattr(self.shared_state, "is_ops_plane_ready") or not self.shared_state.is_ops_plane_ready():
-                    self.logger.warning("❌ No budget detected; agents will launch but may remain idle.")
+                self.logger.warning(
+                    "⚠️ OpsPlaneReady timed out; checking if we have any budget anyway."
+                )
+                if (
+                    not hasattr(self.shared_state, "is_ops_plane_ready")
+                    or not self.shared_state.is_ops_plane_ready()
+                ):
+                    self.logger.warning(
+                        "❌ No budget detected; agents will launch but may remain idle."
+                    )
 
         self.logger.info("🚀 Starting agents...")
         sem = _asyncio.Semaphore(self._max_start_concurrency)
@@ -1358,20 +1509,26 @@ class AgentManager:
         # Launch tasks (Discovery agents ONLY)
         for n, a in sorted(self.agents.items(), key=lambda kv: kv[0].lower()):
             agent_type = getattr(a, "agent_type", None)
-            
+
             # ARCHITECTURAL FIX: Strategy agents are TICK-DRIVEN.
             # They MUST NOT be launched as background tasks to avoid double-execution.
             if agent_type == "strategy":
                 # ISSUE 3: Enforce strategy agent contract early (Startup Sanity)
                 if not hasattr(a, "generate_signals"):
-                    self.logger.error(f"❌ [AgentManager] Strategy agent '{n}' is MISSING generate_signals(). It will never trade.")
+                    self.logger.error(
+                        f"❌ [AgentManager] Strategy agent '{n}' is MISSING generate_signals(). It will never trade."
+                    )
                 else:
-                    self.logger.info(f"✅ [AgentManager] Registered strategy agent: {n} (tick-driven)")
+                    self.logger.info(
+                        f"✅ [AgentManager] Registered strategy agent: {n} (tick-driven)"
+                    )
                 continue
-                
+
             await _start(n, a)
 
-        self.logger.info("✅ Discovery agent tasks launched. Strategy agents are registered for ticking.")
+        self.logger.info(
+            "✅ Discovery agent tasks launched. Strategy agents are registered for ticking."
+        )
         # Intentionally do NOT await agent tasks here.
 
     async def tick_all_once(self):
@@ -1385,23 +1542,34 @@ class AgentManager:
                 # CRITICAL FIX: Update if changed OR if cache is empty (initial bootstrap)
                 if snap_list != self._accepted_symbols_cache or not self._accepted_symbols_cache:
                     if snap_list and snap_list != self._accepted_symbols_cache:
-                        self.logger.info("🔄 Symbol universe changed: %d -> %d symbols. Notifying agents.",
-                                         len(self._accepted_symbols_cache), len(snap_list))
+                        self.logger.info(
+                            "🔄 Symbol universe changed: %d -> %d symbols. Notifying agents.",
+                            len(self._accepted_symbols_cache),
+                            len(snap_list),
+                        )
                     elif snap_list and not self._accepted_symbols_cache:
-                        self.logger.info("🔄 ⚡ INITIAL symbol cache population: %d symbols now available.",
-                                         len(snap_list))
-                    
+                        self.logger.info(
+                            "🔄 ⚡ INITIAL symbol cache population: %d symbols now available.",
+                            len(snap_list),
+                        )
+
                     self._accepted_symbols_cache = snap_list
                     self._last_symbols_refresh_t = now
-                    
+
                     # CRITICAL FIX: FORCE symbol refresh into ALL agents (especially on first non-empty set)
                     for agent_obj in self.agents.values():
-                        if hasattr(agent_obj, "load_symbols") and _asyncio.iscoroutinefunction(agent_obj.load_symbols):
+                        if hasattr(agent_obj, "load_symbols") and _asyncio.iscoroutinefunction(
+                            agent_obj.load_symbols
+                        ):
                             await agent_obj.load_symbols(self._accepted_symbols_cache)
                         elif hasattr(agent_obj, "symbols"):
                             agent_obj.symbols = self._accepted_symbols_cache
                             # ISSUE 2: Log symbol visibility per agent
-                            self.logger.debug("[%s] Injected %d symbols", agent_obj.__class__.__name__, len(self._accepted_symbols_cache))
+                            self.logger.debug(
+                                "[%s] Injected %d symbols",
+                                agent_obj.__class__.__name__,
+                                len(self._accepted_symbols_cache),
+                            )
         except Exception as e:
             self.logger.debug("Symbol refresh check failed: %s", e)
 
@@ -1410,7 +1578,12 @@ class AgentManager:
         # Signal generation happens in collect_and_forward_signals() to avoid double execution
         shared_wallet_mode_raw = getattr(self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True)
         if isinstance(shared_wallet_mode_raw, str):
-            shared_wallet_mode = shared_wallet_mode_raw.strip().lower() in {"1", "true", "yes", "on"}
+            shared_wallet_mode = shared_wallet_mode_raw.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
         else:
             shared_wallet_mode = bool(shared_wallet_mode_raw)
         shared_wallet_spendable = 0.0
@@ -1423,7 +1596,7 @@ class AgentManager:
                 shared_wallet_spendable = float(spendable_res or 0.0)
             except Exception as e:
                 self.logger.debug("[AgentManager] Failed to read shared spendable budget: %s", e)
-        
+
         for name, agent_obj in self.agents.items():
             try:
                 agent_type = getattr(agent_obj, "agent_type", None)
@@ -1443,7 +1616,7 @@ class AgentManager:
                 now_t = time.time()
                 last_log = self._last_agent_log_t.get(name, 0.0)
                 symbol_count = len(getattr(agent_obj, "symbols", []))
-                
+
                 if (now_t - last_log) > 60.0:
                     status = "Active" if budget > 0 else "Active (Exit-Only/ZeroBudget)"
                     if raw_budget <= 0.0 < budget:
@@ -1455,13 +1628,18 @@ class AgentManager:
                             budget,
                         )
                     else:
-                        self.logger.info("[Agent:%s] %s with %d symbols", name, status, symbol_count)
+                        self.logger.info(
+                            "[Agent:%s] %s with %d symbols", name, status, symbol_count
+                        )
                     self._last_agent_log_t[name] = now_t
 
                 # ISSUE 3: Enforce strategy agent contract
                 if not hasattr(agent_obj, "generate_signals"):
-                    self.logger.warning("[%s] Missing generate_signals() - strategy agents MUST implement this", name)
-                
+                    self.logger.warning(
+                        "[%s] Missing generate_signals() - strategy agents MUST implement this",
+                        name,
+                    )
+
             except Exception as e:
                 self.logger.warning("[%s] Tick preparation failed: %s", name, e)
 
@@ -1470,7 +1648,9 @@ class AgentManager:
         Launch all agents that have a `run()` coroutine method.
         Useful in Phase 7 when agents are expected to operate continuously.
         """
-        await update_health(self.shared_state, "AgentManager", "Healthy", "Strategy agent loop running.")
+        await update_health(
+            self.shared_state, "AgentManager", "Healthy", "Strategy agent loop running."
+        )
         # Keep previous run() API but delegate to run_all_agents for consistency
         await self.run_all_agents()
 
@@ -1492,21 +1672,32 @@ class AgentManager:
             if hasattr(self.shared_state, "get_authoritative_reservation"):
                 budget = float(self.shared_state.get_authoritative_reservation(name))
                 if budget <= 0:
-                    shared_wallet_mode_raw = getattr(self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True)
+                    shared_wallet_mode_raw = getattr(
+                        self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True
+                    )
                     if isinstance(shared_wallet_mode_raw, str):
-                        shared_wallet_mode = shared_wallet_mode_raw.strip().lower() in {"1", "true", "yes", "on"}
+                        shared_wallet_mode = shared_wallet_mode_raw.strip().lower() in {
+                            "1",
+                            "true",
+                            "yes",
+                            "on",
+                        }
                     else:
                         shared_wallet_mode = bool(shared_wallet_mode_raw)
                     if shared_wallet_mode and hasattr(self.shared_state, "get_spendable_balance"):
                         try:
-                            quote_asset = str(getattr(self.config, "QUOTE_ASSET", "USDT") or "USDT").upper()
+                            quote_asset = str(
+                                getattr(self.config, "QUOTE_ASSET", "USDT") or "USDT"
+                            ).upper()
                             spendable = self.shared_state.get_spendable_balance(quote_asset)
                             if inspect.isawaitable(spendable):
                                 spendable = await spendable
                             if float(spendable or 0.0) > 0.0:
                                 return True
                         except Exception as e:
-                            self.logger.debug("[Agent:%s] Shared wallet budget probe failed: %s", name, e)
+                            self.logger.debug(
+                                "[Agent:%s] Shared wallet budget probe failed: %s", name, e
+                            )
                     self.logger.debug("[Agent:%s] Idle: No authoritative budget allocated.", name)
                     return False
             return True
@@ -1514,8 +1705,8 @@ class AgentManager:
         async def _once():
             # Apply dynamic budget gating before execution (Point 2)
             if not await _check_budget():
-                 await _asyncio.sleep(10) # check again later
-                 return None
+                await _asyncio.sleep(10)  # check again later
+                return None
 
             # ARCHITECTURAL FIX: Only discovery agents are allowed to have a persistent background task.
             agent_type = getattr(agent, "agent_type", None)
@@ -1526,10 +1717,14 @@ class AgentManager:
                     return await agent.run()
                 if hasattr(agent, "run_once") and _asyncio.iscoroutinefunction(agent.run_once):
                     return await _asyncio.wait_for(agent.run_once(), timeout=self._agent_timeout_s)
-            
+
             # If we are here, it's either a strategy agent (which shouldn't have reached here)
             # or a discovery agent with no supported entry point.
-            self.logger.debug("[AgentManager:_agent_entry] Agent %s type=%s has no background loop; exiting task.", name, agent_type)
+            self.logger.debug(
+                "[AgentManager:_agent_entry] Agent %s type=%s has no background loop; exiting task.",
+                name,
+                agent_type,
+            )
             return None
 
         if not self._restart_on_crash:
@@ -1540,12 +1735,16 @@ class AgentManager:
             try:
                 return await _once()
             except _asyncio.TimeoutError:
-                self.logger.warning("⏰ Agent %s timed out (entry or run_once). Backoff %.1fs.", name, backoff)
+                self.logger.warning(
+                    "⏰ Agent %s timed out (entry or run_once). Backoff %.1fs.", name, backoff
+                )
             except _asyncio.CancelledError:
                 self.logger.info("🛑 Agent %s cancelled; exiting restart loop.", name)
                 raise
             except Exception as e:
-                self.logger.error("🔥 Agent %s crashed: %s — restarting in %.1fs", name, e, backoff, exc_info=True)
+                self.logger.error(
+                    "🔥 Agent %s crashed: %s — restarting in %.1fs", name, e, backoff, exc_info=True
+                )
             await _asyncio.sleep(backoff)
             backoff = min(backoff * 2, self._restart_backoff_max)
 
@@ -1560,13 +1759,13 @@ class AgentManager:
                 ComponentStatusLogger.log_status(
                     component="AgentManager",
                     status="Healthy",
-                    detail=f"Heartbeat ping at {datetime.now().isoformat()}"
+                    detail=f"Heartbeat ping at {datetime.now().isoformat()}",
                 )
                 await _asyncio.sleep(getattr(self.config, "AGENT_HEALTH_INTERVAL", 30))
         except _asyncio.CancelledError:
             self.logger.info("AgentManager.health loop cancelled.")
             raise
- 
+
     async def run_discovery_agents_loop(self):
         """
         Periodically runs discovery agents to populate the symbol universe.
@@ -1584,7 +1783,9 @@ class AgentManager:
             try:
                 await self.run_discovery_agents_once()
                 # Run every 10 minutes or as configured
-                discovery_interval = float(getattr(self.config, "AGENTMGR_DISCOVERY_INTERVAL", 600.0))
+                discovery_interval = float(
+                    getattr(self.config, "AGENTMGR_DISCOVERY_INTERVAL", 600.0)
+                )
                 await _asyncio.sleep(discovery_interval)
             except _asyncio.CancelledError:
                 self.logger.info("Discovery loop cancelled.")
@@ -1596,21 +1797,35 @@ class AgentManager:
 
     async def _tick_loop(self):  # New method for continuous ticking
         self._strategies_started = True  # Set flag when the loop starts
-        self.logger.warning("🔥 [AgentManager:TICK] ✅ TICK LOOP STARTED - will collect signals every %d seconds", getattr(self.config, "AGENT_TICK_SEC", 5))
+        self.logger.warning(
+            "🔥 [AgentManager:TICK] ✅ TICK LOOP STARTED - will collect signals every %d seconds",
+            getattr(self.config, "AGENT_TICK_SEC", 5),
+        )
         tick_count = 0
         try:
             while True:
                 try:
                     tick_count += 1
-                    self.logger.debug("[AgentManager:TICK] Iteration #%d: tick_all_once", tick_count)
-                    await self.tick_all_once()                 # agents do their work
-                    self.logger.debug("[AgentManager:TICK] Iteration #%d: collect_and_forward_signals", tick_count)
-                    await self.collect_and_forward_signals()   # NEW: forward to Meta
+                    self.logger.debug(
+                        "[AgentManager:TICK] Iteration #%d: tick_all_once", tick_count
+                    )
+                    await self.tick_all_once()  # agents do their work
+                    self.logger.debug(
+                        "[AgentManager:TICK] Iteration #%d: collect_and_forward_signals", tick_count
+                    )
+                    await self.collect_and_forward_signals()  # NEW: forward to Meta
                 except _asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    self.logger.error("AgentManager.tick loop iteration #%d failed: %s", tick_count, e, exc_info=True)
-                await _asyncio.sleep(getattr(self.config, "AGENT_TICK_SEC", 5))  # Use AGENT_TICK_SEC from config
+                    self.logger.error(
+                        "AgentManager.tick loop iteration #%d failed: %s",
+                        tick_count,
+                        e,
+                        exc_info=True,
+                    )
+                await _asyncio.sleep(
+                    getattr(self.config, "AGENT_TICK_SEC", 5)
+                )  # Use AGENT_TICK_SEC from config
         except _asyncio.CancelledError:
             self.logger.info("AgentManager.tick loop cancelled after %d iterations.", tick_count)
             raise
@@ -1626,10 +1841,14 @@ class AgentManager:
             return
 
         timeout_s = max(60.0, float(self._strategy_retrain_timeout_s or 3600.0))
-        strategy_total = sum(1 for _n, _a in self.agents.items() if getattr(_a, "agent_type", None) == "strategy")
+        strategy_total = sum(
+            1 for _n, _a in self.agents.items() if getattr(_a, "agent_type", None) == "strategy"
+        )
         retrain_capable = [
-            _n for _n, _a in self.agents.items()
-            if getattr(_a, "agent_type", None) == "strategy" and callable(getattr(_a, "retrain", None))
+            _n
+            for _n, _a in self.agents.items()
+            if getattr(_a, "agent_type", None) == "strategy"
+            and callable(getattr(_a, "retrain", None))
         ]
         self.logger.info(
             "[Phase9:Retrain] Strategy retrain loop started (interval=%.1fs timeout=%.1fs strategies=%d retrain_capable=%d names=%s).",
@@ -1698,7 +1917,7 @@ class AgentManager:
             self.logger.info("AgentManager.strategy_retrain loop cancelled.")
             raise
 
-    async def run_loop(self, stop_event: Optional['_asyncio.Event'] = None):
+    async def run_loop(self, stop_event: Optional[_asyncio.Event] = None):
         """
         Phase 9 compatibility: unblocked orchestration of manager tasks.
         """
@@ -1706,16 +1925,26 @@ class AgentManager:
             self.logger.warning("AgentManager run_loop already active; skipping duplicate start.")
             return
         self.logger.info("🚀 AgentManager run_loop started (Unblocked Mode).")
-        
+
         # schedule manager tasks so stop() can cancel them
         # 🔥 CRITICAL FIX: Create tick task FIRST and ensure it starts immediately
         # This unblocks the tick loop from waiting for other tasks to complete
-        self._manager_tasks["tick"] = _asyncio.create_task(self._tick_loop(), name="AgentManager:tick")
-        self.logger.info("🔥 [AgentManager] Tick loop scheduled - signal collection will begin immediately")
-        
-        self._manager_tasks["discovery"] = _asyncio.create_task(self.run_discovery_agents_loop(), name="AgentManager:discovery")
-        self._manager_tasks["run_all_agents"] = _asyncio.create_task(self.run_all_agents(), name="AgentManager:run_all_agents")
-        self._manager_tasks["health"] = _asyncio.create_task(self.report_health_loop(), name="AgentManager:health")
+        self._manager_tasks["tick"] = _asyncio.create_task(
+            self._tick_loop(), name="AgentManager:tick"
+        )
+        self.logger.info(
+            "🔥 [AgentManager] Tick loop scheduled - signal collection will begin immediately"
+        )
+
+        self._manager_tasks["discovery"] = _asyncio.create_task(
+            self.run_discovery_agents_loop(), name="AgentManager:discovery"
+        )
+        self._manager_tasks["run_all_agents"] = _asyncio.create_task(
+            self.run_all_agents(), name="AgentManager:run_all_agents"
+        )
+        self._manager_tasks["health"] = _asyncio.create_task(
+            self.report_health_loop(), name="AgentManager:health"
+        )
         if float(self._strategy_retrain_interval_s or 0.0) > 0:
             self._manager_tasks["strategy_retrain"] = _asyncio.create_task(
                 self.run_strategy_retrain_loop(),
@@ -1723,6 +1952,7 @@ class AgentManager:
             )
         # Diagnostic hooks: make unexpected task exits visible in logs.
         for task_name, task in self._manager_tasks.items():
+
             def _mk_cb(_name: str):
                 def _done_cb(t: _asyncio.Task):
                     try:
@@ -1746,14 +1976,18 @@ class AgentManager:
                             exc_info=True,
                         )
                     elif _name != "run_all_agents":
-                        self.logger.warning("AgentManager manager task exited unexpectedly: %s", _name)
+                        self.logger.warning(
+                            "AgentManager manager task exited unexpectedly: %s", _name
+                        )
+
                 return _done_cb
+
             task.add_done_callback(_mk_cb(task_name))
 
         ComponentStatusLogger.log_status(
             component="AgentManager",
             status="Healthy",
-            detail=f"AgentManager tasks scheduled: {list(self._manager_tasks.keys())}"
+            detail=f"AgentManager tasks scheduled: {list(self._manager_tasks.keys())}",
         )
 
         # await everything
@@ -1767,7 +2001,7 @@ class AgentManager:
         finally:
             await self.stop()
 
-    async def _get_accepted_symbols_list(self) -> List[str]:
+    async def _get_accepted_symbols_list(self) -> list[str]:
         """
         Snapshot accepted symbols using the full active definition (Accepted + Held).
         This ensures agents like DipSniper can see positions even if they aren't in the 'accepted' list.
@@ -1799,7 +2033,7 @@ class AgentManager:
         """
         return self.agents.get(name)
 
-    def get_agents(self) -> Dict[str, Any]:
+    def get_agents(self) -> dict[str, Any]:
         """
         Return a dictionary of all registered agents by name.
         This is required by AppContext and StrategyManager.
@@ -1861,7 +2095,9 @@ class AgentManager:
 
 # ===== AgentManager helpers =====
 
+
 def _iso_now() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
 
 # CLEANUP: _emit_health, _wait_phase_gates, _is_fresh_intent removed — dead code, never called.

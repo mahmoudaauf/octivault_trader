@@ -102,7 +102,7 @@ for b in balances:
     free = float(b['free'])
     locked = float(b['locked'])
     total = free + locked
-    
+
     if total > 0.00001:  # Only show non-dust
         print(f"{asset}: {total} (free: {free}, locked: {locked})")
 
@@ -202,7 +202,7 @@ tail -50 system_restart.log 2>/dev/null | grep -i "capital\|balance\|free" | tai
 2. **Then Command 7** (if you want real account state from Binance)
 3. **Share the output** and I'll tell you exact fix needed
 
-**Most Important Answer**: 
+**Most Important Answer**:
 - Does Binance actually have an ETH position right now?
 - OR was it already sold/deleted and only phantom in your local state?
 
@@ -214,7 +214,7 @@ tail -50 system_restart.log 2>/dev/null | grep -i "capital\|balance\|free" | tai
 - **Diagnosis**: State sync issue - local qty showing 0.0 but exchange has real qty
 - **Fix**: Force sync from exchange, resume trading
 
-### Scenario B: ETHUSDT deleted from Binance but persists locally  
+### Scenario B: ETHUSDT deleted from Binance but persists locally
 - **Diagnosis**: Stale position cache - position was already closed
 - **Fix**: Delete phantom from local state, resume trading
 
@@ -223,8 +223,7 @@ tail -50 system_restart.log 2>/dev/null | grep -i "capital\|balance\|free" | tai
 - **Fix**: Force liquidate as zero-value position
 
 ### Scenario D: ETHUSDT exists on Binance with qty = 0.0
-- **Diagnosis**: Exactly phantom problem - exchange created zero position somehow  
+- **Diagnosis**: Exactly phantom problem - exchange created zero position somehow
 - **Fix**: Delete from exchange, delete from local state
 
 All scenarios have straightforward fixes. We just need data first.
-

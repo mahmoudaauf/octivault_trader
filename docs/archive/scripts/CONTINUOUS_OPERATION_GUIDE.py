@@ -5,6 +5,7 @@
 How to keep your trading system running 24/7 to compound profits
 """
 
+
 def display_guide():
     guide = """
 
@@ -134,13 +135,13 @@ Starting Capital: $75.49 USDT
 
 Week 1 (5-10% gains from learning):
   Estimated: $75 → $80-82 USDT
-  
+
 Week 2 (10-15% gains as system improves):
   Estimated: $80 → $90-95 USDT
-  
+
 Week 3 (15-20% gains with compounding):
   Estimated: $90 → $105-110 USDT
-  
+
 Week 4 (20-25% gains with full compounding):
   Estimated: $105 → $130-140 USDT
 
@@ -169,7 +170,7 @@ SEE RECENT TRADES
   grep FILLED logs/persistent_trading.log | tail -20
 
 CHECK ACCOUNT BALANCE
-  tail -50 logs/persistent_trading.log | grep "USDT\|balance"
+  tail -50 logs/persistent_trading.log | grep "USDT\\|balance"
 
 GRACEFULLY STOP SYSTEM
   pkill -f "LIVE_ED25519"
@@ -191,7 +192,7 @@ RESTART SYSTEM
    • Don't shut down your computer
    • Keep internet connection stable
    • Avoid sleep mode (disable in settings)
-   
+
 2. MONITOR PERIODICALLY
    • Check logs daily
    • Verify account balance increasing
@@ -355,4 +356,4 @@ if __name__ == "__main__":
     try:
         display_guide()
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error: {e!s}")

@@ -55,27 +55,27 @@ print_running() {
 
 start_persistent_trading() {
     print_header
-    
+
     echo ""
     print_info "Starting persistent autonomous trading system..."
     echo ""
-    
+
     # Activate virtual environment and start process
     print_running "Activating virtual environment..."
     source "${VENV_PATH}/bin/activate"
-    
+
     print_running "Starting trading system in persistent background mode..."
-    
+
     # Start the process with nohup
     nohup python3 "$MAIN_SCRIPT" >> "$LOG_FILE" 2>&1 &
     local pid=$!
-    
+
     # Save PID
     echo $pid > "$PID_FILE"
-    
+
     # Wait a moment for process to start
     sleep 2
-    
+
     # Verify process is running
     if ps -p $pid > /dev/null 2>&1; then
         print_success "Trading system started successfully!"

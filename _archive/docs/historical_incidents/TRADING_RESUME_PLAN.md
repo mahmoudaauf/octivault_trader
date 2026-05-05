@@ -1,9 +1,9 @@
 # 🚀 TRADING RESUME PLAN
 
-**Issue:** No trades executing since ~21:25 UTC on May 3, 2026  
-**Root Cause:** Confidence threshold mismatch (signals at 0.65, validation at 0.75)  
-**Fix Applied:** Increased SwingTradeHunter base_confidence from 0.65 → 0.80  
-**Status:** ✅ FIXED & READY  
+**Issue:** No trades executing since ~21:25 UTC on May 3, 2026
+**Root Cause:** Confidence threshold mismatch (signals at 0.65, validation at 0.75)
+**Fix Applied:** Increased SwingTradeHunter base_confidence from 0.65 → 0.80
+**Status:** ✅ FIXED & READY
 
 ---
 
@@ -39,7 +39,7 @@ All with the same reason: **signal_invalid_at_firing** = confidence check failed
 
 ### What Was Changed
 
-**File:** `agents/swing_trade_hunter.py`  
+**File:** `agents/swing_trade_hunter.py`
 **Line:** 937
 
 ```python
@@ -63,10 +63,10 @@ base_confidence = 0.80  # Increased to meet is_intent_valid() minimum threshold
 
 ### Immediate (Next 1-2 Trading Cycles)
 
-✅ Signals will be generated at 0.80+ confidence  
-✅ MetaController will cache them  
-✅ Firing validation will PASS: 0.80 >= 0.75? YES  
-✅ Trades will EXECUTE  
+✅ Signals will be generated at 0.80+ confidence
+✅ MetaController will cache them
+✅ Firing validation will PASS: 0.80 >= 0.75? YES
+✅ Trades will EXECUTE
 ✅ Logs will show successful trades (not skipped)
 
 ### Verification Commands
@@ -96,13 +96,13 @@ tail -f logs/octivault_master_orchestrator.log | grep -E "TRADE_EXECUTED|TRADE_S
 
 **Why this is definitely the fix:**
 
-✅ **Matching log data:** All skipped trades have same reason  
-✅ **Root cause identified:** is_intent_valid() checking 0.65 < 0.75  
-✅ **Code review:** Signal generation hardcoded at 0.65  
-✅ **Validation logic:** Clearly requires minimum 0.75  
-✅ **Solution direct:** Increase signal output to 0.80  
-✅ **Syntax verified:** Code compiles without errors  
-✅ **No breaking changes:** Only changes confidence output  
+✅ **Matching log data:** All skipped trades have same reason
+✅ **Root cause identified:** is_intent_valid() checking 0.65 < 0.75
+✅ **Code review:** Signal generation hardcoded at 0.65
+✅ **Validation logic:** Clearly requires minimum 0.75
+✅ **Solution direct:** Increase signal output to 0.80
+✅ **Syntax verified:** Code compiles without errors
+✅ **No breaking changes:** Only changes confidence output
 
 Only 1% because we're waiting for actual trade execution to confirm.
 
@@ -110,11 +110,11 @@ Only 1% because we're waiting for actual trade execution to confirm.
 
 ## Side Effects: NONE
 
-✅ No changes to order execution logic  
-✅ No changes to position management  
-✅ No changes to risk controls  
-✅ No changes to agent behavior  
-✅ Only: Increased confidence from 0.65 → 0.80  
+✅ No changes to order execution logic
+✅ No changes to position management
+✅ No changes to risk controls
+✅ No changes to agent behavior
+✅ Only: Increased confidence from 0.65 → 0.80
 
 This is a **pure threshold alignment fix** with zero side effects.
 
@@ -178,4 +178,3 @@ The fix aligns the two systems:
 - **Result:** Perfect alignment = trades proceed
 
 **System is now ready to resume normal trading operations.**
-

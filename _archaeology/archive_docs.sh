@@ -24,7 +24,7 @@ skipped=0
 
 for file in $all_md; do
   filename=$(basename "$file")
-  
+
   # Check if should keep
   should_keep=0
   for keep in "${keep_files[@]}"; do
@@ -33,7 +33,7 @@ for file in $all_md; do
       break
     fi
   done
-  
+
   if [[ $should_keep -eq 1 ]]; then
     echo "  ⊘ keep: $filename"
     skipped=$((skipped+1))

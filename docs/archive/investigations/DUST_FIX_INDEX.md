@@ -68,7 +68,7 @@ STUCK IN INFINITE LOOP ❌
 **Three-layer dust prevention**:
 
 1. ✅ **Quantity Check** - Is remainder too tiny to trade?
-2. ✅ **Value Check** (NEW) - Is remainder worth < $5 USD?  
+2. ✅ **Value Check** (NEW) - Is remainder worth < $5 USD?
 3. ✅ **Percentage Check** (NEW) - Are we selling 95%+ anyway?
 
 If ANY check triggers → **Sell 100% of position** for clean exit
@@ -196,7 +196,7 @@ After restart, you should see:
 
 ### ✅ In the Logs
 ```
-[EM:SellRoundUp] BTCUSDT: qty ROUND_UP 0.001→0.001234 
+[EM:SellRoundUp] BTCUSDT: qty ROUND_UP 0.001→0.001234
                  notional_dust=True → selling 100%
 ```
 
@@ -275,4 +275,3 @@ This will validate the fix is working end-to-end.
 
 **🚀 Ready?**
 → Start with [DUST_FIX_QUICKSTART.md](./DUST_FIX_QUICKSTART.md)
-

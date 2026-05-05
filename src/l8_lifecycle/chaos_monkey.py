@@ -20,14 +20,13 @@ Principles:
 """
 
 import asyncio
-import json
 import logging
 import random
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
+from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -36,32 +35,33 @@ logger = logging.getLogger(__name__)
 # FAILURE TYPES
 # ============================================================================
 
+
 class FailureType(Enum):
     """Types of failures we can inject."""
-    
+
     # API failures
     API_TIMEOUT = "api_timeout"  # 10s timeout
     API_500_ERROR = "api_500_error"  # Internal server error
     API_502_ERROR = "api_502_error"  # Bad gateway
     API_503_ERROR = "api_503_error"  # Service unavailable
     API_429_ERROR = "api_429_error"  # Rate limit
-    
+
     # Network failures
     NETWORK_PARTITION = "network_partition"  # Lose connectivity (30s)
     NETWORK_SLOW = "network_slow"  # Latency 10s
     NETWORK_JITTER = "network_jitter"  # Variable latency
     NETWORK_PACKET_LOSS = "network_packet_loss"  # 10% drop
-    
+
     # Data failures
     CORRUPTED_RESPONSE = "corrupted_response"  # Invalid JSON
     MISSING_FIELDS = "missing_fields"  # Incomplete response
     WRONG_DATA_TYPE = "wrong_data_type"  # Type mismatch
-    
+
     # Database failures
     DB_CONNECTION_FAILED = "db_connection_failed"  # Cannot connect
     DB_TIMEOUT = "db_timeout"  # Query too slow
     DB_DEADLOCK = "db_deadlock"  # Deadlock detected
-    
+
     # System failures
     CLOCK_SKEW = "clock_skew"  # System clock jumps
     OUT_OF_MEMORY = "out_of_memory"  # Low memory
@@ -71,7 +71,7 @@ class FailureType(Enum):
 @dataclass
 class ChaosEvent:
     """Record of an injected failure."""
-    
+
     failure_type: FailureType
     timestamp: float
     component: str  # Which component was affected
@@ -85,10 +85,11 @@ class ChaosEvent:
 # CHAOS MONKEY
 # ============================================================================
 
+
 class ChaosMonkey:
     """
     Controlled failure injection framework.
-    
+
     Usage:
     ```python
     chaos = ChaosMonkey(
@@ -96,7 +97,7 @@ class ChaosMonkey:
         injection_rate=0.01,  # 1% of requests
         seed=42  # Reproducible
     )
-    
+
     # Inject before API call
     failure = await chaos.maybe_inject_failure("exchange_api")
     if failure:
@@ -104,7 +105,7 @@ class ChaosMonkey:
         pass
     ```
     """
-    
+
     def __init__(
         self,
         enabled: bool = False,
@@ -113,7 +114,7 @@ class ChaosMonkey:
     ):
         """
         Initialize ChaosMonkey.
-        
+
         Args:
             enabled: Enable/disable chaos injection (default: False)
             injection_rate: Fraction of requests to fail (0.0-1.0)
@@ -121,16 +122,14 @@ class ChaosMonkey:
         """
         self.enabled = enabled
         self.injection_rate = injection_rate
-        
+
         if seed is not None:
             random.seed(seed)
-        
-        self.injected_failures: List[ChaosEvent] = []
+
+        self.injected_failures: list[ChaosEvent] = []
         self._request_count = 0
-        self._failure_counts: Dict[FailureType, int] = {
-            ft: 0 for ft in FailureType
-        }
-    
+        self._failure_counts: dict[FailureType, int] = {ft: 0 for ft in FailureType}
+
     async def maybe_inject_failure(
         self,
         component: str,
@@ -138,26 +137,26 @@ class ChaosMonkey:
     ) -> Optional[ChaosEvent]:
         """
         Randomly inject failure with configured rate.
-        
+
         Args:
             component: Component being tested ("exchange_api", "database", etc)
             request_id: Optional request ID for tracking
-        
+
         Returns:
             ChaosEvent if failure injected, None otherwise
         Raises:
             Exception if failure is injected (raises appropriate error)
         """
-        
+
         self._request_count += 1
-        
+
         # Check if we should inject
         if not self.enabled or random.random() > self.injection_rate:
             return None
-        
+
         # Pick random failure type
         failure_type = random.choice(list(FailureType))
-        
+
         # Create chaos event
         chaos_event = ChaosEvent(
             failure_type=failure_type,
@@ -165,10 +164,10 @@ class ChaosMonkey:
             component=component,
             request_id=request_id,
         )
-        
+
         # Inject failure
         logger.warning(f"🔴 CHAOS: Injecting {failure_type.value} in {component}")
-        
+
         try:
             await self._inject_failure(failure_type, component)
         except Exception as e:
@@ -176,88 +175,88 @@ class ChaosMonkey:
             self.injected_failures.append(chaos_event)
             self._failure_counts[failure_type] += 1
             raise
-        
+
         return chaos_event
-    
+
     async def _inject_failure(self, failure_type: FailureType, component: str):
         """Inject the actual failure."""
-        
+
         if failure_type == FailureType.API_TIMEOUT:
             # Sleep 10+ seconds (usually times out)
             await asyncio.sleep(random.uniform(10, 15))
             raise TimeoutError("API timeout (chaos injected)")
-        
+
         elif failure_type == FailureType.API_500_ERROR:
             raise ApiError("500 Internal Server Error (chaos injected)")
-        
+
         elif failure_type == FailureType.API_502_ERROR:
             raise ApiError("502 Bad Gateway (chaos injected)")
-        
+
         elif failure_type == FailureType.API_503_ERROR:
             raise ApiError("503 Service Unavailable (chaos injected)")
-        
+
         elif failure_type == FailureType.API_429_ERROR:
             raise ApiError("429 Too Many Requests (chaos injected)")
-        
+
         elif failure_type == FailureType.NETWORK_PARTITION:
             # Simulate 30-second partition
             await asyncio.sleep(random.uniform(30, 60))
             raise ConnectionError("Network partition (chaos injected)")
-        
+
         elif failure_type == FailureType.NETWORK_SLOW:
             # Add 10s latency
             await asyncio.sleep(random.uniform(5, 15))
             # Continue normally
-        
+
         elif failure_type == FailureType.NETWORK_JITTER:
             # Variable latency
             for _ in range(random.randint(3, 10)):
                 await asyncio.sleep(random.uniform(0.1, 0.5))
-        
+
         elif failure_type == FailureType.NETWORK_PACKET_LOSS:
             # Randomly fail this request (10%)
             if random.random() < 0.1:
                 raise ConnectionError("Packet loss (chaos injected)")
-        
+
         elif failure_type == FailureType.CORRUPTED_RESPONSE:
             raise ValueError("Corrupted response: invalid JSON (chaos injected)")
-        
+
         elif failure_type == FailureType.MISSING_FIELDS:
             raise ValueError("Missing required fields in response (chaos injected)")
-        
+
         elif failure_type == FailureType.WRONG_DATA_TYPE:
             raise TypeError("Wrong data type in response (chaos injected)")
-        
+
         elif failure_type == FailureType.DB_CONNECTION_FAILED:
             raise ConnectionError("Database connection failed (chaos injected)")
-        
+
         elif failure_type == FailureType.DB_TIMEOUT:
             await asyncio.sleep(random.uniform(5, 10))
             raise TimeoutError("Database query timeout (chaos injected)")
-        
+
         elif failure_type == FailureType.DB_DEADLOCK:
             raise RuntimeError("Deadlock detected (chaos injected)")
-        
+
         elif failure_type == FailureType.CLOCK_SKEW:
             # In real scenario, would jump system clock
             # Here we just sleep and report it
             logger.error("System clock skew detected (chaos injected)")
-        
+
         elif failure_type == FailureType.OUT_OF_MEMORY:
             raise MemoryError("Out of memory (chaos injected)")
-        
+
         elif failure_type == FailureType.DISK_FULL:
             raise OSError("Disk space full (chaos injected)")
-    
+
     # ========================================================================
     # STATISTICS & MONITORING
     # ========================================================================
-    
-    def get_statistics(self) -> Dict[str, Any]:
+
+    def get_statistics(self) -> dict[str, Any]:
         """Get chaos injection statistics."""
         total_failures = len(self.injected_failures)
         successful_recoveries = sum(1 for f in self.injected_failures if f.success)
-        
+
         return {
             "enabled": self.enabled,
             "injection_rate": self.injection_rate,
@@ -267,16 +266,16 @@ class ChaosMonkey:
             "failures_by_type": dict(self._failure_counts),
             "average_recovery_time": self._compute_avg_recovery_time(),
         }
-    
+
     def _compute_avg_recovery_time(self) -> float:
         """Average time to recover from failure."""
         times = [f.recovery_time for f in self.injected_failures if f.recovery_time]
         return sum(times) / len(times) if times else 0.0
-    
-    def get_failure_log(self) -> List[ChaosEvent]:
+
+    def get_failure_log(self) -> list[ChaosEvent]:
         """Get log of all injected failures."""
         return self.injected_failures.copy()
-    
+
     def reset(self):
         """Reset chaos monkey (clear history)."""
         self.injected_failures.clear()
@@ -288,10 +287,11 @@ class ChaosMonkey:
 # RESILIENCE VERIFIER
 # ============================================================================
 
+
 class ResilienceVerifier:
     """
     Verify that system is resilient to failures.
-    
+
     Runs chaos tests and verifies:
     - System doesn't crash
     - No data loss
@@ -299,50 +299,50 @@ class ResilienceVerifier:
     - No duplicate trades
     - Automatic recovery < 30 seconds
     """
-    
+
     def __init__(self, chaos_monkey: ChaosMonkey):
         """Initialize with ChaosMonkey instance."""
         self.chaos = chaos_monkey
-        self._test_results: List[Dict[str, Any]] = []
-    
+        self._test_results: list[dict[str, Any]] = []
+
     async def test_api_resilience(
         self,
         api_func: Callable,
         iterations: int = 100,
-        failure_types: Optional[List[FailureType]] = None,
-    ) -> Dict[str, Any]:
+        failure_types: Optional[list[FailureType]] = None,
+    ) -> dict[str, Any]:
         """
         Test resilience to API failures.
-        
+
         Runs function with random API failures injected.
         """
         logger.info(f"Testing API resilience ({iterations} iterations)...")
-        
+
         if failure_types is None:
             failure_types = [
                 FailureType.API_TIMEOUT,
                 FailureType.API_500_ERROR,
                 FailureType.API_503_ERROR,
             ]
-        
+
         success_count = 0
         failure_count = 0
-        error_types: Dict[str, int] = {}
-        
+        error_types: dict[str, int] = {}
+
         for i in range(iterations):
             try:
                 # Enable chaos for this iteration
-                self.chaos.enabled = (i % 10 == 0)  # 10% failure rate
-                
+                self.chaos.enabled = i % 10 == 0  # 10% failure rate
+
                 # Call function
                 result = await api_func()
                 success_count += 1
-            
+
             except Exception as e:
                 failure_count += 1
                 error_type = type(e).__name__
                 error_types[error_type] = error_types.get(error_type, 0) + 1
-        
+
         result = {
             "test_name": "api_resilience",
             "iterations": iterations,
@@ -351,18 +351,18 @@ class ResilienceVerifier:
             "success_rate": success_count / iterations,
             "error_types": error_types,
         }
-        
+
         self._test_results.append(result)
         return result
-    
+
     async def test_state_consistency(
         self,
         get_state: Callable,
         iterations: int = 100,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Test that state remains consistent during chaos.
-        
+
         Verifies:
         - Capital is conserved
         - Position count is reasonable
@@ -370,23 +370,23 @@ class ResilienceVerifier:
         - No duplicates
         """
         logger.info(f"Testing state consistency ({iterations} iterations)...")
-        
+
         consistency_failures = []
-        
+
         for i in range(iterations):
             try:
                 # Enable chaos
-                self.chaos.enabled = (i % 20 == 0)  # 5% failure rate
-                
+                self.chaos.enabled = i % 20 == 0  # 5% failure rate
+
                 # Get state
                 state = await get_state()
-                
+
                 # Verify consistency
                 self._verify_state(state)
-            
+
             except Exception as e:
                 consistency_failures.append(str(e))
-        
+
         result = {
             "test_name": "state_consistency",
             "iterations": iterations,
@@ -394,29 +394,29 @@ class ResilienceVerifier:
             "consistency_rate": (iterations - len(consistency_failures)) / iterations,
             "failures": consistency_failures[:10],  # First 10
         }
-        
+
         self._test_results.append(result)
         return result
-    
-    def _verify_state(self, state: Dict[str, Any]):
+
+    def _verify_state(self, state: dict[str, Any]):
         """Verify state validity."""
         capital = state.get("total_capital", 0)
         positions = state.get("open_positions", {})
         pnl = state.get("total_pnl", 0)
-        
+
         assert capital >= 0, f"Negative capital: {capital}"
         assert len(positions) <= 100, f"Too many positions: {len(positions)}"
         assert abs(pnl) < capital * 2, f"Unrealistic P&L: {pnl}"
-    
-    def get_test_results(self) -> List[Dict[str, Any]]:
+
+    def get_test_results(self) -> list[dict[str, Any]]:
         """Get all test results."""
         return self._test_results.copy()
-    
-    def get_summary(self) -> Dict[str, Any]:
+
+    def get_summary(self) -> dict[str, Any]:
         """Get summary of all resilience tests."""
         if not self._test_results:
             return {"message": "No tests run yet"}
-        
+
         return {
             "total_tests": len(self._test_results),
             "test_results": self._test_results,
@@ -428,112 +428,117 @@ class ResilienceVerifier:
 # LOAD TESTER
 # ============================================================================
 
+
 class LoadTester:
     """
     Test system under load.
-    
+
     Verifies:
     - Can handle 10x normal load
     - Can handle 100x normal load
     - Performance degrades gracefully
     - Recovery is automatic
     """
-    
+
     def __init__(self):
         """Initialize load tester."""
-        self._test_results: List[Dict[str, Any]] = []
-    
+        self._test_results: list[dict[str, Any]] = []
+
     async def test_scaling(
         self,
         workload_func: Callable,
         base_load: int = 10,  # 10 symbols, 10 signals/hour
-        scale_factors: List[int] = [1, 5, 10, 50, 100],
-    ) -> Dict[str, Any]:
+        scale_factors: list[int] = [1, 5, 10, 50, 100],
+    ) -> dict[str, Any]:
         """
         Test system scaling characteristics.
-        
+
         Runs workload at increasing scale factors.
         """
         logger.info(f"Testing scaling (base={base_load}, factors={scale_factors})...")
-        
+
         results = []
-        
+
         for scale in scale_factors:
             load = base_load * scale
             start_time = time.time()
-            
+
             try:
                 await workload_func(load)
                 elapsed = time.time() - start_time
-                
-                results.append({
-                    "scale_factor": scale,
-                    "load": load,
-                    "elapsed_seconds": elapsed,
-                    "throughput": load / elapsed,
-                    "status": "success",
-                })
-            
+
+                results.append(
+                    {
+                        "scale_factor": scale,
+                        "load": load,
+                        "elapsed_seconds": elapsed,
+                        "throughput": load / elapsed,
+                        "status": "success",
+                    }
+                )
+
             except Exception as e:
                 elapsed = time.time() - start_time
-                
-                results.append({
-                    "scale_factor": scale,
-                    "load": load,
-                    "elapsed_seconds": elapsed,
-                    "status": "failed",
-                    "error": str(e),
-                })
-                
+
+                results.append(
+                    {
+                        "scale_factor": scale,
+                        "load": load,
+                        "elapsed_seconds": elapsed,
+                        "status": "failed",
+                        "error": str(e),
+                    }
+                )
+
                 # Stop at first failure
                 break
-        
+
         result = {
             "test_name": "scaling",
             "base_load": base_load,
             "scale_results": results,
             "max_sustainable_load": results[-1]["load"] if results else 0,
         }
-        
+
         self._test_results.append(result)
         return result
-    
+
     async def test_saturation(
         self,
         workload_func: Callable,
         max_load: int = 1000,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Find saturation point (where system breaks).
-        
+
         Binary search for maximum sustainable load.
         """
         logger.info(f"Finding saturation point (max={max_load})...")
-        
+
         low, high = 1, max_load
         saturation_load = 0
-        
+
         while low <= high:
             mid = (low + high) // 2
-            
+
             try:
                 start = time.time()
                 await workload_func(mid)
                 elapsed = time.time() - start
-                
+
                 saturation_load = mid
                 low = mid + 1  # Try higher
-            
-            except Exception as e:
+
+            except Exception:
                 # Failed at this load
                 high = mid - 1  # Try lower
-        
+
         result = {
             "test_name": "saturation",
             "saturation_load": saturation_load,
             "max_load_tested": max_load,
         }
-        
+
         self._test_results.append(result)
         return result
 
@@ -542,8 +547,10 @@ class LoadTester:
 # EXCEPTIONS
 # ============================================================================
 
+
 class ApiError(Exception):
     """Simulated API error."""
+
     pass
 
 

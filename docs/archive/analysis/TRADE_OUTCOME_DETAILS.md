@@ -18,11 +18,11 @@
 13:05:25 - BUY ETHUSDT for ~$27 (using capital)
           Entry: TrendHunter signal (conf=0.80)
           Expected move: +2.06%
-          
+
 13:05:47 - SELL ETHUSDT immediately
           Realized: -$0.06 loss
           Exit reason: SwingTradeHunter SELL signal (conf=0.65)
-          
+
 Duration: 22 seconds
 ```
 
@@ -37,14 +37,14 @@ Duration: 22 seconds
 2026-04-25 13:03:40 - TrendHunter BUY signal confidence=0.80
                       Expected move: +2.06%
                       TP target: 1.80%, ATR: 1.50%
-                      
+
 2026-04-25 13:05:25 - BUY order executed
                       Capital: $27.15
-                      
+
 2026-04-25 13:05:47 - SELL triggered by SwingTradeHunter
                       SwingTradeHunter signal confidence=0.65
                       Reason: "EMA downtrend + RSI unfavorable"
-                      
+
 Realized P&L: -$0.06
 ```
 
@@ -56,10 +56,10 @@ Realized P&L: -$0.06
 ```
 13:09:29 - BUY AXSUSDT for ~$27.55
           Entry: TrendHunter signal (conf likely high)
-          
+
 13:09:51 - SELL AXSUSDT
           Realized: +$0.11 gain
-          
+
 Duration: 22 seconds
 ```
 
@@ -157,7 +157,7 @@ The $2.27 gain came from market appreciation on locked positions
 
 ## Why This Matters for Your System
 
-**Critical Truth**: 
+**Critical Truth**:
 - Your system is making money from **market movement** (97.8%), not **signal timing** (2.2%)
 - The first trade LOSS proves signals aren't perfect
 - But with 50+ trades per session, losers are absorbed by winners

@@ -3,13 +3,13 @@
 ## Summary: TWO SEPARATE ISSUES IDENTIFIED & FIXED
 
 ### Issue #1: Liquidation Not Wired (FIXED ✅)
-**Problem:** MetaController checking for `self.liquidation_agent` but orchestrator wiring `_liquidation_orchestrator`  
-**Fix Applied:** Added code to check BOTH in _execute_decision (line 19595+)  
+**Problem:** MetaController checking for `self.liquidation_agent` but orchestrator wiring `_liquidation_orchestrator`
+**Fix Applied:** Added code to check BOTH in _execute_decision (line 19595+)
 **Status:** ✅ Code in place but unreached due to Issue #2
 
 ### Issue #2: Rejection Threshold Pre-Blocks Signals (FIXED ✅)
-**Problem:** Signals rejected 10 times → hit RejectionThreshold → SKIPPED before reaching _execute_decision()  
-**Fix Applied:** Added escalation trigger at threshold check (line 15335+) to call liquidation before skipping  
+**Problem:** Signals rejected 10 times → hit RejectionThreshold → SKIPPED before reaching _execute_decision()
+**Fix Applied:** Added escalation trigger at threshold check (line 15335+) to call liquidation before skipping
 **Status:** ✅ Code in place, not yet triggered
 
 ---

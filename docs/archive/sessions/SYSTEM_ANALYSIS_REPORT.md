@@ -1,5 +1,5 @@
 # OctiVault Trader — Complete System Analysis (All 226 Scripts)
-**Date:** 2026-04-26  
+**Date:** 2026-04-26
 **Scope:** Every .py file read, all logs analyzed, full gap report and fix plan
 
 ---
@@ -178,7 +178,7 @@ System boots cleanly every time. All 17 tasks start. No import errors. No crashe
 [EC:ListenKey] Got 410 Gone — listenKey unavailable
 → Falls back to Tier 3 polling (25s interval)
 ```
-Balance/order updates are 25 seconds stale at all times.  
+Balance/order updates are 25 seconds stale at all times.
 **Root cause:** `.env` has `BINANCE_API_TYPE=HMAC`. The Ed25519 key is present in `.env` as `BINANCE_API_SECRET_ED25519` but is unused.
 
 ### Signal Pipeline — Complete Blockage (Current)
@@ -300,7 +300,7 @@ MetaController imports `get_required_conf_override` from `automation.rule_overri
 References `🚀_LIVE_ED25519_TRADING.py` which does not exist. Crashes immediately if launched.
 
 ### GAP #15 — P3: Async consensus check bug in MetaController
-`Failed to check consensus for MATICUSDT: object bool can't be used in 'await' expression`  
+`Failed to check consensus for MATICUSDT: object bool can't be used in 'await' expression`
 A method returning `bool` is being awaited. Minor noise, not a blocker.
 
 ### GAP #16 — P3: SignalFusion output unclear

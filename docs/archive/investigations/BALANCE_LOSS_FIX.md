@@ -9,7 +9,7 @@
 Your signals were trading with **insufficient profit edge** to overcome trading costs:
 
 ### Fee Structure Analysis
-| Cost Component | Amount | 
+| Cost Component | Amount |
 |---|---|
 | Binance taker fee | 0.10% (10 bps) |
 | Price slippage | 0.15% (15 bps) |
@@ -21,7 +21,7 @@ Your signals were trading with **insufficient profit edge** to overcome trading 
   - This allows trades with only 1 bps expected edge
   - After 30 bps of costs, you lose 29 bps per trade
   - Over many trades → balance decay
-  
+
 - **Old fallback edge**: `fallback_edge_bps = 50 bps` ❌
   - Only 20 bps profit after 30 bps costs
   - Multiplier of only 1.6x fees
@@ -114,7 +114,7 @@ If you want to be **more aggressive** (lower fees, higher confidence signals):
 
 If you want to be **more conservative** (reduce all risk):
 ```python
-"min_positive_edge_bps": 50.0      # Higher threshold 
+"min_positive_edge_bps": 50.0      # Higher threshold
 "fallback_edge_bps": 100.0         # Higher fallback
 "fee_expectancy_multiplier": 3.0   # 3x multiplier
 ```

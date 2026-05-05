@@ -5,7 +5,7 @@ import os
 
 DEFAULT_SYMBOLS = {
     "BTCUSDT": {
-        "symbol": "BTCUSDT", 
+        "symbol": "BTCUSDT",
         "base": "BTC",
         "quote": "USDT",
         "active": True,
@@ -14,7 +14,7 @@ DEFAULT_SYMBOLS = {
     },
     "ETHUSDT": {
         "symbol": "ETHUSDT",
-        "base": "ETH", 
+        "base": "ETH",
         "quote": "USDT",
         "active": True,
         "precision": {"amount": 8, "price": 2},
@@ -23,7 +23,7 @@ DEFAULT_SYMBOLS = {
     "BNBUSDT": {
         "symbol": "BNBUSDT",
         "base": "BNB",
-        "quote": "USDT", 
+        "quote": "USDT",
         "active": True,
         "precision": {"amount": 8, "price": 2},
         "limits": {"amount": {"min": 0.01}, "cost": {"min": 10}},
@@ -85,6 +85,7 @@ DEFAULT_SYMBOLS = {
         "limits": {"amount": {"min": 0.01}, "cost": {"min": 10}},
     },
 }
+
 
 def _build_seed_symbols(shared_state, logger):
     """
@@ -154,46 +155,54 @@ async def bootstrap_default_symbols(shared_state, logger):
         logger.warning("[Bootstrap] STARTING AGGRESSIVE BOOTSTRAP...")
         logger.warning("[Bootstrap] Checking current state:")
         logger.warning("[Bootstrap]   - shared_state type: %s", type(shared_state).__name__)
-        logger.warning("[Bootstrap]   - has accepted_symbols attr: %s", hasattr(shared_state, 'accepted_symbols'))
-        
+        logger.warning(
+            "[Bootstrap]   - has accepted_symbols attr: %s",
+            hasattr(shared_state, "accepted_symbols"),
+        )
+
         current = shared_state.accepted_symbols or {}
         logger.warning("[Bootstrap]   - current accepted_symbols count: %d", len(current))
         logger.warning("[Bootstrap]   - current keys: %s", list(current.keys()))
-        
+
         if len(current) == 0:
             seed_symbols = _build_seed_symbols(shared_state, logger)
             logger.warning(
                 "[Bootstrap] ⚠️  accepted_symbols is EMPTY! Seeding with %d symbols...",
                 len(seed_symbols),
             )
-            
+
             # FORCE: Directly set symbols on shared_state
             logger.warning("[Bootstrap] FORCE-SETTING symbols directly...")
             for sym, meta in seed_symbols.items():
                 shared_state.accepted_symbols[sym] = meta
                 logger.warning("[Bootstrap]   ✓ Direct set: %s", sym)
-            
-            logger.warning("[Bootstrap] Direct verification after force-set: %d symbols", len(shared_state.accepted_symbols))
-            
+
+            logger.warning(
+                "[Bootstrap] Direct verification after force-set: %d symbols",
+                len(shared_state.accepted_symbols),
+            )
+
             # ALSO call set_accepted_symbols for consistency
             logger.warning("[Bootstrap] Calling set_accepted_symbols (merge_mode=True)...")
             await shared_state.set_accepted_symbols(
-                seed_symbols,
-                source="bootstrap_default_symbols",
-                merge_mode=True
+                seed_symbols, source="bootstrap_default_symbols", merge_mode=True
             )
             logger.info(
                 "[Bootstrap] ✅ Seeded %d symbols (merge_mode=True)",
                 len(seed_symbols),
             )
-            
+
             # Verify again
             final_count = len(shared_state.accepted_symbols)
-            logger.warning("[Bootstrap] FINAL verification: %d symbols in accepted_symbols", final_count)
+            logger.warning(
+                "[Bootstrap] FINAL verification: %d symbols in accepted_symbols", final_count
+            )
             if final_count == 0:
-                logger.error("[Bootstrap] ❌ BOOTSTRAP FAILED! Symbols still empty after force-set!")
+                logger.error(
+                    "[Bootstrap] ❌ BOOTSTRAP FAILED! Symbols still empty after force-set!"
+                )
                 return False
-            
+
             # Mark symbol universe as ready
             try:
                 if hasattr(shared_state, "accepted_symbols_ready_event"):
@@ -201,18 +210,18 @@ async def bootstrap_default_symbols(shared_state, logger):
                     logger.info("[Bootstrap] ✅ Marked accepted_symbols_ready_event")
             except Exception as e:
                 logger.warning("[Bootstrap] Failed to set ready event: %s", e)
-            
+
             return True
         else:
             logger.info("[Bootstrap] accepted_symbols already has %d symbols", len(current))
-            
+
             # Ensure ready event is set
             try:
                 if hasattr(shared_state, "accepted_symbols_ready_event"):
                     shared_state.accepted_symbols_ready_event.set()
             except Exception:
                 pass
-            
+
             return True
     except Exception as e:
         logger.error("[Bootstrap] Failed to seed symbols: %s", e, exc_info=True)

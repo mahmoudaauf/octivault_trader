@@ -268,7 +268,7 @@ Cash → Trade Entry → Position Growth → Take Profit
          │                    │
     Close at Profit      Close at Loss
     (Reinvestable)       (Risk Control)
-    
+
     └──────────────────────┬──────────┘
                            │
                     ┌──────↓────────┐

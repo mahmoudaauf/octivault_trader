@@ -1,7 +1,7 @@
 # 🔍 SIGNAL GENERATION BOTTLENECK AUDIT
 
-**Date**: April 25, 2026  
-**Status**: AUDIT COMPLETE - CRITICAL ISSUES IDENTIFIED  
+**Date**: April 25, 2026
+**Status**: AUDIT COMPLETE - CRITICAL ISSUES IDENTIFIED
 **Impact**: Explains 95% of blocked trades (1 trade per 10 min instead of potential 100+/min)
 
 ---
@@ -215,29 +215,29 @@ TIME          EVENT                              PHASE          TRADES
 13:03:40      System starts                      BOOTSTRAP      -
 13:03:50      ETHUSDT signal (conf=0.52)        BOOTSTRAP      1
               ✅ ALLOWED (bootstrap phase relaxed)
-              
+
 13:04:10      AXSUSDT signal (conf=0.51)        BOOTSTRAP      2
               ✅ ALLOWED (bootstrap phase still active)
-              
+
 13:04:15      Phase transitions to INIT          INIT           -
               System now requires 50% success rate
               Previous 2 trades haven't closed yet
-              
+
 13:04:20      BTCUSDT signal (conf=0.48)        INIT           -
               ❌ BLOCKED: confidence < 0.55
-              
+
 13:04:30      ETHUSDT signal (conf=0.49)        INIT           -
               ❌ BLOCKED: confidence < 0.55
-              
+
 13:05:15      Multiple signals generated         INIT           -
               ❌ ALL BLOCKED: Insufficient success rate
               Gate remains locked
-              
+
 13:18:15      After 15 minutes                   STEADY_STATE   -
               System transitions to STEADY_STATE
               BUT success rate was low (2 trades, 1 with loss)
               Gate remains locked due to poor performance
-              
+
 13:23:43      Session crashes                    STEADY_STATE   -
               Crash before next trade opportunity
 ```
@@ -253,9 +253,9 @@ TIME          EVENT                              PHASE          TRADES
 
 ### 🔴 CRITICAL (Fix First)
 
-**Problem**: Confidence thresholds too high  
-**Solution**: Reduce from 55% → 40%  
-**Effort**: 2 minutes (edit 3 config values)  
+**Problem**: Confidence thresholds too high
+**Solution**: Reduce from 55% → 40%
+**Effort**: 2 minutes (edit 3 config values)
 **Impact**: Immediate 40-100% increase in signals
 
 ```python
@@ -267,9 +267,9 @@ DIP_THRESHOLD_PERCENT = 0.30        # Down from 0.80
 
 ### 🟠 HIGH (Fix Second)
 
-**Problem**: Gating system blocks for 15 minutes  
-**Solution**: Disable or reduce duration  
-**Effort**: 1 minute (edit 2 config values)  
+**Problem**: Gating system blocks for 15 minutes
+**Solution**: Disable or reduce duration
+**Effort**: 1 minute (edit 2 config values)
 **Impact**: Immediate unlock of trading after 3 minutes instead of 15
 
 ```python
@@ -281,8 +281,8 @@ GATING_SUCCESS_THRESHOLD = 0.20         # Down from 0.50
 
 ### 🟡 MEDIUM (Monitor Only)
 
-**Problem**: Capital floor blocks micro-positions  
-**Solution**: Monitor, not urgent to fix  
+**Problem**: Capital floor blocks micro-positions
+**Solution**: Monitor, not urgent to fix
 **Reason**: As system compounds, this naturally resolves
 
 ---

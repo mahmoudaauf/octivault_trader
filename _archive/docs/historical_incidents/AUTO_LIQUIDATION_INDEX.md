@@ -189,15 +189,15 @@ Your account ($100 total, $15 free) falls into a gap:
 1. **Start:** MASTER_SUMMARY_AUTO_LIQUIDATION.md (2 min)
    - Get the quick answer
    - Understand you're not stuck with a bug
-   
+
 2. **Understand:** AUTO_LIQUIDATION_SUMMARY.md (10 min)
    - See the decision tree
    - Learn why gates fail
-   
+
 3. **Fix:** SOLUTION_AUTO_LIQUIDATION.md (5 min)
    - Pick your solution
    - Apply the fix
-   
+
 4. **Reference:** CODE_LOCATIONS_AUTO_LIQUIDATION.md (as needed)
    - Find exact line numbers
    - Make code changes if desired

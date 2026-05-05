@@ -2,31 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import inspect
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
-import inspect
+from typing import Any, Optional
 
 # keep these if the rest of your code imports from here; otherwise you can remove
 try:
-    from utils.symbol_filter_pipeline import SymbolFilterPipeline_symbols  # noqa: F401
+    from utils.symbol_filter_pipeline import SymbolFilterPipeline_symbols
 except Exception:
     SymbolFilterPipeline_symbols = None  # runtime noop if unused
 try:
-    from src.l0_core.config import Config  # noqa: F401
+    from src.l0_core.config import Config
 except Exception:
     Config = object  # type: ignore[misc,assignment]
 
 
 # ---------- small helpers ----------
 
+
 def _pair_pattern(base: str) -> re.Pattern:
     base = (base or "USDT").upper()
     return re.compile(rf"^[A-Z0-9]+{re.escape(base)}$")
 
 
-def _extract_quote_volume(kwargs: Dict[str, Any]) -> Optional[float]:
+def _extract_quote_volume(kwargs: dict[str, Any]) -> Optional[float]:
     if not kwargs:
         return None
     for k in ("quote_volume_usd", "quote_volume", "24h_volume", "volume"):
@@ -40,7 +41,7 @@ def _extract_quote_volume(kwargs: Dict[str, Any]) -> Optional[float]:
     return None
 
 
-def _meta_from_kwargs(symbol: str, source: str, **kwargs) -> Dict[str, Any]:
+def _meta_from_kwargs(symbol: str, source: str, **kwargs) -> dict[str, Any]:
     now = dt.datetime.now(dt.timezone.utc)
     entry = {
         "symbol": symbol.upper(),
@@ -56,12 +57,13 @@ def _meta_from_kwargs(symbol: str, source: str, **kwargs) -> Dict[str, Any]:
     return entry
 
 
-def _clean_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+def _clean_meta(meta: dict[str, Any]) -> dict[str, Any]:
     # Avoid double-passing fields that are already explicit params
     return {k: v for k, v in (meta or {}).items() if k not in ("source", "symbol")}
 
 
 # ---------- main manager ----------
+
 
 class SymbolManager:
     """
@@ -101,16 +103,46 @@ class SymbolManager:
         self._base = base
         self._pair_pat = _pair_pattern(base)
 
-        self._min_trade_volume = int(getattr(self.config, "discovery_min_24h_vol", getattr(self.config, "MIN_TRADE_VOLUME", 1000))) if self.config else 1000
-        self._max_conc = int(getattr(self.config, "SYMBOL_VALIDATE_MAX_CONCURRENCY", 24)) if self.config else 24
-        self._info_cache_ttl = float(getattr(self.config, "SYMBOL_INFO_CACHE_TTL", 900.0)) if self.config else 900.0
-        self._snapshot_ttl = float(getattr(self.config, "SYMBOL_SNAPSHOT_TTL", 10.0)) if self.config else 10.0
-        self._exclude_stable_base = bool(getattr(self.config, "EXCLUDE_STABLE_BASE", False)) if self.config else False
-        self._stable_thr_pct = float(getattr(self.config, "STABLE_MAX_ABS_PCT_CHANGE_24H", 0.6)) if self.config else 0.6
-        self._stable_band = float(getattr(self.config, "STABLE_TARGET_BAND", 0.03)) if self.config else 0.03
-        self._stable_target = float(getattr(self.config, "STABLE_TARGET_PRICE", 1.0)) if self.config else 1.0
+        self._min_trade_volume = (
+            int(
+                getattr(
+                    self.config,
+                    "discovery_min_24h_vol",
+                    getattr(self.config, "MIN_TRADE_VOLUME", 1000),
+                )
+            )
+            if self.config
+            else 1000
+        )
+        self._max_conc = (
+            int(getattr(self.config, "SYMBOL_VALIDATE_MAX_CONCURRENCY", 24)) if self.config else 24
+        )
+        self._info_cache_ttl = (
+            float(getattr(self.config, "SYMBOL_INFO_CACHE_TTL", 900.0)) if self.config else 900.0
+        )
+        self._snapshot_ttl = (
+            float(getattr(self.config, "SYMBOL_SNAPSHOT_TTL", 10.0)) if self.config else 10.0
+        )
+        self._exclude_stable_base = (
+            bool(getattr(self.config, "EXCLUDE_STABLE_BASE", False)) if self.config else False
+        )
+        self._stable_thr_pct = (
+            float(getattr(self.config, "STABLE_MAX_ABS_PCT_CHANGE_24H", 0.6))
+            if self.config
+            else 0.6
+        )
+        self._stable_band = (
+            float(getattr(self.config, "STABLE_TARGET_BAND", 0.03)) if self.config else 0.03
+        )
+        self._stable_target = (
+            float(getattr(self.config, "STABLE_TARGET_PRICE", 1.0)) if self.config else 1.0
+        )
         self._cap = self._resolve_universe_cap(self.config)
-        self._accept_new = bool(getattr(self.config, "discovery_accept_new_symbols", True)) if self.config else True
+        self._accept_new = (
+            bool(getattr(self.config, "discovery_accept_new_symbols", True))
+            if self.config
+            else True
+        )
 
         # blacklist (union of config knobs)
         b1 = set(getattr(self.config, "SYMBOL_BLACKLIST", []) or []) if self.config else set()
@@ -120,18 +152,21 @@ class SymbolManager:
         # ---- concurrency & caches ----
         self._sem = asyncio.Semaphore(self._max_conc)
 
-        self.symbol_info_cache: Dict[str, Dict[str, Any]] = {}
+        self.symbol_info_cache: dict[str, dict[str, Any]] = {}
         self._info_cache_ts: float = 0.0
 
-        self._snapshot_symbols_cache: Optional[Dict[str, Any]] = None
+        self._snapshot_symbols_cache: Optional[dict[str, Any]] = None
         self._snapshot_ts: float = 0.0
 
-        self.proposed_symbols: Dict[str, Dict[str, Any]] = {}
-        self.buffered_symbols: List[Dict[str, Any]] = []
+        self.proposed_symbols: dict[str, dict[str, Any]] = {}
+        self.buffered_symbols: list[dict[str, Any]] = []
 
         self.logger.info(
             "✅ SymbolManager init(base=%s, min_vol=%s, max_conc=%s, ttl=%ss)",
-            self._base, self._min_trade_volume, self._max_conc, self._info_cache_ttl,
+            self._base,
+            self._min_trade_volume,
+            self._max_conc,
+            self._info_cache_ttl,
         )
 
         # Runtime sanity check after wiring
@@ -147,7 +182,7 @@ class SymbolManager:
     async def bootstrap(self) -> None:
         await self.initialize_symbols()
 
-    async def discover_symbols(self) -> Dict[str, Dict[str, Any]]:
+    async def discover_symbols(self) -> dict[str, dict[str, Any]]:
         """
         Spec: Discovery → filter/validate → commit to SharedState → emit AcceptedSymbolsReady.
         This delegates to initialize_symbols() and then returns the fresh snapshot.
@@ -155,7 +190,7 @@ class SymbolManager:
         await self.initialize_symbols()
         return await self._get_symbols_snapshot(force=True)
 
-    def filter_symbols(self, candidates: List[Any]) -> Dict[str, Dict[str, Any]]:
+    def filter_symbols(self, candidates: list[Any]) -> dict[str, dict[str, Any]]:
         """
         Spec wants a filter_symbols() entrypoint. We map it to our filter_pipeline().
         """
@@ -163,7 +198,7 @@ class SymbolManager:
 
     async def set_accepted_symbols(
         self,
-        symbols_map: Dict[str, Dict[str, Any]],
+        symbols_map: dict[str, dict[str, Any]],
         *,
         allow_shrink: bool = False,
         source: str = "SymbolManager",
@@ -194,10 +229,10 @@ class SymbolManager:
         prelim_map = self.filter_pipeline(discovered)
         self.logger.info("🧹 Pre-filtered to %d candidate(s); validating…", len(prelim_map))
 
-        validated: Dict[str, Dict[str, Any]] = {}
+        validated: dict[str, dict[str, Any]] = {}
         lock = asyncio.Lock()
 
-        async def _check_one(sym: str, meta: Dict[str, Any]):
+        async def _check_one(sym: str, meta: dict[str, Any]):
             async with self._sem:
                 src, meta2 = self._split_source(meta, "discovery")
                 ok, reason, validated_price = await self._is_symbol_valid(sym, source=src, **meta2)
@@ -219,14 +254,15 @@ class SymbolManager:
             return
 
         # P9 Guard: Catastrophic Collapse Prevention
-        # If we previously had a healthy universe (e.g. 30 from WalletScanner) 
-        # and our fresh discovery only found 1 (due to filters or network flakiness), 
+        # If we previously had a healthy universe (e.g. 30 from WalletScanner)
+        # and our fresh discovery only found 1 (due to filters or network flakiness),
         # we do NOT want to overwrite the healthy set.
         current_map = await self._get_symbols_snapshot(force=True)
         if len(current_map) > 10 and len(validated) <= 1:
             self.logger.error(
                 "🛡️ PANIC GUARD: Refusing to commit discovery (found %d) because it would collapse healthy universe (%d).",
-                len(validated), len(current_map)
+                len(validated),
+                len(current_map),
             )
             return
 
@@ -237,7 +273,7 @@ class SymbolManager:
 
     # ---------------- validation chain ----------------
 
-    def validate_symbol_format(self, symbol: str) -> Tuple[bool, Optional[str]]:
+    def validate_symbol_format(self, symbol: str) -> tuple[bool, Optional[str]]:
         if not isinstance(symbol, str):
             return False, "symbol is not a string"
         if not self._pair_pat.match(symbol.upper()):
@@ -247,7 +283,7 @@ class SymbolManager:
             return False, "self-quote pair"
         return True, None
 
-    async def is_valid_symbol(self, symbol: str) -> Tuple[bool, Optional[str]]:
+    async def is_valid_symbol(self, symbol: str) -> tuple[bool, Optional[str]]:
         """Checks tradability using cached exchange info; lazy fetch on miss."""
         if not isinstance(symbol, str):
             return False, "not a valid symbol string"
@@ -283,7 +319,9 @@ class SymbolManager:
             return False, f"quote asset mismatch (expected {self._base})"
         return True, None
 
-    async def _passes_risk_filters(self, symbol: str, source: str = "unknown", **kwargs) -> Tuple[bool, Optional[str]]:
+    async def _passes_risk_filters(
+        self, symbol: str, source: str = "unknown", **kwargs
+    ) -> tuple[bool, Optional[str]]:
         if symbol in self._blacklist:
             return False, "symbol blacklisted (config)"
         if not self.exchange_client:
@@ -305,10 +343,10 @@ class SymbolManager:
             except Exception as e:
                 self.logger.debug("get_24hr_volume fail %s: %s", symbol, e, exc_info=True)
 
-        stats: Dict[str, Any] = {}
+        stats: dict[str, Any] = {}
         if hasattr(self.exchange_client, "get_cached_24h_stats"):
             stats = self.exchange_client.get_cached_24h_stats(symbol) or {}
-        
+
         # Fallback: if stats missing/empty, try explicit fetch (Bootstrap Safety)
         if not stats and hasattr(self.exchange_client, "get_24h_stats"):
             try:
@@ -329,19 +367,21 @@ class SymbolManager:
             # P9 Guard: If the source is authoritative (WalletScanner), we skip volume check
             # if we can't find volume, as it's better to keep the symbol than to lose it.
             if source == "WalletScannerAgent":
-                self.logger.debug(f"[{source}] No volume info for {symbol}; allowing as authoritative")
+                self.logger.debug(
+                    f"[{source}] No volume info for {symbol}; allowing as authoritative"
+                )
                 return True, None
             return False, "missing 24h quote volume"
-        
+
         # ⚡ ARCHITECT REFINEMENT #1: Move volume filtering to ranking layer (UURE)
         # This layer only validates TECHNICAL correctness, not trading suitability
         # Volume filtering is now handled by UniverseRotationEngine.compute_and_apply_universe()
         # which scores by: 40% conviction + 20% volatility + 20% momentum + 20% liquidity
-        
+
         # Keep only sanity check for effectively zero-liquidity symbols (garbage pairs)
         if float(qv) < 100:  # Less than $100 quote volume = spam/abandoned pair
             return False, "zero liquidity (quote_volume < $100)"
-        
+
         # All symbols passing technical validation (format, exchange, price, sanity check)
         # now proceed to ranking layer where they'll be scored for trading suitability
 
@@ -368,7 +408,9 @@ class SymbolManager:
 
         return True, None
 
-    async def _is_symbol_valid(self, symbol: str, source: str = "unknown", **kwargs) -> Tuple[bool, Optional[str], float]:
+    async def _is_symbol_valid(
+        self, symbol: str, source: str = "unknown", **kwargs
+    ) -> tuple[bool, Optional[str], float]:
         s = symbol.upper()
         if s in self._blacklist:
             return False, "blacklisted", 0.0
@@ -383,7 +425,7 @@ class SymbolManager:
         if not ok:
             self.logger.debug("risk filter failed for %s: %s", s, reason)
             return False, reason, 0.0
-        
+
         # P0: Ensure we have a real price before accepting
         price = float(kwargs.get("price", 0.0))
         if price <= 0:
@@ -391,15 +433,15 @@ class SymbolManager:
                 price = await self.exchange_client.get_ticker_price(s)
             except Exception:
                 price = 0.0
-        
+
         if price <= 0:
-             return False, "market price unavailable", 0.0
-             
+            return False, "market price unavailable", 0.0
+
         return True, None, price
 
-    async def validate_symbols(self, symbols: List[str]) -> List[str]:
+    async def validate_symbols(self, symbols: list[str]) -> list[str]:
         """Validate a batch concurrently (bounded)."""
-        out: List[str] = []
+        out: list[str] = []
 
         async def _one(sym: str):
             async with self._sem:
@@ -410,16 +452,23 @@ class SymbolManager:
         await asyncio.gather(*(_one(s) for s in symbols))
         return out
 
-    async def _safe_set_accepted_symbols(self, symbols_map: dict, *, allow_shrink: bool = False, merge_mode: bool = False, source: Optional[str] = None):
+    async def _safe_set_accepted_symbols(
+        self,
+        symbols_map: dict,
+        *,
+        allow_shrink: bool = False,
+        merge_mode: bool = False,
+        source: Optional[str] = None,
+    ):
         """
         Gateway to SharedState.set_accepted_symbols().
-        
+
         Args:
             symbols_map: Dict of symbol -> metadata to set/merge
             allow_shrink: If False, reject updates that would shrink the universe (replace mode only)
             merge_mode: If True, merge incoming symbols (additive). If False, replace (default).
             source: Source identifier for logging (e.g., "SymbolScreener", "WalletScannerAgent")
-        
+
         NOTE: Governor enforcement is now handled at SharedState level (canonical store).
         This method is a simple passthrough that handles metadata sanitization.
         """
@@ -429,8 +478,7 @@ class SymbolManager:
 
         # Sanitize the metadata for each symbol before passing to SharedState
         sanitized_map = {
-            s: {k: v for k, v in m.items() if k != "symbol"}
-            for s, m in symbols_map.items()
+            s: {k: v for k, v in m.items() if k != "symbol"} for s, m in symbols_map.items()
         }
 
         fn = self.shared_state.set_accepted_symbols
@@ -458,7 +506,7 @@ class SymbolManager:
                         "cap_applied": bool(self._cap and len(symbols_map) > self._cap),
                         "cap_value": int(self._cap or 0),
                         "symbols": list(symbols_map.keys())[:20],
-                        "source": source or "unknown"
+                        "source": source or "unknown",
                     }
                     await self.shared_state.emit_event("AcceptedSymbolsReady", payload)
                 except Exception as e:
@@ -468,7 +516,9 @@ class SymbolManager:
 
         except TypeError as e:
             # Extra belt-and-suspenders fallback without merge_mode/allow_shrink/source
-            self.logger.warning("set_accepted_symbols signature mismatch (%s) — retrying positional-only.", e)
+            self.logger.warning(
+                "set_accepted_symbols signature mismatch (%s) — retrying positional-only.", e
+            )
             result = fn(sanitized_map)
             if asyncio.iscoroutine(result):
                 result = await result
@@ -476,7 +526,9 @@ class SymbolManager:
 
     # ---------------- mutations ----------------
 
-    async def add_symbol(self, symbol: str, source: str = "unknown", **kwargs) -> Tuple[bool, Optional[str]]:
+    async def add_symbol(
+        self, symbol: str, source: str = "unknown", **kwargs
+    ) -> tuple[bool, Optional[str]]:
         if not symbol:
             self.logger.warning("❌ Empty symbol.")
             return False, "empty symbol"
@@ -501,24 +553,30 @@ class SymbolManager:
         # Update price for metadata
         kwargs["price"] = validated_price
         meta = _meta_from_kwargs(symbol, source, **kwargs)
-        
+
         try:
             # FIX #1: Make SymbolManager truly additive (no shrink rejection for discovery)
             # Simply add the symbol to accepted_symbols without comparing lengths
             # This allows discovery to expand the universe incrementally
-            if self.shared_state and hasattr(self.shared_state, 'accepted_symbols'):
+            if self.shared_state and hasattr(self.shared_state, "accepted_symbols"):
                 # Direct additive expansion: just add if not present
                 if symbol not in self.shared_state.accepted_symbols:
-                    self.shared_state.accepted_symbols[symbol] = {k: v for k, v in meta.items() if k != "symbol"}
+                    self.shared_state.accepted_symbols[symbol] = {
+                        k: v for k, v in meta.items() if k != "symbol"
+                    }
                     self.logger.info(f"🌟 Universe expanded: {symbol} added (discovery additive)")
                 else:
                     # Update existing metadata
-                    self.shared_state.accepted_symbols[symbol].update({k: v for k, v in meta.items() if k != "symbol"})
+                    self.shared_state.accepted_symbols[symbol].update(
+                        {k: v for k, v in meta.items() if k != "symbol"}
+                    )
                     self.logger.debug(f"🔄 Universe updated: {symbol} metadata refreshed")
-            
+
             # Also update the symbols dict if it exists
-            if self.shared_state and hasattr(self.shared_state, 'symbols'):
-                self.shared_state.symbols.setdefault(symbol, {}).update({k: v for k, v in meta.items() if k != "symbol"})
+            if self.shared_state and hasattr(self.shared_state, "symbols"):
+                self.shared_state.symbols.setdefault(symbol, {}).update(
+                    {k: v for k, v in meta.items() if k != "symbol"}
+                )
 
             if self.database_manager and hasattr(self.database_manager, "add_symbol"):
                 self.database_manager.add_symbol(symbol)
@@ -535,7 +593,7 @@ class SymbolManager:
     async def _refresh_universe_cache(self) -> None:
         """
         FIX #3: Rebuild the active universe after adding symbols.
-        
+
         This ensures that:
         1. accepted_symbols dict is synchronized
         2. symbol_pool is updated
@@ -544,30 +602,32 @@ class SymbolManager:
         try:
             if not self.shared_state:
                 return
-            
+
             # Get the current accepted symbols set
-            if hasattr(self.shared_state, 'get_accepted_symbols'):
+            if hasattr(self.shared_state, "get_accepted_symbols"):
                 current = await self._maybe_await(self.shared_state.get_accepted_symbols())
                 if current:
                     # Ensure it's a dict for consistency
                     if not isinstance(current, dict):
                         current = {s: {} for s in current}
-                    
+
                     # Update the live universe
-                    if hasattr(self.shared_state, 'accepted_symbols'):
+                    if hasattr(self.shared_state, "accepted_symbols"):
                         self.shared_state.accepted_symbols = dict(current)
                         self.logger.debug(f"🔄 Refreshed universe cache: {len(current)} symbols")
-            
+
             # If SharedState has a refresh method, call it
-            if hasattr(self.shared_state, 'refresh_universe'):
+            if hasattr(self.shared_state, "refresh_universe"):
                 await self._maybe_await(self.shared_state.refresh_universe())
                 self.logger.debug("🔄 SharedState.refresh_universe() called")
-                
+
         except Exception as e:
             self.logger.debug(f"⚠️ Universe cache refresh failed: {e}")
             # Don't raise - this is best-effort
 
-    async def propose_symbol(self, symbol: str, source: str = "unknown", **kwargs) -> Tuple[bool, Optional[str]]:
+    async def propose_symbol(
+        self, symbol: str, source: str = "unknown", **kwargs
+    ) -> tuple[bool, Optional[str]]:
         if not self.shared_state:
             self.logger.warning("⚠️ SharedState not set; cannot propose.")
             return False, "SharedState not initialized"
@@ -588,10 +648,14 @@ class SymbolManager:
 
         return await self.add_symbol(symbol, source=source, **kwargs)
 
-    async def propose_symbols(self, symbols: List[str], source: str = "unknown", **kwargs) -> List[str]:
+    async def propose_symbols(
+        self, symbols: list[str], source: str = "unknown", **kwargs
+    ) -> list[str]:
         """BATACH PROPOSAL: Validates and adds multiple symbols in one SharedState write."""
-        self.logger.info("🧪 Validating batch of %d proposed symbol(s) from %s…", len(symbols), source)
-        
+        self.logger.info(
+            "🧪 Validating batch of %d proposed symbol(s) from %s…", len(symbols), source
+        )
+
         # 1. Fetch current pool once
         final_map = dict(await self._get_symbols_snapshot(force=True))
         added_count = 0
@@ -601,8 +665,8 @@ class SymbolManager:
         for s in symbols:
             s_up = s.upper()
             if s_up in final_map:
-                 continue
-            
+                continue
+
             ok, reason, px = await self._is_symbol_valid(s_up, source=source, **kwargs)
             if ok:
                 meta = _meta_from_kwargs(s_up, source, price=px, **kwargs)
@@ -619,7 +683,9 @@ class SymbolManager:
 
             # 4. Commit once with allow_shrink=False to preserve work
             await self._safe_set_accepted_symbols(final_map, allow_shrink=False, source=source)
-            self.logger.info("✅ Batch update complete: +%d symbol(s) from %s.", added_count, source)
+            self.logger.info(
+                "✅ Batch update complete: +%d symbol(s) from %s.", added_count, source
+            )
         else:
             self.logger.info("ℹ️ No new symbols added from batch.")
 
@@ -633,17 +699,20 @@ class SymbolManager:
             self.logger.info("✅ Flushed 0 buffered symbols (no-op).")
             return
         if not getattr(self, "_accept_new", True):
-            self.logger.info("Discovery.accept_new_symbols is False; skipping buffered proposals flush.")
+            self.logger.info(
+                "Discovery.accept_new_symbols is False; skipping buffered proposals flush."
+            )
             return
 
         effective_blacklist = set(self._blacklist)
         current = dict(await self._get_symbols_snapshot(force=True))
-        final_map: Dict[str, Dict[str, Any]] = dict(current)
+        final_map: dict[str, dict[str, Any]] = dict(current)
         newly_added = 0
 
         # sanitize proposed map
         sanitized = {
-            s: m for s, m in (self.proposed_symbols or {}).items()
+            s: m
+            for s, m in (self.proposed_symbols or {}).items()
             if isinstance(s, str)
             and self._pair_pat.match(s)
             and s != f"{self._base}{self._base}"
@@ -651,45 +720,52 @@ class SymbolManager:
         }
         self.proposed_symbols.clear()
 
-        async def _try_add(sym: str, meta: Dict[str, Any], src_hint: str):
+        async def _try_add(sym: str, meta: dict[str, Any], src_hint: str):
             nonlocal newly_added
             if sym in final_map:
                 return
             src, meta2 = self._split_source(meta, src_hint)
             ok, reason = await self._is_symbol_valid(sym, source=src, **meta2)
             if ok:
-                meta_clean = dict(meta2); meta_clean["source"] = src # Reconstruct meta with source for final_map
+                meta_clean = dict(meta2)
+                meta_clean["source"] = src  # Reconstruct meta with source for final_map
                 final_map[sym] = meta_clean
                 newly_added += 1
             else:
                 self.logger.warning("❌ Buffered %s failed revalidation: %s", sym, reason)
 
-        await asyncio.gather(*(_try_add(s, m, m.get("source", "buffer")) for s, m in sanitized.items()))
+        await asyncio.gather(
+            *(_try_add(s, m, m.get("source", "buffer")) for s, m in sanitized.items())
+        )
 
         tmp = list(self.buffered_symbols)
         self.buffered_symbols.clear()
-        await asyncio.gather(*[
-            _try_add(e.get("symbol"), e, e.get("source", "cap_buffer"))
-            for e in tmp
-            if isinstance(e, dict)
-            and isinstance(e.get("symbol"), str)
-            and self._pair_pat.match(e["symbol"])
-            and e["symbol"] != f"{self._base}{self._base}"
-            and e["symbol"] not in effective_blacklist
-        ])
+        await asyncio.gather(
+            *[
+                _try_add(e.get("symbol"), e, e.get("source", "cap_buffer"))
+                for e in tmp
+                if isinstance(e, dict)
+                and isinstance(e.get("symbol"), str)
+                and self._pair_pat.match(e["symbol"])
+                and e["symbol"] != f"{self._base}{self._base}"
+                and e["symbol"] not in effective_blacklist
+            ]
+        )
 
         # ✅ DO NOT apply cap here - canonical governor enforces in SharedState
         # All buffered symbols are validated and added, cap applied at execution layer
 
         # final existence sanitation
         if self.exchange_client and hasattr(self.exchange_client, "symbol_exists_cached"):
-            final_map = {s: m for s, m in final_map.items() if self.exchange_client.symbol_exists_cached(s)}
+            final_map = {
+                s: m for s, m in final_map.items() if self.exchange_client.symbol_exists_cached(s)
+            }
         elif self.exchange_client and hasattr(self.exchange_client, "symbol_exists"):
             self.logger.warning("⚠️ Falling back to awaitable symbol_exists. May hit rate limits.")
-            exists: Dict[str, Dict[str, Any]] = {}
+            exists: dict[str, dict[str, Any]] = {}
             sem = asyncio.Semaphore(self._max_conc)
 
-            async def _exists(sym: str, meta: Dict[str, Any]):
+            async def _exists(sym: str, meta: dict[str, Any]):
                 async with sem:
                     if await self.exchange_client.symbol_exists(sym):
                         exists[sym] = meta
@@ -699,14 +775,18 @@ class SymbolManager:
 
         # Pass allow_shrink=True when setting symbols after flush
         await self._safe_set_accepted_symbols(final_map, allow_shrink=True)
-        self.logger.info("✅ Accepted %d symbol(s) after flush. SharedState updated. (+%d new)", len(final_map), newly_added)
+        self.logger.info(
+            "✅ Accepted %d symbol(s) after flush. SharedState updated. (+%d new)",
+            len(final_map),
+            newly_added,
+        )
 
     async def finalize_universe(
         self,
         cap: Optional[int] = None,
         allow_shrink: bool = False,
-        source: str = "SymbolManager", # 'source' argument is kept for potential logging/internal use
-    ) -> Dict[str, Dict[str, Any]]:
+        source: str = "SymbolManager",  # 'source' argument is kept for potential logging/internal use
+    ) -> dict[str, dict[str, Any]]:
         """
         Trim current accepted symbols to `cap` (or self._cap) and commit back to SharedState.
         Uses allow_shrink to legally reduce the universe when needed.
@@ -729,13 +809,15 @@ class SymbolManager:
         await self._safe_set_accepted_symbols(final_map, allow_shrink=allow_shrink)
         self.logger.info(
             "✅ Finalized %d symbols (cap=%s, allow_shrink=%s).",
-            len(final_map), eff_cap, allow_shrink
+            len(final_map),
+            eff_cap,
+            allow_shrink,
         )
         return final_map
 
     # ---------------- queries & utilities ----------------
 
-    async def get_final_universe(self) -> Dict[str, Dict[str, Any]]:
+    async def get_final_universe(self) -> dict[str, dict[str, Any]]:
         """
         Canonical Phase-5 API: return the accepted symbols map that should be used
         to seed MarketDataFeed. Applies cap if configured.
@@ -744,15 +826,17 @@ class SymbolManager:
         if self._cap and len(current) > self._cap:
             current = self._apply_cap(current)
         # Ensure meta has no "symbol" key duplication (SharedState holds map by symbol)
-        return {s: {k: v for k, v in (m or {}).items() if k != "symbol"} for s, m in current.items()}
+        return {
+            s: {k: v for k, v in (m or {}).items() if k != "symbol"} for s, m in current.items()
+        }
 
-    async def get_valid_symbol_names_async(self) -> List[str]:
+    async def get_valid_symbol_names_async(self) -> list[str]:
         snap = await self._get_symbols_snapshot(force=False)
         names = list((snap or {}).keys())
         self.logger.info("✅ get_valid_symbol_names_async() → %d symbols", len(names))
         return names
 
-    def get_valid_symbol_names(self) -> List[str]:
+    def get_valid_symbol_names(self) -> list[str]:
         if self.shared_state and hasattr(self.shared_state, "get_symbols_snapshot"):
             names = list((self.shared_state.get_symbols_snapshot() or {}).keys())
             self.logger.info("✅ get_valid_symbol_names() → %d symbols", len(names))
@@ -760,10 +844,14 @@ class SymbolManager:
         self.logger.warning("⚠️ SharedState not initialized or empty.")
         return []
 
-    def get_invalid_symbols(self) -> List[str]:
+    def get_invalid_symbols(self) -> list[str]:
         if self.shared_state and hasattr(self.shared_state, "get_symbols_snapshot"):
             current = self.shared_state.get_symbols_snapshot() or {}
-            return [item["symbol"] for item in self.buffered_symbols if item.get("symbol") not in current]
+            return [
+                item["symbol"]
+                for item in self.buffered_symbols
+                if item.get("symbol") not in current
+            ]
         self.logger.warning("SharedState not available for get_invalid_symbols.")
         return []
 
@@ -778,7 +866,11 @@ class SymbolManager:
         self._base = base
         self._pair_pat = _pair_pattern(base)
 
-        self._min_trade_volume = int(getattr(self.config, "discovery_min_24h_vol", getattr(self.config, "MIN_TRADE_VOLUME", 1000)))
+        self._min_trade_volume = int(
+            getattr(
+                self.config, "discovery_min_24h_vol", getattr(self.config, "MIN_TRADE_VOLUME", 1000)
+            )
+        )
         self._max_conc = int(getattr(self.config, "SYMBOL_VALIDATE_MAX_CONCURRENCY", 24))
         self._info_cache_ttl = float(getattr(self.config, "SYMBOL_INFO_CACHE_TTL", 900.0))
         self._snapshot_ttl = float(getattr(self.config, "SYMBOL_SNAPSHOT_TTL", 10.0))
@@ -794,7 +886,12 @@ class SymbolManager:
         self._blacklist = {str(s).upper() for s in (b1 | b2)}
 
         self._sem = asyncio.Semaphore(self._max_conc)
-        self.logger.info("🔧 Config hot-swapped (base=%s, min_vol=%s, max_conc=%s).", self._base, self._min_trade_volume, self._max_conc)
+        self.logger.info(
+            "🔧 Config hot-swapped (base=%s, min_vol=%s, max_conc=%s).",
+            self._base,
+            self._min_trade_volume,
+            self._max_conc,
+        )
         return self
 
     def set_exchange_client(self, exchange_client):
@@ -805,7 +902,7 @@ class SymbolManager:
         self.market_data_feed = market_data_feed
         return self
 
-    async def get_recent_symbols(self, max_symbols: int = 10) -> List[str]:
+    async def get_recent_symbols(self, max_symbols: int = 10) -> list[str]:
         try:
             if not self.exchange_client:
                 self.logger.warning("[SymbolManager] Exchange client unavailable.")
@@ -817,9 +914,13 @@ class SymbolManager:
             else:
                 self.logger.warning("[SymbolManager] No method for new listings.")
                 return []
-            
-            recent = [s for s in (new_listings or []) if isinstance(s, str) and s.endswith(self._base)]
-            self.logger.info("[SymbolManager] Found %d recent %s listings.", len(recent), self._base)
+
+            recent = [
+                s for s in (new_listings or []) if isinstance(s, str) and s.endswith(self._base)
+            ]
+            self.logger.info(
+                "[SymbolManager] Found %d recent %s listings.", len(recent), self._base
+            )
             return recent[:max_symbols]
         except Exception as e:
             self.logger.error("[SymbolManager] Failed to get recent symbols: %s", e, exc_info=True)
@@ -828,7 +929,11 @@ class SymbolManager:
     async def run_loop(self) -> None:
         """Periodic maintenance (refresh cached exchange info)."""
         self.logger.info("🟡 [SymbolManager] Starting continuous symbol management loop.")
-        interval = int(getattr(self.config, "SYMBOL_INFO_UPDATE_INTERVAL_SECONDS", 3600)) if self.config else 3600
+        interval = (
+            int(getattr(self.config, "SYMBOL_INFO_UPDATE_INTERVAL_SECONDS", 3600))
+            if self.config
+            else 3600
+        )
         while True:
             try:
                 await self._ensure_exchange_info(force=True)
@@ -839,13 +944,13 @@ class SymbolManager:
 
     # ---------------- discovery & cache ----------------
 
-    async def run_discovery_agents(self) -> List[Dict[str, Any]]:
+    async def run_discovery_agents(self) -> list[dict[str, Any]]:
         """Data-driven discovery from cached exchange_info with robust filtering."""
         self.logger.info("Running discovery from exchange_info…")
         await self._ensure_exchange_info()
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         now = dt.datetime.now(dt.timezone.utc)
-        
+
         # P9: Robust filtering to avoid single-symbol locks
         stats_map = {}
         if hasattr(self.exchange_client, "get_all_24h_stats"):
@@ -853,17 +958,17 @@ class SymbolManager:
                 stats_map = await self.exchange_client.get_all_24h_stats()
             except Exception:
                 pass
-        
+
         min_v = float(self._min_trade_volume)
 
         for s, info in (self.symbol_info_cache or {}).items():
             if not isinstance(info, dict) or not info.get("symbol"):
                 continue
-            
+
             # P9: Integration of user-suggested filtering logic
             if info.get("isSpotTradingAllowed") is False:
                 continue
-            
+
             if info.get("status") != "TRADING":
                 continue
 
@@ -872,20 +977,26 @@ class SymbolManager:
 
             stats = stats_map.get(s) or {}
             qv = float(stats.get("quoteVolume") or stats.get("volume") or 0.0)
-            
+
             # Lenient floor (from _min_trade_volume)
             if qv < min_v and min_v > 0:
                 continue
 
-            out.append({
-                "symbol": s,
-                "source": "exchange_info_discovery",
-                "added_at": now,
-                "score": 0.0,
-                "24h_volume": qv,
-                "price": float(stats.get("lastPrice", 0.0)),
-            })
-        self.logger.info("Discovered %d potential symbol(s) from exchange info (Volume floor: %.1f).", len(out), min_v)
+            out.append(
+                {
+                    "symbol": s,
+                    "source": "exchange_info_discovery",
+                    "added_at": now,
+                    "score": 0.0,
+                    "24h_volume": qv,
+                    "price": float(stats.get("lastPrice", 0.0)),
+                }
+            )
+        self.logger.info(
+            "Discovered %d potential symbol(s) from exchange info (Volume floor: %.1f).",
+            len(out),
+            min_v,
+        )
         return out
 
     async def _ensure_exchange_info(self, force: bool = False) -> None:
@@ -894,7 +1005,11 @@ class SymbolManager:
             self.logger.warning("⚠️ Exchange client not available. Cannot fetch symbol info.")
             return
         now = self._now_mono()
-        if not force and self.symbol_info_cache and (now - self._info_cache_ts) < self._info_cache_ttl:
+        if (
+            not force
+            and self.symbol_info_cache
+            and (now - self._info_cache_ts) < self._info_cache_ttl
+        ):
             return
         self.logger.info("🔄 Fetching & caching all symbol information from the exchange…")
         try:
@@ -908,16 +1023,16 @@ class SymbolManager:
 
     # ---------------- filter pipeline & accessors ----------------
 
-    def filter_pipeline(self, symbol_list: List[Any]) -> Dict[str, Dict[str, Any]]:
+    def filter_pipeline(self, symbol_list: list[Any]) -> dict[str, dict[str, Any]]:
         """Normalize, blacklist-filter, and enrich basic fields (cheap, pre-validation)."""
         self.logger.info("Running filtering pipeline…")
         bl = set(self._blacklist)
-        out: Dict[str, Dict[str, Any]] = {}
+        out: dict[str, dict[str, Any]] = {}
         now = dt.datetime.now(dt.timezone.utc)
 
         for entry in symbol_list:
             sym: Optional[str] = None
-            meta: Dict[str, Any] = {}
+            meta: dict[str, Any] = {}
 
             if isinstance(entry, dict) and "symbol" in entry and isinstance(entry["symbol"], str):
                 sym = entry["symbol"].upper()
@@ -936,7 +1051,9 @@ class SymbolManager:
             meta.setdefault("symbol", sym)
             meta.setdefault("source", meta.get("source", "unknown"))
             meta.setdefault("score", float(meta.get("score", 0.0)))
-            meta.setdefault("24h_volume", float(meta.get("24h_volume", meta.get("volume", 0.0) or 0.0)))
+            meta.setdefault(
+                "24h_volume", float(meta.get("24h_volume", meta.get("volume", 0.0) or 0.0))
+            )
             meta.setdefault("price", float(meta.get("price", 0.0)))
             meta.setdefault("added_at", meta.get("added_at", now))
 
@@ -944,7 +1061,7 @@ class SymbolManager:
 
         return out
 
-    def get_filters(self, symbol: str) -> List[Dict[str, Any]]:
+    def get_filters(self, symbol: str) -> list[dict[str, Any]]:
         # Prefer local cached exchangeInfo; keep this method sync-safe (no awaits here)
         info = self.symbol_info_cache.get(symbol) or {}
         fx = info.get("filters") or []
@@ -953,7 +1070,11 @@ class SymbolManager:
             try:
                 raw = None
                 # Some clients expose a dict-like `symbol_filters` map
-                raw = getattr(self.exchange_client, "symbol_filters", None) if self.exchange_client else None
+                raw = (
+                    getattr(self.exchange_client, "symbol_filters", None)
+                    if self.exchange_client
+                    else None
+                )
                 if isinstance(raw, dict):
                     rf = raw.get(symbol) or raw.get(str(symbol).upper())
                     if isinstance(rf, dict) and rf:
@@ -962,14 +1083,20 @@ class SymbolManager:
                             if k.startswith("_"):
                                 continue
                             if isinstance(v, dict):
-                                d = dict(v); d.setdefault("filterType", k)
+                                d = dict(v)
+                                d.setdefault("filterType", k)
                                 fx_list.append(d)
                         if fx_list:
                             return fx_list
             except Exception:
-                self.logger.debug("get_filters sync read of client cache failed; falling back to local cache", exc_info=True)
+                self.logger.debug(
+                    "get_filters sync read of client cache failed; falling back to local cache",
+                    exc_info=True,
+                )
         if not fx:
-            self.logger.debug("No filters in cache for %s. Cache size: %d", symbol, len(self.symbol_info_cache))
+            self.logger.debug(
+                "No filters in cache for %s. Cache size: %d", symbol, len(self.symbol_info_cache)
+            )
         return fx
 
     def get_step_size(self, symbol: str) -> str:
@@ -981,8 +1108,12 @@ class SymbolManager:
     def get_min_notional(self, symbol: str) -> float:
         # Keep sync-safe: use local cache or a synchronous peek of the client's `symbol_filters` map
         try:
-            if self.exchange_client and isinstance(getattr(self.exchange_client, "symbol_filters", None), dict):
-                rf = self.exchange_client.symbol_filters.get(symbol) or self.exchange_client.symbol_filters.get(str(symbol).upper())
+            if self.exchange_client and isinstance(
+                getattr(self.exchange_client, "symbol_filters", None), dict
+            ):
+                rf = self.exchange_client.symbol_filters.get(
+                    symbol
+                ) or self.exchange_client.symbol_filters.get(str(symbol).upper())
                 if isinstance(rf, dict):
                     notional = rf.get("NOTIONAL") or rf.get("MIN_NOTIONAL") or {}
                     return float(notional.get("minNotional", 0.0) or 0.0)
@@ -1016,8 +1147,8 @@ class SymbolManager:
         if not self.shared_state:
             self.logger.error("❌ Cannot finalize proposals: SharedState is not set.")
             return
-        
-        accepted = [* (await self.get_valid_symbol_names_async())]
+
+        accepted = [*(await self.get_valid_symbol_names_async())]
 
         if not accepted:
             self.logger.info("ℹ️ No accepted symbols to finalize.")
@@ -1035,10 +1166,10 @@ class SymbolManager:
 
     # ---------------- internals ----------------
 
-    def _apply_cap(self, sym_map: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    def _apply_cap(self, sym_map: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         """Trim to universe cap using score → 24h_volume → price → symbol.
         Active positions and pending intents are protected."""
-        
+
         # 1. Identify protected symbols (those with balance or active allocation)
         protected = set()
         if self.shared_state:
@@ -1053,14 +1184,16 @@ class SymbolManager:
                         protected.update((snap or {}).keys())
                 except Exception:
                     pass
-            
+
             # Check pending buy intents (P9-Safe Accumulation)
             if hasattr(self.shared_state, "_pending_position_intents"):
                 intents = getattr(self.shared_state, "_pending_position_intents", {})
-                for (sym, side), intent in list(intents.items()): # Use list() to avoid mutation during iteration
+                for (sym, side), intent in list(
+                    intents.items()
+                ):  # Use list() to avoid mutation during iteration
                     if side == "BUY" and intent.accumulated_quote > 0:
                         protected.update([sym])
-            
+
             # P9: Protect Wallet-Force symbols (Legitimate universe preservation)
             if hasattr(self.shared_state, "accepted_symbols"):
                 for sym, meta in self.shared_state.accepted_symbols.items():
@@ -1069,24 +1202,31 @@ class SymbolManager:
 
         items = list(sym_map.items())
 
-        def score_key(it: Tuple[str, Dict[str, Any]]):
+        def score_key(it: tuple[str, dict[str, Any]]):
             sym, m = it
             is_protected = 1 if sym in protected else 0
-            return (-is_protected,
-                    -float(m.get("score", 0.0)),
-                    -float(m.get("24h_volume", 0.0)),
-                    -float(m.get("price", 0.0)),
-                    sym)
+            return (
+                -is_protected,
+                -float(m.get("score", 0.0)),
+                -float(m.get("24h_volume", 0.0)),
+                -float(m.get("price", 0.0)),
+                sym,
+            )
 
         # Sort so protected items are at the top, then by score
         sorted_items = sorted(items, key=score_key)
-        
-        # We take the top N. If we have MORE protected items than the cap, 
+
+        # We take the top N. If we have MORE protected items than the cap,
         # the cap is effectively expanded to include all protected items.
         cap_val = max(self._cap, len(protected))
-        trimmed = dict(sorted_items[: cap_val])
-        
-        self.logger.info("✂️ Trimmed to %d symbols (cap=%d, protected=%d).", len(trimmed), self._cap, len(protected))
+        trimmed = dict(sorted_items[:cap_val])
+
+        self.logger.info(
+            "✂️ Trimmed to %d symbols (cap=%d, protected=%d).",
+            len(trimmed),
+            self._cap,
+            len(protected),
+        )
         return trimmed
 
     @staticmethod
@@ -1125,13 +1265,17 @@ class SymbolManager:
                 cap = 0
         return max(0, int(cap))
 
-    async def _get_symbols_snapshot(self, *, force: bool = False) -> Dict[str, Any]:
+    async def _get_symbols_snapshot(self, *, force: bool = False) -> dict[str, Any]:
         if not self.shared_state:
             return {}
         now = self._now_mono()
-        if not force and self._snapshot_symbols_cache and (now - self._snapshot_ts) < self._snapshot_ttl:
+        if (
+            not force
+            and self._snapshot_symbols_cache
+            and (now - self._snapshot_ts) < self._snapshot_ttl
+        ):
             return self._snapshot_symbols_cache
-        
+
         # Try multiple methods to get symbols snapshot
         snap = None
         if hasattr(self.shared_state, "get_symbols_snapshot"):
@@ -1142,7 +1286,7 @@ class SymbolManager:
             snap = self.shared_state.get_accepted_symbols()
         else:
             snap = getattr(self.shared_state, "accepted_symbols", {})
-        
+
         # support both sync/async
         snap = await snap if asyncio.iscoroutine(snap) else snap
         self._snapshot_symbols_cache = dict(snap or {})
@@ -1150,7 +1294,9 @@ class SymbolManager:
         return self._snapshot_symbols_cache
 
     # New helper to split source from meta
-    def _split_source(self, meta: Optional[Dict[str, Any]], default_src: str) -> Tuple[str, Dict[str, Any]]:
+    def _split_source(
+        self, meta: Optional[dict[str, Any]], default_src: str
+    ) -> tuple[str, dict[str, Any]]:
         """
         Return (source, cleaned_meta). Strip keys that map to explicit parameters
         so we can safely do: _is_symbol_valid(symbol, source=..., **meta).

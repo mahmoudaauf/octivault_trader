@@ -24,7 +24,7 @@ setup_environment() {
     if [ -d "venv" ]; then
         source venv/bin/activate 2>/dev/null
     fi
-    
+
     # Set PYTHONPATH
     export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 }
@@ -49,12 +49,12 @@ show_status() {
 cmd_setup() {
     echo -e "${YELLOW}🔧 Running infrastructure setup...${NC}"
     echo ""
-    
+
     if [ ! -f "setup.sh" ]; then
         echo "❌ setup.sh not found"
         return 1
     fi
-    
+
     bash setup.sh
     return $?
 }
@@ -62,11 +62,11 @@ cmd_setup() {
 cmd_test() {
     setup_environment
     show_status
-    
+
     echo -e "${BLUE}🧪 Running Full Test Suite${NC}"
     echo "   Tests: $(python3 -m pytest tests/ --collect-only -q 2>/dev/null | grep -E "^<" | wc -l)"
     echo ""
-    
+
     python3 -m pytest tests/ -v --tb=short
     return $?
 }
@@ -74,11 +74,11 @@ cmd_test() {
 cmd_quick_test() {
     setup_environment
     show_status
-    
+
     echo -e "${BLUE}⚡ Running Quick Test Suite${NC}"
     echo "   Testing core components only..."
     echo ""
-    
+
     python3 -m pytest tests/test_arbitration_engine.py \
                       tests/test_risk_manager.py \
                       tests/test_error_handler.py \
@@ -90,11 +90,11 @@ cmd_quick_test() {
 cmd_core_test() {
     setup_environment
     show_status
-    
+
     echo -e "${BLUE}✅ Running Core Component Tests${NC}"
     echo "   Testing business logic only (no mocks)..."
     echo ""
-    
+
     python3 -m pytest tests/test_arbitration_engine.py \
                       tests/test_error_types.py \
                       tests/test_config_constants.py \
@@ -105,11 +105,11 @@ cmd_core_test() {
 cmd_integration_test() {
     setup_environment
     show_status
-    
+
     echo -e "${BLUE}🔗 Running Integration Tests${NC}"
     echo "   Testing component interactions..."
     echo ""
-    
+
     python3 -m pytest tests/test_bootstrap_manager.py \
                       tests/test_balance_integration.py \
                       tests/test_websocket_integration.py \
@@ -120,15 +120,15 @@ cmd_integration_test() {
 cmd_phase_run() {
     setup_environment
     show_status
-    
+
     echo -e "${BLUE}🚀 Starting Phased Execution${NC}"
     echo ""
-    
+
     if [ ! -f "🎯_PHASED_RUN.sh" ]; then
         echo "❌ 🎯_PHASED_RUN.sh not found"
         return 1
     fi
-    
+
     bash 🎯_PHASED_RUN.sh
     return $?
 }
@@ -136,10 +136,10 @@ cmd_phase_run() {
 cmd_validate() {
     setup_environment
     show_status
-    
+
     echo -e "${BLUE}✔️ Validating System Setup${NC}"
     echo ""
-    
+
     python3 << 'VALIDATE_EOF'
 import sys
 import os
@@ -189,22 +189,22 @@ else:
     print("🔴 Please run: ./run-local.sh setup")
     sys.exit(1)
 VALIDATE_EOF
-    
+
     return $?
 }
 
 cmd_status() {
     setup_environment
     show_status
-    
+
     echo -e "${BLUE}📊 System Status:${NC}"
     echo ""
-    
+
     # Python
     echo -e "  ${YELLOW}Python:${NC}"
     python3 -c "import sys; print(f'    Version: {sys.version.split()[0]}')"
     python3 -c "import sys; print(f'    Executable: {sys.executable}')"
-    
+
     # Virtual Environment
     echo ""
     echo -e "  ${YELLOW}Virtual Environment:${NC}"
@@ -214,20 +214,20 @@ cmd_status() {
     else
         echo "    Status: Not created (run: ./run-local.sh setup)"
     fi
-    
+
     # Directories
     echo ""
     echo -e "  ${YELLOW}Directories:${NC}"
     for d in core tests logs data models config scripts; do
         [ -d "$d" ] && echo "    ✅ $d/" || echo "    ❌ $d/"
     done
-    
+
     # Tests
     echo ""
     echo -e "  ${YELLOW}Tests:${NC}"
     TESTS=$(python3 -m pytest tests/ --collect-only -q 2>/dev/null | grep -E "^<" | wc -l)
     echo "    Total: $TESTS tests"
-    
+
     echo ""
     return 0
 }

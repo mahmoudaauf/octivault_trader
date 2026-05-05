@@ -1,6 +1,6 @@
 # Dust-Liquidation Flag Wiring & Entry Floor Guard Implementation
 
-**Date**: Session Continuation  
+**Date**: Session Continuation
 **Status**: ✅ IMPLEMENTATION COMPLETE
 
 ## Executive Summary
@@ -28,7 +28,7 @@ self.dust_liquidation_enabled = os.getenv("DUST_LIQUIDATION_ENABLED", "false").l
 self.dust_reentry_override = os.getenv("DUST_REENTRY_OVERRIDE", "true").lower() == "true"
 ```
 
-**Rationale**: 
+**Rationale**:
 - Environment variable remains `DUST_LIQUIDATION_ENABLED` for backward compatibility
 - Runtime storage uses lowercase `dust_liquidation_enabled` for consistency with shared_state
 
@@ -79,21 +79,21 @@ allow_entry_below_significant_floor: bool = False  # NEW: guard to prevent new d
 #### Change 3.1: Lines 2148-2194 - New Guard Method
 ```python
 async def _check_entry_floor_guard(
-    self, 
-    symbol: str, 
-    quote_amount: float, 
+    self,
+    symbol: str,
+    quote_amount: float,
     is_dust_healing_buy: bool = False
 ) -> Tuple[bool, str]:
     """
     Guard: Prevent opening new trades below significant floor unless:
     1. Explicitly allowed via allow_entry_below_significant_floor flag, OR
     2. Dust healing buyback (is_dust_healing_buy=True)
-    
+
     Args:
         symbol: Trading symbol (e.g., "BTCUSDT")
         quote_amount: Quote USD amount for entry
         is_dust_healing_buy: If True, bypasses floor check (allows healing trades)
-    
+
     Returns:
         Tuple[bool, str]: (is_allowed, reason_message)
         - (True, reason): Entry is allowed
@@ -102,13 +102,13 @@ async def _check_entry_floor_guard(
     # Bypass for dust healing operations
     if is_dust_healing_buy:
         return True, "[EM:ENTRY_FLOOR_GUARD] Dust healing trade bypasses floor guard"
-    
+
     # Get configuration
     significant_floor = float(getattr(self.config, "SIGNIFICANT_POSITION_FLOOR", 20.0))
     allow_below_floor = bool(
         getattr(self.shared_state, "allow_entry_below_significant_floor", False)
     )
-    
+
     # Check if entry is below significant floor
     if quote_amount < significant_floor:
         if not allow_below_floor:
@@ -128,7 +128,7 @@ async def _check_entry_floor_guard(
             )
             self.logger.info(reason)
             return True, reason
-    
+
     # Entry above floor - always allowed
     return True, "[EM:ENTRY_FLOOR_GUARD] Entry floor check passed"
 ```
@@ -260,7 +260,7 @@ raw = await self._place_market_order_qty(...)
 def test_flag_consistency():
     config = Config()
     shared_state = SharedState(config)
-    
+
     assert hasattr(config, "dust_liquidation_enabled")
     assert not hasattr(config, "DUST_LIQUIDATION_ENABLED")  # uppercase removed
     assert config.dust_liquidation_enabled == shared_state.dust_liquidation_enabled
@@ -270,14 +270,14 @@ def test_flag_consistency():
 ```python
 async def test_guard_blocks_entry():
     executor = ExecutionManager(...)
-    
+
     # Entry below floor without override
     allowed, reason = await executor._check_entry_floor_guard(
         symbol="BTCUSDT",
         quote_amount=15.0,
         is_dust_healing_buy=False
     )
-    
+
     assert not allowed
     assert "ENTRY_FLOOR_GUARD" in reason
 ```
@@ -287,13 +287,13 @@ async def test_guard_blocks_entry():
 async def test_guard_respects_override():
     executor = ExecutionManager(...)
     executor.shared_state.allow_entry_below_significant_floor = True
-    
+
     allowed, reason = await executor._check_entry_floor_guard(
         symbol="BTCUSDT",
         quote_amount=15.0,
         is_dust_healing_buy=False
     )
-    
+
     assert allowed
     assert "OVERRIDE" in reason
 ```
@@ -302,13 +302,13 @@ async def test_guard_respects_override():
 ```python
 async def test_guard_bypasses_healing():
     executor = ExecutionManager(...)
-    
+
     allowed, reason = await executor._check_entry_floor_guard(
         symbol="BTCUSDT",
         quote_amount=15.0,
         is_dust_healing_buy=True
     )
-    
+
     assert allowed
     assert "healing" in reason.lower()
 ```

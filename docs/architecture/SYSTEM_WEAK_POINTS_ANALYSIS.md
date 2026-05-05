@@ -1,15 +1,15 @@
 # System Weak Points Analysis
-**Generated**: April 26, 2026  
-**System Status**: LIVE (deployed)  
-**Critical Issues Found**: 12  
-**High Priority Issues**: 8  
+**Generated**: April 26, 2026
+**System Status**: LIVE (deployed)
+**Critical Issues Found**: 12
+**High Priority Issues**: 8
 
 ---
 
 ## CRITICAL WEAK POINTS 🔴
 
 ### 1. **Phantom Position Handling (Recently "Fixed" but Fragile)**
-**Severity**: CRITICAL  
+**Severity**: CRITICAL
 **Current Status**: Deployed phantom detection in code but...
 
 **The Problem**:
@@ -35,7 +35,7 @@ if self._detect_phantom_position(sym, pos_qty):
 - Repair scenario B: Delete from local state ✓
 - BUT: No timeout mechanism to prevent infinite retry loops
 
-**Recommendation**: 
+**Recommendation**:
 - Add max_repair_attempts timeout (currently exists but check enforcement)
 - Implement force liquidation after max attempts
 - Add time-based escape hatch (e.g., force-resolve after 5 minutes)
@@ -43,7 +43,7 @@ if self._detect_phantom_position(sym, pos_qty):
 ---
 
 ### 2. **Gate System Over-Enforcement (Too Restrictive)**
-**Severity**: CRITICAL  
+**Severity**: CRITICAL
 **Evidence**: System generating 6+ signals but executing ZERO trades
 
 **The Problem**:
@@ -101,7 +101,7 @@ BOTTLENECK: Gate 1 (Confidence)
 ---
 
 ### 3. **Bootstrap Mechanism Can Lock Indefinitely**
-**Severity**: CRITICAL  
+**Severity**: CRITICAL
 **Status**: Recently "fixed" with per-cycle reset but...
 
 **The Problem**:
@@ -114,7 +114,7 @@ BOTTLENECK: Gate 1 (Confidence)
 class BootstrapDustBypassManager:
     # Old behavior: One-shot only
     # New behavior: Per-cycle reset
-    
+
     # BUT: What defines a "cycle"?
     # - Loop iteration? (18-22 seconds each)
     # - Time window? (not specified)
@@ -143,7 +143,7 @@ class BootstrapDustBypassManager:
 ---
 
 ### 4. **Position Tracking Sync Issues (Root of Phantom Problem)**
-**Severity**: CRITICAL  
+**Severity**: CRITICAL
 **Root Cause**: Local position state ≠ Exchange position state
 
 **The Problem**:
@@ -185,7 +185,7 @@ Result: MISMATCH → Phantom created
 ## HIGH PRIORITY WEAK POINTS 🟠
 
 ### 5. **Capital Allocation Too Conservative**
-**Severity**: HIGH  
+**Severity**: HIGH
 **Current State**: $49.73 available but very restricted trading
 
 **The Problem**:
@@ -222,7 +222,7 @@ Capital Allocation:
 ---
 
 ### 6. **Signal Generation Quality Unknown**
-**Severity**: HIGH  
+**Severity**: HIGH
 **Status**: 6 signals in cache, 0 trades executed
 
 **The Problem**:
@@ -263,7 +263,7 @@ Average PnL/Trade: UNKNOWN
 ---
 
 ### 7. **No Automated Recovery from Crashes**
-**Severity**: HIGH  
+**Severity**: HIGH
 **Status**: Crash at loop 1195 required manual intervention
 
 **The Problem**:
@@ -301,7 +301,7 @@ BUT: What do they do on failure?
 ---
 
 ### 8. **Deadlock Detection Without Resolution**
-**Severity**: HIGH  
+**Severity**: HIGH
 **Status**: System detects deadlock but just logs it
 
 **The Problem**:
@@ -333,7 +333,7 @@ if deadlock_detected:
 ---
 
 ### 9. **No Market Liquidity Checks**
-**Severity**: HIGH  
+**Severity**: HIGH
 **Status**: System may trade illiquid symbols
 
 **The Problem**:
@@ -367,7 +367,7 @@ Current System:
 ---
 
 ### 10. **Multi-Layer Gate System Not Transparent**
-**Severity**: HIGH  
+**Severity**: HIGH
 **Status**: 3 gates but logs don't show all rejections
 
 **The Problem**:
@@ -403,7 +403,7 @@ Gate 3: Capital Floor
 ---
 
 ### 11. **Error Handling Too Broad (Swallows Issues)**
-**Severity**: HIGH  
+**Severity**: HIGH
 **Status**: Too many try-catch blocks catching all errors
 
 **The Problem**:
@@ -440,7 +440,7 @@ except Exception as e:  # ← TOO BROAD!
 ---
 
 ### 12. **No Profit Tracking Per Trade**
-**Severity**: HIGH  
+**Severity**: HIGH
 **Status**: PnL shows +0.00 but can't trace source
 
 **The Problem**:

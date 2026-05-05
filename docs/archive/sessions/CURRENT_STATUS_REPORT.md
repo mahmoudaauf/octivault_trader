@@ -1,7 +1,7 @@
 # 📊 CURRENT RUN STATUS REPORT
 
-**Scan Date**: April 27, 2026 @ 22:54 UTC  
-**Bot Uptime**: 5+ hours (since ~19:18 UTC)  
+**Scan Date**: April 27, 2026 @ 22:54 UTC
+**Bot Uptime**: 5+ hours (since ~19:18 UTC)
 **Current Process**: PID 737 (RUNNING)
 
 ---
@@ -124,7 +124,7 @@ Step 2: Pass All Gates (tradeability, regime, etc.)
 
 Step 3: Capital Sufficiency Check
    Status: ❌ FAILING ($21.57 < $25.00)
-   
+
 Step 4: Execute Trade
    Status: ❌ NEVER REACHED (blocked at step 3)
 
@@ -246,7 +246,7 @@ Deadlock Status:        ✅ NOT DEADLOCKED (system healthy, just blocked)
 1. Batch liquidate dust positions
    - Breaks capital away from dust
    - Could free additional $80+
-   
+
 2. Lower capital floor ratio
    - Currently 10% of NAV
    - Could reduce to 5%
@@ -319,4 +319,3 @@ With $5 entry:   Can afford 4 trades (have $21.57)
 ---
 
 **Ready for action?** The fix is simple - just need to reduce entry size in .env and restart.
-

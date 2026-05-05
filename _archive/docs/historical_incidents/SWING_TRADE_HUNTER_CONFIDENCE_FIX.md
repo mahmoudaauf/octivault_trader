@@ -1,8 +1,8 @@
 # ✅ SWING TRADE HUNTER CONFIDENCE FIX
 
-**Date:** May 3, 2026  
-**Issue:** All trades being skipped - confidence threshold mismatch  
-**Status:** FIXED  
+**Date:** May 3, 2026
+**Issue:** All trades being skipped - confidence threshold mismatch
+**Status:** FIXED
 
 ---
 
@@ -26,7 +26,7 @@ Firing: confidence check: 0.65 < 0.75? → REJECT ✗
 
 ## The Fix
 
-**File Modified:**  
+**File Modified:**
 `agents/swing_trade_hunter.py` Line 937
 
 **Change:**
@@ -66,9 +66,9 @@ Result: TRADES PROCEED ✅
 
 ## Verification
 
-✅ **Syntax verified:** `python3 -m py_compile agents/swing_trade_hunter.py` PASSED  
-✅ **Change confirmed:** `grep -A 5 "base_confidence = 0.80"`  
-✅ **No breaking changes:** Only modifies confidence output, no logic changes  
+✅ **Syntax verified:** `python3 -m py_compile agents/swing_trade_hunter.py` PASSED
+✅ **Change confirmed:** `grep -A 5 "base_confidence = 0.80"`
+✅ **No breaking changes:** Only modifies confidence output, no logic changes
 
 ---
 

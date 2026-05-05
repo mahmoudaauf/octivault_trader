@@ -2,10 +2,10 @@
 
 ## Status: ✅ SYSTEM OPERATIONAL
 
-**Runtime**: 2+ minutes  
-**Signals Generated**: 497 BUY signals  
-**Trade Intents Submitted**: 95,542+  
-**Agent Manager Batches**: 47,771+  
+**Runtime**: 2+ minutes
+**Signals Generated**: 497 BUY signals
+**Trade Intents Submitted**: 95,542+
+**Agent Manager Batches**: 47,771+
 
 ---
 
@@ -19,7 +19,7 @@
 
 ### Problem #2: EMA Requirement Too Strict
 **Issue**: System required price to be BELOW EMA20 (downtrend), rejecting uptrends
-**Solution**: 
+**Solution**:
 - Changed `DIPSNIPER_REQUIRE_BELOW_EMA` default from `True` → **`False`**
 - Lowered `DIPSNIPER_MIN_SCORE` from 2 → **1**
 - File: `agents/dip_sniper.py` line 442-443
@@ -50,7 +50,7 @@
 # Before
 return float(self._cfg("DIP_THRESHOLD_PERCENT", 0.2))
 
-# After  
+# After
 return float(self._cfg("DIP_THRESHOLD_PERCENT", 0.05))
 ```
 
@@ -79,7 +79,7 @@ dip_deep_enough = dip_percent >= dip_thr
 # Before
 condition = (bool(dip_deep_enough) and (score >= max(1, min_score)) and (price_below_ema if require_ema else True)) or uptrend_momentum
 
-# After  
+# After
 condition = (bool(dip_deep_enough) and (score >= max(1, min_score))) or uptrend_momentum
 ```
 
@@ -112,9 +112,9 @@ Signal confidence: 0.83 (83%) ✅
 [DipSniper] 📤 BUY signal: AXSUSDT conf=0.83 dip=5.09%
 ```
 
-- **Asset**: AXSUSDT  
-- **Confidence**: 83%  
-- **Dip Depth**: 5.09%  
+- **Asset**: AXSUSDT
+- **Confidence**: 83%
+- **Dip Depth**: 5.09%
 - **Status**: ✅ Actionable
 
 ---

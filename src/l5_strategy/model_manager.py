@@ -1,25 +1,20 @@
 import logging
 import os
-import json
-import time
 import re
+import time
 from collections import defaultdict
 
 try:
     import tensorflow as tf
 except ImportError:
     tf = None
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from typing import Optional, List, Dict, Any, Union, Tuple
-from collections import deque
-import random
 import os
 import time
+from pathlib import Path
+from typing import Any, Optional, Union
 
 # --- Setup Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ModelManager")
 logger.setLevel(logging.INFO)
 
@@ -29,7 +24,7 @@ logger.setLevel(logging.INFO)
 KERAS_EXT = ".keras"
 LEGACY_EXT = ".h5"
 _LOG_THROTTLE_SEC = 120.0
-_LAST_LOG_TS: Dict[str, float] = defaultdict(float)
+_LAST_LOG_TS: dict[str, float] = defaultdict(float)
 _INCOMPATIBLE_QUARANTINE_DIR = "_incompatible_quarantine"
 
 
@@ -42,14 +37,14 @@ def _auto_cleanup_incompatible_enabled() -> bool:
     return _is_truthy(os.getenv("MODEL_AUTO_CLEANUP_INCOMPATIBLE", "true"))
 
 
-def _classify_model_load_error(exc: Exception) -> Tuple[bool, str]:
+def _classify_model_load_error(exc: Exception) -> tuple[bool, str]:
     """
     Classify model-load exceptions that should trigger quarantine cleanup.
     """
     msg = str(exc or "")
     lower = msg.lower()
 
-    signature_map: Dict[str, List[str]] = {
+    signature_map: dict[str, list[str]] = {
         "legacy_inputlayer_batch_shape": [
             "error when deserializing class 'inputlayer'",
             "unrecognized keyword arguments: ['batch_shape']",
@@ -111,7 +106,9 @@ def _quarantine_model_artifact(path: Path, reason: str) -> Optional[Path]:
             try:
                 meta_src.rename(meta_dst)
             except Exception as me:
-                logger.warning("⚠️ Failed moving metadata sidecar to quarantine (%s): %s", meta_src, me)
+                logger.warning(
+                    "⚠️ Failed moving metadata sidecar to quarantine (%s): %s", meta_src, me
+                )
 
         return dst
     except Exception as qe:
@@ -134,30 +131,38 @@ def _log_throttled(level: str, key: str, msg: str, *args):
     else:
         logger.info(msg, *args)
 
+
 def _ensure_models_dir(p: Union[str, Path]) -> Path:
     """Ensures the given directory path exists and returns it as a Path object."""
     p = Path(p)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
+
 def _with_ext(path: Path, ext: str) -> Path:
     """Changes the suffix of a given Path object to the specified extension."""
     return path.with_suffix(ext)
 
-def _paired_paths(path: Path) -> Tuple[Path, Path]:
+
+def _paired_paths(path: Path) -> tuple[Path, Path]:
     """
     Returns a tuple of (keras_path, h5_path) for a given base path,
     ignoring its original extension.
     """
-    base = path.with_suffix("") # Remove any existing suffix
+    base = path.with_suffix("")  # Remove any existing suffix
     return base.with_suffix(KERAS_EXT), base.with_suffix(LEGACY_EXT)
+
 
 # -------------------------------
 # Public API
 # -------------------------------
-def build_model_path(agent_name: str, symbol: str, version: str = "v2",
-                     model_dir: Union[str, Path, None] = None,
-                     use_legacy_h5: bool = False) -> Path:
+def build_model_path(
+    agent_name: str,
+    symbol: str,
+    version: str = "v2",
+    model_dir: Union[str, Path, None] = None,
+    use_legacy_h5: bool = False,
+) -> Path:
     """
     Constructs a standardized file path for a Keras model.
     Defaults to the modern .keras format. Set `use_legacy_h5=True`
@@ -188,7 +193,7 @@ def build_model_path(agent_name: str, symbol: str, version: str = "v2",
         except Exception:
             # Fallback: use relative path if __file__ resolution fails
             model_dir = Path("models")
-    
+
     # Convert to absolute path and ensure directory exists
     base_model_dir = _ensure_models_dir(Path(model_dir).resolve())
     ext = LEGACY_EXT if use_legacy_h5 else KERAS_EXT
@@ -197,6 +202,7 @@ def build_model_path(agent_name: str, symbol: str, version: str = "v2",
     version_key = str(version or "v2").strip() or "v2"
     model_filename = f"{agent_key}_{symbol_key}_{version_key}{ext}"
     return base_model_dir / model_filename
+
 
 def save_model(model, path: Path):
     """
@@ -212,23 +218,25 @@ def save_model(model, path: Path):
         if path.suffix.lower() == LEGACY_EXT:
             logger.warning("Saving in legacy HDF5 (.h5). Prefer the native Keras format (.keras).")
             _ensure_models_dir(path.parent)
-            model.save(path) # Legacy .h5 format is still supported
+            model.save(path)  # Legacy .h5 format is still supported
         else:
             # Always ensure saving with the modern .keras extension
             keras_path = _with_ext(path, KERAS_EXT)
             _ensure_models_dir(keras_path.parent)
             model.save(keras_path)
-            path = keras_path # Update path to reflect the actual saved file
+            path = keras_path  # Update path to reflect the actual saved file
         logger.info(f"💾 Model saved to: {path}")
     except Exception as e:
         logger.error(f"❌ Failed to save model to {path}: {e}")
+
 
 def _try_load(path: Path) -> Any:
     """
     Attempts to load a Keras model from the given path.
     Returns the model if successful, otherwise None, logging any errors.
     """
-    if tf is None: return None
+    if tf is None:
+        return None
     try:
         if path.exists() and path.stat().st_size > 0:
             return tf.keras.models.load_model(path)
@@ -239,7 +247,7 @@ def _try_load(path: Path) -> Any:
             if quarantined is not None:
                 _log_throttled(
                     "warning",
-                    f"model_quarantined:{str(path)}",
+                    f"model_quarantined:{path!s}",
                     "🧹 Auto-cleaned incompatible model: %s -> %s (reason=%s). Will retrain using fresh artifact.",
                     str(path),
                     str(quarantined),
@@ -248,6 +256,7 @@ def _try_load(path: Path) -> Any:
                 return None
         logger.error(f"❌ Error loading model from {path}: {e}")
     return None
+
 
 def load_model(path: Path):
     """
@@ -267,9 +276,9 @@ def load_model(path: Path):
 
     candidates: list[Path] = []
     if primary.suffix.lower() == KERAS_EXT:
-        candidates = [primary, h5_path] # Prefer .keras, then try .h5
+        candidates = [primary, h5_path]  # Prefer .keras, then try .h5
     elif primary.suffix.lower() == LEGACY_EXT:
-        candidates = [primary, keras_path] # Prefer .h5, then try .keras
+        candidates = [primary, keras_path]  # Prefer .h5, then try .keras
     else:
         # No extension or unknown extension provided, try .keras first then .h5
         candidates = [keras_path, h5_path]
@@ -280,14 +289,14 @@ def load_model(path: Path):
         if available_candidates:
             _log_throttled(
                 "warning",
-                f"tf_missing:{str(primary)}",
+                f"tf_missing:{primary!s}",
                 "⚠️ TensorFlow unavailable; model file exists but cannot be loaded: %s",
                 str(available_candidates[0]),
             )
         else:
             _log_throttled(
                 "info",
-                f"model_missing:{str(primary)}",
+                f"model_missing:{primary!s}",
                 "ℹ️ Model file not found yet (expected for bootstrap): %s",
                 str(primary),
             )
@@ -303,18 +312,19 @@ def load_model(path: Path):
     if remaining_candidates:
         _log_throttled(
             "warning",
-            f"model_corrupt_or_incompatible:{str(primary)}",
+            f"model_corrupt_or_incompatible:{primary!s}",
             "⚠️ Failed to load existing model (possibly incompatible/corrupt); tried: %s",
             ", ".join(str(c) for c in candidates),
         )
     else:
         _log_throttled(
             "info",
-            f"model_missing:{str(primary)}",
+            f"model_missing:{primary!s}",
             "ℹ️ Model file not found yet (expected for bootstrap): %s",
             ", ".join(str(c) for c in candidates),
         )
     return None
+
 
 def model_exists(path: Path) -> bool:
     """
@@ -338,6 +348,7 @@ def model_exists(path: Path) -> bool:
             return True
     return False
 
+
 def safe_load_model(path: Path):
     """
     Safely loads a Keras model from a given path if it exists and is valid.
@@ -356,6 +367,7 @@ def safe_load_model(path: Path):
         logger.warning(f"⚠️ Model path does not exist or is empty (checked .keras/.h5): {path}")
         return None
 
+
 # --- ModelManager Class Wrapper ---
 class ModelManager:
     """
@@ -363,11 +375,19 @@ class ModelManager:
     It abstracts away the file extension details, prioritizing the modern .keras format
     while providing backward compatibility with .h5 files.
     """
+
     def __init__(self, config):
         self.config = config
         logger.info("ModelManager initialized.")
 
-    def build_model_path(self, agent_name: str, symbol: str, version: str = "v2", model_dir: Union[str, Path, None] = None, use_legacy_h5: bool = False) -> Path:
+    def build_model_path(
+        self,
+        agent_name: str,
+        symbol: str,
+        version: str = "v2",
+        model_dir: Union[str, Path, None] = None,
+        use_legacy_h5: bool = False,
+    ) -> Path:
         """Proxies to the global `build_model_path` function."""
         return build_model_path(agent_name, symbol, version, model_dir, use_legacy_h5)
 
@@ -386,6 +406,7 @@ class ModelManager:
     def model_exists(self, path: Path) -> bool:
         """Proxies to the global `model_exists` function."""
         return model_exists(path)
+
 
 # --- ModelTrainer Class (Commented out as per original request, for context only) ---
 # This section is typically part of the model_trainer.py, but was present in the provided model_manager.py snippet.

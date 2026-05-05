@@ -1,12 +1,13 @@
 import asyncio
-import logging
-import time
-from datetime import datetime
 import inspect
-import random
 import json
-from typing import Dict, Any, Optional
+import logging
+import random
+import time
 from collections import deque
+from datetime import datetime
+from typing import Any, Optional
+
 from src.l0_core.component_status_logger import ComponentStatusLogger
 
 logger = logging.getLogger("PnLCalculator")
@@ -14,21 +15,22 @@ logger.setLevel(logging.INFO)
 
 OPEN_STATUSES = {"OPEN", "ACTIVE", "RUNNING", "IN_POSITION"}
 
+
 class PnLCalculator:
     def __init__(self, shared_state, config, exchange_client=None, **kwargs):
         self.shared_state = shared_state
         self.config = config
         # allow direct injection OR borrow from SharedState if present
         self.exchange_client = exchange_client or getattr(shared_state, "exchange_client", None)
-        self.evaluation_interval = float(getattr(config, 'PNL_EVALUATION_INTERVAL', 5))  # seconds
+        self.evaluation_interval = float(getattr(config, "PNL_EVALUATION_INTERVAL", 5))  # seconds
         logger.info("PnLCalculator initialized.")
 
         # Rolling realized window cache baseline
         self._last_realized_seen = float(self._read_realized_pnl_total())
-        
+
         # Phase 5: Price cache from WebSocket events
-        self._price_cache: Dict[str, float] = {}
-        
+        self._price_cache: dict[str, float] = {}
+
         # P9 lifecycle
         self._stop_event = asyncio.Event()
         self._task = None
@@ -49,7 +51,10 @@ class PnLCalculator:
         except TypeError as e:
             # Hotfix: some call sites pass only (component, status) but API expects (component, status, detail)
             msg = str(e)
-            if method == "update_component_status" and "missing 1 required positional argument: 'detail'" in msg:
+            if (
+                method == "update_component_status"
+                and "missing 1 required positional argument: 'detail'" in msg
+            ):
                 try:
                     res = fn(*args, "", **kwargs)  # append empty detail
                 except Exception:
@@ -61,7 +66,7 @@ class PnLCalculator:
         return res
 
     @staticmethod
-    def _is_open(trade: Dict[str, Any]) -> bool:
+    def _is_open(trade: dict[str, Any]) -> bool:
         status = (str(trade.get("status") or trade.get("trade_status") or "")).upper()
         return status in OPEN_STATUSES
 
@@ -78,7 +83,7 @@ class PnLCalculator:
             pass
         return float(getattr(self.shared_state, "realized_pnl", 0.0) or 0.0)
 
-    async def _get_active_trades_snapshot(self) -> Dict[str, Dict[str, Any]]:
+    async def _get_active_trades_snapshot(self) -> dict[str, dict[str, Any]]:
         """
         Unified way to obtain open/active trades without relying on a specific internal attribute.
         Tries:
@@ -101,7 +106,9 @@ class PnLCalculator:
                 got = self.shared_state.get_positions_snapshot()
                 pos = await got if inspect.isawaitable(got) else got
                 if isinstance(pos, dict):
-                    return {k: v for k, v in pos.items() if isinstance(v, dict) and self._is_open(v)}
+                    return {
+                        k: v for k, v in pos.items() if isinstance(v, dict) and self._is_open(v)
+                    }
             except Exception as e:
                 logger.debug(f"[PnLCalculator] get_positions_snapshot failed: {e}")
 
@@ -124,7 +131,7 @@ class PnLCalculator:
     async def _get_latest_price(self, symbol: str) -> Optional[float]:
         """
         Phase 5: Get price from memory-first cascade (0 API calls by default).
-        
+
         Strategy 1: Check SharedState.prices (WebSocket, <1ms, 0 API)
         Strategy 2: Check price cache from events (<1ms, 0 API)
         Strategy 3: Check fallback methods (<10ms, 0 API)
@@ -136,14 +143,14 @@ class PnLCalculator:
             if price is not None and price > 0:
                 logger.debug(f"[PnLCalculator] Got price {symbol} from memory: {price}")
                 return float(price)
-        
+
         # Strategy 2: Check event-based price cache
         if symbol in self._price_cache:
             cached_price = self._price_cache[symbol]
             if cached_price and cached_price > 0:
                 logger.debug(f"[PnLCalculator] Got price {symbol} from event cache: {cached_price}")
                 return float(cached_price)
-        
+
         # Strategy 3: Fallback methods (same as before, 0 API)
         # 3a) get_latest_price_safe
         if hasattr(self.shared_state, "get_latest_price_safe"):
@@ -194,15 +201,17 @@ class PnLCalculator:
                     return float(last[4])
         except Exception:
             pass
-        
+
         # Strategy 4: Optional REST (if allowed by config)
         allow_rest = bool(getattr(self.config, "PNL_ALLOW_REST", False))
         if not allow_rest:
-            logger.debug(f"[PnLCalculator] No price for {symbol} - market data not streaming, REST disabled")
+            logger.debug(
+                f"[PnLCalculator] No price for {symbol} - market data not streaming, REST disabled"
+            )
             return None
-        
+
         # REST fallback (institutional trading: disabled by default)
-        if hasattr(self, "exchange_client") and getattr(self, "exchange_client"):
+        if hasattr(self, "exchange_client") and self.exchange_client:
             try:
                 p = await self.exchange_client.get_current_price(symbol)
                 if p and p > 0:
@@ -214,9 +223,9 @@ class PnLCalculator:
         logger.debug(f"[PnLCalculator] Failed to get price for {symbol} from any source")
         return None
 
-    def _readiness_snapshot(self) -> Dict[str, bool]:
+    def _readiness_snapshot(self) -> dict[str, bool]:
         """Best-effort readiness snapshot from SharedState for gating decisions."""
-        snap: Dict[str, bool] = {
+        snap: dict[str, bool] = {
             "market_data_ready": True,
             "balances_ready": True,
             "ops_plane_ready": True,
@@ -266,7 +275,9 @@ class PnLCalculator:
             side = (trade.get("side") or "").upper()
 
             if entry_price is None or qty in (None, 0, 0.0):
-                logger.debug(f"[PnLCalculator] Incomplete trade data for {symbol}: entry={entry_price}, qty={qty} -> skip")
+                logger.debug(
+                    f"[PnLCalculator] Incomplete trade data for {symbol}: entry={entry_price}, qty={qty} -> skip"
+                )
                 continue
 
             current_price = await self._get_latest_price(symbol)
@@ -281,7 +292,9 @@ class PnLCalculator:
                 pnl = (float(entry_price) - float(current_price)) * float(qty)
             else:
                 pnl = 0.0
-                logger.debug(f"[PnLCalculator] Unknown side/direction for {symbol} (dir='{direction}', side='{side}') -> pnl=0")
+                logger.debug(
+                    f"[PnLCalculator] Unknown side/direction for {symbol} (dir='{direction}', side='{side}') -> pnl=0"
+                )
 
             total_unrealized_pnl += pnl
             # Best-effort write-back to trade dict (non-fatal if it fails)
@@ -295,9 +308,9 @@ class PnLCalculator:
             try:
                 await self.shared_state.set_unrealized_pnl(total_unrealized_pnl)
             except Exception:
-                setattr(self.shared_state, "unrealized_pnl", total_unrealized_pnl)
+                self.shared_state.unrealized_pnl = total_unrealized_pnl
         else:
-            setattr(self.shared_state, "unrealized_pnl", total_unrealized_pnl)
+            self.shared_state.unrealized_pnl = total_unrealized_pnl
 
     async def _calculate_total_portfolio_value(self):
         """
@@ -310,17 +323,18 @@ class PnLCalculator:
             if isinstance(snap, dict):
                 total_value = float(snap.get("nav", 0.0))
                 unrealized_pnl = float(snap.get("unrealized_pnl", 0.0))
-                setattr(self.shared_state, "total_value", total_value)
-                setattr(self.shared_state, "unrealized_pnl", unrealized_pnl)
+                self.shared_state.total_value = total_value
+                self.shared_state.unrealized_pnl = unrealized_pnl
             else:
                 total_value = float(getattr(self.shared_state, "total_value", 0.0))
                 unrealized_pnl = float(getattr(self.shared_state, "unrealized_pnl", 0.0))
             realized_pnl = float(self._read_realized_pnl_total())
             await self._maybe_call(
-                self.shared_state, "update_system_health",
+                self.shared_state,
+                "update_system_health",
                 component="PnLCalculator",
                 status="Operational",
-                message="Portfolio value and unrealized PnL calculated successfully."
+                message="Portfolio value and unrealized PnL calculated successfully.",
             )
         except Exception as e:
             logger.debug(f"[PnLCalculator] portfolio snapshot failed: {e}")
@@ -337,7 +351,7 @@ class PnLCalculator:
         except Exception:
             # NAV already reflects wallet + market value
             total_equity = float(getattr(self.shared_state, "total_value", 0.0))
-        setattr(self.shared_state, "total_equity", total_equity)
+        self.shared_state.total_equity = total_equity
 
         # 2) rolling 60m realized PnL feed (append deltas)
         now = time.time()
@@ -349,7 +363,9 @@ class PnLCalculator:
             # Prefer a public API if available; otherwise fall back to internal deque
             if hasattr(self.shared_state, "append_realized_pnl_delta"):
                 try:
-                    await self._maybe_call(self.shared_state, "append_realized_pnl_delta", now, float(delta))
+                    await self._maybe_call(
+                        self.shared_state, "append_realized_pnl_delta", now, float(delta)
+                    )
                 except Exception:
                     pass
             else:
@@ -363,7 +379,7 @@ class PnLCalculator:
         try:
             last60 = await self._maybe_call(self.shared_state, "get_rolling_realized_pnl", 60)
             if last60 is not None:
-                setattr(self.shared_state, "pnl_realized_60m", float(last60))
+                self.shared_state.pnl_realized_60m = float(last60)
         except Exception as e:
             logger.debug(f"[PnLCalculator] Failed to update pnl_realized_60m: {e}")
 
@@ -377,14 +393,14 @@ class PnLCalculator:
             if symbol and price and price > 0:
                 self._price_cache[symbol] = float(price)
                 logger.debug(f"[PnLCalculator] Updated price cache for {symbol}: {price}")
-            
+
             # Trigger PnL recalculation (only if system is ready)
             snap = self._readiness_snapshot()
             if snap.get("market_data_ready", True) and snap.get("balances_ready", True):
                 await self._calculate_unrealized_pnl()
                 await self._calculate_total_portfolio_value()
                 await self._after_valuation_bookkeeping()
-                
+
                 # Emit updated portfolio snapshot
                 try:
                     snapshot = {
@@ -396,10 +412,12 @@ class PnLCalculator:
                         "ts": time.time(),
                     }
                     if hasattr(self.shared_state, "emit_event"):
-                        await self._maybe_call(self.shared_state, "emit_event", "PortfolioSnapshot", snapshot)
+                        await self._maybe_call(
+                            self.shared_state, "emit_event", "PortfolioSnapshot", snapshot
+                        )
                 except Exception:
                     pass
-                
+
                 logger.debug(f"[PnLCalculator] Real-time PnL update triggered by {symbol} price")
         except Exception as e:
             logger.debug(f"[PnLCalculator] Error in _on_price_update for {symbol}: {e}")
@@ -415,13 +433,15 @@ class PnLCalculator:
         self._stop_event.clear()
         # Spawn health loop first (so Watchdog sees us early)
         if not getattr(self, "_health_task", None) or self._health_task.done():
-            self._health_task = asyncio.create_task(self.report_health_loop(), name="pnl_calculator.health")
+            self._health_task = asyncio.create_task(
+                self.report_health_loop(), name="pnl_calculator.health"
+            )
         # Touch timestamp immediately so Watchdog sees us before first tick
         try:
             await self._maybe_call(self.shared_state, "update_timestamp", "PnLCalculator")
         except Exception:
             pass
-        
+
         # Phase 5: Subscribe to price update events
         try:
             if hasattr(self.shared_state, "subscribe"):
@@ -429,14 +449,13 @@ class PnLCalculator:
                 logger.info("[PnLCalculator] Subscribed to price_update events (Phase 5)")
         except Exception as e:
             logger.debug(f"[PnLCalculator] Failed to subscribe to price_update events: {e}")
-        
+
         ComponentStatusLogger.log_status("PnLCalculator", "Initialized", "OK")
         # Main loop
         self._task = asyncio.create_task(self.run(), name="pnl_calculator.run")
         try:
             await self._maybe_call(
-                self.shared_state, "update_component_status",
-                "PnLCalculator", "Initialized", "OK"
+                self.shared_state, "update_component_status", "PnLCalculator", "Initialized", "OK"
             )
         except Exception:
             logger.debug("PnLCalculator initial health update failed", exc_info=True)
@@ -459,7 +478,9 @@ class PnLCalculator:
             try:
                 t.cancel()
                 try:
-                    await asyncio.wait_for(t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0)))
+                    await asyncio.wait_for(
+                        t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0))
+                    )
                 except asyncio.CancelledError:
                     pass
             except Exception:
@@ -467,8 +488,11 @@ class PnLCalculator:
 
         try:
             await self._maybe_call(
-                self.shared_state, "update_component_status",
-                "PnLCalculator", "Stopped", "Stopped by request"
+                self.shared_state,
+                "update_component_status",
+                "PnLCalculator",
+                "Stopped",
+                "Stopped by request",
             )
         except Exception:
             logger.debug("PnLCalculator final health update failed", exc_info=True)
@@ -481,16 +505,15 @@ class PnLCalculator:
 
         logger.info("✅ PnLCalculator is running.")
         ComponentStatusLogger.log_status(
-            component="PnLCalculator",
-            status="Running",
-            detail="Started and reporting health."
+            component="PnLCalculator", status="Running", detail="Started and reporting health."
         )
 
         await self._maybe_call(
-            self.shared_state, "update_system_health",
+            self.shared_state,
+            "update_system_health",
             component="PnLCalculator",
             status="Running",
-            message="Tracking PnL across active trades."
+            message="Tracking PnL across active trades.",
         )
 
         while not self._stop_event.is_set():
@@ -510,15 +533,22 @@ class PnLCalculator:
 
             if gated_reasons:
                 try:
-                    await self._maybe_call(self.shared_state, "update_component_status", "PnLCalculator", "Degraded", f"Gated: waiting for {', '.join(gated_reasons)}")
+                    await self._maybe_call(
+                        self.shared_state,
+                        "update_component_status",
+                        "PnLCalculator",
+                        "Degraded",
+                        f"Gated: waiting for {', '.join(gated_reasons)}",
+                    )
                 except Exception:
                     pass
                 try:
                     await self._maybe_call(
-                        self.shared_state, "update_system_health",
+                        self.shared_state,
+                        "update_system_health",
                         component="PnLCalculator",
                         status="Degraded",
-                        message=f"Waiting for {', '.join(gated_reasons)}"
+                        message=f"Waiting for {', '.join(gated_reasons)}",
                     )
                 except Exception:
                     pass
@@ -529,7 +559,13 @@ class PnLCalculator:
                 await self._calculate_unrealized_pnl()
                 await self._calculate_total_portfolio_value()
                 await self._after_valuation_bookkeeping()
-                await self._maybe_call(self.shared_state, "update_component_status", "PnLCalculator", "Operational", "Valuation OK")
+                await self._maybe_call(
+                    self.shared_state,
+                    "update_component_status",
+                    "PnLCalculator",
+                    "Operational",
+                    "Valuation OK",
+                )
 
                 # Emit a PortfolioSnapshot event (contract-friendly)
                 try:
@@ -541,7 +577,9 @@ class PnLCalculator:
                         "ts": time.time(),
                     }
                     if hasattr(self.shared_state, "emit_event"):
-                        await self._maybe_call(self.shared_state, "emit_event", "PortfolioSnapshot", snapshot)
+                        await self._maybe_call(
+                            self.shared_state, "emit_event", "PortfolioSnapshot", snapshot
+                        )
                 except Exception:
                     pass
 
@@ -565,12 +603,19 @@ class PnLCalculator:
 
             except Exception as e:
                 logger.exception("❌ PnLCalculator encountered an error.")
-                await self._maybe_call(self.shared_state, "update_component_status", "PnLCalculator", "Error", "Exception during valuation")
                 await self._maybe_call(
-                    self.shared_state, "update_system_health",
+                    self.shared_state,
+                    "update_component_status",
+                    "PnLCalculator",
+                    "Error",
+                    "Exception during valuation",
+                )
+                await self._maybe_call(
+                    self.shared_state,
+                    "update_system_health",
                     component="PnLCalculator",
                     status="Error",
-                    message=f"PnLCalculator encountered an error: {e}"
+                    message=f"PnLCalculator encountered an error: {e}",
                 )
 
             # Jitter to avoid phase alignment; warn if cycle exceeds interval
@@ -581,18 +626,22 @@ class PnLCalculator:
                 try:
                     # Keep component status Operational but include the warning detail
                     await self._maybe_call(
-                        self.shared_state, "update_component_status",
-                        "PnLCalculator", "Operational", warn
+                        self.shared_state,
+                        "update_component_status",
+                        "PnLCalculator",
+                        "Operational",
+                        warn,
                     )
                 except Exception:
                     pass
                 try:
                     # Surface to system health as an informational/healthy note
                     await self._maybe_call(
-                        self.shared_state, "update_system_health",
+                        self.shared_state,
+                        "update_system_health",
                         component="PnLCalculator",
                         status="Healthy",
-                        message=warn
+                        message=warn,
                     )
                 except Exception:
                     pass
@@ -618,7 +667,7 @@ class PnLCalculator:
                     "update_system_health",
                     component="PnLCalculator",
                     status="Running",
-                    message="Heartbeat OK"
+                    message="Heartbeat OK",
                 )
                 _emit_health(self.shared_state, "OK", "PnLCalculator heartbeat OK")
             except Exception as e:
@@ -626,10 +675,10 @@ class PnLCalculator:
             await asyncio.sleep(10)  # Must be <= 30s
 
 
-
 # ===== P9 Spec Helpers (added) =====
 def _iso_now():
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
 
 def _emit_health(ss, status: str, message: str):
     """
@@ -639,12 +688,15 @@ def _emit_health(ss, status: str, message: str):
     try:
         if ss and hasattr(ss, "emit_event"):
             try:
-                res = ss.emit_event("HealthStatus", {
-                    "component": "PnLCalculator",
-                    "level": status,
-                    "details": {"message": message},
-                    "ts": _iso_now()
-                })
+                res = ss.emit_event(
+                    "HealthStatus",
+                    {
+                        "component": "PnLCalculator",
+                        "level": status,
+                        "details": {"message": message},
+                        "ts": _iso_now(),
+                    },
+                )
                 if inspect.isawaitable(res):
                     asyncio.create_task(res)
             except Exception:
@@ -652,12 +704,10 @@ def _emit_health(ss, status: str, message: str):
     except Exception:
         pass
 
+
 def _emit_realized_pnl(ss, pnl_delta: float, nav_quote: float = None, symbol: str = None):
     try:
-        payload = {
-            "pnl_delta": float(pnl_delta or 0.0),
-            "timestamp": _iso_now()
-        }
+        payload = {"pnl_delta": float(pnl_delta or 0.0), "timestamp": _iso_now()}
         if symbol:
             payload["symbol"] = symbol
         if nav_quote is not None:
@@ -673,13 +723,13 @@ def _emit_realized_pnl(ss, pnl_delta: float, nav_quote: float = None, symbol: st
         pass
 
 
-
 # ===== P9 Emission Wrappers (added) =====
 def _wrap_emit_realized_pnl_on_methods(cls, shared_state_attr: str = "shared_state"):
     target_methods = ["on_fill", "handle_fill", "record_fill", "apply_fill", "update_on_fill"]
     for name in target_methods:
         if hasattr(cls, name) and not hasattr(cls, f"_{name}_raw"):
             setattr(cls, f"_{name}_raw", getattr(cls, name))
+
             def _make_wrapper(mname):
                 def _wrapped(self, *a, **kw):
                     res = getattr(cls, f"_{mname}_raw")(self, *a, **kw)
@@ -710,7 +760,9 @@ def _wrap_emit_realized_pnl_on_methods(cls, shared_state_attr: str = "shared_sta
                         _emit_realized_pnl(ss, pnl_delta, nav_quote=nav, symbol=symbol)
                         _emit_health(ss, "OK", f"RealizedPnlUpdated delta={pnl_delta}")
                     return res
+
                 return _wrapped
+
             setattr(cls, name, _make_wrapper(name))
     return cls
 

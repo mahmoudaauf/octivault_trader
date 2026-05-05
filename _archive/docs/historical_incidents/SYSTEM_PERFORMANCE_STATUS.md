@@ -24,9 +24,9 @@ The logs show signals at **0.65 confidence** which means:
 ## 📊 System Metrics (Last 30 Minutes)
 
 ### Trading Activity
-- **Signals Generated:** 8 symbols × 0.65 confidence 
+- **Signals Generated:** 8 symbols × 0.65 confidence
   - BTCUSDT, BNBUSDT, SOLUSDT, ADAUSDT, LINKUSDT, DOGEUSDT, PEPEUSDT, ETHUSDT
-- **Trades Executed:** 0 
+- **Trades Executed:** 0
   - Reason: All signals rejected due to 0.65 < 0.75 threshold
 - **Capital Deployed:** $0 USDT
 - **NAV Change:** Flat (no trading activity)

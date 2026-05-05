@@ -1,7 +1,7 @@
 # 🔄 THE DUST CREATION CYCLE: Propose → Execute → SELL → Dust Loop
 
-**Date:** April 27, 2026  
-**Status:** SECOND PATHWAY IDENTIFIED  
+**Date:** April 27, 2026
+**Status:** SECOND PATHWAY IDENTIFIED
 **Severity:** CRITICAL - Creates endless dust recycling
 
 ---
@@ -98,7 +98,7 @@ async def _build_decisions(self, accepted_symbols_set: set):
     # PHASE 2 FIX: Check if dust ratio > 60% and sustained
     dust_ratio = dust_pos / total  # e.g., 0.80 (80% dust!)
     phase2_age = time.time() - phase2_trigger_time
-    
+
     if dust_ratio > 0.60 and phase2_age >= 300.0:  # 5+ minutes
         # TRIGGER: Generate aggressive SELL signals for all dust
         for sym, qty, value_usdt in dust_to_liquidate:
@@ -157,10 +157,10 @@ The issue is the **timing**:
 for sym, qty, value_usdt, pos_age_sec in dust_to_liquidate:
     # ⚠️ NO CHECK on pos_age_sec minimum age
     # Positions can be liquidated at ANY age
-    
+
     if should_execute or escape_sell:
         executable_dust.append((sym, qty, value_usdt, pos_age_sec))
-        
+
     # Generate SELL immediately for executable dust
     dust_sell_sig = {
         "symbol": sym,
@@ -297,7 +297,7 @@ for sym, qty, value_usdt, pos_age_sec in dust_to_liquidate:
             sym, pos_age_sec, DUST_MIN_AGE_BEFORE_LIQUIDATION
         )
         continue  # Don't liquidate yet
-    
+
     # Only then generate SELL
     executable_dust.append((sym, qty, value_usdt, pos_age_sec))
 ```
@@ -319,7 +319,7 @@ if await self._is_in_dust_liquidation_phase():
             current_dust_ratio * 100
         )
         # Filter out sub-floor entries
-        buy_signals = [s for s in buy_signals 
+        buy_signals = [s for s in buy_signals
                       if s.get("planned_quote", 0) >= 20.0]
 ```
 
@@ -339,21 +339,21 @@ async def _can_liquidate_dust(self, symbol: str, position_age_sec: float) -> boo
     min_age = 3600  # 1 hour
     if position_age_sec and position_age_sec < min_age:
         return False
-    
+
     # Healing-based: did it grow enough?
     sym = self._normalize_symbol(symbol)
     pos = self.shared_state.get_position_qty(sym)
     value = (pos or 0) * await self.shared_state.safe_price(sym)
     min_notional = await self._get_min_notional(sym)
-    
+
     if value >= min_notional * 2.0:
         return True  # It grew out of dust
-    
+
     # Rejection-based: is it stuck?
     rejection_count = self.shared_state.get_rejection_count(sym, "SELL")
     if rejection_count > 5:
         return True  # Give up, liquidate it
-    
+
     return False
 ```
 

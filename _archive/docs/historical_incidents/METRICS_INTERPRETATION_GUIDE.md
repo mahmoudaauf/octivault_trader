@@ -409,7 +409,7 @@ Your test run: +1.66% in 5.7 hours ≈ +0.3%/hour
 ### Tracking Your Compounding
 ```
 Week 1: $84.62 → $85.15 (+0.63%)
-Week 2: $85.15 → $86.93 (+2.09%) 
+Week 2: $85.15 → $86.93 (+2.09%)
 Week 3: $86.93 → $90.24 (+3.81%)
 Week 4: $90.24 → $95.67 (+6.02%) ← Exponential effect visible
 ```

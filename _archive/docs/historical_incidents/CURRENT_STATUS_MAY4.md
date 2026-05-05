@@ -15,7 +15,7 @@
 - **Qty:** 0.293 SOL @ $84.99 = **$24.90**
 - **Status:** ✅ FILLED
 
-### Trade 2: ETHUSDT BUY  
+### Trade 2: ETHUSDT BUY
 - **Time:** 15:23:37 UTC (ML Strategy)
 - **Qty:** 0.0109 ETH @ $2,344.91 = **$25.56**
 - **Status:** ✅ FILLED
@@ -101,5 +101,5 @@ Once free capital reaches **$10+**, the system will:
 
 ---
 
-**Report Generated:** 2026-05-04 18:26:10 UTC  
+**Report Generated:** 2026-05-04 18:26:10 UTC
 **Next Update:** Auto-refresh when capital ≥ $10.00

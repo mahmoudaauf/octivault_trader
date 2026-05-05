@@ -40,14 +40,14 @@ generate_checkpoint_report() {
     local remaining_seconds=$((SESSION_DURATION_SECONDS - elapsed_seconds))
     local remaining_minutes=$((remaining_seconds / 60))
     local remaining_hours=$((remaining_minutes / 60))
-    
+
     local checkpoint_file="$WORKSPACE/SESSION_8H_CHECKPOINT_${checkpoint_num}.md"
     local current_time=$(date "+%Y-%m-%d %H:%M:%S")
-    
+
     echo "📊 CHECKPOINT #$checkpoint_num - $current_time"
     echo "=========================================="
     echo ""
-    
+
     # Get last trades
     local trades_count=$(grep -c "TRADE EXECUTED" "$LOG_FILE" 2>/dev/null || echo "0")
     local trades_success=$(grep -c "TRADE EXECUTED.*status.*success" "$LOG_FILE" 2>/dev/null || echo "0")
@@ -56,16 +56,16 @@ generate_checkpoint_report() {
     if [ "$trades_count" -gt 0 ]; then
         win_rate=$((trades_success * 100 / trades_count))%
     fi
-    
+
     # Get current balance
     local current_balance=$(grep "balance.*USDT" "$LOG_FILE" 2>/dev/null | tail -1 || echo "N/A")
-    
+
     # Get backtest status
     local backtest_status=$(grep "backtest.*gate" "$LOG_FILE" 2>/dev/null | tail -1 || echo "N/A")
-    
+
     # Get latest signal
     local latest_signal=$(grep "signal.*confidence" "$LOG_FILE" 2>/dev/null | tail -1 || echo "N/A")
-    
+
     # Create checkpoint report
     cat > "$checkpoint_file" << CHECKPOINT_EOF
 # 📊 SESSION 8H CHECKPOINT #$checkpoint_num
@@ -132,7 +132,7 @@ while [ $CHECKPOINT_COUNT -lt $MAX_CHECKPOINTS ]; do
     # Calculate elapsed time
     CURRENT_TIME=$(date +%s)
     ELAPSED_SECONDS=$((CURRENT_TIME - SESSION_START_TIME))
-    
+
     # Check if we should generate checkpoint
     if [ $((ELAPSED_SECONDS % CHECKPOINT_INTERVAL_SECONDS)) -lt 5 ] || [ $CHECKPOINT_COUNT -eq 0 ]; then
         CHECKPOINT_COUNT=$((CHECKPOINT_COUNT + 1))
@@ -140,14 +140,14 @@ while [ $CHECKPOINT_COUNT -lt $MAX_CHECKPOINTS ]; do
         echo ""
         sleep 5
     fi
-    
+
     # Check if session is complete
     if [ $ELAPSED_SECONDS -ge $SESSION_DURATION_SECONDS ]; then
         echo "✅ 8-HOUR SESSION COMPLETE!"
         echo "Final checkpoint #$CHECKPOINT_COUNT generated"
         break
     fi
-    
+
     sleep 10
 done
 

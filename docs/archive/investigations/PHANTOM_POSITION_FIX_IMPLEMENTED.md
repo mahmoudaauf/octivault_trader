@@ -2,8 +2,8 @@
 
 ## Status: READY FOR DEPLOYMENT
 
-Date: April 25, 2026  
-Session: Phantom Position Repair Implementation  
+Date: April 25, 2026
+Session: Phantom Position Repair Implementation
 Status: **COMPLETE** - All 4 phases integrated into execution_manager.py
 
 ---
@@ -91,7 +91,7 @@ if self._detect_phantom_position(sym, pos_qty):
         # Re-fetch qty and continue normal close
     else:
         # Return BLOCKED status (prevents infinite retry loop)
-        return {"ok": False, "status": "BLOCKED", 
+        return {"ok": False, "status": "BLOCKED",
                 "error_code": "PHANTOM_UNRESOLVED", ...}
 ```
 

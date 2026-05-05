@@ -28,7 +28,7 @@ components=(
 for component in "${components[@]}"; do
     file="${component%%:*}"
     desc="${component##*:}"
-    
+
     if [ -f "$file" ]; then
         echo "✅ $file"
         echo "   └─ $desc"

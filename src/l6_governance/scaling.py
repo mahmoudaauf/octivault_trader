@@ -12,51 +12,58 @@ This module is responsible for all scaling-related decisions
 and calculations, keeping MetaController focused on orchestration.
 """
 
-from typing import Dict, Any, List, Optional, TYPE_CHECKING, Tuple
-import logging
-from decimal import Decimal
-import time
 import asyncio
 import inspect
+import logging
+import time
+from typing import TYPE_CHECKING, Any, Optional
+
 from src.l6_governance.adaptive_capital_engine import AdaptiveCapitalEngine
 
 if TYPE_CHECKING:
+    from src.l0_core.config import Config
     from src.l0_core.shared_state import SharedState
     from src.l4_execution.execution_manager import ExecutionManager
-    from src.l0_core.config import Config
     from src.l6_governance.mode_manager import ModeManager
 
 
 class ScalingManager:
     """
     Manages position scaling, compounding, and adaptive sizing logic.
-    
+
     Responsibilities:
     - Detect scale-in opportunities for winning positions
     - Scale trade quotes based on account size
     - Validate scaling eligibility
     - Generate compounding signals
     """
-    
-    def __init__(self, shared_state: "SharedState", execution_manager: "ExecutionManager", config: "Config", logger: logging.Logger, mode_manager: Optional["ModeManager"] = None):
+
+    def __init__(
+        self,
+        shared_state: "SharedState",
+        execution_manager: "ExecutionManager",
+        config: "Config",
+        logger: logging.Logger,
+        mode_manager: Optional["ModeManager"] = None,
+    ):
         self.shared_state = shared_state
         self.execution_manager = execution_manager
         self.config = config
         self.logger = logger
         self.mode_manager = mode_manager
-        
+
         # Configuration
         # Phase‑9 wealth engine tuning - lower friction to allow safe compounding but
         # prevent rapid startup flip. Defaults: 3 minutes and 0.2% pnl.
-        self._scale_in_min_age_min = float(getattr(config, 'SCALE_IN_MIN_AGE_MIN', 3.0))
+        self._scale_in_min_age_min = float(getattr(config, "SCALE_IN_MIN_AGE_MIN", 3.0))
         # NOTE: this value is in percent units (e.g. 0.2 == 0.2%) because pnl_pct is computed *100
-        self._scale_in_min_pnl_pct = float(getattr(config, 'SCALE_IN_MIN_PNL_PCT', 0.2))
-        self._default_planned_quote = float(getattr(config, 'DEFAULT_PLANNED_QUOTE', 20.0))
-        
+        self._scale_in_min_pnl_pct = float(getattr(config, "SCALE_IN_MIN_PNL_PCT", 0.2))
+        self._default_planned_quote = float(getattr(config, "DEFAULT_PLANNED_QUOTE", 20.0))
+
         # Account size thresholds for adaptive scaling
         self._large_account_threshold = 1000.0  # $1000+
         self._medium_account_threshold = 300.0  # $300+
-        
+
         # Risk percentages by account size
         self._large_account_risk_pct = 0.01  # 1% per trade
         self._medium_account_risk_pct = 0.02  # 2% per trade
@@ -70,9 +77,7 @@ class ScalingManager:
                 getattr(config, "COMPOUNDING_GROWTH_CURVE_ENABLED", True),
             )
         )
-        configured_growth_phases = list(
-            getattr(config, "COMPOUNDING_GROWTH_PHASES", []) or []
-        )
+        configured_growth_phases = list(getattr(config, "COMPOUNDING_GROWTH_PHASES", []) or [])
         if not configured_growth_phases:
             configured_growth_phases = [
                 {
@@ -129,9 +134,7 @@ class ScalingManager:
                 },
             ]
         self._compounding_growth_phases = self._normalize_growth_phases(configured_growth_phases)
-        configured_growth_thresholds = list(
-            getattr(config, "GROWTH_PHASE_THRESHOLDS", []) or []
-        )
+        configured_growth_thresholds = list(getattr(config, "GROWTH_PHASE_THRESHOLDS", []) or [])
         if not configured_growth_thresholds:
             configured_growth_thresholds = [
                 {"name": "PHASE_1_SEED", "min_ratio": 0.0, "max_ratio": 1.25},
@@ -139,13 +142,11 @@ class ScalingManager:
                 {"name": "PHASE_3_ACCELERATE", "min_ratio": 1.75, "max_ratio": 2.50},
                 {"name": "PHASE_4_SNOWBALL", "min_ratio": 2.50, "max_ratio": None},
             ]
-        self._growth_phase_thresholds = self._normalize_growth_thresholds(configured_growth_thresholds)
-        self._phase_size_multipliers = dict(
-            getattr(config, "PHASE_SIZE_MULTIPLIERS", {}) or {}
+        self._growth_phase_thresholds = self._normalize_growth_thresholds(
+            configured_growth_thresholds
         )
-        self._phase_max_trade_cap = dict(
-            getattr(config, "PHASE_MAX_TRADE_CAP", {}) or {}
-        )
+        self._phase_size_multipliers = dict(getattr(config, "PHASE_SIZE_MULTIPLIERS", {}) or {})
+        self._phase_max_trade_cap = dict(getattr(config, "PHASE_MAX_TRADE_CAP", {}) or {})
         self._compounding_drawdown_guard_pct = float(
             getattr(config, "COMPOUNDING_MAX_DRAWDOWN_PCT", 2.5) or 2.5
         )
@@ -166,15 +167,9 @@ class ScalingManager:
         self._dyn_vol_floor_mult = float(
             getattr(config, "DYNAMIC_SIZE_VOL_FLOOR_MULT", 0.70) or 0.70
         )
-        self._dyn_vol_ceil_mult = float(
-            getattr(config, "DYNAMIC_SIZE_VOL_CEIL_MULT", 1.35) or 1.35
-        )
-        self._dyn_momentum_mult = float(
-            getattr(config, "DYNAMIC_SIZE_MOMENTUM_MULT", 0.45) or 0.45
-        )
-        self._dyn_blend_weight = float(
-            getattr(config, "DYNAMIC_SIZE_BLEND_WEIGHT", 0.65) or 0.65
-        )
+        self._dyn_vol_ceil_mult = float(getattr(config, "DYNAMIC_SIZE_VOL_CEIL_MULT", 1.35) or 1.35)
+        self._dyn_momentum_mult = float(getattr(config, "DYNAMIC_SIZE_MOMENTUM_MULT", 0.45) or 0.45)
+        self._dyn_blend_weight = float(getattr(config, "DYNAMIC_SIZE_BLEND_WEIGHT", 0.65) or 0.65)
         self._dyn_upside_cap_mult = float(
             getattr(config, "DYNAMIC_SIZE_UPSIDE_CAP_MULT", 2.25) or 2.25
         )
@@ -182,8 +177,8 @@ class ScalingManager:
             getattr(config, "DYNAMIC_SIZE_MOMENTUM_LOOKBACK_TRADES", 20) or 20
         )
         self._adaptive_engine = AdaptiveCapitalEngine(config, self.logger)
-        self._adaptive_min_trade_quote_by_symbol: Dict[str, float] = {}
-        self._adaptive_min_trade_quote_logged: Dict[str, float] = {}
+        self._adaptive_min_trade_quote_by_symbol: dict[str, float] = {}
+        self._adaptive_min_trade_quote_logged: dict[str, float] = {}
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         """Get config value with fallback."""
@@ -193,7 +188,9 @@ class ScalingManager:
         """Compute realized-only equity for tiering."""
         try:
             base = float(getattr(self.config, "BASE_CAPITAL", 0.0) or 0.0)
-            realized = float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
+            realized = float(
+                getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0
+            )
             return base + realized
         except Exception:
             return 0.0
@@ -204,20 +201,22 @@ class ScalingManager:
             history = list(getattr(self.shared_state, "trade_history", []) or [])
             if not history:
                 return 0.0
-            recent = history[-int(n):]
+            recent = history[-int(n) :]
             return float(sum(float(t.get("realized_delta", 0.0) or 0.0) for t in recent))
         except Exception:
             return 0.0
 
-    def _normalize_growth_phases(self, phases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+    def _normalize_growth_phases(self, phases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
         for idx, phase in enumerate(phases):
             if not isinstance(phase, dict):
                 continue
             p = dict(phase)
             p.setdefault("name", f"PHASE_{idx + 1}")
             p["min_equity"] = float(p.get("min_equity", 0.0) or 0.0)
-            p["max_equity"] = None if p.get("max_equity", None) is None else float(p.get("max_equity"))
+            p["max_equity"] = (
+                None if p.get("max_equity", None) is None else float(p.get("max_equity"))
+            )
             p["min_momentum"] = float(p.get("min_momentum", -9999.0) or -9999.0)
             p["quote_mult"] = float(p.get("quote_mult", 1.0) or 1.0)
             p["risk_mult"] = float(p.get("risk_mult", 1.0) or 1.0)
@@ -230,8 +229,10 @@ class ScalingManager:
         out.sort(key=lambda x: float(x.get("min_equity", 0.0) or 0.0))
         return out
 
-    def _normalize_growth_thresholds(self, thresholds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+    def _normalize_growth_thresholds(
+        self, thresholds: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
         for idx, row in enumerate(thresholds):
             if not isinstance(row, dict):
                 continue
@@ -258,7 +259,7 @@ class ScalingManager:
             return str(self._growth_phase_thresholds[0].get("name", "PHASE_1_SEED"))
         return "PHASE_1_SEED"
 
-    def _phase_from_name(self, phase_name: str) -> Dict[str, Any]:
+    def _phase_from_name(self, phase_name: str) -> dict[str, Any]:
         p_name = str(phase_name or "PHASE_1_SEED")
         phase = next(
             (
@@ -269,7 +270,13 @@ class ScalingManager:
             None,
         )
         if phase is None:
-            phase = {"name": p_name, "quote_mult": 1.0, "risk_mult": 1.0, "min_quote": 0.0, "max_quote": 0.0}
+            phase = {
+                "name": p_name,
+                "quote_mult": 1.0,
+                "risk_mult": 1.0,
+                "min_quote": 0.0,
+                "max_quote": 0.0,
+            }
         phase_cfg = dict(phase)
         phase_cfg["name"] = p_name
         # Config map overrides are authoritative for sizing/caps.
@@ -292,7 +299,7 @@ class ScalingManager:
                 pass
         return phase_cfg
 
-    def _pick_compounding_phase_by_ratio(self, growth_ratio: float) -> Dict[str, Any]:
+    def _pick_compounding_phase_by_ratio(self, growth_ratio: float) -> dict[str, Any]:
         if not self._growth_phase_thresholds:
             return self._phase_from_name("PHASE_1_SEED")
 
@@ -317,6 +324,7 @@ class ScalingManager:
             pass
         try:
             from src.l0_core.core_utils import _safe_await
+
             if hasattr(self.shared_state, "get_nav_quote"):
                 return float(await _safe_await(self.shared_state.get_nav_quote()) or 0.0)
         except Exception:
@@ -352,7 +360,7 @@ class ScalingManager:
             if not history:
                 return 0
             streak = 0
-            for trade in reversed(history[-int(n):]):
+            for trade in reversed(history[-int(n) :]):
                 delta = float(trade.get("realized_delta", 0.0) or 0.0)
                 if delta > 0:
                     streak += 1
@@ -364,7 +372,7 @@ class ScalingManager:
 
     def _sync_compounding_phase_state(
         self,
-        phase: Optional[Dict[str, Any]],
+        phase: Optional[dict[str, Any]],
         equity_base: float,
         equity_now: float,
         growth_ratio: float,
@@ -379,19 +387,23 @@ class ScalingManager:
                 self.shared_state.dynamic_config = {}
                 state = self.shared_state.dynamic_config
             previous_phase = str(
-                state.get("compounding_phase")
-                or state.get("COMPOUNDING_PHASE")
-                or "PHASE_1_SEED"
+                state.get("compounding_phase") or state.get("COMPOUNDING_PHASE") or "PHASE_1_SEED"
             )
             current_phase = str((phase or {}).get("name", "PHASE_1_SEED"))
             state["COMPOUNDING_GROWTH_ACTIVE"] = bool(active)
             state["compounding_phase"] = current_phase
             state["COMPOUNDING_PHASE"] = current_phase
             state["COMPOUNDING_PHASE_RATIO"] = float(growth_ratio)
-            state["COMPOUNDING_PHASE_QUOTE_MULT"] = float((phase or {}).get("quote_mult", 1.0) or 1.0)
+            state["COMPOUNDING_PHASE_QUOTE_MULT"] = float(
+                (phase or {}).get("quote_mult", 1.0) or 1.0
+            )
             state["COMPOUNDING_PHASE_RISK_MULT"] = float((phase or {}).get("risk_mult", 1.0) or 1.0)
-            state["COMPOUNDING_PHASE_TP_ASYM_MULT"] = float((phase or {}).get("tp_asym_mult", 1.0) or 1.0)
-            state["COMPOUNDING_PHASE_SL_ASYM_MULT"] = float((phase or {}).get("sl_asym_mult", 1.0) or 1.0)
+            state["COMPOUNDING_PHASE_TP_ASYM_MULT"] = float(
+                (phase or {}).get("tp_asym_mult", 1.0) or 1.0
+            )
+            state["COMPOUNDING_PHASE_SL_ASYM_MULT"] = float(
+                (phase or {}).get("sl_asym_mult", 1.0) or 1.0
+            )
             state["COMPOUNDING_PHASE_RR_BONUS"] = float((phase or {}).get("rr_bonus", 0.0) or 0.0)
             state["compounding_equity_base"] = float(equity_base)
             state["COMPOUNDING_EQUITY_NOW"] = float(equity_now)
@@ -429,13 +441,15 @@ class ScalingManager:
         except Exception:
             pass
 
-    async def _get_active_compounding_phase(self) -> Optional[Dict[str, Any]]:
+    async def _get_active_compounding_phase(self) -> Optional[dict[str, Any]]:
         equity_now = float(await self._get_total_equity() or 0.0)
         equity_base = float(self._get_bootstrap_equity(equity_now) or 0.0)
         growth_ratio = (equity_now / max(equity_base, 1e-9)) if equity_base > 0 else 1.0
 
         base_phase = self._pick_compounding_phase_by_ratio(growth_ratio)
-        drawdown_pct = float(getattr(self.shared_state, "metrics", {}).get("drawdown_pct", 0.0) or 0.0)
+        drawdown_pct = float(
+            getattr(self.shared_state, "metrics", {}).get("drawdown_pct", 0.0) or 0.0
+        )
         momentum = float(self._get_realized_pnl_last_n(self._dyn_momentum_lookback) or 0.0)
         positive_streak = int(self._positive_realized_streak(self._dyn_momentum_lookback))
 
@@ -445,7 +459,11 @@ class ScalingManager:
         if drawdown_pct > float(self._compounding_drawdown_guard_pct):
             idx = 0
             adjusted_phase = self._phase_from_name(self._phase_name_by_index(idx))
-        elif self._compounding_min_positive_streak > 0 and positive_streak < self._compounding_min_positive_streak and idx > 0:
+        elif (
+            self._compounding_min_positive_streak > 0
+            and positive_streak < self._compounding_min_positive_streak
+            and idx > 0
+        ):
             adjusted_phase = self._phase_from_name(self._phase_name_by_index(idx - 1))
 
         mode = ""
@@ -467,7 +485,7 @@ class ScalingManager:
         )
         return adjusted_phase if active else None
 
-    def _signal_confidence(self, sig: Dict[str, Any]) -> float:
+    def _signal_confidence(self, sig: dict[str, Any]) -> float:
         try:
             return max(0.0, min(1.0, float(sig.get("confidence", 0.0) or 0.0)))
         except Exception:
@@ -495,6 +513,7 @@ class ScalingManager:
         """Best-effort spendable quote capital used by dynamic sizing."""
         try:
             from src.l0_core.core_utils import _safe_await
+
             quote = str(getattr(self.config, "QUOTE_ASSET", "USDT") or "USDT").upper()
             getter = getattr(self.shared_state, "get_spendable_balance", None)
             if callable(getter):
@@ -510,6 +529,7 @@ class ScalingManager:
             pass
         try:
             from src.l0_core.core_utils import _safe_await
+
             if hasattr(self.shared_state, "get_nav_quote"):
                 return float(await _safe_await(self.shared_state.get_nav_quote()) or 0.0)
         except Exception:
@@ -520,6 +540,7 @@ class ScalingManager:
         """Best-effort NAV in quote asset."""
         try:
             from src.l0_core.core_utils import _safe_await
+
             if hasattr(self.shared_state, "get_nav_quote"):
                 nav = float(await _safe_await(self.shared_state.get_nav_quote()) or 0.0)
                 if nav > 0:
@@ -532,8 +553,8 @@ class ScalingManager:
         self,
         symbol: str,
         base_quote: float,
-        sig: Dict[str, Any],
-        phase: Optional[Dict[str, Any]] = None,
+        sig: dict[str, Any],
+        phase: Optional[dict[str, Any]] = None,
         capital_override: Optional[float] = None,
     ) -> float:
         if not self._dynamic_position_sizing_enabled:
@@ -579,7 +600,9 @@ class ScalingManager:
                 drawdown_pct = float(metrics.get("drawdown_pct", 0.0) or 0.0)
                 utilization_pct = float(metrics.get("capital_utilization_pct", 0.0) or 0.0)
                 throughput_per_hour = float(metrics.get("usdt_per_hour", 0.0) or 0.0)
-                ratio_target = float(getattr(self.config, "TARGET_PROFIT_RATIO_PER_HOUR", 0.0008) or 0.0008)
+                ratio_target = float(
+                    getattr(self.config, "TARGET_PROFIT_RATIO_PER_HOUR", 0.0008) or 0.0008
+                )
                 base_target = float(getattr(self.config, "BASE_TARGET_PER_HOUR", 0.0) or 0.0)
                 target_throughput = max(base_target, max(0.0, nav_quote) * ratio_target)
                 vol_pct = float(await self._estimate_sl_distance_pct(symbol) or 0.0)
@@ -637,12 +660,21 @@ class ScalingManager:
                     sig["_adaptive_min_trade_quote"] = float(adaptive_min_quote)
                     sig["_adaptive_tp_bias_mult"] = float(adaptive_decision.tp_bias_mult)
 
-                if not hasattr(self.shared_state, "dynamic_config") or getattr(self.shared_state, "dynamic_config", None) is None:
+                if (
+                    not hasattr(self.shared_state, "dynamic_config")
+                    or getattr(self.shared_state, "dynamic_config", None) is None
+                ):
                     self.shared_state.dynamic_config = {}
                 self.shared_state.dynamic_config["ADAPTIVE_RISK_FRACTION"] = float(base_risk_pct)
-                self.shared_state.dynamic_config["ADAPTIVE_MIN_TRADE_QUOTE"] = float(adaptive_min_quote)
-                self.shared_state.dynamic_config["ADAPTIVE_COOLDOWN_MULT"] = float(adaptive_decision.cooldown_mult)
-                self.shared_state.dynamic_config["ADAPTIVE_TP_BIAS_MULT"] = float(adaptive_decision.tp_bias_mult)
+                self.shared_state.dynamic_config["ADAPTIVE_MIN_TRADE_QUOTE"] = float(
+                    adaptive_min_quote
+                )
+                self.shared_state.dynamic_config["ADAPTIVE_COOLDOWN_MULT"] = float(
+                    adaptive_decision.cooldown_mult
+                )
+                self.shared_state.dynamic_config["ADAPTIVE_TP_BIAS_MULT"] = float(
+                    adaptive_decision.tp_bias_mult
+                )
         except Exception as e:
             self.logger.debug("[Scaling:Adaptive] evaluation failed for %s: %s", symbol, e)
 
@@ -656,9 +688,17 @@ class ScalingManager:
                 metrics = getattr(self.shared_state, "metrics", {}) or {}
                 drawdown_pct = float(metrics.get("drawdown_pct", 0.0) or 0.0)
                 positive_streak = int(self._positive_realized_streak(self._dyn_momentum_lookback))
-                stable_min_streak = int(getattr(self.config, "STABLE_RISK_MIN_POSITIVE_STREAK", 3) or 3)
-                stable_max_dd = float(getattr(self.config, "STABLE_RISK_MAX_DRAWDOWN_PCT", 1.5) or 1.5)
-                if mode == "NORMAL" and positive_streak >= stable_min_streak and drawdown_pct <= stable_max_dd:
+                stable_min_streak = int(
+                    getattr(self.config, "STABLE_RISK_MIN_POSITIVE_STREAK", 3) or 3
+                )
+                stable_max_dd = float(
+                    getattr(self.config, "STABLE_RISK_MAX_DRAWDOWN_PCT", 1.5) or 1.5
+                )
+                if (
+                    mode == "NORMAL"
+                    and positive_streak >= stable_min_streak
+                    and drawdown_pct <= stable_max_dd
+                ):
                     stable_mult = float(getattr(self.config, "STABLE_RISK_BUDGET_MULT", 1.0) or 1.0)
                     if stable_mult > 0:
                         base_risk_pct *= stable_mult
@@ -682,14 +722,23 @@ class ScalingManager:
             # Shared-wallet mode: direct risk-fraction sizing from allocator usable pool.
             planned_quote = base_risk_budget
         else:
-            planned_quote = base_risk_budget * confidence_weight * volatility_adjust * phase_multiplier
+            planned_quote = (
+                base_risk_budget * confidence_weight * volatility_adjust * phase_multiplier
+            )
         if planned_quote <= 0:
             return base_quote
 
         # Structural clamp from adaptive engine:
         # quote = clamp(nav * risk_fraction, min_trade_quote * buffer, nav * max_position_pct)
-        if not use_pool_fraction and adaptive_decision is not None and nav_quote > 0 and tier != "B":
-            floor_buffer = float(getattr(self.config, "ADAPTIVE_MIN_QUOTE_BUFFER_MULT", 1.20) or 1.20)
+        if (
+            not use_pool_fraction
+            and adaptive_decision is not None
+            and nav_quote > 0
+            and tier != "B"
+        ):
+            floor_buffer = float(
+                getattr(self.config, "ADAPTIVE_MIN_QUOTE_BUFFER_MULT", 1.20) or 1.20
+            )
             max_position_pct = float(
                 getattr(self.config, "MAX_POSITION_EXPOSURE_PERCENTAGE", 0.20) or 0.20
             )
@@ -756,7 +805,7 @@ class ScalingManager:
             self.logger.info("[Scaling:Dynamic] %s stable risk budget boost applied.", symbol)
         return float(capped_quote)
 
-    def _get_equity_tiers(self) -> List[Dict[str, Any]]:
+    def _get_equity_tiers(self) -> list[dict[str, Any]]:
         tiers = list(getattr(self.config, "SCALING_EQUITY_TIERS", []) or [])
         try:
             tiers.sort(key=lambda t: float(t.get("min", 0.0) or 0.0))
@@ -764,7 +813,9 @@ class ScalingManager:
             pass
         return tiers
 
-    def _pick_tier_by_equity(self, tiers: List[Dict[str, Any]], equity: float) -> Optional[Dict[str, Any]]:
+    def _pick_tier_by_equity(
+        self, tiers: list[dict[str, Any]], equity: float
+    ) -> Optional[dict[str, Any]]:
         for tier in tiers:
             min_e = float(tier.get("min", 0.0) or 0.0)
             max_e = tier.get("max", None)
@@ -773,12 +824,12 @@ class ScalingManager:
                 return tier
         return None
 
-    def _tier_name(self, tier: Optional[Dict[str, Any]]) -> str:
+    def _tier_name(self, tier: Optional[dict[str, Any]]) -> str:
         if not tier:
             return ""
         return str(tier.get("name") or "")
 
-    async def _apply_equity_tier_overrides(self) -> Optional[Dict[str, Any]]:
+    async def _apply_equity_tier_overrides(self) -> Optional[dict[str, Any]]:
         tiers = self._get_equity_tiers()
         if not tiers:
             return None
@@ -805,17 +856,27 @@ class ScalingManager:
             current_idx = _tier_index(self._tier_name(desired))
             current_name = self._tier_name(desired)
 
-        realized_pnl = float(getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0)
+        realized_pnl = float(
+            getattr(self.shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0
+        )
         realized_pnl_last_20 = float(self._get_realized_pnl_last_n(20))
-        recovery_active = bool((getattr(self.shared_state, "capital_recovery_mode", {}) or {}).get("recovery_active", False))
-        active_liquidations = bool(getattr(self.shared_state, "active_liquidations", set()) or False)
+        recovery_active = bool(
+            (getattr(self.shared_state, "capital_recovery_mode", {}) or {}).get(
+                "recovery_active", False
+            )
+        )
+        active_liquidations = bool(
+            getattr(self.shared_state, "active_liquidations", set()) or False
+        )
 
         open_positions = 0
         try:
             if hasattr(self.shared_state, "open_positions_count"):
                 open_positions = int(self.shared_state.open_positions_count())
             else:
-                open_positions = len(getattr(self.shared_state, "get_open_positions", lambda: {})() or {})
+                open_positions = len(
+                    getattr(self.shared_state, "get_open_positions", lambda: {})() or {}
+                )
         except Exception:
             open_positions = len(getattr(self.shared_state, "positions", {}) or {})
 
@@ -868,20 +929,31 @@ class ScalingManager:
         effective = tiers[current_idx] if 0 <= current_idx < len(tiers) else desired
 
         # Apply non-sizing overrides to config (sizing stays per-trade in calculate_planned_quote()).
-        planned_quote = float(effective.get("planned_quote", self._default_planned_quote) or self._default_planned_quote)
-        max_positions = int(effective.get("max_positions", getattr(self.config, "MAX_POSITIONS_TOTAL", 1)) or 1)
+        planned_quote = float(
+            effective.get("planned_quote", self._default_planned_quote)
+            or self._default_planned_quote
+        )
+        max_positions = int(
+            effective.get("max_positions", getattr(self.config, "MAX_POSITIONS_TOTAL", 1)) or 1
+        )
         risk_mode = str(effective.get("risk_mode", ""))
-        max_daily_trades = int(effective.get("max_daily_trades", getattr(self.config, "MAX_TRADES_PER_DAY", 0)) or 0)
-        tp_target_pct = float(effective.get("tp_target_pct", getattr(self.config, "TP_TARGET_PCT", 0.0)) or 0.0)
-        sl_cap_pct = float(effective.get("sl_cap_pct", getattr(self.config, "SL_CAP_PCT", 0.0)) or 0.0)
+        max_daily_trades = int(
+            effective.get("max_daily_trades", getattr(self.config, "MAX_TRADES_PER_DAY", 0)) or 0
+        )
+        tp_target_pct = float(
+            effective.get("tp_target_pct", getattr(self.config, "TP_TARGET_PCT", 0.0)) or 0.0
+        )
+        sl_cap_pct = float(
+            effective.get("sl_cap_pct", getattr(self.config, "SL_CAP_PCT", 0.0)) or 0.0
+        )
 
         if int(getattr(self.config, "MAX_POSITIONS_TOTAL", 0) or 0) != max_positions:
             self.config.MAX_POSITIONS_TOTAL = max_positions
         if max_daily_trades > 0:
-            setattr(self.config, "MAX_TRADES_PER_DAY", max_daily_trades)
-        setattr(self.config, "RISK_MODE", risk_mode)
+            self.config.MAX_TRADES_PER_DAY = max_daily_trades
+        self.config.RISK_MODE = risk_mode
         if tp_target_pct > 0:
-            setattr(self.config, "TP_TARGET_PCT", tp_target_pct)
+            self.config.TP_TARGET_PCT = tp_target_pct
             # Do not let tier TP caps collapse RR feasibility.
             # Keep TP_PCT_MAX at least as large as:
             # - current configured TP_PCT_MAX
@@ -901,97 +973,98 @@ class ScalingManager:
                 min_rr = 1.0
             rr_floor_tp_max = max(0.0, sl_pct_min * max(min_rr, 0.0))
             safe_tp_max = max(current_tp_max, float(tp_target_pct), rr_floor_tp_max)
-            setattr(self.config, "TP_PCT_MAX", safe_tp_max)
+            self.config.TP_PCT_MAX = safe_tp_max
         if sl_cap_pct != 0:
-            setattr(self.config, "SL_CAP_PCT", sl_cap_pct)
-            setattr(self.config, "SL_PCT_MAX", abs(sl_cap_pct))
+            self.config.SL_CAP_PCT = sl_cap_pct
+            self.config.SL_PCT_MAX = abs(sl_cap_pct)
 
-        state.update({
-            "EQUITY_TIER_CURRENT": self._tier_name(effective),
-            "EQUITY_TIER_CANDIDATE": candidate_name,
-            "EQUITY_TIER_CANDIDATE_SINCE": candidate_since,
-            "EQUITY_TIER_EQUITY": equity,
-            "EQUITY_TIER_REALIZED_PNL": realized_pnl,
-            "EQUITY_TIER_REALIZED_PNL_LAST_20": realized_pnl_last_20,
-            "EQUITY_TIER_PLANNED_QUOTE": planned_quote,
-            "EQUITY_TIER_MAX_POSITIONS": max_positions,
-            "EQUITY_TIER_RISK_MODE": risk_mode,
-            "EQUITY_TIER_MAX_DAILY_TRADES": max_daily_trades,
-            "EQUITY_TIER_TP_TARGET_PCT": tp_target_pct,
-            "EQUITY_TIER_SL_CAP_PCT": sl_cap_pct,
-            "EQUITY_TIER_OPEN_POSITIONS": open_positions,
-            "EQUITY_TIER_ACTIVE_LIQUIDATIONS": active_liquidations,
-            "EQUITY_TIER_LAST_TS": now_ts,
-        })
+        state.update(
+            {
+                "EQUITY_TIER_CURRENT": self._tier_name(effective),
+                "EQUITY_TIER_CANDIDATE": candidate_name,
+                "EQUITY_TIER_CANDIDATE_SINCE": candidate_since,
+                "EQUITY_TIER_EQUITY": equity,
+                "EQUITY_TIER_REALIZED_PNL": realized_pnl,
+                "EQUITY_TIER_REALIZED_PNL_LAST_20": realized_pnl_last_20,
+                "EQUITY_TIER_PLANNED_QUOTE": planned_quote,
+                "EQUITY_TIER_MAX_POSITIONS": max_positions,
+                "EQUITY_TIER_RISK_MODE": risk_mode,
+                "EQUITY_TIER_MAX_DAILY_TRADES": max_daily_trades,
+                "EQUITY_TIER_TP_TARGET_PCT": tp_target_pct,
+                "EQUITY_TIER_SL_CAP_PCT": sl_cap_pct,
+                "EQUITY_TIER_OPEN_POSITIONS": open_positions,
+                "EQUITY_TIER_ACTIVE_LIQUIDATIONS": active_liquidations,
+                "EQUITY_TIER_LAST_TS": now_ts,
+            }
+        )
         try:
             self.shared_state.dynamic_config = state
         except Exception:
             pass
 
         return effective
-        
+
     async def check_scale_in_opportunity(
-        self, 
-        owned_positions: Dict[str, Any], 
-        now_ts: float,
-        focus_mode_active: bool = False
-    ) -> List[Dict[str, Any]]:
+        self, owned_positions: dict[str, Any], now_ts: float, focus_mode_active: bool = False
+    ) -> list[dict[str, Any]]:
         """
         Detect scale-in opportunities for compounding winners.
-        
+
         Policy:
         - Only in focus mode
         - Position age >= 60 minutes (configurable)
         - PnL > 1.0% (winning position)
         - Generate BUY signal with COMPOUNDING_ADD tag
-        
+
         Args:
             owned_positions: Current positions {symbol: position_data}
             now_ts: Current timestamp
             focus_mode_active: Whether focus mode is active
-            
+
         Returns:
             List of scale-in signals to inject
         """
         if not focus_mode_active:
             return []
-            
+
         scale_signals = []
         open_trades = getattr(self.shared_state, "open_trades", {}) or {}
-        
+
         for sym, pos in owned_positions.items():
             ot = open_trades.get(sym, {}) if isinstance(open_trades, dict) else {}
             opened_at = float(ot.get("opened_at", pos.get("opened_at", 0.0)) or 0.0)
-            
+
             if opened_at <= 0:
                 continue
-                
+
             age_min = (now_ts - opened_at) / 60.0
-            
+
             # Policy: Age >= configured minimum for scaling in
             if age_min < self._scale_in_min_age_min:
                 continue
-                
+
             # Get entry price
             entry = float(ot.get("entry_price", pos.get("avg_price", 0.0)) or 0.0)
             if entry <= 0:
                 continue
-            
+
             # Get current price
             price = await self._get_current_price(sym)
             if price <= 0:
                 continue
-                
+
             # Calculate PnL
             pnl_pct = ((price - entry) / entry) * 100.0
-            
+
             # Policy: pnl > configured minimum (Compounding winners)
             if pnl_pct > self._scale_in_min_pnl_pct:
                 self.logger.warning(
                     "[SCALE_IN] Winner detected: %s | age=%.1fm | pnl=%.3f%% | Scaling in for compounding",
-                    sym, age_min, pnl_pct
+                    sym,
+                    age_min,
+                    pnl_pct,
                 )
-                
+
                 # Generate scale-in signal
                 sig = {
                     "symbol": sym,
@@ -1004,12 +1077,12 @@ class ScalingManager:
                     "_planned_quote": self._default_planned_quote,
                     "_allow_reentry": True,
                     "_is_compounding": True,
-                    "_tier": "A"
+                    "_tier": "A",
                 }
                 scale_signals.append(sig)
-                
+
         return scale_signals
-        
+
     async def _get_current_price(self, symbol: str) -> float:
         """Get current market price for symbol."""
         price = 0.0
@@ -1017,26 +1090,30 @@ class ScalingManager:
             # Try safe_price method first
             if hasattr(self.shared_state, "safe_price"):
                 from src.l0_core.core_utils import _safe_await
+
                 price = float(await _safe_await(self.shared_state.safe_price(symbol)) or 0.0)
         except Exception:
             pass
-            
+
         # Fallback to latest_prices
         if price <= 0:
             price = float(getattr(self.shared_state, "latest_prices", {}).get(symbol, 0.0) or 0.0)
-            
+
         return price
-        
-    async def scale_quote_by_account_size(self, base_q: float, agent_name: str = "Meta", context: Optional[Dict[str, Any]] = None) -> float:
+
+    async def scale_quote_by_account_size(
+        self, base_q: float, agent_name: str = "Meta", context: Optional[dict[str, Any]] = None
+    ) -> float:
         """Scale quote adaptively based on account size/NAV."""
         # Guard for dust healing: do not resize
         if context and context.get("is_dust_healing", False):
             return base_q
-            
+
         try:
             if getattr(self.config, "SCALING_EQUITY_TIERS", None):
                 return base_q
             from src.l0_core.core_utils import _safe_await
+
             nav = 0.0
             if hasattr(self.shared_state, "get_nav_quote"):
                 nav = float(await _safe_await(self.shared_state.get_nav_quote()) or 0.0)
@@ -1062,26 +1139,24 @@ class ScalingManager:
             return base_q
 
     async def calculate_planned_quote(
-        self, 
-        symbol: str, 
-        sig: Dict[str, Any], 
-        budget_override: Optional[float] = None
+        self, symbol: str, sig: dict[str, Any], budget_override: Optional[float] = None
     ) -> float:
         """
         Comprehensive planned quote calculation.
         Migrated from MetaController._planned_quote_for.
-        
+
         Args:
             symbol: Trading symbol
             sig: Signal dictionary
             budget_override: Optional override for base allocation
-            
+
         Returns:
             Calculated quote amount (USDT/QuoteAsset)
         """
         try:
             from src.l0_core.core_utils import _safe_await
         except Exception:
+
             async def _safe_await(x):
                 return x
 
@@ -1110,7 +1185,7 @@ class ScalingManager:
 
         # 0. Apply equity-tier overrides (planned quote + max positions)
         tier = await self._apply_equity_tier_overrides()
-        
+
         # 1. Base allocation from budget or signal
         if budget_override is not None and pool_capital_override is None:
             q = float(budget_override)
@@ -1118,12 +1193,15 @@ class ScalingManager:
             try:
                 if hasattr(self.shared_state, "get_authoritative_reservation"):
                     from src.l0_core.core_utils import _safe_await
-                    reserved = await _safe_await(self.shared_state.get_authoritative_reservation(agent_name))
+
+                    reserved = await _safe_await(
+                        self.shared_state.get_authoritative_reservation(agent_name)
+                    )
                     if reserved and reserved > 0:
                         q = float(reserved)
             except Exception:
                 pass
-        
+
         if q <= 0:
             if tier and tier.get("planned_quote"):
                 q = float(tier.get("planned_quote"))
@@ -1188,32 +1266,42 @@ class ScalingManager:
         exchange_floor = float(await self._get_exchange_min_notional(symbol) or 0.0)
         if exchange_floor <= 0:
             exchange_floor = float(getattr(self.config, "MIN_ORDER_USDT", 0.0) or 0.0)
-        adaptive_symbol_floor = float(self._adaptive_min_trade_quote_by_symbol.get(symbol, 0.0) or 0.0)
-        q = max(float(q), float(base_quote_anchor), float(adaptive_symbol_floor), float(exchange_floor))
+        adaptive_symbol_floor = float(
+            self._adaptive_min_trade_quote_by_symbol.get(symbol, 0.0) or 0.0
+        )
+        q = max(
+            float(q), float(base_quote_anchor), float(adaptive_symbol_floor), float(exchange_floor)
+        )
 
         # 5. Global cap & Reservation Cap & SOP Mode Envelope Cap
         max_spend = float(getattr(self.config, "MAX_SPEND_PER_TRADE_USDT", 50.0))
-        
+
         if self.mode_manager:
             envelope = self.mode_manager.get_envelope()
             mode_max_trade = envelope.get("max_trade_usdt", 0.0)
             if mode_max_trade > 0:
                 # Mode envelope is authoritative for the max spend limit
                 max_spend = mode_max_trade
-                self.logger.debug("[Scaling:Envelope] Setting max_spend to mode limit: %.2f", max_spend)
+                self.logger.debug(
+                    "[Scaling:Envelope] Setting max_spend to mode limit: %.2f", max_spend
+                )
 
         if max_spend > 0 and q > max_spend:
             q = max_spend
-            
+
         # Reservation Cap Alignment
         if budget_override is None:
-             try:
-                 auth_res = float(await _safe_await(self.shared_state.get_authoritative_reservation(agent_name)))
-                 if auth_res > 0 and q > auth_res:
-                     self.logger.info("[Scaling] Capping quote %.2f -> %.2f (Agent Budget)", q, auth_res)
-                     q = auth_res
-             except Exception: 
-                 pass
+            try:
+                auth_res = float(
+                    await _safe_await(self.shared_state.get_authoritative_reservation(agent_name))
+                )
+                if auth_res > 0 and q > auth_res:
+                    self.logger.info(
+                        "[Scaling] Capping quote %.2f -> %.2f (Agent Budget)", q, auth_res
+                    )
+                    q = auth_res
+            except Exception:
+                pass
 
         # Exchange notional hard-cap safeguard.
         try:
@@ -1230,22 +1318,29 @@ class ScalingManager:
 
         return round(float(q), 4)
 
-    async def _apply_risk_based_cap(self, symbol: str, current_q: float, context: Optional[Dict[str, Any]] = None) -> float:
+    async def _apply_risk_based_cap(
+        self, symbol: str, current_q: float, context: Optional[dict[str, Any]] = None
+    ) -> float:
         """Apply ATR-based risk sizing cap."""
         # Guard for dust healing: skip risk-based sizing
         if context and context.get("is_dust_healing", False):
             return current_q
-            
+
         q = current_q
         try:
             # FIRST: Check if TPSLEngine calculated risk-based sizing
             risk_based_quote = getattr(self.shared_state, "risk_based_quote", {}).get(symbol)
             if risk_based_quote and risk_based_quote > 0:
-                self.logger.info("[Scaling] Using TPSLEngine risk-based sizing %s: %.2f USDT", symbol, risk_based_quote)
+                self.logger.info(
+                    "[Scaling] Using TPSLEngine risk-based sizing %s: %.2f USDT",
+                    symbol,
+                    risk_based_quote,
+                )
                 return float(risk_based_quote)
 
             # FALLBACK: Original ATR-based risk sizing
             from src.l0_core.core_utils import _safe_await
+
             # Use authoritative getter for NAV
             if hasattr(self.shared_state, "get_nav_quote"):
                 nav = float(await _safe_await(self.shared_state.get_nav_quote()) or 0.0)
@@ -1268,24 +1363,30 @@ class ScalingManager:
                 if atr > 0:
                     price = float(getattr(self.shared_state, "latest_prices", {}).get(symbol, 0.0))
                     if price > 0:
-                         sl_dist = atr * sl_atr_mult
-                         sl_pct = sl_dist / price
-                         # Cap at 20% SL width for sanity
-                         risk_sized_q = target_risk / max(0.005, min(0.20, sl_pct))
-                         if risk_sized_q < q:
-                              self.logger.info("[Scaling] Fallback risk sizing reducing %s: %.2f -> %.2f (RiskLimit: %.2f USDT)",
-                                               symbol, q, risk_sized_q, target_risk)
-                              q = risk_sized_q
+                        sl_dist = atr * sl_atr_mult
+                        sl_pct = sl_dist / price
+                        # Cap at 20% SL width for sanity
+                        risk_sized_q = target_risk / max(0.005, min(0.20, sl_pct))
+                        if risk_sized_q < q:
+                            self.logger.info(
+                                "[Scaling] Fallback risk sizing reducing %s: %.2f -> %.2f (RiskLimit: %.2f USDT)",
+                                symbol,
+                                q,
+                                risk_sized_q,
+                                target_risk,
+                            )
+                            q = risk_sized_q
         except Exception as e:
             self.logger.debug("[Scaling] Risk sizing failed: %s", e)
         return q
 
-    async def _get_exchange_notional_bounds(self, symbol: str) -> Tuple[float, float]:
+    async def _get_exchange_notional_bounds(self, symbol: str) -> tuple[float, float]:
         """Fetch exchange min/max notional from filters."""
         min_notional = 0.0
         max_notional = 0.0
         try:
             from src.l0_core.core_utils import _safe_await
+
             if hasattr(self.execution_manager, "get_symbol_filters_cached"):
                 f = await _safe_await(self.execution_manager.get_symbol_filters_cached(symbol))
                 if f:
@@ -1308,20 +1409,20 @@ class ScalingManager:
         mn, _ = await self._get_exchange_notional_bounds(symbol)
         return float(mn)
 
-    def get_scaling_config(self) -> Dict[str, Any]:
+    def get_scaling_config(self) -> dict[str, Any]:
         """
         Get current scaling configuration.
-        
+
         Returns:
             Dictionary of scaling configuration parameters
         """
         return {
-            'scale_in_min_age_min': self._scale_in_min_age_min,
-            'scale_in_min_pnl_pct': self._scale_in_min_pnl_pct,
-            'default_planned_quote': self._default_planned_quote,
-            'large_account_threshold': self._large_account_threshold,
-            'medium_account_threshold': self._medium_account_threshold,
-            'large_account_risk_pct': self._large_account_risk_pct,
-            'medium_account_risk_pct': self._medium_account_risk_pct,
-            'small_account_risk_pct': self._small_account_risk_pct,
+            "scale_in_min_age_min": self._scale_in_min_age_min,
+            "scale_in_min_pnl_pct": self._scale_in_min_pnl_pct,
+            "default_planned_quote": self._default_planned_quote,
+            "large_account_threshold": self._large_account_threshold,
+            "medium_account_threshold": self._medium_account_threshold,
+            "large_account_risk_pct": self._large_account_risk_pct,
+            "medium_account_risk_pct": self._medium_account_risk_pct,
+            "small_account_risk_pct": self._small_account_risk_pct,
         }

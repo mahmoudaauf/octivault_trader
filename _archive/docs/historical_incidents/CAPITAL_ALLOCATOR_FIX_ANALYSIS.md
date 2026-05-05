@@ -1,8 +1,8 @@
 # 🔧 ROOT CAUSE FIX: Capital Allocator 60/20/20 Implementation
 
-**Date:** May 4, 2026  
-**Issue:** Fixed $2.00 reserve breaks 60/20/20 allocation strategy  
-**Status:** READY TO IMPLEMENT  
+**Date:** May 4, 2026
+**Issue:** Fixed $2.00 reserve breaks 60/20/20 allocation strategy
+**Status:** READY TO IMPLEMENT
 
 ---
 
@@ -70,11 +70,11 @@ def calculate_dynamic_reserve(nav: float, cfg: dict) -> float:
         reserve_pct = cfg.get("RESERVE_PCT_SMALL", 0.15)
     else:
         reserve_pct = cfg.get("RESERVE_PCT_NORMAL", 0.10)
-    
+
     dynamic_reserve = nav * reserve_pct
     min_reserve = cfg.get("RESERVE_MIN_USDT", 1.00)
     max_reserve = cfg.get("RESERVE_MAX_USDT", nav * 0.40)
-    
+
     return max(min_reserve, min(max_reserve, dynamic_reserve))
 ```
 
@@ -100,7 +100,7 @@ def allocate_capital_60_20_20(
     - 20% to dust healing & recovery
     """
     allocatable = free_usdt  # Already after reserve
-    
+
     return {
         'trading_core': allocatable * 0.60,
         'trading_alts': allocatable * 0.20,
@@ -236,7 +236,7 @@ ALLOC_PCT_DUST = 0.20         # 20% for dust healing
 
 ---
 
-**Status:** Ready for implementation  
-**Risk:** LOW (config-only in first phase)  
-**Rollback:** Simple config revert  
+**Status:** Ready for implementation
+**Risk:** LOW (config-only in first phase)
+**Rollback:** Simple config revert
 **Testing:** Use current $84.55 account as test case

@@ -1,9 +1,9 @@
 # Session Summary — 2026-05-04
 ## Octivault Trader — Capital Loss Event
 
-**Status: STOPPED**  
-**Date:** May 4, 2026  
-**Account Value:** $1.60 USDT (down from $87.88)  
+**Status: STOPPED**
+**Date:** May 4, 2026
+**Account Value:** $1.60 USDT (down from $87.88)
 **Total Loss:** -$86.28 realized
 
 ---
@@ -12,7 +12,7 @@
 
 1. **Goal:** Implement 60/20/20 capital allocation and monitor Phase A strategy improvements
    - 60% Trading positions
-   - 20% Dust healing  
+   - 20% Dust healing
    - 20% Reserve (protected)
 
 2. **Code Changes Implemented:**
@@ -113,7 +113,7 @@ Total NAV: ~$1.60 (flat portfolio)
 1. **capital_allocator.py (lines 103, 764-778):** 60/20/20 split implementation
    - `TARGET_EXPOSURE_PCT = 0.60` is correct
    - Dynamic bootstrap reserve is correct
-   
+
 2. **meta_controller.py (lines 11694, 13511-13523):** Real-time balance sync + dust healing cap
    - Removed erroneous `await` in dust healing NAV fetch ✅
    - Dust healing cap to 20% NAV is correct

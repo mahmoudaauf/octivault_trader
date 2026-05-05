@@ -1,6 +1,6 @@
 # Bottleneck Fixes - Phase 2: Recovery/Rotation Unblocking
 
-**Date:** April 24, 2026  
+**Date:** April 24, 2026
 **Target:** Unblock forced recovery exits, align rotation policies, fix entry-sizing config
 
 ---
@@ -33,12 +33,12 @@ Three critical bottlenecks prevent clean rotation and recovery:
 
 ### Fix #1: Safe Min-Hold Bypass for Forced Recovery Exits
 
-**File:** `core/meta_controller.py`  
+**File:** `core/meta_controller.py`
 **Sections:** Lines 12520-12530, 11857-11870
 
 **Change:**
-- Add `_bypass_min_hold` flag to recovery signals  
-- Make `_safe_passes_min_hold()` respect the bypass flag  
+- Add `_bypass_min_hold` flag to recovery signals
+- Make `_safe_passes_min_hold()` respect the bypass flag
 - Apply to LIQUIDITY_RESTORE and STAGNATION forced exits
 
 **Reasoning:**
@@ -49,7 +49,7 @@ Three critical bottlenecks prevent clean rotation and recovery:
 
 ### Fix #2: Micro Rotation Override Policy Wiring
 
-**File:** `core/rotation_authority.py`  
+**File:** `core/rotation_authority.py`
 **Section:** Lines 171-186, 313-340
 
 **Change:**
@@ -68,10 +68,10 @@ Three critical bottlenecks prevent clean rotation and recovery:
 **File:** `core/config.py` (lines 1360) + `.env` (lines 45, 48, 50, 140)
 
 **Change:**
-- Raise DEFAULT_PLANNED_QUOTE from 12 → 25  
-- Raise MIN_ENTRY_USDT from 10 → 25  
-- Raise MIN_ENTRY_QUOTE_USDT from 10 → 25  
-- Align EMIT_BUY_QUOTE with floor  
+- Raise DEFAULT_PLANNED_QUOTE from 12 → 25
+- Raise MIN_ENTRY_USDT from 10 → 25
+- Raise MIN_ENTRY_QUOTE_USDT from 10 → 25
+- Align EMIT_BUY_QUOTE with floor
 - Add comment explaining floor alignment
 
 **Reasoning:**

@@ -1,7 +1,7 @@
 # 🎯 CRITICAL ISSUE #1: GATE SYSTEM OVER-ENFORCEMENT - DEEP DIVE
 
-**Status:** ACTIVELY BLOCKING ALL TRADES  
-**Date:** April 26, 2026  
+**Status:** ACTIVELY BLOCKING ALL TRADES
+**Date:** April 26, 2026
 **Priority:** CRITICAL - This is the PRIMARY blocker to profitability
 
 ---
@@ -171,7 +171,7 @@ if signal_type == "BUY":
 def get_confidence_floor(self, signal_type, recent_win_rate=None):
     if recent_win_rate is None:
         recent_win_rate = 0.50  # Default 50% win rate
-    
+
     # Scale floor based on how profitable signals have been
     if recent_win_rate > 0.60:
         return 0.50  # Low bar when signals are profitable
@@ -316,7 +316,7 @@ python3 🎯_MASTER_SYSTEM_ORCHESTRATOR.py --duration 1
 
 ## Timeline
 
-**Estimated fix time:** 15-30 minutes  
+**Estimated fix time:** 15-30 minutes
 - 5 min: Locate gate calculation in code
 - 5 min: Understand current values
 - 5 min: Lower values

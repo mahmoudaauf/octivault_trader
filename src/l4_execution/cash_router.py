@@ -1,9 +1,11 @@
 # core/cash_router.py
 from __future__ import annotations
+
 import asyncio
 import logging
 import math
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Optional
+
 
 class CashRouter:
     """
@@ -23,10 +25,15 @@ class CashRouter:
       - CR_FEE_BPS: int (estimated fee bps for market sells/convert, default 10)
     """
 
-    def __init__(self, config: Any, logger: Optional[logging.Logger] = None,
-                 app: Optional[Any] = None, shared_state: Optional[Any] = None,
-                 exchange_client: Optional[Any] = None,
-                 execution_manager: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        config: Any,
+        logger: Optional[logging.Logger] = None,
+        app: Optional[Any] = None,
+        shared_state: Optional[Any] = None,
+        exchange_client: Optional[Any] = None,
+        execution_manager: Optional[Any] = None,
+    ) -> None:
         self.config = config
         self.logger = logger or logging.getLogger("CashRouter")
         self.app = app
@@ -38,6 +45,7 @@ class CashRouter:
 
         if not self.logger.handlers:
             import sys as _sys
+
             h = logging.StreamHandler(_sys.stdout)
             fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
             h.setFormatter(fmt)
@@ -51,8 +59,10 @@ class CashRouter:
     def _cfg_bool(self, name: str, default: bool = False) -> bool:
         try:
             v = getattr(self.config, name, None)
-            if isinstance(v, bool): return v
-            if isinstance(v, str): return v.strip().lower() in ("1","true","yes","y","on")
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "y", "on")
         except Exception:
             pass
         return default
@@ -69,18 +79,18 @@ class CashRouter:
         except Exception:
             return int(default)
 
-    def _cfg_list(self, name: str, default: Optional[List[str]] = None) -> List[str]:
+    def _cfg_list(self, name: str, default: Optional[list[str]] = None) -> list[str]:
         try:
             v = getattr(self.config, name, None)
             if isinstance(v, (list, tuple, set)):
                 return [str(x) for x in v]
             if isinstance(v, str):
-                return [s.strip() for s in v.split(',') if s.strip()]
+                return [s.strip() for s in v.split(",") if s.strip()]
         except Exception:
             pass
         return list(default or [])
 
-    def _protected_assets(self) -> Set[str]:
+    def _protected_assets(self) -> set[str]:
         try:
             vals = getattr(self.config, "CR_PROTECTED_ASSETS", []) or []
             if isinstance(vals, str):
@@ -99,12 +109,14 @@ class CashRouter:
                 r = self.shared_state.free_usdt()
                 return float(await r) if asyncio.iscoroutine(r) else float(r)
             if self.shared_state:
-                return float(getattr(self.shared_state, "balances", {}).get(self.quote, {}).get("free", 0.0))
+                return float(
+                    getattr(self.shared_state, "balances", {}).get(self.quote, {}).get("free", 0.0)
+                )
         except Exception:
             pass
         return 0.0
 
-    async def _balances(self) -> Dict[str, Dict[str, float]]:
+    async def _balances(self) -> dict[str, dict[str, float]]:
         bals = {}
         if not self.ex:
             return bals
@@ -114,13 +126,13 @@ class CashRouter:
                 res = await res if asyncio.iscoroutine(res) else res
                 if isinstance(res, dict):
                     # normalize to {"ASSET":{"free":float,"locked":float}}
-                    bals = {k:strdict(v) for k,v in res.items()}  # type: ignore[name-defined]
+                    bals = {k: strdict(v) for k, v in res.items()}  # type: ignore[name-defined]
         except Exception:
             self.logger.debug("balances fetch failed", exc_info=True)
         return bals
 
     # ---------- market/symbol helpers ----------
-    async def _get_book(self, symbol: str) -> Dict[str, float]:
+    async def _get_book(self, symbol: str) -> dict[str, float]:
         """
         Returns {"bid": float|0.0, "ask": float|0.0, "spread_bps": float|None}
         """
@@ -140,22 +152,31 @@ class CashRouter:
                 spread_bps = (ask - bid) / ask * 10000.0
         except Exception:
             spread_bps = None
-        return {"bid": bid, "ask": ask, "spread_bps": (float(spread_bps) if spread_bps is not None else None)}
+        return {
+            "bid": bid,
+            "ask": ask,
+            "spread_bps": (float(spread_bps) if spread_bps is not None else None),
+        }
+
     async def _get_price(self, symbol: str) -> Optional[float]:
         """
         Fetch current price using 3-strategy cascade (institutional architecture).
-        
+
         Strategy 1: SharedState memory (WebSocket prices, zero latency, zero API calls)
         Strategy 2: Safe price helper (may use snapshot or other sources)
         Strategy 3: REST API (only if explicitly configured, minimizes API calls)
-        
+
         Returns price as float or None if not available.
         """
         price = None
-        
+
         # ===== STRATEGY 1: SharedState memory (WebSocket-updated prices) =====
         try:
-            if self.shared_state and hasattr(self.shared_state, "prices") and self.shared_state.prices:
+            if (
+                self.shared_state
+                and hasattr(self.shared_state, "prices")
+                and self.shared_state.prices
+            ):
                 prices_dict = self.shared_state.prices
                 if isinstance(prices_dict, dict):
                     price = prices_dict.get(symbol.upper())
@@ -163,7 +184,7 @@ class CashRouter:
                         return float(price)  # ✅ Found in memory, 0 API calls, <1ms latency
         except Exception:
             self.logger.debug(f"[CashRouter] Strategy 1 (SharedState prices) failed for {symbol}")
-        
+
         # ===== STRATEGY 2: Safe price helper (may use snapshot or other sources) =====
         try:
             if self.shared_state and hasattr(self.shared_state, "safe_price"):
@@ -172,7 +193,7 @@ class CashRouter:
                     return float(price)  # ✅ Found via safe_price helper
         except Exception:
             self.logger.debug(f"[CashRouter] Strategy 2 (safe_price) failed for {symbol}")
-        
+
         # ===== STRATEGY 3: REST API (only if explicitly configured) =====
         allow_rest = getattr(self.config, "CR_ALLOW_REST", False)
         if allow_rest:
@@ -186,11 +207,13 @@ class CashRouter:
                 self.logger.debug(f"[CashRouter] Strategy 3 (REST) failed for {symbol}")
         else:
             # REST not configured - log in debug mode
-            self.logger.debug(f"[CashRouter] CR_ALLOW_REST=False: Skipping REST fallback for {symbol}")
-        
+            self.logger.debug(
+                f"[CashRouter] CR_ALLOW_REST=False: Skipping REST fallback for {symbol}"
+            )
+
         return None  # No price available from any strategy
 
-    async def _get_filters(self, symbol: str) -> Dict[str, Any]:
+    async def _get_filters(self, symbol: str) -> dict[str, Any]:
         """
         Expected keys from exchange:
           - min_notional: float or None
@@ -198,7 +221,7 @@ class CashRouter:
           - min_qty: float or None
           - max_qty: float or None
         """
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         try:
             if hasattr(self.ex, "get_symbol_filters"):
                 r = self.ex.get_symbol_filters(symbol)
@@ -209,7 +232,9 @@ class CashRouter:
             self.logger.debug("filters fetch failed for %s", symbol, exc_info=True)
         return out
 
-    async def _min_exit_quote(self, symbol: str, price: Optional[float], min_notional: float) -> float:
+    async def _min_exit_quote(
+        self, symbol: str, price: Optional[float], min_notional: float
+    ) -> float:
         """Return exit-feasibility floor for a symbol, falling back to min_notional."""
         try:
             if self.shared_state and hasattr(self.shared_state, "compute_symbol_exit_floor"):
@@ -275,7 +300,9 @@ class CashRouter:
             return None
 
     # ---------- core actions ----------
-    async def sweep_dust(self, *, min_quote: Optional[float] = None, want_usdt: Optional[float] = None) -> Dict[str, Any]:
+    async def sweep_dust(
+        self, *, min_quote: Optional[float] = None, want_usdt: Optional[float] = None
+    ) -> dict[str, Any]:
         """
         Convert small, non-protected free balances into the quote asset respecting
         price, min_notional and lot step filters. Can optionally throttle by a dust max
@@ -284,7 +311,9 @@ class CashRouter:
         if not self._cfg_bool("CR_ENABLE", True):
             return {"ok": False, "freed": 0.0, "reason": "disabled"}
 
-        min_quote = float(min_quote if min_quote is not None else self._cfg_float("CR_SWEEP_DUST_MIN", 1.0))
+        min_quote = float(
+            min_quote if min_quote is not None else self._cfg_float("CR_SWEEP_DUST_MIN", 1.0)
+        )
         max_actions = max(1, self._cfg_int("CR_MAX_ACTIONS", 8))
         slippage_bps = max(0, self._cfg_int("CR_PRICE_SLIPPAGE_BPS", 15))
         fee_bps = max(0, self._cfg_int("CR_FEE_BPS", 10))
@@ -296,16 +325,18 @@ class CashRouter:
         min_quote = max(min_quote, min_order_usdt, quote_min_notional)
 
         # spread cap (prefer LIQUIDATION_SPREAD_CAP_BPS, fallback CR_SPREAD_CAP_BPS)
-        spread_cap_bps = self._cfg_float("LIQUIDATION_SPREAD_CAP_BPS", self._cfg_float("CR_SPREAD_CAP_BPS", 12.0))
+        spread_cap_bps = self._cfg_float(
+            "LIQUIDATION_SPREAD_CAP_BPS", self._cfg_float("CR_SPREAD_CAP_BPS", 12.0)
+        )
 
         dust_max = self._cfg_float("CR_DUST_MAX_USDT", 25.0)
-        remaining_need = float(want_usdt) if want_usdt is not None else float('inf')
+        remaining_need = float(want_usdt) if want_usdt is not None else float("inf")
 
         if not self.ex:
             return {"ok": False, "freed": 0.0, "reason": "no_exchange_client"}
 
         freed = 0.0
-        actions: List[Dict[str, Any]] = []
+        actions: list[dict[str, Any]] = []
         try:
             bals = await self._balances()
             # Prefer smallest notional first to consolidate efficiently
@@ -322,7 +353,7 @@ class CashRouter:
                 items.append((asset_up, free_amt))
 
             # gather prices and books in sequence to keep it simple & robust
-            priced: List[Tuple[str, float, Optional[float], Dict[str, float]]] = []
+            priced: list[tuple[str, float, Optional[float], dict[str, float]]] = []
             for asset, amt in items:
                 sym = f"{asset}{self.quote}"
                 p = await self._get_price(sym)
@@ -390,18 +421,25 @@ class CashRouter:
                     gross = qty * exec_price
                     net = gross * (1.0 - fee_bps / 10_000.0)
                     freed += net
-                    actions.append({
-                        "action": "sweep_dust",
-                        "asset": asset,
-                        "symbol": sym,
-                        "qty": float(f"{qty:.12f}"),
-                        "exec_price": float(f"{exec_price:.10f}"),
-                        "net_quote": float(f"{net:.6f}"),
-                        "spread_bps": (float(spread_bps) if spread_bps is not None else None)
-                    })
-                    self.logger.info("[Liquidity] action sweep_dust %s qty=%.8f exec=%.8f net=%.6f spread_bps=%s",
-                                     sym, qty, exec_price, net,
-                                     (None if spread_bps is None else float(spread_bps)))
+                    actions.append(
+                        {
+                            "action": "sweep_dust",
+                            "asset": asset,
+                            "symbol": sym,
+                            "qty": float(f"{qty:.12f}"),
+                            "exec_price": float(f"{exec_price:.10f}"),
+                            "net_quote": float(f"{net:.6f}"),
+                            "spread_bps": (float(spread_bps) if spread_bps is not None else None),
+                        }
+                    )
+                    self.logger.info(
+                        "[Liquidity] action sweep_dust %s qty=%.8f exec=%.8f net=%.6f spread_bps=%s",
+                        sym,
+                        qty,
+                        exec_price,
+                        net,
+                        (None if spread_bps is None else float(spread_bps)),
+                    )
                     if math.isfinite(remaining_need) and remaining_need > 0 and exec_price > 0:
                         remaining_need = max(0.0, remaining_need - net)
                     if math.isfinite(remaining_need) and remaining_need <= 0.0:
@@ -409,32 +447,39 @@ class CashRouter:
         except Exception:
             self.logger.debug("sweep_dust failed", exc_info=True)
 
-        return {"ok": (freed > 0.0), "freed": float(f"{freed:.6f}"), "actions": actions, "reason": "dust_sweep"}
+        return {
+            "ok": (freed > 0.0),
+            "freed": float(f"{freed:.6f}"),
+            "actions": actions,
+            "reason": "dust_sweep",
+        }
 
-    async def free_dust(self, *, min_quote: Optional[float] = None, want_usdt: Optional[float] = None) -> Dict[str, Any]:
+    async def free_dust(
+        self, *, min_quote: Optional[float] = None, want_usdt: Optional[float] = None
+    ) -> dict[str, Any]:
         return await self.sweep_dust(min_quote=min_quote, want_usdt=want_usdt)
 
-    async def redeem_wrapped_stables(self, *, want_usdt: Optional[float] = None) -> Dict[str, Any]:
+    async def redeem_wrapped_stables(self, *, want_usdt: Optional[float] = None) -> dict[str, Any]:
         """
         Convert non-quote stable balances to the quote stable using either a native
         convert endpoint (preferred) or a market sell fallback. Optionally, sell only up to want_usdt.
         """
         if not self._cfg_bool("CR_ENABLE_REDEEM_STABLES", True):
             return {"ok": False, "freed": 0.0, "reason": "disabled"}
-        stables = getattr(self.config, "CR_STABLE_SYMBOLS", ["FDUSD","BUSD","USDC"]) or []
+        stables = getattr(self.config, "CR_STABLE_SYMBOLS", ["FDUSD", "BUSD", "USDC"]) or []
         protected = self._protected_assets()
         if not self.ex:
             return {"ok": False, "freed": 0.0, "reason": "no_exchange_client"}
 
         freed = 0.0
-        actions: List[Dict[str, Any]] = []
+        actions: list[dict[str, Any]] = []
         fee_bps = max(0, self._cfg_int("CR_FEE_BPS", 10))
         slippage_bps = max(0, self._cfg_int("CR_PRICE_SLIPPAGE_BPS", 15))
-        remaining_need = float(want_usdt) if want_usdt is not None else float('inf')
+        remaining_need = float(want_usdt) if want_usdt is not None else float("inf")
 
         try:
             bals = await self._balances()
-            for asset, row in (bals.items() if isinstance(bals, dict) else []):
+            for asset, row in bals.items() if isinstance(bals, dict) else []:
                 asset_up = str(asset).upper()
                 if asset_up == self.quote or asset_up not in stables or asset_up in protected:
                     continue
@@ -452,7 +497,9 @@ class CashRouter:
 
                 sym = f"{asset_up}{self.quote}"
                 # spread cap (prefer LIQUIDATION_SPREAD_CAP_BPS, fallback CR_SPREAD_CAP_BPS)
-                spread_cap_bps = self._cfg_float("LIQUIDATION_SPREAD_CAP_BPS", self._cfg_float("CR_SPREAD_CAP_BPS", 12.0))
+                spread_cap_bps = self._cfg_float(
+                    "LIQUIDATION_SPREAD_CAP_BPS", self._cfg_float("CR_SPREAD_CAP_BPS", 12.0)
+                )
                 ok = False
                 net = 0.0
                 try:
@@ -477,23 +524,35 @@ class CashRouter:
                             max_qty = float(filt.get("max_qty") or 0.0)
                             min_notional = float(filt.get("min_notional") or 0.0)
                             # conservative exec price: use bid minus slippage; default to 1.0 if no bid (stable pairs)
-                            book_bid = float(book.get("bid") or 0.0) if isinstance(book, dict) else 0.0
-                            exec_price = (book_bid * (1.0 - slippage_bps / 10_000.0)) if book_bid > 0.0 else 1.0
+                            book_bid = (
+                                float(book.get("bid") or 0.0) if isinstance(book, dict) else 0.0
+                            )
+                            exec_price = (
+                                (book_bid * (1.0 - slippage_bps / 10_000.0))
+                                if book_bid > 0.0
+                                else 1.0
+                            )
                             fee = max(0.0, self._cfg_int("CR_FEE_BPS", 10)) / 10_000.0
 
                             # Determine quantity so that net after fee meets remaining_need (capped by to_convert_amt)
                             if exec_price <= 0.0:
                                 ok = False
                             else:
-                                gross_needed = (remaining_need / max(1e-12, (1.0 - fee)))
+                                gross_needed = remaining_need / max(1e-12, (1.0 - fee))
                                 qty_needed = gross_needed / exec_price
                                 to_convert_amt = min(amt, qty_needed)
                                 qty = self._round_step(to_convert_amt, step)
 
-                                if (min_qty and qty < min_qty) or (max_qty and qty > max_qty) or qty <= 0:
+                                if (
+                                    (min_qty and qty < min_qty)
+                                    or (max_qty and qty > max_qty)
+                                    or qty <= 0
+                                ):
                                     ok = False
                                 else:
-                                    min_required = await self._min_exit_quote(sym, exec_price, min_notional)
+                                    min_required = await self._min_exit_quote(
+                                        sym, exec_price, min_notional
+                                    )
                                     # optional conservative notional check
                                     if min_required and (qty * exec_price) < min_required:
                                         ok = False
@@ -507,9 +566,20 @@ class CashRouter:
 
                 if ok:
                     freed += net
-                    actions.append({"action": "redeem_stable", "asset": asset_up, "amount": float(f"{to_convert_amt:.8f}"), "symbol": sym})
-                    self.logger.info("[Liquidity] action redeem_stable %s amt=%.8f net=%.6f",
-                                     sym, float(f"{to_convert_amt:.8f}"), net)
+                    actions.append(
+                        {
+                            "action": "redeem_stable",
+                            "asset": asset_up,
+                            "amount": float(f"{to_convert_amt:.8f}"),
+                            "symbol": sym,
+                        }
+                    )
+                    self.logger.info(
+                        "[Liquidity] action redeem_stable %s amt=%.8f net=%.6f",
+                        sym,
+                        float(f"{to_convert_amt:.8f}"),
+                        net,
+                    )
                     if math.isfinite(remaining_need) and remaining_need > 0:
                         remaining_need = max(0.0, remaining_need - net)
                     if math.isfinite(remaining_need) and remaining_need <= 0.0:
@@ -517,9 +587,14 @@ class CashRouter:
         except Exception:
             self.logger.debug("redeem_wrapped_stables failed", exc_info=True)
 
-        return {"ok": (freed > 0.0), "freed": float(f"{freed:.6f}"), "actions": actions, "reason": "redeem_stables"}
+        return {
+            "ok": (freed > 0.0),
+            "freed": float(f"{freed:.6f}"),
+            "actions": actions,
+            "reason": "redeem_stables",
+        }
 
-    async def free_from_positions(self, want_usdt: float) -> Dict[str, Any]:
+    async def free_from_positions(self, want_usdt: float) -> dict[str, Any]:
         """
         Sell small portions of non-protected assets to free quote, prioritizing
         the smallest notionals first. Respects min_notional, lot step, spread caps,
@@ -537,18 +612,20 @@ class CashRouter:
         max_actions = max(1, self._cfg_int("CR_MAX_ACTIONS", 8))
         slippage_bps = max(0, self._cfg_int("CR_PRICE_SLIPPAGE_BPS", 15))
         fee_bps = max(0, self._cfg_int("CR_FEE_BPS", 10))
-        spread_cap_bps = self._cfg_float("LIQUIDATION_SPREAD_CAP_BPS", self._cfg_float("CR_SPREAD_CAP_BPS", 12.0))
+        spread_cap_bps = self._cfg_float(
+            "LIQUIDATION_SPREAD_CAP_BPS", self._cfg_float("CR_SPREAD_CAP_BPS", 12.0)
+        )
 
         remaining = max(0.0, float(want_usdt))
         freed = 0.0
-        actions: List[Dict[str, Any]] = []
+        actions: list[dict[str, Any]] = []
 
         try:
             bals = await self._balances()
             # consider only sizeable balances; we'll sort by notional asc
-            candidates: List[Tuple[str, float, float]] = []  # (asset, free_amt, notional)
-            price_cache: Dict[str, float] = {}
-            for asset, row in (bals.items() if isinstance(bals, dict) else []):
+            candidates: list[tuple[str, float, float]] = []  # (asset, free_amt, notional)
+            price_cache: dict[str, float] = {}
+            for asset, row in bals.items() if isinstance(bals, dict) else []:
                 asset_up = str(asset).upper()
                 if asset_up in (self.quote, None) or asset_up in protected:
                     continue
@@ -617,29 +694,42 @@ class CashRouter:
                     net = gross * (1.0 - fee_bps / 10_000.0)
                     freed += net
                     remaining = max(0.0, remaining - net)
-                    actions.append({
-                        "action": "free_from_positions",
-                        "asset": asset_up,
-                        "symbol": sym,
-                        "qty": float(f"{qty:.12f}"),
-                        "exec_price": float(f"{exec_price:.10f}"),
-                        "net_quote": float(f"{net:.6f}"),
-                        "spread_bps": (float(s_bps) if s_bps is not None else None)
-                    })
-                    self.logger.info("[Liquidity] action positions %s qty=%.8f exec=%.8f net=%.6f spread_bps=%s",
-                                     sym, qty, exec_price, net,
-                                     (None if s_bps is None else float(s_bps)))
+                    actions.append(
+                        {
+                            "action": "free_from_positions",
+                            "asset": asset_up,
+                            "symbol": sym,
+                            "qty": float(f"{qty:.12f}"),
+                            "exec_price": float(f"{exec_price:.10f}"),
+                            "net_quote": float(f"{net:.6f}"),
+                            "spread_bps": (float(s_bps) if s_bps is not None else None),
+                        }
+                    )
+                    self.logger.info(
+                        "[Liquidity] action positions %s qty=%.8f exec=%.8f net=%.6f spread_bps=%s",
+                        sym,
+                        qty,
+                        exec_price,
+                        net,
+                        (None if s_bps is None else float(s_bps)),
+                    )
         except Exception:
             self.logger.debug("free_from_positions failed", exc_info=True)
 
-        return {"ok": (freed >= want_usdt), "freed": float(f"{freed:.6f}"), "remaining": float(f"{max(0.0, want_usdt - freed):.6f}"), "actions": actions, "reason": "positions"}
+        return {
+            "ok": (freed >= want_usdt),
+            "freed": float(f"{freed:.6f}"),
+            "remaining": float(f"{max(0.0, want_usdt - freed):.6f}"),
+            "actions": actions,
+            "reason": "positions",
+        }
 
-    async def route_best_effort(self, want_usdt: float) -> Dict[str, Any]:
+    async def route_best_effort(self, want_usdt: float) -> dict[str, Any]:
         """
         Try multiple strategies in order until the requested USDT is freed.
         """
         total_freed = 0.0
-        all_actions: List[Dict[str, Any]] = []
+        all_actions: list[dict[str, Any]] = []
 
         remaining = max(0.0, float(want_usdt))
 
@@ -649,7 +739,12 @@ class CashRouter:
         remaining = max(0.0, remaining - float(res.get("freed", 0.0) or 0.0))
         all_actions.extend(res.get("actions", []))
         if remaining <= 0:
-            return {"ok": True, "freed": float(f"{total_freed:.6f}"), "remaining": 0.0, "actions": all_actions}
+            return {
+                "ok": True,
+                "freed": float(f"{total_freed:.6f}"),
+                "remaining": 0.0,
+                "actions": all_actions,
+            }
 
         # 2) Sweep dust (sell only what’s needed)
         res = await self.sweep_dust(want_usdt=remaining)
@@ -657,7 +752,12 @@ class CashRouter:
         remaining = max(0.0, remaining - float(res.get("freed", 0.0) or 0.0))
         all_actions.extend(res.get("actions", []))
         if remaining <= 0:
-            return {"ok": True, "freed": float(f"{total_freed:.6f}"), "remaining": 0.0, "actions": all_actions}
+            return {
+                "ok": True,
+                "freed": float(f"{total_freed:.6f}"),
+                "remaining": 0.0,
+                "actions": all_actions,
+            }
 
         # 3) As a guarded last resort, sell small portions of positions
         if self._cfg_bool("CR_ALLOW_POSITION_FREE", False):
@@ -673,23 +773,40 @@ class CashRouter:
             "actions": all_actions,
         }
 
-    async def ensure_free_usdt(self, target_usdt: float, *, reason: str = "") -> Dict[str, Any]:
+    async def ensure_free_usdt(self, target_usdt: float, *, reason: str = "") -> dict[str, Any]:
         """
         Ensure at least target_usdt free in quote currency using best-effort routing.
         This function is idempotent and will do nothing if current free >= target.
         """
         if not self._cfg_bool("CR_ENABLE", True):
-            return {"ok": False, "freed": 0.0, "remaining": float(target_usdt), "reason": "disabled"}
+            return {
+                "ok": False,
+                "freed": 0.0,
+                "remaining": float(target_usdt),
+                "reason": "disabled",
+            }
         target_usdt = float(max(0.0, target_usdt))
         if target_usdt <= 0:
             tag = "balancer"
-            return {"ok": True, "freed": 0.0, "remaining": 0.0, "reason": reason or "no_gap", "tag": tag}
+            return {
+                "ok": True,
+                "freed": 0.0,
+                "remaining": 0.0,
+                "reason": reason or "no_gap",
+                "tag": tag,
+            }
 
         async with self._lock:
             start_free = await self._free_usdt()
             if start_free >= target_usdt:
                 tag = "balancer"
-                return {"ok": True, "freed": 0.0, "remaining": 0.0, "reason": reason or "already_sufficient", "tag": tag}
+                return {
+                    "ok": True,
+                    "freed": 0.0,
+                    "remaining": 0.0,
+                    "reason": reason or "already_sufficient",
+                    "tag": tag,
+                }
 
             need = target_usdt - start_free
             routed = await self.route_best_effort(need)
@@ -703,7 +820,9 @@ class CashRouter:
                         u = self.shared_state.update_balances(b)
                         await u if asyncio.iscoroutine(u) else u
                     if self.shared_state and hasattr(self.shared_state, "emit_event"):
-                        ev = self.shared_state.emit_event("balances.changed", {"source": "cash_router"})
+                        ev = self.shared_state.emit_event(
+                            "balances.changed", {"source": "cash_router"}
+                        )
                         if asyncio.iscoroutine(ev):
                             asyncio.create_task(ev)
             except Exception:
@@ -722,15 +841,18 @@ class CashRouter:
             # Emit a structured result event for higher layers/grep
             try:
                 if self.shared_state and hasattr(self.shared_state, "emit_event"):
-                    ev3 = self.shared_state.emit_event("LIQUIDITY_RESULT", {
-                        "component": "CashRouter",
-                        "via": "cash_router",
-                        "ok": (remaining <= 0.0),
-                        "freed": float(f"{freed_actual:.6f}"),
-                        "remaining": float(f"{remaining:.6f}"),
-                        "actions": int(len(routed.get("actions", []))),
-                        "reason": reason or "routed",
-                    })
+                    ev3 = self.shared_state.emit_event(
+                        "LIQUIDITY_RESULT",
+                        {
+                            "component": "CashRouter",
+                            "via": "cash_router",
+                            "ok": (remaining <= 0.0),
+                            "freed": float(f"{freed_actual:.6f}"),
+                            "remaining": float(f"{remaining:.6f}"),
+                            "actions": int(len(routed.get("actions", []))),
+                            "reason": reason or "routed",
+                        },
+                    )
                     if asyncio.iscoroutine(ev3):
                         asyncio.create_task(ev3)
             except Exception:
@@ -744,8 +866,9 @@ class CashRouter:
                 "tag": tag,
             }
 
+
 # small helper to normalize balance rows to floats
-def strdict(v: Any) -> Dict[str, float]:
+def strdict(v: Any) -> dict[str, float]:
     try:
         if isinstance(v, dict):
             out = {}

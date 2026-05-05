@@ -18,10 +18,13 @@ a positive feedback loop of rate limit errors.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional, Any, Awaitable
+from collections.abc import Awaitable, Callable
+from typing import Any, Optional
+
 try:
     from binance.exceptions import BinanceAPIException
 except Exception:  # pragma: no cover - fallback for stripped environments
+
     class BinanceAPIException(Exception):
         pass
 
@@ -29,7 +32,7 @@ except Exception:  # pragma: no cover - fallback for stripped environments
 class BalanceSyncRetryManager:
     """
     Manages retry logic for balance synchronization with exponential backoff.
-    
+
     Used by components that need authoritative balance data:
     - MetaController (decision points, execution gates)
     - CapitalGovernor (capital floor checks)
@@ -41,20 +44,20 @@ class BalanceSyncRetryManager:
     def __init__(self, logger: logging.Logger, component_name: str = "BalanceSyncRetry"):
         """
         Initialize the retry manager.
-        
+
         Args:
             logger: Logger instance
             component_name: Name of the component using this manager
         """
         self.logger = logger
         self.component_name = component_name
-        
+
         # Retry configuration
         self.initial_backoff_sec = 1.0  # Start with 1 second
-        self.max_backoff_sec = 30.0     # Cap at 30 seconds
-        self.backoff_multiplier = 2.0   # Double each retry
-        self.max_retries = 3            # Up to 3 attempts
-        
+        self.max_backoff_sec = 30.0  # Cap at 30 seconds
+        self.backoff_multiplier = 2.0  # Double each retry
+        self.max_retries = 3  # Up to 3 attempts
+
         # State tracking
         self.consecutive_failures = 0
         self.max_consecutive_failures = 3
@@ -66,7 +69,7 @@ class BalanceSyncRetryManager:
         self,
         sync_fn: Callable[..., Awaitable[Any]],
         call_point: str = "unknown",
-        force: bool = False
+        force: bool = False,
     ) -> bool:
         """
         Execute balance sync with exponential backoff on rate limit errors.
@@ -78,7 +81,7 @@ class BalanceSyncRetryManager:
 
         Returns:
             True if successful, False if failed after all retries
-            
+
         Behavior:
         - On success: Returns True, resets consecutive_failures counter
         - On rate limit: Backs off 1→2→4→8→16→30s and retries up to 3 times
@@ -87,25 +90,25 @@ class BalanceSyncRetryManager:
         """
         attempt = 0
         backoff_sec = self.initial_backoff_sec
-        
+
         while attempt < self.max_retries:
             attempt += 1
-            
+
             try:
                 # Execute the sync function
                 await sync_fn(force=force)
-                
+
                 # SUCCESS! Reset all failure tracking
                 self.consecutive_failures = 0
                 self.time_in_backoff = 0.0
-                
+
                 if attempt > 1:
                     # Only log if this was a retry
                     self.logger.info(
                         f"[BalanceSync] {self.component_name}:{call_point}: "
                         f"Recovered after {attempt} attempts. Rate limit cleared."
                     )
-                
+
                 return True
 
             except BinanceAPIException as e:
@@ -114,7 +117,7 @@ class BalanceSyncRetryManager:
                     self.last_rate_limit_code = 1003
                     self.last_rate_limit_time = time.time()
                     self.consecutive_failures += 1
-                    
+
                     # If this is the last attempt, give up
                     if attempt >= self.max_retries:
                         self.logger.warning(
@@ -123,7 +126,7 @@ class BalanceSyncRetryManager:
                             f"Giving up. Consecutive failures: {self.consecutive_failures}. "
                             f"Using cached balance."
                         )
-                        
+
                         # If too many consecutive failures, increase backoff window
                         if self.consecutive_failures >= self.max_consecutive_failures:
                             self.logger.error(
@@ -134,26 +137,23 @@ class BalanceSyncRetryManager:
                                 f"2) Check concurrent API calls, "
                                 f"3) Restart bot if issue persists."
                             )
-                        
+
                         return False
-                    
+
                     # Still have retries left - back off and try again
                     self.logger.warning(
                         f"[BalanceSync] {self.component_name}:{call_point}: "
                         f"Rate limit hit (attempt {attempt}/{self.max_retries}). "
                         f"Backing off {backoff_sec:.1f}s before retry..."
                     )
-                    
+
                     self.time_in_backoff += backoff_sec
                     await asyncio.sleep(backoff_sec)
-                    
+
                     # Increase backoff for next iteration
-                    backoff_sec = min(
-                        backoff_sec * self.backoff_multiplier,
-                        self.max_backoff_sec
-                    )
+                    backoff_sec = min(backoff_sec * self.backoff_multiplier, self.max_backoff_sec)
                     continue
-                
+
                 # === NON-RATE-LIMIT ERROR ===
                 else:
                     self.logger.error(
@@ -171,7 +171,7 @@ class BalanceSyncRetryManager:
                     f"Sync cancelled (attempt {attempt}/{self.max_retries})."
                 )
                 raise
-            
+
             except Exception as e:
                 if self._is_rate_limit_error(e):
                     self.last_rate_limit_code = 1003
@@ -203,7 +203,7 @@ class BalanceSyncRetryManager:
                 )
                 self.consecutive_failures = 0  # Reset on unexpected error
                 return False
-        
+
         # Should not reach here, but just in case
         self.logger.error(
             f"[BalanceSync] {self.component_name}:{call_point}: "
@@ -241,7 +241,7 @@ class BalanceSyncRetryManager:
     def get_status(self) -> dict:
         """
         Get current retry manager status.
-        
+
         Returns:
             Dict with current state:
             - is_in_backoff: Whether we're currently experiencing rate limits
@@ -261,17 +261,17 @@ class BalanceSyncRetryManager:
 class BalanceSyncCoordinator:
     """
     Coordinates balance sync across multiple components to prevent thundering herd.
-    
+
     Problem: When multiple independent components (MetaController, CapitalGovernor,
     ExecutionManager, RotationAuthority, ExchangeAuditor) all call
     sync_authoritative_balance(force=True) within the same evaluation cycle,
     they create a "thundering herd" of 5-10+ concurrent API calls, overwhelming
     the rate limit.
-    
+
     Solution: Use a shared coordinator that serializes critical balance syncs
     and prevents duplicate concurrent requests.
     """
-    
+
     def __init__(self, logger: logging.Logger):
         """Initialize the coordinator."""
         self.logger = logger
@@ -279,25 +279,25 @@ class BalanceSyncCoordinator:
         self._inflight_task: Optional[asyncio.Task] = None
         self._last_successful_sync = 0.0
         self._cache_ttl_sec = 30.0  # Cache balance for 30 seconds
-    
+
     async def sync_authoritative_balance_coordinated(
         self,
         sync_fn: Callable[..., Awaitable[Any]],
         component_name: str,
         call_point: str,
         force: bool = False,
-        use_cache: bool = True
+        use_cache: bool = True,
     ) -> bool:
         """
         Coordinate balance sync across components to prevent thundering herd.
-        
+
         Args:
             sync_fn: The actual sync function (shared_state.sync_authoritative_balance)
             component_name: Component requesting sync (e.g., "MetaController")
             call_point: Location in component (e.g., "evaluate_signals")
             force: Whether to force sync
             use_cache: Whether to use cached balance if recent
-        
+
         Returns:
             True if sync successful or cache valid, False if failed
         """
@@ -320,6 +320,7 @@ class BalanceSyncCoordinator:
                     f"[BalanceSyncCoord] {component_name}:{call_point}: joining in-flight sync"
                 )
             else:
+
                 async def _runner() -> bool:
                     try:
                         await sync_fn(force=force)
@@ -329,6 +330,7 @@ class BalanceSyncCoordinator:
                             f"[BalanceSyncCoord] {component_name}:{call_point}: Sync failed: {e}"
                         )
                         return False
+
                 task = asyncio.create_task(_runner())
                 self._inflight_task = task
 

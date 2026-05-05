@@ -6,7 +6,7 @@
 
 **A:** The mechanism EXISTS but is **BLOCKED by decision gates that don't trigger for your account size**:
 1. Dead capital threshold too high ($100+) vs your dust ($100)
-2. Operating cash not low enough ($15 vs $12 danger zone) 
+2. Operating cash not low enough ($15 vs $12 danger zone)
 3. Loop warmup delay (120s) + long interval (30 min) means liquidations checked infrequently
 4. Many dust positions too small to liquidate (< Binance min notional)
 
@@ -20,13 +20,13 @@
 ```python
 class DeadCapitalHealer:
     """Identifies and liquidates dead capital positions."""
-    
+
     def __init__(self, config: Optional[Dict] = None):
         # Adaptive thresholds based on account size
         thresholds = PortfolioBucketState.get_adaptive_thresholds(total_equity)
         self.min_dead_to_heal = thresholds['min_dead_to_heal']  # ~$50-100
         self.dead_min_size = thresholds['dead_min_size']        # ~$25
-        
+
     def should_heal(self, bucket_state: PortfolioBucketState) -> bool:
         """
         ❌ GATE 1: Checks if dead capital exceeds threshold
@@ -34,14 +34,14 @@ class DeadCapitalHealer:
         """
         if bucket_state.dead_total_value > self.min_dead_to_heal:
             return True  # ← BLOCKED: $100 is NOT > $100
-        
+
         """
         ❌ GATE 2: Checks if operating cash in danger zone
         For $100 account: needs free < $12 but you have $15-20
         """
         if bucket_state.operating_cash_usdt < bucket_state.operating_cash_danger_zone:
             return True  # ← BLOCKED: $15 is NOT < $12
-        
+
         return False  # ← BOTH GATES FAIL → NO HEALING
 ```
 
@@ -51,14 +51,14 @@ class DeadCapitalHealer:
 ```python
 class ThreeBucketManager:
     """Manages three-bucket portfolio classification."""
-    
+
     def should_execute_healing(self) -> bool:
         """
         Calls DeadCapitalHealer.should_heal()
         Returns False if both gates fail (which they do for your account)
         """
         return self.healer.should_heal(self.current_bucket_state)
-    
+
     def execute_healing(self, execution_callback=None):
         """
         IF should_execute_healing() returned True:
@@ -84,22 +84,22 @@ async def _three_bucket_management_loop(self):
     ❌ ISSUE: Has 120-second warmup + 1800-second interval
     = First check at 2 min, then every 30 min after
     """
-    
+
     # ❌ WARMUP DELAY (default 120 seconds)
     warmup_sec = float(os.getenv("HEAL_C_WARMUP_SEC", "120"))
     if warmup_sec > 0:
         await asyncio.sleep(warmup_sec)  # WAIT 2 MINUTES
-    
+
     # ❌ MAIN LOOP (every 30 minutes by default)
     interval_sec = float(os.getenv("HEAL_DUST_SWEEP_INTERVAL_SEC", "1800"))
-    
+
     while self.running:
         # Get current positions
         positions = self.shared_state.get_positions_snapshot(include_wallet_inventory=True)
-        
+
         # Classify into three buckets
         bucket_state = self.three_bucket_manager.update_bucket_state(positions, total_equity)
-        
+
         # ❌ CHECK: This returns False for your account
         if self.three_bucket_manager.should_execute_healing():
             # Only reached if should_execute_healing() = True
@@ -107,7 +107,7 @@ async def _three_bucket_management_loop(self):
             healing_result = self.three_bucket_manager.execute_healing(
                 execution_callback=_heal_execution_callback
             )
-        
+
         await asyncio.sleep(interval_sec)  # WAIT 30 MINUTES
 ```
 
@@ -127,10 +127,10 @@ Total NAV: $100
 Healing trigger conditions:
 1. dead_total_value > min_dead_to_heal
    $80 > $100? NO ← FAILS
-   
+
 2. operating_cash < danger_zone
    $15 < $12? NO ← FAILS
-   
+
 Result: should_heal() returns False → NO LIQUIDATION
 ```
 
@@ -391,7 +391,7 @@ Trading: ENABLED (sufficient free capital)
 
 ## ⚠️ Important Notes
 
-1. **Liquidation failures expected:** 
+1. **Liquidation failures expected:**
    - Many dust positions too small for Binance min notional
    - System will mark them as "UNHEALABLE" and stop trying
    - But most positions WILL liquidate successfully

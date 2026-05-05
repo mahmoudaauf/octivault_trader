@@ -2,8 +2,8 @@
 SignalManager subsystem extracted from MetaController.
 Handles signal cache, signal intake, validation, deduplication, and queue management.
 """
-from typing import Dict, Any, List, Optional, Tuple
 import time
+from typing import Any, Optional
 
 # Import utilities needed for intent processing (Phase D-4: extracted to L0)
 try:
@@ -15,14 +15,23 @@ except ImportError:
             return float(ts_val)
         return now_ts
 
+
 class SignalManager:
-    def __init__(self, config, logger, signal_cache=None, intent_manager=None, shared_state=None, position_count_source=None):
+    def __init__(
+        self,
+        config,
+        logger,
+        signal_cache=None,
+        intent_manager=None,
+        shared_state=None,
+        position_count_source=None,
+    ):
         self.config = config
         self.logger = logger
         self.intent_manager = intent_manager
         self.shared_state = shared_state  # NAV source
         self.position_count_source = position_count_source  # Position count source
-        
+
         # Use provided cache or create new one
         if signal_cache is not None:
             self.signal_cache = signal_cache
@@ -31,24 +40,34 @@ class SignalManager:
             # Try to use BoundedCache from L0, fallback to InlineBoundedCache
             try:
                 from src.l0_core.bounded_cache import BoundedCache
-                cache_size = int(getattr(config, 'signal_cache_max_size', 1000))
-                cache_ttl = float(getattr(config, 'signal_cache_ttl', 300.0))
+
+                cache_size = int(getattr(config, "signal_cache_max_size", 1000))
+                cache_ttl = float(getattr(config, "signal_cache_ttl", 300.0))
                 self.signal_cache = BoundedCache(max_size=cache_size, default_ttl=cache_ttl)
-                self.logger.info(f"[SignalManager] Signal cache initialized: max_size={cache_size}, ttl={cache_ttl}s")
+                self.logger.info(
+                    f"[SignalManager] Signal cache initialized: max_size={cache_size}, ttl={cache_ttl}s"
+                )
             except ImportError:
-                self.logger.warning("[SignalManager] BoundedCache unavailable, using InlineBoundedCache fallback")
+                self.logger.warning(
+                    "[SignalManager] BoundedCache unavailable, using InlineBoundedCache fallback"
+                )
                 self.signal_cache = InlineBoundedCache(max_size=1000, default_ttl=300)
 
         # Configuration for signal validation
-        self._min_conf_ingest = float(getattr(config, 'MIN_SIGNAL_CONF', 0.50))  # Defensive floor (0.50)
-        self._max_age_sec = float(getattr(config, 'MAX_SIGNAL_AGE_SECONDS', 60))
+        self._min_conf_ingest = float(
+            getattr(config, "MIN_SIGNAL_CONF", 0.50)
+        )  # Defensive floor (0.50)
+        self._max_age_sec = float(getattr(config, "MAX_SIGNAL_AGE_SECONDS", 60))
         self._known_quotes = {"USDT", "FDUSD", "USDC", "BUSD", "TUSD", "DAI"}
-        
-        if shared_state or position_count_source:
-            self.logger.info("[SignalManager] Initialized with NAV source: shared_state=%s, position_count_source=%s",
-                           "yes" if shared_state else "no", "yes" if position_count_source else "no")
 
-    def receive_signal(self, agent_name: str, symbol: str, signal: Dict[str, Any]) -> bool:
+        if shared_state or position_count_source:
+            self.logger.info(
+                "[SignalManager] Initialized with NAV source: shared_state=%s, position_count_source=%s",
+                "yes" if shared_state else "no",
+                "yes" if position_count_source else "no",
+            )
+
+    def receive_signal(self, agent_name: str, symbol: str, signal: dict[str, Any]) -> bool:
         """
         Accept and cache signals with validation and deduplication.
 
@@ -61,34 +80,57 @@ class SignalManager:
             True if signal was accepted and cached, False otherwise
         """
         if not symbol or not isinstance(signal, dict):
-            self.logger.warning("[SignalManager] Invalid signal received: symbol=%s signal=%s", symbol, signal)
+            self.logger.warning(
+                "[SignalManager] Invalid signal received: symbol=%s signal=%s", symbol, signal
+            )
             return False
 
         # Normalize symbol
         sym = self._normalize_symbol(symbol)
         if not sym or len(sym) < 6:
-            self.logger.debug("[SignalManager] Rejected suspicious symbol: %r (normalized from %r)", sym, symbol)
+            self.logger.debug(
+                "[SignalManager] Rejected suspicious symbol: %r (normalized from %r)", sym, symbol
+            )
             return False
 
         # Check if base is a known quote token
         base, quote = self._split_base_quote(sym)
         if base.upper() in self._known_quotes:
-            self.logger.debug("[SignalManager] %s rejected: base '%s' is a known quote token.", sym, base)
+            self.logger.debug(
+                "[SignalManager] %s rejected: base '%s' is a known quote token.", sym, base
+            )
             return False
 
         # Check if quote is a known quote token
         if quote.upper() not in self._known_quotes:
-            self.logger.debug("[SignalManager] %s rejected: quote '%s' is not a known quote token. (symbol=%s, base=%s)", sym, quote, symbol, base)
+            self.logger.debug(
+                "[SignalManager] %s rejected: quote '%s' is not a known quote token. (symbol=%s, base=%s)",
+                sym,
+                quote,
+                symbol,
+                base,
+            )
             return False
 
         # Early confidence check
         conf_raw = float(signal.get("confidence", 0.0))
         if conf_raw < self._min_conf_ingest:
-            self.logger.debug("[SignalManager] %s from %s conf %.2f < ingest floor %.2f", sym, agent_name, conf_raw, self._min_conf_ingest)
+            self.logger.debug(
+                "[SignalManager] %s from %s conf %.2f < ingest floor %.2f",
+                sym,
+                agent_name,
+                conf_raw,
+                self._min_conf_ingest,
+            )
             return False
 
         if conf_raw > 1.0:
-            self.logger.warning("[SignalManager] Confidence inflation detected from %s for %s: %.2f. Clamping to 1.0", agent_name, sym, conf_raw)
+            self.logger.warning(
+                "[SignalManager] Confidence inflation detected from %s for %s: %.2f. Clamping to 1.0",
+                agent_name,
+                sym,
+                conf_raw,
+            )
 
         # Prepare signal for caching
         s = dict(signal)
@@ -111,12 +153,12 @@ class SignalManager:
 
         # Set default quote if not provided
         if "quote" not in s or float(s.get("quote") or 0) <= 0:
-            s["quote"] = float(getattr(self.config, 'DEFAULT_PLANNED_QUOTE', 10.0))
+            s["quote"] = float(getattr(self.config, "DEFAULT_PLANNED_QUOTE", 10.0))
 
         # Economic hints: buffered min_notional for early filtering
         try:
-            min_notional_cfg = float(getattr(self.config, 'MIN_NOTIONAL_USDT', 10.0))
-            safety_buf = float(getattr(self.config, 'NOTIONAL_SAFETY_BUFFER_USDT', 2.0))
+            min_notional_cfg = float(getattr(self.config, "MIN_NOTIONAL_USDT", 10.0))
+            safety_buf = float(getattr(self.config, "NOTIONAL_SAFETY_BUFFER_USDT", 2.0))
             s["_min_notional_with_buffer"] = max(0.0, min_notional_cfg + safety_buf)
         except Exception:
             s["_min_notional_with_buffer"] = None
@@ -124,10 +166,17 @@ class SignalManager:
         # Store in cache with deduplication by symbol:agent
         cache_key = f"{sym}:{agent_name}"
         self.signal_cache.set(cache_key, s)
-        self.logger.debug("[SignalManager] Signal ACCEPTED and cached: %s from %s (confidence=%.2f)", sym, agent_name, s["confidence"])
+        self.logger.debug(
+            "[SignalManager] Signal ACCEPTED and cached: %s from %s (confidence=%.2f)",
+            sym,
+            agent_name,
+            s["confidence"],
+        )
         return True
 
-    def store_signal(self, agent_name: str, symbol: str, signal: Dict[str, Any], source_intent=None) -> None:
+    def store_signal(
+        self, agent_name: str, symbol: str, signal: dict[str, Any], source_intent=None
+    ) -> None:
         """
         Store a processed signal in the cache, preserving source TradeIntent if provided.
 
@@ -138,18 +187,22 @@ class SignalManager:
             source_intent: Original TradeIntent object (if available)
         """
         cache_key = f"{symbol}:{agent_name}"
-        
+
         # Enhance signal dict with source intent reference if provided
         if source_intent is not None:
             signal = dict(signal)  # Make a copy to avoid mutating caller's dict
             signal["_source_intent"] = source_intent
             signal["_has_source_intent"] = True
-        
-        self.signal_cache.set(cache_key, signal)
-        self.logger.debug("[SignalManager] Signal stored for %s from %s (intent preserved: %s)", 
-                         symbol, agent_name, "yes" if source_intent else "no")
 
-    def get_all_signals(self) -> List[Dict[str, Any]]:
+        self.signal_cache.set(cache_key, signal)
+        self.logger.debug(
+            "[SignalManager] Signal stored for %s from %s (intent preserved: %s)",
+            symbol,
+            agent_name,
+            "yes" if source_intent else "no",
+        )
+
+    def get_all_signals(self) -> list[dict[str, Any]]:
         """
         Get all non-expired signals from the cache.
 
@@ -158,7 +211,7 @@ class SignalManager:
         """
         return self.signal_cache.list_all()
 
-    def get_signals_for_symbol(self, symbol: str) -> List[Dict[str, Any]]:
+    def get_signals_for_symbol(self, symbol: str) -> list[dict[str, Any]]:
         """
         Get all signals for a specific symbol.
 
@@ -171,13 +224,13 @@ class SignalManager:
         all_signals = self.get_all_signals()
         return [s for s in all_signals if s.get("symbol") == symbol]
 
-    def get_source_intent(self, signal: Dict[str, Any]):
+    def get_source_intent(self, signal: dict[str, Any]):
         """
         Extract source TradeIntent from a cached signal if available.
-        
+
         Args:
             signal: Signal dictionary (may contain _source_intent)
-            
+
         Returns:
             TradeIntent object if preserved, None otherwise
         """
@@ -219,7 +272,7 @@ class SignalManager:
             try:
                 # Preserve the original intent object for traceability
                 source_intent = None
-                
+
                 if hasattr(it, "to_dict"):
                     d = it.to_dict()
                     source_intent = it  # ← KEY: Preserve the original TradeIntent object
@@ -242,30 +295,47 @@ class SignalManager:
 
                 # Validate symbol format (same as receive_signal)
                 if not symbol or len(symbol) < 6:
-                    self.logger.debug("[SignalManager:Flush] Rejected suspicious symbol: %r", symbol)
+                    self.logger.debug(
+                        "[SignalManager:Flush] Rejected suspicious symbol: %r", symbol
+                    )
                     continue
 
                 # Check if base is a known quote token
                 base, quote = self._split_base_quote(symbol)
                 if base.upper() in self._known_quotes:
-                    self.logger.debug("[SignalManager:Flush] %s rejected: base is a known quote token.", symbol)
+                    self.logger.debug(
+                        "[SignalManager:Flush] %s rejected: base is a known quote token.", symbol
+                    )
                     continue
 
                 # Check if quote is a known quote token
                 if quote.upper() not in self._known_quotes:
-                    self.logger.debug("[SignalManager:Flush] %s rejected: quote %s is not a known quote token.", symbol, quote)
+                    self.logger.debug(
+                        "[SignalManager:Flush] %s rejected: quote %s is not a known quote token.",
+                        symbol,
+                        quote,
+                    )
                     continue
 
                 if not symbol or action not in ("BUY", "SELL"):
                     if not symbol:
                         self.logger.debug("[SignalManager:Flush] Rejected intent: missing symbol.")
                     elif action not in ("BUY", "SELL"):
-                        self.logger.debug("[SignalManager:Flush] Rejected intent for %s: invalid action '%s'", symbol, action)
+                        self.logger.debug(
+                            "[SignalManager:Flush] Rejected intent for %s: invalid action '%s'",
+                            symbol,
+                            action,
+                        )
                     continue
 
                 # Confidence check
                 if conf < self._min_conf_ingest:
-                    self.logger.debug("[SignalManager:Flush] %s conf %.2f < ingest floor %.2f", symbol, conf, self._min_conf_ingest)
+                    self.logger.debug(
+                        "[SignalManager:Flush] %s conf %.2f < ingest floor %.2f",
+                        symbol,
+                        conf,
+                        self._min_conf_ingest,
+                    )
                     continue
 
                 # TTL check
@@ -280,15 +350,17 @@ class SignalManager:
 
                 # Use dictionary update to preserve all metadata from intent
                 sig = dict(d)
-                sig.update({
-                    "symbol": symbol,
-                    "action": action,
-                    "confidence": conf,
-                    "agent": agent,
-                    "timestamp": now_ts,
-                    "budget_required": budget_required,
-                })
-                
+                sig.update(
+                    {
+                        "symbol": symbol,
+                        "action": action,
+                        "confidence": conf,
+                        "agent": agent,
+                        "timestamp": now_ts,
+                        "budget_required": budget_required,
+                    }
+                )
+
                 quote_value = d.get("planned_quote")
                 if quote_value is None:
                     quote_value = d.get("quote")
@@ -314,19 +386,22 @@ class SignalManager:
                 self.logger.debug("intent->signal failed: %r", it, exc_info=True)
 
         if accepted > 0:
-            self.logger.info("[SignalManager:Flush] Successfully ingested %d signals into cache (intents preserved).", accepted)
+            self.logger.info(
+                "[SignalManager:Flush] Successfully ingested %d signals into cache (intents preserved).",
+                accepted,
+            )
         return accepted
 
     def get_current_nav(self) -> float:
         """
         Get current NAV from configured source (shared_state).
-        
+
         Returns:
             Current NAV in USDT, or 0.0 if unavailable
         """
         if not self.shared_state:
             return 0.0
-        
+
         try:
             # Try get_nav_quote() method first (async, but wrapped by caller if needed)
             if hasattr(self.shared_state, "nav"):
@@ -338,7 +413,7 @@ class SignalManager:
                     val = float(nav or 0.0)
                     if val > 0:
                         return val
-            
+
             # Fallback to portfolio_nav
             if hasattr(self.shared_state, "portfolio_nav"):
                 nav = getattr(self.shared_state, "portfolio_nav", 0.0)
@@ -348,19 +423,19 @@ class SignalManager:
                     val = float(nav or 0.0)
                     if val > 0:
                         return val
-            
+
             # Final fallback
             if hasattr(self.shared_state, "total_equity_usdt"):
-                return float(getattr(self.shared_state, "total_equity_usdt") or 0.0)
+                return float(self.shared_state.total_equity_usdt or 0.0)
         except Exception as e:
             self.logger.debug("[SignalManager] Failed to get NAV from shared_state: %s", e)
-        
+
         return 0.0
 
     def get_position_count(self) -> int:
         """
         Get current position count from configured source.
-        
+
         Returns:
             Number of open positions, or 0 if unavailable
         """
@@ -373,7 +448,7 @@ class SignalManager:
                         return count
             except Exception as e:
                 self.logger.debug("[SignalManager] Failed to get position count from source: %s", e)
-        
+
         # Fallback: try to get from shared_state if available
         if self.shared_state:
             try:
@@ -382,20 +457,26 @@ class SignalManager:
                     if snap and isinstance(snap, dict):
                         count = 0
                         for sym, pos_data in snap.items():
-                            qty = float((pos_data or {}).get("quantity", 0.0) or (pos_data or {}).get("qty", 0.0) or 0.0)
+                            qty = float(
+                                (pos_data or {}).get("quantity", 0.0)
+                                or (pos_data or {}).get("qty", 0.0)
+                                or 0.0
+                            )
                             if qty > 0:
                                 count += 1
                         return count
             except Exception as e:
-                self.logger.debug("[SignalManager] Failed to count positions from shared_state: %s", e)
-        
+                self.logger.debug(
+                    "[SignalManager] Failed to count positions from shared_state: %s", e
+                )
+
         return 0
 
     def _normalize_symbol(self, symbol: str) -> str:
         """Normalize symbol to uppercase."""
         return symbol.upper().strip() if symbol else ""
 
-    def _split_base_quote(self, symbol: str) -> Tuple[str, str]:
+    def _split_base_quote(self, symbol: str) -> tuple[str, str]:
         """Split symbol into base and quote currencies."""
         # Simple split - assumes format like BTCUSDT
         if len(symbol) < 6:
@@ -404,7 +485,7 @@ class SignalManager:
         sorted_quotes = sorted(self._known_quotes, key=len, reverse=True)
         for quote in sorted_quotes:
             if symbol.endswith(quote):
-                base = symbol[:-len(quote)]
+                base = symbol[: -len(quote)]
                 return base, quote
         # Fallback: try common quote lengths (4, 3)
         for quote_len in [4, 3]:
@@ -415,16 +496,20 @@ class SignalManager:
         # Final fallback: assume last 4 chars are quote (for backward compatibility)
         return symbol[:-4], symbol[-4:]
 
+
 class InlineBoundedCache:
     def __init__(self, max_size=1000, default_ttl=300):
         from collections import deque
+
         self._cache = {}
         self._timestamps = {}
         self._access_order = deque(maxlen=max_size)
         self.max_size = max_size
         self.default_ttl = default_ttl
+
     def get(self, key, default=None):
         import time
+
         now = time.time()
         if key in self._cache:
             if now - self._timestamps.get(key, 0) < self.default_ttl:
@@ -438,8 +523,10 @@ class InlineBoundedCache:
                 self._cache.pop(key, None)
                 self._timestamps.pop(key, None)
         return default
+
     def set(self, key, value, ttl=None):
         import time
+
         now = time.time()
         if key not in self._cache and len(self._cache) >= self.max_size:
             if self._access_order:
@@ -449,12 +536,15 @@ class InlineBoundedCache:
         self._cache[key] = value
         self._timestamps[key] = now
         self._access_order.append(key)
+
     def clear(self):
         self._cache.clear()
         self._timestamps.clear()
         self._access_order.clear()
+
     def cleanup_expired(self):
         import time
+
         now = time.time()
         expired = [k for k, t in self._timestamps.items() if now - t >= self.default_ttl]
         for k in expired:
@@ -468,7 +558,7 @@ class InlineBoundedCache:
 
     # Provide a simple list_all implementation so the SignalManager can
     # call `signal_cache.list_all()` on the inline fallback.
-    def list_all(self) -> List[Dict[str, Any]]:
+    def list_all(self) -> list[dict[str, Any]]:
         """Return a list of cached values (non-expired)."""
         now = time.time()
         out = []
@@ -485,6 +575,7 @@ class InlineBoundedCache:
                 except ValueError:
                     pass
         return out
+
 
 # If the external BoundedCache import fails, use the inline fallback
 # by aliasing the expected name.

@@ -41,11 +41,11 @@ def should_heal(self, bucket_state: PortfolioBucketState) -> bool:
     # Heal if dead capital exceeds threshold
     if bucket_state.dead_total_value > self.min_dead_to_heal:
         return True
-    
+
     # Heal if operating cash is low
     if bucket_state.operating_cash_usdt < bucket_state.operating_cash_danger_zone:
         return True
-    
+
     return False  # ← THIS RETURNS FALSE, SO HEALING NEVER FIRES
 ```
 
@@ -121,7 +121,7 @@ Your account has:
 dead_total_value = $100-150
 min_dead_to_heal = probably $100-200 (adaptive to account size)
 
-CHECK: $100 > $100? 
+CHECK: $100 > $100?
 Result: LIKELY FALSE or BORDERLINE → NO LIQUIDATION
 ```
 
@@ -169,13 +169,13 @@ async def liquidate_all_dust():
     client = ExchangeClient()
     shared_state = SharedState(config=..., exchange_client=client)
     exec_mgr = ExecutionManager(shared_state, client, config)
-    
+
     positions = shared_state.get_positions_snapshot()
-    
+
     for symbol, pos in positions.items():
         qty = float(pos.get('quantity', 0))
         value = qty * float(await shared_state.safe_price(symbol))
-        
+
         # Close if < $25
         if 0 < value < 25:
             print(f"LIQUIDATING: {symbol} qty={qty} value=${value:.2f}")

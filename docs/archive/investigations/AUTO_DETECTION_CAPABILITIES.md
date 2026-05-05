@@ -129,17 +129,17 @@ async def _inject_signals_loop():
         # Get current state
         positions = await shared_state.get_positions_snapshot()
         total_equity = await shared_state.get_total_nav()
-        
+
         # Update bucket classification
         bucket_state = await three_bucket_manager.update_bucket_state(
             positions=positions,
             total_equity=total_equity
         )
-        
+
         # Automatic decision: Should we execute healing?
         if three_bucket_manager.should_execute_healing():
             healing_result = await three_bucket_manager.execute_healing()
-        
+
         # Log status every 10 cycles
         if cycle % 10 == 0:
             three_bucket_manager.log_bucket_status()
@@ -235,14 +235,14 @@ snapshot = await shared_state.get_portfolio_snapshot()
 Method 1: Via Balances
   balances = await exchange_client.get_spot_balances()
   → {"USDT": 104.04}
-  
+
   Current Symbols: USDT only (no active positions currently)
   Status: ✅ CASH ONLY MODE
 
 Method 2: Via Positions
   positions = shared_state.get_positions_snapshot()
   → {} (empty - no active positions)
-  
+
   Current Symbols: None
   Status: ✅ READY TO TRADE
 
@@ -319,11 +319,11 @@ async def _wallet_sync_loop():
         # Hard sync: exchange is source of truth
         await shared_state.authoritative_wallet_sync()
         # Updates: balances, positions, invested_capital, free_capital
-        
+
         # Reconcile: find and fix discrepancies
         reconciliation = await exchange_truth_auditor.run()
         # Fixes: phantom positions, balance mismatches, orphaned orders
-        
+
         await asyncio.sleep(300)  # Wait 5 minutes
 ```
 

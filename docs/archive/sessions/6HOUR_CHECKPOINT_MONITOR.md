@@ -8,7 +8,7 @@
 
 This guide sets up **active monitoring with 50-minute checkpoints** to validate Phase 2 implementations:
 - ✅ Recovery exit min-hold bypass
-- ✅ Forced rotation micro bracket override  
+- ✅ Forced rotation micro bracket override
 - ✅ Entry sizing alignment (25 USDT)
 - ✅ Capital velocity governance
 - ✅ Risk management compliance
@@ -366,15 +366,15 @@ Phase 2 Status:
   Recovery Bypasses: {count}
   Forced Rotations: {count}
   Entry Size Range: ${min}-${max}
-  
+
 Trading Status:
   Active Positions: {count}
   Current P&L: {$amount}
   Win Rate: {X}%
-  
+
 Issues:
   - {issue if any}
-  
+
 Notes:
   - {observation if any}
 ```
@@ -413,7 +413,7 @@ Session is successful if:
    - Review checkpoint_summary.txt
    - Check recovery bypass count vs expected
    - Check forced rotation override count
-   
+
 2. **Compare Baselines**
    - Compare P&L before/after Phase 2
    - Compare capital velocity improvement

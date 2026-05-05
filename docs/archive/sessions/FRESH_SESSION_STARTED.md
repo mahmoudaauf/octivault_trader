@@ -1,6 +1,6 @@
 # Fresh Session Started - System Restart Report
 
-**Timestamp**: April 25, 2026 ~ 13:47 PM UTC  
+**Timestamp**: April 25, 2026 ~ 13:47 PM UTC
 **Status**: ✅ **RUNNING SUCCESSFULLY**
 
 ## System Status
@@ -15,9 +15,9 @@
 
 ## Previous Session Summary
 
-**Duration**: 20 minutes (13:03:40 - 13:23:43)  
-**Trades Executed**: 2 (ETHUSDT -$0.06, AXSUSDT +$0.11)  
-**Net P&L**: +$2.32 (+2.27%)  
+**Duration**: 20 minutes (13:03:40 - 13:23:43)
+**Trades Executed**: 2 (ETHUSDT -$0.06, AXSUSDT +$0.11)
+**Net P&L**: +$2.32 (+2.27%)
 **Analysis**:
 - Trade P&L: +$0.05 (2.1% of gains)
 - Market Movement: +$2.27 (97.8% of gains)
@@ -32,7 +32,7 @@
 ✅ **Profit Optimization Methods Now Active**
 - `_calculate_optimal_position_size()` - Smart position sizing based on confidence
 - `_calculate_dynamic_take_profit()` - Adaptive profit targets
-- `_calculate_dynamic_stop_loss()` - Dynamic risk management  
+- `_calculate_dynamic_stop_loss()` - Dynamic risk management
 - `_should_scale_position()` - Identify winners for averaging up
 - `_should_take_partial_profit()` - Lock in partial gains
 
@@ -85,7 +85,7 @@ Agents are generating **0 signals** consistently, indicating:
    - Look for: [ProfitOpt:*] log entries
    - Track: Position size changes, take profit executions
 
-3. **Market-Driven vs Signal-Driven P&L**: 
+3. **Market-Driven vs Signal-Driven P&L**:
    - Previous: 97.8% from market, 2.1% from signal timing
    - Goal: Shift ratio to favor signal-driven gains
 
@@ -111,6 +111,6 @@ Agents are generating **0 signals** consistently, indicating:
 
 ---
 
-**Session Started**: ~13:47 UTC  
-**Report Generated**: ~13:56 UTC  
+**Session Started**: ~13:47 UTC
+**Report Generated**: ~13:56 UTC
 **Status**: Ready for monitoring

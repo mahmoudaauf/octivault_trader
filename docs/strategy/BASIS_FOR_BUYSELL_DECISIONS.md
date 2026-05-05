@@ -1,7 +1,7 @@
 # 🎯 BASIS FOR BUY/SELL DECISIONS - COMPLETE ANALYSIS
 
-**Purpose:** Document the exact criteria used to propose BUY/SELL signals  
-**Date:** April 27, 2026  
+**Purpose:** Document the exact criteria used to propose BUY/SELL signals
+**Date:** April 27, 2026
 **Scope:** All 8+ agents and their signal generation logic
 
 ---
@@ -175,12 +175,12 @@ if ema20 > ema50 and rsi < 75:  # Uptrend + not overbought
     action = "BUY"
     confidence = 0.65  # Fixed, not dynamic
     reason = "EMA uptrend detected"
-    
+
 elif ema20 < ema50 and rsi > 30:  # Downtrend + not oversold
     action = "SELL"
     confidence = 0.65  # Fixed, not dynamic
     reason = "EMA downtrend detected"
-    
+
 else:
     action = "HOLD"
     confidence = 0.0
@@ -251,7 +251,7 @@ BUY: Price pulled back 5-10%
      + Volume spike (2x average)
      + RSI < 40 (oversold)
      + Above EMA200 (support)
-     
+
 HOLD: No dip detected
 ```
 
@@ -350,11 +350,11 @@ predicted_return = model.predict(features)  # Output: -10% to +10%
 if predicted_return >= 0.02:  # >= 2% expected
     action = "BUY"
     confidence = min(0.95, abs(predicted_return) / 0.10)
-    
+
 elif predicted_return <= -0.02:  # <= -2% expected
     action = "SELL"
     confidence = min(0.95, abs(predicted_return) / 0.10)
-    
+
 else:
     action = "HOLD"
     confidence = 0.0
@@ -400,10 +400,10 @@ CONFIDENCE: 0.99 (forced, not optional)
 
 async def propose_liquidations(self, gap_usdt: float, reason: str, force: bool = False):
     """Generate liquidation signals for dust positions"""
-    
+
     # Get all dust positions
     dust_positions = await self.shared_state.get_dust_positions()
-    
+
     proposals = []
     for symbol, qty, value_usdt in dust_positions:
         signal = {
@@ -416,7 +416,7 @@ async def propose_liquidations(self, gap_usdt: float, reason: str, force: bool =
             "_force_dust_liquidation": True,
         }
         proposals.append(signal)
-    
+
     return proposals
 ```
 
@@ -517,7 +517,7 @@ LiquidationAgent| 0.99 (forced)  | 0.99| Forced exit (not optional)
 IPOChaser       | 0.65-0.85     | 0.90| Untested new symbols
 WalletScanner   | 0.70-0.80     | 0.90| Whale tracking signal
 
-PROBLEM: Actual signals range 0.65-0.84 
+PROBLEM: Actual signals range 0.65-0.84
          BUT gate requires 0.89+ minimum
          → 95% rejection rate!
 ```
@@ -705,17 +705,17 @@ CONFIDENCE_GATE_FLOOR = 0.65  # Dynamic, based on success rate
 
 def validate_entry_will_not_be_dust(symbol, planned_quote, current_price):
     """Check worst-case scenario"""
-    
+
     # Worst case: Price moves 2% against, fee 0.1%
     qty = planned_quote / current_price
     worst_case_fill = (current_price * 0.98) × qty  # -2% slippage
     after_fee = worst_case_fill × 0.999            # -0.1% fee
-    
+
     significant_floor = 20.0
-    
+
     if after_fee < significant_floor:
         return False, f"Would be dust: ${after_fee:.2f} < ${significant_floor}"
-    
+
     return True, "Entry value safe"
 ```
 
@@ -736,7 +736,7 @@ for sym, qty, value_usdt, pos_age_sec in dust_to_liquidate:
     # Don't liquidate if too fresh
     if pos_age_sec < DUST_MIN_AGE:
         continue  # Skip, let it mature
-    
+
     dust_sell_sig = create_sell_signal(sym)
 ```
 
@@ -843,4 +843,3 @@ Calibration Loop:
 - 60%+ win rate on decent signals
 - Capital growth instead of decay
 - Profitable system ✓
-

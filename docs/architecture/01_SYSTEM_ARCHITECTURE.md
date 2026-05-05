@@ -1,7 +1,7 @@
 # 🏗️ System Architecture
 
-**Document Version:** 2.0  
-**Last Updated:** April 10, 2026  
+**Document Version:** 2.0
+**Last Updated:** April 10, 2026
 **Status:** Complete
 
 ---

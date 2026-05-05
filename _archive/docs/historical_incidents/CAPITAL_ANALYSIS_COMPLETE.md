@@ -37,7 +37,7 @@ Apr 27 17:37   Starting NAV: $125.69
 May 01 10:46   Current NAV: $99.76
                Realized Loss: -$82.04
                Status: Declining, $39.32 loss in 4 days
-               
+
 Loss Analysis:
   Capital Lost: $25.93 (-20.63%)
   Realized PnL: -$39.32 (actual trading losses)
@@ -68,8 +68,8 @@ micro_bt(win=n/a)                                       ← No winning history
 ### Part 3: How to Reverse the Decay
 
 #### Solution 1: Pause Trading (Safest)
-**Time:** 2 minutes  
-**Risk:** None  
+**Time:** 2 minutes
+**Risk:** None
 **Result:** Stops further losses immediately
 
 ```bash
@@ -279,7 +279,7 @@ I've created 3 new documents for you:
 
 ```
 A) Pause trading    → I'll disable it immediately
-B) Optimize live    → I'll apply fixes while running  
+B) Optimize live    → I'll apply fixes while running
 C) Reset & restart  → I'll liquidate and start fresh
 ```
 
@@ -293,6 +293,6 @@ Your system is working **perfectly**. It's accurately showing you that:
 
 > "Your trading strategy needs optimization, not because the tracking is broken, but because the entry rules are too loose for a micro account where fees have high impact."
 
-Fix: Increase position size, tighten filters, add win-rate gate.  
-Expected: Profitability restoration within 1-7 days.  
+Fix: Increase position size, tighten filters, add win-rate gate.
+Expected: Profitability restoration within 1-7 days.
 Timeline: 30 minutes to implement, 1 week to verify.

@@ -1,7 +1,7 @@
 # 🎯 SYSTEM DESIGN VALIDATION - How the System Is Built to Act
 
-**Date:** May 4, 2026  
-**Based on:** Source code cross-reference with config analysis  
+**Date:** May 4, 2026
+**Based on:** Source code cross-reference with config analysis
 **Status:** ✅ VALIDATED AGAINST DESIGN
 
 ---
@@ -12,7 +12,7 @@ The system is built to:
 
 1. **Discover ALL symbols** (watchlist phase) - Max 30 symbols
 2. **Filter to TOP candidates** - Apply signal scoring
-3. **Select top 3 symbols** - Based on signal strength 
+3. **Select top 3 symbols** - Based on signal strength
 4. **Deploy capital to 2-3 positions** - 60/20/20 allocation
 5. **Rotate 1 symbol** - Periodically swap weakest for next best
 6. **Focus fire** - Concentrate on proven performers
@@ -102,7 +102,7 @@ class SymbolRotationManager:
     - Can be disabled via configuration
     - Allows rotation if replacement exceeds threshold
     """
-    
+
     def __init__(self, config):
         self.soft_lock_enabled = getattr(config, 'BOOTSTRAP_SOFT_LOCK_ENABLED', True)
         self.soft_lock_duration = 3600  # 1 hour lock
@@ -130,7 +130,7 @@ async def _estimate_available_position_capacity(self) -> Tuple[int, int, int]:
     """
     max_positions = int(self._cfg("MAX_POSITIONS_TOTAL", 2) or 2)
     max_positions = max(1, max_positions)
-    
+
     # Constraint: only allow new positions if slots available
     available_slots = max_positions - open_positions
     return (available_slots, max_positions, open_positions)
@@ -450,4 +450,3 @@ This breaks because:
 5. Fix position consolidation
 
 The system IS well-designed for micro accounts. It's just not executing the design correctly.
-

@@ -45,13 +45,13 @@ while kill -0 $BOT_PID 2>/dev/null; do
     LATEST_NAV=$(grep -o 'nav=[0-9.]*' "$LOG_FILE" | tail -1 | cut -d= -f2)
     TRADE_COUNT=$(grep -c 'TRADE_SUBMITTED\|TRADE_FILLED' "$LOG_FILE" || echo 0)
     DECISION_COUNT=$(grep -c 'DECISION:' "$LOG_FILE" || echo 0)
-    
+
     if [ -n "$LATEST_NAV" ]; then
         echo "💰 Latest NAV: \$$LATEST_NAV"
     fi
     echo "📈 Decisions Made: $DECISION_COUNT"
     echo "🎯 Trades Executed: $TRADE_COUNT"
-    
+
     sleep 15
     echo "---"
 done

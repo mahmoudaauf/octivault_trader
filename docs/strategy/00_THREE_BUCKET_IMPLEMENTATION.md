@@ -1,7 +1,7 @@
 # 🎯 THREE-BUCKET IMPLEMENTATION GUIDE
 ## Complete Integration Instructions
 
-**Date**: April 17, 2026  
+**Date**: April 17, 2026
 **Status**: ✅ **READY TO INTEGRATE**
 
 ---
@@ -65,11 +65,11 @@ from core.three_bucket_manager import ThreeBucketPortfolioManager
 ```python
 class OrchestratorConfig:
     # ... existing code ...
-    
+
     # Add after existing capital settings (around line 240):
     def __init__(self):
         # ... existing init code ...
-        
+
         # Three-bucket configuration
         self.three_bucket_config = {
             'min_productive_size': 25.0,           # $25 minimum
@@ -88,7 +88,7 @@ class OrchestratorConfig:
 class MainOrchestrator:
     def __init__(self, ...):
         # ... existing code ...
-        
+
         # Add after other managers:
         self.three_bucket_manager = ThreeBucketPortfolioManager(
             self.config.three_bucket_config
@@ -107,69 +107,69 @@ Find the main loop where trading decisions are made. Add these steps:
 ```python
 async def _run_trading_loop(self):
     """Main trading loop with three-bucket integration"""
-    
+
     while self._should_continue():
         loop_id = self.loop_counter
-        
+
         try:
             # ================================================================
             # STEP 0: CLASSIFICATION (New - Three-Bucket)
             # ================================================================
             logger.info(f"LOOP {loop_id}: Three-bucket classification...")
-            
+
             # Get current positions from shared state
             current_positions = self.shared_state.get_portfolio_positions()
             total_equity = self.shared_state.get_total_equity()
-            
+
             # Update bucket classification
             bucket_state = self.three_bucket_manager.update_bucket_state(
                 positions=current_positions,
                 total_equity=total_equity,
             )
-            
+
             # Log bucket status
             self.three_bucket_manager.log_bucket_status()
-            
+
             # ================================================================
             # STEP 1: HEALING (New - Priority)
             # ================================================================
             healing_priority = self.three_bucket_manager.should_execute_healing()
-            
+
             if healing_priority:
                 logger.info(f"LOOP {loop_id}: Executing dead capital healing...")
-                
+
                 should_heal, reason, orders = self.three_bucket_manager.plan_healing_cycle()
-                
+
                 if should_heal and orders:
                     logger.info(f"🔧 {reason}")
-                    
+
                     # Execute healing (with exchange callback)
                     healing_report = self.three_bucket_manager.execute_healing(
                         execution_callback=self.execution_manager.execute_market_order
                     )
-                    
+
                     if healing_report:
                         logger.info(
                             f"✅ Healed ${healing_report.total_amount_recovered:.2f} "
                             f"({healing_report.total_positions_healed} positions)"
                         )
-                        
+
                         # Update shared state with healed cash
                         self.shared_state.update_from_healing(healing_report)
                 else:
                     logger.debug(f"💭 Healing not needed: {reason}")
-            
+
             # ================================================================
             # STEP 2: TRADING GATES (Enhanced - Bucket-Aware)
             # ================================================================
             logger.debug(f"LOOP {loop_id}: Checking trading gates...")
-            
+
             gates = self.three_bucket_manager.get_trading_decision_gates()
             self.three_bucket_manager.log_trading_gates()
-            
+
             # Check if all critical gates pass
             gates_pass, gate_reason = gates['all_gates_pass']
-            
+
             if not gates_pass:
                 logger.warning(
                     f"⚠️ Trading gates failed: {gate_reason}. "
@@ -178,21 +178,21 @@ async def _run_trading_loop(self):
                 # Skip to next iteration
                 await self._sleep_until_next_poll()
                 continue
-            
+
             # ================================================================
             # STEP 3: SIGNAL PROCESSING (Existing - Unchanged)
             # ================================================================
             logger.info(f"LOOP {loop_id}: Processing signals...")
-            
+
             # ... existing signal processing code ...
-            
+
             # ================================================================
             # STEP 4: TRADING (Existing - Unchanged but gate-checked)
             # ================================================================
             logger.info(f"LOOP {loop_id}: Building trading decisions...")
-            
+
             # ... existing trading decision code ...
-            
+
         except Exception as e:
             logger.error(f"❌ Loop error: {str(e)}")
             # ... existing error handling ...
@@ -209,9 +209,9 @@ async def _run_trading_loop(self):
 
 def get_portfolio_health(self):
     """Get health including three-bucket metrics"""
-    
+
     metrics = self.three_bucket_manager.get_bucket_metrics()
-    
+
     return {
         'timestamp': datetime.now().isoformat(),
         'portfolio': {
@@ -247,18 +247,18 @@ def get_portfolio_health(self):
 ```python
 class SharedState:
     # ... existing code ...
-    
+
     # Add these fields:
     current_bucket_state: Optional[PortfolioBucketState] = None
     three_bucket_metrics: Optional[BucketMetrics] = None
     healing_history: List[HealingEvent] = field(default_factory=list)
-    
+
     # Add these methods:
     def update_from_healing(self, healing_report):
         """Update state after healing operation"""
         self.healing_history.extend(healing_report.healing_events)
         # Mark positions as healed in portfolio
-        
+
     def get_portfolio_positions(self):
         """Return positions formatted for three-bucket manager"""
         # Convert internal position format to bucket manager format
@@ -348,7 +348,7 @@ HEALING STATUS
 2026-04-17 01:25:37,456 [INFO    ] BucketClassifier - 🔍 Classifying 4 positions...
 2026-04-17 01:25:37,457 [DEBUG   ] BucketClassifier -    ✅ ETHUSDT: PRODUCTIVE | Value=$34.50 | Confidence=90%
 2026-04-17 01:25:37,457 [DEBUG   ] BucketClassifier -    💀 BTCUSDT: DEAD (below_min_size) | Value=$0.0592 | Confidence=95%
-2026-04-17 01:25:37,458 [INFO    ] BucketClassifier - 
+2026-04-17 01:25:37,458 [INFO    ] BucketClassifier -
 📊 PORTFOLIO CLASSIFICATION COMPLETE
 ├─ 💵 Operating Cash:  $60.81 (55.0%) [HEALTHY]
 ├─ 📈 Productive:      $34.50 (31.0%) in 1 positions (avg $34.50)
@@ -364,7 +364,7 @@ HEALING STATUS
 2026-04-17 01:25:37,500 [INFO    ] DeadCapitalHealer - ✅ Healed BTCUSDT | Recovered: $0.0586
 2026-04-17 01:25:37,502 [INFO    ] DeadCapitalHealer - ✅ Healed XRPUSDT | Recovered: $0.1150
 2026-04-17 01:25:37,505 [INFO    ] DeadCapitalHealer - ✅ Healed SOLUSDT | Recovered: $0.0008
-2026-04-17 01:25:37,506 [INFO    ] DeadCapitalHealer - 
+2026-04-17 01:25:37,506 [INFO    ] DeadCapitalHealer -
 🎯 HEALING CYCLE COMPLETE
 ├─ Positions healed: 3
 ├─ Amount recovered: $15.17

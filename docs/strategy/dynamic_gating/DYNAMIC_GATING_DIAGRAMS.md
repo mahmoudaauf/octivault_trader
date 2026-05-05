@@ -20,26 +20,26 @@ TIME AXIS (Horizontal):
 
 
 GATE STRICTNESS (Vertical):
-                                    
-  STRICT ████████████            
+
+  STRICT ████████████
          ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ← Gates always relaxed
          ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
   RELAX  ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-         
+
          0min    5min      10min     15min     20min  ...  24h
-         
+
          Legend: ████ = Strict gates
                  ░░░░ = Relaxed gates
 
 
 SIGNAL GENERATION (Horizontal):
-         
+
   NONE   ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ← BUY/SELL allowed
   BUY ↓  ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
   SELL ↓ ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-  
+
          0min    5min      10min     15min     20min  ...  24h
-         
+
          Legend: ████ = No BUY signals (NONE/HOLD only)
                  ░░░░ = BUY/SELL signals allowed
 
@@ -58,7 +58,7 @@ SUCCESS RATE (Growth):
    10%          ╱─────────────────────────────────────────┤
     0% ◀────────────────────────────────────────────────────┤
        0min    5min      10min     15min     20min  ...  24h
-       
+
        ✅ = Threshold reached, gates relax
 
 
@@ -81,7 +81,7 @@ PROFIT ACCUMULATION (PnL):
     $1        ╱────┤
     $0 ◀─────────────────────────────────────────────────────┤
        0min    5min      10min     15min     20min  ...  24h
-       
+
        ↓ No trades
        First trade opens
        ↓ Profit starts
@@ -197,7 +197,7 @@ Execution Attempt History (Rolling Window - Last 50 attempts):
 
 Index:    1    2    3    4    5    6   ...  47   48   49   50
 Result:  [❌, ❌, ✅, ✅, ❌, ✅, ..., ✅, ✅, ❌, ✅]
-         
+
 Where:
   ❌ = Execution failed (rejected)
   ✅ = Execution succeeded (filled)
@@ -206,7 +206,7 @@ Calculation:
   Successes = 30 (count of ✅ in window)
   Total     = 50 (window size)
   Rate      = 30/50 = 60% ✅ (GATES RELAX!)
-  
+
 Timeline:
   New attempt comes in → Oldest pushed out → Rate recalculated → Gate decision updated
 ```
@@ -231,12 +231,12 @@ System Start Time: 0 seconds (time.time() stored)
          │
          │ (After 300 seconds)
          ▼
-         
+
          transition_check:
          elapsed = time.time() - start_time
          if elapsed >= 300:
              phase = "INITIALIZATION"
-             
+
 ┌─────────────────────────────────────────────────────────────────┐
 │                    INITIALIZATION PHASE                         │
 │                    (300-1200 seconds)                           │
@@ -252,12 +252,12 @@ System Start Time: 0 seconds (time.time() stored)
          │
          │ (After 1200 seconds = 20 min total)
          ▼
-         
+
          transition_check:
          elapsed = time.time() - start_time
          if elapsed >= (300 + 900) = 1200:
              phase = "STEADY_STATE"
-             
+
 ┌─────────────────────────────────────────────────────────────────┐
 │                    STEADY_STATE PHASE                           │
 │                    (1200+ seconds)                              │
@@ -272,7 +272,7 @@ System Start Time: 0 seconds (time.time() stored)
          │
          │ (Continues for remainder of session)
          ▼
-         
+
          Continue until:
          - Session duration reached (24 hours)
          - Profit target achieved ($10+ USDT)
@@ -464,4 +464,3 @@ SCENARIO: 24-hour trading session with dynamic gating
 ║                                                                        ║
 ╚════════════════════════════════════════════════════════════════════════╝
 ```
-

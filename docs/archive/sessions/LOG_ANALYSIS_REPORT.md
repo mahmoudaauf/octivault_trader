@@ -1,7 +1,7 @@
 # 🚨 LOG ANALYSIS REPORT - WARNINGS & ERRORS
 
-**Generated**: April 27, 2026 @ 19:02 UTC  
-**Log File**: `/tmp/octivault_master_orchestrator.log` (381 MB)  
+**Generated**: April 27, 2026 @ 19:02 UTC
+**Log File**: `/tmp/octivault_master_orchestrator.log` (381 MB)
 **Analysis Period**: Full session duration
 
 ---
@@ -66,11 +66,11 @@
 
 **Critical Error:**
 ```
-[CRITICAL] ExecutionManager - Execution quote mismatch: Meta vs Execution 
+[CRITICAL] ExecutionManager - Execution quote mismatch: Meta vs Execution
 (planned=11.57 execute=20.18)
 ```
 
-**Problem**: 
+**Problem**:
 - Meta controller plans entry at 11.57 USDT
 - Execution manager executes at 20.18 USDT
 - **43% discrepancy!**
@@ -100,7 +100,7 @@ META_MICRO_SIZE_USDT=15        ← SHOULD BE 25
 
 The deployment claimed all 8 parameters were updated to 25 USDT, but they're still at **15 USDT**.
 
-**Why This Explains The Quote Mismatch**: 
+**Why This Explains The Quote Mismatch**:
 - Meta is calculating positions based on 15 USDT
 - But execution is using different logic
 - This causes the 11.57 vs 20.18 discrepancy
@@ -156,7 +156,7 @@ Content: [DEBUG:CLASSIFY] position floor verification
 ### Top 10 Warning Sources (by frequency)
 
 1. **PEPEUSDT Classification** (49,963) - Position floor verification
-2. **BFUSDUSDT Classification** (29,653) - Position floor verification  
+2. **BFUSDUSDT Classification** (29,653) - Position floor verification
 3. **LUNCUSDT Classification** (25,376) - Position floor verification
 4. **LINKUSDT Classification** (23,541) - Position floor verification
 5. **LUNCUSDT v2** (17,799) - Position floor verification
@@ -174,8 +174,8 @@ Content: [DEBUG:CLASSIFY] position floor verification
 
 ### Priority 1: URGENT - Fix Phase 2 Configuration (Breaking) 🚨
 
-**Current**: Entry sizing still at 15 USDT  
-**Should Be**: 25 USDT  
+**Current**: Entry sizing still at 15 USDT
+**Should Be**: 25 USDT
 **Impact**: Medium (affects position sizing)
 
 **Action Required**:
@@ -201,7 +201,7 @@ MIN_SIGNIFICANT_POSITION_USDT=25  (was 12, should be 25)
 
 **When**: Every ~1-2 minutes starting 18:33:36
 
-**Likely Cause**: 
+**Likely Cause**:
 - Capital dropping too low
 - Allocation algorithm receiving zero available balance
 - Possible reserve calculation issue
@@ -233,7 +233,7 @@ MIN_SIGNIFICANT_POSITION_USDT=25  (was 12, should be 25)
 
 **Issue**: 1.8+ million DEBUG:CLASSIFY warnings bloating logs
 
-**Impact**: 
+**Impact**:
 - Log file 381 MB (3-4x normal size)
 - Performance overhead from logging
 - Hard to find real issues
@@ -321,4 +321,3 @@ MIN_SIGNIFICANT_POSITION_USDT=25  (was 12, should be 25)
 ---
 
 **Status**: 🚨 **CONFIGURATION ERROR - PHASE 2 NOT PROPERLY APPLIED**
-

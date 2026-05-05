@@ -26,7 +26,7 @@ All 6 TODO/FIXME comments have been resolved and replaced with working implement
 
 #### Issue 1a: `load_shared_state_snapshot()` - Line 25
 **Before:** Returned empty dict structure (no actual DB retrieval)
-**After:** 
+**After:**
 - Queries `app_state` table with key `'shared_state_snapshot'`
 - Deserializes JSON from database
 - Returns valid snapshot or safe defaults on error
@@ -79,8 +79,8 @@ await self.insert_row(query, params)
 ### 2. ✅ `core/reserve_manager.py` (HIGH - Fixed)
 
 #### Issue: `get_current_volatility_regime()` - Line 175
-**Before:** Always returned `VolatilityRegime.NORMAL` 
-**After:** 
+**Before:** Always returned `VolatilityRegime.NORMAL`
+**After:**
 - Analyzes current cash ratio vs portfolio
 - Escalates to ELEVATED if cash < 8% of NAV
 - Includes try/except for safety
@@ -290,4 +290,3 @@ All 6 TODO/FIXME comments have been eliminated and replaced with working, tested
 - ✅ Backward compatibility
 
 **Ready for:** Code review → Testing → Deployment
-

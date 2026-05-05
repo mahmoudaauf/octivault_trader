@@ -124,7 +124,7 @@ Position Misalignment:
 💡 TYPICAL SESSION (6 Hours)
 
 Hour 0:     NAV $100 → $102 (+2%)
-Hour 1-2:   NAV $102 → $110 (+8%) 
+Hour 1-2:   NAV $102 → $110 (+8%)
 Hour 2-4:   NAV $110 → $120 (+20%)
 Hour 4-6:   NAV $120 → $130+ (+30%)
 
@@ -221,4 +221,3 @@ Status: ✅ PRODUCTION READY
 Version: 1.0
 
 Next Step: cat README_MONITORING.md
-

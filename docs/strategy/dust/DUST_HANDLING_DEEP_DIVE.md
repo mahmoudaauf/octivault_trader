@@ -1,7 +1,7 @@
 # 🧹 DUST HANDLING MECHANISMS - DEEP DIVE
 
-**Focus:** How the system currently deals with dust positions  
-**Date:** April 27, 2026  
+**Focus:** How the system currently deals with dust positions
+**Date:** April 27, 2026
 **Status:** Complete analysis of all dust handling pathways
 
 ---
@@ -24,8 +24,8 @@ The system has **THREE LAYERS** of dust handling:
 
 ### Where Dust Gets Created
 
-**File:** `core/shared_state.py`  
-**Method:** `record_fill()` (lines 5963-6130)  
+**File:** `core/shared_state.py`
+**Method:** `record_fill()` (lines 5963-6130)
 **Trigger:** After any BUY/SELL order fills
 
 ### The Exact Moment of Creation
@@ -101,7 +101,7 @@ Can only be liquidated or healed
 
 ### The Dust Registry
 
-**File:** `core/shared_state.py`  
+**File:** `core/shared_state.py`
 **Data Structure:** Dictionary of all dust positions
 
 ```python
@@ -132,7 +132,7 @@ self.dust_registry = {
 async def mark_as_dust(self, symbol: str) -> None:
     """
     Mark a position as dust.
-    
+
     Result:
     - Position state = DUST_LOCKED
     - Status = "DUST"
@@ -151,10 +151,10 @@ async def mark_as_dust(self, symbol: str) -> None:
         pos["_is_dust"] = True
         pos["open_position"] = False  # Not active
         pos["accumulation_locked"] = False
-        
+
     # Remove from open_trades (not counted as active position)
     self.open_trades.pop(sym, None)
-    
+
     # Record in dust registry
     self.record_dust(sym, qty, origin="strategy_portfolio", ...)
 ```
@@ -169,7 +169,7 @@ async def mark_as_dust(self, symbol: str) -> None:
 async def mark_as_permanent_dust(self, symbol: str) -> None:
     """
     🔒 DUST RETIREMENT RULE: Mark position as PERMANENT_DUST.
-    
+
     Once dust has been rejected >= N times:
     - Cannot be re-activated
     - Excluded from rejection counters
@@ -180,13 +180,13 @@ async def mark_as_permanent_dust(self, symbol: str) -> None:
     sym = symbol.upper()
     if sym not in self.permanent_dust:
         self.permanent_dust.add(sym)
-        
+
         # Mark in position data
         if sym in self.positions:
             self.positions[sym]["status"] = "PERMANENT_DUST"
             self.positions[sym]["capital_occupied"] = 0.0
             self.positions[sym]["state"] = PositionState.DUST_LOCKED.value
-        
+
         # CRITICAL: Clear ALL rejection counters for this symbol
         keys_to_del = [k for k in self.rejection_counters.keys() if k[0] == sym]
         for k in keys_to_del:
@@ -220,8 +220,8 @@ async def classify_positions_by_size(self) -> Dict[str, List]:
 
 ### Where Liquidation is Triggered
 
-**File:** `core/meta_controller.py`  
-**Section:** PHASE 2 Dust Liquidation (lines 16900-17010)  
+**File:** `core/meta_controller.py`
+**Section:** PHASE 2 Dust Liquidation (lines 16900-17010)
 **Trigger:** When `dust_ratio > 60%` and `phase2_age >= 300 seconds`
 
 ### The Liquidation Logic
@@ -232,20 +232,20 @@ async def classify_positions_by_size(self) -> Dict[str, List]:
 # PHASE 2: Dust Detection & Liquidation
 async def _build_decisions(self):
     # ... other code ...
-    
+
     # Check current dust situation
     dust_pos_count = len(await self.shared_state.get_dust_positions())
     total_pos_count = len(await self.shared_state.get_all_positions())
     dust_ratio = dust_pos_count / total_pos_count if total_pos_count > 0 else 0.0
-    
+
     # TRIGGER: Dust ratio exceeds threshold
     if dust_ratio > 0.60:  # 60% of portfolio is dust
         phase2_age = time.time() - self.phase2_start_time
-        
+
         if phase2_age >= 300.0:  # Been this bad for 5 minutes
             # ⚠️ GENERATE SELL SIGNALS FOR ALL DUST IMMEDIATELY
             for symbol, qty, value_usdt, pos_age_sec in dust_to_liquidate:
-                
+
                 # Create forced liquidation signal
                 dust_sell_sig = {
                     "symbol": symbol,
@@ -255,7 +255,7 @@ async def _build_decisions(self):
                     "agent": "MetaDustLiquidator",
                     "reason": "phase2_dust_liquidation",
                 }
-                
+
                 # Add to decision queue → immediate execution
                 self.append_decision(dust_sell_sig)
 ```
@@ -267,7 +267,7 @@ async def _build_decisions(self):
 for symbol, qty, value_usdt, pos_age_sec in dust_to_liquidate:
     # 🔴 NO CHECK: if pos_age_sec < MIN_AGE: continue
     # This means FRESH positions get liquidated!
-    
+
     dust_sell_sig = {
         "symbol": symbol,
         "action": "SELL",
@@ -367,7 +367,7 @@ STEP 8: Capital Recovery
 ├─ Dust ratio decreased
 └─ Status: Ready for new entries
 
-RESULT: 
+RESULT:
 ✅ Dust position cleared
 ❌ Lost $0.0125 on forced liquidation
 ⚠️ Capital slightly reduced
@@ -470,7 +470,7 @@ Time: 00:00 - First dust entry
 ├─ BUY $20 → $19
 └─ Dust#1 created
 
-Time: 05:00 - Second dust entry  
+Time: 05:00 - Second dust entry
 ├─ BUY $20 → $18.50 (capital reduced, worse fill)
 ├─ Dust ratio: 2/2 = 100%
 └─ Dust#2 created
@@ -520,7 +520,7 @@ Result: DEATH SPIRAL
 
 ### Fix 1: Add Minimum Age Guard (CRITICAL)
 
-**Location:** `meta_controller.py` line 16920  
+**Location:** `meta_controller.py` line 16920
 **Change:**
 
 ```python
@@ -542,7 +542,7 @@ for symbol, qty, value_usdt, pos_age_sec in dust_to_liquidate:
             f"< min {DUST_MIN_AGE_BEFORE_LIQUIDATION:.0f}s"
         )
         continue
-    
+
     dust_sell_sig = {
         "symbol": symbol,
         "action": "SELL",
@@ -554,7 +554,7 @@ for symbol, qty, value_usdt, pos_age_sec in dust_to_liquidate:
 
 ### Fix 2: Raise Liquidation Trigger Threshold
 
-**Location:** `meta_controller.py` line 16901  
+**Location:** `meta_controller.py` line 16901
 **Change:**
 
 ```python
@@ -569,7 +569,7 @@ if dust_ratio > 0.80:  # Only trigger at 80% dust
 
 ### Fix 3: Allow Natural Healing
 
-**Location:** Add to liquidation logic  
+**Location:** Add to liquidation logic
 **Change:**
 
 ```python
@@ -615,4 +615,3 @@ Gain: +5% per session
 - `DUST_LIQUIDATION_CYCLE_ANALYSIS.md` - Liquidation mechanism
 - `DUST_PATHWAYS_COMPLETE_DIAGNOSTIC.md` - Both pathways combined
 - `EXECUTIVE_SUMMARY_LATEST_BEHAVIOR.md` - Overall system status
-

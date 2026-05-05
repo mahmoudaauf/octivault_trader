@@ -121,9 +121,9 @@ The fix prevents the second attempt from happening in the first place.
 
 ## Impact on Dust Healing
 
-✅ **Before Fix:** Dust healing blocked by position verification timeouts  
-✅ **After Fix:** Dust healing can proceed cleanly  
-✅ **Expected:** Remaining 41 dust positions will liquidate without timeouts  
+✅ **Before Fix:** Dust healing blocked by position verification timeouts
+✅ **After Fix:** Dust healing can proceed cleanly
+✅ **Expected:** Remaining 41 dust positions will liquidate without timeouts
 
 ---
 
@@ -137,10 +137,10 @@ The fix prevents the second attempt from happening in the first place.
 
 ## Bottom Line
 
-✅ **Root cause:** Partial fills triggered duplicate finalization attempts  
-✅ **Solution:** Idempotency guards prevent duplicate finalization  
-✅ **Status:** Deployed & verified (9 guards active)  
-✅ **Safety:** Zero breaking changes, only prevents duplicates  
-✅ **Ready:** System ready for dust healing to continue  
+✅ **Root cause:** Partial fills triggered duplicate finalization attempts
+✅ **Solution:** Idempotency guards prevent duplicate finalization
+✅ **Status:** Deployed & verified (9 guards active)
+✅ **Safety:** Zero breaking changes, only prevents duplicates
+✅ **Ready:** System ready for dust healing to continue
 
 Your observation about different quantities and fees was **exactly right** - this indicated partial fills, not simple duplication. The fix now prevents the system from attempting to finalize the same order twice.

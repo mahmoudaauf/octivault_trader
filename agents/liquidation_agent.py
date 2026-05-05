@@ -1,29 +1,30 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
 import time as _t
-from typing import Dict, List, Optional, Any, Set
+from datetime import datetime
+from typing import Any, Optional
 
-from src.l0_core.component_status_logger import log_component_status, ComponentStatusLogger as CSL
-from src.l0_core.stubs import TradeIntent, ExecOrder
+from src.l0_core.component_status_logger import ComponentStatusLogger as CSL
+from src.l0_core.stubs import TradeIntent
 
 AGENT_NAME = "LiquidationAgent"
+
 
 class LiquidationAgent:
     """
     P9 Canonical LiquidationAgent: The 'Risk Desk + Treasury Desk'.
-    
+
     Mission: Free capital when needed, safely and intelligently.
     Identity: Infrastructure agent (discovery type), background task-driven.
-    
+
     Triggers:
     A) Capital Shortage (Requested via Orchestrator -> propose_liquidations)
     B) Performance-based exit (ROI/Loss thresholds)
     C) Dust/MinNotional Cleanup
     D) Rebalancing/Maintenance
     """
-    
-    agent_type = "discovery" # Infrastructure agent, background task-driven.
+
+    agent_type = "discovery"  # Infrastructure agent, background task-driven.
 
     def __init__(
         self,
@@ -45,20 +46,20 @@ class LiquidationAgent:
         self.tp_sl_engine = tp_sl_engine
         self.meta_controller = meta_controller
         self.exchange_client = exchange_client
-        
+
         self.logger = logging.getLogger(self.name)
         self.logger.propagate = False
-        
+
         # Proper status logging: initialize instance with agent's logger
         self.csl = CSL(logger=self.logger)
-        
-        self.symbols: List[str] = []
+
+        self.symbols: list[str] = []
         self._last_rebalance_ts = 0.0
-        self.cooldown_tracker: Dict[str, float] = {}
-        self.intent_sink: List[Any] = []
-        self.active_liquidations: Set[str] = set()
-        self._bg_tasks: Set[asyncio.Task] = set()
-        
+        self.cooldown_tracker: dict[str, float] = {}
+        self.intent_sink: list[Any] = []
+        self.active_liquidations: set[str] = set()
+        self._bg_tasks: set[asyncio.Task] = set()
+
         self.csl.log_status(self.name, "Operational", detail="Initialized as Treasury/Risk Desk")
 
     # -----------------------------
@@ -70,23 +71,42 @@ class LiquidationAgent:
         return default
 
     @property
-    def target_free_usdt(self) -> float: return float(self._cfg("CAPITAL_TARGET_FREE_USDT", 10.0))
+    def target_free_usdt(self) -> float:
+        return float(self._cfg("CAPITAL_TARGET_FREE_USDT", 10.0))
+
     @property
-    def buffer_mult(self) -> float: return float(self._cfg("LIQUIDATION_BUFFER_MULT", 1.05))
+    def buffer_mult(self) -> float:
+        return float(self._cfg("LIQUIDATION_BUFFER_MULT", 1.05))
+
     @property
-    def min_edge_bps(self) -> float: return float(self._cfg("LIQ_MIN_EDGE_BPS", 8.0))
+    def min_edge_bps(self) -> float:
+        return float(self._cfg("LIQ_MIN_EDGE_BPS", 8.0))
+
     @property
-    def est_liq_cost_bps(self) -> float: return float(self._cfg("EST_LIQ_COST_BPS", 12.0))
+    def est_liq_cost_bps(self) -> float:
+        return float(self._cfg("EST_LIQ_COST_BPS", 12.0))
+
     @property
-    def evaluation_window_hours(self) -> float: return float(self._cfg("LIQ_EVAL_WINDOW_HOURS", 6.0))
+    def evaluation_window_hours(self) -> float:
+        return float(self._cfg("LIQ_EVAL_WINDOW_HOURS", 6.0))
+
     @property
-    def loss_threshold(self) -> int: return int(self._cfg("LIQ_LOSS_THRESHOLD", 3))
+    def loss_threshold(self) -> int:
+        return int(self._cfg("LIQ_LOSS_THRESHOLD", 3))
+
     @property
-    def roi_threshold(self) -> float: return float(self._cfg("LIQ_ROI_THRESHOLD", -0.05))
+    def roi_threshold(self) -> float:
+        return float(self._cfg("LIQ_ROI_THRESHOLD", -0.05))
+
     @property
-    def min_notional_dust_factor(self) -> float: return float(self._cfg("LIQ_DUST_FACTOR", 1.2))
+    def min_notional_dust_factor(self) -> float:
+        return float(self._cfg("LIQ_DUST_FACTOR", 1.2))
+
     @property
-    def min_hold_sec(self) -> float: return float(self._cfg("LIQ_MIN_HOLD_SEC", 10.0))  # Reduced from 90s for faster dust cleanup
+    def min_hold_sec(self) -> float:
+        return float(
+            self._cfg("LIQ_MIN_HOLD_SEC", 10.0)
+        )  # Reduced from 90s for faster dust cleanup
 
     def _parse_ts(self, val: Any) -> float:
         if isinstance(val, datetime):
@@ -172,19 +192,25 @@ class LiquidationAgent:
             self.symbols = self.shared_state.get_analysis_symbols()
         else:
             self.symbols = list(getattr(self.shared_state, "symbols", {}).keys())
-        
+
     # -----------------------------
     # Core Scheduler
     # -----------------------------
     async def scheduler(self):
         """Main loop managing internal hygiene (Triggers B, C)."""
-        interval = float(self._cfg("LIQ_SCHED_INTERVAL_SEC", 10))  # Reduced from 30s for more frequent checks
+        interval = float(
+            self._cfg("LIQ_SCHED_INTERVAL_SEC", 10)
+        )  # Reduced from 30s for more frequent checks
         while True:
             try:
                 await self._refresh_universe()
                 # Trigger B & C: Internal Hygiene (Performance & Dust)
                 await self._process_internal_hygiene()
-                self.csl.set_status(self.name, "Operational", f"Risk desk heartbeating | Universe: {len(self.symbols)}")
+                self.csl.set_status(
+                    self.name,
+                    "Operational",
+                    f"Risk desk heartbeating | Universe: {len(self.symbols)}",
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -195,22 +221,29 @@ class LiquidationAgent:
         """Trigger B (Performance) & Trigger C (Dust)."""
         positions = self.shared_state.get_positions_snapshot() or {}
         for sym, pos in positions.items():
-            if sym in self.active_liquidations: continue
+            if sym in self.active_liquidations:
+                continue
             qty = float(pos.get("quantity", 0.0))
-            if qty <= 0: continue
+            if qty <= 0:
+                continue
             price = float(await self.shared_state.safe_price(sym, default=0.0))
-            if price <= 0: continue
-            
+            if price <= 0:
+                continue
+
             # TRIGGER C: Dust Cleanup
             is_dust = await self._check_dust(sym, qty, price)
             if is_dust:
-                await self._liquidate_symbol(sym, reason="Trigger C: Dust Cleanup", tag="liquidation_dust")
+                await self._liquidate_symbol(
+                    sym, reason="Trigger C: Dust Cleanup", tag="liquidation_dust"
+                )
                 continue
 
             # TRIGGER B: Performance
             is_bad = await self._check_performance(sym, pos)
             if is_bad:
-                await self._liquidate_symbol(sym, reason="Trigger B: Poor Performance", tag="liquidation_performance")
+                await self._liquidate_symbol(
+                    sym, reason="Trigger B: Poor Performance", tag="liquidation_performance"
+                )
 
     async def _check_dust(self, symbol: str, qty: float, price: float) -> bool:
         filters = await self.shared_state.get_symbol_filters_cached(symbol) or {}
@@ -218,7 +251,7 @@ class LiquidationAgent:
         notional = qty * price
         return 0 < notional < (min_notional * self.min_notional_dust_factor)
 
-    async def _check_performance(self, symbol: str, pos: Dict) -> bool:
+    async def _check_performance(self, symbol: str, pos: dict) -> bool:
         agent_scores = getattr(self.shared_state, "agent_scores", {}).get(symbol, {})
         for agent, metrics in agent_scores.items():
             losses = metrics.get("consecutive_losses", 0)
@@ -230,45 +263,74 @@ class LiquidationAgent:
     # -----------------------------
     # Planning API (Decision Bridge)
     # -----------------------------
-    async def build_plan(self, target_symbol: str = None, needed_quote: float = 0.0, opp_meta: Dict = None, force: bool = False) -> Dict:
+    async def build_plan(
+        self,
+        target_symbol: str = None,
+        needed_quote: float = 0.0,
+        opp_meta: dict = None,
+        force: bool = False,
+    ) -> dict:
         """
         The decision engine called by LiquidationOrchestrator.
         Either plans a specific symbol exit or finding assets to meet 'needed_quote'.
         """
-        self.logger.info("Building liquidation plan (target=%s, needed=%.2f, force=%s)", target_symbol, needed_quote, force)
-        
+        self.logger.info(
+            "Building liquidation plan (target=%s, needed=%.2f, force=%s)",
+            target_symbol,
+            needed_quote,
+            force,
+        )
+
         intents = []
         if target_symbol:
             qty = await self.shared_state.get_position_quantity(target_symbol)
             if qty > 0:
                 if self._passes_min_hold(target_symbol):
-                    intents.append(self._create_intent(target_symbol, qty, reason=opp_meta.get("reason", "manual"), force=force))
-        
+                    intents.append(
+                        self._create_intent(
+                            target_symbol, qty, reason=opp_meta.get("reason", "manual"), force=force
+                        )
+                    )
+
         elif needed_quote > 0:
             freed = 0.0
             positions = self.shared_state.get_positions_snapshot() or {}
             candidates = []
             for sym, pos in positions.items():
                 qty = float(pos.get("quantity", 0.0))
-                if qty <= 0: continue
+                if qty <= 0:
+                    continue
                 price = float(await self.shared_state.safe_price(sym, default=0.0))
-                if price <= 0: continue
+                if price <= 0:
+                    continue
                 roi = float(pos.get("roi", 0.0))
                 candidates.append({"symbol": sym, "qty": qty, "value": qty * price, "roi": roi})
-            
+
             # FIX #Q1: Liquidate experimental symbols FIRST (before proven symbols)
             # Sort by: (1) is_proven (False first = experimental first), (2) ROI (worst first)
             def sort_key(cand):
-                is_proven = self.shared_state.is_symbol_proven(cand["symbol"]) if self.shared_state else False
+                is_proven = (
+                    self.shared_state.is_symbol_proven(cand["symbol"])
+                    if self.shared_state
+                    else False
+                )
                 return (is_proven, cand["roi"])  # False < True, so experimental symbols come first
-            
+
             candidates.sort(key=sort_key)
-            
+
             for cand in candidates:
-                if freed >= needed_quote: break
+                if freed >= needed_quote:
+                    break
                 if not self._passes_min_hold(cand["symbol"]):
                     continue
-                intents.append(self._create_intent(cand["symbol"], cand["qty"], reason=f"Free capital: {opp_meta.get('reason','gap')}", force=force))
+                intents.append(
+                    self._create_intent(
+                        cand["symbol"],
+                        cand["qty"],
+                        reason=f"Free capital: {opp_meta.get('reason','gap')}",
+                        force=force,
+                    )
+                )
                 freed += cand["value"]
 
         if intents:
@@ -276,7 +338,9 @@ class LiquidationAgent:
             return {"status": "APPROVED", "count": len(intents)}
         return {"status": "NOOP", "count": 0}
 
-    async def propose_liquidations(self, gap_usdt: float, reason: str, force: bool = False) -> List[Dict]:
+    async def propose_liquidations(
+        self, gap_usdt: float, reason: str, force: bool = False
+    ) -> list[dict]:
         """Back-compat API for Orchestrator. Returns serialized intents."""
         res = await self.build_plan(needed_quote=gap_usdt, opp_meta={"reason": reason}, force=force)
         if res["status"] == "APPROVED":
@@ -286,24 +350,23 @@ class LiquidationAgent:
             return out
         return []
 
-    async def produce_orders(self) -> List[Dict]:
+    async def produce_orders(self) -> list[dict]:
         """Shim for Orchestrator drain."""
         out = []
         for it in self.intent_sink:
             # Convert intent to order-like dict for legacy Orchestrator drain
-            out.append({
-                "symbol": it.symbol,
-                "side": it.action,
-                "quantity": it.qty_hint,
-                "tag": it.tag
-            })
+            out.append(
+                {"symbol": it.symbol, "side": it.action, "quantity": it.qty_hint, "tag": it.tag}
+            )
         self.intent_sink.clear()
         return out
 
     # -----------------------------
     # Execution Logic
     # -----------------------------
-    def _create_intent(self, symbol: str, qty: float, reason: str, force: bool = False) -> TradeIntent:
+    def _create_intent(
+        self, symbol: str, qty: float, reason: str, force: bool = False
+    ) -> TradeIntent:
         return TradeIntent(
             symbol=symbol,
             side="SELL",
@@ -312,10 +375,17 @@ class LiquidationAgent:
             qty_hint=qty,
             ttl_sec=300,
             tag="liquidation",
-            rationale=(f"{reason} (force)" if force else reason)
+            rationale=(f"{reason} (force)" if force else reason),
         )
 
-    async def request_liquidation(self, symbol: str, side: str = "SELL", qty: float = 0.0, reason: str = "External request", **kwargs):
+    async def request_liquidation(
+        self,
+        symbol: str,
+        side: str = "SELL",
+        qty: float = 0.0,
+        reason: str = "External request",
+        **kwargs,
+    ):
         """Standardized interface for external agents (like WalletScanner) to request an exit."""
         self.logger.info("External Liquidation Request: %s | Reason: %s", symbol, reason)
         await self._liquidate_symbol(symbol, reason=reason)
@@ -327,23 +397,27 @@ class LiquidationAgent:
             if not self._passes_min_hold(symbol):
                 return
             qty = await self.shared_state.get_position_quantity(symbol)
-            if qty <= 0: return
+            if qty <= 0:
+                return
 
             # P9 STABILITY FIX: Prevent loop on "Hard Dust" (Value < MinNotional)
             try:
                 price = float(await self.shared_state.safe_price(symbol, default=0.0))
                 filters = await self.shared_state.get_symbol_filters_cached(symbol) or {}
-                min_notional = float(filters.get("minNotional") or filters.get("min_notional") or 10.0)
-                
+                min_notional = float(
+                    filters.get("minNotional") or filters.get("min_notional") or 10.0
+                )
+
                 # If value is too small to trade, do NOT emit a signal (it will just fail and loop)
                 val = qty * price
                 if val < min_notional:
                     # Log once every N times or debug only to avoid noise
-                    self.logger.debug(f"[{self.name}] Ignoring Hard Dust {symbol}: Val {val:.2f} < Min {min_notional}")
+                    self.logger.debug(
+                        f"[{self.name}] Ignoring Hard Dust {symbol}: Val {val:.2f} < Min {min_notional}"
+                    )
                     return
             except Exception as e:
                 self.logger.warning(f"[{self.name}] Error checking dust executability: {e}")
-
 
             # Legacy path removed - using TradeIntent publishing only
 
@@ -355,5 +429,8 @@ class LiquidationAgent:
         finally:
             self.active_liquidations.discard(symbol)
 
-    async def run(self, symbol): pass
-    def health(self): return {"status": "Operational", "universe_size": len(self.symbols)}
+    async def run(self, symbol):
+        pass
+
+    def health(self):
+        return {"status": "Operational", "universe_size": len(self.symbols)}

@@ -61,7 +61,7 @@ Files using `print()` instead of proper logging framework:
 | `tools/fix_python_indentation.py` | Tool (utility) |
 | `tools/fix_indentation.py` | Tool (utility) |
 
-**Recommendation:** 
+**Recommendation:**
 - Priority: Core modules (phases.py, portfolio_segmentation.py) should use logging
 - Low priority: Utility/tool files can use print() for CLI output
 
@@ -88,7 +88,7 @@ Files using `print()` instead of proper logging framework:
 3. 📝 Replace `print()` in core modules with proper logging:
    - `core/phases.py`
    - `core/portfolio_segmentation.py`
-   
+
 ### Priority: LOW
 4. 📝 Optionally replace `print()` in utility/tool files with logging for consistency
 

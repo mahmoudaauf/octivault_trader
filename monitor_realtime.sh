@@ -36,7 +36,7 @@ get_signal_count() {
 # Function to get latest prices for major symbols
 get_latest_prices() {
     local symbols=("BTCUSDT" "ETHUSDT" "BNBUSDT" "SOLUSDT" "DOGEUSDT")
-    
+
     echo "  📊 Latest Prices:"
     for sym in "${symbols[@]}"; do
         price=$(grep "\[DEBUG_MDF\] price update $sym = " "$LOG_FILE" 2>/dev/null | tail -1 | grep -oE "[0-9]+\.[0-9]+" | tail -1)
@@ -56,14 +56,14 @@ get_balances() {
         usdt="—"
     fi
     printf "     %-12s %s\n" "USDT:" "$usdt"
-    
+
     # Get BTC balance
     btc=$(grep "BTC.*free" "$LOG_FILE" 2>/dev/null | tail -1 | grep -oE "free=[0-9.]+")
     if [ -z "$btc" ]; then
         btc="—"
     fi
     printf "     %-12s %s\n" "BTC:" "$btc"
-    
+
     # Get ETH balance
     eth=$(grep "ETH.*free" "$LOG_FILE" 2>/dev/null | tail -1 | grep -oE "free=[0-9.]+")
     if [ -z "$eth" ]; then
@@ -85,16 +85,16 @@ get_nav_history() {
         # Extract NAV value
         match($0, /\$[0-9.]+/, nav_arr)
         nav = nav_arr[0]
-        
+
         # Extract trend emoji
         trend = "—"
         if (match($0, /📈/)) trend = "📈"
         if (match($0, /📉/)) trend = "📉"
-        
+
         # Extract delta
         match($0, /delta=\$([^/]+)/, delta_arr)
         delta = delta_arr[1]
-        
+
         printf "     %s %s %s\n", nav, trend, delta
     }' | tail -5
 }
@@ -104,7 +104,7 @@ get_trades() {
     echo "  🔄 Recent Trading Activity:"
     local trade_count=$(grep -c "TRADE_SUBMITTED" "$LOG_FILE" 2>/dev/null || echo "0")
     echo "     Total trades submitted: $trade_count"
-    
+
     # Get last trade
     local last_trade=$(grep "TRADE_" "$LOG_FILE" 2>/dev/null | tail -1 | grep -oE "symbol.*reason" | head -1)
     if [ -n "$last_trade" ]; then
@@ -117,12 +117,12 @@ get_trades() {
 # Main loop
 while true; do
     clear
-    
+
     echo "🎯 OCTI AI TRADING BOT - REAL-TIME MONITORING DASHBOARD"
     echo "========================================================"
     echo "Last update: $(date '+%H:%M:%S') | Refresh rate: ${REFRESH_RATE}s"
     echo ""
-    
+
     # System Status
     echo "📊 SYSTEM STATUS"
     echo "─────────────────"
@@ -130,45 +130,45 @@ while true; do
     trend=$(get_nav_trend)
     symbol_count=$(get_symbol_count)
     signal_count=$(get_signal_count)
-    
+
     echo "  NAV: \$$nav $trend"
     echo "  Active Symbols: $symbol_count"
     echo "  Cached Signals: $signal_count"
     echo ""
-    
+
     # Market Data
     echo "🌐 MARKET DATA"
     echo "──────────────"
     get_latest_prices
     echo ""
-    
+
     # Account Status
     echo "💼 ACCOUNT STATUS"
     echo "──────────────────"
     get_balances
     echo ""
-    
+
     # Signal Activity
     echo "📡 SIGNAL ACTIVITY"
     echo "───────────────────"
     get_signals
     echo ""
-    
+
     # NAV Tracking
     echo "📊 NAV TRACKING"
     echo "────────────────"
     get_nav_history
     echo ""
-    
+
     # Trading Activity
     echo "🔄 TRADING ACTIVITY"
     echo "────────────────────"
     get_trades
     echo ""
-    
+
     echo "─────────────────────────────────────────────────────"
     echo "💡 Legend: 📈 = Growing | 📉 = Decaying | ✓ = Accepted"
     echo "Press Ctrl+C to exit. Refreshing in ${REFRESH_RATE}s..."
-    
+
     sleep $REFRESH_RATE
 done

@@ -350,7 +350,7 @@ print(f"Healing fires? {gate1 or gate2}")  # FALSE
 **The solution: Set environment variables BEFORE starting bot:**
 ```bash
 export DEAD_CAPITAL_MIN_THRESHOLD=5.0
-export HEAL_C_WARMUP_SEC=5  
+export HEAL_C_WARMUP_SEC=5
 export HEAL_DUST_SWEEP_INTERVAL_SEC=60
 pkill -9 -f MASTER_SYSTEM_ORCHESTRATOR
 nohup python3 🎯_MASTER_SYSTEM_ORCHESTRATOR.py > /tmp/bot.log 2>&1 &

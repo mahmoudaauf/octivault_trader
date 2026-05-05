@@ -41,7 +41,7 @@ if action == "SELL":
     except Exception as e:
         self.logger.debug("[Meta:SELL] Failed to check position for %s: %s", sym, e)
         has_open_pos = False
-    
+
     if not has_open_pos:
         # Early reject SELL signals when flat
         self.logger.debug(
@@ -52,7 +52,7 @@ if action == "SELL":
         # Only run gates if we have an open position
         profit_gate = await self._passes_meta_sell_profit_gate(sym, sig)
         excursion_gate = await self._passes_meta_sell_excursion_gate(sym, sig)
-        
+
         if profit_gate and excursion_gate:
             decisions.append((sym, action, sig))
 ```
@@ -76,11 +76,11 @@ if action == "SELL":
 13:05:02  Loop 4: decision=BUY but exec_attempted=False
 13:05:25  Loop 5: ✅ decision=BUY exec_attempted=True SUCCESS trade_opened=True
           Capital: $50.03 → $22.85 (trade opened)
-          
+
 13:05:47  Loop 6: ✅ decision=SELL exec_attempted=True SUCCESS trade_opened=False
           Capital: $22.85 → $50.01 (position closed)
           PnL: -$0.06 (small loss, but TRADED!)
-          
+
 13:05:49+ Loops 7+: Waiting for next signal (flat state)
 ```
 
@@ -187,4 +187,3 @@ The Dynamic Gating System from the previous iteration continues to work:
 **Status**: 🟢 OPTIMIZATION COMPLETE & TRADING ACTIVE
 
 **Recommendation**: Continue with Option 2 (Profit Optimization) to improve PnL while maintaining stable trading, then run extended monitoring session.
-

@@ -1,8 +1,8 @@
 # 🚨 DUPLICATE SELL FINALIZATION BUG - INVESTIGATION REPORT
 
-**Investigation Date:** May 3, 2026 20:55 UTC  
-**Affected Symbol:** AIXBTUSDT  
-**Order ID:** 1039011941  
+**Investigation Date:** May 3, 2026 20:55 UTC
+**Affected Symbol:** AIXBTUSDT
+**Order ID:** 1039011941
 **Root Cause:** IDENTIFIED ✅
 
 ---
@@ -39,7 +39,7 @@ The system sent **ONE order** to Binance but attempted to **FINALIZE it TWICE** 
 
 The execution flow is calling `_finalize_sell_post_fill()` **twice** on the same order:
 
-**Call #1 (Primary):**  
+**Call #1 (Primary):**
 Initiated from the main liquidation execution path after ORDER_FILLED event:
 ```
 place_market_order(AIXBTUSDT, SELL, qty=1552.4)
@@ -48,7 +48,7 @@ place_market_order(AIXBTUSDT, SELL, qty=1552.4)
   → _finalize_sell_post_fill() called (FIRST TIME)
 ```
 
-**Call #2 (Erroneous):**  
+**Call #2 (Erroneous):**
 Initiated ~1 second later, likely from a **recovery or verification loop**:
 ```
 [Some recovery/monitoring code]
@@ -78,11 +78,11 @@ This explains your observation: "Two SELL trades that already happened at 20:55:
 
 ### 2. Second Finalization Attempt (DUPLICATE)
 ```log
-2026-05-03 20:55:18,737 [ERROR] ExecutionManager - [EM:SellFinalizeAssert] Duplicate SELL close finalization attempt 
-key=AIXBTUSDT|oid:1039011941 
-symbol=AIXBTUSDT 
-order_id=1039011941 
-client_order_id=octi7830917051d5c920Sf0871d1fmeta_he 
+2026-05-03 20:55:18,737 [ERROR] ExecutionManager - [EM:SellFinalizeAssert] Duplicate SELL close finalization attempt
+key=AIXBTUSDT|oid:1039011941
+symbol=AIXBTUSDT
+order_id=1039011941
+client_order_id=octi7830917051d5c920Sf0871d1fmeta_he
 tag=meta/heal_c_dust
 ```
 
@@ -90,13 +90,13 @@ The error shows `duplicate_attempt=True`, meaning the system detected it was try
 
 ### 3. Position Verification Failures
 ```log
-2026-05-03 20:55:32,797 [WARNING] ExecutionManager - [SELL_VERIFY:Pending] 
-Position close not yet verified: AIXBTUSDT order_id=1039011941 
-current_qty=1552.40000000 
-expected_close=1552.40000000 
+2026-05-03 20:55:32,797 [WARNING] ExecutionManager - [SELL_VERIFY:Pending]
+Position close not yet verified: AIXBTUSDT order_id=1039011941
+current_qty=1552.40000000
+expected_close=1552.40000000
 (age=15.1s)
 
-2026-05-03 20:56:32,801 [WARNING] ExecutionManager - [SELL_VERIFY:Timeout] 
+2026-05-03 20:56:32,801 [WARNING] ExecutionManager - [SELL_VERIFY:Timeout]
 Position close verification timed out: AIXBTUSDT order_id=1039011941 (age=75.1s)
 ```
 
@@ -108,21 +108,21 @@ This indicates the position was never properly **reduced in SharedState** becaus
 
 Possible sources (need code inspection):
 
-1. **Liquidation Agent Batch Loop**  
+1. **Liquidation Agent Batch Loop**
    - Builds a plan of positions to liquidate
    - Executes in a loop
    - May be re-attempting the same symbol on retry logic
 
-2. **Recovery/Reconciliation Loop**  
+2. **Recovery/Reconciliation Loop**
    - Detects unfilled orders
    - Attempts recovery
    - May be re-calling finalization on already-handled fills
 
-3. **Delayed Fill Recovery** (lines ~1200-1250 in ExecutionManager)  
+3. **Delayed Fill Recovery** (lines ~1200-1250 in ExecutionManager)
    - Polls for fills after submission
    - May be calling finalization on a fill that was already finalized
 
-4. **Position Verification Loop** (lines ~1700+ in ExecutionManager)  
+4. **Position Verification Loop** (lines ~1700+ in ExecutionManager)
    - Runs periodically
    - May be attempting finalization of pending positions
    - But position was already finalized, so triggers duplicate attempt
@@ -209,4 +209,3 @@ Ensure only ONE code path handles finalization per order, not multiple competing
 3. ⏳ Implement idempotency fix
 4. ⏳ Validate fix doesn't introduce new blocking scenarios
 5. ⏳ Monitor for recurrence post-fix
-

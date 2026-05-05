@@ -64,7 +64,7 @@ grep "\[Meta:ALLOC_TRACE\]" logs/trading_run_20260425T080527Z.log | tail -3
 # Check TrendHunter activity
 grep "TrendHunter" logs/trading_run_20260425T080527Z.log | grep -v "DEBUG" | tail -20
 
-# Check MLForecaster activity  
+# Check MLForecaster activity
 grep "MLForecaster" logs/trading_run_20260425T080527Z.log | grep -v "DEBUG" | tail -20
 
 # Check for errors
@@ -146,7 +146,7 @@ grep "LOOP_SUMMARY" logs/trading_run_20260425T080527Z.log | tail -1 | grep -o "p
 **Watch Loop Evolution**:
 ```bash
 # Show last 5 loops
-for i in {1..5}; do 
+for i in {1..5}; do
   grep "LOOP_SUMMARY" logs/trading_run_20260425T080527Z.log | tail -$i | head -1 | sed 's/.*loop_id=/Loop /;s/ symbols.*//'
 done
 ```
@@ -155,7 +155,7 @@ done
 
 ### Success Criteria for Each Iteration
 
-**Iteration 1 Success**: 
+**Iteration 1 Success**:
 - At least one loop shows `decision=BUY` or `decision=SELL`
 
 **Iteration 2 Success**:

@@ -1,8 +1,8 @@
 # 🚀 PHASE 2 FIXES - DEPLOYMENT GUIDE
 
-**Quick Reference for Deploying Phase 2 Bottleneck Fixes**  
-**Status:** Ready for Production  
-**Time Required:** 30 minutes (15 min deploy + 15 min warm-up test)  
+**Quick Reference for Deploying Phase 2 Bottleneck Fixes**
+**Status:** Ready for Production
+**Time Required:** 30 minutes (15 min deploy + 15 min warm-up test)
 
 ---
 
@@ -36,21 +36,21 @@ tail -f /tmp/octivault_master_orchestrator.log
 ## 📋 WHAT WAS FIXED
 
 ### Fix #1: Recovery Exit Min-Hold Bypass
-**Problem:** When capital drops, recovery exits blocked by min-hold gate  
-**Solution:** Set `_bypass_min_hold` flag on recovery exits  
-**Impact:** Capital recycled even during age restrictions  
+**Problem:** When capital drops, recovery exits blocked by min-hold gate
+**Solution:** Set `_bypass_min_hold` flag on recovery exits
+**Impact:** Capital recycled even during age restrictions
 **Status:** ✅ Implemented
 
 ### Fix #2: Micro Rotation Override
-**Problem:** MICRO accounts can't rotate even when beneficial  
-**Solution:** Set `force_rotation` precedence to override MICRO bracket  
-**Impact:** Forced rotations now work in all regimes  
+**Problem:** MICRO accounts can't rotate even when beneficial
+**Solution:** Set `force_rotation` precedence to override MICRO bracket
+**Impact:** Forced rotations now work in all regimes
 **Status:** ✅ Implemented
 
 ### Fix #3: Entry-Sizing Config Alignment
-**Problem:** Config defaults (15 USDT) misaligned from floor (25 USDT)  
-**Solution:** Align all 7 entry-size parameters to 25 USDT  
-**Impact:** Clean intent, no runtime friction  
+**Problem:** Config defaults (15 USDT) misaligned from floor (25 USDT)
+**Solution:** Align all 7 entry-size parameters to 25 USDT
+**Impact:** Clean intent, no runtime friction
 **Status:** ✅ Implemented
 
 ---
@@ -186,21 +186,21 @@ grep "quote: 25" /tmp/octivault_master_orchestrator.log
 ```
 [Meta:SafeMinHold] Bypassing min-hold check for forced recovery exit: ETHUSDT
 ```
-This appears when capital drops below strategic reserve.  
+This appears when capital drops below strategic reserve.
 Expected frequency: Every 1-3 cycles if capital is strained
 
 **Fix #2 - Micro Rotation Override:**
 ```
 [REA:authorize_rotation] ⚠️ MICRO restriction OVERRIDDEN for BTCUSDT due to forced rotation
 ```
-This appears when a MICRO account needs to rotate.  
+This appears when a MICRO account needs to rotate.
 Expected frequency: Every 5-15 minutes if MICRO and at capacity
 
 **Fix #3 - Entry-Sizing Alignment:**
 ```
 [Execution] Submitting BUY order: ETHUSDT @ quantity 0.05 (quote: 25.00)
 ```
-This appears on every BUY order.  
+This appears on every BUY order.
 Expected frequency: On each signal (3-12 per hour depending on regime)
 
 ### Health Indicators
@@ -244,7 +244,7 @@ python3 🎯_MASTER_SYSTEM_ORCHESTRATOR.py
 grep -i "bypass\|recovery" /tmp/octivault_master_orchestrator.log | head -20
 ```
 
-**If not in logs:** Recovery conditions haven't triggered  
+**If not in logs:** Recovery conditions haven't triggered
 **If in logs but still blocked:** Check min-hold logic in meta_controller.py
 
 ### Issue: Entry orders still 15 USDT
@@ -254,11 +254,11 @@ grep "DEFAULT_PLANNED_QUOTE" .env
 # Should show: DEFAULT_PLANNED_QUOTE=25
 ```
 
-**If shows 15:** .env changes didn't apply  
+**If shows 15:** .env changes didn't apply
 **Remedy:** Restart bot: `pkill -f MASTER_SYSTEM_ORCHESTRATOR && sleep 3 && python3 🎯_MASTER_SYSTEM_ORCHESTRATOR.py &`
 
 ### Issue: Unexpected "MICRO restriction OVERRIDDEN" messages
-**Normal:** This is expected behavior when forced rotations occur  
+**Normal:** This is expected behavior when forced rotations occur
 **Not a problem:** The override is working correctly
 
 ---
@@ -378,7 +378,7 @@ The fixes will automatically improve system efficiency as capital is recovered a
 
 ---
 
-**Version:** 1.0  
-**Status:** Ready to Deploy  
-**Date:** April 27, 2026  
+**Version:** 1.0
+**Status:** Ready to Deploy
+**Date:** April 27, 2026
 **Estimated Deploy Time:** 30 minutes

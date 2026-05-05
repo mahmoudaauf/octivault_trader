@@ -22,7 +22,7 @@ fee_expectancy_multiplier = 1.6  # ❌ Insufficient safety margin
 
 ## What Changed ✅
 
-**New Settings** 
+**New Settings**
 ```python
 min_positive_edge_bps = 35.0         # ✅ Covers 30 bps costs + 5 bps profit
 fallback_edge_bps = 80.0             # ✅ 50 bps profit above costs

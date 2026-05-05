@@ -50,14 +50,14 @@ Config:
 import asyncio
 import logging
 import time
-from typing import Dict, Any, List, Optional, Set
 from collections import defaultdict
+from typing import Any, Optional
 
 
 class DiscoveryCoordinator:
     """
     Centralized discovery proposal coordinator.
-    
+
     Responsibilities:
     1. Collect proposals from all discovery agents
     2. Deduplicate (keep best by source & confidence)
@@ -89,8 +89,8 @@ class DiscoveryCoordinator:
         self.track_metrics = bool(self._cfg("DISCOVERY_TRACK_METRICS", True))
 
         # State tracking
-        self._recent_proposals: Dict[str, float] = {}  # symbol -> timestamp
-        self._proposal_history: Dict[str, Dict[str, Any]] = {}  # symbol -> best_proposal
+        self._recent_proposals: dict[str, float] = {}  # symbol -> timestamp
+        self._proposal_history: dict[str, dict[str, Any]] = {}  # symbol -> best_proposal
         self._metrics = {
             "total_collected": 0,
             "total_deduped": 0,
@@ -105,10 +105,10 @@ class DiscoveryCoordinator:
             return self.config.get(key, default)
         return getattr(self.config, key, default)
 
-    async def collect_and_deduplicate(self) -> Dict[str, Dict[str, Any]]:
+    async def collect_and_deduplicate(self) -> dict[str, dict[str, Any]]:
         """
         Main entry point: collect proposals from all agents and deduplicate.
-        
+
         Returns:
             Dict of {symbol: {source, confidence, metadata, timestamp}}
         """
@@ -144,10 +144,10 @@ class DiscoveryCoordinator:
             self.logger.error(f"[DiscoveryCoordinator] Error in collect_and_deduplicate: {e}")
             return {}
 
-    async def collect_and_rank_by_regime(self) -> Dict[str, Dict[str, Any]]:
+    async def collect_and_rank_by_regime(self) -> dict[str, dict[str, Any]]:
         """
         Phase 3: Enhanced collection with regime-based weighting.
-        
+
         Process:
         1. Collect all proposals (Phase 2b behavior)
         2. Deduplicate (Phase 2b behavior)
@@ -155,109 +155,111 @@ class DiscoveryCoordinator:
         4. Sort by weighted score
         5. Apply rate limiting
         6. Store in SharedState
-        
+
         Returns:
             Dict of {symbol: {source, confidence, weighted_score, regime_bonus, ...}}
         """
         try:
             # Enable weighting if configured
             use_weighting = bool(self._cfg("DISCOVERY_USE_REGIME_WEIGHTING", False))
-            
+
             if not use_weighting:
                 # Fall back to Phase 2b behavior (no weighting)
                 return await self.collect_and_deduplicate()
-            
+
             # Get RegimeProposalAnalyzer
             if not hasattr(self, "_analyzer"):
                 from src.l2_marketdata.regime_proposal_analyzer import RegimeProposalAnalyzer
+
                 self._analyzer = RegimeProposalAnalyzer(self.ss, self.config, self.logger)
-            
+
             # Step 1: Collect from all sources
             all_proposals = await self._collect_all_proposals()
             self._metrics["total_collected"] += len(all_proposals)
-            
+
             if not all_proposals:
                 self.logger.debug("[DiscoveryCoordinator] No proposals for weighting")
                 return {}
-            
+
             # Step 2: Deduplicate (Phase 2b)
             deduped = await self._deduplicate_proposals(all_proposals)
             self._metrics["total_deduped"] += len(deduped)
-            
+
             # Step 3: Apply regime weighting (Phase 3) ← NEW
             weighted_proposals = await self._apply_regime_weighting(list(deduped.values()))
-            
+
             # Convert back to dict format {symbol: {properties}}
             weighted_dict = {}
             for prop in weighted_proposals:
                 symbol = str(prop.get("symbol", "")).upper()
                 weighted_dict[symbol] = prop
-            
+
             # Step 4: Apply quality filter (now with weighted scores)
             filtered = await self._apply_quality_filter(weighted_dict)
-            
+
             # Step 5: Apply rate limiting
             final = await self._apply_rate_limit(filtered)
-            
+
             # Step 6: Store in SharedState (with weighted tag)
-            setattr(self.ss, "discovery_proposals_weighted", final)
-            setattr(self.ss, "discovery_proposals", final)  # Also update regular
-            
+            self.ss.discovery_proposals_weighted = final
+            self.ss.discovery_proposals = final  # Also update regular
+
             # Step 7: Update metrics
             self._metrics["last_collection_time"] = time.time()
             self._log_metrics(all_proposals, deduped, filtered, final)
-            
+
             self.logger.info(
                 f"[DiscoveryCoordinator] Phase 3 weighting applied: "
                 f"{len(final)} proposals, top score: "
                 f"{max((p.get('weighted_score', 0) for p in final.values()), default=0):.3f}"
             )
-            
+
             return final
-        
+
         except Exception as e:
             self.logger.error(f"[DiscoveryCoordinator] Error in regime weighting: {e}")
             # Fall back to Phase 2b (no weighting)
             return await self.collect_and_deduplicate()
 
     async def _apply_regime_weighting(
-        self, proposals: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+        self, proposals: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         """
         Apply regime-based weighting to proposals. Phase 3 enhancement.
-        
+
         Uses RegimeProposalAnalyzer to:
         1. Score each proposal based on market regime
         2. Apply regime-specific multipliers
         3. Sort by weighted score
-        
+
         Args:
             proposals: List of proposal dicts
-        
+
         Returns:
             List of weighted proposals sorted by weighted_score descending
         """
         try:
             if not hasattr(self, "_analyzer"):
                 from src.l2_marketdata.regime_proposal_analyzer import RegimeProposalAnalyzer
+
                 self._analyzer = RegimeProposalAnalyzer(self.ss, self.config, self.logger)
-            
+
             # Batch analyze all proposals
             weighted = await self._analyzer.batch_analyze_proposals(proposals)
-            
+
             self.logger.debug(
                 f"[DiscoveryCoordinator] Weighted {len(weighted)} proposals, "
                 f"metrics: {self._analyzer.get_metrics()}"
             )
-            
+
             return weighted
-        
+
         except Exception as e:
             self.logger.error(f"[DiscoveryCoordinator] Error applying regime weighting: {e}")
             # Return original proposals (no weighting)
             return proposals
 
-    async def _collect_all_proposals(self) -> List[Dict[str, Any]]:
+    async def _collect_all_proposals(self) -> list[dict[str, Any]]:
         """Collect proposals from all discovery agents and stashes."""
         proposals = []
 
@@ -266,29 +268,39 @@ class DiscoveryCoordinator:
             if hasattr(self.ss, "symbol_proposals"):
                 stash = getattr(self.ss, "symbol_proposals", None) or {}
                 for symbol, prop in stash.items():
-                    proposals.append({
-                        "symbol": str(symbol).upper(),
-                        "source": prop.get("source", "stash"),
-                        "confidence": float(prop.get("confidence", 0.5)),
-                        "metadata": prop.get("metadata", {}),
-                        "timestamp": float(prop.get("ts", time.time())),
-                    })
+                    proposals.append(
+                        {
+                            "symbol": str(symbol).upper(),
+                            "source": prop.get("source", "stash"),
+                            "confidence": float(prop.get("confidence", 0.5)),
+                            "metadata": prop.get("metadata", {}),
+                            "timestamp": float(prop.get("ts", time.time())),
+                        }
+                    )
 
             # Source 2: SymbolManager proposals (if available)
             if hasattr(self.ss, "get_pending_proposals"):
                 try:
-                    pending = await self.ss.get_pending_proposals() if asyncio.iscoroutine(self.ss.get_pending_proposals()) else self.ss.get_pending_proposals()
+                    pending = (
+                        await self.ss.get_pending_proposals()
+                        if asyncio.iscoroutine(self.ss.get_pending_proposals())
+                        else self.ss.get_pending_proposals()
+                    )
                     if isinstance(pending, dict):
                         for symbol, prop in pending.items():
-                            proposals.append({
-                                "symbol": str(symbol).upper(),
-                                "source": prop.get("source", "symbol_manager"),
-                                "confidence": float(prop.get("confidence", 0.5)),
-                                "metadata": prop.get("metadata", {}),
-                                "timestamp": float(prop.get("ts", time.time())),
-                            })
+                            proposals.append(
+                                {
+                                    "symbol": str(symbol).upper(),
+                                    "source": prop.get("source", "symbol_manager"),
+                                    "confidence": float(prop.get("confidence", 0.5)),
+                                    "metadata": prop.get("metadata", {}),
+                                    "timestamp": float(prop.get("ts", time.time())),
+                                }
+                            )
                 except Exception as e:
-                    self.logger.debug(f"[DiscoveryCoordinator] Failed to get pending proposals: {e}")
+                    self.logger.debug(
+                        f"[DiscoveryCoordinator] Failed to get pending proposals: {e}"
+                    )
 
             self.logger.debug(
                 f"[DiscoveryCoordinator] Collected {len(proposals)} total proposals "
@@ -301,11 +313,11 @@ class DiscoveryCoordinator:
             return proposals
 
     async def _deduplicate_proposals(
-        self, proposals: List[Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
+        self, proposals: list[dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
         """
         Deduplicate proposals: keep highest-confidence per symbol.
-        
+
         Strategy:
           1. Group by symbol
           2. Within each symbol, keep highest confidence
@@ -346,12 +358,8 @@ class DiscoveryCoordinator:
                 existing_priority = existing.get("priority", 0)
 
                 # Better if: higher confidence, OR same confidence + higher source priority
-                is_better = (
-                    confidence > existing["confidence"]
-                    or (
-                        confidence == existing["confidence"]
-                        and priority > existing_priority
-                    )
+                is_better = confidence > existing["confidence"] or (
+                    confidence == existing["confidence"] and priority > existing_priority
                 )
 
                 if is_better:
@@ -372,8 +380,8 @@ class DiscoveryCoordinator:
         return deduped
 
     async def _apply_quality_filter(
-        self, proposals: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
+        self, proposals: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
         """Filter proposals by minimum confidence threshold."""
         filtered = {}
         low_quality_count = 0
@@ -400,11 +408,11 @@ class DiscoveryCoordinator:
         return filtered
 
     async def _apply_rate_limit(
-        self, proposals: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
+        self, proposals: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
         """
         Rate limit: don't process more than max_proposals_per_min in this cycle.
-        
+
         Strategy:
         1. Recent proposals (< dedup_window) are rate-limited
         2. New proposals have unlimited throughput
@@ -415,7 +423,8 @@ class DiscoveryCoordinator:
 
         # Find recent proposals
         recent_count = sum(
-            1 for symbol in self._recent_proposals
+            1
+            for symbol in self._recent_proposals
             if current_time - self._recent_proposals[symbol] < self.dedup_window_sec
         )
 
@@ -454,9 +463,7 @@ class DiscoveryCoordinator:
 
         return final
 
-    async def _store_in_shared_state(
-        self, proposals: Dict[str, Dict[str, Any]]
-    ) -> None:
+    async def _store_in_shared_state(self, proposals: dict[str, dict[str, Any]]) -> None:
         """Store finalized proposals in SharedState for UURE consumption."""
         try:
             if not hasattr(self.ss, "discovery_proposals"):
@@ -472,10 +479,10 @@ class DiscoveryCoordinator:
 
     def _log_metrics(
         self,
-        all_proposals: List[Dict[str, Any]],
-        deduped: Dict[str, Dict[str, Any]],
-        filtered: Dict[str, Dict[str, Any]],
-        final: Dict[str, Dict[str, Any]],
+        all_proposals: list[dict[str, Any]],
+        deduped: dict[str, dict[str, Any]],
+        filtered: dict[str, dict[str, Any]],
+        final: dict[str, dict[str, Any]],
     ) -> None:
         """Log metrics for this collection cycle."""
         if not self.track_metrics:
@@ -487,16 +494,8 @@ class DiscoveryCoordinator:
                 if all_proposals
                 else 0
             )
-            filter_rate = (
-                (len(deduped) - len(filtered)) / len(deduped) * 100
-                if deduped
-                else 0
-            )
-            rate_limit_rate = (
-                (len(filtered) - len(final)) / len(filtered) * 100
-                if filtered
-                else 0
-            )
+            filter_rate = (len(deduped) - len(filtered)) / len(deduped) * 100 if deduped else 0
+            rate_limit_rate = (len(filtered) - len(final)) / len(filtered) * 100 if filtered else 0
 
             self.logger.info(
                 f"[DiscoveryCoordinator] Cycle metrics: "
@@ -511,7 +510,7 @@ class DiscoveryCoordinator:
             sources = defaultdict(int)
             for prop in deduped.values():
                 sources[prop.get("source", "unknown")] += 1
-            
+
             if sources:
                 source_str = ", ".join(f"{src}={cnt}" for src, cnt in sorted(sources.items()))
                 self.logger.debug(f"[DiscoveryCoordinator] Proposals by source: {source_str}")
@@ -519,7 +518,7 @@ class DiscoveryCoordinator:
         except Exception as e:
             self.logger.debug(f"[DiscoveryCoordinator] Error logging metrics: {e}")
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         """Export current metrics."""
         return dict(self._metrics)
 

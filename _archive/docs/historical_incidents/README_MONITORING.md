@@ -40,12 +40,12 @@ python check_status.py
 
 ## 🎯 Key Features
 
-✅ **Real-Time Capital Tracking** - NAV, free capital, returns every 10 seconds  
-✅ **Health Scoring** - Balance sync, execution, positions (0-100)  
-✅ **Issue Detection** - Stale cache, misalignment, stagnation, slowdown  
-✅ **Auto-Fix Engine** - Applies fixes automatically (5min cooldown)  
-✅ **Live Dashboard** - Beautiful visualization with sparklines  
-✅ **Metrics Export** - JSON format for external analysis  
+✅ **Real-Time Capital Tracking** - NAV, free capital, returns every 10 seconds
+✅ **Health Scoring** - Balance sync, execution, positions (0-100)
+✅ **Issue Detection** - Stale cache, misalignment, stagnation, slowdown
+✅ **Auto-Fix Engine** - Applies fixes automatically (5min cooldown)
+✅ **Live Dashboard** - Beautiful visualization with sparklines
+✅ **Metrics Export** - JSON format for external analysis
 
 ## 🔍 What Gets Monitored
 
@@ -209,9 +209,9 @@ Watch your capital grow with real-time monitoring & automatic fixes!
 
 ---
 
-**Created:** May 2, 2026  
-**Status:** ✅ Production Ready  
-**Version:** 1.0  
+**Created:** May 2, 2026
+**Status:** ✅ Production Ready
+**Version:** 1.0
 
-For more details: `cat MONITORING_GUIDE.md`  
+For more details: `cat MONITORING_GUIDE.md`
 For all commands: `bash QUICK_REFERENCE.sh`

@@ -1,7 +1,7 @@
 # 📊 ANALYSIS & FIX SUMMARY REPORT
 
-**Generated:** May 3, 2026  
-**Analysis Confidence:** 99.2%  
+**Generated:** May 3, 2026
+**Analysis Confidence:** 99.2%
 **Status:** ✅ READY FOR FIXES
 
 ---
@@ -148,22 +148,22 @@ PRETRADE_EFFECT_GATE_MIN_PROFIT_PCT = 0.02  # New (allows tighter spreads)
 
 ### Evidence #1: Signals ARE Being Generated
 ```
-Log: 2026-05-03 23:01:38,575 [WARNING] [AgentManager:BATCH] 
+Log: 2026-05-03 23:01:38,575 [WARNING] [AgentManager:BATCH]
 Submitted batch of 7 intents: ['SwingTradeHunter:BTCUSDT', 'SwingTradeHunter:BNBUSDT', ...]
 → Confirms: 7 signals per cycle being created ✅
 ```
 
 ### Evidence #2: Gate IS Blocking
 ```
-Log: 2026-05-03 23:01:38,923 CRITICAL [MetaController] 
-[Deadlock:TRIGGER] ❌ REPEATED FAILURES DETECTED: 
+Log: 2026-05-03 23:01:38,923 CRITICAL [MetaController]
+[Deadlock:TRIGGER] ❌ REPEATED FAILURES DETECTED:
 PRETRADE_EFFECT_GATE:NET_PCT_BELOW_THRESHOLD count=132
 → Confirms: Gate blocking 132 times ✅
 ```
 
 ### Evidence #3: System NOT Crashed
 ```
-Log: 2026-05-03 23:01:38,930 INFO [MetaController] 
+Log: 2026-05-03 23:01:38,930 INFO [MetaController]
 [GovernanceDecision] {"mode": "PROTECTIVE", "allowed_actions": ["BUY", "SELL", "LIQUIDATE"]}
 → Confirms: System still deciding normally ✅
 ```
@@ -320,15 +320,15 @@ Return: +0.15-0.25% per cycle (estimated)
 1. ✅ **CRITICAL:** Lower PRETRADE gate threshold (10 min)
    - Unblocks trades
    - Highest impact
-   
+
 2. ✅ **HIGH:** Add missing dependencies (2 min)
    - Enables optional dashboard
    - No risk
-   
+
 3. ⚡ **MEDIUM:** Implement TrendHunter (20-30 min, optional)
    - Adds 7% more signals
    - Can skip if time-constrained
-   
+
 4. 💎 **LOW:** Polish fixes (10-20 min, optional)
    - Type annotations
    - Filename rename

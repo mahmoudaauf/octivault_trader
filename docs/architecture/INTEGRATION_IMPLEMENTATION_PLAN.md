@@ -1,8 +1,8 @@
 # 🚀 INTEGRATION IMPLEMENTATION PLAN
 
-**Status:** Ready to implement  
-**Complexity:** Medium (wiring + threshold adjustment)  
-**Timeline:** 2-3 hours to complete all 5 fixes  
+**Status:** Ready to implement
+**Complexity:** Medium (wiring + threshold adjustment)
+**Timeline:** 2-3 hours to complete all 5 fixes
 **Risk Level:** LOW (all components already coded and tested)
 
 ---
@@ -99,7 +99,7 @@ self.min_dead_to_heal = self.config.get('min_dead_to_heal', 50.0)  # Heal if > $
 def get_adaptive_thresholds(total_equity: float) -> Dict[str, float]:
     """
     Get adaptive healing thresholds based on account size.
-    
+
     Micro accounts (<$500) have lower thresholds for faster healing.
     """
     if total_equity < 500:  # MICRO bracket
@@ -125,13 +125,13 @@ def get_adaptive_thresholds(total_equity: float) -> Dict[str, float]:
 @dataclass
 class PortfolioBucketState:
     # ... existing fields ...
-    
+
     @property
     def adaptive_healing_threshold(self) -> float:
         """Get current healing threshold based on portfolio size"""
         thresholds = self.get_adaptive_thresholds(self.total_equity)
         return thresholds['min_dead_to_heal']
-    
+
     def should_heal_dead_capital(self) -> bool:
         """Should we prioritize liquidating dead capital?"""
         return self.dead_total_value > self.adaptive_healing_threshold
@@ -141,15 +141,15 @@ class PortfolioBucketState:
 ```python
 def __init__(self, config: Optional[Dict] = None):
     self.config = config or {}
-    
+
     # Get thresholds (adaptive or fixed)
     total_equity = self.config.get('total_equity', 500)  # default to MICRO
     thresholds = PortfolioBucketState.get_adaptive_thresholds(total_equity)
-    
+
     self.min_dead_to_heal = self.config.get('min_dead_to_heal') or thresholds['min_dead_to_heal']
     self.dead_min_size = thresholds['dead_min_size']
     self.healing_urgency = thresholds['healing_urgency']
-    
+
     logger.info(f"✅ DeadCapitalHealer initialized (bracket=$${total_equity:.0f})")
     logger.info(f"   Min dead to heal: ${self.min_dead_to_heal:.2f}")
     logger.info(f"   Healing urgency: {self.healing_urgency}")
@@ -172,27 +172,27 @@ def __init__(self, config: Optional[Dict] = None):
 async def _periodic_portfolio_health_check(self):
     """
     Periodic check for portfolio health and dead capital healing.
-    
+
     Called every N cycles to:
     1. Classify portfolio into three buckets
     2. Identify dead capital
     3. Trigger healing if needed
     """
-    
+
     if not self.three_bucket_manager:
         return  # Not available
-    
+
     try:
         # Get current portfolio state
         nav = self.shared_state.get_total_equity()
         all_positions = self.shared_state.get_all_positions()
-        
+
         # Update bucket classification
         bucket_state = self.three_bucket_manager.update_bucket_state(
             positions=all_positions,
             total_equity=nav
         )
-        
+
         # Log bucket state
         self.logger.info(
             "[BUCKETS] Operating Cash: $%.2f | Productive: $%.2f | Dead: $%.2f | Health: %s",
@@ -201,7 +201,7 @@ async def _periodic_portfolio_health_check(self):
             bucket_state.dead_total_value,
             bucket_state.operating_cash_health
         )
-        
+
         # Check if healing needed
         if self.three_bucket_manager.should_execute_healing():
             self.logger.warning(
@@ -209,10 +209,10 @@ async def _periodic_portfolio_health_check(self):
                 bucket_state.dead_total_value,
                 bucket_state.healing_potential
             )
-            
+
             # Plan healing cycle
             should_heal, reason, orders = self.three_bucket_manager.plan_healing_cycle()
-            
+
             if should_heal and orders:
                 self.logger.warning(
                     "[HEALING:TRIGGER] %s | %d orders to execute | Recovery: $%.2f",
@@ -220,12 +220,12 @@ async def _periodic_portfolio_health_check(self):
                     len(orders),
                     bucket_state.healing_potential
                 )
-                
+
                 # Execute healing
                 report = self.three_bucket_manager.execute_healing(
                     execution_callback=self._execute_healing_order
                 )
-                
+
                 if report:
                     self.logger.info(
                         "[HEALING:COMPLETE] Recovered: $%.2f | Symbols: %d | Status: %s",
@@ -233,41 +233,41 @@ async def _periodic_portfolio_health_check(self):
                         report.liquidation_count if hasattr(report, 'liquidation_count') else 0,
                         report.status if hasattr(report, 'status') else 'UNKNOWN'
                     )
-    
+
     except Exception as e:
         self.logger.error(f"[HEALTH:ERROR] Portfolio health check failed: {e}", exc_info=True)
 
 async def _execute_healing_order(self, order: Dict) -> bool:
     """
     Execute a single healing liquidation order.
-    
+
     Args:
         order: Order dict from DeadCapitalHealer
-        
+
     Returns:
         True if executed successfully
     """
     try:
         symbol = order.get('symbol')
         side = order.get('side', 'SELL')  # Usually SELL for healing
-        
+
         self.logger.info(
             "[HEALING:EXECUTE] %s %s | Qty: %.8f | Price: %.2f",
             symbol, side,
             order.get('qty', 0),
             order.get('price', 0)
         )
-        
+
         # Execute via execution manager (already set up for order handling)
         result = await self.execution_manager.execute_liquidation_plan([order])
-        
+
         if result:
             self.logger.info(f"[HEALING:SUCCESS] {symbol} liquidated")
             return True
         else:
             self.logger.warning(f"[HEALING:FAILED] {symbol} execution failed")
             return False
-    
+
     except Exception as e:
         self.logger.error(f"[HEALING:ERROR] Failed to execute healing order: {e}")
         return False
@@ -286,14 +286,14 @@ health_check_interval = 10
 
 while self.running:
     cycle_count += 1
-    
+
     # Existing decision logic
     await self._build_decisions()
-    
+
     # NEW: Periodic portfolio health check
     if cycle_count % health_check_interval == 0:
         await self._periodic_portfolio_health_check()
-    
+
     # Rest of loop...
     await asyncio.sleep(1)
 ```
@@ -316,7 +316,7 @@ while self.running:
 # 🔥 NEW: Initialize CashRouter for dust sweeping
 try:
     from core.cash_router import CashRouter
-    
+
     self.cash_router = CashRouter(
         config=self.config,
         logger=logger,
@@ -341,9 +341,9 @@ cycle_count = 0
 
 while self.running:
     cycle_count += 1
-    
+
     # ... existing logic ...
-    
+
     # NEW: Periodic dust sweeping
     if cycle_count % cash_router_interval == 0 and self.cash_router:
         try:
@@ -351,7 +351,7 @@ while self.running:
             # This automatically sweeps dust and consolidates stables
         except Exception as e:
             logger.debug(f"CashRouter sweep failed (non-critical): {e}")
-    
+
     await asyncio.sleep(1)
 ```
 
@@ -381,7 +381,7 @@ self._on_completed: List[Callable[[Dict[str, Any]], None]] = []
 def register_completion_callback(self, callback: Callable):
     """
     Register a callback to be called when healing completes.
-    
+
     Args:
         callback: Function to call with healing report
     """
@@ -397,7 +397,7 @@ if self.liquidation_orchestrator:
         """Called when healing cycle completes"""
         logger.info(f"[CALLBACK] Healing complete: {report}")
         # Update stats, metrics, etc.
-    
+
     self.liquidation_orchestrator.register_completion_callback(on_healing_complete)
     logger.info("✅ Liquidation callbacks registered")
 ```
@@ -518,12 +518,11 @@ Portfolio: SELF-HEALING
 
 ## SUCCESS CRITERIA
 
-✅ All 5 fixes implemented  
-✅ Logs show "LiquidationOrchestrator started (async loop active)"  
-✅ Portfolio health checks running every 10 cycles  
-✅ Dead capital healing triggered when > $10  
-✅ USDT recovered from fragmentation within 2-3 cycles  
-✅ Next trades execute without "insufficient balance" errors  
-✅ Portfolio segmentation maintains 40-60% USDT liquidity  
-✅ System trades continuously for 1+ hour without freezing  
-
+✅ All 5 fixes implemented
+✅ Logs show "LiquidationOrchestrator started (async loop active)"
+✅ Portfolio health checks running every 10 cycles
+✅ Dead capital healing triggered when > $10
+✅ USDT recovered from fragmentation within 2-3 cycles
+✅ Next trades execute without "insufficient balance" errors
+✅ Portfolio segmentation maintains 40-60% USDT liquidity
+✅ System trades continuously for 1+ hour without freezing

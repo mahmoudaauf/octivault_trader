@@ -57,7 +57,7 @@ async def run_loop(self):
         # Every 5-30 seconds:
         current_symbols = await self._get_accepted_symbols()
         delta = current_symbols - self._known_symbols
-        
+
         if delta:
             await self._schedule_symbol_backfill(delta)
             await self.ws_subscribe(delta)
@@ -72,7 +72,7 @@ async def _schedule_symbol_backfill(self, symbols: List[str]):
     for symbol in symbols:
         # Load OHLCV history from exchange
         ohlcv = await self.exchange_client.get_klines(
-            symbol, 
+            symbol,
             timeframe='5m',
             limit=500
         )
@@ -108,17 +108,17 @@ async def on_symbol_accepted(self, symbol: str):
 ```python
 async def _propose(self, symbol: str, *, source: str, metadata: Dict[str, Any]) -> bool:
     """Propose a new symbol for evaluation"""
-    
+
     # Step 1: Convergence gating (prevents bad symbols)
     if not await self._should_accept_symbol(symbol):
         logger.warning(f"[SymbolScreener] 🚫 {symbol} BLOCKED by convergence gating")
         return False
-    
+
     # Step 2: Pre-filter checks
     if not await self._prefilter_symbol(symbol):
         logger.warning(f"[SymbolScreener] 🚫 {symbol} failed pre-filter")
         return False
-    
+
     # Step 3: Write to symbol_proposals for UURE processing
     if self.shared_state is not None:
         self.shared_state.symbol_proposals[str(symbol).upper()] = {
@@ -129,7 +129,7 @@ async def _propose(self, symbol: str, *, source: str, metadata: Dict[str, Any]) 
         }
         logger.info(f"[SymbolScreener] ✅ Proposed {symbol} for UURE processing")
         return True
-    
+
     # Fallback: stash if no shared state
     return False
 ```
@@ -139,21 +139,21 @@ async def _propose(self, symbol: str, *, source: str, metadata: Dict[str, Any]) 
 ```python
 async def _prefilter_symbol(self, symbol: str) -> bool:
     """Validate trading status and liquidity"""
-    
+
     # Check 1: Is symbol trading?
     if not await self.exchange_client.has_symbol(symbol):
         return False
-    
+
     # Check 2: Trading status = TRADING?
     info = await self.exchange_client.get_symbol_info(symbol)
     if info.get('status') != 'TRADING':
         return False
-    
+
     # Check 3: Meets min notional?
     min_notional = float(info.get('minNotional', 10.0))
     if min_notional > self.config.MAX_PER_TRADE_USDT:
         return False
-    
+
     return True
 ```
 
@@ -206,49 +206,49 @@ async def classify_positions_by_size(self) -> Dict[str, List[str]]:
         "HARD_DUST": [],
         "DUST_LOCKED": []
     }
-    
+
     for symbol, position in self.positions.items():
         qty = float(position.get("quantity", 0.0))
         if qty <= 0:
             continue
-        
+
         # Get symbol's exchange minNotional filter
         try:
             info = await self.exchange_client.get_symbol_info(symbol)
             min_notional = float(info.get("minNotional", 10.0))
         except:
             min_notional = 10.0  # Default fallback
-        
+
         # Get current market price
         price = self.get_latest_price_safe(symbol)
         if price <= 0:
             classifications["DUST_LOCKED"].append(symbol)
             continue
-        
+
         # Calculate notional value
         notional = qty * price
-        
+
         # Classification logic:
-        
+
         # Check 1: Is position locked?
         status = position.get("status", "")
         if status in {"LOCKED", "ERROR", "MARGIN_CALL"}:
             classifications["HARD_DUST"].append(symbol)
             continue
-        
+
         # Check 2: Is qty extremely small?
         if qty < self.DUST_POSITION_QTY:
             classifications["MICRO_DUST"].append(symbol)
             continue
-        
+
         # Check 3: Below min notional?
         if notional < min_notional:
             classifications["DUST_LOCKED"].append(symbol)
             continue
-        
+
         # Else: Normal position
         classifications["CLEAN"].append(symbol)
-    
+
     return classifications
 ```
 
@@ -267,13 +267,13 @@ class PortfolioBucketState:
     operating_cash_usdt: float = 0.0
     operating_cash_target_pct: float = 0.20  # Target 20%
     operating_cash_floor: float = 10.0       # Minimum $10
-    
+
     # Bucket B: Productive Inventory (Active Trading)
     productive_positions: Dict[str, dict] = field(default_factory=dict)
     productive_total_value: float = 0.0
     productive_count: int = 0
     productive_max_count: int = 5  # Max 5 positions
-    
+
     # Bucket C: Dead Capital (To Be Liquidated)
     dead_positions: Dict[str, dict] = field(default_factory=dict)
     dead_total_value: float = 0.0
@@ -311,30 +311,30 @@ def identify_liquidation_candidates(
 ) -> Tuple[List[str], float]:
     """
     Find all positions that should be liquidated.
-    
+
     Returns:
         Tuple of (list of symbols to liquidate, total value)
     """
     candidates = []
     total_value = 0.0
-    
+
     # Get liquidation priority order (largest value first)
     priority_order = bucket_state.get_healing_priority_order()
-    
+
     # Liquidate up to max per cycle
     for symbol in priority_order[:self.max_liquidations_per_cycle]:
         if symbol not in bucket_state.dead_positions:
             continue
-        
+
         pos_data = bucket_state.dead_positions[symbol]
         value = pos_data.get('value', 0.0)
         reason = pos_data.get('reason')
-        
+
         candidates.append(symbol)
         total_value += value
-        
+
         logger.debug(f"   ✅ Candidate: {symbol:10s} | ${value:>8.2f}")
-    
+
     logger.info(f"🎯 Found {len(candidates)} liquidation candidates")
     return candidates, total_value
 ```
@@ -352,24 +352,24 @@ def execute_liquidation_batch(
     execution_callback=None,
 ) -> HealingReport:
     """Execute batch liquidation of dead positions"""
-    
+
     report = HealingReport(
         session_id=self.session_id,
         timestamp=datetime.now(),
         total_positions_healed=0,
         total_amount_recovered=0.0,
     )
-    
+
     if not orders:
         logger.info("ℹ️  No dead capital to heal this cycle")
         return report
-    
+
     logger.info(f"🚀 Executing {len(orders)} liquidation orders...")
-    
+
     for order in orders:
         symbol = order['symbol']
         expected_value = order['expected_value']
-        
+
         try:
             # Execute on exchange
             if execution_callback:
@@ -378,7 +378,7 @@ def execute_liquidation_batch(
             else:
                 # Simulate (assume 99% fill)
                 recovered = expected_value * 0.99
-            
+
             # Record healing event
             event = HealingEvent(
                 symbol=symbol,
@@ -387,16 +387,16 @@ def execute_liquidation_batch(
                 amount_recovered=recovered,
                 timestamp=datetime.now()
             )
-            
+
             report.events.append(event)
             report.total_positions_healed += 1
             report.total_amount_recovered += recovered
-            
+
             logger.info(f"✅ Healed {symbol}: ${recovered:.2f}")
-            
+
         except Exception as e:
             logger.warning(f"❌ Failed to heal {symbol}: {e}")
-    
+
     return report
 ```
 
@@ -411,7 +411,7 @@ def execute_liquidation_batch(
 ```python
 class DustRegistry:
     """Persistent storage and tracking of dust positions"""
-    
+
     def mark_position_as_dust(self, symbol: str, quantity: float, notional_usd: float) -> None:
         """Record a position as dust"""
         if symbol not in self._cached_registry["dust_positions"]:
@@ -425,7 +425,7 @@ class DustRegistry:
             self._cached_registry["dust_positions"][symbol] = dust_pos.to_dict()
             self._write(self._cached_registry)
             self.logger.info(f"[DustRegistry] Marked {symbol} as dust")
-    
+
     def record_healing_attempt(self, symbol: str) -> None:
         """Increment healing attempt counter"""
         if symbol in self._cached_registry["dust_positions"]:
@@ -433,7 +433,7 @@ class DustRegistry:
             pos["healing_attempts"] = pos.get("healing_attempts", 0) + 1
             pos["last_healing_attempt_at"] = time.time()
             self._write(self._cached_registry)
-    
+
     def trip_circuit_breaker(self, symbol: str) -> None:
         """Prevent further healing attempts after repeated failures"""
         if symbol in self._cached_registry["dust_positions"]:
@@ -442,24 +442,24 @@ class DustRegistry:
             pos["circuit_breaker_tripped_at"] = time.time()
             self._write(self._cached_registry)
             self.logger.warning(f"[DustRegistry] Circuit breaker TRIPPED for {symbol}")
-    
+
     def should_attempt_healing(self, symbol: str) -> bool:
         """Check if healing should be attempted"""
         if symbol not in self._cached_registry["dust_positions"]:
             return False
-        
+
         pos = self._cached_registry["dust_positions"][symbol]
-        
+
         # Don't attempt if already healed
         if pos.get("status") == "HEALED":
             return False
-        
+
         # Don't attempt if circuit breaker tripped
         if pos.get("circuit_breaker_enabled") and pos.get("circuit_breaker_tripped_at") is not None:
             return False
-        
+
         return True
-    
+
     def cleanup_abandoned_dust(self, days_threshold: float = 30.0) -> List[str]:
         """Remove dust that hasn't improved in N days"""
         cleaned = []
@@ -486,7 +486,7 @@ class DustRegistry:
 @staticmethod
 def get_adaptive_thresholds(total_equity: float) -> Dict[str, float]:
     """Return adaptive thresholds based on account size"""
-    
+
     # Micro accounts (<$500)
     if total_equity < 500:
         return {
@@ -494,7 +494,7 @@ def get_adaptive_thresholds(total_equity: float) -> Dict[str, float]:
             'dead_min_size': 25.0,             # $25 minimum for productive
             'healing_urgency': 'aggressive',   # Heal frequently
         }
-    
+
     # Small accounts ($500-5000)
     elif total_equity < 5000:
         return {
@@ -502,7 +502,7 @@ def get_adaptive_thresholds(total_equity: float) -> Dict[str, float]:
             'dead_min_size': 50.0,
             'healing_urgency': 'normal',
         }
-    
+
     # Medium accounts ($5000+)
     else:
         return {
@@ -521,26 +521,26 @@ def get_adaptive_thresholds(total_equity: float) -> Dict[str, float]:
 ```python
 async def _is_dust(self, asset: str, amount: Decimal, price: Optional[Decimal]) -> bool:
     """Check if position is dust (notional < MIN_ECONOMIC_TRADE_USDT)"""
-    
+
     asset = (asset or "").upper()
     if not asset or amount is None or amount <= Decimal("0"):
         return True
-    
+
     # Get unified dust threshold from config
     min_usdt = getattr(self._cfg, "MIN_ECONOMIC_TRADE_USDT", 30.0)
     if callable(self._cfg):
         min_usdt = self._cfg("MIN_ECONOMIC_TRADE_USDT", 30.0) or 30.0
     min_usdt = float(min_usdt or 30.0)
-    
+
     # Stablecoins: use 1:1 ratio
     STABLECOIN_1to1 = {"USDT", "FDUSD", "TUSD", "BUSD", "USDC"}
     if asset in STABLECOIN_1to1:
         return amount < Decimal(str(min_usdt))
-    
+
     # Non-stablecoins: need price
     if price is None or price <= Decimal("0"):
         return True  # Conservative: treat as dust if no price
-    
+
     notional = float(amount) * float(price)
     return notional < min_usdt
 ```
@@ -562,15 +562,15 @@ async def test_classification():
         "RAYUSDT": {"quantity": 5000, "entry_price": 0.0015}, # $7.5 → DUST_LOCKED
         "SHIB": {"quantity": 1000000, "entry_price": 0.000004}, # $4 → DUST_LOCKED
     }
-    
+
     # Run classification
     classifications = await shared_state.classify_positions_by_size()
-    
+
     # Validate results
     assert "ETHUSDT" in classifications["CLEAN"]
     assert "RAYUSDT" in classifications["DUST_LOCKED"]
     assert "SHIB" in classifications["DUST_LOCKED"]
-    
+
     print("✅ Classifications validated")
 ```
 
@@ -585,7 +585,7 @@ async def test_healing_cycle():
         'total_equity': 200,
         'min_dead_to_heal': 10.0,
     })
-    
+
     # Create portfolio state with dead positions
     bucket_state = PortfolioBucketState()
     bucket_state.dead_positions = {
@@ -594,10 +594,10 @@ async def test_healing_cycle():
     }
     bucket_state.dead_total_value = 11.7
     bucket_state.dead_count = 2
-    
+
     # Identify candidates
     candidates, total_value = healer.identify_liquidation_candidates(bucket_state)
-    
+
     # Validate
     assert len(candidates) == 2
     assert total_value == 11.7
@@ -661,6 +661,6 @@ grep "HealthStatus.*PortfolioManager\|capital_bucket" logs/*.log
 
 ---
 
-**Document Version:** 1.0  
-**For:** Developers integrating with symbol system  
-**Accuracy:** Code location verified from actual codebase  
+**Document Version:** 1.0
+**For:** Developers integrating with symbol system
+**Accuracy:** Code location verified from actual codebase

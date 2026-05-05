@@ -4,10 +4,10 @@
 
 Your Octivault Trading Bot is now running **autonomously 24/7** on live Binance.
 
-**Started:** 2026-04-16 17:25 UTC  
-**Status:** ✅ Trading actively  
-**Capital:** $75.49 USDT  
-**Process ID:** 60113  
+**Started:** 2026-04-16 17:25 UTC
+**Status:** ✅ Trading actively
+**Capital:** $75.49 USDT
+**Process ID:** 60113
 **Mode:** LIVE (Real Money)
 
 ---
@@ -16,7 +16,7 @@ Your Octivault Trading Bot is now running **autonomously 24/7** on live Binance.
 
 The system just executed its **first trade**:
 - **Symbol:** BTCUSDT (Bitcoin)
-- **Side:** BUY  
+- **Side:** BUY
 - **Quantity:** 0.0004 BTC
 - **Price:** $73,582.45
 - **Total Value:** $29.43 USDT

@@ -236,10 +236,10 @@ SCENARIO C: Inject Capital + Scale
 ### Must-Have (Without these, NO profitability possible)
 1. ✅ **Capital to execute** ($21.85 < $25 required)
    - Solution: Reduce entry size to $5
-   
+
 2. ✅ **Winning signal quality** (currently 0% win rate)
    - Solution: Debug TrendHunter strategy
-   
+
 3. ✅ **Execution reliability** (quote mismatches causing rejections)
    - Solution: Fix ExecutionManager quote matching
 
@@ -287,4 +287,3 @@ Time to Recovery:
 **To fix**: Inject capital + reduce entry size + debug signals
 
 **Timeline to Profitability**: 2-7 days depending on signal quality
-

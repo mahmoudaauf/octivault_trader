@@ -42,7 +42,7 @@ From the $72.49 free capital:
 
 ```python
 compound_pct = 0.60      # 60% for swing trading
-healing_pct = 0.20       # 20% for healing/liquidation  
+healing_pct = 0.20       # 20% for healing/liquidation
 buffer_pct = 0.20        # 20% for buffer/dip buying
 ```
 

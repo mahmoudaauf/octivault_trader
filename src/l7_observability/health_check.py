@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 health_check.py - P9-aligned Health Check Endpoints
 
@@ -17,16 +16,16 @@ Architecture:
 """
 
 import logging
-import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from datetime import datetime
 from enum import Enum
+from typing import Any, Optional
 
 logger = logging.getLogger("HealthCheck")
 
 
 class HealthStatus(str, Enum):
     """Health check status values"""
+
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
     DEGRADED = "degraded"
@@ -35,10 +34,10 @@ class HealthStatus(str, Enum):
 class HealthChecker:
     """
     Health checker for Octivault Trader.
-    
+
     Tracks application state and provides health status for orchestrators.
     """
-    
+
     def __init__(self):
         self.start_time = datetime.utcnow()
         self.last_trade_time: Optional[datetime] = None
@@ -46,39 +45,39 @@ class HealthChecker:
         self.dependencies_ok = False
         self.market_data_ok = False
         self.trading_active = False
-    
+
     # Configuration thresholds
     STALE_TRADE_THRESHOLD_SEC = 300  # 5 minutes
-    STALE_DATA_THRESHOLD_SEC = 60    # 1 minute
-    
+    STALE_DATA_THRESHOLD_SEC = 60  # 1 minute
+
     def get_uptime_seconds(self) -> float:
         """Get uptime in seconds"""
         return (datetime.utcnow() - self.start_time).total_seconds()
-    
+
     def mark_trade_executed(self):
         """Mark that a trade was just executed"""
         self.last_trade_time = datetime.utcnow()
-    
+
     def mark_error(self, error_msg: str):
         """Mark that an error occurred"""
         self.last_error = error_msg
-    
+
     def set_dependencies_ok(self, ok: bool):
         """Set if dependencies are healthy (DB, Redis, etc.)"""
         self.dependencies_ok = ok
-    
+
     def set_market_data_ok(self, ok: bool):
         """Set if market data is flowing normally"""
         self.market_data_ok = ok
-    
+
     def set_trading_active(self, active: bool):
         """Set if trading logic is active"""
         self.trading_active = active
-    
-    def get_health_status(self) -> Dict[str, Any]:
+
+    def get_health_status(self) -> dict[str, Any]:
         """
         Get basic health status (liveness).
-        
+
         Returns:
             Dict with status, uptime, and basic info
         """
@@ -88,18 +87,18 @@ class HealthChecker:
             "uptime_seconds": self.get_uptime_seconds(),
             "version": "P9-aligned",
         }
-    
-    def get_ready_status(self) -> Dict[str, Any]:
+
+    def get_ready_status(self) -> dict[str, Any]:
         """
         Get readiness status (dependencies check).
-        
+
         Returns:
             Dict with readiness and dependency details
         """
         dependencies_ready = self.dependencies_ok
         market_data_ready = self.market_data_ok
         overall_ready = dependencies_ready and market_data_ready
-        
+
         return {
             "status": HealthStatus.HEALTHY.value if overall_ready else HealthStatus.UNHEALTHY.value,
             "ready": overall_ready,
@@ -113,13 +112,13 @@ class HealthChecker:
                 "logging_configured": True,
                 "market_data_synced": self.market_data_ok,
                 "dependencies_connected": self.dependencies_ok,
-            }
+            },
         }
-    
-    def get_live_status(self) -> Dict[str, Any]:
+
+    def get_live_status(self) -> dict[str, Any]:
         """
         Get live trading status (active processing check).
-        
+
         Returns:
             Dict with trading status and recent activity
         """
@@ -130,48 +129,53 @@ class HealthChecker:
                 "reason": "Trading not active",
                 "timestamp": datetime.utcnow().isoformat(),
             }
-        
+
         # Check if trades are recent (not stale)
         if self.last_trade_time:
             time_since_trade = (datetime.utcnow() - self.last_trade_time).total_seconds()
             trade_stale = time_since_trade > self.STALE_TRADE_THRESHOLD_SEC
-            
+
             return {
-                "status": HealthStatus.HEALTHY.value if not trade_stale else HealthStatus.DEGRADED.value,
+                "status": HealthStatus.HEALTHY.value
+                if not trade_stale
+                else HealthStatus.DEGRADED.value,
                 "live": not trade_stale,
                 "timestamp": datetime.utcnow().isoformat(),
                 "last_trade": self.last_trade_time.isoformat() if self.last_trade_time else None,
                 "time_since_last_trade_sec": time_since_trade,
                 "stale_threshold_sec": self.STALE_TRADE_THRESHOLD_SEC,
             }
-        
+
         return {
             "status": HealthStatus.DEGRADED.value,
             "live": False,
             "reason": "No trades executed yet",
             "timestamp": datetime.utcnow().isoformat(),
         }
-    
-    def get_full_status(self) -> Dict[str, Any]:
+
+    def get_full_status(self) -> dict[str, Any]:
         """
         Get full health status (all checks).
-        
+
         Returns:
             Dict with complete health information
         """
         ready = self.get_ready_status()
         live = self.get_live_status()
-        
+
         # Determine overall status
         if ready["status"] == HealthStatus.UNHEALTHY.value:
             overall_status = HealthStatus.UNHEALTHY.value
         elif live["status"] == HealthStatus.UNHEALTHY.value:
             overall_status = HealthStatus.UNHEALTHY.value
-        elif ready["status"] == HealthStatus.DEGRADED.value or live["status"] == HealthStatus.DEGRADED.value:
+        elif (
+            ready["status"] == HealthStatus.DEGRADED.value
+            or live["status"] == HealthStatus.DEGRADED.value
+        ):
             overall_status = HealthStatus.DEGRADED.value
         else:
             overall_status = HealthStatus.HEALTHY.value
-        
+
         return {
             "status": overall_status,
             "timestamp": datetime.utcnow().isoformat(),
@@ -204,12 +208,12 @@ def initialize_health_checker() -> HealthChecker:
 
 
 # FastAPI route handlers
-async def health_endpoint() -> Dict[str, Any]:
+async def health_endpoint() -> dict[str, Any]:
     """
     GET /health - Liveness probe for Kubernetes
-    
+
     Always returns 200 if app is running.
-    
+
     Response:
         {
             "status": "healthy",
@@ -222,12 +226,12 @@ async def health_endpoint() -> Dict[str, Any]:
     return checker.get_health_status()
 
 
-async def ready_endpoint() -> Dict[str, Any]:
+async def ready_endpoint() -> dict[str, Any]:
     """
     GET /ready - Readiness probe for Kubernetes
-    
+
     Returns 200 only if app is ready to receive traffic.
-    
+
     Response:
         {
             "status": "healthy|unhealthy",
@@ -242,18 +246,18 @@ async def ready_endpoint() -> Dict[str, Any]:
     """
     checker = get_health_checker()
     status = checker.get_ready_status()
-    
+
     # Return appropriate HTTP status
     # Kubernetes expects 200 for ready, anything else for not ready
     return status
 
 
-async def live_endpoint() -> Dict[str, Any]:
+async def live_endpoint() -> dict[str, Any]:
     """
     GET /live - Live trading probe for Kubernetes
-    
+
     Returns 200 only if trading is processing normally.
-    
+
     Response:
         {
             "status": "healthy|degraded|unhealthy",
@@ -267,12 +271,12 @@ async def live_endpoint() -> Dict[str, Any]:
     return checker.get_live_status()
 
 
-async def deep_status_endpoint() -> Dict[str, Any]:
+async def deep_status_endpoint() -> dict[str, Any]:
     """
     GET /status - Full health status (debugging)
-    
+
     Returns complete health information for debugging.
-    
+
     Response:
         {
             "status": "healthy|degraded|unhealthy",

@@ -1,6 +1,6 @@
 # 🎯 System Decision Logic: Liquidate vs. Reinvest
 
-**Date:** April 28, 2026  
+**Date:** April 28, 2026
 **Topic:** How the system identifies whether to liquidate or reinvest in dust positions
 
 ---
@@ -55,11 +55,11 @@ If DUST:
 async def classify_positions_by_size(self) -> Dict[str, List[str]]:
     """
     Classify positions into SIGNIFICANT and DUST based on minNotional.
-    
+
     SIGNIFICANT positions:
     - >= Significant Floor (usually min_notional)
     - Can be traded/held/reinvested
-    
+
     DUST positions:
     - < Significant Floor
     - Do NOT block capital allocation
@@ -211,7 +211,7 @@ If Dust Detected & Capital OK:
 ```
 When capital is low:
     LIQUIDATE > WAIT > REINVEST
-    
+
 Decision: Free capital first
 Result: Prevent margin calls
 ```
@@ -234,7 +234,7 @@ else:
 ```
 When capital is healthy:
     REINVEST (consolidation) > WAIT > LIQUIDATE
-    
+
 Decision: Use dust as inventory for consolidation
 Result: Perfect capital efficiency
 ```
@@ -256,7 +256,7 @@ Option A: Automatic (Recommended)
     └─ Consolidates dust automatically
     └─ Capital naturally healed
     └─ Zero manual work
-    
+
 Option B: Manual (When Urgent)
     └─ Human triggers liquidation manually
     └─ Immediate capital recovery

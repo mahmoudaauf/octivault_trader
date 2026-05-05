@@ -122,7 +122,7 @@ DeadCapitalHealer(config=config)
 ```
 
 ### Result:
-**Gate Check Before:** $80 dust > $100 threshold = ❌ FAIL  
+**Gate Check Before:** $80 dust > $100 threshold = ❌ FAIL
 **Gate Check After:** $80 dust > $5 threshold = ✅ PASS
 
 ---
@@ -261,12 +261,12 @@ Position Classifier (is_dust?)
 
 ---
 
-**Status:** 🟢 OPERATIONAL  
-**Health:** 🟢 OPTIMAL  
+**Status:** 🟢 OPERATIONAL
+**Health:** 🟢 OPTIMAL
 **Recommendation:** 🚀 CONTINUE RUNNING
 
 ---
 
-*Generated: May 1, 2026*  
-*Verified by: Comprehensive automated audit*  
+*Generated: May 1, 2026*
+*Verified by: Comprehensive automated audit*
 *Confidence: 100%*

@@ -1,8 +1,8 @@
 # ⚡ QUICK START: Capital Allocator Fix Implementation
 
-**Time to Deploy:** 25 minutes  
-**Risk Level:** LOW  
-**Files Needed:** 2 (CAPITAL_ALLOCATOR_FIX_CODE.py + config)  
+**Time to Deploy:** 25 minutes
+**Risk Level:** LOW
+**Files Needed:** 2 (CAPITAL_ALLOCATOR_FIX_CODE.py + config)
 
 ---
 
@@ -14,7 +14,7 @@ default_bootstrap_reserve = 2.0  # Fixed - same for all accounts
 # Result: $8.73 free gets 100% to trading, 0% to dust healing
 
 # FIXED (new):
-reserve = nav * 0.20  # Dynamic - 20% for micro accounts  
+reserve = nav * 0.20  # Dynamic - 20% for micro accounts
 # Result: $84.55 NAV reserves $16.91, frees $67.64 for 60/20/20 split
 ```
 
@@ -206,9 +206,9 @@ git checkout src/l6_governance/capital_allocator.py
 
 ---
 
-**Estimated Total Time:** 30 minutes (5+3+5+10+5 min)  
-**Risk:** LOW (config only in phase 1)  
-**Testing:** Use current $84.55 account  
-**Rollback:** Simple git revert  
+**Estimated Total Time:** 30 minutes (5+3+5+10+5 min)
+**Risk:** LOW (config only in phase 1)
+**Testing:** Use current $84.55 account
+**Rollback:** Simple git revert
 
 Ready to deploy? Start with `.env` config additions.

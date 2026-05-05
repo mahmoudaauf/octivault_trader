@@ -5,15 +5,16 @@ import contextlib
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
+from typing import Any, Optional
 
 
 class TruthAuditorMode(Enum):
     """TruthAuditor operational modes."""
-    DISABLED = "disabled"           # No reconciliation (shadow mode)
-    STARTUP_ONLY = "startup_only"   # Reconcile at startup, then stop
-    CONTINUOUS = "continuous"       # Startup + passive ongoing monitoring
+
+    DISABLED = "disabled"  # No reconciliation (shadow mode)
+    STARTUP_ONLY = "startup_only"  # Reconcile at startup, then stop
+    CONTINUOUS = "continuous"  # Startup + passive ongoing monitoring
 
 
 class ExchangeTruthAuditor:
@@ -70,17 +71,25 @@ class ExchangeTruthAuditor:
                 self.mode = TruthAuditorMode.DISABLED
             else:
                 self.mode = TruthAuditorMode.CONTINUOUS
-        
+
         self.logger.info(f"[TruthAuditor] Mode: {self.mode.value}")
 
         self.interval_sec = float(self._cfg("TRUTH_AUDIT_INTERVAL_SEC", 5.0) or 5.0)
         self.order_history_limit = int(self._cfg("TRUTH_AUDIT_ORDER_LIMIT", 50) or 50)
         self.max_symbols_per_cycle = int(self._cfg("TRUTH_AUDIT_SYMBOLS_PER_CYCLE", 24) or 24)
-        self.recovery_window_sec = int(self._cfg("TRUTH_AUDIT_RECOVERY_WINDOW_SEC", 6 * 3600) or (6 * 3600))
-        self.trade_match_window_sec = float(self._cfg("TRUTH_AUDIT_TRADE_MATCH_WINDOW_SEC", 180.0) or 180.0)
+        self.recovery_window_sec = int(
+            self._cfg("TRUTH_AUDIT_RECOVERY_WINDOW_SEC", 6 * 3600) or (6 * 3600)
+        )
+        self.trade_match_window_sec = float(
+            self._cfg("TRUTH_AUDIT_TRADE_MATCH_WINDOW_SEC", 180.0) or 180.0
+        )
         self.event_scan_limit = int(self._cfg("TRUTH_AUDIT_EVENT_SCAN_LIMIT", 3000) or 3000)
-        self.position_mismatch_tol = float(self._cfg("TRUTH_AUDIT_POSITION_MISMATCH_TOL", 1e-8) or 1e-8)
-        self.phantom_cooldown_sec = float(self._cfg("TRUTH_AUDIT_PHANTOM_COOLDOWN_SEC", 20.0) or 20.0)
+        self.position_mismatch_tol = float(
+            self._cfg("TRUTH_AUDIT_POSITION_MISMATCH_TOL", 1e-8) or 1e-8
+        )
+        self.phantom_cooldown_sec = float(
+            self._cfg("TRUTH_AUDIT_PHANTOM_COOLDOWN_SEC", 20.0) or 20.0
+        )
         self.dust_threshold = float(self._cfg("DUST_POSITION_QTY", 0.00001) or 0.00001)
         self.seen_ttl_sec = float(self._cfg("TRUTH_AUDIT_SEEN_TTL_SEC", 24 * 3600) or (24 * 3600))
         self.sell_finalize_gap_warn_threshold = int(
@@ -97,12 +106,12 @@ class ExchangeTruthAuditor:
         self._task: Optional[asyncio.Task] = None
         self._started_at = time.time()
         self._cursor = 0
-        self._seen_order_ids: Dict[str, float] = {}
-        self._seen_trade_ids: Dict[str, float] = {}
-        self._recent_phantom_by_symbol: Dict[str, float] = {}
+        self._seen_order_ids: dict[str, float] = {}
+        self._seen_trade_ids: dict[str, float] = {}
+        self._recent_phantom_by_symbol: dict[str, float] = {}
         self._last_signed_skip_log_ts = 0.0
         self._last_sell_finalize_warn_ts = 0.0
-        self._last_sell_finalize_snapshot: Dict[str, int] = {
+        self._last_sell_finalize_snapshot: dict[str, int] = {
             "sell_finalize_fills_seen": 0,
             "sell_finalize_finalized": 0,
             "sell_finalize_pending": 0,
@@ -124,10 +133,12 @@ class ExchangeTruthAuditor:
         self.open_order_verify_interval_sec = float(
             self._cfg("OPEN_ORDER_VERIFY_INTERVAL_SEC", 7.0) or 7.0
         )
-        self.open_order_verify_interval_sec = min(max(self.open_order_verify_interval_sec, 5.0), 10.0)
+        self.open_order_verify_interval_sec = min(
+            max(self.open_order_verify_interval_sec, 5.0), 10.0
+        )
 
         self.last_successful_force_sync_ts = 0.0
-        self._last_user_data_health_snapshot: Dict[str, Any] = {}
+        self._last_user_data_health_snapshot: dict[str, Any] = {}
         self._force_sync_lock: Optional[asyncio.Lock] = None
         self._user_data_health_task: Optional[asyncio.Task] = None
         self._open_order_verify_task: Optional[asyncio.Task] = None
@@ -167,18 +178,20 @@ class ExchangeTruthAuditor:
             self.logger.info("[TruthAuditor] Mode=DISABLED; skipping start (shadow/simulation)")
             await self._set_status("Skipped", "disabled_mode")
             return
-        
+
         if not self.exchange_client:
-            self.logger.warning("[TruthAuditor] No exchange_client; cannot operate in mode=%s", self.mode.value)
+            self.logger.warning(
+                "[TruthAuditor] No exchange_client; cannot operate in mode=%s", self.mode.value
+            )
             await self._set_status("Skipped", "no_exchange_client")
             return
-        
+
         if self._running:
             return
         self._running = True
         await self._set_status("Initialized", "startup_reconciliation")
         await self._restart_recovery()
-        
+
         # In STARTUP_ONLY mode, only run reconciliation once then stop
         if self.mode == TruthAuditorMode.STARTUP_ONLY:
             self.logger.info("[TruthAuditor] Mode=STARTUP_ONLY; reconciling now, then stopping")
@@ -188,9 +201,11 @@ class ExchangeTruthAuditor:
             await asyncio.sleep(2.0)
             self._running = False
             await self._set_status("Stopped", "startup_only_complete")
-            self.logger.info("[TruthAuditor] Startup reconciliation complete; mode=startup_only stopping")
+            self.logger.info(
+                "[TruthAuditor] Startup reconciliation complete; mode=startup_only stopping"
+            )
             return
-        
+
         # CONTINUOUS mode: full loop
         self._task = asyncio.create_task(self._run_loop(), name="ExchangeTruthAuditor:loop")
         self._user_data_health_task = asyncio.create_task(
@@ -205,7 +220,9 @@ class ExchangeTruthAuditor:
             )
         else:
             self._open_order_verify_task = None
-        self.logger.info("[TruthAuditor] Mode=CONTINUOUS; started (interval=%.2fs)", self.interval_sec)
+        self.logger.info(
+            "[TruthAuditor] Mode=CONTINUOUS; started (interval=%.2fs)", self.interval_sec
+        )
         await self._set_status("Operational", "running")
 
     async def stop(self) -> None:
@@ -233,7 +250,7 @@ class ExchangeTruthAuditor:
     async def close(self) -> None:
         await self.stop()
 
-    def health(self) -> Dict[str, Any]:
+    def health(self) -> dict[str, Any]:
         running = bool(self._task and not self._task.done() and self._running)
         sell_map = dict(self._last_sell_finalize_snapshot or {})
         return {
@@ -250,7 +267,9 @@ class ExchangeTruthAuditor:
             "sell_finalize_pending": int(sell_map.get("sell_finalize_pending", 0) or 0),
             "sell_finalize_gap": int(sell_map.get("sell_finalize_gap", 0) or 0),
             "sell_finalize_duplicate": int(sell_map.get("sell_finalize_duplicate", 0) or 0),
-            "sell_finalize_pending_timeout": int(sell_map.get("sell_finalize_pending_timeout", 0) or 0),
+            "sell_finalize_pending_timeout": int(
+                sell_map.get("sell_finalize_pending_timeout", 0) or 0
+            ),
             "last_successful_force_sync_ts": float(self.last_successful_force_sync_ts or 0.0),
             "last_user_data_health": dict(self._last_user_data_health_snapshot or {}),
         }
@@ -380,11 +399,7 @@ class ExchangeTruthAuditor:
             return
 
         # Soft gap is exposure-aware and debounced.
-        if (
-            exposure_exists
-            and user_gap > soft_gap
-            and since_sync > cooldown
-        ):
+        if exposure_exists and user_gap > soft_gap and since_sync > cooldown:
             sync_res = await self.trigger_immediate_sync(reason="SOFT_GAP_EXPOSURE")
             await self._emit_event(
                 "TRUTH_AUDIT_USER_DATA_SOFT_GAP",
@@ -400,7 +415,7 @@ class ExchangeTruthAuditor:
                 str((sync_res or {}).get("status", "")),
             )
 
-    def _get_ws_health_snapshot(self) -> Dict[str, Any]:
+    def _get_ws_health_snapshot(self) -> dict[str, Any]:
         ec = self.exchange_client
         if ec is None:
             return {
@@ -416,7 +431,7 @@ class ExchangeTruthAuditor:
                 "listenkey_refresh_gap_sec": -1.0,
             }
 
-        snap: Dict[str, Any] = {}
+        snap: dict[str, Any] = {}
         getter = getattr(ec, "get_ws_health_snapshot", None)
         if callable(getter):
             with contextlib.suppress(Exception):
@@ -424,20 +439,30 @@ class ExchangeTruthAuditor:
                 snap = raw if isinstance(raw, dict) else {}
 
         now = time.time()
-        user_ts = float(snap.get("last_user_data_event_ts", getattr(ec, "last_user_data_event_ts", 0.0)) or 0.0)
-        any_ts = float(snap.get("last_any_ws_event_ts", getattr(ec, "last_any_ws_event_ts", 0.0)) or 0.0)
+        user_ts = float(
+            snap.get("last_user_data_event_ts", getattr(ec, "last_user_data_event_ts", 0.0)) or 0.0
+        )
+        any_ts = float(
+            snap.get("last_any_ws_event_ts", getattr(ec, "last_any_ws_event_ts", 0.0)) or 0.0
+        )
         listen_ts = float(
-            snap.get("last_listenkey_refresh_ts", getattr(ec, "last_listenkey_refresh_ts", 0.0)) or 0.0
+            snap.get("last_listenkey_refresh_ts", getattr(ec, "last_listenkey_refresh_ts", 0.0))
+            or 0.0
         )
         sync_ts = float(
-            snap.get("last_successful_force_sync_ts", getattr(ec, "last_successful_force_sync_ts", 0.0)) or 0.0
+            snap.get(
+                "last_successful_force_sync_ts", getattr(ec, "last_successful_force_sync_ts", 0.0)
+            )
+            or 0.0
         )
         return {
             "user_data_stream_enabled": bool(
                 snap.get("user_data_stream_enabled", getattr(ec, "user_data_stream_enabled", True))
             ),
             "ws_connected": bool(snap.get("ws_connected", getattr(ec, "ws_connected", False))),
-            "ws_reconnect_count": int(snap.get("ws_reconnect_count", getattr(ec, "ws_reconnect_count", 0)) or 0),
+            "ws_reconnect_count": int(
+                snap.get("ws_reconnect_count", getattr(ec, "ws_reconnect_count", 0)) or 0
+            ),
             "last_user_data_event_ts": user_ts,
             "last_any_ws_event_ts": any_ts,
             "last_listenkey_refresh_ts": listen_ts,
@@ -482,14 +507,16 @@ class ExchangeTruthAuditor:
         now = float(now_ts if now_ts is not None else time.time())
         ec_ts = 0.0
         with contextlib.suppress(Exception):
-            ec_ts = float(getattr(self.exchange_client, "last_successful_force_sync_ts", 0.0) or 0.0)
+            ec_ts = float(
+                getattr(self.exchange_client, "last_successful_force_sync_ts", 0.0) or 0.0
+            )
         local_ts = float(self.last_successful_force_sync_ts or 0.0)
         ref = max(local_ts, ec_ts)
         if ref <= 0:
             return float("inf")
         return max(0.0, now - ref)
 
-    async def trigger_immediate_sync(self, reason: str = "MANUAL_TRIGGER") -> Dict[str, Any]:
+    async def trigger_immediate_sync(self, reason: str = "MANUAL_TRIGGER") -> dict[str, Any]:
         """
         Idempotent, async-safe, debounced immediate sync trigger.
         """
@@ -513,9 +540,9 @@ class ExchangeTruthAuditor:
                 return payload
 
             symbols = await self._collect_symbols()
-            open_stats: Dict[str, int] = {"open_orders": 0, "open_order_mismatch": 0}
-            order_stats: Dict[str, int] = {"fills_recovered": 0}
-            trade_stats: Dict[str, int] = {"trades_recovered": 0, "trades_sell_finalized": 0}
+            open_stats: dict[str, int] = {"open_orders": 0, "open_order_mismatch": 0}
+            order_stats: dict[str, int] = {"fills_recovered": 0}
+            trade_stats: dict[str, int] = {"trades_recovered": 0, "trades_sell_finalized": 0}
             sync_balance_ok = False
 
             ss = self.shared_state
@@ -538,7 +565,7 @@ class ExchangeTruthAuditor:
                 if callable(rec):
                     rec(reason=reason_u, ts=done_ts)
                 else:
-                    setattr(self.exchange_client, "last_successful_force_sync_ts", done_ts)
+                    self.exchange_client.last_successful_force_sync_ts = done_ts
 
             payload = {
                 "status": "ok",
@@ -563,12 +590,12 @@ class ExchangeTruthAuditor:
             )
             return payload
 
-    def _get_state_positions(self) -> Dict[str, Dict[str, Any]]:
+    def _get_state_positions(self) -> dict[str, dict[str, Any]]:
         """
         Get all open positions from shared state.
         Returns empty dict if state unavailable.
         """
-        positions: Dict[str, Dict[str, Any]] = {}
+        positions: dict[str, dict[str, Any]] = {}
         ss = self.shared_state
         if ss is None:
             return positions
@@ -601,11 +628,11 @@ class ExchangeTruthAuditor:
         balance_stats, balance_data = await self._reconcile_balances(symbols=symbols)
         orders = await self._reconcile_open_orders(symbols=symbols)
         sell_map = await self._validate_sell_finalize_mapping(startup=True)
-        
+
         # Hydrate missing positions from wallet balances
         symbols_set = set(symbols or [])
         hydration_stats = await self._hydrate_missing_positions(balance_data, symbols_set)
-        
+
         # Enforce wallet authority: wallet overrides internal state
         wallet_auth_stats = await self._enforce_wallet_authority(balance_data, symbols_set)
 
@@ -618,7 +645,9 @@ class ExchangeTruthAuditor:
                 "trades_sell_finalized": trades.get("trades_sell_finalized", 0),
                 "phantoms_closed": balance_stats.get("phantoms_closed", 0),
                 "positions_hydrated": hydration_stats.get("hydrated_positions", 0),
-                "wallet_authority_corrections": wallet_auth_stats.get("wallet_authority_corrections", 0),
+                "wallet_authority_corrections": wallet_auth_stats.get(
+                    "wallet_authority_corrections", 0
+                ),
                 "open_order_mismatch": orders.get("open_order_mismatch", 0),
                 "sell_missing_canonical": fills.get("sell_missing_canonical", 0),
                 "sell_finalize_fills_seen": sell_map.get("sell_finalize_fills_seen", 0),
@@ -629,7 +658,7 @@ class ExchangeTruthAuditor:
             },
         )
 
-    async def _audit_cycle(self) -> Dict[str, int]:
+    async def _audit_cycle(self) -> dict[str, int]:
         self._prune_seen_cache()
         symbols_all = await self._collect_symbols()
         symbols = self._slice_symbols(symbols_all)
@@ -639,11 +668,11 @@ class ExchangeTruthAuditor:
         balance_stats, balance_data = await self._reconcile_balances(symbols=symbols)
         open_stats = await self._reconcile_open_orders(symbols=symbols)
         sell_map = await self._validate_sell_finalize_mapping(startup=False)
-        
+
         # Periodic hydration: catch assets added via manual trades, airdrops, dust conversions
         symbols_set = set(symbols or [])
         hydration_stats = await self._hydrate_missing_positions(balance_data, symbols_set)
-        
+
         # Enforce wallet authority: wallet overrides internal state
         wallet_auth_stats = await self._enforce_wallet_authority(balance_data, symbols_set)
 
@@ -654,7 +683,9 @@ class ExchangeTruthAuditor:
             "trades_sell_finalized": int(trade_stats.get("trades_sell_finalized", 0)),
             "phantoms_closed": int(balance_stats.get("phantoms_closed", 0)),
             "positions_hydrated": hydration_stats.get("hydrated_positions", 0),
-            "wallet_authority_corrections": wallet_auth_stats.get("wallet_authority_corrections", 0),
+            "wallet_authority_corrections": wallet_auth_stats.get(
+                "wallet_authority_corrections", 0
+            ),
             "open_order_mismatch": int(open_stats.get("open_order_mismatch", 0)),
             "sell_missing_canonical": int(order_stats.get("sell_missing_canonical", 0)),
             "sell_finalize_fills_seen": int(sell_map.get("sell_finalize_fills_seen", 0)),
@@ -670,7 +701,9 @@ class ExchangeTruthAuditor:
         if ss is None:
             return
         try:
-            upd = getattr(ss, "update_component_status", None) or getattr(ss, "set_component_status", None)
+            upd = getattr(ss, "update_component_status", None) or getattr(
+                ss, "set_component_status", None
+            )
             if callable(upd):
                 await self._maybe_await(upd("ExchangeTruthAuditor", status, detail))
             else:
@@ -686,7 +719,7 @@ class ExchangeTruthAuditor:
         except Exception:
             self.logger.debug("status update failed", exc_info=True)
 
-    async def _emit_event(self, event_name: str, payload: Dict[str, Any]) -> None:
+    async def _emit_event(self, event_name: str, payload: dict[str, Any]) -> None:
         ss = self.shared_state
         if ss is None:
             return
@@ -697,7 +730,7 @@ class ExchangeTruthAuditor:
         except Exception:
             self.logger.debug("emit_event failed: %s", event_name, exc_info=True)
 
-    async def _validate_sell_finalize_mapping(self, startup: bool = False) -> Dict[str, int]:
+    async def _validate_sell_finalize_mapping(self, startup: bool = False) -> dict[str, int]:
         """
         Validate SELL finalization invariant by reading ExecutionManager health counters.
         Does NOT place orders. Governance-only check.
@@ -790,8 +823,8 @@ class ExchangeTruthAuditor:
 
         return result
 
-    def _known_quotes(self) -> List[str]:
-        quotes: List[str] = []
+    def _known_quotes(self) -> list[str]:
+        quotes: list[str] = []
         try:
             gkq = getattr(self.exchange_client, "get_known_quotes", None)
             if callable(gkq):
@@ -808,12 +841,16 @@ class ExchangeTruthAuditor:
     def _default_quote(self) -> str:
         try:
             if isinstance(self.config, dict):
-                return str(self.config.get("quote_asset", self.config.get("BASE_CURRENCY", "USDT"))).upper()
-            return str(getattr(self.config, "quote_asset", getattr(self.config, "BASE_CURRENCY", "USDT"))).upper()
+                return str(
+                    self.config.get("quote_asset", self.config.get("BASE_CURRENCY", "USDT"))
+                ).upper()
+            return str(
+                getattr(self.config, "quote_asset", getattr(self.config, "BASE_CURRENCY", "USDT"))
+            ).upper()
         except Exception:
             return "USDT"
 
-    def _split_base_quote(self, symbol: str) -> Tuple[str, str]:
+    def _split_base_quote(self, symbol: str) -> tuple[str, str]:
         sym = str(symbol or "").upper().replace("/", "")
         for q in self._known_quotes():
             if sym.endswith(q) and len(sym) > len(q):
@@ -823,8 +860,8 @@ class ExchangeTruthAuditor:
             return sym[: -len(dq)], dq
         return sym[:-4], sym[-4:] if len(sym) > 4 else dq
 
-    async def _collect_symbols(self) -> List[str]:
-        out: List[str] = []
+    async def _collect_symbols(self) -> list[str]:
+        out: list[str] = []
         seen = set()
         ss = self.shared_state
         if ss is None:
@@ -834,7 +871,9 @@ class ExchangeTruthAuditor:
             active = getattr(ss, "get_active_symbols", None)
             if callable(active):
                 try:
-                    v = active(limit=max(0, int(self._cfg("TRUTH_AUDIT_ACTIVE_SYMBOL_LIMIT", 200) or 200)))
+                    v = active(
+                        limit=max(0, int(self._cfg("TRUTH_AUDIT_ACTIVE_SYMBOL_LIMIT", 200) or 200))
+                    )
                 except TypeError:
                     v = active()
                 v = await self._maybe_await(v)
@@ -902,7 +941,7 @@ class ExchangeTruthAuditor:
             out = out[:max_symbols]
         return out
 
-    def _slice_symbols(self, symbols: List[str]) -> List[str]:
+    def _slice_symbols(self, symbols: list[str]) -> list[str]:
         if not symbols:
             return []
         n = len(symbols)
@@ -918,7 +957,7 @@ class ExchangeTruthAuditor:
         self._cursor = (start + per_cycle) % n
         return batch
 
-    async def _get_exchange_balances(self) -> Dict[str, Dict[str, float]]:
+    async def _get_exchange_balances(self) -> dict[str, dict[str, float]]:
         ec = self.exchange_client
         if ec is None:
             return {}
@@ -952,7 +991,7 @@ class ExchangeTruthAuditor:
                 return False
             if key == "paper_key" and sec == "paper_secret":
                 return False
-            if hasattr(ec, "is_started") and not bool(getattr(ec, "is_started")):
+            if hasattr(ec, "is_started") and not bool(ec.is_started):
                 return False
             return True
         except Exception:
@@ -968,13 +1007,15 @@ class ExchangeTruthAuditor:
             where,
         )
 
-    def _position_qty(self, pos: Dict[str, Any]) -> float:
+    def _position_qty(self, pos: dict[str, Any]) -> float:
         try:
             return float(pos.get("quantity", pos.get("qty", 0.0)) or 0.0)
         except Exception:
             return 0.0
 
-    async def _reconcile_balances(self, symbols: List[str]) -> Tuple[Dict[str, int], Dict[str, Any]]:
+    async def _reconcile_balances(
+        self, symbols: list[str]
+    ) -> tuple[dict[str, int], dict[str, Any]]:
         stats = {"phantoms_closed": 0, "mismatches": 0}
         ss = self.shared_state
         if ss is None:
@@ -984,7 +1025,7 @@ class ExchangeTruthAuditor:
         if not balances:
             return stats, {}
 
-        positions: Dict[str, Dict[str, Any]] = {}
+        positions: dict[str, dict[str, Any]] = {}
         try:
             get_open = getattr(ss, "get_open_positions", None)
             positions = get_open() if callable(get_open) else {}
@@ -1006,7 +1047,9 @@ class ExchangeTruthAuditor:
                 continue
             base_asset, _ = self._split_base_quote(sym)
             bal = balances.get(base_asset.upper(), {})
-            exchange_qty = float((bal or {}).get("free", 0.0) or 0.0) + float((bal or {}).get("locked", 0.0) or 0.0)
+            exchange_qty = float((bal or {}).get("free", 0.0) or 0.0) + float(
+                (bal or {}).get("locked", 0.0) or 0.0
+            )
             if state_qty > self.dust_threshold and exchange_qty < self.dust_threshold:
                 closed = await self._close_phantom_position(sym, pos, state_qty)
                 if closed:
@@ -1027,7 +1070,7 @@ class ExchangeTruthAuditor:
                 )
         return stats, balances
 
-    async def _close_phantom_position(self, symbol: str, pos: Dict[str, Any], qty: float) -> bool:
+    async def _close_phantom_position(self, symbol: str, pos: dict[str, Any], qty: float) -> bool:
         now = time.time()
         last = float(self._recent_phantom_by_symbol.get(symbol, 0.0) or 0.0)
         if now - last < self.phantom_cooldown_sec:
@@ -1035,7 +1078,9 @@ class ExchangeTruthAuditor:
 
         price = 0.0
         try:
-            price = float((pos or {}).get("avg_price", 0.0) or (pos or {}).get("entry_price", 0.0) or 0.0)
+            price = float(
+                (pos or {}).get("avg_price", 0.0) or (pos or {}).get("entry_price", 0.0) or 0.0
+            )
         except Exception:
             price = 0.0
         if price <= 0:
@@ -1044,7 +1089,11 @@ class ExchangeTruthAuditor:
                 price = float(lp.get(symbol, 0.0) or 0.0)
             except Exception:
                 price = 0.0
-        if price <= 0 and self.exchange_client and hasattr(self.exchange_client, "get_current_price"):
+        if (
+            price <= 0
+            and self.exchange_client
+            and hasattr(self.exchange_client, "get_current_price")
+        ):
             with contextlib.suppress(Exception):
                 price = float(await self.exchange_client.get_current_price(symbol) or 0.0)
         if price <= 0:
@@ -1080,26 +1129,28 @@ class ExchangeTruthAuditor:
             )
         return ok
 
-    async def _hydrate_missing_positions(self, balances: Dict[str, Dict[str, Any]], symbols_set: set) -> Dict[str, int]:
+    async def _hydrate_missing_positions(
+        self, balances: dict[str, dict[str, Any]], symbols_set: set
+    ) -> dict[str, int]:
         """
         Hydrate missing positions from wallet balances.
-        
+
         CRITICAL FIX: Create position entries WITHOUT modifying capital ledger.
         This prevents double-counting of position value in NAV calculation.
-        
+
         SAFETY RULES:
         1. Create position structure only: {"qty": qty, "entry_price": None, "source": "wallet"}
         2. DO NOT call record_trade() - that modifies invested_capital and free_capital
         3. PnL computed later by PortfolioManager after position established
         4. Entry price left as None to prevent PnL calculation at creation time
-        
+
         For each non-dust balance, check if position already exists in state.
         If not, create position entry directly without capital ledger updates.
-        
+
         Args:
             balances: Exchange balances from _get_exchange_balances()
             symbols_set: Set of symbols to process (subset check)
-            
+
         Returns:
             Stats dict with hydrated_positions count
         """
@@ -1107,75 +1158,79 @@ class ExchangeTruthAuditor:
         ss = self.shared_state
         if ss is None:
             return stats
-        
+
         # Get current state positions
         state_positions = self._get_state_positions()
-        
+
         # Get MIN_ECONOMIC_TRADE_USDT from config
         min_usdt = getattr(self._cfg, "MIN_ECONOMIC_TRADE_USDT", 30.0)
         if callable(self._cfg):
             min_usdt = self._cfg("MIN_ECONOMIC_TRADE_USDT", 30.0) or 30.0
         min_usdt = float(min_usdt or 30.0)
-        
+
         # Get latest prices for notional calculation
         lp = getattr(ss, "latest_prices", {}) or {}
-        
+
         # Track symbols we're processing
         processed = set()
-        
+
         for asset, bal in (balances or {}).items():
             if not isinstance(bal, dict):
                 continue
-            
+
             free = float((bal or {}).get("free", 0.0) or 0.0)
             locked = float((bal or {}).get("locked", 0.0) or 0.0)
             total = free + locked
-            
+
             # Skip dust balances
             if total <= 0.0:
                 continue
-            
+
             # Find matching symbol(s) for this asset
-            for sym in (symbols_set or []):
+            for sym in symbols_set or []:
                 if not isinstance(sym, str):
                     continue
-                
+
                 try:
                     base_asset, _ = self._split_base_quote(sym)
                 except Exception:
                     continue
-                
+
                 if base_asset.upper() != asset.upper():
                     continue
-                
+
                 # Skip if position already exists
                 if sym in state_positions:
                     processed.add(sym)
                     continue
-                
+
                 # Check notional amount
                 try:
                     price = float((lp or {}).get(sym, 0.0) or 0.0)
                 except Exception:
                     price = 0.0
-                
+
                 # Fetch price from exchange if not in state
-                if price <= 0 and self.exchange_client and hasattr(self.exchange_client, "get_current_price"):
+                if (
+                    price <= 0
+                    and self.exchange_client
+                    and hasattr(self.exchange_client, "get_current_price")
+                ):
                     try:
                         price = float(await self.exchange_client.get_current_price(sym) or 0.0)
                     except Exception:
                         price = 0.0
-                
+
                 # Skip if we still can't get price
                 if price <= 0:
                     continue
-                
+
                 notional = total * price
-                
+
                 # Skip if notional is below min threshold
                 if notional < min_usdt:
                     continue
-                
+
                 # CRITICAL FIX: Create position structure directly WITHOUT capital ledger updates
                 # This prevents double-counting: position value is in wallet balance data,
                 # NOT in the invested_capital ledger
@@ -1205,7 +1260,7 @@ class ExchangeTruthAuditor:
                         }
                         stats["hydrated_positions"] += 1
                         processed.add(sym)
-                        
+
                         await self._emit_event(
                             "TRUTH_AUDIT_POSITION_HYDRATED",
                             {
@@ -1223,28 +1278,32 @@ class ExchangeTruthAuditor:
                 except Exception as e:
                     self.logger.error(
                         "[TruthAuditor] Failed to hydrate position %s: %s",
-                        sym, str(e), exc_info=True
+                        sym,
+                        str(e),
+                        exc_info=True,
                     )
-        
+
         return stats
 
-    async def _enforce_wallet_authority(self, balances: Dict[str, Dict[str, Any]], symbols_set: set) -> Dict[str, int]:
+    async def _enforce_wallet_authority(
+        self, balances: dict[str, dict[str, Any]], symbols_set: set
+    ) -> dict[str, int]:
         """
         CRITICAL INVARIANT: Exchange wallet balances override internal positions.
-        
+
         If conflict exists between wallet and state:
         - Wallet wins ALWAYS
         - This protects against partial fills, API lag, or state corruption
-        
+
         Examples:
         - Wallet: 1.0 BTC, State: 0.5 BTC → Close 0.5 BTC position
         - Wallet: 0.5 BTC, State: 1.0 BTC → Close phantom 0.5 BTC
         - Wallet: 0 BTC, State: 0.1 BTC → Close all (dust or real)
-        
+
         Args:
             balances: Exchange balances (source of truth)
             symbols_set: Set of symbols to check
-            
+
         Returns:
             Stats dict with corrections applied
         """
@@ -1252,31 +1311,33 @@ class ExchangeTruthAuditor:
         ss = self.shared_state
         if ss is None:
             return stats
-        
+
         state_positions = self._get_state_positions()
         if not state_positions:
             return stats
-        
+
         min_usdt = getattr(self._cfg, "MIN_ECONOMIC_TRADE_USDT", 30.0)
         if callable(self._cfg):
             min_usdt = self._cfg("MIN_ECONOMIC_TRADE_USDT", 30.0) or 30.0
         min_usdt = float(min_usdt or 30.0)
-        
+
         lp = getattr(ss, "latest_prices", {}) or {}
-        
+
         # Check each position against wallet authority
         for sym, pos in state_positions.items():
             if symbols_set and sym not in symbols_set:
                 continue
-            
+
             try:
                 state_qty = self._position_qty(pos if isinstance(pos, dict) else {})
                 base_asset, _ = self._split_base_quote(sym)
-                
+
                 # Get wallet truth
                 bal = balances.get(base_asset.upper(), {})
-                wallet_qty = float((bal or {}).get("free", 0.0) or 0.0) + float((bal or {}).get("locked", 0.0) or 0.0)
-                
+                wallet_qty = float((bal or {}).get("free", 0.0) or 0.0) + float(
+                    (bal or {}).get("locked", 0.0) or 0.0
+                )
+
                 # Compare: if mismatch, wallet wins
                 if abs(state_qty - wallet_qty) > self.position_mismatch_tol:
                     # Get current price for notional check
@@ -1284,18 +1345,22 @@ class ExchangeTruthAuditor:
                         price = float((lp or {}).get(sym, 0.0) or 0.0)
                     except Exception:
                         price = 0.0
-                    
-                    if price <= 0 and self.exchange_client and hasattr(self.exchange_client, "get_current_price"):
+
+                    if (
+                        price <= 0
+                        and self.exchange_client
+                        and hasattr(self.exchange_client, "get_current_price")
+                    ):
                         try:
                             price = float(await self.exchange_client.get_current_price(sym) or 0.0)
                         except Exception:
                             price = 0.0
-                    
+
                     # Wallet authority: close/adjust position to match wallet
                     if wallet_qty < state_qty:
                         # Position qty > wallet qty: wallet had less → close the difference
                         diff_qty = state_qty - wallet_qty
-                        
+
                         # Only close if meaningful (above dust threshold)
                         if price > 0:
                             notional = diff_qty * price
@@ -1313,13 +1378,13 @@ class ExchangeTruthAuditor:
                                     "orderId": f"truth-wallet-auth-close-{sym}-{int(now * 1000)}",
                                     "updateTime": int(now * 1000),
                                 }
-                                
+
                                 ok = await self._apply_recovered_fill(
                                     synthetic_close,
                                     reason="wallet_authority_enforcement",
                                     synthetic=True,
                                 )
-                                
+
                                 if ok:
                                     stats["wallet_authority_corrections"] += 1
                                     await self._emit_event(
@@ -1334,18 +1399,18 @@ class ExchangeTruthAuditor:
                                             "ts": now,
                                         },
                                     )
-            
+
             except Exception as e:
                 self.logger.debug("[TruthAuditor:WalletAuthority] Error for %s: %s", sym, e)
                 continue
-        
+
         return stats
 
     # =============================
     # Trade-level (fill-level) reconciliation via /api/v3/myTrades
     # =============================
 
-    async def _reconcile_trades(self, symbols: List[str], startup: bool) -> Dict[str, int]:
+    async def _reconcile_trades(self, symbols: list[str], startup: bool) -> dict[str, int]:
         """
         Fill-level reconciliation using exchange trade history (myTrades).
 
@@ -1370,7 +1435,9 @@ class ExchangeTruthAuditor:
             try:
                 trades = await ec.get_my_trades(sym, limit=self.trade_history_limit)
             except Exception:
-                self.logger.debug("[TruthAuditor:Trades] get_my_trades failed for %s", sym, exc_info=True)
+                self.logger.debug(
+                    "[TruthAuditor:Trades] get_my_trades failed for %s", sym, exc_info=True
+                )
                 continue
             if not isinstance(trades, list) or not trades:
                 continue
@@ -1429,17 +1496,21 @@ class ExchangeTruthAuditor:
                     "executedQty": float(qty),
                     "price": float(price),
                     "avgPrice": float(price),
-                    "cummulativeQuoteQty": float(quote_qty) if quote_qty > 0 else float(qty * price),
+                    "cummulativeQuoteQty": float(quote_qty)
+                    if quote_qty > 0
+                    else float(qty * price),
                     "orderId": order_id,
                     "updateTime": int(trade_time_ms),
                     "fee_quote": float(fee_quote),
                     "fee_base": float(fee_base),
-                    "fills": [{
-                        "price": str(price),
-                        "qty": str(qty),
-                        "commission": str(commission),
-                        "commissionAsset": str(trade.get("commissionAsset", "") or ""),
-                    }],
+                    "fills": [
+                        {
+                            "price": str(price),
+                            "qty": str(qty),
+                            "commission": str(commission),
+                            "commissionAsset": str(trade.get("commissionAsset", "") or ""),
+                        }
+                    ],
                     "_truth_auditor_trade_id": trade_id,
                     "_truth_auditor_source": "myTrades",
                 }
@@ -1459,7 +1530,12 @@ class ExchangeTruthAuditor:
                 # Unseen fill — recover it
                 self.logger.warning(
                     "[TruthAuditor:Trades] Recovering unseen %s fill: symbol=%s trade_id=%s order_id=%s qty=%.8f price=%.8f",
-                    side, sym, trade_id, order_id or "n/a", qty, price,
+                    side,
+                    sym,
+                    trade_id,
+                    order_id or "n/a",
+                    qty,
+                    price,
                 )
                 recovered = await self._apply_recovered_fill(
                     synthetic_order,
@@ -1476,7 +1552,9 @@ class ExchangeTruthAuditor:
                     # For SELL fills, force the full lifecycle finalization
                     if side == "SELL":
                         finalized = await self._force_finalize_sell_lifecycle(
-                            sym, synthetic_order, trade_id=trade_id,
+                            sym,
+                            synthetic_order,
+                            trade_id=trade_id,
                         )
                         if finalized:
                             stats["trades_sell_finalized"] += 1
@@ -1488,7 +1566,7 @@ class ExchangeTruthAuditor:
     async def _force_finalize_sell_lifecycle(
         self,
         symbol: str,
-        order: Dict[str, Any],
+        order: dict[str, Any],
         *,
         trade_id: str = "",
     ) -> bool:
@@ -1512,7 +1590,8 @@ class ExchangeTruthAuditor:
             self.logger.debug(
                 "[TruthAuditor:SellFinalize] ExecutionManager unavailable for %s trade_id=%s; "
                 "falling back to record_trade only",
-                symbol, trade_id,
+                symbol,
+                trade_id,
             )
             return False
 
@@ -1534,13 +1613,18 @@ class ExchangeTruthAuditor:
                 order=order,
                 tag="truth_auditor",
                 post_fill=post_fill if isinstance(post_fill, dict) else None,
-                policy_ctx={"exit_reason": "TRUTH_AUDIT_RECOVERY", "reason": "TRUTH_AUDIT_RECOVERY"},
+                policy_ctx={
+                    "exit_reason": "TRUTH_AUDIT_RECOVERY",
+                    "reason": "TRUTH_AUDIT_RECOVERY",
+                },
                 tier=None,
             )
 
             self.logger.info(
                 "[TruthAuditor:SellFinalize] Forced SELL lifecycle finalization: symbol=%s trade_id=%s order_id=%s",
-                symbol, trade_id, self._order_id(order) or "n/a",
+                symbol,
+                trade_id,
+                self._order_id(order) or "n/a",
             )
             await self._emit_event(
                 "TRUTH_AUDIT_SELL_LIFECYCLE_FINALIZED",
@@ -1558,7 +1642,10 @@ class ExchangeTruthAuditor:
         except Exception as e:
             self.logger.error(
                 "[TruthAuditor:SellFinalize] Failed to force SELL lifecycle for %s trade_id=%s: %s",
-                symbol, trade_id, e, exc_info=True,
+                symbol,
+                trade_id,
+                e,
+                exc_info=True,
             )
             return False
 
@@ -1572,7 +1659,7 @@ class ExchangeTruthAuditor:
         if trade_id:
             self._seen_trade_ids[trade_id] = time.time()
 
-    async def _reconcile_orders(self, symbols: List[str], startup: bool) -> Dict[str, int]:
+    async def _reconcile_orders(self, symbols: list[str], startup: bool) -> dict[str, int]:
         stats = {"fills_recovered": 0, "fills_skipped": 0, "sell_missing_canonical": 0}
 
         if not symbols or self.exchange_client is None:
@@ -1594,7 +1681,11 @@ class ExchangeTruthAuditor:
                     continue
 
                 age_ms = max(0, now_ms - self._order_update_time_ms(order))
-                if not startup and self.recovery_window_sec > 0 and age_ms > (self.recovery_window_sec * 1000):
+                if (
+                    not startup
+                    and self.recovery_window_sec > 0
+                    and age_ms > (self.recovery_window_sec * 1000)
+                ):
                     self._mark_order_seen(order_id)
                     continue
 
@@ -1631,7 +1722,9 @@ class ExchangeTruthAuditor:
                     stats["fills_skipped"] += 1
                     continue
 
-                recovered = await self._apply_recovered_fill(order, reason="missed_fill_recovery", synthetic=False)
+                recovered = await self._apply_recovered_fill(
+                    order, reason="missed_fill_recovery", synthetic=False
+                )
                 self._mark_order_seen(order_id)
                 if recovered:
                     stats["fills_recovered"] += 1
@@ -1639,19 +1732,19 @@ class ExchangeTruthAuditor:
                     stats["fills_skipped"] += 1
         return stats
 
-    async def _reconcile_open_orders(self, symbols: List[str]) -> Dict[str, int]:
+    async def _reconcile_open_orders(self, symbols: list[str]) -> dict[str, int]:
         stats = {"open_orders": 0, "open_order_mismatch": 0}
         ec = self.exchange_client
         ss = self.shared_state
         if ec is None or ss is None:
             return stats
 
-        exchange_open: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        exchange_open: dict[str, dict[str, dict[str, Any]]] = {}
         for sym in symbols:
             open_orders = await self._fetch_open_orders(sym)
             if not open_orders:
                 continue
-            sym_map: Dict[str, Dict[str, Any]] = {}
+            sym_map: dict[str, dict[str, Any]] = {}
             for order in open_orders:
                 oid = self._order_id(order)
                 if not oid:
@@ -1688,19 +1781,21 @@ class ExchangeTruthAuditor:
 
         # Always publish a dedicated truth snapshot.
         try:
-            setattr(ss, "truth_open_orders", {sym: dict(orders) for sym, orders in exchange_open.items()})
+            ss.truth_open_orders = {sym: dict(orders) for sym, orders in exchange_open.items()}
         except Exception:
             pass
         return stats
 
-    def _normalize_open_order_map(self, raw: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, Any]]]:
-        out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    def _normalize_open_order_map(
+        self, raw: dict[str, Any]
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        out: dict[str, dict[str, dict[str, Any]]] = {}
         for sym, payload in (raw or {}).items():
             sym_u = str(sym or "").upper()
             if not sym_u:
                 continue
             if isinstance(payload, dict):
-                sym_map: Dict[str, Dict[str, Any]] = {}
+                sym_map: dict[str, dict[str, Any]] = {}
                 for k, v in payload.items():
                     oid = str(k)
                     if not oid and isinstance(v, dict):
@@ -1720,7 +1815,7 @@ class ExchangeTruthAuditor:
                     out[sym_u] = sym_map
         return out
 
-    async def _fetch_recent_orders(self, symbol: str) -> List[Dict[str, Any]]:
+    async def _fetch_recent_orders(self, symbol: str) -> list[dict[str, Any]]:
         ec = self.exchange_client
         if ec is None:
             return []
@@ -1731,7 +1826,9 @@ class ExchangeTruthAuditor:
             return []
         try:
             if hasattr(ec, "get_all_orders"):
-                orders = await self._maybe_await(ec.get_all_orders(sym, limit=self.order_history_limit))
+                orders = await self._maybe_await(
+                    ec.get_all_orders(sym, limit=self.order_history_limit)
+                )
                 if isinstance(orders, list):
                     return orders
         except Exception:
@@ -1739,14 +1836,16 @@ class ExchangeTruthAuditor:
         try:
             client = getattr(ec, "client", None)
             if client and hasattr(client, "get_all_orders"):
-                orders = await client.get_all_orders(symbol=sym, limit=int(self.order_history_limit))
+                orders = await client.get_all_orders(
+                    symbol=sym, limit=int(self.order_history_limit)
+                )
                 if isinstance(orders, list):
                     return orders
         except Exception:
             self.logger.debug("client.get_all_orders failed for %s", sym, exc_info=True)
         return []
 
-    async def _fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+    async def _fetch_open_orders(self, symbol: str) -> list[dict[str, Any]]:
         ec = self.exchange_client
         if ec is None:
             return []
@@ -1772,7 +1871,7 @@ class ExchangeTruthAuditor:
             self.logger.debug("client.get_open_orders failed for %s", sym, exc_info=True)
         return []
 
-    def _is_filled_order(self, order: Dict[str, Any]) -> bool:
+    def _is_filled_order(self, order: dict[str, Any]) -> bool:
         status = str((order or {}).get("status", "")).upper()
         if status not in {"FILLED", "PARTIALLY_FILLED"}:
             return False
@@ -1781,7 +1880,7 @@ class ExchangeTruthAuditor:
         except Exception:
             return False
 
-    def _order_id(self, order: Dict[str, Any]) -> str:
+    def _order_id(self, order: dict[str, Any]) -> str:
         if not isinstance(order, dict):
             return ""
         oid = order.get("orderId") or order.get("exchange_order_id") or order.get("order_id")
@@ -1789,15 +1888,19 @@ class ExchangeTruthAuditor:
             return ""
         return str(oid)
 
-    def _order_client_id(self, order: Dict[str, Any]) -> str:
+    def _order_client_id(self, order: dict[str, Any]) -> str:
         if not isinstance(order, dict):
             return ""
-        cid = order.get("clientOrderId") or order.get("origClientOrderId") or order.get("client_order_id")
+        cid = (
+            order.get("clientOrderId")
+            or order.get("origClientOrderId")
+            or order.get("client_order_id")
+        )
         if cid is None:
             return ""
         return str(cid)
 
-    def _infer_order_source(self, order: Dict[str, Any]) -> Dict[str, str]:
+    def _infer_order_source(self, order: dict[str, Any]) -> dict[str, str]:
         """
         Infer source/tag from client order id for provenance debugging.
         Expected internal pattern: octi-<timestamp>-<tag>.
@@ -1831,7 +1934,7 @@ class ExchangeTruthAuditor:
             "order_source_hint": source_hint,
         }
 
-    def _order_update_time_ms(self, order: Dict[str, Any]) -> int:
+    def _order_update_time_ms(self, order: dict[str, Any]) -> int:
         if not isinstance(order, dict):
             return 0
         for key in ("updateTime", "time", "transactTime", "workingTime"):
@@ -1868,7 +1971,7 @@ class ExchangeTruthAuditor:
             if now - ts > max(self.phantom_cooldown_sec * 4.0, 60.0):
                 self._recent_phantom_by_symbol.pop(sym, None)
 
-    def _is_fill_likely_already_applied(self, order: Dict[str, Any]) -> bool:
+    def _is_fill_likely_already_applied(self, order: dict[str, Any]) -> bool:
         ss = self.shared_state
         if ss is None:
             return False
@@ -1889,7 +1992,11 @@ class ExchangeTruthAuditor:
         except Exception:
             qty = 0.0
         price = self._resolve_order_price(order)
-        order_ts = self._order_update_time_ms(order) / 1000.0 if self._order_update_time_ms(order) > 0 else 0.0
+        order_ts = (
+            self._order_update_time_ms(order) / 1000.0
+            if self._order_update_time_ms(order) > 0
+            else 0.0
+        )
 
         for tr in reversed(rows):
             if not isinstance(tr, dict):
@@ -1921,7 +2028,7 @@ class ExchangeTruthAuditor:
             return True
         return False
 
-    def _resolve_order_price(self, order: Dict[str, Any]) -> float:
+    def _resolve_order_price(self, order: dict[str, Any]) -> float:
         try:
             p = float(order.get("avgPrice", 0.0) or order.get("price", 0.0) or 0.0)
         except Exception:
@@ -1937,7 +2044,7 @@ class ExchangeTruthAuditor:
             pass
         return 0.0
 
-    def _is_canonical_trade_event_present(self, order: Dict[str, Any]) -> bool:
+    def _is_canonical_trade_event_present(self, order: dict[str, Any]) -> bool:
         """
         Check if a SELL fill appears in recent TRADE_EXECUTED events from canonical sources.
         Excludes truth-auditor generated events to detect off-canonical executions.
@@ -1977,14 +2084,18 @@ class ExchangeTruthAuditor:
         if events is None:
             return False
         try:
-            rows = list(events)[-max(100, int(self.event_scan_limit or 800)):]
+            rows = list(events)[-max(100, int(self.event_scan_limit or 800)) :]
         except Exception:
             return False
         if not rows:
             return False
         qty = 0.0
         price = self._resolve_order_price(order)
-        order_ts = self._order_update_time_ms(order) / 1000.0 if self._order_update_time_ms(order) > 0 else 0.0
+        order_ts = (
+            self._order_update_time_ms(order) / 1000.0
+            if self._order_update_time_ms(order) > 0
+            else 0.0
+        )
         with contextlib.suppress(Exception):
             qty = float(order.get("executedQty", 0.0) or 0.0)
 
@@ -2004,10 +2115,17 @@ class ExchangeTruthAuditor:
             if source == "ExchangeTruthAuditor":
                 continue
 
-            data_oid = str(data.get("order_id") or data.get("orderId") or data.get("exchange_order_id") or "")
+            data_oid = str(
+                data.get("order_id") or data.get("orderId") or data.get("exchange_order_id") or ""
+            )
             if oid and data_oid and data_oid == oid:
                 return True
-            data_cid = str(data.get("client_order_id") or data.get("clientOrderId") or data.get("origClientOrderId") or "")
+            data_cid = str(
+                data.get("client_order_id")
+                or data.get("clientOrderId")
+                or data.get("origClientOrderId")
+                or ""
+            )
             if cid and data_cid and data_cid == cid:
                 return True
 
@@ -2018,7 +2136,12 @@ class ExchangeTruthAuditor:
 
             ev_ts = 0.0
             with contextlib.suppress(Exception):
-                ev_ts = float(ev.get("timestamp", 0.0) or data.get("timestamp", 0.0) or data.get("ts", 0.0) or 0.0)
+                ev_ts = float(
+                    ev.get("timestamp", 0.0)
+                    or data.get("timestamp", 0.0)
+                    or data.get("ts", 0.0)
+                    or 0.0
+                )
             if order_ts > 0 and ev_ts > 0 and abs(order_ts - ev_ts) > self.trade_match_window_sec:
                 continue
 
@@ -2039,7 +2162,7 @@ class ExchangeTruthAuditor:
             return True
         return False
 
-    async def _emit_missing_canonical_sell(self, order: Dict[str, Any], startup: bool) -> None:
+    async def _emit_missing_canonical_sell(self, order: dict[str, Any], startup: bool) -> None:
         sym = str(order.get("symbol", "")).upper()
         oid = self._order_id(order)
         source_meta = self._infer_order_source(order)
@@ -2072,7 +2195,9 @@ class ExchangeTruthAuditor:
         )
         await self._emit_event("TRUTH_AUDIT_SELL_MISSING_CANONICAL", payload)
 
-    async def _apply_recovered_fill(self, order: Dict[str, Any], reason: str, synthetic: bool) -> bool:
+    async def _apply_recovered_fill(
+        self, order: dict[str, Any], reason: str, synthetic: bool
+    ) -> bool:
         ss = self.shared_state
         if ss is None or not isinstance(order, dict):
             return False
@@ -2090,7 +2215,11 @@ class ExchangeTruthAuditor:
             return False
 
         price = self._resolve_order_price(order)
-        if price <= 0 and self.exchange_client and hasattr(self.exchange_client, "get_current_price"):
+        if (
+            price <= 0
+            and self.exchange_client
+            and hasattr(self.exchange_client, "get_current_price")
+        ):
             with contextlib.suppress(Exception):
                 price = float(await self.exchange_client.get_current_price(sym) or 0.0)
         if price <= 0:
@@ -2136,7 +2265,10 @@ class ExchangeTruthAuditor:
         if side == "SELL":
             try:
                 if os.environ.get("TRUTH_AUDIT_WALLET_GUARD", "1").strip().lower() in (
-                    "1", "true", "yes", "on",
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
                 ):
                     pos_qty_pre = 0.0
                     if hasattr(ss, "get_position_qty"):
@@ -2146,7 +2278,11 @@ class ExchangeTruthAuditor:
                         balances = await self._get_exchange_balances()
                         base_asset_g, _ = self._split_base_quote(sym)
                         if balances and base_asset_g:
-                            bal = balances.get(base_asset_g) or balances.get(base_asset_g.upper()) or {}
+                            bal = (
+                                balances.get(base_asset_g)
+                                or balances.get(base_asset_g.upper())
+                                or {}
+                            )
                             if isinstance(bal, dict):
                                 wallet_free = float(
                                     bal.get("free")
@@ -2163,25 +2299,49 @@ class ExchangeTruthAuditor:
                                     "[TruthAuditor:WalletGuard] Skipping SELL recovery for %s "
                                     "(record_trade + mark_position_closed) — wallet still holds "
                                     "%.10f (≥ pos_qty=%.10f). Historical SELL already in wallet truth.",
-                                    sym, wallet_free, pos_qty_pre,
+                                    sym,
+                                    wallet_free,
+                                    pos_qty_pre,
                                 )
             except Exception as _wg_err:
                 self.logger.debug(
                     "[TruthAuditor:WalletGuard] guard check failed for %s: %s — proceeding",
-                    sym, _wg_err,
+                    sym,
+                    _wg_err,
                 )
 
         applied = False
         if not skip_recovery:
             try:
                 if hasattr(ss, "record_trade"):
-                    await self._maybe_call(ss, "record_trade", sym, side, qty, price, fee_quote, fee_base, "truth_auditor")
+                    await self._maybe_call(
+                        ss,
+                        "record_trade",
+                        sym,
+                        side,
+                        qty,
+                        price,
+                        fee_quote,
+                        fee_base,
+                        "truth_auditor",
+                    )
                     applied = True
                 elif hasattr(ss, "record_fill"):
-                    await self._maybe_call(ss, "record_fill", sym, side, qty, price, fee_quote=fee_quote, fee_base=fee_base)
+                    await self._maybe_call(
+                        ss,
+                        "record_fill",
+                        sym,
+                        side,
+                        qty,
+                        price,
+                        fee_quote=fee_quote,
+                        fee_base=fee_base,
+                    )
                     applied = True
             except Exception:
-                self.logger.error("[TruthAuditor] failed applying recovered fill %s %s", sym, side, exc_info=True)
+                self.logger.error(
+                    "[TruthAuditor] failed applying recovered fill %s %s", sym, side, exc_info=True
+                )
 
         if side == "SELL" and not skip_recovery:
             # ── P&L-AWARE DUST PRESERVATION (new) ──
@@ -2225,7 +2385,12 @@ class ExchangeTruthAuditor:
                                 self.logger.info(
                                     "[TruthAuditor:P&L_Filter] 📈 PRESERVING %s for reinvestment: "
                                     "qty=%.8f, entry=$%.4f, current=$%.4f, pnl=%+.2f%% (>= %.1f%% threshold)",
-                                    sym, qty_current, avg_entry, current_price, unrealized_pnl_pct, min_pnl_to_preserve_pct
+                                    sym,
+                                    qty_current,
+                                    avg_entry,
+                                    current_price,
+                                    unrealized_pnl_pct,
+                                    min_pnl_to_preserve_pct,
                                 )
                                 skip_recovery = True  # Skip closing this position
                             else:
@@ -2233,13 +2398,19 @@ class ExchangeTruthAuditor:
                                 self.logger.warning(
                                     "[TruthAuditor:P&L_Filter] 📉 CLOSING losing position %s: "
                                     "qty=%.8f, entry=$%.4f, current=$%.4f, pnl=%+.2f%% (< %.1f%% threshold)",
-                                    sym, qty_current, avg_entry, current_price, unrealized_pnl_pct, min_pnl_to_preserve_pct
+                                    sym,
+                                    qty_current,
+                                    avg_entry,
+                                    current_price,
+                                    unrealized_pnl_pct,
+                                    min_pnl_to_preserve_pct,
                                 )
                                 # Proceed with normal closure (continues to mark_position_closed below)
             except Exception as e:
                 self.logger.debug(
                     "[TruthAuditor:P&L_Filter] P&L check failed for %s: %s; proceeding with closure",
-                    sym, str(e)
+                    sym,
+                    str(e),
                 )
                 # Fall through to mark_position_closed (safe default behavior)
 
@@ -2249,7 +2420,11 @@ class ExchangeTruthAuditor:
                 pos_qty = 0.0
                 if hasattr(ss, "get_position_qty"):
                     pos_qty = float(ss.get_position_qty(sym) or 0.0)
-                if not skip_recovery and pos_qty > self.dust_threshold and hasattr(ss, "mark_position_closed"):
+                if (
+                    not skip_recovery
+                    and pos_qty > self.dust_threshold
+                    and hasattr(ss, "mark_position_closed")
+                ):
                     await self._maybe_call(
                         ss,
                         "mark_position_closed",
@@ -2271,16 +2446,26 @@ class ExchangeTruthAuditor:
         try:
             em = None
             with contextlib.suppress(Exception):
-                em = getattr(self.app, "execution_manager", None) or getattr(self.shared_state, "execution_manager", None)
+                em = getattr(self.app, "execution_manager", None) or getattr(
+                    self.shared_state, "execution_manager", None
+                )
             if em is not None and callable(getattr(em, "_emit_trade_executed_event", None)):
                 # Best-effort — ExecutionManager will dedupe and honour canonical contract
                 try:
-                    await em._emit_trade_executed_event(sym, side, str(order.get("tag") or "truth_auditor"), order)
+                    await em._emit_trade_executed_event(
+                        sym, side, str(order.get("tag") or "truth_auditor"), order
+                    )
                 except Exception:
-                    self.logger.debug("ExecutionManager canonical re-emit failed for recovered fill %s", order.get("orderId") or self._order_id(order), exc_info=True)
+                    self.logger.debug(
+                        "ExecutionManager canonical re-emit failed for recovered fill %s",
+                        order.get("orderId") or self._order_id(order),
+                        exc_info=True,
+                    )
         except Exception:
             # Nothing fatal if we cannot reach ExecutionManager
-            self.logger.debug("ExchangeTruthAuditor: emit to ExecutionManager failed", exc_info=True)
+            self.logger.debug(
+                "ExchangeTruthAuditor: emit to ExecutionManager failed", exc_info=True
+            )
 
         payload = {
             "symbol": sym,

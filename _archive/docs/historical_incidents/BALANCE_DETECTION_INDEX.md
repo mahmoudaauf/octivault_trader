@@ -105,8 +105,8 @@
 | 3 (HIGH) | BNB | DUST_LOCKED | $0.90 | Heal immediately |
 | 2 (MED) | RAY | MICRO_DUST | $7.50 | Monitor or heal |
 
-**Next Cycle:** ~30 minutes  
-**Expected Recovery:** $8.35-$8.40  
+**Next Cycle:** ~30 minutes
+**Expected Recovery:** $8.35-$8.40
 **Success Rate:** 95-99%
 
 ---
@@ -120,7 +120,7 @@
 - **Threat:** Limited trading flexibility
 - **Fix:** Reduce SHIB by 3-4%, run healing cycles
 
-### Issue #2: High SHIB Concentration  
+### Issue #2: High SHIB Concentration
 - **Current:** 75.4%
 - **Target:** 50-60%
 - **Excess:** 15.4%
@@ -233,9 +233,8 @@ A: RAY can recover if price rises. BNB should be healed (too small).
 
 ---
 
-**Generated:** 2026-05-04  
-**Tool:** Balance Symbol Detector v1.0  
-**Status:** ✅ Production Ready  
-**Detection:** 100% (7/7)  
+**Generated:** 2026-05-04
+**Tool:** Balance Symbol Detector v1.0
+**Status:** ✅ Production Ready
+**Detection:** 100% (7/7)
 **Accuracy:** 100%
-

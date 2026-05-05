@@ -1,7 +1,7 @@
 # PRODUCTION ROLLOUT PLAN - DUST FIX & HEALING
 
-**Date:** April 28, 2026  
-**Status:** Ready for Deployment  
+**Date:** April 28, 2026
+**Status:** Ready for Deployment
 **Priority:** HIGH (Fixes capital deadlock issue)
 
 ---
@@ -14,8 +14,8 @@
 3. ⏳ Dust healing mechanism (ready to deploy)
 4. ⏳ Aggressive dust cleanup (optional enhancement)
 
-**Total Changes:** 4 files modified, 600+ lines added  
-**Breaking Changes:** NONE (100% backward compatible)  
+**Total Changes:** 4 files modified, 600+ lines added
+**Breaking Changes:** NONE (100% backward compatible)
 **Rollback Plan:** Simple git revert if needed
 
 ---
@@ -121,27 +121,27 @@ async def _aggressive_dust_healing(self, symbol: str, dust_qty: float) -> bool:
     """
     Aggressively heal stuck dust by buying small amount to consolidate.
     Triggered when dust has been stuck > DUST_HEALING_TIME_THRESHOLD.
-    
+
     Args:
         symbol: Trading pair (e.g., "DOGEUSDT")
         dust_qty: Quantity of stuck dust
-    
+
     Returns:
         True if healing successful, False otherwise
     """
     if dust_qty <= 0:
         return False
-    
+
     try:
         pos = await self.shared_state.get_position(symbol) or {}
         current_price = float(pos.get("mark_price") or 0.0)
-        
+
         if current_price <= 0:
             self.logger.warning("[Dust:HEALING] %s no valid price for healing", symbol)
             return False
-        
+
         dust_notional = dust_qty * current_price
-        
+
         # Only heal SMALL dust (< $1 USDT)
         if dust_notional >= 1.0:
             self.logger.info(
@@ -149,19 +149,19 @@ async def _aggressive_dust_healing(self, symbol: str, dust_qty: float) -> bool:
                 symbol, dust_notional
             )
             return False
-        
+
         # Healing buy amount: round up to nearest $5
         healing_amount = max(5.0, math.ceil(dust_notional / 5.0) * 5.0)
-        
+
         self.logger.info(
             "[Dust:HEALING] %s aggressive buy initiated: "
             "dust=%.8f ($%.2f) → buy_amount=$%.2f",
             symbol, dust_qty, dust_notional, healing_amount
         )
-        
+
         # Execute healing buy at market
         buy_qty = healing_amount / current_price
-        
+
         result = await self.execute_order(
             symbol=symbol,
             side="buy",
@@ -170,7 +170,7 @@ async def _aggressive_dust_healing(self, symbol: str, dust_qty: float) -> bool:
             _is_dust_healing_buy=True,
             tag="dust_healing"
         )
-        
+
         if result and result.get("status") == "filled":
             self.logger.info(
                 "[Dust:HEALING] ✅ Success: %s consolidated "
@@ -181,7 +181,7 @@ async def _aggressive_dust_healing(self, symbol: str, dust_qty: float) -> bool:
         else:
             self.logger.warning("[Dust:HEALING] %s buy failed or pending", symbol)
             return False
-        
+
     except Exception as e:
         self.logger.error("[Dust:HEALING] %s failed: %s", symbol, e)
         return False
@@ -194,19 +194,19 @@ Update `_monitor_and_execute_exits()` method to include:
 ```python
 async def _monitor_and_execute_exits(self):
     """Main exit monitoring loop"""
-    
+
     while self.is_running:
         try:
             # ... existing exit logic ...
-            
+
             # NEW: Check for stuck dust and heal aggressively (every 5 minutes)
             dust_check_interval = getattr(self, '_dust_check_interval', 0)
             if time.time() - dust_check_interval > 300:  # 5 minutes
                 await self._check_and_heal_stuck_dust()
                 self._dust_check_interval = time.time()
-            
+
             await asyncio.sleep(10)
-            
+
         except Exception as e:
             self.logger.error("Exit monitor error: %s", e)
             await asyncio.sleep(10)
@@ -216,15 +216,15 @@ async def _check_and_heal_stuck_dust(self):
     try:
         for symbol in list(self.shared_state.positions.keys()):
             pos = await self.shared_state.get_position(symbol)
-            
+
             if not pos:
                 continue
-            
+
             status = pos.get("status_field", "")
             dust_qty = float(pos.get("current_qty", 0.0))
             last_update = float(pos.get("last_update", time.time()))
             dust_age = time.time() - last_update
-            
+
             # If dust and stuck > 30 minutes, heal it
             if status == "DUST" and dust_qty > 0 and dust_age > 1800:
                 self.logger.info(
@@ -232,7 +232,7 @@ async def _check_and_heal_stuck_dust(self):
                     symbol, int(dust_age), dust_qty
                 )
                 await self._aggressive_dust_healing(symbol, dust_qty)
-    
+
     except Exception as e:
         self.logger.error("[Dust:CHECK] Error: %s", e)
 ```
@@ -244,10 +244,10 @@ async def _check_and_heal_stuck_dust(self):
 async def test_dust_healing():
     """Test dust healing mechanism"""
     em = ExecutionManager(...)
-    
+
     # Create test dust
     await em._aggressive_dust_healing("DOGEUSDT", 0.898)
-    
+
     # Verify healing triggered
     assert em.logger.info.called
     print("✅ Dust healing test passed")
@@ -524,11 +524,10 @@ Commits:
 
 ## ✅ READY FOR PRODUCTION
 
-**Status:** GREEN 🟢  
-**All Systems:** GO ✅  
-**Tests:** PASS ✅  
-**Docs:** COMPLETE ✅  
-**Rollback:** READY ✅  
+**Status:** GREEN 🟢
+**All Systems:** GO ✅
+**Tests:** PASS ✅
+**Docs:** COMPLETE ✅
+**Rollback:** READY ✅
 
 **DEPLOYMENT CAN PROCEED** 🚀
-

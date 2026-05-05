@@ -5,78 +5,79 @@ Generates prioritized list of type errors for fixing
 """
 
 import subprocess
-import json
 import sys
-from pathlib import Path
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from pathlib import Path
 
-def run_mypy(directories: List[str]) -> str:
+
+def run_mypy(directories: list[str]) -> str:
     """Run mypy and capture output"""
-    cmd = ["python3", "-m", "mypy"] + directories + [
-        "--ignore-missing-imports",
-        "--show-error-codes",
-        "--no-error-summary"
-    ]
-    
+    cmd = (
+        ["python3", "-m", "mypy"]
+        + directories
+        + ["--ignore-missing-imports", "--show-error-codes", "--no-error-summary"]
+    )
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout + result.stderr
 
-def parse_mypy_output(output: str) -> Dict[str, List[str]]:
+
+def parse_mypy_output(output: str) -> dict[str, list[str]]:
     """Parse mypy output and categorize errors"""
     errors_by_file = defaultdict(list)
     errors_by_type = defaultdict(int)
-    
-    for line in output.split('\n'):
-        if ':' in line and ('error:' in line or 'note:' in line):
-            parts = line.split(':')
+
+    for line in output.split("\n"):
+        if ":" in line and ("error:" in line or "note:" in line):
+            parts = line.split(":")
             if len(parts) >= 2:
                 filepath = parts[0]
-                if 'error:' in line:
-                    error_type = line.split('[')[-1].rstrip(']') if '[' in line else 'unknown'
+                if "error:" in line:
+                    error_type = line.split("[")[-1].rstrip("]") if "[" in line else "unknown"
                     errors_by_file[filepath].append(line)
                     errors_by_type[error_type] += 1
-    
+
     return dict(errors_by_file), dict(errors_by_type)
 
-def generate_report(errors_by_file: Dict, errors_by_type: Dict):
+
+def generate_report(errors_by_file: dict, errors_by_type: dict):
     """Generate remediation report"""
     report = []
     report.append("=" * 80)
     report.append("TYPE CHECKING ERROR ANALYSIS REPORT")
     report.append("=" * 80)
     report.append("")
-    
+
     # Summary
     total_errors = sum(len(v) for v in errors_by_file.values())
     total_files = len(errors_by_file)
-    
+
     report.append(f"Total Errors: {total_errors}")
     report.append(f"Files with Errors: {total_files}")
     report.append(f"Average Errors per File: {total_errors/total_files:.1f}")
     report.append("")
-    
+
     # Error Types
     report.append("TOP ERROR TYPES:")
     report.append("-" * 80)
     for error_type, count in sorted(errors_by_type.items(), key=lambda x: -x[1])[:10]:
         report.append(f"  [{error_type}]: {count} occurrences")
     report.append("")
-    
+
     # Files by Error Count (Priority Order)
     report.append("FILES BY ERROR COUNT (Fix Priority):")
     report.append("-" * 80)
     sorted_files = sorted(errors_by_file.items(), key=lambda x: -len(x[1]))
-    
+
     critical = []
     high = []
     medium = []
     low = []
-    
+
     for filepath, errors in sorted_files:
         error_count = len(errors)
         filename = Path(filepath).name
-        
+
         if error_count > 30:
             critical.append((filename, error_count))
         elif error_count > 15:
@@ -85,20 +86,20 @@ def generate_report(errors_by_file: Dict, errors_by_type: Dict):
             medium.append((filename, error_count))
         else:
             low.append((filename, error_count))
-    
+
     # Print by priority
     if critical:
         report.append("🔴 CRITICAL (>30 errors - fix first):")
         for name, count in critical:
             report.append(f"   {name}: {count} errors")
         report.append("")
-    
+
     if high:
         report.append("🟠 HIGH (16-30 errors):")
         for name, count in high:
             report.append(f"   {name}: {count} errors")
         report.append("")
-    
+
     if medium:
         report.append("🟡 MEDIUM (6-15 errors):")
         for name, count in medium[:10]:  # Show top 10
@@ -106,11 +107,11 @@ def generate_report(errors_by_file: Dict, errors_by_type: Dict):
         if len(medium) > 10:
             report.append(f"   ... and {len(medium)-10} more files")
         report.append("")
-    
+
     if low:
         report.append(f"🟢 LOW (<5 errors): {len(low)} files")
         report.append("")
-    
+
     # Recommendations
     report.append("REMEDIATION RECOMMENDATIONS:")
     report.append("-" * 80)
@@ -142,27 +143,29 @@ def generate_report(errors_by_file: Dict, errors_by_type: Dict):
     report.append("4. Import TypedDict for structures:")
     report.append("   from typing import TypedDict")
     report.append("")
-    
+
     return "\n".join(report)
+
 
 def main():
     print("🔍 Running Type Checking Analysis...")
     print("")
-    
+
     directories = ["core", "agents", "utils", "models"]
     output = run_mypy(directories)
-    
+
     errors_by_file, errors_by_type = parse_mypy_output(output)
     report = generate_report(errors_by_file, errors_by_type)
-    
+
     print(report)
-    
+
     # Save to file
     report_path = Path(".archived/status_reports/type_checking_analysis.txt")
     report_path.write_text(report)
     print(f"\n📁 Report saved to: {report_path}")
-    
+
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

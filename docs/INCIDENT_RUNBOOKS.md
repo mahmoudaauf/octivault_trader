@@ -18,8 +18,8 @@ Critical playbooks for on-call incident response.
 
 ## Database is Down
 
-**Severity**: CRITICAL 🔴  
-**Response Time**: < 5 minutes  
+**Severity**: CRITICAL 🔴
+**Response Time**: < 5 minutes
 **Owner**: DevOps Lead
 
 ### Symptoms
@@ -141,8 +141,8 @@ docker logs octivault_trader | grep -i error
 
 ## Trading System Hung
 
-**Severity**: CRITICAL 🔴  
-**Response Time**: < 2 minutes  
+**Severity**: CRITICAL 🔴
+**Response Time**: < 2 minutes
 **Owner**: Backend Lead
 
 ### Symptoms
@@ -254,8 +254,8 @@ done
 
 ## Capital Allocation Failure
 
-**Severity**: CRITICAL 🔴  
-**Response Time**: < 1 minute  
+**Severity**: CRITICAL 🔴
+**Response Time**: < 1 minute
 **Owner**: Trading Lead
 
 ### Symptoms

@@ -88,8 +88,8 @@ python3 capital_health_monitor.py
 ## Bottom Line
 Your system is **NOT BROKEN**—it's accurately showing that your strategy needs **stricter entry filters** and **larger position sizes**.
 
-**Fix:** 3 parameter changes (5 min to code, 30 min to test)  
-**Expected:** Profitability restored in 1-7 days  
+**Fix:** 3 parameter changes (5 min to code, 30 min to test)
+**Expected:** Profitability restored in 1-7 days
 **Risk:** Minimal if you pause first
 
 ---
@@ -100,8 +100,8 @@ Your system is **NOT BROKEN**—it's accurately showing that your strategy needs
 3. **capital_health_monitor.py** - Monitoring tool
 
 ## What Do You Want to Do?
-**A)** Pause trading (play it safe)  
-**B)** Apply fixes live (faster)  
+**A)** Pause trading (play it safe)
+**B)** Apply fixes live (faster)
 **C)** Reset & restart (cleanest)
 
 Tell me and I'll implement it! 🚀

@@ -45,7 +45,7 @@ Capital Allocator (Execution Layer)
    └─ Money locked in when you CLOSE a position
    └─ Example: Bought BTC at $1000, sold at $1050 = +$50 realized
 
-2. UNREALIZED PnL  
+2. UNREALIZED PnL
    └─ Paper gains/losses on OPEN positions
    └─ Example: Bought ETH at $100, now worth $120 = +$20 unrealized
    └─ Not locked in until you sell
@@ -66,7 +66,7 @@ REALIZED PnL Calculation:
 
 UNREALIZED PnL Calculation:
 ├─ Loop through all OPEN positions
-├─ For each: (current_price - entry_price) × quantity  
+├─ For each: (current_price - entry_price) × quantity
 ├─ Sum all = Total Unrealized PnL
 └─ Example: +9 positions mark-to-market
 
@@ -113,7 +113,7 @@ Your system divides capital into **three buckets** that work together:
        ↓               ↓               ↓
    ┌───────┐       ┌───────┐       ┌───────┐
    │  60%  │       │  20%  │       │  20%  │
-   │COMPOUND       │HEALING       │BUFFER 
+   │COMPOUND       │HEALING       │BUFFER
    │BUCKET │       │BUCKET │       │BUCKET │
    └───────┘       └───────┘       └───────┘
       ↓               ↓               ↓
@@ -135,7 +135,7 @@ Your system divides capital into **three buckets** that work together:
 ```
 60% of $84.62 = $50.77 available for top 3 positions
 ├─ Position 1 (EV=85%): ~$20 deployed
-├─ Position 2 (EV=80%): ~$18 deployed  
+├─ Position 2 (EV=80%): ~$18 deployed
 └─ Position 3 (EV=78%): ~$13 deployed
 
 When one position closes with +0.5% profit:
@@ -210,30 +210,30 @@ async def check_and_compound():
     realized_pnl = get_total_realized_profit()  # e.g., +$0.14
     free_capital = get_available_cash()          # e.g., $50.00
     nav = get_current_nav()                      # e.g., $84.62
-    
+
     # Step 2: Check protective gates
     if not await validate_volatility_gate(symbol):
         return  # Too calm, skip
-    
+
     if not await validate_edge_gate(symbol):
         return  # Bad entry, skip
-    
+
     if not await validate_economic_gate(symbol):
         return  # Not profitable enough, skip
-    
+
     # Step 3: Allocate from appropriate bucket
     if realized_pnl > 0:
         compounding_capital = realized_pnl * 0.60  # Reinvest 60% of profits
         healing_capital = realized_pnl * 0.20       # 20% to healing
         buffer_capital = realized_pnl * 0.20        # 20% to buffer
-    
+
     # Step 4: Deploy with constraints
     signal_size = calculate_position_size(
         capital=compounding_capital,
         volatility=market_volatility,
         max_position_limit=2  # Max 2 active
     )
-    
+
     # Step 5: Propose to MetaController (doesn't execute directly)
     await meta_controller.propose_compounding_trade(
         symbol=best_signal,
@@ -251,7 +251,7 @@ The Compounding Engine has THREE gates to prevent fee drain:
 ```
 Requirement: Symbol volatility > 0.45% (24h)
 
-Why: 
+Why:
 ├─ Binance fee: ~0.1% per trade
 ├─ Spread/slippage: ~0.125%
 ├─ Total cost per entry: ~0.225%
@@ -489,7 +489,7 @@ Metrics Updated Every 5 Seconds:
 5. free_capital: ~$9.62
    └─ Available for new trades
 
-6. position_count: 9 
+6. position_count: 9
    └─ Active open positions
 
 7. win_rate: 7/9 (78%)
@@ -575,11 +575,11 @@ Reality check:
 
 ### Your System's Advantage
 
-✅ **Automated:** No manual intervention needed  
-✅ **Protective:** Gates prevent bad trades  
-✅ **Allocating:** Capital flows to best opportunities  
-✅ **Compounding:** Each profit enables bigger trades  
-✅ **Healing:** Recovers from losses intelligently  
+✅ **Automated:** No manual intervention needed
+✅ **Protective:** Gates prevent bad trades
+✅ **Allocating:** Capital flows to best opportunities
+✅ **Compounding:** Each profit enables bigger trades
+✅ **Healing:** Recovers from losses intelligently
 
 ### Next 6 Hours
 
@@ -591,7 +591,6 @@ Based on your test pattern:
 
 ---
 
-**Documentation Date:** May 4, 2026  
-**Test Duration:** 5 hours 43 minutes  
-**System Status:** ✅ COMPOUNDING ACTIVE  
-
+**Documentation Date:** May 4, 2026
+**Test Duration:** 5 hours 43 minutes
+**System Status:** ✅ COMPOUNDING ACTIVE

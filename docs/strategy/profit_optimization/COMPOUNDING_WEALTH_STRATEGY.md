@@ -224,7 +224,7 @@ Month 6: $3,372 → $7,281  (+6,873% cumulative)
 
 ### Step 1: Audit & Identify Bottleneck (Today - 2 hours)
 
-**Where**: `core/signal_generator.py` or equivalent agent files  
+**Where**: `core/signal_generator.py` or equivalent agent files
 **What to find**: Signal trigger thresholds
 
 ```python
@@ -292,7 +292,7 @@ grep "Daily P&L\|Session profit" logs/orchestrator*.log | tail -1
 
 ### Step 4: Enable Profit Optimization (1 hour)
 
-**File**: `core/meta_controller.py`  
+**File**: `core/meta_controller.py`
 **Location**: Lines 2230-2245 (initialization) + 6000-6200 (methods)
 
 ```python
@@ -475,7 +475,7 @@ With proper execution:
 
 ## 🎯 Bottom Line Action
 
-**Your next step**: 
+**Your next step**:
 1. I'll audit the signal generation code
 2. We'll identify what's blocking trades
 3. We'll relax thresholds for 10x frequency

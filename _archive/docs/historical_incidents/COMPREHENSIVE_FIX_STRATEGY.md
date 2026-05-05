@@ -1,9 +1,9 @@
 # 🔧 COMPREHENSIVE FIX STRATEGY: How to Solve the Trading Freeze
 
-**Document:** Complete Solution Guide  
-**Severity:** 🔴 CRITICAL  
-**Estimated Fix Time:** 5-30 minutes  
-**Impact:** System will resume trading immediately after fix  
+**Document:** Complete Solution Guide
+**Severity:** 🔴 CRITICAL
+**Estimated Fix Time:** 5-30 minutes
+**Impact:** System will resume trading immediately after fix
 
 ---
 
@@ -139,8 +139,8 @@ if str(regime).upper() == "MICRO_SNIPER":
         "🚨 [Auto-Recovery] FORCING RECOVERY MODE for dust liquidation"
     )
     success = self.meta_controller.mode_manager.set_mode(
-        "RECOVERY", 
-        force=True, 
+        "RECOVERY",
+        force=True,
         reason="manual_dust_trap_fix"
     )
     if success:
@@ -244,21 +244,21 @@ import asyncio
 async def liquidate_all():
     cfg = Config()
     client = ExchangeClient(cfg)
-    
+
     # Get all positions
     positions = await client.get_open_positions()
     print(f"Found {len(positions)} positions to liquidate")
-    
+
     # Close each one
     for pos in positions:
         symbol = pos['symbol']
         qty = float(pos['qty'])
-        
+
         if qty <= 0:
             continue
-            
+
         print(f"Liquidating {symbol}: {qty} units...")
-        
+
         try:
             # Market sell to close immediately
             result = await client.place_order(
@@ -270,7 +270,7 @@ async def liquidate_all():
             print(f"✓ {symbol} closed: {result}")
         except Exception as e:
             print(f"✗ {symbol} failed: {e}")
-    
+
     print("Liquidation complete!")
 
 asyncio.run(liquidate_all())
@@ -492,7 +492,7 @@ Once trading resumes:
    ```bash
    # Remove from .env
    sed -i '' '/STARTUP_MODE_OVERRIDE/d' .env
-   
+
    # Or just leave it (won't hurt if dust trap detected again)
    ```
 
@@ -536,4 +536,3 @@ Before running Fix #1:
 - [ ] Ready to wait 1-2 minutes for dust liquidation
 
 You're now ready to fix the trading freeze!
-

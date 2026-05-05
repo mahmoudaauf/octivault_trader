@@ -161,13 +161,13 @@ python3 🎯_MASTER_SYSTEM_ORCHESTRATOR.py --duration 2
 
 Watch for these in logs:
 
-✅ `[RECOVERY MODE OVERRIDE] Dust healing ENABLED`  
-✅ `[Meta:DustHealing] ACTIVE in mode=RECOVERY`  
-✅ `[SELL] Liquidating *USDT`  
-✅ `[POSITION FULLY CLOSED]`  
-✅ `[CAPITAL_FLOOR_CHECK] ✓ PASSED`  
-✅ `[Meta:CapitalFloor] ✅ BUYs UNBLOCKED`  
-✅ `[TRADE_INTENT] BUY * prepared`  
+✅ `[RECOVERY MODE OVERRIDE] Dust healing ENABLED`
+✅ `[Meta:DustHealing] ACTIVE in mode=RECOVERY`
+✅ `[SELL] Liquidating *USDT`
+✅ `[POSITION FULLY CLOSED]`
+✅ `[CAPITAL_FLOOR_CHECK] ✓ PASSED`
+✅ `[Meta:CapitalFloor] ✅ BUYs UNBLOCKED`
+✅ `[TRADE_INTENT] BUY * prepared`
 
 ### Expected Metrics Before/After
 
@@ -218,11 +218,10 @@ tail -f logs/8hour_run_session.log | grep -iE "recovery|dust|floor"
 
 ## 📞 SUMMARY
 
-**What's broken:** Dust healing disabled, capital locked  
-**What fixes it:** RECOVERY mode override  
-**How long:** 5 minutes  
-**Risk level:** Very low (reversible)  
-**Success rate:** 95%+  
+**What's broken:** Dust healing disabled, capital locked
+**What fixes it:** RECOVERY mode override
+**How long:** 5 minutes
+**Risk level:** Very low (reversible)
+**Success rate:** 95%+
 
 You've got this! 🚀
-

@@ -1,7 +1,7 @@
 # Last Trade Analysis - May 4, 2026
 
-**Report Generated:** 2026-05-04 01:38  
-**Bot Status:** Running (PID 96511)  
+**Report Generated:** 2026-05-04 01:38
+**Bot Status:** Running (PID 96511)
 **Trading Mode:** LIVE
 
 ---
@@ -18,11 +18,11 @@ The bot has been running since 01:33:31 (PHASE 2 start) but has **NOT executed a
 
 ### Stage 1: Initial Rejection (01:34-01:35)
 
-**Status:** TRADE_REJECTED  
-**Symbol:** SOLUSDT  
-**Side:** BUY  
-**Agent:** MLForecaster  
-**Confidence:** 100%  
+**Status:** TRADE_REJECTED
+**Symbol:** SOLUSDT
+**Side:** BUY
+**Agent:** MLForecaster
+**Confidence:** 100%
 **Reason:** `POSITION_ALREADY_OPEN`
 
 ```
@@ -38,11 +38,11 @@ Error Details:
 
 ### Stage 2: Current Status (01:35+)
 
-**Status:** TRADE_SKIPPED  
-**Symbol:** SOLUSDT  
-**Side:** BUY  
-**Agent:** MLForecaster  
-**Confidence:** 100%  
+**Status:** TRADE_SKIPPED
+**Symbol:** SOLUSDT
+**Side:** BUY
+**Agent:** MLForecaster
+**Confidence:** 100%
 **Reason:** `pretrade_effect_gate:net_pct_below_threshold`
 
 ```
@@ -134,8 +134,8 @@ This could happen if:
 
 ### Current Portfolio State:
 
-**Positions:** 35 (all dust - < $1 each)  
-**Regime:** MICRO_SNIPER (NAV < $1000)  
+**Positions:** 35 (all dust - < $1 each)
+**Regime:** MICRO_SNIPER (NAV < $1000)
 **Kill-Switch:** ACTIVE (blocks new BUYs when portfolio fragmented)
 
 ### Why This Blocks Trading:
@@ -178,7 +178,7 @@ The auto-recovery trigger at system startup may not have:
 
 ```
 1. Auto-recovery detects dust trap
-2. Switches to RECOVERY mode  
+2. Switches to RECOVERY mode
 3. LiquidationAgent starts liquidating dust (every 10 seconds)
 4. Capital freed (dust consolidated)
 5. Position count drops from 35 → < 5
@@ -203,7 +203,7 @@ The auto-recovery trigger at system startup may not have:
 grep -i "auto-recovery\|recovery.*mode\|dust trap" \
   logs/octivault_master_orchestrator.log | head -20
 
-# Check LiquidationAgent activity  
+# Check LiquidationAgent activity
 grep -i "liquidation\|dust.*healer\|position.*closed" \
   logs/octivault_master_orchestrator.log | tail -10
 

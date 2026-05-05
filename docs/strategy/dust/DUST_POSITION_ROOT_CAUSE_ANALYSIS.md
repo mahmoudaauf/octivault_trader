@@ -1,7 +1,7 @@
 # 🔍 WHY DUST POSITIONS ARE CREATED - ROOT CAUSE ANALYSIS
 
-**Date:** April 27, 2026  
-**Status:** ROOT CAUSE IDENTIFIED  
+**Date:** April 27, 2026
+**Status:** ROOT CAUSE IDENTIFIED
 **Severity:** CRITICAL - Prevents profitable trading
 
 ---
@@ -31,7 +31,7 @@ This is a **sequential timing issue**, not a configuration issue.
    └─ ✅ Position registered
    └─ 📊 Value calculated: qty × price
    └─ ⚠️ **VALUE COMPARISON WITH significant_floor happens HERE**
-   
+
 4. Classification at record_fill (shared_state.py:6041-6046)
    ├─ Calculate: position_value = qty × price
    ├─ Get: significant_floor (default: $20-25 USDT)
@@ -118,7 +118,7 @@ SIGNIFICANT_POSITION_FLOOR = 20.0 # What qualifies as significant
 
 **Problem:** Entry floor ($10) is MUCH lower than significant floor ($20)
 
-Entry approval checks: `entry_quote >= 10`  
+Entry approval checks: `entry_quote >= 10`
 Dust classification checks: `value >= 20`
 
 Gap = **$10 difference** where positions can fall through!
@@ -134,18 +134,18 @@ Gap = **$10 difference** where positions can fall through!
 ```python
 async def record_fill(self, symbol: str, side: str, qty: float, price: float, ...):
     # ... filling logic ...
-    
+
     current_qty = float(pos.get("quantity", 0.0) or 0.0)
     significant_floor = float(await self.get_significant_position_floor(symbol) or 0.0)
     position_value = float(current_qty * price) if current_qty > 0 and price > 0 else 0.0
-    
+
     # ⚠️ THIS IS WHERE DUST DECISION IS MADE:
     is_significant = bool(position_value >= significant_floor and position_value > 0.0)
-    
+
     if not is_significant:
         pos["state"] = PositionState.DUST_LOCKED.value  # ← DUST CREATED HERE
         pos["status"] = "DUST"
-        
+
         self.record_dust(  # ← RECORDED IN DUST REGISTRY
             symbol,
             current_qty,
@@ -169,7 +169,7 @@ async def _build_decisions(self, accepted_symbols_set: set):
         strategy_floor,
         min_entry,  # ← Often 12-24 USDT
     )
-    
+
     # Filter BUY signals: reject if planned_quote < significant_position_usdt
     # But this checks PLANNED quote, not POST-FILL value!
 ```
@@ -184,7 +184,7 @@ async def validate_entry_will_not_be_dust(symbol, planned_quote, current_price):
     """MISSING: This check is never performed"""
     estimated_qty = planned_quote / current_price
     min_notional = await get_symbol_min_notional(symbol)
-    
+
     # After fees/rounding, will position be significant?
     # THIS IS NOT CHECKED ANYWHERE IN THE CODEBASE
     pass
@@ -246,45 +246,45 @@ async def _validate_entry_will_be_significant(
 ) -> Tuple[bool, str]:
     """
     PREVENT dust creation at the source.
-    
+
     Validate that after fill, position value will be >= significant floor
     accounting for:
     - Price volatility (±2% buffer)
     - Rounding (lot step)
     - Fees (exchange % deduction)
-    
+
     Returns: (is_valid, reason)
     """
     sym = self._norm_symbol(symbol)
-    
+
     # 1. Get exchange filters for rounding
     filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
     step_size, _, _, _, _ = self._extract_filter_vals(filters)
-    
+
     # 2. Calculate quantity with rounding
     raw_qty = planned_quote / current_price
     rounded_qty = self._apply_lot_step(raw_qty, step_size)
-    
+
     # 3. Account for fees (typical -0.1%)
     fee_pct = 0.001  # 0.1% exchange fee
     qty_after_fee = rounded_qty * (1.0 - fee_pct)
-    
+
     # 4. Conservative worst-case: price down 2%
     worst_price = current_price * 0.98
-    
+
     # 5. Calculate worst-case value
     worst_value = qty_after_fee * worst_price
-    
+
     # 6. Get significant floor
     significant_floor = await self.shared_state.get_significant_position_floor(sym)
-    
+
     # 7. Validate
     is_valid = worst_value >= significant_floor
     reason = (
         f"OK: {worst_value:.2f} >= {significant_floor:.2f}" if is_valid
         else f"DUST_RISK: worst_case={worst_value:.2f} < floor={significant_floor:.2f}"
     )
-    
+
     return is_valid, reason
 ```
 
@@ -315,37 +315,37 @@ async def _calculate_dust_safe_quantity(
 ) -> float:
     """
     Calculate quantity that WILL be significant after fill.
-    
+
     Adds 10% buffer to account for:
     - Fee deductions
     - Price slippage
     - Rounding down
     """
     sym = self._norm_symbol(symbol)
-    
+
     # Step 1: Get constraints
     filters = await self.exchange_client.ensure_symbol_filters_ready(sym)
     step_size, _, _, _, _ = self._extract_filter_vals(filters)
     significant_floor = await self.shared_state.get_significant_position_floor(sym)
-    
+
     # Step 2: Calculate with 10% buffer
     buffer_quote = planned_quote * 1.10  # 10% extra to account for slippage/fees
     raw_qty = buffer_quote / current_price
-    
+
     # Step 3: Round to lot step
     rounded_qty = self._apply_lot_step(raw_qty, step_size)
-    
+
     # Step 4: Verify it's still meaningful
     post_fee_qty = rounded_qty * 0.999  # 0.1% fee
     final_value = post_fee_qty * current_price
-    
+
     if final_value < significant_floor:
         self.logger.warning(
             f"[DUST_SAFE_QTY] {symbol}: calculated qty would be dust. "
             f"Aborting: value={final_value:.2f} < floor={significant_floor:.2f}"
         )
         return 0.0  # Signal to reject this entry
-    
+
     return rounded_qty
 ```
 
@@ -356,7 +356,7 @@ async def _calculate_dust_safe_quantity(
 ```python
 async def record_fill(self, symbol: str, side: str, qty: float, price: float, ...):
     # ... existing logic ...
-    
+
     if current_qty > 0 and not is_significant:
         # NEW: Log warning with diagnostic data
         self.logger.warning(
@@ -369,7 +369,7 @@ async def record_fill(self, symbol: str, side: str, qty: float, price: float, ..
             price,
             position_value,
         )
-        
+
         # NEW: Check if this was predictable
         if hasattr(self, '_last_planned_quote'):
             last_planned = self._last_planned_quote.get(symbol, 0.0)

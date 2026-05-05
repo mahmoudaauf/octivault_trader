@@ -14,30 +14,25 @@ ROOT CAUSE:
 - Solution: Replace with NAV-percentage-based tiered reserve system
 """
 
-from typing import Dict, Tuple, Optional
-from decimal import Decimal, ROUND_DOWN
-
+from decimal import Decimal
 
 # ============================================================================
 # PART 1: DYNAMIC RESERVE CALCULATION (replaces fixed $2.00)
 # ============================================================================
 
-def calculate_dynamic_reserve(
-    nav: float,
-    cfg: dict,
-    logger=None
-) -> float:
+
+def calculate_dynamic_reserve(nav: float, cfg: dict, logger=None) -> float:
     """
     Calculate NAV-based reserve with tiered percentages.
-    
+
     This replaces the hardcoded $2.00 reserve in line 766 with a dynamic
     percentage-based system that scales with account size.
-    
+
     Reserve Tiers:
     - NAV < $50 (MICRO):     20% reserve (safety for small accounts)
     - NAV $50-$200 (SMALL):  15% reserve (moderate accounts)
     - NAV >= $200 (NORMAL):  10% reserve (larger accounts)
-    
+
     Args:
         nav: Net Asset Value in USDT
         cfg: Config dict containing:
@@ -47,14 +42,14 @@ def calculate_dynamic_reserve(
             - RESERVE_MIN_USDT (default 1.00)
             - RESERVE_MAX_USDT (default NAV * 0.40)
         logger: Optional logger instance
-    
+
     Returns:
         Dynamic reserve amount in USDT
-        
+
     Example:
         >>> calculate_dynamic_reserve(84.55, cfg)
         16.91  # 20% of $84.55 for micro tier
-        
+
     Previous:
         >>> default_bootstrap_reserve  # Hardcoded
         2.0    # Same for all account sizes - WRONG
@@ -65,7 +60,7 @@ def calculate_dynamic_reserve(
     reserve_pct_normal = cfg.get("RESERVE_PCT_NORMAL", 0.10)
     reserve_min = cfg.get("RESERVE_MIN_USDT", 1.00)
     reserve_max = cfg.get("RESERVE_MAX_USDT", nav * 0.40)
-    
+
     # Select percentage tier based on NAV
     if nav < 50:
         tier = "MICRO"
@@ -76,20 +71,20 @@ def calculate_dynamic_reserve(
     else:
         tier = "NORMAL"
         reserve_pct = reserve_pct_normal
-    
+
     # Calculate dynamic reserve
     dynamic_reserve = nav * reserve_pct
-    
+
     # Apply bounds
     bounded_reserve = max(reserve_min, min(reserve_max, dynamic_reserve))
-    
+
     if logger:
         logger.debug(
             f"Dynamic reserve calc: NAV=${nav:.2f}, tier={tier}, "
             f"pct={reserve_pct*100:.0f}%, dynamic=${dynamic_reserve:.2f}, "
             f"bounded=${bounded_reserve:.2f}"
         )
-    
+
     return bounded_reserve
 
 
@@ -97,23 +92,20 @@ def calculate_dynamic_reserve(
 # PART 2: 60/20/20 CAPITAL ALLOCATION SPLIT
 # ============================================================================
 
-def allocate_capital_60_20_20(
-    free_usdt: float,
-    cfg: dict,
-    logger=None
-) -> Dict[str, float]:
+
+def allocate_capital_60_20_20(free_usdt: float, cfg: dict, logger=None) -> dict[str, float]:
     """
     Split allocatable capital into 60/20/20 tiers.
-    
+
     After reserve is deducted from NAV, the remaining allocatable capital
     is split across three distinct budgets:
     - 60% → Trading Core (BTC/ETH main strategies)
     - 20% → Trading Alts (growth/emerging coins)
     - 20% → Dust Healing (recovery/liquidation)
-    
+
     This ensures dust healing operations get guaranteed budget floor,
     preventing starvation when trading signals compete.
-    
+
     Args:
         free_usdt: Allocatable capital (after reserve) in USDT
         cfg: Config dict containing:
@@ -121,7 +113,7 @@ def allocate_capital_60_20_20(
             - ALLOC_PCT_ALTS (default 0.20)
             - ALLOC_PCT_DUST (default 0.20)
         logger: Optional logger instance
-    
+
     Returns:
         Dict with keys:
         {
@@ -130,7 +122,7 @@ def allocate_capital_60_20_20(
             'dust_healing': float,      # 20% - Dust liquidation
             'effective_trading': float  # 80% - Total trading budget
         }
-        
+
     Example:
         >>> allocate_capital_60_20_20(67.64, cfg)
         {
@@ -139,7 +131,7 @@ def allocate_capital_60_20_20(
             'dust_healing': 13.53,      # 20% of $67.64
             'effective_trading': 54.11  # 60% + 20%
         }
-        
+
     Previous:
         >>> # No explicit allocation tiers
         # System used: 100% trading / 0% dust healing
@@ -149,34 +141,34 @@ def allocate_capital_60_20_20(
     pct_core = cfg.get("ALLOC_PCT_CORE", 0.60)
     pct_alts = cfg.get("ALLOC_PCT_ALTS", 0.20)
     pct_dust = cfg.get("ALLOC_PCT_DUST", 0.20)
-    
+
     # Normalize percentages to ensure they sum to 1.0
     total_pct = pct_core + pct_alts + pct_dust
     if abs(total_pct - 1.0) > 0.01:  # Tolerance for rounding
         pct_core = pct_core / total_pct
         pct_alts = pct_alts / total_pct
         pct_dust = pct_dust / total_pct
-    
+
     # Calculate allocations using Decimal for precision
     free_decimal = Decimal(str(free_usdt))
     core = float(free_decimal * Decimal(str(pct_core)))
     alts = float(free_decimal * Decimal(str(pct_alts)))
     dust = float(free_decimal * Decimal(str(pct_dust)))
-    
+
     allocation = {
-        'trading_core': core,
-        'trading_alts': alts,
-        'dust_healing': dust,
-        'effective_trading': core + alts,
+        "trading_core": core,
+        "trading_alts": alts,
+        "dust_healing": dust,
+        "effective_trading": core + alts,
     }
-    
+
     if logger:
         logger.debug(
             f"60/20/20 split: Free=${free_usdt:.2f} → "
             f"Core=${core:.2f}(60%) + Alts=${alts:.2f}(20%) + "
             f"Dust=${dust:.2f}(20%)"
         )
-    
+
     return allocation
 
 
@@ -184,33 +176,34 @@ def allocate_capital_60_20_20(
 # PART 3: MASTER ORCHESTRATOR FUNCTION
 # ============================================================================
 
+
 async def allocate_with_nav_dynamics(
     self,  # CapitalAllocator instance
     nav: float,
     free_usdt: float,
-    mode: str = "NORMAL"
-) -> Dict[str, any]:
+    mode: str = "NORMAL",
+) -> dict[str, any]:
     """
     Master allocation orchestrator combining dynamic reserve + 60/20/20 split.
-    
+
     This is the main entry point for capital allocation decisions. It:
     1. Calculates dynamic reserve based on NAV
     2. Deducts reserve from free_usdt to get allocatable
     3. Splits allocatable into 60/20/20 tiers
     4. Determines trading mode (MICRO, NORMAL, GROWTH)
     5. Returns complete allocation structure
-    
+
     This replaces the old allocation logic that used:
     - Fixed $2.00 reserve (line 766)
     - No explicit dust healing allocation
     - No trading tier separation
-    
+
     Args:
         self: CapitalAllocator instance with logger and config
         nav: Current Net Asset Value in USDT
         free_usdt: Free capital available in USDT
         mode: Trading mode ("NORMAL", "RECOVERY", "GROWTH")
-    
+
     Returns:
         Complete allocation dict:
         {
@@ -224,14 +217,14 @@ async def allocate_with_nav_dynamics(
             'capital_floor_met': bool,     # >= min_agent_budget
             'allocation_mode': str,        # LOCKED/RESTRICTED/FULL
         }
-        
+
     Example:
         >>> allocation = await allocate_with_nav_dynamics(
         ...     self, nav=84.55, free_usdt=8.73
         ... )
         >>> allocation['dust_healing']
         1.75  # Can now liquidate dust with budget floor!
-        
+
     Previous:
         >>> # Old logic would return:
         >>> {'trading': 8.73, 'dust_healing': 0}  # Dust starved!
@@ -239,16 +232,16 @@ async def allocate_with_nav_dynamics(
     # Get config
     cfg = self._cfg  # or however configs are accessed
     min_agent_budget = cfg.get("MIN_AGENT_BUDGET", 10.0)
-    
+
     # Step 1: Calculate dynamic reserve
     reserve = calculate_dynamic_reserve(nav, cfg, self.logger)
-    
+
     # Step 2: Calculate allocatable (free capital after reserve)
     allocatable = max(0, free_usdt - reserve)
-    
+
     # Step 3: Determine capital floor status
-    capital_floor_met = (free_usdt >= min_agent_budget)
-    
+    capital_floor_met = free_usdt >= min_agent_budget
+
     # Step 4: Determine allocation mode
     if not capital_floor_met:
         allocation_mode = "LOCKED"  # Can't trade, must liquidate dust
@@ -256,18 +249,18 @@ async def allocate_with_nav_dynamics(
         allocation_mode = "RESTRICTED"  # Limited trading
     else:
         allocation_mode = "FULL"  # Normal operation
-    
+
     # Step 5: Split allocatable if we have room
     if allocatable > 0:
         split = allocate_capital_60_20_20(allocatable, cfg, self.logger)
     else:
         split = {
-            'trading_core': 0,
-            'trading_alts': 0,
-            'dust_healing': 0,
-            'effective_trading': 0,
+            "trading_core": 0,
+            "trading_alts": 0,
+            "dust_healing": 0,
+            "effective_trading": 0,
         }
-    
+
     # Step 6: Determine mode based on NAV
     if nav < 50:
         trading_mode = "MICRO"
@@ -275,20 +268,20 @@ async def allocate_with_nav_dynamics(
         trading_mode = "NORMAL"
     else:
         trading_mode = "GROWTH"
-    
+
     # Step 7: Assemble complete allocation
     allocation = {
-        'reserve': reserve,
-        'allocatable': allocatable,
-        'trading_core': split['trading_core'],
-        'trading_alts': split['trading_alts'],
-        'dust_healing': split['dust_healing'],
-        'effective_trading': split['effective_trading'],
-        'mode': trading_mode,
-        'capital_floor_met': capital_floor_met,
-        'allocation_mode': allocation_mode,
+        "reserve": reserve,
+        "allocatable": allocatable,
+        "trading_core": split["trading_core"],
+        "trading_alts": split["trading_alts"],
+        "dust_healing": split["dust_healing"],
+        "effective_trading": split["effective_trading"],
+        "mode": trading_mode,
+        "capital_floor_met": capital_floor_met,
+        "allocation_mode": allocation_mode,
     }
-    
+
     if self.logger:
         self.logger.info(
             f"NAV Allocation: NAV=${nav:.2f}, Free=${free_usdt:.2f}, "
@@ -297,7 +290,7 @@ async def allocate_with_nav_dynamics(
             f"Split=${split['trading_core']:.2f}/"
             f"${split['trading_alts']:.2f}/${split['dust_healing']:.2f}"
         )
-    
+
     return allocation
 
 

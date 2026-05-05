@@ -189,7 +189,7 @@ TrendHunter                              │  subscribers
   ├─ _publish_trade_intent()    →     ├─ Notify listeners
   │                                    │
   └─ [events.trade.intent]            └─ Store in history
-                                          
+
 ExecutionManager                                                       Dashboard
   ├─ _emit_execution_event()    →     [Various Event Types]      →    _consume_events()
   │                                    ├─ TradeIntent                  └─ Display metrics
@@ -212,7 +212,7 @@ INCOMING DATA:                      STATEMANAGER (L3)              OUTGOING STAT
 Order Fills from Binance  →  update_position()         →  SharedState.positions
   ├─ symbol                   ├─ Add/modify/remove pos    ├─ {symbol: {qty, avg_price}}
   ├─ qty                      └─ Update NAV               └─ Updated every fill
-  └─ price                    
+  └─ price
 
 Price Updates (L2)         →  recalculate_nav()         →  SharedState.nav
   ├─ BTCUSDT: 78,500           ├─ Sum all positions        ├─ NAV = $87.29

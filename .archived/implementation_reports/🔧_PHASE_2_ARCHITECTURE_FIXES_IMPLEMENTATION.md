@@ -1,9 +1,9 @@
 # 🔧 Phase 2: Critical Architecture Fixes - Implementation Plan
 
-**Date:** April 10, 2026  
-**Status:** ✅ IN PROGRESS  
-**Target:** Address 5 critical architecture issues identified in Phase 2 review  
-**Priority:** CRITICAL  
+**Date:** April 10, 2026
+**Status:** ✅ IN PROGRESS
+**Target:** Address 5 critical architecture issues identified in Phase 2 review
+**Priority:** CRITICAL
 
 ---
 
@@ -12,7 +12,7 @@
 The comprehensive code review (Phase 2) identified **5 critical architecture issues** that impact system reliability, maintainability, and safety:
 
 1. **MetaController Monolithic Size** (16,827 lines, 246 methods) - 🔴 CRITICAL
-2. **Dual State Management** (race condition risk) - 🟠 HIGH  
+2. **Dual State Management** (race condition risk) - 🟠 HIGH
 3. **Limited Error Recovery** (no retry logic) - 🟡 MEDIUM
 4. **No Health Checks on Startup** (silent failures) - 🟡 MEDIUM
 5. **Signal Cache Not Persistent** (data loss on restart) - 🟡 MEDIUM
@@ -119,17 +119,17 @@ core/lifecycle_manager.py
 class MetaController:
     def __init__(self, ...):
         # Contains all initialization
-        
+
     # 80+ bootstrap methods
     def _is_bootstrap_mode(self): ...
     def _bootstrap_dust_bypass_allowed(self): ...
     # ... many more
-    
+
     # 100+ arbitration methods
     def _apply_gates(self): ...
     def _policy_evaluation(self): ...
     # ... many more
-    
+
     # 60+ lifecycle methods
     def _set_lifecycle(self): ...
     def _get_lifecycle(self): ...
@@ -143,11 +143,11 @@ class MetaController:
         self.bootstrap_mgr = BootstrapManager(...)
         self.arbitration = ArbitrationEngine(...)
         self.lifecycle = LifecycleManager(...)
-    
+
     async def evaluate_once(self):
         """Orchestration logic (delegating to handlers)"""
         signal = self.signal_manager.get_next()
-        
+
         # Check bootstrap mode
         if self.bootstrap_mgr.is_bootstrap_mode(signal):
             result = await self.bootstrap_mgr.apply_logic(signal)
@@ -156,10 +156,10 @@ class MetaController:
             approved = self.arbitration.evaluate_signal(signal)
             if approved:
                 result = await self.execute(signal)
-        
+
         # Update lifecycle
         self.lifecycle.update_state(signal.symbol, result)
-        
+
         return result
 ```
 
@@ -222,21 +222,21 @@ class MetaController:
 ```python
 class StateSynchronizer:
     """Reconciles SharedState and MetaController state."""
-    
+
     def __init__(self, shared_state, meta_controller):
         self.shared_state = shared_state
         self.meta_controller = meta_controller
         self.logger = logging.getLogger("StateSynchronizer")
-    
+
     async def reconcile_all(self) -> Dict[str, Any]:
         """Full state reconciliation."""
         mismatches = {}
-        
+
         # Check symbol lifecycle consistency
         for symbol in self.shared_state.symbols:
             shared_lifecycle = self.shared_state.get_symbol_state(symbol)
             meta_lifecycle = self.meta_controller.lifecycle.get_state(symbol)
-            
+
             if shared_lifecycle != meta_lifecycle:
                 self.logger.warning(
                     f"State mismatch for {symbol}: "
@@ -247,14 +247,14 @@ class StateSynchronizer:
                     'meta': meta_lifecycle,
                     'source_of_truth': 'shared'  # Shared is authoritative
                 }
-                
+
                 # Reconcile: use SharedState as source of truth
                 self.meta_controller.lifecycle.set_state(
-                    symbol, 
+                    symbol,
                     shared_lifecycle,
                     force=True
                 )
-        
+
         # Check position counts
         shared_positions = len(self.shared_state.positions)
         meta_positions = self.meta_controller.position_count
@@ -267,14 +267,14 @@ class StateSynchronizer:
                 'shared': shared_positions,
                 'meta': meta_positions,
             }
-        
+
         return mismatches
-    
+
     async def verify_capital_consistency(self) -> bool:
         """Verify capital allocation is consistent."""
         # Implementation...
         pass
-    
+
     async def verify_position_tracking(self) -> bool:
         """Verify positions match between states."""
         # Implementation...
@@ -287,10 +287,10 @@ class MetaController:
     def __init__(self, app_context):
         # ... existing init ...
         self.state_sync = StateSynchronizer(
-            self.shared_state, 
+            self.shared_state,
             self
         )
-    
+
     async def run_cycle(self):
         """Main execution cycle."""
         # Every 5th cycle (~50 seconds), reconcile states
@@ -298,7 +298,7 @@ class MetaController:
             mismatches = await self.state_sync.reconcile_all()
             if mismatches:
                 self.logger.info(f"State reconciliation: {len(mismatches)} fixes applied")
-        
+
         # ... rest of cycle ...
 ```
 
@@ -377,13 +377,13 @@ class RetryConfig:
 
 class RetryManager:
     """Manages retry logic for operations."""
-    
+
     def __init__(self, config: RetryConfig = None):
         self.config = config or RetryConfig()
         self.logger = logging.getLogger("RetryManager")
         self.failed_queue = deque()
         self.retry_counts = {}
-    
+
     async def execute_with_retry(
         self,
         operation,
@@ -394,19 +394,19 @@ class RetryManager:
         """Execute operation with automatic retry on failure."""
         attempt = 0
         last_error = None
-        
+
         while attempt < self.config.max_attempts:
             try:
                 result = await operation(*args, **kwargs)
-                
+
                 # Clear retry count on success
                 self.retry_counts[operation_name] = 0
                 return result
-                
+
             except ExecutionError as e:
                 last_error = e
                 attempt += 1
-                
+
                 # Check if error is retryable
                 if e.error_type not in self.config.retryable_errors:
                     self.logger.warning(
@@ -414,7 +414,7 @@ class RetryManager:
                         f"{e.error_type} - {e.message}"
                     )
                     raise  # Don't retry non-retryable errors
-                
+
                 # Calculate backoff
                 if attempt < self.config.max_attempts:
                     delay_ms = min(
@@ -423,21 +423,21 @@ class RetryManager:
                         ),
                         self.config.max_delay_ms,
                     )
-                    
+
                     self.logger.info(
                         f"Retry {attempt}/{self.config.max_attempts} "
                         f"for {operation_name} "
                         f"in {delay_ms}ms"
                     )
-                    
+
                     await asyncio.sleep(delay_ms / 1000.0)
-        
+
         # All retries exhausted
         self.logger.error(
             f"All {self.config.max_attempts} retries failed "
             f"for {operation_name}: {last_error}"
         )
-        
+
         # Queue for dead letter processing
         self.failed_queue.append({
             'operation': operation_name,
@@ -447,13 +447,13 @@ class RetryManager:
             'timestamp': datetime.datetime.now(timezone.utc),
             'attempts': attempt,
         })
-        
+
         raise last_error
-    
+
     def get_failed_operations(self) -> List[Dict]:
         """Get list of failed operations."""
         return list(self.failed_queue)
-    
+
     def clear_failed_operations(self):
         """Clear failed operations queue."""
         self.failed_queue.clear()
@@ -465,13 +465,13 @@ class ExecutionManager:
     def __init__(self, app_context):
         # ... existing init ...
         self.retry_manager = RetryManager()
-    
+
     async def place_order(self, intent):
         """Place order with retry logic."""
         async def _place():
             # Original order placement logic
             return await self._execute_order(intent)
-        
+
         try:
             result = await self.retry_manager.execute_with_retry(
                 _place,
@@ -556,12 +556,12 @@ class HealthCheckResult:
 
 class HealthCheckManager:
     """Manages health checks for all components."""
-    
+
     def __init__(self, app_context):
         self.app_context = app_context
         self.logger = logging.getLogger("HealthCheckManager")
         self.results = []
-    
+
     async def check_all_critical(self) -> bool:
         """Run all critical health checks. Returns True if all pass."""
         checks = [
@@ -571,44 +571,44 @@ class HealthCheckManager:
             self._check_agent_manager,
             self._check_market_data,
         ]
-        
+
         results = []
         for check in checks:
             try:
                 result = await check()
                 results.append(result)
-                
+
                 status_icon = "✅" if result.status == HealthStatus.HEALTHY else "⚠️"
                 self.logger.info(
                     f"{status_icon} {result.component}: {result.message}"
                 )
-                
+
             except Exception as e:
                 self.logger.error(f"Health check for failed: {e}")
                 return False
-        
+
         # All critical checks passed?
         all_healthy = all(
-            r.status == HealthStatus.HEALTHY 
+            r.status == HealthStatus.HEALTHY
             for r in results
         )
-        
+
         if not all_healthy:
             unhealthy = [r for r in results if r.status != HealthStatus.HEALTHY]
             self.logger.error(
                 f"Health checks failed for: {[u.component for u in unhealthy]}"
             )
             return False
-        
+
         return True
-    
+
     async def _check_database(self) -> HealthCheckResult:
         """Check database connectivity."""
         try:
             db_manager = self.app_context.database_manager
             # Try a simple query
             await db_manager.ping()
-            
+
             return HealthCheckResult(
                 component="DatabaseManager",
                 status=HealthStatus.HEALTHY,
@@ -622,14 +622,14 @@ class HealthCheckManager:
                 message=f"Database check failed: {e}",
                 timestamp=datetime.datetime.now(timezone.utc),
             )
-    
+
     async def _check_exchange_client(self) -> HealthCheckResult:
         """Check exchange API connectivity."""
         try:
             exchange = self.app_context.exchange_client
             # Get account info (validates API key)
             account = await exchange.get_account()
-            
+
             if not account or 'balances' not in account:
                 return HealthCheckResult(
                     component="ExchangeClient",
@@ -637,7 +637,7 @@ class HealthCheckManager:
                     message="Invalid account data returned",
                     timestamp=datetime.datetime.now(timezone.utc),
                 )
-            
+
             return HealthCheckResult(
                 component="ExchangeClient",
                 status=HealthStatus.HEALTHY,
@@ -652,12 +652,12 @@ class HealthCheckManager:
                 message=f"Exchange check failed: {e}",
                 timestamp=datetime.datetime.now(timezone.utc),
             )
-    
+
     async def _check_shared_state(self) -> HealthCheckResult:
         """Check shared state initialization."""
         try:
             shared_state = self.app_context.shared_state
-            
+
             # Check required state is populated
             if not shared_state.nav or shared_state.nav <= 0:
                 return HealthCheckResult(
@@ -666,7 +666,7 @@ class HealthCheckManager:
                     message="NAV not set or zero",
                     timestamp=datetime.datetime.now(timezone.utc),
                 )
-            
+
             return HealthCheckResult(
                 component="SharedState",
                 status=HealthStatus.HEALTHY,
@@ -680,13 +680,13 @@ class HealthCheckManager:
                 message=f"State check failed: {e}",
                 timestamp=datetime.datetime.now(timezone.utc),
             )
-    
+
     async def _check_agent_manager(self) -> HealthCheckResult:
         """Check agent manager initialization."""
         try:
             agent_mgr = self.app_context.agent_manager
             agent_count = len(agent_mgr.agents)
-            
+
             if agent_count == 0:
                 return HealthCheckResult(
                     component="AgentManager",
@@ -694,7 +694,7 @@ class HealthCheckManager:
                     message="No agents registered",
                     timestamp=datetime.datetime.now(timezone.utc),
                 )
-            
+
             return HealthCheckResult(
                 component="AgentManager",
                 status=HealthStatus.HEALTHY,
@@ -708,12 +708,12 @@ class HealthCheckManager:
                 message=f"Agent check failed: {e}",
                 timestamp=datetime.datetime.now(timezone.utc),
             )
-    
+
     async def _check_market_data(self) -> HealthCheckResult:
         """Check market data feed."""
         try:
             market_data = self.app_context.market_data_feed
-            
+
             # Check if any prices loaded
             if not market_data.latest_prices or len(market_data.latest_prices) == 0:
                 return HealthCheckResult(
@@ -722,7 +722,7 @@ class HealthCheckManager:
                     message="No market prices available yet",
                     timestamp=datetime.datetime.now(timezone.utc),
                 )
-            
+
             return HealthCheckResult(
                 component="MarketData",
                 status=HealthStatus.HEALTHY,
@@ -743,17 +743,17 @@ class HealthCheckManager:
 async def initialize_all(self):
     """Initialize all components and verify health."""
     # ... existing initialization code ...
-    
+
     # Add health check after initialization
     health_mgr = HealthCheckManager(self)
     all_healthy = await health_mgr.check_all_critical()
-    
+
     if not all_healthy:
         raise RuntimeError(
             "Critical health checks failed during startup. "
             "See logs for details."
         )
-    
+
     self.logger.info("✅ All health checks passed. System ready.")
 ```
 
@@ -815,11 +815,11 @@ Add persistent storage:
 ```python
 class SignalStore:
     """Persistent storage for signals."""
-    
+
     def __init__(self, database_manager):
         self.db = database_manager
         self.logger = logging.getLogger("SignalStore")
-    
+
     async def store_signal(self, signal: Dict[str, Any]) -> None:
         """Store signal in database."""
         try:
@@ -834,7 +834,7 @@ class SignalStore:
             })
         except Exception as e:
             self.logger.error(f"Failed to store signal: {e}")
-    
+
     async def get_signals_by_symbol(
         self,
         symbol: str,
@@ -842,7 +842,7 @@ class SignalStore:
     ) -> List[Dict[str, Any]]:
         """Get signals for a symbol in last N hours."""
         start_time = datetime.datetime.now(timezone.utc) - datetime.timedelta(hours=hours)
-        
+
         return await self.db.query(
             'signals',
             where={
@@ -851,7 +851,7 @@ class SignalStore:
             },
             order_by='created_at DESC',
         )
-    
+
     async def cleanup_expired(self) -> int:
         """Remove expired signals. Returns count deleted."""
         now = datetime.datetime.now(timezone.utc)
@@ -866,17 +866,17 @@ class SignalManager:
         self._cache = BoundedCache(max_size=1000, default_ttl=300.0)
         self._signal_store = SignalStore(app_context.database_manager)
         self.logger = logging.getLogger("SignalManager")
-    
+
     async def cache_signal(self, signal: Dict[str, Any]) -> None:
         """Cache signal in memory and persist to database."""
         key = f"{signal['symbol']}_{signal['source_agent']}_{int(time.time())}"
-        
+
         # Store in memory
         self._cache.set(key, signal, ttl=300.0)
-        
+
         # Persist to database (async, fire-and-forget)
         asyncio.create_task(self._signal_store.store_signal(signal))
-    
+
     async def get_signal_history(
         self,
         symbol: str,
@@ -1014,7 +1014,7 @@ class SignalManager:
 
 ---
 
-**Document Version:** 1.0  
-**Author:** Architecture Review Team  
-**Date:** April 10, 2026  
+**Document Version:** 1.0
+**Author:** Architecture Review Team
+**Date:** April 10, 2026
 **Status:** Implementation Plan Ready

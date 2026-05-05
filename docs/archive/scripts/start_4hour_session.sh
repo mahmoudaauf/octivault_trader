@@ -44,19 +44,19 @@ print_error() {
 cleanup() {
     echo ""
     print_warning "Received interrupt signal - shutting down gracefully..."
-    
+
     if [ ! -z "$TRADING_PID" ]; then
         print_info "Stopping trading system (PID: $TRADING_PID)..."
         kill $TRADING_PID 2>/dev/null || true
         sleep 2
     fi
-    
+
     if [ ! -z "$MONITOR_PID" ]; then
         print_info "Stopping monitor (PID: $MONITOR_PID)..."
         kill $MONITOR_PID 2>/dev/null || true
         sleep 1
     fi
-    
+
     print_success "Session terminated gracefully"
     exit 0
 }

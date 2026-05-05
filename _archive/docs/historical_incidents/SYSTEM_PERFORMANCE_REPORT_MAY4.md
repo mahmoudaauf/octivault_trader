@@ -1,6 +1,6 @@
 # 🔍 SYSTEM PERFORMANCE REPORT - May 4, 2026
 
-**Generated:** After restart with Fixes #1-4 applied  
+**Generated:** After restart with Fixes #1-4 applied
 **Status:** ⚠️ TRADING BLOCKED (Kill-Switch Active) - Portfolio Healing Required
 
 ---
@@ -198,6 +198,6 @@ All fixes are production-ready and committed. Just need to:
 
 ---
 
-**Current NAV:** $41.70  
-**Target NAV:** $50+ (after consolidation)  
+**Current NAV:** $41.70
+**Target NAV:** $50+ (after consolidation)
 **Status:** Healthy system in protection mode (working as designed)

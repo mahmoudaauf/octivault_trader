@@ -1,23 +1,23 @@
 # dashboard.py
 
-from fastapi import FastAPI, Depends, HTTPException, Query
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
 import os
-from collections import defaultdict
-from src.l0_core.shared_state import SharedState
-from src.l7_observability.performance_monitor import PerformanceMonitor
-from src.l6_governance.capital_allocator import CapitalAllocator
-from src.l4_execution.execution_manager import ExecutionManager
-from src.l7_observability.health_check import (
-    initialize_health_checker,
-    get_health_checker,
-    health_endpoint,
-    ready_endpoint,
-    live_endpoint,
-    deep_status_endpoint,
-)
+
 from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from src.l0_core.shared_state import SharedState
+from src.l4_execution.execution_manager import ExecutionManager
+from src.l6_governance.capital_allocator import CapitalAllocator
+from src.l7_observability.health_check import (
+    deep_status_endpoint,
+    health_endpoint,
+    initialize_health_checker,
+    live_endpoint,
+    ready_endpoint,
+)
+from src.l7_observability.performance_monitor import PerformanceMonitor
 
 load_dotenv()
 
@@ -25,9 +25,11 @@ load_dotenv()
 TOKEN = os.getenv("DASHBOARD_TOKEN", "octivault-secret")
 security = HTTPBearer()
 
+
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if credentials.credentials != TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized access")
+
 
 # Initialize FastAPI App
 app = FastAPI(title="Octivault Trader Dashboard", docs_url="/docs")
@@ -47,13 +49,14 @@ performance_monitor: PerformanceMonitor = None
 capital_allocator: CapitalAllocator = None
 execution_manager: ExecutionManager = None
 
+
 def initialize_dashboard(state, perf_monitor, cap_alloc, exec_mgr):
     global shared_state, performance_monitor, capital_allocator, execution_manager
     shared_state = state
     performance_monitor = perf_monitor
     capital_allocator = cap_alloc
     execution_manager = exec_mgr
-    
+
     # Initialize health checker
     initialize_health_checker()
 
@@ -61,6 +64,7 @@ def initialize_dashboard(state, perf_monitor, cap_alloc, exec_mgr):
 # ═══════════════════════════════════════════════════════════════════════════════
 # P9: HEALTH CHECK ENDPOINTS (Kubernetes-compatible, no auth required)
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 @app.get("/health", tags=["health"])
 async def health():
@@ -104,6 +108,7 @@ async def full_status():
 # DASHBOARD ENDPOINTS (Auth required)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @app.get("/dashboard", dependencies=[Depends(verify_token)])
 async def get_dashboard():
     # Per-symbol view
@@ -130,9 +135,11 @@ async def get_dashboard():
         "kpi_metrics": shared_state.kpi_metrics,
     }
 
+
 @app.get("/trades", dependencies=[Depends(verify_token)])
 async def get_trade_log(limit: int = 20):
     return shared_state.trade_log[-limit:]
+
 
 @app.get("/agents", dependencies=[Depends(verify_token)])
 async def get_agents(symbol: str = Query(None)):
@@ -145,7 +152,7 @@ async def get_agents(symbol: str = Query(None)):
                 "ROI": sym_scores.get("ROI", 0),
                 "Sharpe": sym_scores.get("Sharpe", 0),
                 "win_rate": sym_scores.get("win_rate", 0),
-                "trades_per_hour": sym_scores.get("trades_per_hour", 0)
+                "trades_per_hour": sym_scores.get("trades_per_hour", 0),
             }
         else:
             result[agent] = {
@@ -154,9 +161,10 @@ async def get_agents(symbol: str = Query(None)):
                 "Sharpe": scores.get("Sharpe", 0),
                 "win_rate": scores.get("win_rate", 0),
                 "trades_per_hour": scores.get("trades_per_hour", 0),
-                "by_symbol": scores.get("symbols", {})  # nested data
+                "by_symbol": scores.get("symbols", {}),  # nested data
             }
     return result
+
 
 @app.get("/performance", dependencies=[Depends(verify_token)])
 async def get_performance_summary():
@@ -164,8 +172,9 @@ async def get_performance_summary():
         "total_profit": performance_monitor.total_profit,
         "profit_by_symbol": performance_monitor.profit_by_symbol,
         "equity_curve": performance_monitor.equity_curve,
-        "global_KPIs": shared_state.kpi_metrics
+        "global_KPIs": shared_state.kpi_metrics,
     }
+
 
 @app.get("/health", tags=["Health"])
 async def health_check():

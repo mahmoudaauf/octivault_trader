@@ -3,10 +3,10 @@ Quick Win Metrics Collection Module
 Lightweight metrics tracking for OCTI AI BOT performance monitoring
 """
 
-from collections import defaultdict, deque
-from typing import Dict, Any, Optional
-import time
 import logging
+import time
+from collections import defaultdict, deque
+from typing import Any, Optional
 
 
 class MetricsCollector:
@@ -14,65 +14,62 @@ class MetricsCollector:
     Lightweight metrics collector for tracking system performance.
     Thread-safe for async operations.
     """
-    
+
     def __init__(self, max_samples: int = 1000):
         self.logger = logging.getLogger(__name__)
         self.max_samples = max_samples
-        
+
         # Counters
-        self.counters: Dict[str, int] = defaultdict(int)
-        
+        self.counters: dict[str, int] = defaultdict(int)
+
         # Gauges (current values)
-        self.gauges: Dict[str, float] = {}
-        
+        self.gauges: dict[str, float] = {}
+
         # Histograms (time series data)
-        self.histograms: Dict[str, deque] = defaultdict(lambda: deque(maxlen=max_samples))
-        
+        self.histograms: dict[str, deque] = defaultdict(lambda: deque(maxlen=max_samples))
+
         # Timers (for measuring durations)
-        self._timer_starts: Dict[str, float] = {}
-        
+        self._timer_starts: dict[str, float] = {}
+
         self.start_time = time.time()
-        
+
     def increment(self, metric_name: str, value: int = 1) -> None:
         """Increment a counter metric."""
         self.counters[metric_name] += value
-        
+
     def set_gauge(self, metric_name: str, value: float) -> None:
         """Set a gauge metric to a specific value."""
         self.gauges[metric_name] = value
-        
+
     def record_value(self, metric_name: str, value: float) -> None:
         """Record a value in a histogram."""
-        self.histograms[metric_name].append({
-            "timestamp": time.time(),
-            "value": value
-        })
-        
+        self.histograms[metric_name].append({"timestamp": time.time(), "value": value})
+
     def start_timer(self, metric_name: str) -> None:
         """Start a timer for measuring duration."""
         self._timer_starts[metric_name] = time.time()
-        
+
     def stop_timer(self, metric_name: str) -> Optional[float]:
         """Stop a timer and record the duration."""
         if metric_name not in self._timer_starts:
             return None
-            
+
         duration = time.time() - self._timer_starts[metric_name]
         del self._timer_starts[metric_name]
-        
+
         # Record in histogram
         self.record_value(f"{metric_name}_duration_seconds", duration)
         return duration
-        
-    def get_summary(self) -> Dict[str, Any]:
+
+    def get_summary(self) -> dict[str, Any]:
         """Get a summary of all metrics."""
         summary = {
             "uptime_seconds": time.time() - self.start_time,
             "counters": dict(self.counters),
             "gauges": dict(self.gauges),
-            "histograms": {}
+            "histograms": {},
         }
-        
+
         # Add histogram statistics
         for name, values in self.histograms.items():
             if values:
@@ -82,11 +79,11 @@ class MetricsCollector:
                     "min": min(vals),
                     "max": max(vals),
                     "avg": sum(vals) / len(vals),
-                    "latest": vals[-1] if vals else None
+                    "latest": vals[-1] if vals else None,
                 }
-                
+
         return summary
-        
+
     def get_metric(self, metric_name: str) -> Optional[Any]:
         """Get a specific metric value."""
         if metric_name in self.counters:
@@ -96,7 +93,7 @@ class MetricsCollector:
         elif metric_name in self.histograms:
             return list(self.histograms[metric_name])
         return None
-        
+
     def reset(self) -> None:
         """Reset all metrics."""
         self.counters.clear()
@@ -104,7 +101,7 @@ class MetricsCollector:
         self.histograms.clear()
         self._timer_starts.clear()
         self.start_time = time.time()
-        
+
     def log_summary(self, level: int = logging.INFO) -> None:
         """Log a summary of metrics."""
         summary = self.get_summary()
@@ -151,15 +148,15 @@ def stop_timer(metric_name: str) -> Optional[float]:
 
 class TimerContext:
     """Context manager for timing code blocks."""
-    
+
     def __init__(self, metric_name: str):
         self.metric_name = metric_name
         self.start_time = None
-        
+
     def __enter__(self):
         self.start_time = time.time()
         return self
-        
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         duration = time.time() - self.start_time
         record_value(f"{self.metric_name}_duration_seconds", duration)

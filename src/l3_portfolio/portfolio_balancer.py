@@ -1,13 +1,11 @@
 # core/portfolio_balancer.py
+import asyncio
 import logging
 import math
-import asyncio
-from typing import Dict, List, Tuple, Optional, Any
 from types import SimpleNamespace
+from typing import Any, Optional
 
-from utils.hyg_guards import compute_tradable_qty, enforce_min_entry_quote, enforce_fee_safety
-from src.l0_core.stubs import MetaPolicy, TradeIntent, ExecOrder
-from src.l0_core.stubs import maybe_await, maybe_call
+from src.l0_core.stubs import maybe_call
 
 logger = logging.getLogger("PortfolioBalancer")
 
@@ -17,8 +15,8 @@ def _default_pcfg():
         ENABLE_BALANCER=False,
         REBALANCE_INTERVAL_SEC=300,
         N_MAX_POSITIONS=8,
-        METHOD="equal_weight",              # or "risk_parity"
-        MIN_TARGET_MULTIPLIER=1.0,          # x * minNotional
+        METHOD="equal_weight",  # or "risk_parity"
+        MIN_TARGET_MULTIPLIER=1.0,  # x * minNotional
         COOLDOWN_AFTER_REBALANCE_SEC=900,
         FEE_SAFETY_MULTIPLIER=5.0,
         MIN_ENTRY_QUOTE_USDT=20.0,
@@ -26,7 +24,15 @@ def _default_pcfg():
 
 
 class PortfolioBalancer:
-    def __init__(self, shared_state, exchange_client, execution_manager, config, meta_controller=None, **kwargs):
+    def __init__(
+        self,
+        shared_state,
+        exchange_client,
+        execution_manager,
+        config,
+        meta_controller=None,
+        **kwargs,
+    ):
         self.ss = shared_state
         self.ex = exchange_client
         self.exec = execution_manager
@@ -57,10 +63,10 @@ class PortfolioBalancer:
             val = pcfg.get(key)
         else:
             val = getattr(pcfg, key, None)
-        
+
         if val is not None:
             return val
-            
+
         # 3. Final fallback to top-level config or default
         if isinstance(self.cfg, dict):
             return self.cfg.get(key, default)
@@ -109,14 +115,14 @@ class PortfolioBalancer:
             notl = f
         return {
             "lot": {
-                "stepSize": float(lot.get("stepSize", lot.get("step_size", "0.000001")) or "0.000001"),
+                "stepSize": float(
+                    lot.get("stepSize", lot.get("step_size", "0.000001")) or "0.000001"
+                ),
                 "minQty": float(lot.get("minQty", lot.get("min_qty", 0.0)) or 0.0),
             },
             "notional": {
-                "minNotional": float(
-                    notl.get("minNotional", notl.get("min_notional", 0.0)) or 0.0
-                )
-            }
+                "minNotional": float(notl.get("minNotional", notl.get("min_notional", 0.0)) or 0.0)
+            },
         }
 
     async def run(self):
@@ -157,7 +163,7 @@ class PortfolioBalancer:
             logger.info("[Balancer] Disabled — exiting task cleanly.")
             await self._emit_health("DEGRADED", "Disabled")
             return
-        
+
         await self._emit_health("OK", f"Running (interval={self.rebalance_interval}s)")
         while not self._stop_event.is_set():
             try:
@@ -179,18 +185,24 @@ class PortfolioBalancer:
         try:
             ss = self.ss
             if ss:
-                await maybe_call(ss, "emit_event", "HealthStatus", {
-                    "component": self.component,
-                    "level": level,
-                    "details": {"message": message},
-                    "ts": self._iso_now(),
-                })
+                await maybe_call(
+                    ss,
+                    "emit_event",
+                    "HealthStatus",
+                    {
+                        "component": self.component,
+                        "level": level,
+                        "details": {"message": message},
+                        "ts": self._iso_now(),
+                    },
+                )
         except Exception:
             pass
 
     @staticmethod
     def _iso_now():
         from datetime import datetime
+
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
     async def run_once(self):
@@ -203,9 +215,9 @@ class PortfolioBalancer:
             return
 
         # 1) snapshot
-        positions: Dict[str, Dict] = await maybe_call(self.ss, "get_positions_snapshot")
-        accepted: Dict[str, Any] = await maybe_call(self.ss, "get_accepted_symbols")
-        
+        positions: dict[str, dict] = await maybe_call(self.ss, "get_positions_snapshot")
+        accepted: dict[str, Any] = await maybe_call(self.ss, "get_accepted_symbols")
+
         # Combine existing positions and candidate accepted symbols
         all_candidates = set(positions.keys()) | set(accepted.keys())
         if not all_candidates:
@@ -214,7 +226,7 @@ class PortfolioBalancer:
 
         symbols = list(all_candidates)
         # 2) prices
-        prices: Dict[str, float] = await maybe_call(self.ss, "get_all_prices")
+        prices: dict[str, float] = await maybe_call(self.ss, "get_all_prices")
 
         # 3) filters
         async def _one(sym):
@@ -225,8 +237,8 @@ class PortfolioBalancer:
                 logger.warning(f"[Balancer] Failed to fetch filters for {sym}: {e}")
                 return sym, {}
 
-        filters_pairs: List[Tuple[str, Dict]] = await asyncio.gather(*[_one(s) for s in symbols])
-        filters: Dict[str, Dict] = {s: f or {} for s, f in filters_pairs}
+        filters_pairs: list[tuple[str, dict]] = await asyncio.gather(*[_one(s) for s in symbols])
+        filters: dict[str, dict] = {s: f or {} for s, f in filters_pairs}
 
         # 4) ATR (optional)
         try:
@@ -237,9 +249,12 @@ class PortfolioBalancer:
         # metrics update (may be sync)
         try:
             dust, tradable = self._classify_dust(symbols, positions, prices, filters)
-            await maybe_call(self.ss, "update_portfolio_metrics",
-                             dust_count=len(dust),
-                             dust_quote=self._quote_sum(dust, prices))
+            await maybe_call(
+                self.ss,
+                "update_portfolio_metrics",
+                dust_count=len(dust),
+                dust_quote=self._quote_sum(dust, prices),
+            )
         except Exception:
             dust, tradable = self._classify_dust(symbols, positions, prices, filters)
             pass  # non-fatal
@@ -279,7 +294,12 @@ class PortfolioBalancer:
             # Cooldown logic (Best effort, usually checked by Meta/Risk too)
             try:
                 if hasattr(self.ss, "was_recently_rebalanced"):
-                    if await maybe_call(self.ss, "was_recently_rebalanced", symbol, self._cfg("COOLDOWN_AFTER_REBALANCE_SEC", 900)):
+                    if await maybe_call(
+                        self.ss,
+                        "was_recently_rebalanced",
+                        symbol,
+                        self._cfg("COOLDOWN_AFTER_REBALANCE_SEC", 900),
+                    ):
                         continue
             except Exception:
                 pass
@@ -290,12 +310,12 @@ class PortfolioBalancer:
                 continue
 
             trade_quote = qty_rounded * price
-            
+
             # P9: Instead of direct execution, we build a TradeIntent
             intent = {
                 "symbol": symbol,
                 "action": side,
-                "confidence": 1.0, # Balancer intents are high-conv policy
+                "confidence": 1.0,  # Balancer intents are high-conv policy
                 "planned_qty": qty_rounded if side == "SELL" else None,
                 "planned_quote": trade_quote if side == "BUY" else None,
                 "agent": self.component,
@@ -314,7 +334,7 @@ class PortfolioBalancer:
                     # Fallback to shared_state event bus for all intents
                     for it in intents:
                         await maybe_call(self.ss, "emit_event", "TradeIntent", it)
-                
+
                 # Success bookkeeping
                 await self._emit_health("OK", f"Submitted {len(intents)} intents")
             except Exception as e:
@@ -325,17 +345,25 @@ class PortfolioBalancer:
 
     # --- helpers: classify, select, targets, diff, rounding ---
 
-    def _should_skip(self, tradable: Dict[str, Dict], prices: Dict[str, float]) -> bool:
+    def _should_skip(self, tradable: dict[str, dict], prices: dict[str, float]) -> bool:
         if not tradable:
             logger.info("[Balancer] No tradable positions — skipping.")
             return True
         miss = [s for s in tradable if not prices.get(s)]
         if miss and len(miss) / max(1, len(tradable)) > 0.5:
-            logger.info(f"[Balancer] Too many missing prices ({len(miss)}/{len(tradable)}) — skipping.")
+            logger.info(
+                f"[Balancer] Too many missing prices ({len(miss)}/{len(tradable)}) — skipping."
+            )
             return True
         return False
 
-    def _classify_dust(self, candidates: List[str], positions: Dict[str, Dict], prices: Dict[str, float], filters: Dict[str, Dict]):
+    def _classify_dust(
+        self,
+        candidates: list[str],
+        positions: dict[str, dict],
+        prices: dict[str, float],
+        filters: dict[str, dict],
+    ):
         dust, tradable = {}, {}
         for s in candidates:
             p = positions.get(s, {"current_qty": 0.0, "quantity": 0.0})
@@ -344,12 +372,12 @@ class PortfolioBalancer:
             step = nf["lot"]["stepSize"]
             min_notional = nf["notional"]["minNotional"]
             qty = self._floor_step(p.get("current_qty", p.get("quantity", 0.0)), step)
-            
+
             # If price is missing, we can't trade it
             if price is None:
                 continue
-                
-            is_dust = (qty * float(price) < min_notional)
+
+            is_dust = qty * float(price) < min_notional
             if is_dust and qty > 0:
                 dust[s] = p
             else:
@@ -371,22 +399,22 @@ class PortfolioBalancer:
             except Exception:
                 pass
             scored.append((score, s))
-        
+
         scored.sort(reverse=True, key=lambda x: x[0])
         top_n = [s for _, s in scored[:N]]
-        
+
         # P9 Violation Fix: Avoid direct mutation. Emit event instead for others to consume.
         try:
-             await maybe_call(self.ss, "emit_event", "BalancerTargetsUpdated", {"symbols": top_n})
+            await maybe_call(self.ss, "emit_event", "BalancerTargetsUpdated", {"symbols": top_n})
         except Exception:
             pass
-            
+
         return top_n
 
     async def _compute_targets(self, keep, prices, filters, atr):
         method = self.method
         min_mult = self.min_target_multiplier
-        targets: Dict[str, float] = {}
+        targets: dict[str, float] = {}
         try:
             val = await maybe_call(self.ss, "get_nav_quote")
             nav_quote = float(val) if val is not None else 0.0
@@ -399,7 +427,9 @@ class PortfolioBalancer:
             exposure = 0.0
 
         if nav_quote <= 0 or exposure <= 0 or not keep:
-            logger.info(f"[Balancer] Skipping targets: nav={nav_quote}, exposure={exposure}, keep_len={len(keep)}")
+            logger.info(
+                f"[Balancer] Skipping targets: nav={nav_quote}, exposure={exposure}, keep_len={len(keep)}"
+            )
             return targets
 
         if method == "equal_weight":
@@ -435,7 +465,11 @@ class PortfolioBalancer:
 
             cur_qty = float(tradable.get(s, {}).get("qty_rounded", 0.0))
             tgt_quote = float(targets.get(s, 0.0))
-            tgt_qty = self._floor_step((tgt_quote / price), step) if price and step else (tgt_quote / price if price else 0.0)
+            tgt_qty = (
+                self._floor_step((tgt_quote / price), step)
+                if price and step
+                else (tgt_quote / price if price else 0.0)
+            )
             delta = tgt_qty - cur_qty
             if abs(delta) < max(step, 1e-18):
                 continue
@@ -453,7 +487,10 @@ class PortfolioBalancer:
 
     @staticmethod
     def _quote_sum(positions, prices):
-        return sum((positions[s].get("current_qty", 0.0) or 0.0) * (prices.get(s) or 0.0) for s in positions)
+        return sum(
+            (positions[s].get("current_qty", 0.0) or 0.0) * (prices.get(s) or 0.0)
+            for s in positions
+        )
 
     @staticmethod
     def _norm(x):
@@ -461,6 +498,3 @@ class PortfolioBalancer:
             return max(-1.0, min(1.0, x / 0.05))
         except Exception:
             return 0.0
-
-
-

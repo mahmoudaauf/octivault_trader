@@ -2,10 +2,10 @@
 
 ## Executive Summary
 
-**Period:** 2:00 AM - 7:15 AM (5 hours 15 minutes)  
-**Trades Executed:** 0  
-**Trades Skipped:** 100+ (primarily SOLUSDT BUY signals)  
-**Trades Rejected:** 0  
+**Period:** 2:00 AM - 7:15 AM (5 hours 15 minutes)
+**Trades Executed:** 0
+**Trades Skipped:** 100+ (primarily SOLUSDT BUY signals)
+**Trades Rejected:** 0
 **Status:** All trades blocked by capital/profitability gates ⚠️
 
 ---
@@ -30,7 +30,7 @@ The system is correctly functioning, but **capital constraints prevent all trade
 - **Problem:** Expected profit percentage too low
 - **Why:** Position sizes constrained by capital starvation
 - **Effect:** All signals rejected because expected_profit < 0.0960% threshold
-- **Example:** 
+- **Example:**
   - Signal: SOLUSDT BUY (confidence: 100%)
   - Planned quote: ~$27 USDT
   - Issue: Too small for expected profit to meet threshold
@@ -38,7 +38,7 @@ The system is correctly functioning, but **capital constraints prevent all trade
 **Status:** ❌ All trades blocked
 
 #### Phase 2: 2:12 - 2:15 AM
-**Reason:** `economic_guard` 
+**Reason:** `economic_guard`
 
 - **Problem:** Economic conditions not favorable
 - **Why:** Capital-constrained position sizes generate minimal expected returns
@@ -82,7 +82,7 @@ Planned Quote: $26.84 - $28.87 (increasing slightly)
 Primary Reason: pretrade_effect_gate:net_pct_below_threshold
 Status: ❌ ALL SKIPPED (20 consecutive)
 ```
-**Analysis:** 
+**Analysis:**
 - System generating signals (confidence 100%)
 - Profitability threshold not met due to small position sizes
 - Capital floor protecting against unprofitable trades ✅
@@ -107,7 +107,7 @@ Symbol: SOLUSDT (still repeating)
 Side: BUY (still repeating)
 Agent: MLForecaster (still generating)
 Confidence: 100% (still strong)
-Primary Reason: 
+Primary Reason:
   - pretrade_effect_gate:net_usdt_below_threshold
   - pretrade_effect_gate:net_pct_below_threshold
 Status: ❌ ALL SKIPPED (50+)
@@ -262,11 +262,11 @@ The trading bot is functioning **exactly as designed**:
 Despite **zero trades executing**, the system is functioning **optimally**:
 
 ### What This Shows:
-✅ Safety gates are active and protecting capital  
-✅ Signal generation is continuous and strong (100% confidence)  
-✅ Dust healing is priority #1 (ongoing)  
-✅ System won't take unprofitable trades (smart)  
-✅ Capital preservation is working (no erosion)  
+✅ Safety gates are active and protecting capital
+✅ Signal generation is continuous and strong (100% confidence)
+✅ Dust healing is priority #1 (ongoing)
+✅ System won't take unprofitable trades (smart)
+✅ Capital preservation is working (no erosion)
 
 ### System Status: 🟢 HEALTHY & PROTECTED
 
@@ -300,19 +300,18 @@ The 0 executed trades are **NOT a failure** - they're evidence of working safety
 
 **The 2:00 AM - 7:15 AM period shows:**
 
-✅ System is working correctly  
-✅ Safety gates preventing bad trades  
-✅ Dust healing proceeding as planned  
-✅ Capital protection mechanisms active  
-✅ Ready to resume trading once constraints lift  
+✅ System is working correctly
+✅ Safety gates preventing bad trades
+✅ Dust healing proceeding as planned
+✅ Capital protection mechanisms active
+✅ Ready to resume trading once constraints lift
 
 **This is expected behavior for a micro-cap dust recovery scenario.** No action needed - system is protecting itself and will resume trading when capital becomes available.
 
 ---
 
-**Analysis Period:** 2:00 AM - 7:15 AM (5h 15m)  
-**Signal Quality:** Excellent (100% confidence)  
-**Trade Execution:** Blocked (capital/profitability)  
-**System Health:** ✅ EXCELLENT  
+**Analysis Period:** 2:00 AM - 7:15 AM (5h 15m)
+**Signal Quality:** Excellent (100% confidence)
+**Trade Execution:** Blocked (capital/profitability)
+**System Health:** ✅ EXCELLENT
 **Safety Status:** ✅ ALL ACTIVE
-

@@ -13,12 +13,12 @@
 
 Your Octi AI Trading Bot is actively:
 
-### 1. **Trading Generation** 
+### 1. **Trading Generation**
 ```
 Market Data → Signal Agents → Meta Controller → Execution → Profits Captured
 ```
 - ✅ **SwingTradeHunter**: Analyzing 1-hour candles for swing signals
-- ✅ **TrendHunter**: Identifying trend-based entry/exit opportunities  
+- ✅ **TrendHunter**: Identifying trend-based entry/exit opportunities
 - ✅ **MLForecaster**: Running indicator-based predictions
 
 ### 2. **Profit Management**
@@ -218,7 +218,7 @@ Example:
   Entry: Buy 0.01 BTC at $75,000 = $750 invested
   Current: BTC at $75,500 = $755
   Unrealized profit = ($75,500 - $75,000) × 0.01 = +$5 (0.67%)
-  
+
   When sold at $75,500:
   Realized profit = $5 (capital now available to reinvest)
 ```
@@ -228,10 +228,10 @@ Example:
 ```
 Hour 1: Start with $100
   - Trade 1: Profit +$2 → Available capital now $102
-  
-Hour 2: Start with $102  
+
+Hour 2: Start with $102
   - Trade 2: Profit +$2.04 (applied to bigger base) → Available capital now $104.04
-  
+
 Hour 3: Start with $104.04
   - Trade 3: Profit +$2.08 (even bigger base!) → Final $106.12
 
@@ -319,10 +319,10 @@ echo "Rejected Orders: $(grep -c 'REJECTED\|blocked' /tmp/octivault_master_orche
 
 ### If You See an Error:
 ```
-❌ "SELL_DYNAMIC_EDGE_MIN" 
+❌ "SELL_DYNAMIC_EDGE_MIN"
 → Not enough profit margin to exit trade. System waiting for better price.
 
-❌ "REJECTED" 
+❌ "REJECTED"
 → Trade was proposed but risk checks failed. Strategy preserving capital.
 
 ❌ "blocked"
@@ -377,7 +377,7 @@ kill -TERM <PID>
 - ✅ Reinvestment visible in capital growth
 
 ### Excellent (Outstanding):
-- ✅ 10+ trades executed  
+- ✅ 10+ trades executed
 - ✅ Win rate 70%+
 - ✅ +2-5% ROI in 3 hours
 - ✅ Clear compounding effect
@@ -419,7 +419,7 @@ Continuous Loop (Every 10 seconds):
   6. Monitor positions for exits
   7. Collect profits → Available for reinvestment
   8. Repeat with slightly larger capital base
-  
+
 Result: Exponential growth from reinvestment compounding
 ```
 
@@ -446,4 +446,3 @@ Result: Exponential growth from reinvestment compounding
 **Session Active Until:** ~23:12 UTC (approximately)
 
 Good luck! 🚀📈
-

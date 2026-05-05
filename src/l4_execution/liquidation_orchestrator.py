@@ -1,8 +1,10 @@
 import asyncio
 import logging
-import time
 import os
-from typing import Any, Dict, Optional, List, Callable
+import time
+from collections.abc import Callable
+from typing import Any, Optional
+
 
 class LiquidationOrchestrator:
     """
@@ -59,7 +61,7 @@ class LiquidationOrchestrator:
 
         # guardrails
         self._planner_timeout_s = float(planner_timeout_s)
-        self._tasks: Dict[str, Optional[asyncio.Task]] = {}
+        self._tasks: dict[str, Optional[asyncio.Task]] = {}
         self._running = asyncio.Event()
 
         # internal ticks
@@ -67,9 +69,9 @@ class LiquidationOrchestrator:
         self._t_last_rebalance = 0.0
 
         # completion callbacks (e.g., to refresh meta/cash state)
-        self._on_completed: List[Callable[[Dict[str, Any]], None]] = []
+        self._on_completed: list[Callable[[dict[str, Any]], None]] = []
 
-        self._last_action: Dict[str, Any] = {}  # for health surfacing
+        self._last_action: dict[str, Any] = {}  # for health surfacing
         self._rebalance_fail_streak = 0
         self._rebalance_skip_until = 0.0
         self._started_once = False
@@ -81,7 +83,11 @@ class LiquidationOrchestrator:
 
         self.log.info(
             "[%s] initialized floors/targets: min_usdt_floor=%.2f, min_usdt_target=%.2f, liq_batch_target=%.2f (cash_router=%s)",
-            self.name, self.min_usdt_floor, self.min_usdt_target, self.liq_batch_target_usdt, bool(self.cash)
+            self.name,
+            self.min_usdt_floor,
+            self.min_usdt_target,
+            self.liq_batch_target_usdt,
+            bool(self.cash),
         )
 
     # ----------------- lifecycle -----------------
@@ -95,8 +101,13 @@ class LiquidationOrchestrator:
         # schedule periodic heartbeat
         if not self._tasks.get("hb") or self._tasks["hb"].done():
             self._tasks["hb"] = asyncio.create_task(self._heartbeat_loop(interval_s=30))
-        self.log.info("[%s] started (loop=%ss, probe=%ss, rebalance=%ss)",
-                      self.name, self.loop_interval_s, self.free_usdt_probe_interval_s, self.rebalance_interval_s)
+        self.log.info(
+            "[%s] started (loop=%ss, probe=%ss, rebalance=%ss)",
+            self.name,
+            self.loop_interval_s,
+            self.free_usdt_probe_interval_s,
+            self.rebalance_interval_s,
+        )
 
     async def start(self, interval_s: int = 15):
         """
@@ -112,7 +123,7 @@ class LiquidationOrchestrator:
         # schedule the async starter if not already running
         if not self._tasks.get("bootstrap") or self._tasks["bootstrap"].done():
             self._tasks["bootstrap"] = asyncio.create_task(self._async_start())
-        
+
         self.log.info("[%s] start() scheduled (async bootstrap)", self.name)
 
     async def stop(self):
@@ -122,7 +133,9 @@ class LiquidationOrchestrator:
                 t.cancel()
         if self._tasks:
             try:
-                await asyncio.gather(*[t for t in self._tasks.values() if t], return_exceptions=True)
+                await asyncio.gather(
+                    *[t for t in self._tasks.values() if t], return_exceptions=True
+                )
             except Exception:
                 pass
         self._tasks.clear()
@@ -143,7 +156,7 @@ class LiquidationOrchestrator:
                 self.log.debug("[ORCH] heartbeat emit failed", exc_info=True)
             await asyncio.sleep(interval_s)
 
-    def health(self) -> Dict[str, Any]:
+    def health(self) -> dict[str, Any]:
         ready = self._running.is_set()
         ops_ready = False
         try:
@@ -177,8 +190,8 @@ class LiquidationOrchestrator:
         *,
         min_usdt_floor: Optional[float] = None,
         min_usdt_target: Optional[float] = None,
-        liq_batch_target_usdt: Optional[float] = None
-    ) -> Dict[str, float]:
+        liq_batch_target_usdt: Optional[float] = None,
+    ) -> dict[str, float]:
         """
         Dynamically update key thresholds. Returns the effective values.
         """
@@ -188,10 +201,19 @@ class LiquidationOrchestrator:
             self.min_usdt_target = float(min_usdt_target)
         if liq_batch_target_usdt is not None:
             self.liq_batch_target_usdt = float(liq_batch_target_usdt)
-        self._last_action = {"type": "reconfig", "floor": self.min_usdt_floor, "target": self.min_usdt_target,
-                             "batch": self.liq_batch_target_usdt, "ts": time.time()}
-        self.log.info("[ORCH] thresholds updated: floor=%.4f target=%.4f batch=%.4f",
-                      self.min_usdt_floor, self.min_usdt_target, self.liq_batch_target_usdt)
+        self._last_action = {
+            "type": "reconfig",
+            "floor": self.min_usdt_floor,
+            "target": self.min_usdt_target,
+            "batch": self.liq_batch_target_usdt,
+            "ts": time.time(),
+        }
+        self.log.info(
+            "[ORCH] thresholds updated: floor=%.4f target=%.4f batch=%.4f",
+            self.min_usdt_floor,
+            self.min_usdt_target,
+            self.liq_batch_target_usdt,
+        )
         return {
             "min_usdt_floor": self.min_usdt_floor,
             "min_usdt_target": self.min_usdt_target,
@@ -206,7 +228,7 @@ class LiquidationOrchestrator:
         if callable(cb):
             self._on_completed.append(cb)
 
-    def _notify_completed(self, context: Optional[Dict[str, Any]] = None):
+    def _notify_completed(self, context: Optional[dict[str, Any]] = None):
         for cb in list(self._on_completed):
             try:
                 cb(context or {})
@@ -232,7 +254,7 @@ class LiquidationOrchestrator:
         confidence: float = 0.9,
         ttl_sec: float = 90.0,
         tag: str = "liquidation",
-        agent: Optional[str] = None
+        agent: Optional[str] = None,
     ) -> dict:
         """
         Build a TradeIntent-like payload as a plain dict to avoid hard dependency on a specific dataclass.
@@ -266,7 +288,6 @@ class LiquidationOrchestrator:
         except Exception:
             self.log.debug("[ORCH] emit_event(TradeIntent) failed", exc_info=True)
 
-
     async def trigger_liquidity(
         self,
         *,
@@ -274,7 +295,7 @@ class LiquidationOrchestrator:
         required_usdt: Optional[float] = None,
         free_usdt: Optional[float] = None,
         gap_usdt: Optional[float] = None,
-        reason: str = "INSUFFICIENT_QUOTE"
+        reason: str = "INSUFFICIENT_QUOTE",
     ) -> dict:
         """
         Public API used by AppContext / Readiness checks.
@@ -292,9 +313,15 @@ class LiquidationOrchestrator:
         if isinstance(res, dict):
             return res
         # Back-compat: if old float is returned, normalize
-        return {"ok": bool(res and res > 0.0), "freed": float(res or 0.0), "status": "OK" if (res and res > 0.0) else "NOOP"}
+        return {
+            "ok": bool(res and res > 0.0),
+            "freed": float(res or 0.0),
+            "status": "OK" if (res and res > 0.0) else "NOOP",
+        }
 
-    async def _free_usdt_now(self, target: float, reason: str, free_before: Optional[float] = None) -> dict:
+    async def _free_usdt_now(
+        self, target: float, reason: str, free_before: Optional[float] = None
+    ) -> dict:
         """
         Ask CashRouter first to ensure target free USDT; fall back to LiquidationAgent to PROPOSE liquidation intents (no direct execution here).
         Throttled and single-flight guarded so only one free operation can run at a time.
@@ -302,24 +329,57 @@ class LiquidationOrchestrator:
                   "submitted": int, "approx_quote": float, "status": "OK"|"NOOP"|"THROTTLED"|"FAILED"}
         """
         if target <= 0:
-            return {"ok": False, "freed": 0.0, "path": "none", "submitted": 0, "approx_quote": 0.0, "status": "NOOP"}
+            return {
+                "ok": False,
+                "freed": 0.0,
+                "path": "none",
+                "submitted": 0,
+                "approx_quote": 0.0,
+                "status": "NOOP",
+            }
 
         try:
             target = max(0.0, float(target))
         except Exception:
-            return {"ok": False, "freed": 0.0, "path": "none", "submitted": 0, "approx_quote": 0.0, "status": "FAILED"}
+            return {
+                "ok": False,
+                "freed": 0.0,
+                "path": "none",
+                "submitted": 0,
+                "approx_quote": 0.0,
+                "status": "FAILED",
+            }
 
         now = time.monotonic()
         if (now - self._last_free_attempt_ts) < self._min_gap_sec_between_free:
-            self.log.debug("[ORCH] skip free_usdt (throttled %.1fs)", self._min_gap_sec_between_free)
-            return {"ok": False, "freed": 0.0, "path": "none", "submitted": 0, "approx_quote": 0.0, "status": "THROTTLED"}
+            self.log.debug(
+                "[ORCH] skip free_usdt (throttled %.1fs)", self._min_gap_sec_between_free
+            )
+            return {
+                "ok": False,
+                "freed": 0.0,
+                "path": "none",
+                "submitted": 0,
+                "approx_quote": 0.0,
+                "status": "THROTTLED",
+            }
 
         async with self._freeing_lock:
             # Re-check after acquiring the lock
             now = time.monotonic()
             if (now - self._last_free_attempt_ts) < self._min_gap_sec_between_free:
-                self.log.debug("[ORCH] skip free_usdt (throttled %.1fs after lock)", self._min_gap_sec_between_free)
-                return {"ok": False, "freed": 0.0, "path": "none", "submitted": 0, "approx_quote": 0.0, "status": "THROTTLED"}
+                self.log.debug(
+                    "[ORCH] skip free_usdt (throttled %.1fs after lock)",
+                    self._min_gap_sec_between_free,
+                )
+                return {
+                    "ok": False,
+                    "freed": 0.0,
+                    "path": "none",
+                    "submitted": 0,
+                    "approx_quote": 0.0,
+                    "status": "THROTTLED",
+                }
             self._last_free_attempt_ts = now
 
             freed_total = 0.0
@@ -330,9 +390,17 @@ class LiquidationOrchestrator:
 
             # 1) Preferred path: CashRouter.ensure_free_usdt (absolute target)
             try:
-                if self.cash and hasattr(self.cash, "ensure_free_usdt") and callable(getattr(self.cash, "ensure_free_usdt")):
+                if (
+                    self.cash
+                    and hasattr(self.cash, "ensure_free_usdt")
+                    and callable(self.cash.ensure_free_usdt)
+                ):
                     try:
-                        fb = float(free_before) if free_before is not None else await self._current_free_usdt()
+                        fb = (
+                            float(free_before)
+                            if free_before is not None
+                            else await self._current_free_usdt()
+                        )
                     except Exception:
                         fb = 0.0
                     absolute_target = max(fb + float(target), float(self.min_usdt_target or 0.0))
@@ -341,46 +409,83 @@ class LiquidationOrchestrator:
                     res = await res if asyncio.iscoroutine(res) else res
                     ok = bool(isinstance(res, dict) and res.get("ok")) or (res is True)
                     if ok:
-                        freed_total = float((res or {}).get("freed", 0.0)) if isinstance(res, dict) else 0.0
+                        freed_total = (
+                            float((res or {}).get("freed", 0.0)) if isinstance(res, dict) else 0.0
+                        )
                         if freed_total <= 0.0:
                             try:
                                 after = await self._current_free_usdt()
                                 freed_total = max(0.0, float(after) - float(fb))
                             except Exception:
                                 pass
-                        self._last_action = {"type": "free_usdt", "via": "cash_router", "reason": reason,
-                                             "target_abs": absolute_target, "freed": freed_total, "ts": time.time()}
-                        self.log.info("[ORCH] ensure_free_usdt via CashRouter ok: target_abs=%.4f freed≈%.4f (%s)",
-                                      absolute_target, freed_total, reason)
-                        self._notify_completed({"type": "free_usdt", "via": "cash_router", "reason": reason, "freed": freed_total})
+                        self._last_action = {
+                            "type": "free_usdt",
+                            "via": "cash_router",
+                            "reason": reason,
+                            "target_abs": absolute_target,
+                            "freed": freed_total,
+                            "ts": time.time(),
+                        }
+                        self.log.info(
+                            "[ORCH] ensure_free_usdt via CashRouter ok: target_abs=%.4f freed≈%.4f (%s)",
+                            absolute_target,
+                            freed_total,
+                            reason,
+                        )
+                        self._notify_completed(
+                            {
+                                "type": "free_usdt",
+                                "via": "cash_router",
+                                "reason": reason,
+                                "freed": freed_total,
+                            }
+                        )
                         # Ask ops/meta to re-check affordability (BUY retry once policy)
                         try:
                             if self.ss and hasattr(self.ss, "emit_event"):
-                                ev = self.ss.emit_event("AffordabilityRecheck", {"reason": reason, "ts": time.time()})
+                                ev = self.ss.emit_event(
+                                    "AffordabilityRecheck", {"reason": reason, "ts": time.time()}
+                                )
                                 if asyncio.iscoroutine(ev):
                                     asyncio.create_task(ev)
                         except Exception:
                             pass
-                        return {"ok": True, "freed": max(freed_total, 0.0), "path": "cash_router", "submitted": 0, "approx_quote": 0.0, "status": "OK"}
+                        return {
+                            "ok": True,
+                            "freed": max(freed_total, 0.0),
+                            "path": "cash_router",
+                            "submitted": 0,
+                            "approx_quote": 0.0,
+                            "status": "OK",
+                        }
                     else:
-                        self.log.debug("[ORCH] CashRouter.ensure_free_usdt returned not-ok: %s", res)
+                        self.log.debug(
+                            "[ORCH] CashRouter.ensure_free_usdt returned not-ok: %s", res
+                        )
             except Exception as e:
                 self.log.debug("[ORCH] CashRouter.ensure_free_usdt failed: %s", e, exc_info=True)
 
             # 2) Fallback: ask LiquidationAgent to PROPOSE liquidation intents (no direct execution here)
             if not self.agent:
                 self.log.info("[ORCH] BOOTSTRAP: No liquidation agent; no action required")
-                return {"ok": True, "freed": 0.0, "path": "no_agent", "submitted": 0, "approx_quote": 0.0, "status": "NO_ACTION_REQUIRED"}
-            
+                return {
+                    "ok": True,
+                    "freed": 0.0,
+                    "path": "no_agent",
+                    "submitted": 0,
+                    "approx_quote": 0.0,
+                    "status": "NO_ACTION_REQUIRED",
+                }
+
             # BOOTSTRAP FIX: Check if we have any positions to liquidate (excluding permanent dust)
             has_positions = False
             permanent_dust_threshold = 1.0
             try:
                 if self.ss and hasattr(self.ss, "_positions"):
                     permanent_dust_symbols = set()
-                    if hasattr(self.ss, 'get_permanent_dust_positions'):
+                    if hasattr(self.ss, "get_permanent_dust_positions"):
                         permanent_dust_symbols = set(self.ss.get_permanent_dust_positions())
-                    
+
                     for sym, p in self.ss._positions.items():
                         qty = float(p.get("quantity", 0.0))
                         if qty > 0 and sym not in permanent_dust_symbols:
@@ -388,16 +493,27 @@ class LiquidationOrchestrator:
                             break
             except Exception:
                 pass
-            
+
             if not has_positions and target <= 0:
-                self.log.info("[ORCH] BOOTSTRAP: No significant positions to liquidate (permanent dust excluded); no action required")
-                return {"ok": True, "freed": 0.0, "path": "no_positions", "submitted": 0, "approx_quote": 0.0, "status": "NO_ACTION_REQUIRED"}
-            
+                self.log.info(
+                    "[ORCH] BOOTSTRAP: No significant positions to liquidate (permanent dust excluded); no action required"
+                )
+                return {
+                    "ok": True,
+                    "freed": 0.0,
+                    "path": "no_positions",
+                    "submitted": 0,
+                    "approx_quote": 0.0,
+                    "status": "NO_ACTION_REQUIRED",
+                }
+
             try:
                 intents = []
                 # Determine if this is a mandatory/forced liquidation (e.g. triggered by gap filling or floor violation)
                 # We treat gap filling, floor violations, and blocks as mandatory.
-                is_forced = (target > 0) and any(kw in str(reason) for kw in ("gap", "floor", "block", "INSUFFICIENT_QUOTE"))
+                is_forced = (target > 0) and any(
+                    kw in str(reason) for kw in ("gap", "floor", "block", "INSUFFICIENT_QUOTE")
+                )
 
                 if is_forced:
                     # Rule 6: Liquidation must be allowed to break readiness
@@ -406,20 +522,34 @@ class LiquidationOrchestrator:
                         self.log.info("[ORCH] Forced Liquidation triggered. Readiness = FALSE.")
 
                 # Prefer a targeted proposal API if available
-                if hasattr(self.agent, "propose_liquidations") and callable(getattr(self.agent, "propose_liquidations")):
-                    intents = await self.agent.propose_liquidations(gap_usdt=float(target), reason=str(reason), force=is_forced)
+                if hasattr(self.agent, "propose_liquidations") and callable(
+                    self.agent.propose_liquidations
+                ):
+                    intents = await self.agent.propose_liquidations(
+                        gap_usdt=float(target), reason=str(reason), force=is_forced
+                    )
                 # Back-compat: if agent only exposes run_once/produce_orders, call and map to intents
-                elif hasattr(self.agent, "produce_orders") and callable(getattr(self.agent, "produce_orders")):
-                    orders = await asyncio.wait_for(self.agent.produce_orders(), timeout=self._planner_timeout_s)
+                elif hasattr(self.agent, "produce_orders") and callable(self.agent.produce_orders):
+                    orders = await asyncio.wait_for(
+                        self.agent.produce_orders(), timeout=self._planner_timeout_s
+                    )
                     for eo in orders or []:
                         sym = eo.get("symbol")
                         side = (eo.get("side") or "").upper()
                         qty = eo.get("quantity")
                         if side not in ("SELL", "SELL_SHORT") or not sym or not qty:
                             continue
-                        intents.append(self._intent_payload(
-                            symbol=sym, side="SELL", planned_qty=float(qty), confidence=0.99, ttl_sec=90.0, tag="liquidation", agent=self.name
-                        ))
+                        intents.append(
+                            self._intent_payload(
+                                symbol=sym,
+                                side="SELL",
+                                planned_qty=float(qty),
+                                confidence=0.99,
+                                ttl_sec=90.0,
+                                tag="liquidation",
+                                agent=self.name,
+                            )
+                        )
                 # Emit intents to SharedState
                 submitted, approx_quote = 0, 0.0
                 for it in intents:
@@ -427,24 +557,56 @@ class LiquidationOrchestrator:
                     submitted += 1
                     approx_quote += float(it.get("planned_quote") or 0.0)
                 if submitted > 0:
-                    self._last_action = {"type": "emit_intent_batch", "via": "liquidation_agent", "submitted": submitted,
-                                         "approx_quote": approx_quote, "reason": reason, "ts": time.time()}
-                    self.log.info("[ORCH] Emitted %d liquidation intents (approx_quote≈%.2f) via LiquidationAgent (%s)",
-                                  submitted, approx_quote, reason)
-                    self._notify_completed({"type": "intent_batch", "via": "liquidation_agent",
-                                            "submitted": submitted, "approx_quote": approx_quote})
+                    self._last_action = {
+                        "type": "emit_intent_batch",
+                        "via": "liquidation_agent",
+                        "submitted": submitted,
+                        "approx_quote": approx_quote,
+                        "reason": reason,
+                        "ts": time.time(),
+                    }
+                    self.log.info(
+                        "[ORCH] Emitted %d liquidation intents (approx_quote≈%.2f) via LiquidationAgent (%s)",
+                        submitted,
+                        approx_quote,
+                        reason,
+                    )
+                    self._notify_completed(
+                        {
+                            "type": "intent_batch",
+                            "via": "liquidation_agent",
+                            "submitted": submitted,
+                            "approx_quote": approx_quote,
+                        }
+                    )
                     # Best-effort: ask ops/meta to re-check affordability
                     try:
                         if self.ss and hasattr(self.ss, "emit_event"):
-                            ev = self.ss.emit_event("AffordabilityRecheck", {"reason": reason, "ts": time.time()})
+                            ev = self.ss.emit_event(
+                                "AffordabilityRecheck", {"reason": reason, "ts": time.time()}
+                            )
                             if asyncio.iscoroutine(ev):
                                 asyncio.create_task(ev)
                     except Exception:
                         pass
-                return {"ok": False, "freed": 0.0, "path": "liquidation_agent", "submitted": submitted, "approx_quote": approx_quote, "status": "NOOP"}
+                return {
+                    "ok": False,
+                    "freed": 0.0,
+                    "path": "liquidation_agent",
+                    "submitted": submitted,
+                    "approx_quote": approx_quote,
+                    "status": "NOOP",
+                }
             except Exception as e:
                 self.log.exception("[ORCH] propose_liquidations/produce_orders failed: %s", e)
-                return {"ok": False, "freed": 0.0, "path": "liquidation_agent", "submitted": submitted, "approx_quote": approx_quote, "status": "FAILED"}
+                return {
+                    "ok": False,
+                    "freed": 0.0,
+                    "path": "liquidation_agent",
+                    "submitted": submitted,
+                    "approx_quote": approx_quote,
+                    "status": "FAILED",
+                }
 
     async def _current_free_usdt(self) -> float:
         try:
@@ -458,7 +620,7 @@ class LiquidationOrchestrator:
             pass
         try:
             # Fallback: simple free_usdt() callable
-            if hasattr(self.ss, "free_usdt") and callable(getattr(self.ss, "free_usdt")):
+            if hasattr(self.ss, "free_usdt") and callable(self.ss.free_usdt):
                 v = self.ss.free_usdt()
                 v = await v if asyncio.iscoroutine(v) else v
                 if v is not None:
@@ -488,9 +650,11 @@ class LiquidationOrchestrator:
         """
         if not self.agent:
             return
-        orders: List[Dict[str, Any]] = []
+        orders: list[dict[str, Any]] = []
         try:
-            orders = await asyncio.wait_for(self.agent.produce_orders(), timeout=self._planner_timeout_s)
+            orders = await asyncio.wait_for(
+                self.agent.produce_orders(), timeout=self._planner_timeout_s
+            )
         except asyncio.TimeoutError:
             self.log.warning("[ORCH] produce_orders timeout after %.1fs", self._planner_timeout_s)
             return
@@ -532,14 +696,22 @@ class LiquidationOrchestrator:
             )
             await self._emit_trade_intent(payload)
             submitted += 1
-            self._last_action = {"type": "emit_intent", "symbol": symbol, "side": "SELL", "qty": qf, "ts": time.time()}
+            self._last_action = {
+                "type": "emit_intent",
+                "symbol": symbol,
+                "side": "SELL",
+                "qty": qf,
+                "ts": time.time(),
+            }
             self.log.info("[ORCH] EMIT_INTENT SELL %s qty=%.8f tag=%s", symbol, qf, tag)
             await asyncio.sleep(0)  # yield
 
         if submitted or skipped:
             self.log.info("[ORCH] drain summary: submitted=%d skipped=%d", submitted, skipped)
         if submitted > 0:
-            self._notify_completed({"type": "intent_batch", "submitted": submitted, "skipped": skipped})
+            self._notify_completed(
+                {"type": "intent_batch", "submitted": submitted, "skipped": skipped}
+            )
 
     async def _maybe_rebalance_min_notional(self):
         if not self.agent:
@@ -562,17 +734,22 @@ class LiquidationOrchestrator:
         except Exception:
             self._rebalance_fail_streak += 1
             # simple exponential backoff: skip future attempts for up to ~rebalance_interval_s * 2^n (capped)
-            backoff = min(self.rebalance_interval_s * (2 ** min(self._rebalance_fail_streak, 4)), 3600)
+            backoff = min(
+                self.rebalance_interval_s * (2 ** min(self._rebalance_fail_streak, 4)), 3600
+            )
             self._rebalance_skip_until = now + backoff
-            self.log.exception("[ORCH] rebalance_once failed (streak=%d, backoff≈%ss)",
-                               self._rebalance_fail_streak, int(backoff))
+            self.log.exception(
+                "[ORCH] rebalance_once failed (streak=%d, backoff≈%ss)",
+                self._rebalance_fail_streak,
+                int(backoff),
+            )
 
-    async def _read_ops_issues(self) -> Dict[str, Any]:
+    async def _read_ops_issues(self) -> dict[str, Any]:
         """
         Best-effort snapshot of ops-plane issues and recent liquidity events from SharedState.
         Returns dict like: {"issues": [...], "liquidity_gap": float|None}
         """
-        issues: List[str] = []
+        issues: list[str] = []
         gap: Optional[float] = None
         try:
             # Preferred: a structured readiness snapshot
@@ -589,7 +766,11 @@ class LiquidationOrchestrator:
             ops = snap.get("OpsPlane") or snap.get("AppContext") or {}
             if isinstance(ops, dict):
                 msg = str(ops.get("message", "") or "")
-                for key in ("MinNotionalTooHighForConfiguredQuote", "NAVNotReady", "INSUFFICIENT_QUOTE"):
+                for key in (
+                    "MinNotionalTooHighForConfiguredQuote",
+                    "NAVNotReady",
+                    "INSUFFICIENT_QUOTE",
+                ):
                     if key in msg and key not in issues:
                         issues.append(key)
         except Exception:
@@ -616,7 +797,7 @@ class LiquidationOrchestrator:
 
         free_usdt = await self._current_free_usdt()
         ops = await self._read_ops_issues()
-        issues: List[str] = list(ops.get("issues", []) or [])
+        issues: list[str] = list(ops.get("issues", []) or [])
         liq_gap = ops.get("liquidity_gap")
 
         need_reason, target = None, 0.0
@@ -628,12 +809,14 @@ class LiquidationOrchestrator:
         try:
             positions = {}
             if self.agent and hasattr(self.agent, "shared_state"):
-                positions = self.agent.shared_state.get_positions_snapshot(include_wallet_inventory=True) or {}
+                positions = (
+                    self.agent.shared_state.get_positions_snapshot(include_wallet_inventory=True)
+                    or {}
+                )
 
             if not positions:
                 snap_fn = getattr(self.ss, "get_positions_snapshot", None)
                 if snap_fn:
-                    import inspect
                     try:
                         positions = snap_fn(include_wallet_inventory=True) or {}
                     except TypeError:
@@ -642,8 +825,8 @@ class LiquidationOrchestrator:
             for sym, pos in positions.items():
                 qty = float((pos or {}).get("quantity") or (pos or {}).get("qty") or 0.0)
                 if qty > 0:
-                     px = await self.agent._safe_price(sym) if self.agent else 0.0
-                     total_spot_value += (qty * px)
+                    px = await self.agent._safe_price(sym) if self.agent else 0.0
+                    total_spot_value += qty * px
         except Exception as e:
             self.log.warning("[ORCH] failed to calc spot value: %s", e)
 
@@ -651,8 +834,12 @@ class LiquidationOrchestrator:
         if self.min_usdt_floor and free_usdt < self.min_usdt_floor:
             # Policy: If we have very little inventory, don't cannibalize it just to hit a floor unless CRITICAL
             if total_spot_value < self.min_inventory_usdt:
-                 self.log.debug("[ORCH] SKIP raise_free_usdt: inventory=%.2f < min=%.2f (floor=%.2f)",
-                                total_spot_value, self.min_inventory_usdt, self.min_usdt_floor)
+                self.log.debug(
+                    "[ORCH] SKIP raise_free_usdt: inventory=%.2f < min=%.2f (floor=%.2f)",
+                    total_spot_value,
+                    self.min_inventory_usdt,
+                    self.min_usdt_floor,
+                )
             else:
                 need_reason = f"raise_free_usdt_to_floor({self.min_usdt_floor:.2f})"
                 target = max(0.0, self.min_usdt_floor - free_usdt)
@@ -664,27 +851,40 @@ class LiquidationOrchestrator:
                 target = float(liq_gap)
 
         # 3) If min-notional or insufficient-quote issues are reported, free a batch
-        elif any(k in issues for k in ("MinNotionalTooHighForConfiguredQuote", "INSUFFICIENT_QUOTE")):
-             if total_spot_value >= self.min_inventory_usdt:
+        elif any(
+            k in issues for k in ("MinNotionalTooHighForConfiguredQuote", "INSUFFICIENT_QUOTE")
+        ):
+            if total_spot_value >= self.min_inventory_usdt:
                 need_reason = "min_notional_block"
-                target = max(self.liq_batch_target_usdt, self.min_usdt_target or self.liq_batch_target_usdt)
+                target = max(
+                    self.liq_batch_target_usdt, self.min_usdt_target or self.liq_batch_target_usdt
+                )
 
         # 4) Soft target
         elif self.min_usdt_target and free_usdt < self.min_usdt_target:
-             if total_spot_value >= self.min_inventory_usdt:
+            if total_spot_value >= self.min_inventory_usdt:
                 need_reason = f"topup_free_usdt_to_target({self.min_usdt_target:.2f})"
                 target = max(0.0, self.min_usdt_target - free_usdt)
 
         if need_reason and target > 0.0:
-            res = await self._free_usdt_now(target=target, reason=need_reason, free_before=free_usdt)
+            res = await self._free_usdt_now(
+                target=target, reason=need_reason, free_before=free_usdt
+            )
             freed = float(res.get("freed", 0.0)) if isinstance(res, dict) else float(res or 0.0)
             if freed > 0:
-                self._last_action = {"type": "free_usdt", "reason": need_reason, "amount": freed,
-                                     "free_before": free_usdt, "ts": time.time()}
+                self._last_action = {
+                    "type": "free_usdt",
+                    "reason": need_reason,
+                    "amount": freed,
+                    "free_before": free_usdt,
+                    "ts": time.time(),
+                }
                 # Emit a best-effort event back to SharedState, if supported
                 try:
                     if hasattr(self.ss, "emit_event"):
-                        ev = self.ss.emit_event("LiquidityFreed", {"amount": freed, "reason": need_reason})
+                        ev = self.ss.emit_event(
+                            "LiquidityFreed", {"amount": freed, "reason": need_reason}
+                        )
                         if asyncio.iscoroutine(ev):
                             asyncio.create_task(ev)
                 except Exception:
@@ -703,23 +903,29 @@ class LiquidationOrchestrator:
             req = await self.ss.get_next_liquidation_request()
             if not req:
                 break
-            
+
             sym = req.get("symbol")
             reason = req.get("reason", "external_request")
             needed = float(req.get("min_quote_target") or 0.0)
-            
-            self.log.info("[ORCH] Servicing symbol liquidation request: %s (Reason: %s)", sym, reason)
-            
+
+            self.log.info(
+                "[ORCH] Servicing symbol liquidation request: %s (Reason: %s)", sym, reason
+            )
+
             if sym == "__FREE_QUOTE__" or needed > 0:
                 # Requested a specific amount of cash
-                await self._free_usdt_now(target=needed or self.liq_batch_target_usdt, reason=reason)
+                await self._free_usdt_now(
+                    target=needed or self.liq_batch_target_usdt, reason=reason
+                )
             else:
                 # Requested specific symbol exit. MetaController/Rules will decide if it's 'forced'.
                 # We ask the agent to plan this specific exit.
-                plan = await self.agent.build_plan(target_symbol=sym, needed_quote=0.0, opp_meta={"reason": reason}, force=True)
+                plan = await self.agent.build_plan(
+                    target_symbol=sym, needed_quote=0.0, opp_meta={"reason": reason}, force=True
+                )
                 if plan.get("status") == "APPROVED":
                     await self._drain_and_emit_intents()
-                
+
             if hasattr(self.ss, "clear_liquidation_flag") and sym:
                 self.ss.clear_liquidation_flag(sym)
 

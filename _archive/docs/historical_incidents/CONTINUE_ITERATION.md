@@ -3,14 +3,14 @@
 ## Current Status: TWO FIXES DEPLOYED, WAITING FOR SYSTEM TO HIT CAPITAL THRESHOLD
 
 ### Fix #1: RULE5_ESCALATION Liquidation Trigger (Line 19615+)
-✅ **Applied:** Check for both `_liquidation_orchestrator` and `liquidation_agent` when RULE5_ESCALATION detected  
-✅ **Code:** Calls `ensure_liquidity()` with target=$15-25  
-✅ **Debug:** Added logging to detect if orchestrator is None or missing method  
+✅ **Applied:** Check for both `_liquidation_orchestrator` and `liquidation_agent` when RULE5_ESCALATION detected
+✅ **Code:** Calls `ensure_liquidity()` with target=$15-25
+✅ **Debug:** Added logging to detect if orchestrator is None or missing method
 ⏳ **Status:** Waiting to be triggered (needs signal to hit RULE5_ESCALATION condition)
 
 ### Fix #2: Rejection Threshold Escalation Trigger (Line 15335+)
-✅ **Applied:** When rejection count >= 10 (threshold), try liquidation before skipping signal  
-✅ **Code:** Calls liquidation, resets counter if successful, allows signal retry  
+✅ **Applied:** When rejection count >= 10 (threshold), try liquidation before skipping signal
+✅ **Code:** Calls liquidation, resets counter if successful, allows signal retry
 ✅ **Status:** Waiting to be triggered (needs signal rejected 10 times first)
 
 ---
@@ -55,13 +55,13 @@ If system is truly stuck on capital, could manually:
 2. Or reduce threshold from 10 to 5
 3. Or manually invoke liquidation
 
-### Option C: Verify Bootstrap is Working  
+### Option C: Verify Bootstrap is Working
 Check if system is actually executing trades with bootstrap bypass enabled:
 ```bash
 tail -f /tmp/octivault_debug_liquidation.log | grep -iE "EXECUTION_CONFIRMED|order.*filled|TRADE.*placed"
 ```
 
-If seeing executions despite low capital → bootstrap working ✅  
+If seeing executions despite low capital → bootstrap working ✅
 If no executions → bootstrap not working, need different approach
 
 ---
@@ -80,7 +80,7 @@ If no executions → bootstrap not working, need different approach
 - Then trades resume normally
 - **Action:** Wait another 2-3 minutes and check for liquidation trigger
 
-### Scenario 3: Silent Failure (10% probability)  
+### Scenario 3: Silent Failure (10% probability)
 - System running but nothing actually executing
 - Possible race condition or missing method
 - **Action:** Check for ERROR messages in logs
@@ -122,7 +122,7 @@ If no executions → bootstrap not working, need different approach
 
 ---
 
-**Process:** PID 44789  
-**Log File:** /tmp/octivault_debug_liquidation.log  
-**Restart Command (if needed):** See terminal history  
+**Process:** PID 44789
+**Log File:** /tmp/octivault_debug_liquidation.log
+**Restart Command (if needed):** See terminal history
 **Last Check:** ~9:00 PM UTC, running stably

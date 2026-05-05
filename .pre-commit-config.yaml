@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://json.schemastore.org/pre-commit-config.json
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.14
+    hooks:
+      - id: ruff
+        args: [--fix, --show-fixes]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.7.1
+    hooks:
+      - id: mypy
+        args: [--ignore-missing-imports, --no-error-summary]
+        additional_dependencies: ['types-all']
+        stages: [manual]  # optional: run only on-demand, not every commit
+
+  - repo: local
+    hooks:
+      - id: vulture-dead-code
+        name: vulture (dead code detection)
+        entry: bash -c 'vulture . --exclude _archive,_archaeology,.claude,build,dist --min-confidence 80 --quiet || true'
+        language: system
+        pass_filenames: false
+        stages: [commit]
+        verbose: true

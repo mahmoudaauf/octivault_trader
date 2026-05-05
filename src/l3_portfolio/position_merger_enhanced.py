@@ -29,14 +29,12 @@ Auditable: Complete history of all merge operations
 
 from __future__ import annotations
 
-import logging
 import asyncio
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Set, Tuple, Optional, Any, Callable
-from enum import Enum
-from datetime import datetime, timedelta
+import logging
 import time
-from decimal import Decimal
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -45,17 +43,20 @@ logger = logging.getLogger(__name__)
 # Enums and Data Structures
 # =============================
 
+
 class MergeStrategy(Enum):
     """Available merge strategies."""
-    VOLUME_WEIGHTED = "VOLUME_WEIGHTED"      # Merge by volume weighting
-    TIME_BASED = "TIME_BASED"                # Merge by position age
-    PRICE_PROXIMITY = "PRICE_PROXIMITY"      # Merge by entry price similarity
+
+    VOLUME_WEIGHTED = "VOLUME_WEIGHTED"  # Merge by volume weighting
+    TIME_BASED = "TIME_BASED"  # Merge by position age
+    PRICE_PROXIMITY = "PRICE_PROXIMITY"  # Merge by entry price similarity
     DUST_CONSOLIDATION = "DUST_CONSOLIDATION"  # Consolidate dust positions
-    HYBRID = "HYBRID"                        # Multi-criteria approach
+    HYBRID = "HYBRID"  # Multi-criteria approach
 
 
 class MergeStatus(Enum):
     """Status of merge operation."""
+
     PENDING = "PENDING"
     VALIDATING = "VALIDATING"
     APPROVED = "APPROVED"
@@ -68,15 +69,16 @@ class MergeStatus(Enum):
 @dataclass
 class MergeCandidate:
     """Candidate pair for merging."""
+
     symbol: str
-    position_ids: List[str] = field(default_factory=list)
-    quantities: List[float] = field(default_factory=list)
-    entry_prices: List[float] = field(default_factory=list)
-    created_ats: List[float] = field(default_factory=list)
+    position_ids: list[str] = field(default_factory=list)
+    quantities: list[float] = field(default_factory=list)
+    entry_prices: list[float] = field(default_factory=list)
+    created_ats: list[float] = field(default_factory=list)
     confidence_score: float = 0.0
     merge_reason: str = ""
-    
-    def to_dict(self) -> Dict[str, Any]:
+
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return asdict(self)
 
@@ -84,8 +86,9 @@ class MergeCandidate:
 @dataclass
 class MergeProposal:
     """Proposed merge operation with validation."""
+
     symbol: str
-    source_positions: List[str]
+    source_positions: list[str]
     target_position: str
     total_quantity: float
     weighted_entry_price: float
@@ -94,22 +97,26 @@ class MergeProposal:
     confidence_score: float
     merge_strategy: MergeStrategy
     merge_status: MergeStatus = MergeStatus.PENDING
-    validation_errors: List[str] = field(default_factory=list)
+    validation_errors: list[str] = field(default_factory=list)
     approval_timestamp: Optional[float] = None
     execution_timestamp: Optional[float] = None
-    
-    def to_dict(self) -> Dict[str, Any]:
+
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         d = asdict(self)
         d["merge_strategy"] = self.merge_strategy.value
         d["merge_status"] = self.merge_status.value
         return d
-    
+
     @property
     def is_approved(self) -> bool:
         """Check if proposal is approved."""
-        return self.merge_status in (MergeStatus.APPROVED, MergeStatus.EXECUTING, MergeStatus.COMPLETED)
-    
+        return self.merge_status in (
+            MergeStatus.APPROVED,
+            MergeStatus.EXECUTING,
+            MergeStatus.COMPLETED,
+        )
+
     @property
     def is_valid(self) -> bool:
         """Check if proposal is valid."""
@@ -119,6 +126,7 @@ class MergeProposal:
 @dataclass
 class MergeMetrics:
     """Metrics for merge operations."""
+
     total_merges_proposed: int = 0
     total_merges_approved: int = 0
     total_merges_completed: int = 0
@@ -130,8 +138,8 @@ class MergeMetrics:
     merge_success_rate: float = 0.0
     last_merge_timestamp: Optional[float] = None
     last_error: Optional[str] = None
-    
-    def to_dict(self) -> Dict[str, Any]:
+
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return asdict(self)
 
@@ -139,6 +147,7 @@ class MergeMetrics:
 @dataclass
 class ConsolidationReport:
     """Report on consolidation cycle."""
+
     cycle_timestamp: float
     symbols_analyzed: int
     candidates_identified: int
@@ -151,9 +160,9 @@ class ConsolidationReport:
     total_fee_savings: float
     execution_time_sec: float
     cycle_metrics: MergeMetrics = field(default_factory=MergeMetrics)
-    errors: List[str] = field(default_factory=list)
-    
-    def to_dict(self) -> Dict[str, Any]:
+    errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         d = asdict(self)
         d["cycle_metrics"] = self.cycle_metrics.to_dict()
@@ -164,18 +173,19 @@ class ConsolidationReport:
 # Position Merger Enhanced
 # =============================
 
+
 class PositionMergerEnhanced:
     """
     Professional position merger for consolidation and fragmentation prevention.
-    
+
     Supports multiple merge strategies with intelligent candidate selection,
     comprehensive validation, and detailed audit trail.
     """
-    
+
     def __init__(self, shared_state=None, exchange_client=None, config=None):
         """
         Initialize the enhanced position merger.
-        
+
         Args:
             shared_state: SharedState instance for position data
             exchange_client: ExchangeClient for fees and limits
@@ -185,110 +195,114 @@ class PositionMergerEnhanced:
         self.exchange_client = exchange_client
         self.config = config
         self.logger = logging.getLogger(__name__)
-        
+
         # Configuration
         self.min_merge_confidence = 0.70  # Minimum confidence for merge
         self.max_price_deviation = 0.05  # 5% maximum entry price deviation
         self.min_positions_to_merge = 2
         self.max_positions_per_merge = 10
         self.dust_threshold_usd = 5.0  # Dust consolidation threshold
-        
+
         # Operation tracking
-        self.merge_proposals: Dict[str, MergeProposal] = {}  # By proposal ID
-        self.merge_history: List[MergeProposal] = []
+        self.merge_proposals: dict[str, MergeProposal] = {}  # By proposal ID
+        self.merge_history: list[MergeProposal] = []
         self.metrics = MergeMetrics()
         self._lock = asyncio.Lock()
-        
+
         # Configure from config if provided
         if config:
             self.min_merge_confidence = getattr(config, "MIN_MERGE_CONFIDENCE", 0.70)
             self.max_price_deviation = getattr(config, "MAX_PRICE_DEVIATION", 0.05)
             self.dust_threshold_usd = getattr(config, "DUST_THRESHOLD_USD", 5.0)
-    
-    async def identify_merge_candidates(self, positions: Dict[str, Any], prices: Dict[str, float]) -> Dict[str, List[MergeCandidate]]:
+
+    async def identify_merge_candidates(
+        self, positions: dict[str, Any], prices: dict[str, float]
+    ) -> dict[str, list[MergeCandidate]]:
         """
         Identify positions that are candidates for merging.
-        
+
         Args:
             positions: Dict of position_id -> position details
             prices: Dict of symbol -> current price
-            
+
         Returns:
             Dict mapping symbol -> list of merge candidates
         """
-        candidates_by_symbol: Dict[str, List[MergeCandidate]] = {}
-        
+        candidates_by_symbol: dict[str, list[MergeCandidate]] = {}
+
         # Group positions by symbol
-        positions_by_symbol: Dict[str, List[Dict]] = {}
+        positions_by_symbol: dict[str, list[dict]] = {}
         for pos_id, pos_data in positions.items():
             symbol = pos_data.get("symbol", "")
             if not symbol:
                 continue
-            
+
             if symbol not in positions_by_symbol:
                 positions_by_symbol[symbol] = []
             positions_by_symbol[symbol].append({**pos_data, "position_id": pos_id})
-        
+
         # Analyze each symbol
         for symbol, symbol_positions in positions_by_symbol.items():
             if len(symbol_positions) < self.min_positions_to_merge:
                 continue
-            
+
             price = prices.get(symbol, 0)
-            candidates = self._find_merge_candidates_for_symbol(
-                symbol, symbol_positions, price
-            )
-            
+            candidates = self._find_merge_candidates_for_symbol(symbol, symbol_positions, price)
+
             if candidates:
                 candidates_by_symbol[symbol] = candidates
-        
+
         return candidates_by_symbol
-    
-    def _find_merge_candidates_for_symbol(self, symbol: str, positions: List[Dict], price: float) -> List[MergeCandidate]:
+
+    def _find_merge_candidates_for_symbol(
+        self, symbol: str, positions: list[dict], price: float
+    ) -> list[MergeCandidate]:
         """
         Find merge candidates for a specific symbol.
-        
+
         Applies multiple merge strategies and returns best candidates.
         """
         candidates = []
-        
+
         if len(positions) < self.min_positions_to_merge:
             return candidates
-        
+
         # Try each merge strategy
         volume_candidates = self._find_volume_weighted_candidates(symbol, positions, price)
         if volume_candidates:
             candidates.extend(volume_candidates)
-        
+
         time_candidates = self._find_time_based_candidates(symbol, positions, price)
         if time_candidates:
             candidates.extend(time_candidates)
-        
+
         price_candidates = self._find_price_proximity_candidates(symbol, positions, price)
         if price_candidates:
             candidates.extend(price_candidates)
-        
+
         # Deduplicate and score
         return self._deduplicate_and_score_candidates(candidates)
-    
-    def _find_volume_weighted_candidates(self, symbol: str, positions: List[Dict], price: float) -> List[MergeCandidate]:
+
+    def _find_volume_weighted_candidates(
+        self, symbol: str, positions: list[dict], price: float
+    ) -> list[MergeCandidate]:
         """Find candidates by volume weighting."""
         candidates = []
-        
+
         if len(positions) < 2:
             return candidates
-        
+
         # Sort by quantity (highest first)
         sorted_pos = sorted(positions, key=lambda p: abs(p.get("quantity", 0)), reverse=True)
-        
+
         # Group high-volume with small-volume positions
         if len(sorted_pos) >= 2:
             target = sorted_pos[0]
             satellites = sorted_pos[1:]
-            
+
             # Validate all can merge with target
             all_valid = all(self._can_merge_pair(target, p) for p in satellites)
-            
+
             if all_valid:
                 candidate = MergeCandidate(
                     symbol=symbol,
@@ -297,29 +311,31 @@ class PositionMergerEnhanced:
                     entry_prices=[p.get("entry_price", 0) for p in [target] + satellites],
                     created_ats=[p.get("created_at", time.time()) for p in [target] + satellites],
                     confidence_score=0.85,
-                    merge_reason="Volume weighted consolidation"
+                    merge_reason="Volume weighted consolidation",
                 )
                 candidates.append(candidate)
-        
+
         return candidates
-    
-    def _find_time_based_candidates(self, symbol: str, positions: List[Dict], price: float) -> List[MergeCandidate]:
+
+    def _find_time_based_candidates(
+        self, symbol: str, positions: list[dict], price: float
+    ) -> list[MergeCandidate]:
         """Find candidates by position age."""
         candidates = []
-        
+
         if len(positions) < 2:
             return candidates
-        
+
         # Sort by creation time (oldest first)
         sorted_pos = sorted(positions, key=lambda p: p.get("created_at", time.time()))
-        
+
         # Group old positions together
         old_cutoff = time.time() - (86400 * 7)  # 7 days old
         old_positions = [p for p in sorted_pos if p.get("created_at", time.time()) < old_cutoff]
-        
+
         if len(old_positions) >= self.min_positions_to_merge:
             all_valid = all(self._can_merge_pair(old_positions[0], p) for p in old_positions[1:])
-            
+
             if all_valid:
                 candidate = MergeCandidate(
                     symbol=symbol,
@@ -328,44 +344,49 @@ class PositionMergerEnhanced:
                     entry_prices=[p.get("entry_price", 0) for p in old_positions],
                     created_ats=[p.get("created_at", time.time()) for p in old_positions],
                     confidence_score=0.75,
-                    merge_reason="Time-based consolidation of old positions"
+                    merge_reason="Time-based consolidation of old positions",
                 )
                 candidates.append(candidate)
-        
+
         return candidates
-    
-    def _find_price_proximity_candidates(self, symbol: str, positions: List[Dict], price: float) -> List[MergeCandidate]:
+
+    def _find_price_proximity_candidates(
+        self, symbol: str, positions: list[dict], price: float
+    ) -> list[MergeCandidate]:
         """Find candidates by entry price similarity."""
         candidates = []
-        
+
         if len(positions) < 2:
             return candidates
-        
+
         # Sort by entry price
         sorted_pos = sorted(positions, key=lambda p: p.get("entry_price", 0))
-        
+
         # Find clusters of similar prices
         clusters = []
         current_cluster = [sorted_pos[0]]
-        
+
         for pos in sorted_pos[1:]:
             base_price = current_cluster[0].get("entry_price", 0)
             curr_price = pos.get("entry_price", 0)
-            
-            if base_price > 0 and abs(curr_price - base_price) / base_price <= self.max_price_deviation:
+
+            if (
+                base_price > 0
+                and abs(curr_price - base_price) / base_price <= self.max_price_deviation
+            ):
                 current_cluster.append(pos)
             else:
                 if len(current_cluster) >= self.min_positions_to_merge:
                     clusters.append(current_cluster)
                 current_cluster = [pos]
-        
+
         if len(current_cluster) >= self.min_positions_to_merge:
             clusters.append(current_cluster)
-        
+
         # Create candidates from clusters
         for cluster in clusters:
             all_valid = all(self._can_merge_pair(cluster[0], p) for p in cluster[1:])
-            
+
             if all_valid:
                 candidate = MergeCandidate(
                     symbol=symbol,
@@ -374,17 +395,19 @@ class PositionMergerEnhanced:
                     entry_prices=[p.get("entry_price", 0) for p in cluster],
                     created_ats=[p.get("created_at", time.time()) for p in cluster],
                     confidence_score=0.80,
-                    merge_reason=f"Price proximity clustering (deviation < {self.max_price_deviation:.1%})"
+                    merge_reason=f"Price proximity clustering (deviation < {self.max_price_deviation:.1%})",
                 )
                 candidates.append(candidate)
-        
+
         return candidates
-    
-    def _deduplicate_and_score_candidates(self, candidates: List[MergeCandidate]) -> List[MergeCandidate]:
+
+    def _deduplicate_and_score_candidates(
+        self, candidates: list[MergeCandidate]
+    ) -> list[MergeCandidate]:
         """Deduplicate candidates and score them."""
         # Use position ID sets to identify duplicates
-        seen_sets: Dict[frozenset, MergeCandidate] = {}
-        
+        seen_sets: dict[frozenset, MergeCandidate] = {}
+
         for candidate in candidates:
             pos_set = frozenset(candidate.position_ids)
             if pos_set not in seen_sets:
@@ -394,60 +417,64 @@ class PositionMergerEnhanced:
                 existing = seen_sets[pos_set]
                 if candidate.confidence_score > existing.confidence_score:
                     seen_sets[pos_set] = candidate
-        
+
         return list(seen_sets.values())
-    
-    def _can_merge_pair(self, pos1: Dict, pos2: Dict) -> bool:
+
+    def _can_merge_pair(self, pos1: dict, pos2: dict) -> bool:
         """Check if two positions can be merged."""
         # Same symbol
         if pos1.get("symbol") != pos2.get("symbol"):
             return False
-        
+
         # Valid quantities
         qty1 = pos1.get("quantity", 0)
         qty2 = pos2.get("quantity", 0)
         if qty1 == 0 or qty2 == 0:
             return False
-        
+
         # Valid entry prices
         price1 = pos1.get("entry_price", 0)
         price2 = pos2.get("entry_price", 0)
         if price1 <= 0 or price2 <= 0:
             return False
-        
+
         # Price deviation within tolerance
         max_price = max(price1, price2)
         min_price = min(price1, price2)
         deviation = (max_price - min_price) / max_price
         if deviation > self.max_price_deviation:
             return False
-        
+
         return True
-    
-    async def generate_merge_proposals(self, candidates_by_symbol: Dict[str, List[MergeCandidate]], prices: Dict[str, float]) -> List[MergeProposal]:
+
+    async def generate_merge_proposals(
+        self, candidates_by_symbol: dict[str, list[MergeCandidate]], prices: dict[str, float]
+    ) -> list[MergeProposal]:
         """
         Generate merge proposals from candidates.
-        
+
         Args:
             candidates_by_symbol: Merge candidates by symbol
             prices: Current prices
-            
+
         Returns:
             List of merge proposals
         """
         proposals = []
-        
+
         for symbol, candidates in candidates_by_symbol.items():
             price = prices.get(symbol, 0)
-            
+
             for candidate in candidates:
                 proposal = await self._create_proposal_from_candidate(candidate, price)
                 if proposal:
                     proposals.append(proposal)
-        
+
         return proposals
-    
-    async def _create_proposal_from_candidate(self, candidate: MergeCandidate, price: float) -> Optional[MergeProposal]:
+
+    async def _create_proposal_from_candidate(
+        self, candidate: MergeCandidate, price: float
+    ) -> Optional[MergeProposal]:
         """Create a merge proposal from a candidate."""
         try:
             # Calculate merged position metrics
@@ -455,16 +482,18 @@ class PositionMergerEnhanced:
             weighted_entry = self._calculate_weighted_entry_price(
                 candidate.quantities, candidate.entry_prices
             )
-            
+
             # Estimate fee savings (assume 0.1% taker fee per order merged)
             orders_merged = len(candidate.position_ids) - 1
             estimated_fee_savings = total_qty * price * (orders_merged * 0.001)
-            
+
             # Estimate cost savings
-            estimated_cost_savings = abs(weighted_entry - sum(candidate.entry_prices) / len(candidate.entry_prices))
-            
+            estimated_cost_savings = abs(
+                weighted_entry - sum(candidate.entry_prices) / len(candidate.entry_prices)
+            )
+
             proposal_id = f"{candidate.symbol}_{time.time():.0f}"
-            
+
             proposal = MergeProposal(
                 symbol=candidate.symbol,
                 source_positions=candidate.position_ids[1:],
@@ -477,42 +506,42 @@ class PositionMergerEnhanced:
                 merge_strategy=MergeStrategy.HYBRID,
                 merge_status=MergeStatus.PENDING,
             )
-            
+
             # Validate proposal
             await self._validate_proposal(proposal)
-            
+
             # Store proposal
             self.merge_proposals[proposal_id] = proposal
-            
+
             return proposal
-        
+
         except Exception as e:
             self.logger.error(f"[PositionMergerEnhanced] Failed to create proposal: {e}")
             return None
-    
+
     async def _validate_proposal(self, proposal: MergeProposal) -> None:
         """Validate merge proposal."""
         proposal.merge_status = MergeStatus.VALIDATING
         proposal.validation_errors = []
-        
+
         # Check confidence score
         if proposal.confidence_score < self.min_merge_confidence:
             proposal.validation_errors.append(
                 f"Confidence score {proposal.confidence_score:.2f} below minimum {self.min_merge_confidence}"
             )
-        
+
         # Check quantity
         if proposal.total_quantity <= 0:
             proposal.validation_errors.append("Invalid total quantity")
-        
+
         # Check entry price
         if proposal.weighted_entry_price <= 0:
             proposal.validation_errors.append("Invalid entry price")
-        
+
         # Check position count
         if len(proposal.source_positions) < self.min_positions_to_merge - 1:
             proposal.validation_errors.append("Insufficient source positions")
-        
+
         # Set status based on validation
         if proposal.is_valid:
             proposal.merge_status = MergeStatus.APPROVED
@@ -520,36 +549,38 @@ class PositionMergerEnhanced:
             self.metrics.total_merges_approved += 1
         else:
             proposal.merge_status = MergeStatus.REJECTED
-    
-    def _calculate_weighted_entry_price(self, quantities: List[float], entry_prices: List[float]) -> float:
+
+    def _calculate_weighted_entry_price(
+        self, quantities: list[float], entry_prices: list[float]
+    ) -> float:
         """Calculate volume-weighted average entry price."""
         total_notional = 0.0
         total_quantity = 0.0
-        
-        for qty, entry in zip(quantities, entry_prices):
+
+        for qty, entry in zip(quantities, entry_prices, strict=False):
             abs_qty = abs(qty)
             notional = abs_qty * entry
             total_notional += notional
             total_quantity += abs_qty
-        
+
         if total_quantity == 0:
             return 0.0
-        
+
         return total_notional / total_quantity
-    
+
     async def _execute_merge_consolidation(self, proposal: MergeProposal) -> bool:
         """
         Execute the merge by consolidating positions.
-        
+
         Process:
         1. Sell source positions at market price
         2. Buy consolidated position
         3. Update position records
         4. Track execution timestamp
-        
+
         Args:
             proposal: Merge proposal to execute
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
@@ -557,11 +588,13 @@ class PositionMergerEnhanced:
             if not self.execution_manager:
                 self.logger.error("[PositionMergerEnhanced] No execution manager available")
                 return False
-            
+
             symbol = proposal.symbol
-            
+
             # Step 1: Liquidate source positions
-            self.logger.debug(f"[PositionMergerEnhanced] Liquidating {len(proposal.source_positions)} source positions")
+            self.logger.debug(
+                f"[PositionMergerEnhanced] Liquidating {len(proposal.source_positions)} source positions"
+            )
             for src_pos in proposal.source_positions:
                 try:
                     # Sell at market price
@@ -570,63 +603,79 @@ class PositionMergerEnhanced:
                         side="SELL",
                         order_type="MARKET",
                         quantity=src_pos.quantity,
-                        client_order_id=f"merge_liquidate_{src_pos.symbol}_{int(time.time())}"
+                        client_order_id=f"merge_liquidate_{src_pos.symbol}_{int(time.time())}",
                     )
                     if not result:
-                        self.logger.warning(f"[PositionMergerEnhanced] Failed to liquidate {src_pos.symbol}")
+                        self.logger.warning(
+                            f"[PositionMergerEnhanced] Failed to liquidate {src_pos.symbol}"
+                        )
                 except Exception as e:
-                    self.logger.error(f"[PositionMergerEnhanced] Error liquidating {src_pos.symbol}: {e}")
-            
+                    self.logger.error(
+                        f"[PositionMergerEnhanced] Error liquidating {src_pos.symbol}: {e}"
+                    )
+
             # Step 2: Execute consolidated buy order
-            self.logger.debug(f"[PositionMergerEnhanced] Buying consolidated position: {symbol} x {proposal.total_quantity}")
+            self.logger.debug(
+                f"[PositionMergerEnhanced] Buying consolidated position: {symbol} x {proposal.total_quantity}"
+            )
             try:
                 result = await self.execution_manager.submit_order(
                     symbol=symbol,
                     side="BUY",
                     order_type="MARKET",
                     quantity=proposal.total_quantity,
-                    client_order_id=f"merge_buy_{symbol}_{int(time.time())}"
+                    client_order_id=f"merge_buy_{symbol}_{int(time.time())}",
                 )
                 if not result:
-                    self.logger.error(f"[PositionMergerEnhanced] Failed to buy consolidated position")
+                    self.logger.error(
+                        "[PositionMergerEnhanced] Failed to buy consolidated position"
+                    )
                     return False
             except Exception as e:
-                self.logger.error(f"[PositionMergerEnhanced] Error buying consolidated position: {e}")
+                self.logger.error(
+                    f"[PositionMergerEnhanced] Error buying consolidated position: {e}"
+                )
                 return False
-            
-            self.logger.info(f"[PositionMergerEnhanced] Successfully executed merge for {symbol}: "
-                           f"consolidated {len(proposal.source_positions)} positions")
+
+            self.logger.info(
+                f"[PositionMergerEnhanced] Successfully executed merge for {symbol}: "
+                f"consolidated {len(proposal.source_positions)} positions"
+            )
             return True
-            
+
         except Exception as e:
-            self.logger.error(f"[PositionMergerEnhanced] Error executing merge consolidation: {e}", exc_info=True)
+            self.logger.error(
+                f"[PositionMergerEnhanced] Error executing merge consolidation: {e}", exc_info=True
+            )
             return False
-    
+
     async def execute_merge(self, proposal: MergeProposal) -> bool:
         """
         Execute a merge operation.
-        
+
         Args:
             proposal: Merge proposal to execute
-            
+
         Returns:
             True if successful, False otherwise
         """
         if not proposal.is_approved:
-            self.logger.warning(f"[PositionMergerEnhanced] Cannot execute unapproved merge: {proposal.symbol}")
+            self.logger.warning(
+                f"[PositionMergerEnhanced] Cannot execute unapproved merge: {proposal.symbol}"
+            )
             return False
-        
+
         try:
             async with self._lock:
                 proposal.merge_status = MergeStatus.EXECUTING
-                
+
                 # Execute merge by consolidating positions
                 execution_success = await self._execute_merge_consolidation(proposal)
-                
+
                 if execution_success:
                     proposal.merge_status = MergeStatus.COMPLETED
                     proposal.execution_timestamp = time.time()
-                    
+
                     # Update metrics
                     self.metrics.total_merges_completed += 1
                     self.metrics.total_positions_consolidated += len(proposal.source_positions)
@@ -636,58 +685,65 @@ class PositionMergerEnhanced:
                     self.metrics.last_merge_timestamp = time.time()
                 else:
                     proposal.merge_status = MergeStatus.FAILED
-                    self.logger.error(f"[PositionMergerEnhanced] Merge execution failed for {proposal.symbol}")
+                    self.logger.error(
+                        f"[PositionMergerEnhanced] Merge execution failed for {proposal.symbol}"
+                    )
                     return False
-                
+
                 # Track in history
                 self.merge_history.append(proposal)
-                
-                self.logger.info(f"[PositionMergerEnhanced] Executed merge for {proposal.symbol}: "
-                               f"{proposal.total_quantity} @ {proposal.weighted_entry_price:.2f}")
-                
+
+                self.logger.info(
+                    f"[PositionMergerEnhanced] Executed merge for {proposal.symbol}: "
+                    f"{proposal.total_quantity} @ {proposal.weighted_entry_price:.2f}"
+                )
+
                 return True
-        
+
         except Exception as e:
             proposal.merge_status = MergeStatus.FAILED
             self.metrics.last_error = str(e)
             self.logger.error(f"[PositionMergerEnhanced] Merge execution failed: {e}")
             return False
-    
-    async def consolidate_dust(self, positions: Dict[str, Any], prices: Dict[str, float]) -> List[MergeProposal]:
+
+    async def consolidate_dust(
+        self, positions: dict[str, Any], prices: dict[str, float]
+    ) -> list[MergeProposal]:
         """
         Consolidate dust positions.
-        
+
         Args:
             positions: All positions
             prices: Current prices
-            
+
         Returns:
             List of dust consolidation proposals
         """
         proposals = []
-        
+
         # Group by symbol
-        positions_by_symbol: Dict[str, List[Dict]] = {}
+        positions_by_symbol: dict[str, list[dict]] = {}
         for pos_id, pos_data in positions.items():
             symbol = pos_data.get("symbol", "")
             if not symbol:
                 continue
-            
+
             if symbol not in positions_by_symbol:
                 positions_by_symbol[symbol] = []
             positions_by_symbol[symbol].append({**pos_data, "position_id": pos_id})
-        
+
         # Find dust positions
         for symbol, symbol_positions in positions_by_symbol.items():
             price = prices.get(symbol, 0)
             if price <= 0:
                 continue
-            
+
             dust_positions = [
-                p for p in symbol_positions
+                p
+                for p in symbol_positions
                 if abs(p.get("quantity", 0)) * price < self.dust_threshold_usd
             ]
-            
+
             if len(dust_positions) >= self.min_positions_to_merge:
                 candidate = MergeCandidate(
                     symbol=symbol,
@@ -696,23 +752,25 @@ class PositionMergerEnhanced:
                     entry_prices=[p.get("entry_price", 0) for p in dust_positions],
                     created_ats=[p.get("created_at", time.time()) for p in dust_positions],
                     confidence_score=0.90,
-                    merge_reason="Dust consolidation"
+                    merge_reason="Dust consolidation",
                 )
-                
+
                 proposal = await self._create_proposal_from_candidate(candidate, price)
                 if proposal:
                     proposals.append(proposal)
-        
+
         return proposals
-    
-    async def run_consolidation_cycle(self, positions: Dict[str, Any], prices: Dict[str, float]) -> ConsolidationReport:
+
+    async def run_consolidation_cycle(
+        self, positions: dict[str, Any], prices: dict[str, float]
+    ) -> ConsolidationReport:
         """
         Run a complete consolidation cycle.
-        
+
         Args:
             positions: All current positions
             prices: Current prices
-            
+
         Returns:
             Report on consolidation cycle
         """
@@ -730,21 +788,21 @@ class PositionMergerEnhanced:
             total_fee_savings=0.0,
             execution_time_sec=0.0,
         )
-        
+
         try:
             # Identify candidates
             candidates = await self.identify_merge_candidates(positions, prices)
             report.symbols_analyzed = len(positions)
             report.candidates_identified = sum(len(c) for c in candidates.values())
-            
+
             # Generate proposals
             proposals = await self.generate_merge_proposals(candidates, prices)
             report.proposals_generated = len(proposals)
-            
+
             # Count approved proposals
             approved = [p for p in proposals if p.is_approved]
             report.proposals_approved = len(approved)
-            
+
             # Execute approved proposals
             for proposal in approved:
                 if await self.execute_merge(proposal):
@@ -753,32 +811,31 @@ class PositionMergerEnhanced:
                     report.total_quantity_consolidated += proposal.total_quantity
                     report.total_cost_savings += proposal.estimated_cost_savings
                     report.total_fee_savings += proposal.estimated_fee_savings
-            
+
             # Add dust consolidation
             dust_proposals = await self.consolidate_dust(positions, prices)
             for proposal in dust_proposals:
                 if proposal.is_approved and await self.execute_merge(proposal):
                     report.proposals_executed += 1
-            
+
             report.cycle_metrics = self.metrics
-            
+
         except Exception as e:
             report.errors.append(str(e))
             self.logger.error(f"[PositionMergerEnhanced] Consolidation cycle failed: {e}")
-        
+
         finally:
             report.execution_time_sec = time.time() - cycle_start
-        
+
         return report
-    
-    def get_summary(self) -> Dict[str, Any]:
+
+    def get_summary(self) -> dict[str, Any]:
         """Get current merger summary."""
         total_proposed = self.metrics.total_merges_proposed
         success_rate = (
-            self.metrics.total_merges_completed / total_proposed
-            if total_proposed > 0 else 0.0
+            self.metrics.total_merges_completed / total_proposed if total_proposed > 0 else 0.0
         )
-        
+
         return {
             "total_merges_proposed": self.metrics.total_merges_proposed,
             "total_merges_completed": self.metrics.total_merges_completed,
@@ -787,8 +844,12 @@ class PositionMergerEnhanced:
             "total_quantity_consolidated": self.metrics.total_quantity_consolidated,
             "total_cost_savings": self.metrics.total_cost_savings,
             "total_fee_savings": self.metrics.total_fee_savings,
-            "pending_proposals": len([p for p in self.merge_proposals.values() if p.merge_status == MergeStatus.PENDING]),
-            "approved_proposals": len([p for p in self.merge_proposals.values() if p.merge_status == MergeStatus.APPROVED]),
+            "pending_proposals": len(
+                [p for p in self.merge_proposals.values() if p.merge_status == MergeStatus.PENDING]
+            ),
+            "approved_proposals": len(
+                [p for p in self.merge_proposals.values() if p.merge_status == MergeStatus.APPROVED]
+            ),
             "last_merge": self.metrics.last_merge_timestamp,
             "last_error": self.metrics.last_error,
         }

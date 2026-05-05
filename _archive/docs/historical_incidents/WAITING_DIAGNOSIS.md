@@ -216,7 +216,7 @@ Three mechanisms could free capital:
 2. ⏳ Accumulation threshold (working, 5-20 min)
 3. ⏳ Natural position closes (slow, 30+ min)
 
-**Current Status:** 
+**Current Status:**
 - 🔴 Stuck in rejection loop for ~7 min
 - 🔴 Liquidation not auto-triggering (that's the real issue)
 - ⏳ Accumulation counter running in background
@@ -245,7 +245,7 @@ To understand why liquidation isn't triggering:
 
 ---
 
-**Current Process:** PID 27344 (still running)  
-**Stuck Since:** ~20:44 (RULE5_ESCALATION first rejection)  
-**Duration:** ~7-10 minutes  
+**Current Process:** PID 27344 (still running)
+**Stuck Since:** ~20:44 (RULE5_ESCALATION first rejection)
+**Duration:** ~7-10 minutes
 **Expected Resolution:** 5-30 minutes (depending on which mechanism triggers first)

@@ -108,6 +108,6 @@ READY FOR DEPLOYMENT ✅
 Next Step: Run session with monitoring active
 Target Metrics:
   - Liquidity restoration hits per session
-  - Forced rotation escape frequency  
+  - Forced rotation escape frequency
   - Entry size consistency (25 USDT baseline)
   - Min-hold bypass log frequency

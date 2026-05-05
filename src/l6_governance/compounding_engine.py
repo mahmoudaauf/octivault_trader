@@ -1,7 +1,8 @@
-import logging
 import asyncio
+import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
+
 import numpy as np
 
 logger = logging.getLogger("CompoundingEngine")
@@ -10,31 +11,40 @@ logger = logging.getLogger("CompoundingEngine")
 try:
     from binance.exceptions import BinanceAPIException  # type: ignore
 except Exception:  # pragma: no cover
+
     class BinanceAPIException(Exception):  # fallback
         pass
+
+
 try:
     import aiohttp  # type: ignore
+
     _NetError = aiohttp.ClientConnectionError
 except Exception:  # pragma: no cover
+
     class _NetError(Exception):
         pass
+
+
 try:
     from tenacity import RetryError  # type: ignore
 except Exception:  # pragma: no cover
+
     class RetryError(Exception):
         pass
+
 
 class CompoundingEngine:
     """
     Generates exposure directives (proposals) to MetaController instead of executing directly.
-    
+
     No longer an autonomous executor. Instead:
     1. Analyzes market conditions
     2. Passes protective gates (volatility, edge, economic)
     3. Proposes exposure directives to MetaController
     4. MetaController validates signals and issues trace_id
     5. ExecutionManager executes with trace_id (rejects without)
-    
+
     This aligns CompoundingEngine with the coordinated system design.
     """
 
@@ -44,7 +54,7 @@ class CompoundingEngine:
         exchange_client: Optional[Any],
         config: Any,
         execution_manager: Any,
-        **kwargs
+        **kwargs,
     ):
         if execution_manager is None:
             raise ValueError("execution_manager must not be None")
@@ -132,7 +142,9 @@ class CompoundingEngine:
         # Preferred: canonical shared-state free-balance getter
         try:
             if hasattr(self.shared_state, "get_free_balance"):
-                bal = await self._maybe_await(self.shared_state.get_free_balance(self.base_currency))
+                bal = await self._maybe_await(
+                    self.shared_state.get_free_balance(self.base_currency)
+                )
                 return float(bal or 0.0)
         except Exception:
             logger.debug("shared_state.get_free_balance failed", exc_info=True)
@@ -149,7 +161,11 @@ class CompoundingEngine:
 
         # Final fallback to shared_state snapshot
         try:
-            bmap = getattr(self.shared_state, "wallet_balances", {}) or getattr(self.shared_state, "balances", {}) or {}
+            bmap = (
+                getattr(self.shared_state, "wallet_balances", {})
+                or getattr(self.shared_state, "balances", {})
+                or {}
+            )
             v = bmap.get(self.base_currency) or bmap.get(self.base_currency.upper()) or 0.0
             if isinstance(v, dict):
                 return float(v.get("free", 0.0))
@@ -250,7 +266,7 @@ class CompoundingEngine:
         except Exception:
             return False
 
-    def _atr_readiness_requirements(self) -> Tuple[int, int, List[str]]:
+    def _atr_readiness_requirements(self) -> tuple[int, int, list[str]]:
         """Resolve ATR period/min bars/timeframe chain used before affordability checks."""
         period = max(2, int(self._cfg("COMPOUNDING_ATR_PERIOD", 14) or 14))
         min_bars = int(self._cfg("COMPOUNDING_ATR_MIN_BARS", period + 1) or (period + 1))
@@ -260,7 +276,7 @@ class CompoundingEngine:
         raw_fallbacks = str(self._cfg("COMPOUNDING_ATR_TIMEFRAME_FALLBACKS", "1h,1m") or "1h,1m")
         fallback_tfs = [t.strip() for t in raw_fallbacks.split(",") if t.strip()]
 
-        timeframes: List[str] = []
+        timeframes: list[str] = []
         for tf in [primary_tf, *fallback_tfs, "5m", "1h", "1m"]:
             tf_u = str(tf or "").strip()
             if tf_u and tf_u not in timeframes:
@@ -274,8 +290,8 @@ class CompoundingEngine:
         *,
         period: int,
         min_bars: int,
-        timeframes: List[str],
-    ) -> Tuple[bool, Optional[str], float]:
+        timeframes: list[str],
+    ) -> tuple[bool, Optional[str], float]:
         """
         Return True when symbol has enough candles and a positive ATR on at least one timeframe.
         """
@@ -301,47 +317,49 @@ class CompoundingEngine:
         return False, None, 0.0
 
     # ========== PROTECTIVE GATES FOR FEE CHURN ELIMINATION ==========
-    
+
     def _get_volatility_filter(self) -> float:
         """
         Gate 1: VOLATILITY FILTER
-        
+
         Returns the minimum required 24h volatility for a symbol to be eligible
         for compounding. Prevents buying calm symbols where fees exceed edge.
-        
+
         Fee structure costs ~0.225% per buy (Binance fee + spread + slippage).
         We require volatility > 2x this cost (0.45%) to ensure we have recovery space.
-        
+
         Returns: Minimum required volatility (e.g., 0.0045 for 0.45%)
         """
         return float(self._cfg("COMPOUNDING_MIN_VOLATILITY", 0.0045))  # 0.45% default
-    
+
     async def _validate_volatility_gate(self, symbol: str) -> bool:
         """
         Check if symbol has sufficient volatility for compounding entry.
-        
+
         Args:
             symbol: Trading pair symbol (e.g., "ETHUSDT")
-            
+
         Returns:
             True if volatility meets minimum threshold, False otherwise
         """
         min_vol = self._get_volatility_filter()
-        
+
         # Try to get volatility from various sources
         volatility = None
-        
+
         # Option 1: From OHLCV data in shared_state
         try:
             if hasattr(self.shared_state, "get_symbol_ohlcv"):
-                ohlcv = await self._maybe_await(self.shared_state.get_symbol_ohlcv(symbol, "1h", limit=24))
+                ohlcv = await self._maybe_await(
+                    self.shared_state.get_symbol_ohlcv(symbol, "1h", limit=24)
+                )
                 if ohlcv and len(ohlcv) >= 5:
                     closes = [float(candle[4]) for candle in ohlcv]
-                    returns = [(closes[i] / closes[i-1] - 1) for i in range(1, len(closes))]
+                    returns = [(closes[i] / closes[i - 1] - 1) for i in range(1, len(closes))]
                     volatility = float(np.std(returns)) if returns else 0.0
         except Exception:
             logger.debug(f"Failed to get OHLCV volatility for {symbol}", exc_info=True)
-        
+
         # Option 2: From market data snapshot if available
         if volatility is None:
             try:
@@ -351,7 +369,7 @@ class CompoundingEngine:
                     volatility = float(data.get("volatility_24h", 0.0))
             except Exception:
                 logger.debug(f"Failed to get market data volatility for {symbol}", exc_info=True)
-        
+
         # Option 3: Use exchange client if available (fallback)
         if volatility is None and self.exchange_client:
             try:
@@ -360,24 +378,26 @@ class CompoundingEngine:
                 )
                 if klines and len(klines) >= 5:
                     closes = [float(k[4]) for k in klines]
-                    returns = [(closes[i] / closes[i-1] - 1) for i in range(1, len(closes))]
+                    returns = [(closes[i] / closes[i - 1] - 1) for i in range(1, len(closes))]
                     volatility = float(np.std(returns)) if returns else 0.0
             except Exception:
                 logger.debug(f"Failed to get exchange volatility for {symbol}", exc_info=True)
-        
+
         # If we couldn't calculate volatility, skip this symbol (conservative approach)
         if volatility is None:
             logger.debug(f"⚠️ Could not calculate volatility for {symbol}, skipping (conservative)")
             return False
-        
+
         # Check against threshold
         if volatility >= min_vol:
             logger.debug(f"✅ {symbol} volatility {volatility:.4%} >= {min_vol:.4%} (Gate 1: PASS)")
             return True
         else:
-            logger.debug(f"❌ {symbol} volatility {volatility:.4%} < {min_vol:.4%} (Gate 1: FAIL - too calm)")
+            logger.debug(
+                f"❌ {symbol} volatility {volatility:.4%} < {min_vol:.4%} (Gate 1: FAIL - too calm)"
+            )
             return False
-    
+
     async def _validate_edge_gate(
         self,
         symbol: str,
@@ -389,15 +409,15 @@ class CompoundingEngine:
     ) -> bool:
         """
         Gate 2: EDGE VALIDATION
-        
+
         Prevents buying:
         - At local highs (within 0.1% of 20-candle high)
         - After momentum has already fired (within last 5 candles)
         - When price action is flat
-        
+
         Args:
             symbol: Trading pair symbol (e.g., "ETHUSDT")
-            
+
         Returns:
             True if entry is valid, False if entry appears poor-timing
         """
@@ -408,7 +428,7 @@ class CompoundingEngine:
                 ohlcv = await self._maybe_await(
                     self.shared_state.get_symbol_ohlcv(symbol, "1h", limit=25)
                 )
-            
+
             if not ohlcv or len(ohlcv) < 5:
                 # Can't validate. Strict mode stays conservative; relaxed mode can opt in.
                 if allow_inconclusive:
@@ -423,13 +443,13 @@ class CompoundingEngine:
                     gate_label,
                 )
                 return False
-            
+
             # Check 1: Not at local high (within 0.1% of 20-candle high)
             high_prices = [float(c[2]) for c in ohlcv[-20:]]
             current_price = float(ohlcv[-1][4])  # Close of last candle
             local_high = max(high_prices)
             distance_from_high = (local_high - current_price) / current_price
-            
+
             if distance_from_high < float(local_high_buffer):  # Too close to local high
                 logger.debug(
                     "❌ %s at local high (current=%.8f, high=%.8f, dist=%.4f%%, min_dist=%.4f%%) (%s: FAIL)",
@@ -441,11 +461,11 @@ class CompoundingEngine:
                     gate_label,
                 )
                 return False
-            
+
             # Check 2: Not after recent momentum (uptrend in last 5 candles)
             recent_closes = [float(c[4]) for c in ohlcv[-6:]]
-            recent_momentum = (recent_closes[-1] / recent_closes[0] - 1)
-            
+            recent_momentum = recent_closes[-1] / recent_closes[0] - 1
+
             if recent_momentum > float(momentum_limit):  # Too much short-term uptrend
                 logger.debug(
                     "❌ %s momentum fired recently (move=%.4f%% in last 5 candles, max=%.4f%%) (%s: FAIL)",
@@ -456,38 +476,42 @@ class CompoundingEngine:
                 )
                 return False
 
-            logger.debug("✅ %s edge is valid - not at high, momentum clear (%s: PASS)", symbol, gate_label)
+            logger.debug(
+                "✅ %s edge is valid - not at high, momentum clear (%s: PASS)", symbol, gate_label
+            )
             return True
-            
+
         except Exception as e:
-            logger.debug("⚠️ Edge validation failed for %s: %s, being conservative", symbol, e, exc_info=True)
+            logger.debug(
+                "⚠️ Edge validation failed for %s: %s, being conservative", symbol, e, exc_info=True
+            )
             return False
-    
+
     async def _validate_economic_gate(self, amount: float, num_symbols: int) -> bool:
         """
         Gate 3: ECONOMIC THRESHOLD
-        
+
         Prevents compounding when profit is insufficient to cover:
         - Trading fees (~0.225% per buy)
         - Safety buffer ($50 minimum remaining)
-        
+
         This ensures compounding won't eat away ALL profit via fee churn.
-        
+
         Args:
             amount: Total USDT available to deploy
             num_symbols: Number of symbols we'd buy
-            
+
         Returns:
             True if profit has room for compounding, False if too thin
         """
         realized_pnl = float(await self._get_realized_pnl_total())
-        
+
         # Estimate total fees for this compounding cycle
         # Each $10 order costs ~$0.0225 (0.225% friction)
         per_symbol = amount / num_symbols if num_symbols > 0 else amount
         fee_per_order = per_symbol * 0.00225  # 0.225% total friction
         estimated_total_fees = fee_per_order * num_symbols
-        
+
         # Safety buffer to ensure compounding doesn't eat all profit.
         # Default reduced to 5.0 — $50 was effectively disabling compounding on small accounts.
         # Micro-account dynamic path below further adapts this based on NAV.
@@ -495,7 +519,7 @@ class CompoundingEngine:
         if str(self._cfg("COMPOUNDING_ECONOMIC_BUFFER_DYNAMIC", "true")).lower() == "true":
             try:
                 metrics = getattr(self.shared_state, "metrics", {}) or {}
-                nav_candidates: List[float] = []
+                nav_candidates: list[float] = []
 
                 # 1) Metrics (fast path)
                 for key in ("nav", "total_nav", "total_equity", "total_value"):
@@ -565,7 +589,9 @@ class CompoundingEngine:
                 # so the $5 default buffer is not blocked by a missing NAV read.
                 if nav <= micro_threshold:
                     micro_floor = float(self._cfg("COMPOUNDING_ECONOMIC_BUFFER_MICRO_MIN", 0.05))
-                    micro_nav_pct = float(self._cfg("COMPOUNDING_ECONOMIC_BUFFER_MICRO_NAV_PCT", 0.001))
+                    micro_nav_pct = float(
+                        self._cfg("COMPOUNDING_ECONOMIC_BUFFER_MICRO_NAV_PCT", 0.001)
+                    )
                     legacy_fee_mult = self._cfg("COMPOUNDING_ECONOMIC_BUFFER_MICRO_FEE_MULT", None)
                     if legacy_fee_mult is None:
                         micro_fee_mult = float(
@@ -591,11 +617,13 @@ class CompoundingEngine:
                         micro_fee_mult,
                     )
             except Exception:
-                logger.debug("Compounding adaptive economic buffer resolution failed", exc_info=True)
-        
+                logger.debug(
+                    "Compounding adaptive economic buffer resolution failed", exc_info=True
+                )
+
         # Calculate remaining profit after fees and buffer
         available_for_compounding = realized_pnl - estimated_total_fees - safety_buffer
-        
+
         if available_for_compounding > 0:
             logger.info(
                 f"✅ Economic gate PASS: realized_pnl=${realized_pnl:.2f} - "
@@ -610,7 +638,7 @@ class CompoundingEngine:
             )
             return False
 
-    async def _estimate_available_position_capacity(self) -> Tuple[int, int, int]:
+    async def _estimate_available_position_capacity(self) -> tuple[int, int, int]:
         """
         Estimate allocation-layer capacity for NEW positions.
         Returns: (available_slots, max_positions_total, open_positions_count)
@@ -646,11 +674,11 @@ class CompoundingEngine:
         available_slots = max(0, int(max_positions - open_positions))
         return available_slots, max_positions, open_positions
 
-    async def _pick_symbols(self, limit: Optional[int] = None) -> List[str]:
+    async def _pick_symbols(self, limit: Optional[int] = None) -> list[str]:
         """
         Choose up to max_symbols from active/accepted symbols, preferring highest score if available.
         Ensures USDT quote and filters out obvious non-tradables.
-        
+
         🚨 INTEGRATED PROTECTIVE GATES:
         - Gate 1: Volatility Filter (skip calm symbols where fees > edge)
         - Gate 2: Edge Validation (skip poor entries at local highs or after momentum)
@@ -677,7 +705,13 @@ class CompoundingEngine:
             return []
 
         # USDT quote only, and avoid doubled quote (e.g., USDTUSDT)
-        syms = [s for s in syms if isinstance(s, str) and s.endswith(self.base_currency) and not s.endswith(self.base_currency * 2)]
+        syms = [
+            s
+            for s in syms
+            if isinstance(s, str)
+            and s.endswith(self.base_currency)
+            and not s.endswith(self.base_currency * 2)
+        ]
 
         # 1. Use unified scoring from SharedState
         try:
@@ -707,17 +741,19 @@ class CompoundingEngine:
             if await self._validate_volatility_gate(symbol):
                 filtered_syms.append(symbol)
         syms = filtered_syms
-        
+
         if not syms:
-            logger.warning("⚠️ All symbols filtered by volatility gate (none volatile enough for compounding)")
+            logger.warning(
+                "⚠️ All symbols filtered by volatility gate (none volatile enough for compounding)"
+            )
             return []
-        
+
         # Gate 2: Edge Validation
         strict_local_high_buffer = float(self._cfg("COMPOUNDING_EDGE_LOCAL_HIGH_BUFFER", 0.001))
         strict_momentum_limit = float(self._cfg("COMPOUNDING_EDGE_MOMENTUM_LIMIT", 0.005))
-        strict_allow_inconclusive = str(
-            self._cfg("COMPOUNDING_EDGE_ALLOW_INCONCLUSIVE", "false")
-        ).lower() == "true"
+        strict_allow_inconclusive = (
+            str(self._cfg("COMPOUNDING_EDGE_ALLOW_INCONCLUSIVE", "false")).lower() == "true"
+        )
         pre_edge_syms = list(syms)
         filtered_syms = []
         for symbol in syms:
@@ -732,7 +768,9 @@ class CompoundingEngine:
         syms = filtered_syms
 
         if not syms:
-            relax_enabled = str(self._cfg("COMPOUNDING_EDGE_RELAX_WHEN_EMPTY", "true")).lower() == "true"
+            relax_enabled = (
+                str(self._cfg("COMPOUNDING_EDGE_RELAX_WHEN_EMPTY", "true")).lower() == "true"
+            )
             if relax_enabled and pre_edge_syms:
                 relaxed_local_high_buffer = float(
                     self._cfg("COMPOUNDING_EDGE_RELAXED_LOCAL_HIGH_BUFFER", 0.0002)
@@ -740,9 +778,10 @@ class CompoundingEngine:
                 relaxed_momentum_limit = float(
                     self._cfg("COMPOUNDING_EDGE_RELAXED_MOMENTUM_LIMIT", 0.015)
                 )
-                relaxed_allow_inconclusive = str(
-                    self._cfg("COMPOUNDING_EDGE_RELAXED_ALLOW_INCONCLUSIVE", "false")
-                ).lower() == "true"
+                relaxed_allow_inconclusive = (
+                    str(self._cfg("COMPOUNDING_EDGE_RELAXED_ALLOW_INCONCLUSIVE", "false")).lower()
+                    == "true"
+                )
 
                 relaxed_syms = []
                 for symbol in pre_edge_syms:
@@ -765,9 +804,10 @@ class CompoundingEngine:
                     )
                     syms = relaxed_syms
                 else:
-                    score_fallback_enabled = str(
-                        self._cfg("COMPOUNDING_EDGE_SCORE_FALLBACK_WHEN_EMPTY", "true")
-                    ).lower() == "true"
+                    score_fallback_enabled = (
+                        str(self._cfg("COMPOUNDING_EDGE_SCORE_FALLBACK_WHEN_EMPTY", "true")).lower()
+                        == "true"
+                    )
                     if score_fallback_enabled:
                         fallback_cap = int(
                             self._cfg("COMPOUNDING_EDGE_SCORE_FALLBACK_MAX_SYMBOLS", 1) or 1
@@ -777,18 +817,15 @@ class CompoundingEngine:
                             self._cfg("COMPOUNDING_EDGE_SCORE_FALLBACK_MIN_SCORE", 0.0) or 0.0
                         )
 
-                        scores: Dict[str, float] = {}
+                        scores: dict[str, float] = {}
                         try:
                             raw_scores = self.shared_state.get_symbol_scores()
                             if isinstance(raw_scores, dict):
-                                scores = {
-                                    str(k): float(v or 0.0)
-                                    for k, v in raw_scores.items()
-                                }
+                                scores = {str(k): float(v or 0.0) for k, v in raw_scores.items()}
                         except Exception:
                             logger.debug("Score fallback: get_symbol_scores failed", exc_info=True)
 
-                        fallback_syms: List[str] = []
+                        fallback_syms: list[str] = []
                         for symbol in pre_edge_syms:
                             score_val = float(scores.get(symbol, 0.0) or 0.0) if scores else 0.0
                             if score_val >= min_score:
@@ -820,7 +857,9 @@ class CompoundingEngine:
                         )
                         return []
             else:
-                logger.warning("⚠️ All symbols filtered by edge validation gate (poor entry timing for all)")
+                logger.warning(
+                    "⚠️ All symbols filtered by edge validation gate (poor entry timing for all)"
+                )
                 return []
 
         cap = int(self.max_symbols)
@@ -832,7 +871,10 @@ class CompoundingEngine:
 
     async def _check_and_compound(self) -> None:
         # --- Circuit Breaker Invariant ---
-        if hasattr(self.shared_state, "is_circuit_breaker_open") and await self.shared_state.is_circuit_breaker_open():
+        if (
+            hasattr(self.shared_state, "is_circuit_breaker_open")
+            and await self.shared_state.is_circuit_breaker_open()
+        ):
             logger.warning("🛑 Compounding frozen: Circuit Breaker is OPEN.")
             return
 
@@ -864,7 +906,9 @@ class CompoundingEngine:
 
         reserve_from_ratio = free_balance * reserve_ratio
         legacy_abs_reserve = float(self._cfg("COMPOUNDING_RESERVE_USDT", 25.0) or 0.0)
-        legacy_cap_ratio = float(self._cfg("COMPOUNDING_RESERVE_USDT_CAP_RATIO", reserve_ratio) or reserve_ratio)
+        legacy_cap_ratio = float(
+            self._cfg("COMPOUNDING_RESERVE_USDT_CAP_RATIO", reserve_ratio) or reserve_ratio
+        )
         legacy_cap_ratio = max(0.0, min(1.0, legacy_cap_ratio))
         bounded_legacy_reserve = min(max(0.0, legacy_abs_reserve), free_balance * legacy_cap_ratio)
         reserve = max(reserve_from_ratio, bounded_legacy_reserve)
@@ -888,9 +932,13 @@ class CompoundingEngine:
             reserve_ratio * 100.0,
             spendable,
         )
-        
+
         # ========== Allocation Capacity (separate from universe breadth) ==========
-        available_slots, max_positions, open_positions = await self._estimate_available_position_capacity()
+        (
+            available_slots,
+            max_positions,
+            open_positions,
+        ) = await self._estimate_available_position_capacity()
         if available_slots <= 0:
             logger.info(
                 "Compounding skipped: allocation full (open_positions=%d max_positions=%d).",
@@ -902,21 +950,25 @@ class CompoundingEngine:
         # ========== GATE 3: ECONOMIC THRESHOLD ==========
         # Fee estimate should reflect likely executable orders, not universe breadth.
         estimated_symbols = max(1, min(int(self.max_symbols), int(available_slots)))
-        
+
         # Apply economic gate BEFORE executing strategy
         if not await self._validate_economic_gate(spendable, estimated_symbols):
-            logger.info("⚠️ Compounding blocked by economic gate (profit insufficient to cover fee churn)")
+            logger.info(
+                "⚠️ Compounding blocked by economic gate (profit insufficient to cover fee churn)"
+            )
             return
-        
+
         await self._execute_compounding_strategy(spendable, max_new_positions=available_slots)
 
-    async def _execute_compounding_strategy(self, amount: float, max_new_positions: Optional[int] = None) -> None:
+    async def _execute_compounding_strategy(
+        self, amount: float, max_new_positions: Optional[int] = None
+    ) -> None:
         """
         Generate exposure directives (proposals) instead of executing directly.
-        
+
         PHASE 2 CHANGE: No longer executes trades autonomously.
         Instead proposes directives to MetaController for validation.
-        
+
         🚨 NOTE: Symbol selection includes protective gates (volatility + edge validation)
                  Economic threshold is checked in _check_and_compound before calling this.
         """
@@ -930,7 +982,8 @@ class CompoundingEngine:
         if per < self.min_compound_threshold:
             logger.info(
                 "⚠️ Skipping compounding: per-symbol allocation %.2f below threshold %.2f.",
-                per, self.min_compound_threshold
+                per,
+                self.min_compound_threshold,
             )
             return
 
@@ -945,7 +998,11 @@ class CompoundingEngine:
             free_quote = await self._get_free_quote()
             remaining = max(0.0, amount - (directives_generated * per))
             if remaining < self.min_compound_threshold or free_quote < self.min_compound_threshold:
-                logger.info("Stopping directive generation: remaining=%.2f, free=%.2f", remaining, free_quote)
+                logger.info(
+                    "Stopping directive generation: remaining=%.2f, free=%.2f",
+                    remaining,
+                    free_quote,
+                )
                 break
 
             planned = min(per, remaining, free_quote)
@@ -970,13 +1027,16 @@ class CompoundingEngine:
 
                 atr_pct_hint = 0.0
                 try:
-                    px = float((getattr(self.shared_state, "latest_prices", {}) or {}).get(symbol, 0.0) or 0.0)
+                    px = float(
+                        (getattr(self.shared_state, "latest_prices", {}) or {}).get(symbol, 0.0)
+                        or 0.0
+                    )
                     if px > 0 and atr_val > 0:
                         atr_pct_hint = float(atr_val) / px
                 except Exception:
                     atr_pct_hint = 0.0
 
-                afford_policy_ctx: Dict[str, Any] = {
+                afford_policy_ctx: dict[str, Any] = {
                     "source": "CompoundingEngine",
                     "atr_timeframe": str(atr_tf or ""),
                     # Compounding pre-check should validate sizing/liquidity only.
@@ -996,7 +1056,13 @@ class CompoundingEngine:
                     policy_context=afford_policy_ctx,
                 )
                 if not ok:
-                    logger.info("⏭️ Skipping directive for %s: cannot afford planned %.2f (%s, gap=%.2f).", symbol, planned, why, gap)
+                    logger.info(
+                        "⏭️ Skipping directive for %s: cannot afford planned %.2f (%s, gap=%.2f).",
+                        symbol,
+                        planned,
+                        why,
+                        gap,
+                    )
                     continue
 
                 # PHASE 2: Generate directive instead of executing
@@ -1008,7 +1074,7 @@ class CompoundingEngine:
                     atr_value=atr_val,
                     atr_pct=atr_pct_hint,
                 )
-                
+
                 # Propose to MetaController
                 await self._propose_exposure_directive(directive)
                 directives_generated += 1
@@ -1023,18 +1089,26 @@ class CompoundingEngine:
                 )
 
             except BinanceAPIException as api_error:
-                logger.error("Binance API error during directive generation for %s: %s", symbol, api_error)
+                logger.error(
+                    "Binance API error during directive generation for %s: %s", symbol, api_error
+                )
             except _NetError as net_error:
-                logger.error("Network error during directive generation for %s: %s", symbol, net_error)
+                logger.error(
+                    "Network error during directive generation for %s: %s", symbol, net_error
+                )
             except RetryError as retry_error:
                 logger.error("RetryError generating directive for %s: %s", symbol, retry_error)
             except Exception as unknown_error:
-                logger.exception("Unexpected error generating directive for %s: %s", symbol, unknown_error)
+                logger.exception(
+                    "Unexpected error generating directive for %s: %s", symbol, unknown_error
+                )
 
         if directives_generated > 0:
             self.just_ran = True
 
-        logger.info("🧮 Directive generation cycle finished. Generated %d directives.", directives_generated)
+        logger.info(
+            "🧮 Directive generation cycle finished. Generated %d directives.", directives_generated
+        )
 
     # ---------- PHASE 2: Exposure Directive Generation ----------
     def _generate_directive(
@@ -1045,10 +1119,10 @@ class CompoundingEngine:
         atr_timeframe: Optional[str] = None,
         atr_value: float = 0.0,
         atr_pct: float = 0.0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Generate exposure directive (proposal) without executing.
-        
+
         Returns:
             {
                 "source": "CompoundingEngine",
@@ -1076,18 +1150,15 @@ class CompoundingEngine:
             "atr_pct": float(atr_pct or 0.0),
             "gates_status": {
                 "volatility": True,  # Already passed gates before here
-                "edge": True,        # Symbol selection enforces these
-                "economic": True,    # Economic gate checked in _check_and_compound
-            }
+                "edge": True,  # Symbol selection enforces these
+                "economic": True,  # Economic gate checked in _check_and_compound
+            },
         }
 
-    async def _propose_exposure_directive(
-        self,
-        directive: Dict[str, Any]
-    ) -> None:
+    async def _propose_exposure_directive(self, directive: dict[str, Any]) -> None:
         """
         Send exposure directive to MetaController for decision.
-        
+
         MetaController will:
         1. Validate directive against all signal sources
         2. Generate trace_id if approved
@@ -1099,32 +1170,32 @@ class CompoundingEngine:
                 meta_controller = getattr(self.shared_state, "meta_controller", None)
             if meta_controller is None:
                 app_ref = getattr(self.shared_state, "app", None)
-                meta_controller = getattr(app_ref, "meta_controller", None) if app_ref is not None else None
+                meta_controller = (
+                    getattr(app_ref, "meta_controller", None) if app_ref is not None else None
+                )
             if meta_controller is None and hasattr(self.shared_state, "get"):
-                with_context_get = getattr(self.shared_state, "get")
+                with_context_get = self.shared_state.get
                 if callable(with_context_get):
                     meta_controller = with_context_get("meta_controller")
 
             if not meta_controller:
                 logger.warning(
                     "MetaController not available for directive %s, directive cached locally",
-                    directive.get("symbol")
+                    directive.get("symbol"),
                 )
                 return
-            
+
             # Proposal to MetaController
             await meta_controller.propose_exposure_directive(directive)
             logger.info(
                 "✅ Proposed exposure directive: %s buy %.2f %s",
                 directive["symbol"],
                 directive["amount"],
-                self.base_currency
+                self.base_currency,
             )
         except Exception as e:
             logger.error(
-                "Failed to propose exposure directive for %s: %s",
-                directive.get("symbol"),
-                e
+                "Failed to propose exposure directive for %s: %s", directive.get("symbol"), e
             )
 
     # ---------- dynamic properties ----------

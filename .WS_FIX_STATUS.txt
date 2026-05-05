@@ -147,7 +147,7 @@ STEP 2: Start the Bot
 
 STEP 3: Monitor WebSocket Health
   tail -f logs/octivault_master_orchestrator.log | grep "\[WS"
-  
+
   Expected Output:
   ├─ [WS:AutoSubscribe] Subscribed to 10 symbols
   ├─ [WS:Connected] WebSocket connected
@@ -155,7 +155,7 @@ STEP 3: Monitor WebSocket Health
 
 STEP 4: Verify Trade Execution
   tail -f logs/octivault_master_orchestrator.log | grep -E "DECISION|execute|TRADE_"
-  
+
   Expected Output:
   ├─ DECISION: BUY BTCUSDT
   ├─ TRADE_SUBMITTED: BTCUSDT MARKET BUY

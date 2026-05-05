@@ -1,7 +1,7 @@
 # Integrating State Recovery with Phase 4 Monitoring
 
-**Status**: ✅ READY TO INTEGRATE  
-**Priority**: MEDIUM (nice-to-have, not blocking Phase 4)  
+**Status**: ✅ READY TO INTEGRATE
+**Priority**: MEDIUM (nice-to-have, not blocking Phase 4)
 
 ---
 
@@ -14,7 +14,7 @@ The state recovery system is **already implemented**, but needs to be **hooked i
 ## 📋 Integration Tasks
 
 ### Task 1: Add Auto-Recovery Hook to Monitoring Start
-**File**: `monitoring/sandbox_monitor.py`  
+**File**: `monitoring/sandbox_monitor.py`
 **Location**: At the very start of `SandboxMonitor.__init__()`
 
 ```python
@@ -28,20 +28,20 @@ def __init__(self, config_path: str = "config/sandbox.yaml"):
     if recovery_result['restart_detected']:
         print("✅ Restart detected - recovering from previous session")
         print(f"   Recovered context: {recovery_result['context']}")
-    
+
     # 2. Continue with normal initialization
     # ... existing init code ...
 ```
 
 ### Task 2: Add Periodic Checkpoint During Monitoring
-**File**: `monitoring/sandbox_monitor.py`  
+**File**: `monitoring/sandbox_monitor.py`
 **Location**: In `start_monitoring()` method, every monitoring cycle
 
 ```python
 # Inside the monitoring loop (in _monitoring_cycle() or similar):
 def _monitoring_cycle(self):
     # ... existing monitoring code ...
-    
+
     # Add checkpoint every 60 minutes (60 cycles × 60 seconds)
     if self.cycle_count % 60 == 0:
         from system_state_manager import SystemStateManager
@@ -55,7 +55,7 @@ def _monitoring_cycle(self):
 ```
 
 ### Task 3: Record Phase 4 Progress in Session Memory
-**File**: `monitoring/sandbox_monitor.py`  
+**File**: `monitoring/sandbox_monitor.py`
 **Location**: After successful monitoring events
 
 ```python
@@ -114,23 +114,23 @@ with open('state/checkpoint.json') as f:
 ## 📊 Integration Timeline
 
 ### Immediate (Now):
-✅ State recovery system implemented (DONE)  
-✅ Documentation complete (DONE)  
-✅ Files verified (DONE)  
+✅ State recovery system implemented (DONE)
+✅ Documentation complete (DONE)
+✅ Files verified (DONE)
 
 ### Short-term (Next 1-2 hours):
-⏳ Hook auto-recovery into monitoring startup  
-⏳ Add periodic checkpointing during monitoring  
-⏳ Test restart recovery simulation  
+⏳ Hook auto-recovery into monitoring startup
+⏳ Add periodic checkpointing during monitoring
+⏳ Test restart recovery simulation
 
 ### Medium-term (During Phase 4):
-⏳ Monitor state persistence during 48-hour run  
-⏳ Verify checkpoint files growing correctly  
-⏳ Collect recovery statistics  
+⏳ Monitor state persistence during 48-hour run
+⏳ Verify checkpoint files growing correctly
+⏳ Collect recovery statistics
 
 ### Long-term (After Phase 4):
-⏳ Include state recovery metrics in Phase 4 report  
-⏳ Use recovery system for Phase 5 production deployment  
+⏳ Include state recovery metrics in Phase 4 report
+⏳ Use recovery system for Phase 5 production deployment
 
 ---
 
@@ -161,11 +161,11 @@ with open('state/checkpoint.json') as f:
 
 ## 🎯 Expected Outcomes After Integration
 
-✅ Monitoring survives any unexpected restart  
-✅ All metrics collected so far preserved  
-✅ Checkpoint enables recovery within 1 minute  
-✅ 48-hour validation clock continues uninterrupted  
-✅ Zero data loss from restart  
+✅ Monitoring survives any unexpected restart
+✅ All metrics collected so far preserved
+✅ Checkpoint enables recovery within 1 minute
+✅ 48-hour validation clock continues uninterrupted
+✅ Zero data loss from restart
 
 ---
 
@@ -221,8 +221,8 @@ print('Current Task:', ctx['system_status']['current_task'])
 
 ---
 
-**Status**: ✅ READY FOR INTEGRATION  
-**Blocking Phase 4?**: NO - Phase 4 runs independently  
-**Priority**: MEDIUM - Nice-to-have safety feature  
+**Status**: ✅ READY FOR INTEGRATION
+**Blocking Phase 4?**: NO - Phase 4 runs independently
+**Priority**: MEDIUM - Nice-to-have safety feature
 
 The state recovery system is **production-ready** and can be integrated whenever convenient!

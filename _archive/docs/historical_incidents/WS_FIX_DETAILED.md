@@ -8,7 +8,7 @@
 
 **Solution**: Three-pronged fix:
 1. Auto-subscribe WebSocket to accepted_symbols on startup
-2. Fallback to bootstrap DEFAULT_SYMBOLS if needed  
+2. Fallback to bootstrap DEFAULT_SYMBOLS if needed
 3. Proactive subscription in MarketDataFeed when new symbols appear
 
 **Files Modified**: 2
@@ -38,7 +38,7 @@ Trade Execution ✅
 
 ### The Problem (What Was Happening)
 ```
-Agent (SwingTradeHunter) 
+Agent (SwingTradeHunter)
     ↓ publishes TradeIntent
 EventBus (signals cached successfully ✅)
     ↓ MetaController processes...
@@ -77,7 +77,7 @@ async def _ws_main_loop(self) -> None:
     while self._running:
         try:
             self._logger.info(f"[WS:Connect] Connecting...")
-            
+
             # === NEW: Auto-subscribe to available symbols ===
             if not self._symbols_subscribed:
                 try:
@@ -89,7 +89,7 @@ async def _ws_main_loop(self) -> None:
                             self._logger.info(f"[WS:AutoSubscribe] Subscribed to {len(syms)} symbols")
                 except Exception as e:
                     self._logger.debug(f"[WS:AutoSubscribe] Failed: {e}")
-            
+
             binance_client = await self._get_binance_client()
             # ... now has symbols to work with ✅
 ```
@@ -118,7 +118,7 @@ async def _get_fallback_symbols(self) -> List[str]:
             return symbols
     except Exception as e:
         self._logger.debug(f"[WS:Fallback] Failed to load bootstrap symbols: {e}")
-    
+
     # Hardcoded fallback if everything else fails
     hardcoded = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
     self._logger.warning(f"[WS:Fallback] Using hardcoded symbols: {hardcoded}")
@@ -152,11 +152,11 @@ while not self._stop.is_set():
     symbols = await self._get_accepted_symbols()
     current_symbols = {str(s).upper() for s in symbols}
     new_symbols = sorted(current_symbols - self._known_symbols)
-    
+
     if new_symbols:
         self._logger.info(f"[MDF] delta detected: {new_symbols}")
         await self._schedule_symbol_backfill(new_symbols)
-    
+
     self._known_symbols = current_symbols
     # ... rest of polling logic
 ```
@@ -167,11 +167,11 @@ while not self._stop.is_set():
     symbols = await self._get_accepted_symbols()
     current_symbols = {str(s).upper() for s in symbols}
     new_symbols = sorted(current_symbols - self._known_symbols)
-    
+
     if new_symbols:
         self._logger.info(f"[MDF] delta detected: {new_symbols}")
         await self._schedule_symbol_backfill(new_symbols)
-        
+
         # === NEW: Subscribe WebSocket to new symbols ===
         if self.websocket_feed and hasattr(self.websocket_feed, 'subscribe'):
             try:
@@ -179,7 +179,7 @@ while not self._stop.is_set():
                 self._logger.info(f"[MDF] WebSocket subscribed to {len(new_symbols)} new symbols")
             except Exception as e:
                 self._logger.debug(f"[MDF] WebSocket subscription failed: {e}")
-    
+
     self._known_symbols = current_symbols
     # ... rest of polling logic
 ```

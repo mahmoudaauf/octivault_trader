@@ -1,8 +1,8 @@
 # ⏱️ QUICK REFERENCE - 6 Hour Run
 
-**Start:** NOW  
-**End:** +6 hours  
-**Bot PID:** 96511 ✅  
+**Start:** NOW
+**End:** +6 hours
+**Bot PID:** 96511 ✅
 
 ---
 
@@ -94,5 +94,5 @@ echo "Hour $(date +%H): Trades=$(grep TRADE_EXECUTED logs/octivault_master_orche
 
 ---
 
-**Default:** Let it run! System is stable. Just check status occasionally.  
+**Default:** Let it run! System is stable. Just check status occasionally.
 **Full Plan:** See `6HOUR_MONITORING_PLAN.md`

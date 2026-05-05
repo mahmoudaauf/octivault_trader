@@ -107,8 +107,8 @@ bash emergency_liquidate.sh
 
 ## Current Status
 
-**Portfolio:** 28 active positions (all dust)  
-**NAV:** $41.70  
+**Portfolio:** 28 active positions (all dust)
+**NAV:** $41.70
 **Blockage:** Kill-switch (waiting for consolidation)
 
 **Which tool to use?**

@@ -52,7 +52,7 @@ grep -i "debug:classify" "$ORCHESTRATOR_LOG" 2>/dev/null | tail -5 | while read 
     SYMBOL=$(echo "$line" | grep -o "[A-Z]*USDT" | head -1)
     VALUE=$(echo "$line" | grep -o "value=[0-9.]*" | grep -o "[0-9.]*")
     QTY=$(echo "$line" | grep -o "qty=[0-9.]*" | grep -o "[0-9.]*")
-    
+
     if [ ! -z "$VALUE" ]; then
         printf "  📍 %-10s Qty=%.8f Value=\$%-8s\n" "$SYMBOL" "$QTY" "$VALUE"
     fi
@@ -113,21 +113,21 @@ echo -e "${YELLOW}Live monitoring (updates every 10 seconds):${NC}\n"
 while true; do
     clear
     echo -e "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] 3-HOUR TRADING SESSION MONITOR${NC}\n"
-    
+
     # Portfolio value
     PORTFOLIO=$(grep -o '"total_value": [0-9.]*' "$ORCHESTRATOR_LOG" 2>/dev/null | tail -1 | grep -o "[0-9.]*")
     if [ ! -z "$PORTFOLIO" ]; then
         echo -e "${GREEN}Portfolio Value: \$$PORTFOLIO${NC}"
     fi
-    
+
     # Latest signals
     echo -e "\n${BLUE}Recent Signals (last 5):${NC}"
     grep -i "received.*signal\|submitted.*signal" "$ORCHESTRATOR_LOG" 2>/dev/null | tail -5 | nl -w2 -s'. '
-    
+
     # Latest P&L
     echo -e "\n${BLUE}Latest P&L Update:${NC}"
     grep "total_equity" "$ORCHESTRATOR_LOG" 2>/dev/null | tail -1 | sed 's/^/  /'
-    
+
     # Status
     echo -e "\n${BLUE}Process Status:${NC}"
     if pgrep -f "RUN_3HOUR_SESSION.py" > /dev/null; then
@@ -135,6 +135,6 @@ while true; do
     else
         echo -e "  ${RED}❌ Stopped${NC}"
     fi
-    
+
     sleep 10
 done

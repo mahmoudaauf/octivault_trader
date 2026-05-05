@@ -1,7 +1,7 @@
 # 🚨 EMERGENCY ACTION CHECKLIST - GET SYSTEM TRADING AGAIN
 
-**Status**: ⚠️ **ACCOUNT CRITICAL - $103.71 REMAINING**  
-**Problem**: Cannot execute trades (need $25 entry, have $21.85)  
+**Status**: ⚠️ **ACCOUNT CRITICAL - $103.71 REMAINING**
+**Problem**: Cannot execute trades (need $25 entry, have $21.85)
 **Solution**: Reduce entry size to $5-10 USDT and test
 
 ---
@@ -93,7 +93,7 @@ Check for:
 ### Issue: Still can't trade at $5 entry
 **Reason**: Position limit gate or other blocker
 
-**Solution**: 
+**Solution**:
 ```bash
 # Disable some strategies temporarily
 # Edit core/app_context.py and comment out:
@@ -218,4 +218,3 @@ If stuck:
 ---
 
 **READY TO FIX?** → Apply the changes above and monitor for 30 minutes. Report win rate + P&L results.
-

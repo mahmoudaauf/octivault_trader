@@ -60,7 +60,7 @@ python3 monitoring/active_capital_monitor.py --interval 10
 
 ## Files Created
 - `EXECUTION_DEADLOCK_FIX.md` - Full technical analysis
-- `DEADLOCK_RESOLUTION_REPORT.md` - Complete incident report  
+- `DEADLOCK_RESOLUTION_REPORT.md` - Complete incident report
 - `fix_execution_deadlock.py` - Auto-fix script
 - `diagnose_execution_blocker.py` - Diagnostics script
 

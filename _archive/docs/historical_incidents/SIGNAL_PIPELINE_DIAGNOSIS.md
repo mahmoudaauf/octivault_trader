@@ -182,7 +182,7 @@ self._collected_signals.append(signal)
 ### Verification Needed
 
 Check if min notional filter is actually filtering:
-- Log shows zero `"filtering out"` messages  
+- Log shows zero `"filtering out"` messages
 - But we see zero `[MLForecaster] SIGNAL:` logs too
 - This suggests either:
   1. The condition IS true (signals being filtered), OR
@@ -280,6 +280,3 @@ The bot was designed to trade with `expected_move >= 0.61%`, but the current mar
 - Current regime: "normal" (low volatility)
 - When market enters "high" regime, expected_move will exceed 0.61%
 - Passive; no code changes needed
-
-
-

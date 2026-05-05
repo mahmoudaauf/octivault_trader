@@ -248,19 +248,19 @@ await rebuild_nav_from_state(source="auto_fix")
 ## 🚨 Troubleshooting
 
 ### Dashboard Shows No Data
-**Cause:** Orchestrator hasn't logged metrics yet  
+**Cause:** Orchestrator hasn't logged metrics yet
 **Fix:** Wait 30 seconds for first cycle
 
 ### Monitor Shows Low Health Scores
-**Cause:** Too many API errors or failed syncs  
+**Cause:** Too many API errors or failed syncs
 **Fix:** Monitor will auto-apply fixes; check Binance API status
 
 ### Capital Not Growing
-**Cause:** Could be capital floor constraints or market conditions  
+**Cause:** Could be capital floor constraints or market conditions
 **Fix:** Monitor logs, check if orders are being rejected
 
 ### Auto-Fix Not Applied
-**Cause:** Same fix type ran recently (5min cooldown)  
+**Cause:** Same fix type ran recently (5min cooldown)
 **Fix:** Wait or manually restart to force fresh sync
 
 ## 🔧 Configuration
@@ -383,6 +383,6 @@ For issues:
 
 ---
 
-**Created:** May 2, 2026  
-**Version:** 1.0  
+**Created:** May 2, 2026
+**Version:** 1.0
 **Status:** Production Ready ✅

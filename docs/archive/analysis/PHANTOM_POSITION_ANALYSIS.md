@@ -40,7 +40,7 @@ System frozen at loop 1195, repeatedly trying to SELL ETHUSDT with `amount=0.0`,
 
 ### 1️⃣ **Does ETHUSDT position actually exist on Binance?**
 
-**Why this matters**: 
+**Why this matters**:
 - If position exists on exchange but qty shows 0.0 locally → STATE SYNC BUG
 - If position deleted on exchange but persists locally → STALE CACHE BUG
 
@@ -82,7 +82,7 @@ Lines 9460-9500 in `execution_manager.py`:
 **Issue**: These fixes only run if `qty > 0` initially
 
 ### What's NOT Fixed ❌
-- **No repair for qty=0.0 phantom positions** 
+- **No repair for qty=0.0 phantom positions**
 - **No "skip or liquidate" logic** when qty won't calculate > 0
 - **No startup validation** to detect phantoms at boot
 - **No circuit breaker** for repeated rejections on same symbol
@@ -109,12 +109,12 @@ async def _scan_for_phantom_positions(self):
                 'qty': qty,
                 'reason': 'qty_is_zero_or_negative'
             })
-    
+
     if phantoms:
         logger.warning(f"[PHANTOM_DETECTION] Found {len(phantoms)} phantom positions")
         for p in phantoms:
             logger.warning(f"  - {p['symbol']}: qty={p['qty']}")
-    
+
     return phantoms
 ```
 
@@ -142,11 +142,11 @@ async def _force_sync_position_qty(symbol):
     """
     real_qty = await exchange_client.get_position_qty(symbol)
     local_qty = await shared_state.get_position_qty(symbol)
-    
+
     if abs(real_qty - local_qty) > min_qty:
         logger.warning(f"[FORCE_SYNC] {symbol} qty mismatch: exchange={real_qty} local={local_qty}")
         await shared_state.update_position_qty(symbol, real_qty)
-    
+
     return real_qty
 ```
 
@@ -161,11 +161,11 @@ async def _validate_sellable_qty_exists(symbol):
     """
     qty = await _get_sellable_qty(symbol)
     min_qty = get_min_qty(symbol)
-    
+
     if qty < min_qty:
         logger.error(f"[PRESELL_VALIDATION] {symbol} qty={qty} < min_qty={min_qty}")
         return False, qty
-    
+
     return True, qty
 
 # In execute_sell():
@@ -279,7 +279,7 @@ Restart with new code, should:
 
 1. **You read this analysis** ← You are here
 2. **You tell me**: Is ETHUSDT stuck phantom or already gone?
-3. **I implement**: Phantom detection + repair  
+3. **I implement**: Phantom detection + repair
 4. **You restart**: New system fixes itself
 5. **You confirm**: Trading resumes, capital freed
 
@@ -299,4 +299,3 @@ The proper fix is to:
 Not to keep restarting or applying band-aid fixes.
 
 Ready to proceed once you confirm the ETHUSDT phantom status.
-

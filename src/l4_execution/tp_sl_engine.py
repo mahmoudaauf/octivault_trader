@@ -1,13 +1,14 @@
-import logging
 import asyncio
+import logging
 import time
-import os
 from datetime import datetime
 from inspect import iscoroutine
-from typing import Optional, List, Dict, Any, Tuple
 from math import fsum, sqrt
-from utils.shared_state_tools import fee_bps
+from typing import Any, Optional
+
 from src.l4_execution.exit_utils import post_exit_bookkeeping
+from utils.shared_state_tools import fee_bps
+
 
 class TPSLEngine:
     """
@@ -31,42 +32,60 @@ class TPSLEngine:
         self.session_id: str = ""  # injected by AppContext
 
         # RACE CONDITION FIX #4: Per-symbol locking to prevent concurrent closes
-        self._symbol_close_locks: Dict[str, asyncio.Lock] = {}
+        self._symbol_close_locks: dict[str, asyncio.Lock] = {}
         self._symbol_close_locks_lock = asyncio.Lock()
 
         # Defensive defaults on shared_state attributes we use
-        if not hasattr(self.shared_state, "open_trades"): self.shared_state.open_trades = {}
-        if not hasattr(self.shared_state, "latest_prices"): self.shared_state.latest_prices = {}
-        if not hasattr(self.shared_state, "sentiment_score"): self.shared_state.sentiment_score = {}
-        if not hasattr(self.shared_state, "volatility_state"): self.shared_state.volatility_state = {}
+        if not hasattr(self.shared_state, "open_trades"):
+            self.shared_state.open_trades = {}
+        if not hasattr(self.shared_state, "latest_prices"):
+            self.shared_state.latest_prices = {}
+        if not hasattr(self.shared_state, "sentiment_score"):
+            self.shared_state.sentiment_score = {}
+        if not hasattr(self.shared_state, "volatility_state"):
+            self.shared_state.volatility_state = {}
 
         # Config snapshot (hot-path)
         self._interval = float(getattr(self.config, "TPSL_CHECK_INTERVAL", 10) or 10)
         self._close_concurrency = int(getattr(self.config, "MAX_CONCURRENT_CLOSES", 5) or 5)
         self._fallback_atr_pct = float(getattr(self.config, "TPSL_FALLBACK_ATR_PCT", 0.01) or 0.01)
-        self._debounce_close_sec = float(getattr(self.config, "TPSL_DEBOUNCE_CLOSE_SEC", 5.0) or 5.0)
+        self._debounce_close_sec = float(
+            getattr(self.config, "TPSL_DEBOUNCE_CLOSE_SEC", 5.0) or 5.0
+        )
 
         # Time helpers & close debounce state
         self._mono = time.monotonic
         self._session_start = time.monotonic()  # Track when this session started
-        self._last_close_attempt: Dict[str, float] = {}
-        self._tp_floor_hit: Dict[str, bool] = {}
-        self._last_tp_sl_method: Dict[str, str] = {}
-        self._last_profit_audit_ts: Dict[str, float] = {}
+        self._last_close_attempt: dict[str, float] = {}
+        self._tp_floor_hit: dict[str, bool] = {}
+        self._last_tp_sl_method: dict[str, str] = {}
+        self._last_profit_audit_ts: dict[str, float] = {}
         self._price_stale_sec = float(getattr(self.config, "TPSL_PRICE_STALE_SEC", 120.0) or 120.0)
         self._ohlcv_stale_sec = float(getattr(self.config, "TPSL_OHLCV_STALE_SEC", 300.0) or 300.0)
-        self._min_notional_safety = float(getattr(self.config, "TPSL_MIN_NOTIONAL_SAFETY", 1.0) or 1.0)
+        self._min_notional_safety = float(
+            getattr(self.config, "TPSL_MIN_NOTIONAL_SAFETY", 1.0) or 1.0
+        )
         # Default strategy contract: hybrid ATR targets + time-based exits
-        self._tp_sl_strategy = str(getattr(self.config, "TPSL_STRATEGY", "hybrid_atr_time") or "hybrid_atr_time")
-        self._tp_sl_calc_model = str(getattr(self.config, "TPSL_CALC_MODEL", "atr_pct") or "atr_pct")
-        self._status_timeout_sec = float(getattr(self.config, "TPSL_STATUS_TIMEOUT_SEC", 1.0) or 1.0)
+        self._tp_sl_strategy = str(
+            getattr(self.config, "TPSL_STRATEGY", "hybrid_atr_time") or "hybrid_atr_time"
+        )
+        self._tp_sl_calc_model = str(
+            getattr(self.config, "TPSL_CALC_MODEL", "atr_pct") or "atr_pct"
+        )
+        self._status_timeout_sec = float(
+            getattr(self.config, "TPSL_STATUS_TIMEOUT_SEC", 1.0) or 1.0
+        )
         self._profit_audit_enabled = bool(getattr(self.config, "TPSL_PROFIT_AUDIT", False))
-        self._profit_audit_sec = float(getattr(self.config, "TPSL_PROFIT_AUDIT_SEC", 300.0) or 300.0)
+        self._profit_audit_sec = float(
+            getattr(self.config, "TPSL_PROFIT_AUDIT_SEC", 300.0) or 300.0
+        )
         self._time_exit_enabled = bool(getattr(self.config, "TPSL_TIME_EXIT_ENABLED", False))
         self._rv_lookback = int(getattr(self.config, "TPSL_RV_LOOKBACK", 20) or 20)
         self._vol_low_pct = float(getattr(self.config, "TPSL_VOL_LOW_ATR_PCT", 0.0045) or 0.0045)
         self._vol_high_pct = float(getattr(self.config, "TPSL_VOL_HIGH_ATR_PCT", 0.0150) or 0.0150)
-        self._vol_target_atr_pct = float(getattr(self.config, "TPSL_VOL_TARGET_ATR_PCT", 0.0090) or 0.0090)
+        self._vol_target_atr_pct = float(
+            getattr(self.config, "TPSL_VOL_TARGET_ATR_PCT", 0.0090) or 0.0090
+        )
         self._rr_min = float(getattr(self.config, "TPSL_DYNAMIC_RR_MIN", 1.35) or 1.35)
         self._rr_max = float(getattr(self.config, "TPSL_DYNAMIC_RR_MAX", 2.60) or 2.60)
         self._spread_adaptive_enabled = bool(
@@ -74,38 +93,68 @@ class TPSLEngine:
         )
         self._spread_tight_bps = float(getattr(self.config, "TPSL_SPREAD_TIGHT_BPS", 6.0) or 6.0)
         self._spread_high_bps = float(getattr(self.config, "TPSL_SPREAD_HIGH_BPS", 18.0) or 18.0)
-        self._spread_extreme_bps = float(getattr(self.config, "TPSL_SPREAD_EXTREME_BPS", 45.0) or 45.0)
-        self._spread_rr_bonus_max = float(getattr(self.config, "TPSL_SPREAD_RR_BONUS_MAX", 0.18) or 0.18)
-        self._spread_rr_discount_max = float(getattr(self.config, "TPSL_SPREAD_RR_DISCOUNT_MAX", 0.06) or 0.06)
-        self._spread_tp_floor_mult = float(getattr(self.config, "TPSL_SPREAD_TP_FLOOR_MULT", 2.0) or 2.0)
+        self._spread_extreme_bps = float(
+            getattr(self.config, "TPSL_SPREAD_EXTREME_BPS", 45.0) or 45.0
+        )
+        self._spread_rr_bonus_max = float(
+            getattr(self.config, "TPSL_SPREAD_RR_BONUS_MAX", 0.18) or 0.18
+        )
+        self._spread_rr_discount_max = float(
+            getattr(self.config, "TPSL_SPREAD_RR_DISCOUNT_MAX", 0.06) or 0.06
+        )
+        self._spread_tp_floor_mult = float(
+            getattr(self.config, "TPSL_SPREAD_TP_FLOOR_MULT", 2.0) or 2.0
+        )
         self._asymmetric_tp_enabled = bool(getattr(self.config, "TPSL_ASYMMETRIC_TP_ENABLED", True))
-        self._asymmetric_tp_trend_bonus = float(getattr(self.config, "TPSL_ASYM_TP_TREND_BONUS", 0.12) or 0.12)
-        self._asymmetric_tp_high_vol_bonus = float(getattr(self.config, "TPSL_ASYM_TP_HIGH_VOL_BONUS", 0.08) or 0.08)
-        self._asymmetric_tp_chop_discount = float(getattr(self.config, "TPSL_ASYM_TP_CHOP_DISCOUNT", 0.08) or 0.08)
-        self._asymmetric_tp_sentiment_weight = float(getattr(self.config, "TPSL_ASYM_TP_SENTIMENT_WEIGHT", 0.06) or 0.06)
-        self._asymmetric_tp_phase_gap_weight = float(getattr(self.config, "TPSL_ASYM_TP_PHASE_GAP_WEIGHT", 0.20) or 0.20)
-        self._asymmetric_tp_phase_bonus_cap = float(getattr(self.config, "TPSL_ASYM_TP_PHASE_BONUS_CAP", 0.12) or 0.12)
-        self._asymmetric_tp_min_bias = float(getattr(self.config, "TPSL_ASYM_TP_MIN_BIAS", 0.92) or 0.92)
-        self._asymmetric_tp_max_bias = float(getattr(self.config, "TPSL_ASYM_TP_MAX_BIAS", 1.35) or 1.35)
-        self._asymmetric_tp_tier_b_cap = float(getattr(self.config, "TPSL_ASYM_TP_TIER_B_CAP", 1.08) or 1.08)
+        self._asymmetric_tp_trend_bonus = float(
+            getattr(self.config, "TPSL_ASYM_TP_TREND_BONUS", 0.12) or 0.12
+        )
+        self._asymmetric_tp_high_vol_bonus = float(
+            getattr(self.config, "TPSL_ASYM_TP_HIGH_VOL_BONUS", 0.08) or 0.08
+        )
+        self._asymmetric_tp_chop_discount = float(
+            getattr(self.config, "TPSL_ASYM_TP_CHOP_DISCOUNT", 0.08) or 0.08
+        )
+        self._asymmetric_tp_sentiment_weight = float(
+            getattr(self.config, "TPSL_ASYM_TP_SENTIMENT_WEIGHT", 0.06) or 0.06
+        )
+        self._asymmetric_tp_phase_gap_weight = float(
+            getattr(self.config, "TPSL_ASYM_TP_PHASE_GAP_WEIGHT", 0.20) or 0.20
+        )
+        self._asymmetric_tp_phase_bonus_cap = float(
+            getattr(self.config, "TPSL_ASYM_TP_PHASE_BONUS_CAP", 0.12) or 0.12
+        )
+        self._asymmetric_tp_min_bias = float(
+            getattr(self.config, "TPSL_ASYM_TP_MIN_BIAS", 0.92) or 0.92
+        )
+        self._asymmetric_tp_max_bias = float(
+            getattr(self.config, "TPSL_ASYM_TP_MAX_BIAS", 1.35) or 1.35
+        )
+        self._asymmetric_tp_tier_b_cap = float(
+            getattr(self.config, "TPSL_ASYM_TP_TIER_B_CAP", 1.08) or 1.08
+        )
         self._enforce_execution_manager_only = bool(
             getattr(self.config, "TPSL_ENFORCE_EXECUTION_MANAGER_ONLY", True)
         )
-        self._dynamic_trailing_mult: Dict[str, float] = {}
+        self._dynamic_trailing_mult: dict[str, float] = {}
         self._snowball_asymmetry_enabled = bool(
             getattr(self.config, "TPSL_SNOWBALL_ASYMMETRY_ENABLED", True)
         )
-        self._snowball_phase_profiles = getattr(
-            self.config,
-            "COMPOUNDING_TPSL_PHASE_PROFILES",
-            {
-                "PHASE_1_SEED": {"tp_mult": 1.20, "sl_mult": 1.00, "rr_bonus": 0.04},
-                "PHASE_2_TRACTION": {"tp_mult": 1.40, "sl_mult": 0.95, "rr_bonus": 0.12},
-                "PHASE_3_ACCELERATE": {"tp_mult": 1.60, "sl_mult": 0.90, "rr_bonus": 0.22},
-                # Phase 4 shifts to capital defense: reduced TP aggression, tighter SL.
-                "PHASE_4_SNOWBALL": {"tp_mult": 1.30, "sl_mult": 0.75, "rr_bonus": 0.10},
-            },
-        ) or {}
+        self._snowball_phase_profiles = (
+            getattr(
+                self.config,
+                "COMPOUNDING_TPSL_PHASE_PROFILES",
+                {
+                    "PHASE_1_SEED": {"tp_mult": 1.20, "sl_mult": 1.00, "rr_bonus": 0.04},
+                    "PHASE_2_TRACTION": {"tp_mult": 1.40, "sl_mult": 0.95, "rr_bonus": 0.12},
+                    "PHASE_3_ACCELERATE": {"tp_mult": 1.60, "sl_mult": 0.90, "rr_bonus": 0.22},
+                    # Phase 4 shifts to capital defense: reduced TP aggression, tighter SL.
+                    "PHASE_4_SNOWBALL": {"tp_mult": 1.30, "sl_mult": 0.75, "rr_bonus": 0.10},
+                },
+            )
+            or {}
+        )
+
     async def start(self):
         """
         P9 contract: start() creates the monitoring task and emits an initial status.
@@ -114,10 +163,12 @@ class TPSLEngine:
         if getattr(self, "_task", None) and not self._task.done():
             return
         self._stop_event.clear()
-        
+
         # Start heartbeat first to satisfy Watchdog during startup gates
         if not self._heartbeat_task or self._heartbeat_task.done():
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="TPSLEngine:heartbeat")
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(), name="TPSLEngine:heartbeat"
+            )
 
         # Auto-arm TP/SL for existing open positions (startup safety)
         try:
@@ -128,7 +179,7 @@ class TPSLEngine:
                 "[TPSLEngine] Auto-arm failed on startup — open positions may have no stop-loss",
                 exc_info=True,
             )
-            
+
         self._task = asyncio.create_task(self.run())
         await self._safe_status_update("Initialized", "Ready")
 
@@ -142,9 +193,7 @@ class TPSLEngine:
 
         # Derive open trades from positions
         open_trades = {
-            sym: pos
-            for sym, pos in positions.items()
-            if float(pos.get("position_qty", 0) or 0) > 0
+            sym: pos for sym, pos in positions.items() if float(pos.get("position_qty", 0) or 0) > 0
         }
         symbols = set(open_trades.keys()) | set(positions.keys())
 
@@ -155,7 +204,9 @@ class TPSLEngine:
             pos = positions.get(symbol, {}) if isinstance(positions, dict) else {}
             gate_ref = tr if tr else pos
             try:
-                is_open_sig, value_usdt, floor_usdt = self.shared_state.classify_position_snapshot(symbol, gate_ref)
+                is_open_sig, value_usdt, floor_usdt = self.shared_state.classify_position_snapshot(
+                    symbol, gate_ref
+                )
             except Exception:
                 is_open_sig, value_usdt, floor_usdt = True, 0.0, 0.0
             if not is_open_sig:
@@ -173,7 +224,9 @@ class TPSLEngine:
             if tr.get("tp") is not None and tr.get("sl") is not None:
                 continue
 
-            entry_price = float(tr.get("entry_price") or tr.get("avg_price") or tr.get("entry") or 0.0)
+            entry_price = float(
+                tr.get("entry_price") or tr.get("avg_price") or tr.get("entry") or 0.0
+            )
             qty = float(tr.get("quantity") or tr.get("qty") or 0.0)
 
             if (entry_price <= 0 or qty <= 0) and isinstance(positions, dict):
@@ -196,16 +249,25 @@ class TPSLEngine:
                 sl_price = float(sl or 0.0)
                 self.logger.debug(
                     "[TPSL:ARM_DEBUG] %s FINAL TP=%.6f SL=%.6f entry=%.6f",
-                    symbol, tp_price, sl_price, entry_price
+                    symbol,
+                    tp_price,
+                    sl_price,
+                    entry_price,
                 )
                 self.logger.info(
                     "[TPSL:auto_arm] %s tp=%.6f sl=%.6f entry=%.6f qty=%.6f",
-                    symbol, float(tp or 0.0), float(sl or 0.0), entry_price, qty
+                    symbol,
+                    float(tp or 0.0),
+                    float(sl or 0.0),
+                    entry_price,
+                    qty,
                 )
             else:
                 self.logger.warning(
                     "[TPSL:auto_arm] %s missing entry/qty; TP/SL not armed (entry=%.6f qty=%.6f)",
-                    symbol, entry_price, qty
+                    symbol,
+                    entry_price,
+                    qty,
                 )
 
     async def stop(self):
@@ -213,7 +275,7 @@ class TPSLEngine:
         P9 contract: stop() cancels the monitoring task and emits a final status.
         """
         self._stop_event.set()
-        
+
         # Cancel heartbeat
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
@@ -225,13 +287,17 @@ class TPSLEngine:
             try:
                 t.cancel()
                 try:
-                    await asyncio.wait_for(t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0)))
+                    await asyncio.wait_for(
+                        t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0))
+                    )
                 except asyncio.CancelledError:
                     pass
             except Exception:
                 self.logger.debug("TPSLEngine stop wait failed", exc_info=True)
         try:
-            await self.shared_state.update_component_status("TPSLEngine", "Stopped", "Stopped by request")
+            await self.shared_state.update_component_status(
+                "TPSLEngine", "Stopped", "Stopped by request"
+            )
         except Exception:
             self.logger.debug("TPSLEngine final health update failed", exc_info=True)
 
@@ -316,7 +382,17 @@ class TPSLEngine:
 
         taker_bps = float(fee_bps(self.shared_state, "taker") or 10.0)
         fee_pct = (taker_bps * 2.0) / 10000.0
-        slippage_pct = float(getattr(self.config, "EXIT_SLIPPAGE_BPS", getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0) / 10000.0
+        slippage_pct = (
+            float(
+                getattr(
+                    self.config,
+                    "EXIT_SLIPPAGE_BPS",
+                    getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0),
+                )
+                or 0.0
+            )
+            / 10000.0
+        )
         buffer_pct = float(getattr(self.config, "TP_MIN_BUFFER_BPS", 0.0) or 0.0) / 10000.0
         net_tp_pct = tp_pct - (fee_pct + slippage_pct)
         net_sl_pct = sl_pct + (fee_pct + slippage_pct)
@@ -336,7 +412,7 @@ class TPSLEngine:
             win_rate_be * 100.0,
         )
 
-    def _pick_candles(self, symbol: str) -> List[Dict[str, Any]]:
+    def _pick_candles(self, symbol: str) -> list[dict[str, Any]]:
         """
         Prefer shared_state.market_data[symbol]['5m']['ohlcv']; fallback to '1m'.
         Normalizes rows to dicts: {'timestamp','open','high','low','close'}.
@@ -362,21 +438,25 @@ class TPSLEngine:
         ap = out.append
         for row in ohlcv:
             if isinstance(row, dict):
-                ap({
-                    "timestamp": row.get("timestamp"),
-                    "open": float(row.get("open", 0.0)),
-                    "high": float(row.get("high", 0.0)),
-                    "low": float(row.get("low", 0.0)),
-                    "close": float(row.get("close", 0.0)),
-                })
+                ap(
+                    {
+                        "timestamp": row.get("timestamp"),
+                        "open": float(row.get("open", 0.0)),
+                        "high": float(row.get("high", 0.0)),
+                        "low": float(row.get("low", 0.0)),
+                        "close": float(row.get("close", 0.0)),
+                    }
+                )
             elif isinstance(row, (list, tuple)) and len(row) >= 5:
-                ap({
-                    "timestamp": row[0],
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                })
+                ap(
+                    {
+                        "timestamp": row[0],
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                    }
+                )
         return out
 
     def _compute_atr(self, symbol: str, lookback: int = 14) -> Optional[float]:
@@ -389,11 +469,12 @@ class TPSLEngine:
             n = len(candles)
             if n < lookback + 1:
                 return None
-            window = candles[-(lookback + 1):]
-            trs: List[float] = []
+            window = candles[-(lookback + 1) :]
+            trs: list[float] = []
             prev_c = window[0]["close"]
             for i in range(1, len(window)):
-                h = window[i]["high"]; l = window[i]["low"]
+                h = window[i]["high"]
+                l = window[i]["low"]
                 tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
                 trs.append(tr)
                 prev_c = window[i]["close"]
@@ -414,7 +495,7 @@ class TPSLEngine:
             candles = self._pick_candles(symbol)
             if len(candles) < (lb + 1):
                 return 0.0
-            closes = [float(c.get("close", 0.0) or 0.0) for c in candles[-(lb + 1):]]
+            closes = [float(c.get("close", 0.0) or 0.0) for c in candles[-(lb + 1) :]]
             if any(c <= 0 for c in closes):
                 return 0.0
             returns = []
@@ -431,7 +512,9 @@ class TPSLEngine:
         except Exception:
             return 0.0
 
-    def _build_volatility_profile(self, symbol: str, entry_price: float, atr: float, tier: Optional[str] = None) -> Dict[str, Any]:
+    def _build_volatility_profile(
+        self, symbol: str, entry_price: float, atr: float, tier: Optional[str] = None
+    ) -> dict[str, Any]:
         """
         Build a normalized volatility profile used by TP/SL and trailing logic.
         """
@@ -451,7 +534,9 @@ class TPSLEngine:
         vol_pressure = max(-0.6, min(1.2, (atr_pct / max(target, 1e-6)) - 1.0))
 
         # Optional external regime from shared_state; fallback to inferred regime.
-        ext_regime = str((getattr(self.shared_state, "volatility_state", {}) or {}).get(symbol, "") or "").lower()
+        ext_regime = str(
+            (getattr(self.shared_state, "volatility_state", {}) or {}).get(symbol, "") or ""
+        ).lower()
         if ext_regime in {"trend", "uptrend", "downtrend", "high_vol", "high", "sideways", "chop"}:
             regime = ext_regime
         else:
@@ -474,7 +559,7 @@ class TPSLEngine:
             "tier_b": tier_b,
         }
 
-    def _estimate_spread(self, symbol: str, ref_price: float) -> Tuple[float, float]:
+    def _estimate_spread(self, symbol: str, ref_price: float) -> tuple[float, float]:
         """
         Estimate current spread using best in-memory sources.
         Returns (spread_abs, spread_pct_of_price).
@@ -517,7 +602,9 @@ class TPSLEngine:
         spread_pct = (spread_abs / px) if (spread_abs > 0 and px > 0) else 0.0
         return float(spread_abs), float(spread_pct)
 
-    def _resolve_adaptive_rr(self, base_rr: float, profile: Dict[str, Any], sentiment: float) -> float:
+    def _resolve_adaptive_rr(
+        self, base_rr: float, profile: dict[str, Any], sentiment: float
+    ) -> float:
         rr = float(base_rr)
         regime = str(profile.get("regime", "sideways")).lower()
         vol_score = float(profile.get("vol_score", 0.0))
@@ -538,9 +625,9 @@ class TPSLEngine:
 
     def _resolve_asymmetric_tp_bias(
         self,
-        profile: Dict[str, Any],
+        profile: dict[str, Any],
         sentiment: float,
-        phase_profile: Dict[str, float],
+        phase_profile: dict[str, float],
         tier: Optional[str] = None,
     ) -> float:
         """
@@ -556,11 +643,17 @@ class TPSLEngine:
         bias = 1.0
 
         if regime in {"trend", "uptrend", "downtrend"}:
-            bias += max(0.0, float(self._asymmetric_tp_trend_bonus)) * max(0.0, 1.0 + (vol_score * 0.25))
+            bias += max(0.0, float(self._asymmetric_tp_trend_bonus)) * max(
+                0.0, 1.0 + (vol_score * 0.25)
+            )
         elif regime in {"high_vol", "high"}:
-            bias += max(0.0, float(self._asymmetric_tp_high_vol_bonus)) * max(0.6, 1.0 + (vol_score * 0.30))
+            bias += max(0.0, float(self._asymmetric_tp_high_vol_bonus)) * max(
+                0.6, 1.0 + (vol_score * 0.30)
+            )
         elif regime in {"sideways", "chop"}:
-            bias -= max(0.0, float(self._asymmetric_tp_chop_discount)) * max(0.25, 1.0 - max(0.0, vol_score))
+            bias -= max(0.0, float(self._asymmetric_tp_chop_discount)) * max(
+                0.25, 1.0 - max(0.0, vol_score)
+            )
 
         sent_w = max(0.0, float(self._asymmetric_tp_sentiment_weight))
         bias += max(-sent_w, min(sent_w, float(sentiment or 0.0) * sent_w))
@@ -581,7 +674,7 @@ class TPSLEngine:
         high = max(float(self._asymmetric_tp_min_bias), float(self._asymmetric_tp_max_bias))
         return max(low, min(high, float(bias)))
 
-    def _get_compounding_phase_profile(self) -> Dict[str, float]:
+    def _get_compounding_phase_profile(self) -> dict[str, float]:
         phase_name = "PHASE_1_SEED"
         active = True
         try:
@@ -594,7 +687,9 @@ class TPSLEngine:
             phase_name = "PHASE_1_SEED"
             active = True
 
-        profiles = self._snowball_phase_profiles if isinstance(self._snowball_phase_profiles, dict) else {}
+        profiles = (
+            self._snowball_phase_profiles if isinstance(self._snowball_phase_profiles, dict) else {}
+        )
         profile = dict(profiles.get(phase_name) or profiles.get("PHASE_1_SEED") or {})
 
         # Optional explicit per-phase TP/SL maps from config.
@@ -635,7 +730,9 @@ class TPSLEngine:
         )
         return min_notional
 
-    def _pre_activation_guard(self, symbol: str, entry_price: float, qty: float) -> Tuple[bool, str]:
+    def _pre_activation_guard(
+        self, symbol: str, entry_price: float, qty: float
+    ) -> tuple[bool, str]:
         if entry_price <= 0:
             return False, "missing_entry_or_qty"
         if qty <= 0:
@@ -715,7 +812,9 @@ class TPSLEngine:
 
     # ---------- public API used by EM ----------
 
-    def set_initial_tp_sl(self, symbol: str, entry_price: float, quantity: float, tier: Optional[str] = None) -> Tuple[Optional[float], Optional[float]]:
+    def set_initial_tp_sl(
+        self, symbol: str, entry_price: float, quantity: float, tier: Optional[str] = None
+    ) -> tuple[Optional[float], Optional[float]]:
         """
         Called by ExecutionManager right after a fill.
         Computes and stores TP/SL on the open_trades record (if present).
@@ -744,9 +843,14 @@ class TPSLEngine:
         elif bool(getattr(self.shared_state, "dust_operation_symbols", {}).get(symbol)):
             # If this is a dust healing operation, preserve the exact deficit sizing.
             # Do not apply risk-based sizing that would override the dust healing amount.
-            self.logger.info("[TPSL:DustOperation] %s is dust healing operation, preserving exact deficit sizing", symbol)
+            self.logger.info(
+                "[TPSL:DustOperation] %s is dust healing operation, preserving exact deficit sizing",
+                symbol,
+            )
         elif sl is not None:
-            risk_based_quote = self.calculate_risk_based_position_size(symbol, entry_price, sl, tier=tier)
+            risk_based_quote = self.calculate_risk_based_position_size(
+                symbol, entry_price, sl, tier=tier
+            )
             # Store for ExecutionManager to use
             self.shared_state.risk_based_quote = getattr(self.shared_state, "risk_based_quote", {})
             self.shared_state.risk_based_quote[symbol] = risk_based_quote
@@ -799,14 +903,20 @@ class TPSLEngine:
 
             # Tier B: Set shorter TTL for fast exits
             if tier == "B":
-                ot["ttl_sec"] = int(getattr(self.config, "TIER_B_TTL_SEC", 300))  # 5 minutes default
+                ot["ttl_sec"] = int(
+                    getattr(self.config, "TIER_B_TTL_SEC", 300)
+                )  # 5 minutes default
                 ot["created_at"] = now_ts
 
             self.shared_state.open_trades[symbol] = ot
         except Exception as persist_err:
             self.logger.error(
                 "[TPSL_PERSIST_FAILED] %s: TP/SL computed (tp=%s sl=%s) but not stored: %s",
-                symbol, tp, sl, persist_err, exc_info=True,
+                symbol,
+                tp,
+                sl,
+                persist_err,
+                exc_info=True,
             )
             # Mark as unarmed so check_orders will retry on next cycle
             try:
@@ -819,7 +929,9 @@ class TPSLEngine:
 
     # ---------- core logic ----------
 
-    def calculate_tp_sl(self, symbol: str, entry_price: float, tier: Optional[str] = None) -> Tuple[Optional[float], Optional[float]]:
+    def calculate_tp_sl(
+        self, symbol: str, entry_price: float, tier: Optional[str] = None
+    ) -> tuple[Optional[float], Optional[float]]:
         """
         Volatility-adaptive TP/SL model.
         - Uses ATR + realized volatility profile for dynamic SL/TP distances
@@ -844,7 +956,9 @@ class TPSLEngine:
             # atr is guaranteed > 0 since entry_price > 0 and min_atr_pct > 0.
 
             sentiment = float(self.shared_state.sentiment_score.get(symbol, 0.0) or 0.0)
-            profile = self._build_volatility_profile(symbol, float(entry_price), float(atr), tier=tier)
+            profile = self._build_volatility_profile(
+                symbol, float(entry_price), float(atr), tier=tier
+            )
             regime = str(profile.get("regime", "sideways")).lower()
             vol_score = float(profile.get("vol_score", 0.0))
             vol_pressure = float(profile.get("vol_pressure", 0.0))
@@ -858,20 +972,26 @@ class TPSLEngine:
 
             # First cycle: prioritize getting the system live with a cleaner edge.
             try:
-                total_exec = int(getattr(self.shared_state, "metrics", {}).get("total_trades_executed", 0) or 0)
+                total_exec = int(
+                    getattr(self.shared_state, "metrics", {}).get("total_trades_executed", 0) or 0
+                )
             except Exception:
                 total_exec = 0
             if total_exec < 1:
-                base_tp_atr_mult *= float(getattr(self.config, "FIRST_CYCLE_TP_BOOST_MULT", 1.15) or 1.15)
-                base_sl_atr_mult *= float(getattr(self.config, "FIRST_CYCLE_SL_TIGHTEN_MULT", 0.90) or 0.90)
+                base_tp_atr_mult *= float(
+                    getattr(self.config, "FIRST_CYCLE_TP_BOOST_MULT", 1.15) or 1.15
+                )
+                base_sl_atr_mult *= float(
+                    getattr(self.config, "FIRST_CYCLE_SL_TIGHTEN_MULT", 0.90) or 0.90
+                )
 
             # Adaptive multipliers
             tp_atr_mult = base_tp_atr_mult
             sl_atr_mult = base_sl_atr_mult
 
             # Volatility response: high vol widens SL more than TP; low vol gently tightens both.
-            sl_atr_mult *= (1.0 + max(-0.25, min(0.55, vol_pressure * 0.35)))
-            tp_atr_mult *= (1.0 + max(-0.20, min(0.40, vol_pressure * 0.22)))
+            sl_atr_mult *= 1.0 + max(-0.25, min(0.55, vol_pressure * 0.35))
+            tp_atr_mult *= 1.0 + max(-0.20, min(0.40, vol_pressure * 0.22))
 
             # Market structure regime response.
             if regime in ("trend", "uptrend", "downtrend"):
@@ -927,12 +1047,18 @@ class TPSLEngine:
             tp_dist_clamped = entry_price * tp_pct_clamped
             sl_dist = entry_price * sl_pct_clamped
 
-            phase_rr_bonus = float(phase_profile.get("rr_bonus", 0.0) or 0.0) if self._snowball_asymmetry_enabled else 0.0
+            phase_rr_bonus = (
+                float(phase_profile.get("rr_bonus", 0.0) or 0.0)
+                if self._snowball_asymmetry_enabled
+                else 0.0
+            )
             base_rr = float(getattr(self.config, "TARGET_RR_RATIO", 1.8) or 1.8) + phase_rr_bonus
             if tier == "B":
                 base_rr = min(base_rr, 1.55)
             target_rr = self._resolve_adaptive_rr(base_rr, profile, sentiment)
-            tp_asymmetry_bias = self._resolve_asymmetric_tp_bias(profile, sentiment, phase_profile, tier=tier)
+            tp_asymmetry_bias = self._resolve_asymmetric_tp_bias(
+                profile, sentiment, phase_profile, tier=tier
+            )
             spread_abs, spread_pct = self._estimate_spread(symbol, float(entry_price))
             spread_rr_adjust = 0.0
             if self._spread_adaptive_enabled and spread_pct > 0:
@@ -946,11 +1072,10 @@ class TPSLEngine:
                 tight_norm = 0.0
                 if tight_pct > 0:
                     tight_norm = max(0.0, min(1.0, (tight_pct - spread_pct) / tight_pct))
-                spread_rr_adjust = (
-                    spread_norm * max(0.0, float(self._spread_rr_bonus_max))
-                    - tight_norm * max(0.0, float(self._spread_rr_discount_max))
-                )
-                target_rr *= (1.0 + spread_rr_adjust)
+                spread_rr_adjust = spread_norm * max(
+                    0.0, float(self._spread_rr_bonus_max)
+                ) - tight_norm * max(0.0, float(self._spread_rr_discount_max))
+                target_rr *= 1.0 + spread_rr_adjust
                 target_rr = max(float(self._rr_min), min(float(self._rr_max), target_rr))
             if self._snowball_asymmetry_enabled:
                 # Ensure TP phase bias still has effect when RR branch dominates TP distance.
@@ -971,7 +1096,9 @@ class TPSLEngine:
 
             min_tp_dist = entry_price * fee_clearance_pct
             if self._spread_adaptive_enabled and spread_abs > 0:
-                min_tp_dist = max(min_tp_dist, spread_abs * max(1.0, float(self._spread_tp_floor_mult)))
+                min_tp_dist = max(
+                    min_tp_dist, spread_abs * max(1.0, float(self._spread_tp_floor_mult))
+                )
             # Mark floor-hit only when TP was actually below the floor before clamping.
             tp_floor_hit = bool(tp_dist < (min_tp_dist - 1e-12))
             tp_dist = max(tp_dist, min_tp_dist)
@@ -1032,7 +1159,9 @@ class TPSLEngine:
 
             # Calculate risk-based position size for logging (defensive)
             try:
-                risk_based_quote = self.calculate_risk_based_position_size(symbol, entry_price, sl_price, tier=tier)
+                risk_based_quote = self.calculate_risk_based_position_size(
+                    symbol, entry_price, sl_price, tier=tier
+                )
             except Exception:
                 risk_based_quote = 0.0
 
@@ -1073,7 +1202,14 @@ class TPSLEngine:
             self.logger.error("VOL-ADAPTIVE TP/SL calc failed for %s: %s", symbol, e)
             return None, None
 
-    def calculate_risk_based_position_size(self, symbol: str, entry_price: float, sl_price: float, tier: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> float:
+    def calculate_risk_based_position_size(
+        self,
+        symbol: str,
+        entry_price: float,
+        sl_price: float,
+        tier: Optional[str] = None,
+        context: Optional[dict[str, Any]] = None,
+    ) -> float:
         """
         RISK-BASED POSITION SIZING
 
@@ -1086,9 +1222,11 @@ class TPSLEngine:
         """
         # Guard for dust healing: skip risk-based sizing
         if context and context.get("is_dust_healing", False):
-            self.logger.info("[TPSLEngine] Skipping risk-based sizing for dust healing operation on %s", symbol)
+            self.logger.info(
+                "[TPSLEngine] Skipping risk-based sizing for dust healing operation on %s", symbol
+            )
             return 0.0  # Return 0 to indicate no risk-based adjustment
-            
+
         try:
             # Get available equity
             equity = float(getattr(self.shared_state, "total_equity", 0.0) or 0.0)
@@ -1097,9 +1235,13 @@ class TPSLEngine:
                 return float(getattr(self.config, "DEFAULT_PLANNED_QUOTE", 80.0))
 
             # Risk per trade based on tier
-            risk_pct_per_trade = float(getattr(self.config, "RISK_PCT_PER_TRADE", 0.01))  # Default 1%
+            risk_pct_per_trade = float(
+                getattr(self.config, "RISK_PCT_PER_TRADE", 0.01)
+            )  # Default 1%
             if tier == "B":
-                risk_pct_per_trade = float(getattr(self.config, "TIER_B_RISK_PCT", 0.005))  # 0.5% for micro trades
+                risk_pct_per_trade = float(
+                    getattr(self.config, "TIER_B_RISK_PCT", 0.005)
+                )  # 0.5% for micro trades
 
             # Calculate risk amount in USD
             risk_amount_usd = equity * risk_pct_per_trade
@@ -1109,7 +1251,9 @@ class TPSLEngine:
             sl_distance_pct = sl_distance_usd / entry_price if entry_price else 0.0
 
             if sl_distance_usd <= 0:
-                self.logger.warning("[%s] Invalid SL distance for risk sizing: %.6f", symbol, sl_distance_usd)
+                self.logger.warning(
+                    "[%s] Invalid SL distance for risk sizing: %.6f", symbol, sl_distance_usd
+                )
                 return float(getattr(self.config, "DEFAULT_PLANNED_QUOTE", 80.0))
 
             # Calculate position size: Risk Amount / SL Distance
@@ -1122,10 +1266,18 @@ class TPSLEngine:
 
             # Tier-specific adjustments
             if tier == "B":
-                position_size_usd = min(position_size_usd, float(getattr(self.config, "TIER_B_MAX_QUOTE", 40.0)))
+                position_size_usd = min(
+                    position_size_usd, float(getattr(self.config, "TIER_B_MAX_QUOTE", 40.0))
+                )
 
-            self.logger.info("🎯 Risk-based sizing %s: $%.2f (Risk=%.1f%% of $%.2f, SL=%.1f%%)",
-                            symbol, position_size_usd, risk_pct_per_trade*100, equity, sl_distance_pct*100)
+            self.logger.info(
+                "🎯 Risk-based sizing %s: $%.2f (Risk=%.1f%% of $%.2f, SL=%.1f%%)",
+                symbol,
+                position_size_usd,
+                risk_pct_per_trade * 100,
+                equity,
+                sl_distance_pct * 100,
+            )
 
             return position_size_usd
 
@@ -1218,7 +1370,9 @@ class TPSLEngine:
             return False
         return True
 
-    async def _passes_excursion_gate(self, symbol: str, entry_price: float, exit_price: float, atr: Optional[float], reason: str) -> bool:
+    async def _passes_excursion_gate(
+        self, symbol: str, entry_price: float, exit_price: float, atr: Optional[float], reason: str
+    ) -> bool:
         """Minimum price excursion gate for non-SL TP exits."""
         reason_u = str(reason or "").upper()
         if "SL" in reason_u or "STOP_LOSS" in reason_u or "EMERGENCY" in reason_u:
@@ -1248,7 +1402,9 @@ class TPSLEngine:
 
         atr_val = float(atr or 0.0)
         if atr_val <= 0:
-            atr_val = entry_price * float(getattr(self.config, "TPSL_FALLBACK_ATR_PCT", 0.01) or 0.01)
+            atr_val = entry_price * float(
+                getattr(self.config, "TPSL_FALLBACK_ATR_PCT", 0.01) or 0.01
+            )
 
         tick_mult = float(getattr(self.config, "EXIT_EXCURSION_TICK_MULT", 2.0) or 2.0)
         atr_mult = float(getattr(self.config, "EXIT_EXCURSION_ATR_MULT", 0.35) or 0.35)
@@ -1262,7 +1418,12 @@ class TPSLEngine:
         if excursion < threshold:
             self.logger.info(
                 "[TPSL:ExcursionGate] %s blocked excursion=%.6f < threshold=%.6f (tick=%.6f atr=%.6f spread=%.6f)",
-                symbol, excursion, threshold, min_tick_move, atr_val, spread,
+                symbol,
+                excursion,
+                threshold,
+                min_tick_move,
+                atr_val,
+                spread,
             )
             return False
 
@@ -1319,23 +1480,23 @@ class TPSLEngine:
     async def _get_close_lock(self, symbol: str) -> asyncio.Lock:
         """
         Get or create an asyncio.Lock for close operations on this symbol.
-        
+
         RACE CONDITION FIX #4: Prevents concurrent _close() calls for same symbol.
-        
+
         THREAD-SAFE: Uses double-check locking pattern.
-        
+
         Args:
             symbol: Trading symbol (e.g., 'BTC')
-            
+
         Returns:
             asyncio.Lock for close operations on this symbol
         """
         sym = str(symbol or "").upper()
-        
+
         # Fast path: lock already exists
         if sym in self._symbol_close_locks:
             return self._symbol_close_locks[sym]
-        
+
         # Slow path: create new lock under synchronization
         async with self._symbol_close_locks_lock:
             # Double-check after acquiring lock
@@ -1351,7 +1512,7 @@ class TPSLEngine:
         *,
         tag: str = "tp_sl",
         force_finalize: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Canonical close path for TP/SL.
         Contract: TP/SL must never execute orders via ExchangeClient directly.
@@ -1363,7 +1524,9 @@ class TPSLEngine:
                 "TPSLEngine requires ExecutionManager.close_position(); direct exchange execution is forbidden"
             )
         if not callable(close_fn):
-            raise RuntimeError("TPSLEngine close routing unavailable: ExecutionManager.close_position missing")
+            raise RuntimeError(
+                "TPSLEngine close routing unavailable: ExecutionManager.close_position missing"
+            )
         res = close_fn(
             symbol=symbol,
             reason=close_reason,
@@ -1438,7 +1601,15 @@ class TPSLEngine:
         Evaluate open trades; if TP/SL is hit → close via EM (bounded concurrency).
         Debounces repeated closes per symbol.
         """
-        def _log_skip(symbol: str, qty: float, price: Optional[float], tp: Optional[float], sl: Optional[float], reason: str) -> None:
+
+        def _log_skip(
+            symbol: str,
+            qty: float,
+            price: Optional[float],
+            tp: Optional[float],
+            sl: Optional[float],
+            reason: str,
+        ) -> None:
             self.logger.info(
                 "[TPSL:skip] %s qty=%.8f price=%s tp=%s sl=%s reason=%s",
                 symbol,
@@ -1448,6 +1619,7 @@ class TPSLEngine:
                 f"{sl:.8f}" if sl is not None else "None",
                 reason,
             )
+
         try:
             # Canonical architecture: positions are the only source of truth
             if getattr(self.shared_state, "trading_mode", "") == "shadow":
@@ -1461,16 +1633,20 @@ class TPSLEngine:
                 for sym, pos in positions.items()
                 if float(pos.get("position_qty", 0) or 0) > 0
             }
-            
+
             prices = self.shared_state.latest_prices or {}
             self.logger.info("[TPSL:check] open_trades=%d prices=%d", len(open_trades), len(prices))
-            to_close: List[Tuple[str, str]] = []
+            to_close: list[tuple[str, str]] = []
 
             for symbol, tr in open_trades.items():
                 pos = positions.get(symbol, {}) if isinstance(positions, dict) else {}
                 gate_ref = pos if isinstance(pos, dict) and pos else tr
                 try:
-                    is_open_sig, value_usdt, floor_usdt = self.shared_state.classify_position_snapshot(symbol, gate_ref)
+                    (
+                        is_open_sig,
+                        value_usdt,
+                        floor_usdt,
+                    ) = self.shared_state.classify_position_snapshot(symbol, gate_ref)
                 except Exception:
                     is_open_sig, value_usdt, floor_usdt = True, 0.0, 0.0
                 if not is_open_sig:
@@ -1492,7 +1668,9 @@ class TPSLEngine:
                 if not position or entry_price is None:
                     self.logger.debug(
                         "[%s] TPSL skip: missing position or entry_price (position=%s entry_price=%s)",
-                        symbol, position, entry_price
+                        symbol,
+                        position,
+                        entry_price,
                     )
                     _log_skip(symbol, 0.0, None, None, None, "missing_position_or_entry")
                     continue
@@ -1528,14 +1706,14 @@ class TPSLEngine:
 
                 now = self._mono()
                 last = self._last_close_attempt.get(symbol, 0.0)
-                
+
                 # [FIX #8] Debounce logic: if symbol not in dict yet (first call), allow it.
                 # Otherwise, require debounce_close_sec to have passed since last attempt.
                 if symbol in self._last_close_attempt:
                     debounce_ok = now - last >= self._debounce_close_sec
                 else:
                     debounce_ok = True  # First call for this symbol, no debounce
-                
+
                 if not debounce_ok:
                     continue  # debounce
 
@@ -1552,16 +1730,19 @@ class TPSLEngine:
 
                 if self._time_exit_enabled:
                     # 1. Hard max-hold time exit (no exceptions)
-                    max_hold_sec = float(getattr(self.config, "MAX_HOLD_TIME_SEC", 1800.0) or 1800.0)
+                    max_hold_sec = float(
+                        getattr(self.config, "MAX_HOLD_TIME_SEC", 1800.0) or 1800.0
+                    )
                     if max_hold_sec > 0 and age_sec >= max_hold_sec:
                         self.logger.info(
                             "[TPSL:MAX_HOLD_EXIT] %s age=%.0fs >= max_hold=%.0fs",
-                            symbol, age_sec, max_hold_sec
-                        )
-                        to_close.append((
                             symbol,
-                            f"Max-hold exit: age={int(age_sec)}s >= {int(max_hold_sec)}s"
-                        ))
+                            age_sec,
+                            max_hold_sec,
+                        )
+                        to_close.append(
+                            (symbol, f"Max-hold exit: age={int(age_sec)}s >= {int(max_hold_sec)}s")
+                        )
                         continue
 
                 # 2. Capital recovery mode: force small-profit or time-based exit
@@ -1573,7 +1754,9 @@ class TPSLEngine:
                 cap_rec_active = isinstance(cap_rec, dict) and cap_rec.get("active")
                 # Best-practice: do not let recovery exits fire when TP/SL is armed
                 try:
-                    if cap_rec_active and bool(getattr(self.config, "CAPITAL_RECOVERY_TPSL_GUARD", True)):
+                    if cap_rec_active and bool(
+                        getattr(self.config, "CAPITAL_RECOVERY_TPSL_GUARD", True)
+                    ):
                         if tr.get("tp") is not None and tr.get("sl") is not None:
                             cap_rec_active = False
                 except Exception:
@@ -1582,13 +1765,15 @@ class TPSLEngine:
                 if self._time_exit_enabled and cap_rec_active:
                     min_pnl_rec = float(cap_rec.get("min_pnl_pct", 0.0002) or 0.0002)
                     max_age_sec_rec = float(cap_rec.get("max_age_sec", 0.0) or 0.0)
-                    
+
                     # Mandatory time-only exit once max age is reached
                     if max_age_sec_rec > 0 and age_sec >= max_age_sec_rec:
-                        to_close.append((
-                            symbol,
-                            f"Capital recovery exit: age={int(age_sec)}s (max={int(max_age_sec_rec)}s)"
-                        ))
+                        to_close.append(
+                            (
+                                symbol,
+                                f"Capital recovery exit: age={int(age_sec)}s (max={int(max_age_sec_rec)}s)",
+                            )
+                        )
                         continue
 
                 current_price = prices.get(symbol)
@@ -1597,24 +1782,35 @@ class TPSLEngine:
                 if current_price is None:
                     self.logger.debug(
                         "[%s] TPSL skip: missing current price (cannot evaluate TP/SL or pnl-based exits).",
-                        symbol
+                        symbol,
                     )
                     _log_skip(symbol, qty, None, None, None, "missing_current_price")
                     continue
 
                 # Prefer stored TP/SL, compute if missing or if arming failed
-                tp = tr.get("tp"); sl = tr.get("sl")
+                tp = tr.get("tp")
+                sl = tr.get("sl")
                 if tr.get("_tpsl_armed") is False:
                     # EM flagged that set_initial_tp_sl failed — force re-arm
-                    self.logger.warning("[TPSL:RE_ARM] %s retrying TP/SL arm (_tpsl_armed=False)", symbol)
+                    self.logger.warning(
+                        "[TPSL:RE_ARM] %s retrying TP/SL arm (_tpsl_armed=False)", symbol
+                    )
                     tp, sl = None, None  # force recalculation below
                 if tp is None or sl is None:
                     tp, sl = self.calculate_tp_sl(symbol, float(entry_price))
                     if tp is None or sl is None:
-                        _log_skip(symbol, qty, float(current_price) if current_price is not None else None, tp, sl, "missing_tp_sl")
+                        _log_skip(
+                            symbol,
+                            qty,
+                            float(current_price) if current_price is not None else None,
+                            tp,
+                            sl,
+                            "missing_tp_sl",
+                        )
                         continue
                     try:
-                        tr["tp"] = tp; tr["sl"] = sl  # cache for next pass
+                        tr["tp"] = tp
+                        tr["sl"] = sl  # cache for next pass
                         tr.setdefault("initial_tp", tp)
                         tr.setdefault("initial_sl", sl)
                         tr.pop("_tpsl_armed", None)  # clear failed-arm flag on success
@@ -1623,18 +1819,30 @@ class TPSLEngine:
                         pass
 
                 cp = float(current_price)
-                
+
                 # Tier B TTL check (Phase A Frequency Engineering)
                 tier = tr.get("tier")
-                pnl_pct = (cp - entry_price) / entry_price if position == "long" else (entry_price - cp) / entry_price
+                pnl_pct = (
+                    (cp - entry_price) / entry_price
+                    if position == "long"
+                    else (entry_price - cp) / entry_price
+                )
 
                 # Dust exit rule: if value is tiny and held too long, force exit to free capital.
                 if self._time_exit_enabled:
-                    dust_usdt_threshold = float(getattr(self.config, "TPSL_DUST_EXIT_USDT", 4.0) or 4.0)
-                    max_hold_min = float(getattr(self.config, "TPSL_DUST_MAX_HOLD_MINUTES", 15.0) or 15.0)
+                    dust_usdt_threshold = float(
+                        getattr(self.config, "TPSL_DUST_EXIT_USDT", 4.0) or 4.0
+                    )
+                    max_hold_min = float(
+                        getattr(self.config, "TPSL_DUST_MAX_HOLD_MINUTES", 15.0) or 15.0
+                    )
                     if dust_usdt_threshold > 0 and max_hold_min > 0:
                         position_value = float(qty) * cp
-                        if position_value > 0 and position_value < dust_usdt_threshold and age_sec >= (max_hold_min * 60.0):
+                        if (
+                            position_value > 0
+                            and position_value < dust_usdt_threshold
+                            and age_sec >= (max_hold_min * 60.0)
+                        ):
                             self.logger.warning(
                                 "[TPSL:DustExit] %s value=%.2f < %.2f and age=%.0fs >= %.0fs. Forcing exit.",
                                 symbol,
@@ -1643,10 +1851,12 @@ class TPSLEngine:
                                 age_sec,
                                 max_hold_min * 60.0,
                             )
-                            to_close.append((
-                                symbol,
-                                f"Dust exit: value={position_value:.2f} < {dust_usdt_threshold:.2f} age={int(age_sec)}s"
-                            ))
+                            to_close.append(
+                                (
+                                    symbol,
+                                    f"Dust exit: value={position_value:.2f} < {dust_usdt_threshold:.2f} age={int(age_sec)}s",
+                                )
+                            )
                             continue
 
                 # --- Fee-aware Stagnation Purge (Phase A Frequency Engineering) ---
@@ -1659,16 +1869,20 @@ class TPSLEngine:
                 if self._time_exit_enabled and age_sec >= (stagnation_min * 60.0):
                     stagnation_pnl_threshold = rt_fee_pct * 2.0
                     if pnl_pct < stagnation_pnl_threshold:
-                         self.logger.warning(
-                             "[TPSL:StagnationPurge] %s age=%dm >= %dm, pnl=%.2f%% < threshold=%.2f%%. Purging.",
-                             symbol, int(age_sec/60), int(stagnation_min), pnl_pct*100, stagnation_pnl_threshold*100
-                         )
-                         reason = f"Stagnation purge: age={int(age_sec/60)}m pnl={pnl_pct*100:.2f}%"
-                         if self._passes_profit_gate(pnl_pct, reason):
-                             to_close.append((symbol, reason))
-                         else:
-                             self.logger.info("[%s] Profit gate blocked SELL (%s).", symbol, reason)
-                         continue
+                        self.logger.warning(
+                            "[TPSL:StagnationPurge] %s age=%dm >= %dm, pnl=%.2f%% < threshold=%.2f%%. Purging.",
+                            symbol,
+                            int(age_sec / 60),
+                            int(stagnation_min),
+                            pnl_pct * 100,
+                            stagnation_pnl_threshold * 100,
+                        )
+                        reason = f"Stagnation purge: age={int(age_sec/60)}m pnl={pnl_pct*100:.2f}%"
+                        if self._passes_profit_gate(pnl_pct, reason):
+                            to_close.append((symbol, reason))
+                        else:
+                            self.logger.info("[%s] Profit gate blocked SELL (%s).", symbol, reason)
+                        continue
 
                 # 🔑 Rule 1: Fee-Adjusted Breakeven Exit
                 # If PnL <= fees AND age >= 20m -> EXIT IMMEDIATELY
@@ -1676,16 +1890,22 @@ class TPSLEngine:
                 min_hold_breakeven = float(getattr(self.config, "BREAKEVEN_EXIT_MINUTES", 20.0))
                 if self._time_exit_enabled and age_sec >= (min_hold_breakeven * 60.0):
                     if pnl_pct <= rt_fee_pct:
-                         self.logger.warning(
-                             "[TPSL:Breakeven] %s age=%dm >= %dm, pnl=%.2f%% <= fees=%.2f%%. Breakeven exit.",
-                             symbol, int(age_sec/60), int(min_hold_breakeven), pnl_pct*100, rt_fee_pct*100
-                         )
-                         reason = f"Fee-adjusted breakeven: age={int(age_sec/60)}m pnl={pnl_pct*100:.2f}%"
-                         if self._passes_profit_gate(pnl_pct, reason):
-                             to_close.append((symbol, reason))
-                         else:
-                             self.logger.info("[%s] Profit gate blocked SELL (%s).", symbol, reason)
-                         continue
+                        self.logger.warning(
+                            "[TPSL:Breakeven] %s age=%dm >= %dm, pnl=%.2f%% <= fees=%.2f%%. Breakeven exit.",
+                            symbol,
+                            int(age_sec / 60),
+                            int(min_hold_breakeven),
+                            pnl_pct * 100,
+                            rt_fee_pct * 100,
+                        )
+                        reason = (
+                            f"Fee-adjusted breakeven: age={int(age_sec/60)}m pnl={pnl_pct*100:.2f}%"
+                        )
+                        if self._passes_profit_gate(pnl_pct, reason):
+                            to_close.append((symbol, reason))
+                        else:
+                            self.logger.info("[%s] Profit gate blocked SELL (%s).", symbol, reason)
+                        continue
 
                 # 3. Capital recovery mode: optional early exit optimizer (small profit)
                 if cap_rec_active and min_pnl_rec is not None:
@@ -1694,7 +1914,9 @@ class TPSLEngine:
                         if self._passes_profit_gate(pnl_pct, reason):
                             to_close.append((symbol, reason))
                         else:
-                            self.logger.info("[%s] Profit/excursion gate blocked SELL (%s).", symbol, reason)
+                            self.logger.info(
+                                "[%s] Profit/excursion gate blocked SELL (%s).", symbol, reason
+                            )
                         continue
 
                 # 4. Micro-profit cycle: time exit after first trade succeeds
@@ -1704,30 +1926,48 @@ class TPSLEngine:
                 except Exception:
                     trades_executed = 0
 
-                if self._time_exit_enabled and trades_executed >= 1 and bool(getattr(self.config, "MICRO_PROFIT_CYCLE_ENABLED", False)):
-                    min_age_h = float(getattr(self.config, "MICRO_PROFIT_CYCLE_MIN_AGE_HOURS", 2.0) or 2.0)
-                    min_pnl_cycle = float(getattr(self.config, "MICRO_PROFIT_CYCLE_MIN_PNL_PCT", 0.001) or 0.001)
+                if (
+                    self._time_exit_enabled
+                    and trades_executed >= 1
+                    and bool(getattr(self.config, "MICRO_PROFIT_CYCLE_ENABLED", False))
+                ):
+                    min_age_h = float(
+                        getattr(self.config, "MICRO_PROFIT_CYCLE_MIN_AGE_HOURS", 2.0) or 2.0
+                    )
+                    min_pnl_cycle = float(
+                        getattr(self.config, "MICRO_PROFIT_CYCLE_MIN_PNL_PCT", 0.001) or 0.001
+                    )
                     if age_sec >= (min_age_h * 3600) and pnl_pct >= min_pnl_cycle:
-                        reason = f"Micro-cycle time exit: age={int(age_sec)}s pnl={pnl_pct*100:.2f}%"
+                        reason = (
+                            f"Micro-cycle time exit: age={int(age_sec)}s pnl={pnl_pct*100:.2f}%"
+                        )
                         if self._passes_profit_gate(pnl_pct, reason):
                             to_close.append((symbol, reason))
                         else:
-                            self.logger.info("[%s] Profit/excursion gate blocked SELL (%s).", symbol, reason)
+                            self.logger.info(
+                                "[%s] Profit/excursion gate blocked SELL (%s).", symbol, reason
+                            )
                         continue
 
                 if self._time_exit_enabled and tier == "B":
                     ttl_sec = tr.get("ttl_sec", 300)  # Default 5 minutes
                     if age_sec > ttl_sec:
-                            # Grace period: only for winners (PnL > 1%)
-                            if pnl_pct > 0.01 and age_sec < (ttl_sec + 120):
-                                self.logger.info("[%s] Tier-B TTL GRACE: PnL=%.2f%%, age=%ds, extending", 
-                                               symbol, pnl_pct*100, int(age_sec))
-                                continue  # Skip closing - let position run
-                            else:
-                                # TTL expired and no grace → force close
-                                to_close.append((symbol, f"Tier-B FORCED TTL: age={age_sec:.0f}s > {ttl_sec}s"))
-                                continue  # Skip TP/SL check, TTL takes priority
-                
+                        # Grace period: only for winners (PnL > 1%)
+                        if pnl_pct > 0.01 and age_sec < (ttl_sec + 120):
+                            self.logger.info(
+                                "[%s] Tier-B TTL GRACE: PnL=%.2f%%, age=%ds, extending",
+                                symbol,
+                                pnl_pct * 100,
+                                int(age_sec),
+                            )
+                            continue  # Skip closing - let position run
+                        else:
+                            # TTL expired and no grace → force close
+                            to_close.append(
+                                (symbol, f"Tier-B FORCED TTL: age={age_sec:.0f}s > {ttl_sec}s")
+                            )
+                            continue  # Skip TP/SL check, TTL takes priority
+
                 # --- Wealth Guard: Support for Trailing SL and Ratcheting ---
                 use_trailing = tr.get("_use_trailing", False)
 
@@ -1738,18 +1978,23 @@ class TPSLEngine:
                     float(tp),
                     float(sl),
                 )
-                
+
                 if position == "long":
                     # Update Trailing SL if price moves up
                     if use_trailing and atr and atr > 0:
-                        activate_r = float(getattr(self.config, "TRAILING_ACTIVATE_R_MULT", 0.60) or 0.60)
+                        activate_r = float(
+                            getattr(self.config, "TRAILING_ACTIVATE_R_MULT", 0.60) or 0.60
+                        )
                         initial_sl = float(tr.get("initial_sl") or tr.get("sl") or 0.0)
                         base_r = max(float(entry_price) - initial_sl, 0.0)
                         mfe = max(cp - float(entry_price), 0.0)
                         if base_r > 0 and mfe < (activate_r * base_r):
                             self.logger.debug(
                                 "[%s] Trailing not armed yet: mfe=%.6f < %.2fR (R=%.6f)",
-                                symbol, mfe, activate_r, base_r
+                                symbol,
+                                mfe,
+                                activate_r,
+                                base_r,
                             )
                         else:
                             trailing_mult = float(
@@ -1761,19 +2006,26 @@ class TPSLEngine:
                             trail_dist = atr * trailing_mult
                             new_sl = self._round_price_sync(symbol, cp - trail_dist)
                             if new_sl > float(sl):
-                                 self.logger.info("[%s] Trailing SL up: %.4f -> %.4f (atr_mult=%.2f)", symbol, float(sl), new_sl, trailing_mult)
-                                 tr["sl"] = new_sl
-                                 sl = new_sl
-                                 self.shared_state.open_trades[symbol] = tr
+                                self.logger.info(
+                                    "[%s] Trailing SL up: %.4f -> %.4f (atr_mult=%.2f)",
+                                    symbol,
+                                    float(sl),
+                                    new_sl,
+                                    trailing_mult,
+                                )
+                                tr["sl"] = new_sl
+                                sl = new_sl
+                                self.shared_state.open_trades[symbol] = tr
 
                     if cp >= float(tp):
                         reason = "TP Hit"
                         if (
                             self._passes_tp_distance_gate(symbol, float(entry_price), float(tp))
-                            and
-                            self._passes_net_exit_gate(pnl_pct)
+                            and self._passes_net_exit_gate(pnl_pct)
                             and self._passes_profit_gate(pnl_pct, reason)
-                            and await self._passes_excursion_gate(symbol, entry_price, cp, atr, reason)
+                            and await self._passes_excursion_gate(
+                                symbol, entry_price, cp, atr, reason
+                            )
                         ):
                             to_close.append((symbol, reason))
                         else:
@@ -1791,14 +2043,19 @@ class TPSLEngine:
                 elif position == "short":
                     # Update Trailing SL if price moves down
                     if use_trailing and atr and atr > 0:
-                        activate_r = float(getattr(self.config, "TRAILING_ACTIVATE_R_MULT", 0.60) or 0.60)
+                        activate_r = float(
+                            getattr(self.config, "TRAILING_ACTIVATE_R_MULT", 0.60) or 0.60
+                        )
                         initial_sl = float(tr.get("initial_sl") or tr.get("sl") or 0.0)
                         base_r = max(initial_sl - float(entry_price), 0.0)
                         mfe = max(float(entry_price) - cp, 0.0)
                         if base_r > 0 and mfe < (activate_r * base_r):
                             self.logger.debug(
                                 "[%s] Trailing not armed yet (short): mfe=%.6f < %.2fR (R=%.6f)",
-                                symbol, mfe, activate_r, base_r
+                                symbol,
+                                mfe,
+                                activate_r,
+                                base_r,
                             )
                         else:
                             trailing_mult = float(
@@ -1810,19 +2067,26 @@ class TPSLEngine:
                             trail_dist = atr * trailing_mult
                             new_sl = self._round_price_sync(symbol, cp + trail_dist)
                             if new_sl < float(sl):
-                                 self.logger.info("[%s] Trailing SL down: %.4f -> %.4f (atr_mult=%.2f)", symbol, float(sl), new_sl, trailing_mult)
-                                 tr["sl"] = new_sl
-                                 sl = new_sl
-                                 self.shared_state.open_trades[symbol] = tr
+                                self.logger.info(
+                                    "[%s] Trailing SL down: %.4f -> %.4f (atr_mult=%.2f)",
+                                    symbol,
+                                    float(sl),
+                                    new_sl,
+                                    trailing_mult,
+                                )
+                                tr["sl"] = new_sl
+                                sl = new_sl
+                                self.shared_state.open_trades[symbol] = tr
 
                     if cp <= float(tp):
                         reason = "TP Hit (short)"
                         if (
                             self._passes_tp_distance_gate(symbol, float(entry_price), float(tp))
-                            and
-                            self._passes_net_exit_gate(pnl_pct)
+                            and self._passes_net_exit_gate(pnl_pct)
                             and self._passes_profit_gate(pnl_pct, reason)
-                            and await self._passes_excursion_gate(symbol, entry_price, cp, atr, reason)
+                            and await self._passes_excursion_gate(
+                                symbol, entry_price, cp, atr, reason
+                            )
                         ):
                             to_close.append((symbol, reason))
                         else:
@@ -1852,16 +2116,28 @@ class TPSLEngine:
 
                             try:
                                 total_position_qty = 0.0
-                                pos = getattr(self.shared_state, "positions", {}).get(sym, {}) if hasattr(self.shared_state, "positions") else {}
+                                pos = (
+                                    getattr(self.shared_state, "positions", {}).get(sym, {})
+                                    if hasattr(self.shared_state, "positions")
+                                    else {}
+                                )
                                 if isinstance(pos, dict):
                                     total_position_qty = float(pos.get("quantity", 0.0) or 0.0)
-                                if total_position_qty <= 0 and hasattr(self.shared_state, "get_position_qty"):
-                                    total_position_qty = float(self.shared_state.get_position_qty(sym) or 0.0)
+                                if total_position_qty <= 0 and hasattr(
+                                    self.shared_state, "get_position_qty"
+                                ):
+                                    total_position_qty = float(
+                                        self.shared_state.get_position_qty(sym) or 0.0
+                                    )
                                 min_notional = await self._get_min_notional(sym)
                                 if min_notional > 0 and total_position_qty > 0:
                                     try:
-                                        cp_now = float((self.shared_state.latest_prices or {}).get(sym) or 0.0)
-                                        value_usdt = total_position_qty * cp_now if cp_now > 0 else 0.0
+                                        cp_now = float(
+                                            (self.shared_state.latest_prices or {}).get(sym) or 0.0
+                                        )
+                                        value_usdt = (
+                                            total_position_qty * cp_now if cp_now > 0 else 0.0
+                                        )
                                         if value_usdt > 0 and value_usdt < min_notional:
                                             self.logger.warning(
                                                 "[TPSL] Proceeding with close %s: notional=%.4f < min_notional=%.4f",
@@ -1915,20 +2191,25 @@ class TPSLEngine:
                             tj = getattr(self, "trade_journal", None)
                             if tj:
                                 try:
-                                    tj.record("TPSL_TRIGGER", {
-                                        "symbol": sym,
-                                        "reason": close_reason,
-                                        "trigger": reason,
-                                        "entry_price": entry_price,
-                                        "current_price": current_price,
-                                        "tp": tp,
-                                        "sl": sl,
-                                        "pnl_pct": round(pnl_pct * 100, 4) if pnl_pct is not None else None,
-                                        "qty": position_qty,
-                                        "position": position,
-                                        "tier": tier,
-                                        "session_id": getattr(self, "session_id", ""),
-                                    })
+                                    tj.record(
+                                        "TPSL_TRIGGER",
+                                        {
+                                            "symbol": sym,
+                                            "reason": close_reason,
+                                            "trigger": reason,
+                                            "entry_price": entry_price,
+                                            "current_price": current_price,
+                                            "tp": tp,
+                                            "sl": sl,
+                                            "pnl_pct": round(pnl_pct * 100, 4)
+                                            if pnl_pct is not None
+                                            else None,
+                                            "qty": position_qty,
+                                            "position": position,
+                                            "tier": tier,
+                                            "session_id": getattr(self, "session_id", ""),
+                                        },
+                                    )
                                 except Exception:
                                     pass
                             res = await self._close_via_execution_manager(
@@ -1958,18 +2239,31 @@ class TPSLEngine:
                                     str(res.get("executedQty", res.get("executed_qty", ""))),
                                 )
                             else:
-                                self.logger.warning("[TPSL:CLOSE_RESULT] %s trigger=%s non-dict response=%r", sym, reason, res)
+                                self.logger.warning(
+                                    "[TPSL:CLOSE_RESULT] %s trigger=%s non-dict response=%r",
+                                    sym,
+                                    reason,
+                                    res,
+                                )
                         except Exception:
-                            self.logger.debug("[TPSL] close result logging failed for %s", sym, exc_info=True)
+                            self.logger.debug(
+                                "[TPSL] close result logging failed for %s", sym, exc_info=True
+                            )
                         try:
-                            status = str(res.get("status", "")).lower() if isinstance(res, dict) else ""
+                            status = (
+                                str(res.get("status", "")).lower() if isinstance(res, dict) else ""
+                            )
                             executed_qty = 0.0
                             if isinstance(res, dict):
                                 try:
-                                    executed_qty = float(res.get("executedQty", res.get("executed_qty", 0.0)) or 0.0)
+                                    executed_qty = float(
+                                        res.get("executedQty", res.get("executed_qty", 0.0)) or 0.0
+                                    )
                                 except Exception:
                                     executed_qty = 0.0
-                            is_fill = status in {"filled", "partially_filled"} and executed_qty > 0.0
+                            is_fill = (
+                                status in {"filled", "partially_filled"} and executed_qty > 0.0
+                            )
                             # Always stamp the attempt so failed closes are debounced too.
                             self._last_close_attempt[sym] = self._mono()
                             if is_fill:
@@ -1988,26 +2282,35 @@ class TPSLEngine:
                                     "tp_sl",
                                 )
                                 await self._force_close_all_open_lots(sym, close_reason)
-                            elif status and status not in {"error", "rejected", "cancelled", "canceled"}:
+                            elif status and status not in {
+                                "error",
+                                "rejected",
+                                "cancelled",
+                                "canceled",
+                            }:
                                 self.logger.warning(
                                     "[TPSL:PENDING_FILL] %s close submitted but not filled yet status=%s qty=%.8f — EM reconciliation will handle",
-                                    sym, status, executed_qty,
+                                    sym,
+                                    status,
+                                    executed_qty,
                                 )
                         except Exception as bk_err:
-                            self.logger.error("[TPSL:BOOKKEEPING_FAILED] %s: %s", sym, bk_err, exc_info=True)
+                            self.logger.error(
+                                "[TPSL:BOOKKEEPING_FAILED] %s: %s", sym, bk_err, exc_info=True
+                            )
 
                 # [FIX #10] Timeout protection: prevent TPSL from stalling on ExchangeClient hangs
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*(_close(s, r) for s, r in to_close)),
-                        timeout=15  # Max 15 seconds for all closes to complete
+                        timeout=15,  # Max 15 seconds for all closes to complete
                     )
                 except asyncio.TimeoutError:
                     self.logger.error("[TIMEOUT] TP/SL close operations exceeded 15s timeout")
                     await self.shared_state.update_system_health(
                         component="TPSLEngine",
                         status="Warning",
-                        message=f"TP/SL close timeout: {len(to_close)} positions may have been skipped"
+                        message=f"TP/SL close timeout: {len(to_close)} positions may have been skipped",
                     )
 
             uh = getattr(self.shared_state, "update_system_health", None)
@@ -2015,7 +2318,7 @@ class TPSLEngine:
                 res = uh(
                     component="TPSLEngine",
                     status="Operational",
-                    message=f"TP/SL evaluation OK. Closed={len(to_close)}"
+                    message=f"TP/SL evaluation OK. Closed={len(to_close)}",
                 )
                 if iscoroutine(res):
                     await res
@@ -2029,7 +2332,7 @@ class TPSLEngine:
                 res = uh(
                     component="TPSLEngine",
                     status="Error",
-                    message=f"Exception during TP/SL evaluation: {e}"
+                    message=f"Exception during TP/SL evaluation: {e}",
                 )
                 if iscoroutine(res):
                     await res
@@ -2039,6 +2342,7 @@ class TPSLEngine:
         """
         Continuous, drift-free monitoring loop.
         """
+
         # Wait gates using events if present (non-fatal if missing)
         async def _wait_gate(ev, name: str, timeout: float) -> None:
             try:
@@ -2100,11 +2404,12 @@ class TPSLEngine:
             raise
 
 
-
 # ===== P9 Spec Helpers =====
+
 
 def _iso_now():
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
 
 def _emit_health(ss, status: str, message: str):
     try:
@@ -2113,7 +2418,7 @@ def _emit_health(ss, status: str, message: str):
                 "component": "TPSLEngine",
                 "status": status,
                 "message": message,
-                "timestamp": _iso_now()
+                "timestamp": _iso_now(),
             }
             # Fire and forget safely
             try:
@@ -2129,9 +2434,15 @@ def _emit_health(ss, status: str, message: str):
     except Exception:
         pass
 
+
 def _norm_exec_order_tp_sl(x):
     def g(obj, k, d=None):
-        return getattr(obj, k, None) if hasattr(obj, k) else (obj.get(k, d) if isinstance(obj, dict) else d)
+        return (
+            getattr(obj, k, None)
+            if hasattr(obj, k)
+            else (obj.get(k, d) if isinstance(obj, dict) else d)
+        )
+
     symbol = g(x, "symbol")
     side = g(x, "side")
     if not symbol or not side:
@@ -2146,17 +2457,20 @@ def _norm_exec_order_tp_sl(x):
     return eo
 
 
-
 # ===== P9 TP/SL Normalization Wrappers =====
 def _wrap_tp_sl_outputs(cls):
     # Add required P9 lifecycle stubs if not already defined.
     if not hasattr(cls, "warmup"):
+
         async def warmup(self):
             _emit_health(getattr(self, "shared_state", None), "Running", "warmup ok")
+
         cls.warmup = warmup
     if not hasattr(cls, "health"):
+
         def health(self):
             return {"component": "TPSLEngine", "status": "Running", "timestamp": _iso_now()}
+
         cls.health = health
     return cls
 

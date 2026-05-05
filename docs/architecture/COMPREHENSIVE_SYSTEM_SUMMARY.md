@@ -632,7 +632,7 @@ From Quote to Quantity:
 ### Capital Velocity Optimization
 
 ```
-Capital Velocity = (Total PnL / Time) 
+Capital Velocity = (Total PnL / Time)
                  = (Realized PnL * 360) / (Actual Trading Days)
 
 Example:
@@ -1193,7 +1193,7 @@ cp /tmp/trades.db /backups/trades_$(date +%Y%m%d_%H%M%S).db
 
 ---
 
-**Document Version:** 1.0  
-**Last Reviewed:** 2026-02-14  
-**Maintained By:** Octi AI Bot Dev Team  
+**Document Version:** 1.0
+**Last Reviewed:** 2026-02-14
+**Maintained By:** Octi AI Bot Dev Team
 **Status:** Ready for Production

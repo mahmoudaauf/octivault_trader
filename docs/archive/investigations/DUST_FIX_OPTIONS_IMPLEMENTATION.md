@@ -1,7 +1,7 @@
 # FIXING THE 0.898 DOGE DUST - IMPLEMENTATION OPTIONS
 
-**Date:** April 28, 2026  
-**Goal:** Remove the 0.898 DOGE dust permanently  
+**Date:** April 28, 2026
+**Goal:** Remove the 0.898 DOGE dust permanently
 **Status:** 3 Options Available
 
 ---
@@ -101,7 +101,7 @@ Root Cause:   Rounding bug in EM:SellRoundUp (line ~2179)
 
 ### **Part A: Fix the Rounding Bug**
 
-**File:** `core/execution_manager.py`  
+**File:** `core/execution_manager.py`
 **Current Location:** Line ~2179 (in `_market_buy_base` method)
 
 **Current Code (BUGGY):**
@@ -130,7 +130,7 @@ if dust_detected and include_remainder:
 
 ### **Part B: Add Aggressive Dust Healing**
 
-**File:** `core/execution_manager.py`  
+**File:** `core/execution_manager.py`
 **New Code Section** (after line 7150):
 
 ```python
@@ -139,35 +139,35 @@ async def _aggressive_dust_healing(self, symbol: str, dust_qty: float) -> bool:
     Aggressively heal stuck dust by buying small amount to consolidate.
     Used when dust has been stuck > threshold time.
     """
-    
+
     if dust_qty <= 0:
         return False
-    
+
     try:
         pos = await self.shared_state.get_position(symbol) or {}
         current_price = float(pos.get("mark_price") or 0.0)
-        
+
         if current_price <= 0:
             return False
-        
+
         dust_notional = dust_qty * current_price
-        
+
         # Only heal SMALL dust (< $1 USDT)
         if dust_notional >= 1.0:
             return False  # Wait for normal healing
-        
+
         # Healing buy amount: round up to nearest $5
         healing_amount = math.ceil(dust_notional / 5.0) * 5.0
-        
+
         self.logger.info(
             "[Dust:HEALING] %s aggressive buy: "
             "dust=%.6f ($%.2f) → buy_amount=$%.2f",
             symbol, dust_qty, dust_notional, healing_amount
         )
-        
+
         # Execute healing buy at market
         buy_qty = healing_amount / current_price
-        
+
         result = await self.execute_order(
             symbol=symbol,
             side="buy",
@@ -176,7 +176,7 @@ async def _aggressive_dust_healing(self, symbol: str, dust_qty: float) -> bool:
             _is_dust_healing_buy=True,
             tag="dust_healing"
         )
-        
+
         if result.get("status") == "filled":
             self.logger.info(
                 "[Dust:HEALING] ✅ Success: %s consolidated "
@@ -184,9 +184,9 @@ async def _aggressive_dust_healing(self, symbol: str, dust_qty: float) -> bool:
                 symbol, dust_qty + buy_qty
             )
             return True
-        
+
         return False
-        
+
     except Exception as e:
         self.logger.error("[Dust:HEALING] Failed: %s", e)
         return False
@@ -197,25 +197,25 @@ async def _aggressive_dust_healing(self, symbol: str, dust_qty: float) -> bool:
 ```python
 async def _monitor_and_execute_exits(self):
     """Main exit monitoring loop - add dust healing check"""
-    
+
     while self.is_running:
         try:
             # ... existing exit logic ...
-            
+
             # NEW: Check for stuck dust and heal aggressively
             for symbol in self.shared_state.positions.keys():
                 pos = await self.shared_state.get_position(symbol)
-                
+
                 if pos and pos.get("status_field") == "DUST":
                     dust_qty = pos.get("current_qty", 0.0)
                     age = time.time() - pos.get("last_update", time.time())
-                    
+
                     # If dust stuck for > 30 minutes, heal it
                     if age > 1800:  # 30 minutes
                         await self._aggressive_dust_healing(symbol, dust_qty)
-            
+
             await asyncio.sleep(10)
-            
+
         except Exception as e:
             self.logger.error("Exit monitor error: %s", e)
             await asyncio.sleep(10)
@@ -278,9 +278,9 @@ async def _monitor_and_execute_exits(self):
 
 ### **The Bug Location:**
 
-**File:** `core/execution_manager.py`  
-**Method:** `_market_buy_base()` or similar  
-**Line:** ~2179  
+**File:** `core/execution_manager.py`
+**Method:** `_market_buy_base()` or similar
+**Line:** ~2179
 
 **Current (BROKEN):**
 ```python
@@ -340,10 +340,10 @@ if dust_detected:
 
 ## 🎯 FINAL RECOMMENDATION
 
-**Right now:** Manual sell (Option 1)  
-**Why:** Dust gone in 5 minutes, verified fix  
+**Right now:** Manual sell (Option 1)
+**Why:** Dust gone in 5 minutes, verified fix
 
-**Then:** Deploy code fix (Option 3)  
+**Then:** Deploy code fix (Option 3)
 **Why:** Prevents this ever happening again
 
 **This will ensure:**
@@ -351,4 +351,3 @@ if dust_detected:
 - ✅ Automatic consolidation when dust detected
 - ✅ Aggressive healing for micro amounts
 - ✅ System stays clean and productive
-

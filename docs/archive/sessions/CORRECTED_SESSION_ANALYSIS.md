@@ -32,14 +32,14 @@ Position ROI:            +4.46%
 ```
 Entry:    BUY ETHUSDT @ 13:05:25 (Loop 5)
           Capital used: ~$27.15 (free became $22.85)
-Exit:     SELL ETHUSDT @ 13:05:47 (Loop 6)  
+Exit:     SELL ETHUSDT @ 13:05:47 (Loop 6)
           Capital returned: ~$27.09
 P&L:      -$0.06 (LOSS)
 Duration: 22 seconds
 Status:   trade_opened=False, pnl=-0.06
 ```
 
-### Trade 2: AXSUSDT  
+### Trade 2: AXSUSDT
 ```
 Entry:    BUY AXSUSDT @ 13:09:29 (Loop 95)
           Capital used: ~$27.55 (free became $22.53)
@@ -184,4 +184,3 @@ I made significant errors in my initial analysis. The system is:
 - ❌ Not generating alpha from signal timing
 
 Profit optimization won't fix this - we need to fix the core trading engine first.
-

@@ -1,8 +1,8 @@
 # ⚙️ PHASE 2 BOTTLENECK FIXES - IMPLEMENTATION SEQUENCE
 
-**Execution Plan:** Sequential Implementation of 3 Fixes  
-**Status:** READY TO DEPLOY  
-**Date:** April 27, 2026  
+**Execution Plan:** Sequential Implementation of 3 Fixes
+**Status:** READY TO DEPLOY
+**Date:** April 27, 2026
 
 ---
 
@@ -89,10 +89,10 @@ Expected log pattern:
 #### Step 2.1: Review authorize_rotation() method (Line ~302)
 ```python
 async def authorize_rotation(
-    self, 
-    sig_pos: int, 
-    max_pos: int, 
-    owned_positions: Dict[str, Any], 
+    self,
+    sig_pos: int,
+    max_pos: int,
+    owned_positions: Dict[str, Any],
     best_opp: Dict[str, Any],
     current_mode: str,
     is_starved: bool = False,
@@ -216,31 +216,31 @@ This is the only fix that needs implementation. Execute the changes below.
 **Solution:** Align all 7 entry-size parameters to 25 USDT
 
 ### Step 3.1: Update .env - DEFAULT_PLANNED_QUOTE
-From: `DEFAULT_PLANNED_QUOTE=15`  
+From: `DEFAULT_PLANNED_QUOTE=15`
 To: `DEFAULT_PLANNED_QUOTE=25`
 
 ### Step 3.2: Update .env - MIN_TRADE_QUOTE
-From: `MIN_TRADE_QUOTE=15`  
+From: `MIN_TRADE_QUOTE=15`
 To: `MIN_TRADE_QUOTE=25`
 
 ### Step 3.3: Update .env - MIN_ENTRY_USDT
-From: `MIN_ENTRY_USDT=15`  
+From: `MIN_ENTRY_USDT=15`
 To: `MIN_ENTRY_USDT=25`
 
 ### Step 3.4: Update .env - TRADE_AMOUNT_USDT
-From: `TRADE_AMOUNT_USDT=15`  
+From: `TRADE_AMOUNT_USDT=15`
 To: `TRADE_AMOUNT_USDT=25`
 
 ### Step 3.5: Update .env - MIN_ENTRY_QUOTE_USDT
-From: `MIN_ENTRY_QUOTE_USDT=15`  
+From: `MIN_ENTRY_QUOTE_USDT=15`
 To: `MIN_ENTRY_QUOTE_USDT=25`
 
 ### Step 3.6: Update .env - EMIT_BUY_QUOTE
-From: `EMIT_BUY_QUOTE=15`  
+From: `EMIT_BUY_QUOTE=15`
 To: `EMIT_BUY_QUOTE=25`
 
 ### Step 3.7: Update .env - META_MICRO_SIZE_USDT
-From: `META_MICRO_SIZE_USDT=15`  
+From: `META_MICRO_SIZE_USDT=15`
 To: `META_MICRO_SIZE_USDT=25`
 
 ### Step 3.8: Update .env - Floor alignment comment
@@ -301,6 +301,6 @@ else:
 
 ---
 
-**Version:** 1.0  
-**Status:** Ready for implementation  
+**Version:** 1.0
+**Status:** Ready for implementation
 **Estimated Time:** 15 minutes to implement + 5 minutes to verify

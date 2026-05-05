@@ -196,7 +196,7 @@ Scenario A: Position profitable at 4-hour mark
   Current Value: $22.50 (+$1.00, +4.6%)
   Action: Close with profit ✅
   Capital Released: $22.50
-  
+
 Scenario B: Position breakeven at 4-hour mark
   Entry: $21.50
   Current Value: $21.50 (0%, unchanged)
@@ -536,32 +536,32 @@ Conclusion: AT LEAST ONE EXIT PATHWAY WILL ALWAYS WORK ✅
 
 class PositionWithExitPlan:
     """Position that MUST have exit plan before entry"""
-    
+
     def __init__(self, symbol: str, entry_size: float):
         self.symbol = symbol
         self.entry_size = entry_size
         self.entry_time = None
-        
+
         # Exit planning (REQUIRED before entry)
         self.tp_price = None          # Take profit level
         self.tp_executed = False
         self.tp_trigger_time = None
-        
+
         self.sl_price = None          # Stop loss level
         self.sl_executed = False
         self.sl_trigger_time = None
-        
+
         self.max_hold_time = 4 * 3600  # 4 hours in seconds
         self.time_exit_planned = None
         self.time_exit_triggered = False
-        
+
         self.dust_liquidation_viable = False  # Can liquidate if needed
-        
+
         # Execution tracking
         self.entry_executed = False
         self.exit_executed = False
         self.exit_pathway = None  # Which exit worked: TP/SL/TIME/DUST
-    
+
     def validate_exit_plan(self) -> bool:
         """Returns True if ALL exit pathways are properly planned"""
         checks = [
@@ -575,29 +575,29 @@ class PositionWithExitPlan:
             abs(self.entry_price - self.sl_price) / self.entry_price >= 0.015,  # SL >= 1.5%
         ]
         return all(checks)
-    
+
     def check_exit_conditions(self, current_price: float) -> Optional[str]:
         """Returns which exit pathway triggered first"""
-        
+
         # Check TP
         if current_price >= self.tp_price and not self.tp_executed:
             self.tp_executed = True
             self.exit_pathway = "TAKE_PROFIT"
             return "TAKE_PROFIT"
-        
+
         # Check SL
         if current_price <= self.sl_price and not self.sl_executed:
             self.sl_executed = True
             self.exit_pathway = "STOP_LOSS"
             return "STOP_LOSS"
-        
+
         # Check Time
         elapsed = time.time() - self.entry_time
         if elapsed > self.max_hold_time and not self.time_exit_triggered:
             self.time_exit_triggered = True
             self.exit_pathway = "TIME_BASED"
             return "TIME_BASED"
-        
+
         return None  # No exit triggered yet
 ```
 
@@ -606,7 +606,7 @@ class PositionWithExitPlan:
 ```python
 # In core/meta_controller.py
 
-async def should_enter_new_trade(self, symbol: str, entry_size: float, 
+async def should_enter_new_trade(self, symbol: str, entry_size: float,
                                   tp_price: float, sl_price: float) -> bool:
     """
     Only allows entry if:
@@ -614,36 +614,36 @@ async def should_enter_new_trade(self, symbol: str, entry_size: float,
     2. Capital will be freed within 4 hours
     3. No deadlock scenario possible
     """
-    
+
     # Validate exit plan exists
     if not tp_price or not sl_price:
         return False  # Missing exit pathways
-    
+
     # Validate exit plan is reasonable
     gain_pct = (tp_price - entry_price) / entry_price
     loss_pct = (entry_price - sl_price) / entry_price
-    
+
     if gain_pct < 0.02:  # TP must be at least +2%
         return False
-    
+
     if loss_pct < 0.015:  # SL must be at least -1.5%
         return False
-    
+
     # Validate win probability
     signal_quality = self._assess_signal_quality(symbol)
     if signal_quality < 0.50:  # Win rate < 50%: risky
         return False
-    
+
     # Validate capital release timing
     avg_exit_time = self._estimate_exit_time(symbol, gain_pct)
     if avg_exit_time > 4 * 3600:  # > 4 hours: will get force-closed
         return False
-    
+
     # Validate dust liquidation fallback
     if entry_size > 5.0:  # Larger positions need viable dust path
         if not self._can_liquidate_dust(entry_size * 0.5):
             return False  # Dust liquidation won't work
-    
+
     # All checks passed: entry approved
     return True
 ```
@@ -949,4 +949,3 @@ Next Trade:
 - ✅ 8-12 compounding cycles per day (vs 1-2 current)
 - ✅ No position held > 4 hours indefinitely
 - ✅ System recovery $103 → $500+ within 1-2 weeks
-

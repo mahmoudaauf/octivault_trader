@@ -33,9 +33,9 @@ import asyncio
 import json
 import logging
 import time
-from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
+from decimal import ROUND_DOWN, ROUND_UP, Decimal, getcontext
 from inspect import iscoroutine
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 getcontext().prec = 28
 
@@ -86,6 +86,7 @@ class SafetyOrderManager:
         # Config class doesn't define this attr, so getattr() always returned True
         # default. Now we check os.environ first, then config attr, then default True.
         import os as _os
+
         _env_flag = _os.environ.get("SAFETY_ORDERS_ENABLED", "").strip().lower()
         if _env_flag in ("false", "0", "no", "off"):
             self._enabled = False
@@ -93,43 +94,35 @@ class SafetyOrderManager:
             self._enabled = True
         else:
             self._enabled = bool(getattr(config, "SAFETY_ORDERS_ENABLED", True))
-        
+
         self._tp_pct = float(getattr(config, "SAFETY_ORDER_TP_PCT", 0.015))
         self._sl_pct = float(getattr(config, "SAFETY_ORDER_SL_PCT", 0.030))
-        self._sl_limit_buffer = float(
-            getattr(config, "SAFETY_ORDER_SL_LIMIT_BUFFER", 0.003)
-        )
-        self._min_notional = float(
-            getattr(config, "SAFETY_ORDER_MIN_NOTIONAL_USDT", 5.0)
-        )
-        self._recheck_interval = float(
-            getattr(config, "SAFETY_ORDER_RECHECK_INTERVAL", 300.0)
-        )
-        self._auto_arm_on_startup = bool(
-            getattr(config, "SAFETY_ORDER_AUTO_ARM_ON_STARTUP", True)
-        )
+        self._sl_limit_buffer = float(getattr(config, "SAFETY_ORDER_SL_LIMIT_BUFFER", 0.003))
+        self._min_notional = float(getattr(config, "SAFETY_ORDER_MIN_NOTIONAL_USDT", 5.0))
+        self._recheck_interval = float(getattr(config, "SAFETY_ORDER_RECHECK_INTERVAL", 300.0))
+        self._auto_arm_on_startup = bool(getattr(config, "SAFETY_ORDER_AUTO_ARM_ON_STARTUP", True))
         self._dry_run = bool(getattr(config, "SAFETY_ORDER_DRY_RUN", False))
 
         # State
-        self._last_arm_attempt: Dict[str, float] = {}
-        self._symbol_filters: Dict[str, Dict[str, Any]] = {}
+        self._last_arm_attempt: dict[str, float] = {}
+        self._symbol_filters: dict[str, dict[str, Any]] = {}
 
     # ─── Lifecycle ─────────────────────────────────────────────────────────
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
         if not self._enabled:
-            self.logger.info(
-                "[SafetyOrderManager] disabled via SAFETY_ORDERS_ENABLED=False"
-            )
+            self.logger.info("[SafetyOrderManager] disabled via SAFETY_ORDERS_ENABLED=False")
             await self._safe_status_update("Disabled", "Disabled by config")
             return
 
         self._stop_event.clear()
         self.logger.info(
             "[SafetyOrderManager] starting (tp=+%.2f%% sl=-%.2f%% recheck=%.0fs dry_run=%s)",
-            self._tp_pct * 100, self._sl_pct * 100,
-            self._recheck_interval, self._dry_run,
+            self._tp_pct * 100,
+            self._sl_pct * 100,
+            self._recheck_interval,
+            self._dry_run,
         )
         await self._safe_status_update("Starting", "Initializing")
 
@@ -145,7 +138,8 @@ class SafetyOrderManager:
                 armed, skipped = await self.arm_all_positions()
                 self.logger.info(
                     "[SafetyOrderManager] startup auto-arm: armed=%d skipped=%d",
-                    armed, skipped,
+                    armed,
+                    skipped,
                 )
             except Exception:
                 self.logger.error(
@@ -184,14 +178,13 @@ class SafetyOrderManager:
                 if armed:
                     self.logger.info(
                         "[SafetyOrderManager] periodic re-arm: armed=%d skipped=%d",
-                        armed, skipped,
+                        armed,
+                        skipped,
                     )
             except asyncio.CancelledError:
                 break
             except Exception:
-                self.logger.error(
-                    "[SafetyOrderManager] periodic loop error", exc_info=True
-                )
+                self.logger.error("[SafetyOrderManager] periodic loop error", exc_info=True)
                 await asyncio.sleep(30)
 
     async def _heartbeat_loop(self) -> None:
@@ -206,16 +199,19 @@ class SafetyOrderManager:
                 continue
 
     # ─── Public API ────────────────────────────────────────────────────────
-    async def arm_all_positions(self) -> Tuple[int, int]:
+    async def arm_all_positions(self) -> tuple[int, int]:
         """
         Discover unprotected positions and place OCO orders.
         Returns (armed_count, skipped_count).
         """
         # OPTION B FIX: Double-check disabled state
         if not self._enabled:
-            print(f"⚠️  [SafetyOrderManager.arm_all_positions] Called but DISABLED (enabled={self._enabled}). Returning 0,0.", flush=True)
+            print(
+                f"⚠️  [SafetyOrderManager.arm_all_positions] Called but DISABLED (enabled={self._enabled}). Returning 0,0.",
+                flush=True,
+            )
             return 0, 0
-            
+
         positions = await self._discover_positions()
         if not positions:
             return 0, 0
@@ -235,9 +231,7 @@ class SafetyOrderManager:
                 else:
                     skipped += 1
             except Exception as e:
-                self.logger.error(
-                    "[SafetyOrderManager] arm %s failed: %s", sym, e, exc_info=False
-                )
+                self.logger.error("[SafetyOrderManager] arm %s failed: %s", sym, e, exc_info=False)
                 skipped += 1
         return armed, skipped
 
@@ -264,18 +258,21 @@ class SafetyOrderManager:
                 )
                 self.logger.info(
                     "[SafetyOrderManager] cancelled %s order %s",
-                    o["symbol"], o["orderId"],
+                    o["symbol"],
+                    o["orderId"],
                 )
                 cancelled += 1
             except Exception as e:
                 self.logger.warning(
                     "[SafetyOrderManager] cancel %s/%s failed: %s",
-                    o.get("symbol"), o.get("orderId"), e,
+                    o.get("symbol"),
+                    o.get("orderId"),
+                    e,
                 )
         return cancelled
 
     # ─── Discovery ─────────────────────────────────────────────────────────
-    async def _discover_positions(self) -> List[Dict[str, Any]]:
+    async def _discover_positions(self) -> list[dict[str, Any]]:
         """Return tradeable positions worth ≥ min_notional with current price + qty."""
         try:
             balances = await self.exchange_client.get_account_balances()
@@ -283,7 +280,7 @@ class SafetyOrderManager:
             self.logger.error("[SafetyOrderManager] balances fetch failed: %s", e)
             return []
 
-        positions: List[Dict[str, Any]] = []
+        positions: list[dict[str, Any]] = []
         # SharedState canonical positions snapshot (preferred for entry price)
         ss_positions = getattr(self.shared_state, "positions", {}) or {}
 
@@ -315,24 +312,23 @@ class SafetyOrderManager:
             # Entry price preference: shared_state.positions → known fallback → current price
             ss_pos = ss_positions.get(symbol, {}) or {}
             entry = float(
-                ss_pos.get("avg_price")
-                or ss_pos.get("entry_price")
-                or ss_pos.get("entry")
-                or 0.0
+                ss_pos.get("avg_price") or ss_pos.get("entry_price") or ss_pos.get("entry") or 0.0
             )
             if entry <= 0:
                 entry = price  # arm relative to now if no known entry
 
-            positions.append({
-                "symbol": symbol,
-                "asset": asset,
-                "free_qty": free,
-                "locked_qty": locked,
-                "total_qty": total,
-                "price_now": price,
-                "value_usdt": value,
-                "entry_price": entry,
-            })
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "asset": asset,
+                    "free_qty": free,
+                    "locked_qty": locked,
+                    "total_qty": total,
+                    "price_now": price,
+                    "value_usdt": value,
+                    "entry_price": entry,
+                }
+            )
         positions.sort(key=lambda r: -r["value_usdt"])
         return positions
 
@@ -352,7 +348,7 @@ class SafetyOrderManager:
                 protected.add(o["symbol"])
         return protected
 
-    async def _get_filters(self, symbol: str) -> Optional[Dict[str, Any]]:
+    async def _get_filters(self, symbol: str) -> Optional[dict[str, Any]]:
         if symbol in self._symbol_filters:
             return self._symbol_filters[symbol]
         try:
@@ -367,9 +363,9 @@ class SafetyOrderManager:
             "tickSize": Decimal(str(flt.get("PRICE_FILTER", {}).get("tickSize", "0.01"))),
             "stepSize": Decimal(str(flt.get("LOT_SIZE", {}).get("stepSize", "0.0001"))),
             "minQty": Decimal(str(flt.get("LOT_SIZE", {}).get("minQty", "0"))),
-            "minNotional": Decimal(str(
-                flt.get("NOTIONAL", flt.get("MIN_NOTIONAL", {})).get("minNotional", "5")
-            )),
+            "minNotional": Decimal(
+                str(flt.get("NOTIONAL", flt.get("MIN_NOTIONAL", {})).get("minNotional", "5"))
+            ),
             "ocoAllowed": bool(info.get("ocoAllowed", True)),
         }
         self._symbol_filters[symbol] = filters
@@ -384,9 +380,9 @@ class SafetyOrderManager:
 
     def _build_oco_plan(
         self,
-        pos: Dict[str, Any],
-        filt: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
+        pos: dict[str, Any],
+        filt: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
         sym = pos["symbol"]
         entry = Decimal(str(pos["entry_price"]))
         price_now = Decimal(str(pos["price_now"]))
@@ -407,7 +403,8 @@ class SafetyOrderManager:
         sl_stop = self._round_step(sl_raw, tick, ROUND_DOWN)
         sl_limit = self._round_step(
             sl_stop * (Decimal("1") - Decimal(str(self._sl_limit_buffer))),
-            tick, ROUND_DOWN,
+            tick,
+            ROUND_DOWN,
         )
 
         qty = self._round_step(Decimal(str(pos["free_qty"])), step, ROUND_DOWN)
@@ -426,11 +423,11 @@ class SafetyOrderManager:
             "client_order_id": f"{CLIENT_ID_PREFIX}{sym}_{int(time.time())}",
         }
 
-    async def _arm_one(self, pos: Dict[str, Any]) -> bool:
+    async def _arm_one(self, pos: dict[str, Any]) -> bool:
         # OPTION B FIX: Guard against disabled state
         if not self._enabled:
             return False
-            
+
         sym = pos["symbol"]
         # Debounce
         last = self._last_arm_attempt.get(sym, 0.0)
@@ -456,8 +453,11 @@ class SafetyOrderManager:
         if self._dry_run:
             self.logger.info(
                 "[SafetyOrderManager] DRY_RUN %s qty=%s tp=%s sl_stop=%s sl_limit=%s",
-                plan["symbol"], plan["qty"], plan["tp_price"],
-                plan["sl_stop"], plan["sl_limit"],
+                plan["symbol"],
+                plan["qty"],
+                plan["tp_price"],
+                plan["sl_stop"],
+                plan["sl_limit"],
             )
             return True
 
@@ -465,9 +465,9 @@ class SafetyOrderManager:
             "symbol": plan["symbol"],
             "side": "SELL",
             "quantity": plan["qty"],
-            "price": plan["tp_price"],            # TP limit leg
-            "stopPrice": plan["sl_stop"],         # Stop trigger
-            "stopLimitPrice": plan["sl_limit"],   # Stop limit leg
+            "price": plan["tp_price"],  # TP limit leg
+            "stopPrice": plan["sl_stop"],  # Stop trigger
+            "stopLimitPrice": plan["sl_limit"],  # Stop limit leg
             "stopLimitTimeInForce": "GTC",
             "newOrderRespType": "RESULT",
             "listClientOrderId": plan["client_order_id"],
@@ -477,24 +477,23 @@ class SafetyOrderManager:
                 "POST", "/api/v3/order/oco", params, signed=True, api="spot_api"
             )
         except Exception as e:
-            self.logger.error(
-                "[SafetyOrderManager] OCO POST %s failed: %s", sym, e
-            )
+            self.logger.error("[SafetyOrderManager] OCO POST %s failed: %s", sym, e)
             return False
 
         list_id = (resp or {}).get("orderListId", "?")
         self.logger.info(
             "[SafetyOrderManager] ✅ ARMED %s qty=%s tp=%s sl=%s (orderListId=%s)",
-            plan["symbol"], plan["qty"], plan["tp_price"],
-            plan["sl_stop"], list_id,
+            plan["symbol"],
+            plan["qty"],
+            plan["tp_price"],
+            plan["sl_stop"],
+            list_id,
         )
         # Best-effort journal record
         await self._journal_event("SAFETY_OCO_ARMED", plan, list_id)
         return True
 
-    async def _journal_event(
-        self, event: str, plan: Dict[str, Any], list_id: Any
-    ) -> None:
+    async def _journal_event(self, event: str, plan: dict[str, Any], list_id: Any) -> None:
         try:
             tj = getattr(self.shared_state, "trade_journal", None) or getattr(
                 self, "trade_journal", None
@@ -528,8 +527,10 @@ class SafetyOrderManager:
             statuses = getattr(self.shared_state, "component_statuses", None)
             if isinstance(statuses, dict):
                 statuses[self.COMPONENT_NAME] = {
-                    "status": status, "message": message,
-                    "timestamp": ts, "ts": ts,
+                    "status": status,
+                    "message": message,
+                    "timestamp": ts,
+                    "ts": ts,
                 }
             last_seen = getattr(self.shared_state, "component_last_seen", None)
             if isinstance(last_seen, dict):

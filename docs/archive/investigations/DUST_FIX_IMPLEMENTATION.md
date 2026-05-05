@@ -38,7 +38,7 @@ Your system was **creating and trapping dust positions** in an infinite loop. He
 # 1. QUANTITY-BASED: Is remainder too tiny to trade?
 qty_residual_is_dust = remainder > 0 and remainder < max(min_qty, step_size)
 
-# 2. NOTIONAL-BASED (NEW): Is remainder worth < $5 USDT? 
+# 2. NOTIONAL-BASED (NEW): Is remainder worth < $5 USDT?
 # ✅ KEY FIX: This catches dust that quantity check misses
 notional_residual_is_dust = residual_notional > 0 and residual_notional < 5.0
 
@@ -51,7 +51,7 @@ if qty_residual_is_dust or notional_residual_is_dust or near_total_exit:
     qty = round_step(_raw_quantity, step_size)  # Sell EVERYTHING
 ```
 
-**Impact**: 
+**Impact**:
 - Dust remainders < $5 USDT automatically sold as part of position
 - No more partial exits leaving stranded capital
 - Clean position exits on first attempt
@@ -70,8 +70,8 @@ self._dust_position_tracker: Dict[str, Dict[str, Any]] = {}
 self._dust_stuck_threshold_cycles = 3  # If stuck for 3 cycles, force exit
 
 # ✅ NEW: Detection method
-async def _detect_stuck_dust_position(self, symbol: str, 
-                                     current_price: float, 
+async def _detect_stuck_dust_position(self, symbol: str,
+                                     current_price: float,
                                      remainder_qty: float) -> bool:
     """If same remainder detected 3+ times → return True (force liquidate)"""
 ```
@@ -198,7 +198,7 @@ Old code only checked: "Is remainder < min_qty?"
 
 ### Why New Fix Works
 New code checks **THREE ways**:
-1. **Quantity**: Is it too small to trade? 
+1. **Quantity**: Is it too small to trade?
 2. **Economics**: Is it worth < $5 USD? ← ✅ Catches most escapes
 3. **Percentage**: Are we selling 95%+ anyway? ← ✅ Just finish the job
 
@@ -230,4 +230,3 @@ Trade cycles frozen         Yes (loops) No         No
 ---
 
 **Summary**: Your system now has **three-layer dust prevention** + **automatic stuck-detection safety net**. Dust positions will be caught and fully exited on first attempt, with forced liquidation if anything slips through.
-

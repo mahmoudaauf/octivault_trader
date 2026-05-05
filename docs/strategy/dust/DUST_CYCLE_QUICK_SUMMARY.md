@@ -18,7 +18,7 @@ The system creates a **self-reinforcing dust loop**:
 6. Capital freed but reduced ($20 → $13)
          ↓
    🔄 Back to step 1 with less capital
-   
+
 Result: Capital decays, positions get smaller, more dust
 ```
 
@@ -74,12 +74,12 @@ if dust_ratio > 60% and time_sustained > 5_minutes:
 
 1. **Don't propose entries if system will liquidate them**
    - During dust phase, block new sub-floor entries
-   
+
 2. **Add minimum age guard on dust positions**
    - Dust must be >= 1 hour old before liquidation
    - Exception: If it healed naturally (value grew), liquidate immediately
    - Exception: If permanently stuck (rejections > 5), give up
-   
+
 3. **Delay dust liquidation phase activation**
    - Only trigger when 80%+ dust (not 60%)
    - Wait 30 minutes (not 5 minutes)
@@ -89,8 +89,8 @@ if dust_ratio > 60% and time_sustained > 5_minutes:
 
 ## Impact
 
-**Without fix:** Capital decays 7-8% per 10 cycles  
-**With fix:** Capital stable or grows naturally  
+**Without fix:** Capital decays 7-8% per 10 cycles
+**With fix:** Capital stable or grows naturally
 
 **Key insight:** Don't liquidate positions that haven't had time to work.
 

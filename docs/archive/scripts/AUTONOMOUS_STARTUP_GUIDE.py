@@ -6,24 +6,28 @@ Complete guide to run the trading system autonomously on your machine.
 """
 
 import subprocess
-from pathlib import Path
 import sys
+from pathlib import Path
+
 
 def print_header(text):
     print(f"\n{'='*80}")
     print(f"  {text}")
     print(f"{'='*80}\n")
 
+
 def print_section(text):
     print(f"\n{text}")
     print("-" * 80)
 
+
 def main():
     project_root = Path("/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader")
-    
+
     print_header("🤖 OCTIVAULT AUTONOMOUS TRADING SYSTEM - STARTUP GUIDE")
-    
-    print("""
+
+    print(
+        """
 This system is designed to trade autonomously 24/7 on the Binance exchange.
 
 KEY FEATURES:
@@ -35,11 +39,13 @@ KEY FEATURES:
 ✅ Automatic profit compounding - reinvest gains
 ✅ Position management - take-profit/stop-loss
 ✅ Signal generation - AI-driven trade signals
-""")
-    
+"""
+    )
+
     print_section("📋 QUICK START - THREE OPTIONS")
-    
-    print("""
+
+    print(
+        r"""
 OPTION 1: Simple (Recommended)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -72,28 +78,42 @@ OPTION 3: With Real-time Monitor
   ./AUTONOMOUS_START.sh --monitor
 
   This gives you a real-time dashboard of system status.
-""")
-    
+"""
+    )
+
     print_section("🔧 CONFIGURATION")
-    
-    print("""
+
+    print(
+        """
 The system reads configuration from: .env
 
 Current settings:
-""")
-    
+"""
+    )
+
     # Read .env to show current config
     env_file = project_root / ".env"
     if env_file.exists():
-        with open(env_file, 'r') as f:
+        with open(env_file) as f:
             content = f.read()
             # Extract key settings
-            for line in content.split('\n'):
-                if any(x in line for x in ['BINANCE_TESTNET', 'TRADING_MODE', 'LIVE_MODE', 'TESTNET_MODE', 'BASE_TARGET', 'CAPITAL_TARGET']):
-                    if not line.startswith('#') and '=' in line:
+            for line in content.split("\n"):
+                if any(
+                    x in line
+                    for x in [
+                        "BINANCE_TESTNET",
+                        "TRADING_MODE",
+                        "LIVE_MODE",
+                        "TESTNET_MODE",
+                        "BASE_TARGET",
+                        "CAPITAL_TARGET",
+                    ]
+                ):
+                    if not line.startswith("#") and "=" in line:
                         print(f"  {line}")
-    
-    print("""
+
+    print(
+        """
 To change settings:
   1. Open .env in your text editor
   2. Modify the BINANCE_TESTNET setting:
@@ -104,11 +124,13 @@ To change settings:
 ⚠️  WARNING: LIVE MODE is currently ENABLED
     The system will trade with REAL MONEY
     Only run in LIVE mode if you have funded your account
-""")
-    
+"""
+    )
+
     print_section("📊 MONITORING")
-    
-    print("""
+
+    print(
+        """
 While the system is running, you can:
 
 1. View logs:
@@ -122,11 +144,13 @@ While the system is running, you can:
 
 4. Stop system:
    pkill -f "LIVE_ED25519"
-""")
-    
+"""
+    )
+
     print_section("🔄 SYSTEM ARCHITECTURE")
-    
-    print("""
+
+    print(
+        """
 The autonomous system consists of:
 
 1. 🔗 Exchange Client
@@ -168,11 +192,13 @@ The autonomous system consists of:
    └─ Handles recovery and restarts
 
 All components run continuously and automatically.
-""")
-    
+"""
+    )
+
     print_section("✅ VERIFICATION CHECKLIST")
-    
-    print("""
+
+    print(
+        """
 Before running in LIVE mode, verify:
 
 □ API Keys are correct (test with testnet first)
@@ -199,11 +225,13 @@ async def test():
 
 asyncio.run(test())
   "
-""")
-    
+"""
+    )
+
     print_section("📞 TROUBLESHOOTING")
-    
-    print("""
+
+    print(
+        r"""
 Issue: "Cannot import core modules"
 Solution: Make sure you're in the project directory and venv is activated
   cd /Users/mauf/Desktop/Octi\ AI\ Trading\ Bot/octivault_trader
@@ -223,11 +251,13 @@ Solution: Check logs for errors
 Issue: "Not enough balance"
 Solution: Minimum 10 USDT required for first trade
   Check your account at https://www.binance.com
-""")
-    
+"""
+    )
+
     print_section("💡 TIPS FOR SUCCESS")
-    
-    print("""
+
+    print(
+        """
 1. START SMALL - Test with 10-50 USDT first
 2. MONITOR LOGS - Watch logs/octivault_trader.log for activity
 3. USE TESTNET - Test with testnet mode first (BINANCE_TESTNET=true in .env)
@@ -235,29 +265,30 @@ Solution: Minimum 10 USDT required for first trade
 5. STABILITY - Keep computer/connection running continuously
 6. BACKUPS - System maintains trade journal in logs/
 7. COMPOUND - Enable auto-compounding for exponential growth
-""")
-    
+"""
+    )
+
     print_section("🚀 LAUNCHING NOW")
-    
+
     response = input("Ready to start the autonomous system? (yes/no): ").strip().lower()
-    
+
     if response == "yes":
         print("\n✅ Starting autonomous system...\n")
-        
+
         # Change to project directory and activate venv
         import os
+
         os.chdir(str(project_root))
-        
+
         # Try to run the quick start script
         script_path = project_root / "QUICK_START_AUTONOMOUS.sh"
         if script_path.exists():
             subprocess.run(["bash", str(script_path)])
         else:
             print("Script not found, running directly...")
-            subprocess.run([
-                f"{project_root}/venv/bin/python3",
-                f"{project_root}/🚀_LIVE_ED25519_TRADING.py"
-            ])
+            subprocess.run(
+                [f"{project_root}/venv/bin/python3", f"{project_root}/🚀_LIVE_ED25519_TRADING.py"]
+            )
     else:
         print("\n✅ Setup complete. When ready, run:")
         print(f"  cd {project_root}")
@@ -270,5 +301,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n⏹️  Setup cancelled")
     except Exception as e:
-        print(f"\nError: {str(e)}")
+        print(f"\nError: {e!s}")
         sys.exit(1)

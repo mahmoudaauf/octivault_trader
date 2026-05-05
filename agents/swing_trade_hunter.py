@@ -1,29 +1,31 @@
 import asyncio
 import logging
+import math
 import os
 import time
-import inspect
-import math
 import traceback
+
 import numpy as np
+
 try:
     import tensorflow as tf
 except ImportError:
     tf = None
-from functools import partial
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Set
-from math import inf
+from typing import Any
 
-from utils.indicators import compute_ema, compute_rsi, compute_macd, compute_bollinger_bands
+from utils.indicators import compute_ema, compute_macd, compute_rsi
+
 try:
     from utils.ta_indicators import calculate_volume_surge as _calc_volume_surge
+
     _HAS_TA_INDICATORS = True
 except Exception:
     _HAS_TA_INDICATORS = False
     _calc_volume_surge = None
 try:
-    from utils.tuned_params import get_tuned_params as _get_tuned_params, get_symbol_volatility_class as _get_vol_class
+    from utils.tuned_params import get_tuned_params as _get_tuned_params
+
     _HAS_TUNED_PARAMS = True
 except Exception:
     _HAS_TUNED_PARAMS = False
@@ -31,12 +33,17 @@ except Exception:
 try:
     from utils.status_logger import log_component_status
 except Exception:
+
     def log_component_status(*args, **kwargs):
         return None
-from utils.shared_state_tools import inject_agent_signal, spread_bps as ss_spread_bps, min_notional as ss_min_notional
-from src.l5_strategy.model_manager import safe_load_model, save_model, build_model_path
-from src.l0_core.stubs import TradeIntent
+
+
 from agents.edge_calculator import compute_agent_edge
+from src.l0_core.stubs import TradeIntent
+from src.l5_strategy.model_manager import build_model_path, safe_load_model, save_model
+from utils.shared_state_tools import inject_agent_signal
+from utils.shared_state_tools import min_notional as ss_min_notional
+from utils.shared_state_tools import spread_bps as ss_spread_bps
 
 AGENT_NAME = "SwingTradeHunter"
 logger = logging.getLogger(AGENT_NAME)
@@ -46,7 +53,7 @@ logger.setLevel(logging.DEBUG)
 log_path = f"logs/agents/{AGENT_NAME.lower()}.log"
 os.makedirs(os.path.dirname(log_path), exist_ok=True)
 file_handler = logging.FileHandler(log_path)
-formatter = logging.Formatter('%(asctime)s [%(levelname)s] [%(name)s] %(message)s')
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
 file_handler.setFormatter(formatter)
 if not logger.hasHandlers():
     logger.addHandler(file_handler)
@@ -70,9 +77,9 @@ class SwingTradeHunter:
         tp_sl_engine=None,
         model_manager=None,
         symbols=None,
-        timeframe='1h',
+        timeframe="1h",
         name=AGENT_NAME,
-        **kwargs
+        **kwargs,
     ):
         self.shared_state = shared_state
         self.market_data = market_data
@@ -83,7 +90,7 @@ class SwingTradeHunter:
         self.name = name
         self.timeframe = timeframe
         # Signal collection buffer for AgentManager
-        self._collected_signals: List[Dict[str, Any]] = []
+        self._collected_signals: list[dict[str, Any]] = []
         self._collecting_for_agent_manager = False
 
         # Modified line: Use get_accepted_symbols() from shared_state
@@ -117,27 +124,34 @@ class SwingTradeHunter:
                 getattr(self.config, "AUTO_TRAIN", False),
             )
         self._auto_train_enabled = _as_bool(auto_train_raw)
-        self._retrain_inflight: Set[str] = set()
-        self._retrain_last_attempt_ts: Dict[str, float] = {}
-        self._retrain_last_failure_ts: Dict[str, float] = {}
-        self._retrain_last_success_ts: Dict[str, float] = {}
+        self._retrain_inflight: set[str] = set()
+        self._retrain_last_attempt_ts: dict[str, float] = {}
+        self._retrain_last_failure_ts: dict[str, float] = {}
+        self._retrain_last_success_ts: dict[str, float] = {}
 
         if tf is None:
-            logger.warning("[%s] TensorFlow unavailable; inference will use indicator-only path and retrain is disabled.", self.name)
+            logger.warning(
+                "[%s] TensorFlow unavailable; inference will use indicator-only path and retrain is disabled.",
+                self.name,
+            )
 
         # Pre-load models
         for symbol in self.symbols:
             path = build_model_path(self.name, symbol)
-            model = safe_load_model(path) # Use safe_load_model which handles exceptions
+            model = safe_load_model(path)  # Use safe_load_model which handles exceptions
             if model is None:
-                logger.warning(f"[{self.name}] ❌ No pre-trained model found for {symbol}. Will train on first retrain.")
-                self.model_cache[symbol] = None # Explicitly set to None if not found
+                logger.warning(
+                    f"[{self.name}] ❌ No pre-trained model found for {symbol}. Will train on first retrain."
+                )
+                self.model_cache[symbol] = None  # Explicitly set to None if not found
             else:
                 logger.info(f"[{self.name}] ✅ Loaded model for {symbol}")
                 self.model_cache[symbol] = model
 
         log_component_status(self.name, "Initialized")
-        logger.info(f"🚀 {self.name} initialized with {len(self.symbols)} symbols on {self.timeframe} timeframe.")
+        logger.info(
+            f"🚀 {self.name} initialized with {len(self.symbols)} symbols on {self.timeframe} timeframe."
+        )
 
     @staticmethod
     async def _await_maybe(coro):
@@ -150,48 +164,47 @@ class SwingTradeHunter:
         return getattr(self.config, key, default)
 
     # ---------- FIX #8 SYMBOL CONVERGENCE: CAPITAL GATING BY SYMBOL CLASSIFICATION ----------
-    
+
     def get_available_capital_for_symbol(self, symbol: str, total_capital: float) -> float:
         """
         Gate capital availability based on symbol classification.
-        
+
         FIX #8 - Symbol Convergence Capital Discipline
-        
+
         Uses existing 60/20/20 capital allocation:
         - 60% compounding pool (proven symbols get priority)
         - 20% healing pool (experimental symbols liquidated first during healing)
         - 20% emergency buffer (reserved)
-        
+
         Gating logic:
         - Proven symbols: eligible for compounding capital (60%)
         - Experimental symbols: restricted to healing pool only (20%)
         - Rejected symbols: no capital allocated
-        
+
         Note: Actual percentages managed by existing FIX8_*_ALLOCATION_PCT config
         """
         if self.shared_state is None:
             return total_capital  # Fallback: no gating
-        
-        proven_symbols = self.shared_state.symbol_convergence_state.get('proven_symbols', {})
+
+        proven_symbols = self.shared_state.symbol_convergence_state.get("proven_symbols", {})
         sym = symbol.upper().replace("/", "")
-        
+
         # Check if symbol is in exclusion list
         if self.shared_state.is_symbol_excluded(sym):
             return 0.0  # No capital for excluded symbols
-        
+
         # For proven symbols: eligible for compounding capital
         if sym in proven_symbols:
             # Proven symbol: can access compounding pool (60%)
-            compounding_pct = float(self._cfg('FIX8_COMPOUND_ALLOCATION_PCT', 0.60))
+            compounding_pct = float(self._cfg("FIX8_COMPOUND_ALLOCATION_PCT", 0.60))
             num_proven = max(1, len(proven_symbols))
             return total_capital * (compounding_pct / num_proven)
         else:
             # Experimental symbol: restricted to healing pool (20%)
             # Healing liquidations will prioritize these (Q1 Answer A)
-            healing_pct = float(self._cfg('FIX8_HEALING_ALLOCATION_PCT', 0.20))
-            max_experimental = self.shared_state.symbol_convergence_state.get('max_experimental', 2)
+            healing_pct = float(self._cfg("FIX8_HEALING_ALLOCATION_PCT", 0.20))
+            max_experimental = self.shared_state.symbol_convergence_state.get("max_experimental", 2)
             return total_capital * (healing_pct / max(1, max_experimental))
-
 
     def _round_trip_cost_pct(self) -> float:
         """Estimate round-trip friction as ratio (e.g., 0.0045 = 0.45%)."""
@@ -216,11 +229,24 @@ class SwingTradeHunter:
                 data = self.shared_state.get_market_data_sync(symbol, self.timeframe)
 
             if not data:
-                logger.debug("[%s] No market data available for %s/%s; using fallback expected move %.2f%%", self.name, symbol, self.timeframe, fallback_pct)
+                logger.debug(
+                    "[%s] No market data available for %s/%s; using fallback expected move %.2f%%",
+                    self.name,
+                    symbol,
+                    self.timeframe,
+                    fallback_pct,
+                )
 
             rows = self._normalize_ohlcv_rows(data)
             if len(rows) < 20:
-                logger.debug("[%s] Insufficient OHLCV rows for %s/%s: %d rows; using fallback %.2f%%", self.name, symbol, self.timeframe, len(rows), fallback_pct)
+                logger.debug(
+                    "[%s] Insufficient OHLCV rows for %s/%s: %d rows; using fallback %.2f%%",
+                    self.name,
+                    symbol,
+                    self.timeframe,
+                    len(rows),
+                    fallback_pct,
+                )
                 return fallback_pct
 
             closes = np.asarray([float(r.get("close", 0.0) or 0.0) for r in rows], dtype=float)
@@ -232,7 +258,7 @@ class SwingTradeHunter:
             close_now = float(closes[-1])
 
             # ATR-like volatility move
-            tr_vals: List[float] = []
+            tr_vals: list[float] = []
             for i in range(len(closes)):
                 prev_close = float(closes[i - 1]) if i > 0 else float(closes[i])
                 tr = max(
@@ -265,11 +291,22 @@ class SwingTradeHunter:
                             tp_pct,
                         )
             except Exception:
-                logger.debug("[%s] TP/SL calculation failed for %s: %s", self.name, symbol, traceback.format_exc(), exc_info=False)
+                logger.debug(
+                    "[%s] TP/SL calculation failed for %s: %s",
+                    self.name,
+                    symbol,
+                    traceback.format_exc(),
+                    exc_info=False,
+                )
                 tp_pct = 0.0
 
             if tp_pct <= 0.0:
-                logger.warning("[%s] TP calculation invalid for %s; falling back to ATR estimate (%.2f%% * 1.2)", self.name, symbol, atr_pct)
+                logger.warning(
+                    "[%s] TP calculation invalid for %s; falling back to ATR estimate (%.2f%% * 1.2)",
+                    self.name,
+                    symbol,
+                    atr_pct,
+                )
                 tp_pct = atr_pct * 1.2
 
             expected_move_pct = (0.65 * float(tp_pct)) + (0.35 * float(atr_pct))
@@ -277,7 +314,9 @@ class SwingTradeHunter:
             max_pct = float(self._cfg("SWING_EXPECTED_MOVE_MAX_PCT", 6.0) or 6.0)
             return max(min_pct, min(max_pct, float(expected_move_pct)))
         except Exception as e:
-            logger.debug("[%s] Expected move fallback for %s: %s", self.name, symbol, e, exc_info=True)
+            logger.debug(
+                "[%s] Expected move fallback for %s: %s", self.name, symbol, e, exc_info=True
+            )
             return fallback_pct
 
     async def _passes_local_buy_viability(
@@ -285,7 +324,7 @@ class SwingTradeHunter:
         symbol: str,
         quote_hint: float,
         expected_move_pct: float,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """Lightweight pre-publish viability guard for BUY signals."""
         try:
             quote = float(quote_hint or 0.0)
@@ -317,12 +356,12 @@ class SwingTradeHunter:
         except Exception:
             return True, "guard_error_allow"
 
-    def _normalize_ohlcv_rows(self, data: Any) -> List[Dict[str, float]]:
+    def _normalize_ohlcv_rows(self, data: Any) -> list[dict[str, float]]:
         """
         Normalize OHLCV into canonical dict rows with open/high/low/close/volume.
         Accepts both dict payloads and list/tuple klines.
         """
-        rows: List[Dict[str, float]] = []
+        rows: list[dict[str, float]] = []
         if not isinstance(data, list):
             return rows
 
@@ -369,13 +408,15 @@ class SwingTradeHunter:
 
         if not rows:
             return rows
-        dedup: Dict[float, Dict[str, float]] = {}
+        dedup: dict[float, dict[str, float]] = {}
         for r in rows:
             dedup[float(r["timestamp"])] = r
         return [dedup[k] for k in sorted(dedup.keys())]
 
-    async def _fetch_retrain_rows(self, symbol: str, min_rows: int, fetch_limit: int) -> List[Dict[str, float]]:
-        rows: List[Dict[str, float]] = []
+    async def _fetch_retrain_rows(
+        self, symbol: str, min_rows: int, fetch_limit: int
+    ) -> list[dict[str, float]]:
+        rows: list[dict[str, float]] = []
         get_md = getattr(self.shared_state, "get_market_data", None)
         if callable(get_md):
             try:
@@ -385,7 +426,11 @@ class SwingTradeHunter:
             except Exception:
                 rows = []
 
-        ec = getattr(self.execution_manager, "exchange_client", None) if self.execution_manager else None
+        ec = (
+            getattr(self.execution_manager, "exchange_client", None)
+            if self.execution_manager
+            else None
+        )
         if len(rows) < min_rows and ec and hasattr(ec, "get_klines"):
             try:
                 raw_klines = await ec.get_klines(symbol, self.timeframe, limit=int(fetch_limit))
@@ -408,11 +453,13 @@ class SwingTradeHunter:
                     ]
                     await self._await_maybe(set_md(symbol, self.timeframe, compact))
             except Exception as e:
-                logger.debug("[%s] Retrain backfill failed for %s: %s", self.name, symbol, e, exc_info=True)
+                logger.debug(
+                    "[%s] Retrain backfill failed for %s: %s", self.name, symbol, e, exc_info=True
+                )
 
         return rows
 
-    def _can_launch_retrain(self, symbol: str) -> Tuple[bool, str]:
+    def _can_launch_retrain(self, symbol: str) -> tuple[bool, str]:
         now_ts = time.time()
         cooldown_s = max(0.0, float(self._cfg("SWING_RETRAIN_COOLDOWN_S", 0.0) or 0.0))
         last_attempt = float(self._retrain_last_attempt_ts.get(symbol, 0.0) or 0.0)
@@ -428,7 +475,7 @@ class SwingTradeHunter:
 
         return True, "ok"
 
-    async def generate_signals(self) -> List[Dict[str, Any]]:
+    async def generate_signals(self) -> list[dict[str, Any]]:
         """
         Canonical strategy contract:
         - Generate and return signal payloads
@@ -446,17 +493,21 @@ class SwingTradeHunter:
         finally:
             self._collecting_for_agent_manager = False
 
-    async def _publish_trade_intent(self, payload: Dict[str, Any]) -> bool:
+    async def _publish_trade_intent(self, payload: dict[str, Any]) -> bool:
         # Debug breadcrumbs demoted from WARNING → DEBUG. Were emitting 6 WARNING lines
         # per publish (~12847 publishes/14min = 90 lines/sec → log flood → jetsam).
-        logger.debug(f"[{self.name}] ENTERING _publish_trade_intent with payload: symbol={payload.get('symbol')} side={payload.get('side')}")
+        logger.debug(
+            f"[{self.name}] ENTERING _publish_trade_intent with payload: symbol={payload.get('symbol')} side={payload.get('side')}"
+        )
         event_bus = getattr(self.shared_state, "event_bus", None)
         logger.debug(f"[{self.name}] event_bus={event_bus}")
         publish = getattr(event_bus, "publish", None) if event_bus else None
         logger.debug(f"[{self.name}] publish method={publish}")
         if callable(publish):
             try:
-                logger.debug(f"[{self.name}] Calling event_bus.publish('events.trade.intent', TradeIntent(...))")
+                logger.debug(
+                    f"[{self.name}] Calling event_bus.publish('events.trade.intent', TradeIntent(...))"
+                )
                 await publish("events.trade.intent", TradeIntent(**payload))
                 logger.info(
                     "[%s] Published TradeIntent: %s %s",
@@ -476,7 +527,7 @@ class SwingTradeHunter:
                 )
         else:
             logger.warning(f"[{self.name}] event_bus.publish is NOT callable, trying fallback")
-        
+
         emit_event = getattr(self.shared_state, "emit_event", None)
         logger.warning(f"[{self.name}] emit_event method={emit_event}")
         if callable(emit_event):
@@ -495,7 +546,7 @@ class SwingTradeHunter:
                 )
         else:
             logger.warning(f"[{self.name}] shared_state.emit_event is NOT callable")
-        
+
         logger.warning(f"[{self.name}] ❌ FAILED to publish TradeIntent - no method available")
         return False
 
@@ -511,7 +562,7 @@ class SwingTradeHunter:
                 accepted = await res if asyncio.iscoroutine(res) else (res or {})
             else:
                 accepted = {}
-            
+
             if not isinstance(accepted, dict):
                 snap = getattr(self.shared_state, "get_accepted_symbols_snapshot", None)
                 if callable(snap):
@@ -519,18 +570,23 @@ class SwingTradeHunter:
                     accepted = await r if asyncio.iscoroutine(r) else (r or {})
                 if not isinstance(accepted, dict):
                     accepted = {s: {} for s in (accepted or [])}
-            
+
             # ITERATION 2 FIX: If accepted_symbols empty, use DEFAULT_SYMBOLS as fallback
             if not accepted:
-                logger.warning(f"[{self.name}] ⚠️  accepted_symbols is empty! Using DEFAULT_SYMBOLS fallback...")
+                logger.warning(
+                    f"[{self.name}] ⚠️  accepted_symbols is empty! Using DEFAULT_SYMBOLS fallback..."
+                )
                 try:
                     from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
+
                     accepted = DEFAULT_SYMBOLS
-                    logger.debug(f"[{self.name}] ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
+                    logger.debug(
+                        f"[{self.name}] ✅ Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback"
+                    )
                 except Exception as e:
                     logger.error(f"[{self.name}] Failed to load DEFAULT_SYMBOLS fallback: {e}")
                     accepted = {}
-            
+
             new_symbols = list(accepted.keys())
             if new_symbols != self.symbols:
                 self.symbols = new_symbols
@@ -548,24 +604,28 @@ class SwingTradeHunter:
             # ✅ FIX: Do NOT wipe symbols on exception - keep existing ones
             # This prevents: error in loading → self.symbols=[] → loop over zero symbols
             if not self.symbols:
-                logger.warning(f"[{self.name}] No symbols available to trade; agent will be idle until symbols load")
+                logger.warning(
+                    f"[{self.name}] No symbols available to trade; agent will be idle until symbols load"
+                )
             # Removed: self.symbols = []
 
     async def run_once(self):
         # ✅ ATOMIC GUARD: Prevent concurrent run_once() calls
         # This stops scheduler re-entry and BTC duplicate processing
-        if hasattr(self, '_run_once_lock'):
+        if hasattr(self, "_run_once_lock"):
             if self._run_once_lock:
-                logger.warning(f"[{self.name}] run_once() already in progress, skipping concurrent invocation.")
+                logger.warning(
+                    f"[{self.name}] run_once() already in progress, skipping concurrent invocation."
+                )
                 return
         else:
             self._run_once_lock = False
-        
+
         self._run_once_lock = True
         try:
             logger.info(f"[{self.name}] Entering run_once loop (ATOMIC).")
             await self._load_symbols()
-            
+
             # ITERATION 1 FIX: Bypass market data ready check - symbols available, data flowing
             # try:
             #     if hasattr(self.shared_state, "is_market_data_ready"):
@@ -575,18 +635,20 @@ class SwingTradeHunter:
             #             return
             # except Exception:
             #     pass
-            
+
             if not self.symbols:
                 logger.info(f"[{self.name}] No symbols configured. Skipping.")
                 return
-            
+
             # ✅ CRITICAL: Iterate symbols as a snapshot to prevent re-entry issues
             symbols_to_process = list(self.symbols)
-            logger.debug(f"[{self.name}] Processing {len(symbols_to_process)} symbols: {symbols_to_process}")
-            
+            logger.debug(
+                f"[{self.name}] Processing {len(symbols_to_process)} symbols: {symbols_to_process}"
+            )
+
             for symbol in symbols_to_process:
                 await self._process_symbol(symbol)
-            
+
             logger.info(f"[{self.name}] Exiting run_once loop (ATOMIC COMPLETE).")
         finally:
             self._run_once_lock = False
@@ -613,7 +675,9 @@ class SwingTradeHunter:
                     except Exception:
                         self.model_cache[symbol] = None
         except Exception:
-            logger.debug("[%s] Failed to refresh symbols from SharedState", self.name, exc_info=True)
+            logger.debug(
+                "[%s] Failed to refresh symbols from SharedState", self.name, exc_info=True
+            )
 
     async def _process_symbol(self, symbol):
         logger.info(f"[{self.name}] Processing {symbol}")
@@ -621,53 +685,68 @@ class SwingTradeHunter:
         # ✅ Auto-train model if missing (NON-BLOCKING fire-and-forget)
         if self.model_cache.get(symbol) is None:
             if tf is None:
-                logger.debug("[%s] Model missing for %s; TensorFlow unavailable so using indicator-only mode.", self.name, symbol)
+                logger.debug(
+                    "[%s] Model missing for %s; TensorFlow unavailable so using indicator-only mode.",
+                    self.name,
+                    symbol,
+                )
             elif not self._auto_train_enabled:
                 logger.debug("[%s] Model missing for %s; AUTO_TRAIN disabled.", self.name, symbol)
             elif symbol in self._retrain_inflight:
-                logger.debug("[%s] Retrain already in-flight for %s; skipping duplicate launch.", self.name, symbol)
+                logger.debug(
+                    "[%s] Retrain already in-flight for %s; skipping duplicate launch.",
+                    self.name,
+                    symbol,
+                )
             else:
                 allowed, gate_reason = self._can_launch_retrain(symbol)
                 if not allowed:
-                    logger.debug("[%s] Retrain launch blocked for %s: %s", self.name, symbol, gate_reason)
+                    logger.debug(
+                        "[%s] Retrain launch blocked for %s: %s", self.name, symbol, gate_reason
+                    )
                     allowed = False
                 if not allowed:
                     pass
                 else:
                     self._retrain_last_attempt_ts[symbol] = time.time()
-                    logger.info(f"[{self.name}] 🧠 Auto-training missing model for {symbol}... (background)")
+                    logger.info(
+                        f"[{self.name}] 🧠 Auto-training missing model for {symbol}... (background)"
+                    )
                     self._retrain_inflight.add(symbol)
                     # Schedule training in background without blocking symbol iteration
                     asyncio.create_task(self._retrain_async_single(symbol))
-        
+
         # Generate signal (use cached model or indicators-only fallback)
         # ✅ FIX: Add timeout to prevent signal generation from blocking loop indefinitely
         try:
             action, confidence, reason = await asyncio.wait_for(
-                self._generate_signal(symbol),
-                timeout=5.0
+                self._generate_signal(symbol), timeout=5.0
             )
         except asyncio.TimeoutError:
             logger.error(f"[{self.name}] ⏱️ Signal generation TIMEOUT for {symbol} (>5s)")
-            action, confidence, reason = 'hold', 0.0, 'Signal generation timeout'
+            action, confidence, reason = "hold", 0.0, "Signal generation timeout"
         except Exception as e:
-            logger.error(f"[{self.name}] ❌ Signal generation failed for {symbol}: {e}", exc_info=True)
-            action, confidence, reason = 'hold', 0.0, f'Error: {str(e)}'
+            logger.error(
+                f"[{self.name}] ❌ Signal generation failed for {symbol}: {e}", exc_info=True
+            )
+            action, confidence, reason = "hold", 0.0, f"Error: {e!s}"
         signal = {
             "source": self.name,
             "action": action,
             "confidence": confidence,
             "reason": reason,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
         }
 
         # Inject signal for tracing
         await inject_agent_signal(self.shared_state, self.name, symbol, signal)
 
         # Signal-only routing: actionable signals go to signal bus + collection buffer.
-        min_conf = float(getattr(self.config, 'SWING_MIN_CONFIDENCE', 0.35) or 0.35)
-        if action in ['buy', 'sell'] and confidence > min_conf:
-            logger.info(f"[{self.name}] ✅ SIGNAL ACTIONABLE: {symbol} action={action} conf={confidence:.2f} > min={min_conf:.2f}")
+        min_conf = float(getattr(self.config, "SWING_MIN_CONFIDENCE", 0.35) or 0.35)
+        if action in ["buy", "sell"] and confidence > min_conf:
+            logger.info(
+                f"[{self.name}] ✅ SIGNAL ACTIONABLE: {symbol} action={action} conf={confidence:.2f} > min={min_conf:.2f}"
+            )
             await self._submit_signal(symbol, action.upper(), float(confidence), str(reason))
         else:
             logger.warning(
@@ -684,17 +763,15 @@ class SwingTradeHunter:
         try:
             fn = getattr(self.shared_state, "update_system_health", None)
             if callable(fn):
-                res = fn(
-                    self.name,
-                    'Operational',
-                    f"Last signal: {action} ({confidence:.2f})"
-                )
+                res = fn(self.name, "Operational", f"Last signal: {action} ({confidence:.2f})")
                 if asyncio.iscoroutine(res):
                     await res
         except Exception:
             pass  # Non-fatal; ignore if method not available
 
-    async def _submit_signal(self, symbol: str, action: str, confidence: float, reason: str) -> None:
+    async def _submit_signal(
+        self, symbol: str, action: str, confidence: float, reason: str
+    ) -> None:
         logger.debug(f"[{self.name}] ENTERING _submit_signal: {symbol} {action} conf={confidence}")
         action_u = str(action or "").upper().strip()
         if action_u not in {"BUY", "SELL"}:
@@ -708,7 +785,12 @@ class SwingTradeHunter:
                     res = get_qty(symbol)
                     pos_qty = await res if asyncio.iscoroutine(res) else float(res or 0.0)
                     if pos_qty <= 0:
-                        logger.warning("[%s] Skip SELL for %s — no position (qty=%.8f).", self.name, symbol, pos_qty)
+                        logger.warning(
+                            "[%s] Skip SELL for %s — no position (qty=%.8f).",
+                            self.name,
+                            symbol,
+                            pos_qty,
+                        )
                         return
             except Exception as e:
                 logger.warning(f"[{self.name}] Failed to check position qty for {symbol}: {e}")
@@ -720,7 +802,11 @@ class SwingTradeHunter:
                     getattr(
                         self.config,
                         "EMIT_BUY_QUOTE",
-                        getattr(self.config, "MIN_ENTRY_USDT", getattr(self.config, "DEFAULT_PLANNED_QUOTE", 10.0)),
+                        getattr(
+                            self.config,
+                            "MIN_ENTRY_USDT",
+                            getattr(self.config, "DEFAULT_PLANNED_QUOTE", 10.0),
+                        ),
                     )
                     or 10.0
                 )
@@ -819,31 +905,37 @@ class SwingTradeHunter:
             md_ready_event = getattr(self.shared_state, "market_data_ready_event", None)
             if md_ready_event and hasattr(md_ready_event, "is_set"):
                 if not md_ready_event.is_set():
-                    logger.warning(f"[{self.name}] Market data ready event not set for {symbol}. Returning hold.")
-                    return 'hold', 0.0, 'Market data not ready'
+                    logger.warning(
+                        f"[{self.name}] Market data ready event not set for {symbol}. Returning hold."
+                    )
+                    return "hold", 0.0, "Market data not ready"
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to check market data ready: {e}")
             pass
-        
+
         # Fetch market data (first try cache, then fallback to exchange)
         logger.warning(f"[{self.name}] Fetching market data for {symbol} on {self.timeframe}")
-        
+
         # Step 1: Try to get from cache
         data = None
         if hasattr(self.market_data, "get_market_data_sync"):
             data = self.market_data.get_market_data_sync(symbol, self.timeframe)
         elif hasattr(self.market_data, "get_market_data"):
             data = await self.market_data.get_market_data(symbol, self.timeframe)
-        
+
         # Step 2: If cache empty, try to fetch from SharedState directly
         if not data and hasattr(self.shared_state, "get_market_data_sync"):
             data = self.shared_state.get_market_data_sync(symbol, self.timeframe)
-        
+
         # Step 3: If still empty, fetch directly from exchange
         if not data:
-            logger.warning(f"[{self.name}] Cache empty for {symbol} {self.timeframe}, fetching from exchange...")
+            logger.warning(
+                f"[{self.name}] Cache empty for {symbol} {self.timeframe}, fetching from exchange..."
+            )
             try:
-                if hasattr(self, 'execution_manager') and hasattr(self.execution_manager, 'exchange_client'):
+                if hasattr(self, "execution_manager") and hasattr(
+                    self.execution_manager, "exchange_client"
+                ):
                     ec = self.execution_manager.exchange_client
                     fetch_limit = max(100, int(self._cfg("SWING_SIGNAL_FETCH_LIMIT", 300) or 300))
                     # Fetch raw klines and convert to OHLCV format
@@ -860,7 +952,9 @@ class SwingTradeHunter:
                             }
                             for kline in raw_klines
                         ]
-                        logger.warning(f"[{self.name}] Fetched {len(data)} candles from exchange for {symbol}")
+                        logger.warning(
+                            f"[{self.name}] Fetched {len(data)} candles from exchange for {symbol}"
+                        )
                         set_md = getattr(self.shared_state, "set_market_data", None)
                         if callable(set_md):
                             compact_rows = [
@@ -878,12 +972,14 @@ class SwingTradeHunter:
             except Exception as e:
                 logger.warning(f"[{self.name}] Failed to fetch from exchange: {e}")
                 data = None
-        
+
         logger.warning(f"[{self.name}] Got {len(data) if data else 0} candles for {symbol}")
         rows = self._normalize_ohlcv_rows(data)
         if not rows or len(rows) < 50:
-            logger.warning(f"[{self.name}] Insufficient data for {symbol}: {len(rows) if rows else 0} < 50")
-            return 'hold', 0.0, 'Insufficient data'
+            logger.warning(
+                f"[{self.name}] Insufficient data for {symbol}: {len(rows) if rows else 0} < 50"
+            )
+            return "hold", 0.0, "Insufficient data"
 
         # --- Fix 2: Placeholder for skipping inference if no model is loaded ---
         # If you decide to use the trained model for signal generation,
@@ -894,42 +990,44 @@ class SwingTradeHunter:
         #     return 'hold', 0.0, 'No model for inference'
         # --- End Fix 2 placeholder ---
 
-        closes = np.array([r['close'] for r in rows], dtype=float)
+        closes = np.array([r["close"] for r in rows], dtype=float)
         ema20 = compute_ema(closes, 20)
         ema50 = compute_ema(closes, 50)
         rsi = compute_rsi(closes, 14)
         macd_line, signal_line, hist = compute_macd(closes)
-        
+
         # Validate indicators have values - handle both Series and ndarray
         try:
-            ema20_len = len(ema20) if hasattr(ema20, '__len__') else 0
-            ema50_len = len(ema50) if hasattr(ema50, '__len__') else 0
-            rsi_len = len(rsi) if hasattr(rsi, '__len__') else 0
-            hist_len = len(hist) if hasattr(hist, '__len__') else 0
-            
+            ema20_len = len(ema20) if hasattr(ema20, "__len__") else 0
+            ema50_len = len(ema50) if hasattr(ema50, "__len__") else 0
+            rsi_len = len(rsi) if hasattr(rsi, "__len__") else 0
+            hist_len = len(hist) if hasattr(hist, "__len__") else 0
+
             if ema20_len == 0 or ema50_len == 0 or rsi_len == 0 or hist_len == 0:
                 logger.warning(f"[{self.name}] {symbol}: insufficient indicator data - skipping")
-                return 'hold', 0.0, 'Insufficient indicator data'
+                return "hold", 0.0, "Insufficient indicator data"
         except:
             logger.warning(f"[{self.name}] {symbol}: error validating indicators")
-            return 'hold', 0.0, 'Indicator validation error'
-        
+            return "hold", 0.0, "Indicator validation error"
+
         # Safe access with bounds checking
         try:
-            ema20_val = float(ema20.iloc[-1]) if hasattr(ema20, 'iloc') else float(ema20[-1])
-            ema50_val = float(ema50.iloc[-1]) if hasattr(ema50, 'iloc') else float(ema50[-1])
-            rsi_val = float(rsi.iloc[-1]) if hasattr(rsi, 'iloc') else float(rsi[-1])
-            hist_val = float(hist.iloc[-1]) if hasattr(hist, 'iloc') else float(hist[-1])
+            ema20_val = float(ema20.iloc[-1]) if hasattr(ema20, "iloc") else float(ema20[-1])
+            ema50_val = float(ema50.iloc[-1]) if hasattr(ema50, "iloc") else float(ema50[-1])
+            rsi_val = float(rsi.iloc[-1]) if hasattr(rsi, "iloc") else float(rsi[-1])
+            hist_val = float(hist.iloc[-1]) if hasattr(hist, "iloc") else float(hist[-1])
         except (IndexError, KeyError, ValueError, AttributeError) as e:
             logger.warning(f"[{self.name}] {symbol}: error accessing indicator values: {e}")
-            return 'hold', 0.0, 'Cannot access indicators'
-        
-        logger.warning(f"[{self.name}] {symbol} indicators: ema20={ema20_val:.4f} ema50={ema50_val:.4f} rsi={rsi_val:.2f} macd_hist={hist_val:.6f}")
-        
+            return "hold", 0.0, "Cannot access indicators"
+
+        logger.warning(
+            f"[{self.name}] {symbol} indicators: ema20={ema20_val:.4f} ema50={ema50_val:.4f} rsi={rsi_val:.2f} macd_hist={hist_val:.6f}"
+        )
+
         # RELAXED SIGNAL CRITERIA: Temporarily lowered thresholds to generate signals during testing
         # Original: EMA20 > EMA50 AND MACD > 0 AND RSI < 70
         # Relaxed: EMA20 > EMA50 AND RSI < 75 (removed MACD check - sometimes conflicting with price)
-        
+
         # --- Tuned params override (symbol-specific thresholds) ---
         rsi_buy_thresh = 60.0
         rsi_sell_thresh = 40.0
@@ -956,15 +1054,19 @@ class SwingTradeHunter:
 
         if ema20_val > ema50_val and rsi_val < rsi_buy_thresh and vol_confirmed:
             conf = base_confidence + (0.05 if vol_confirmed else 0.0)
-            reason = 'EMA uptrend + volume surge' if vol_confirmed else 'EMA uptrend detected'
-            logger.debug(f"[{self.name}] ✅ BUY SIGNAL for {symbol}: {reason} (ema20>{ema50_val:.4f} rsi={rsi_val:.2f} vol_ok={vol_confirmed})")
-            return 'buy', round(conf, 4), reason
+            reason = "EMA uptrend + volume surge" if vol_confirmed else "EMA uptrend detected"
+            logger.debug(
+                f"[{self.name}] ✅ BUY SIGNAL for {symbol}: {reason} (ema20>{ema50_val:.4f} rsi={rsi_val:.2f} vol_ok={vol_confirmed})"
+            )
+            return "buy", round(conf, 4), reason
         if ema20_val < ema50_val and rsi_val > rsi_sell_thresh:
-            logger.debug(f"[{self.name}] ✅ SELL SIGNAL for {symbol}: EMA downtrend + RSI unfavorable (EMA20 < EMA50, RSI > {rsi_sell_thresh})")
-            return 'sell', base_confidence, 'EMA downtrend detected'
+            logger.debug(
+                f"[{self.name}] ✅ SELL SIGNAL for {symbol}: EMA downtrend + RSI unfavorable (EMA20 < EMA50, RSI > {rsi_sell_thresh})"
+            )
+            return "sell", base_confidence, "EMA downtrend detected"
 
         logger.warning(f"[{self.name}] ❌ HOLD for {symbol}: no clear signal")
-        return 'hold', 0.0, 'No clear signal'
+        return "hold", 0.0, "No clear signal"
 
     async def _retrain_async_single(self, symbol: str):
         """
@@ -975,19 +1077,25 @@ class SwingTradeHunter:
         if tf is None:
             logger.warning("[%s] Retrain skipped: TensorFlow unavailable.", self.name)
             return
-        
+
         if not symbol:
             logger.warning("[%s] Retrain skipped: no symbol specified.", self.name)
             return
-        
+
         logger.info(f"[{self.name}] 🧠 Background retrain started for {symbol}")
         loop = asyncio.get_event_loop()
-        
+
         try:
-            lookback = int(self._cfg("SWING_RETRAIN_LOOKBACK", self._cfg("RETRAIN_LOOKBACK", 100)) or 100)
+            lookback = int(
+                self._cfg("SWING_RETRAIN_LOOKBACK", self._cfg("RETRAIN_LOOKBACK", 100)) or 100
+            )
             min_rows = max(lookback + 50, int(self._cfg("SWING_RETRAIN_MIN_BARS", 180) or 180))
-            fetch_limit = max(min_rows + 50, int(self._cfg("SWING_RETRAIN_FETCH_LIMIT", 600) or 600))
-            rows = await self._fetch_retrain_rows(symbol, min_rows=min_rows, fetch_limit=fetch_limit)
+            fetch_limit = max(
+                min_rows + 50, int(self._cfg("SWING_RETRAIN_FETCH_LIMIT", 600) or 600)
+            )
+            rows = await self._fetch_retrain_rows(
+                symbol, min_rows=min_rows, fetch_limit=fetch_limit
+            )
 
             # Run the blocking retrain in executor (non-blocking to main loop)
             result = await loop.run_in_executor(None, self._retrain_blocking, symbol, rows)
@@ -999,17 +1107,21 @@ class SwingTradeHunter:
             else:
                 self._retrain_last_failure_ts[symbol] = time.time()
                 reason = result.get("reason") if isinstance(result, dict) else "train_failed"
-                logger.warning(f"[{self.name}] ⚠️ Background retrain did not complete for {symbol} (reason={reason})")
+                logger.warning(
+                    f"[{self.name}] ⚠️ Background retrain did not complete for {symbol} (reason={reason})"
+                )
         except Exception as e:
             self._retrain_last_failure_ts[symbol] = time.time()
-            logger.error(f"[{self.name}] Background retrain failed for {symbol}: {e}", exc_info=True)
+            logger.error(
+                f"[{self.name}] Background retrain failed for {symbol}: {e}", exc_info=True
+            )
         finally:
             self._retrain_inflight.discard(symbol)
 
     async def _retrain_async(self, symbol=None):
         """
         Async wrapper for model retraining (BLOCKING variant for explicit waits).
-        
+
         ⚠️ DEPRECATED for per-symbol calls - use _retrain_async_single() instead.
         This awaits ALL retraining to complete before returning.
         Runs blocking training in executor to avoid blocking event loop.
@@ -1017,10 +1129,10 @@ class SwingTradeHunter:
         if tf is None:
             logger.warning("[%s] Retrain skipped: TensorFlow unavailable.", self.name)
             return
-        
+
         symbols = [symbol] if symbol else self.symbols
         loop = asyncio.get_event_loop()
-        
+
         for sym in symbols:
             try:
                 # Run the blocking retrain in executor
@@ -1036,7 +1148,7 @@ class SwingTradeHunter:
         if tf is None:
             logger.warning("[%s] Retrain skipped: TensorFlow unavailable.", self.name)
             return {"ok": False, "reason": "tensorflow_unavailable"}
-        
+
         try:
             # Use pre-fetched async rows when available, else fall back to sync cache.
             if data is None:
@@ -1045,27 +1157,36 @@ class SwingTradeHunter:
             else:
                 data = self._normalize_ohlcv_rows(data)
 
-            lookback = int(self._cfg("SWING_RETRAIN_LOOKBACK", self._cfg("RETRAIN_LOOKBACK", 100)) or 100)
+            lookback = int(
+                self._cfg("SWING_RETRAIN_LOOKBACK", self._cfg("RETRAIN_LOOKBACK", 100)) or 100
+            )
             min_rows = max(lookback + 50, int(self._cfg("SWING_RETRAIN_MIN_BARS", 180) or 180))
             if not data or len(data) < min_rows:
-                logger.warning("Cannot retrain %s: insufficient data (rows=%d need>=%d).", symbol, len(data or []), min_rows)
+                logger.warning(
+                    "Cannot retrain %s: insufficient data (rows=%d need>=%d).",
+                    symbol,
+                    len(data or []),
+                    min_rows,
+                )
                 return {"ok": False, "reason": "insufficient_data", "rows": int(len(data or []))}
-            
+
             # Prepare data X,y similar to MLForecaster
             max_rows = max(min_rows, int(self._cfg("SWING_RETRAIN_MAX_ROWS", 1200) or 1200))
             data = data[-max_rows:]
             X, y = [], []
             for i in range(lookback, len(data)):
-                window = data[i-lookback:i]
-                X.append([[c['open'], c['high'], c['low'], c['close'], c['volume']] for c in window])
-                future = data[i]['close']
-                current = window[-1]['close']
+                window = data[i - lookback : i]
+                X.append(
+                    [[c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in window]
+                )
+                future = data[i]["close"]
+                current = window[-1]["close"]
                 if future > current:
-                    y.append([1,0,0])
+                    y.append([1, 0, 0])
                 elif future < current:
-                    y.append([0,1,0])
+                    y.append([0, 1, 0])
                 else:
-                    y.append([0,0,1])
+                    y.append([0, 0, 1])
 
             min_samples = max(32, int(self._cfg("SWING_RETRAIN_MIN_SAMPLES", 64) or 64))
             if len(X) < min_samples:
@@ -1077,29 +1198,31 @@ class SwingTradeHunter:
                     min_samples,
                 )
                 return {"ok": False, "reason": "insufficient_samples", "samples": int(len(X))}
-            
+
             X = np.array(X)
             y = np.array(y)
-            
+
             # Build and train model
-            model = tf.keras.Sequential([
-                tf.keras.layers.Input(shape=(lookback, 5)),
-                tf.keras.layers.LSTM(50),
-                tf.keras.layers.Dense(3, activation='softmax')
-            ])
-            model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+            model = tf.keras.Sequential(
+                [
+                    tf.keras.layers.Input(shape=(lookback, 5)),
+                    tf.keras.layers.LSTM(50),
+                    tf.keras.layers.Dense(3, activation="softmax"),
+                ]
+            )
+            model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
             epochs = max(1, int(self._cfg("SWING_RETRAIN_EPOCHS", 5) or 5))
             batch_size = max(8, int(self._cfg("SWING_RETRAIN_BATCH_SIZE", 32) or 32))
             fit_kwargs = {"epochs": epochs, "batch_size": batch_size, "verbose": 0}
             if len(X) >= 100:
                 fit_kwargs["validation_split"] = 0.1
             model.fit(X, y, **fit_kwargs)
-            
+
             # Save model
             path = build_model_path(self.name, symbol)
             save_model(model, path)
             self.model_cache[symbol] = model
-            logger.info(f"✅ [%s] Retrained and saved model for %s at %s", self.name, symbol, path)
+            logger.info("✅ [%s] Retrained and saved model for %s at %s", self.name, symbol, path)
             return {"ok": True, "reason": "trained", "rows": int(len(data)), "samples": int(len(X))}
         except Exception as e:
             logger.error(f"[{self.name}] Blocking retrain failed for {symbol}: {e}", exc_info=True)
@@ -1108,7 +1231,7 @@ class SwingTradeHunter:
     def retrain(self, symbol=None):
         """
         Synchronous retrain method (for backward compatibility).
-        
+
         ⚠️ WARNING: This blocks the event loop!
         Use _retrain_async() instead when in async context.
         """

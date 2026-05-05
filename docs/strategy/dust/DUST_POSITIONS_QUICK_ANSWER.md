@@ -7,7 +7,7 @@
 ### The Issue in 3 Steps
 
 1. **MetaController approves:** "Buy with $20 minimum" ✅
-2. **ExecutionManager executes:** Places order for ~0.0033 BTC ✅  
+2. **ExecutionManager executes:** Places order for ~0.0033 BTC ✅
 3. **Fill arrives:** "0.0033 BTC × $42,000 = $14.70" ❌ **BELOW $20 = DUST**
 
 ---
@@ -33,7 +33,7 @@ async def record_fill(self, symbol, side, qty, price, ...):
     # Calculate position value AFTER fill
     position_value = qty * price
     significant_floor = 20.0  # From config
-    
+
     # If value < $20 = DUST (TOO LATE - position already created!)
     if position_value < significant_floor:
         mark_as_dust(symbol)  # ← Dust created here, after execution

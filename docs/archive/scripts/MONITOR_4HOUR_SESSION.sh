@@ -39,33 +39,33 @@ generate_checkpoint_report() {
     local remaining_seconds=$((SESSION_DURATION_SECONDS - elapsed_seconds))
     local remaining_minutes=$((remaining_seconds / 60))
     local remaining_hours=$((remaining_minutes / 60))
-    
+
     local checkpoint_file="$WORKSPACE/SESSION_4H_CHECKPOINT_${checkpoint_num}.md"
     local current_time=$(date "+%Y-%m-%d %H:%M:%S")
-    
+
     echo "📊 CHECKPOINT #$checkpoint_num - $current_time"
     echo "=========================================="
     echo ""
-    
+
     # Get last trades
     local trades=$(tail -300 "$LOG_FILE" 2>/dev/null | grep -E "TRADE EXECUTED|POSITION_OPENED|POSITION_CLOSED" | tail -10)
-    
+
     # Get current balance
     local balance=$(tail -100 "$LOG_FILE" 2>/dev/null | grep "balance\|NAV" | tail -1)
-    
+
     # Get rejection counts
     local win_rate_rejections=$(grep "MICRO_BACKTEST_WIN_RATE_BELOW_THRESHOLD" "$LOG_FILE" 2>/dev/null | wc -l)
     local capital_rejections=$(grep "NET_USDT_BELOW_THRESHOLD" "$LOG_FILE" 2>/dev/null | wc -l)
-    
+
     # Get active symbols
     local active_symbols=$(tail -200 "$LOG_FILE" 2>/dev/null | grep -E "confidence.*\[0-9\]" | sed 's/.*symbol=//' | sed 's/ .*//' | sort | uniq | head -15)
-    
+
     cat > "$checkpoint_file" << EOF
 # 🎯 4-HOUR SESSION CHECKPOINT #$checkpoint_num
 
-**Checkpoint Time**: $current_time  
-**Session Elapsed**: ${elapsed_hours}h ${elapsed_minutes}m ${elapsed_seconds}s  
-**Session Remaining**: ${remaining_hours}h ${remaining_minutes}m ${remaining_seconds}s  
+**Checkpoint Time**: $current_time
+**Session Elapsed**: ${elapsed_hours}h ${elapsed_minutes}m ${elapsed_seconds}s
+**Session Remaining**: ${remaining_hours}h ${remaining_minutes}m ${remaining_seconds}s
 **Total Progress**: $((elapsed_seconds * 100 / SESSION_DURATION_SECONDS))%
 
 ---
@@ -111,7 +111,7 @@ $trades
 
 ## Next Checkpoint
 
-**Next Checkpoint**: In $CHECKPOINT_INTERVAL_MINUTES minutes  
+**Next Checkpoint**: In $CHECKPOINT_INTERVAL_MINUTES minutes
 **Expected Time**: $(date -u -d "+$CHECKPOINT_INTERVAL_SECONDS seconds" "+%Y-%m-%d %H:%M:%S")
 
 ---
@@ -124,7 +124,7 @@ $trades
 - Monitoring active and reports updating every 30 minutes
 
 EOF
-    
+
     echo "✅ Checkpoint report saved: $checkpoint_file"
 }
 
@@ -132,7 +132,7 @@ EOF
 while true; do
     current_time=$(date +%s)
     elapsed=$((current_time - SESSION_START_TIME))
-    
+
     # Check if session duration exceeded
     if [ $elapsed -ge $SESSION_DURATION_SECONDS ]; then
         echo ""
@@ -140,15 +140,15 @@ while true; do
         echo "===================="
         echo "Session ended after $SESSION_DURATION_HOURS hours"
         echo "Total elapsed: $((elapsed / 3600))h $((elapsed % 3600 / 60))m"
-        
+
         # Generate final report
         generate_checkpoint_report $MAX_CHECKPOINTS $elapsed
-        
+
         echo ""
         echo "Final checkpoint report saved!"
         break
     fi
-    
+
     # Generate checkpoint reports every CHECKPOINT_INTERVAL_SECONDS
     if [ $((elapsed % CHECKPOINT_INTERVAL_SECONDS)) -lt 5 ] && [ $CHECKPOINT_COUNT -eq 0 ]; then
         CHECKPOINT_COUNT=1
@@ -159,7 +159,7 @@ while true; do
     elif [ $((elapsed % CHECKPOINT_INTERVAL_SECONDS)) -ge 5 ]; then
         CHECKPOINT_COUNT=0
     fi
-    
+
     # Sleep for 1 minute between checks
     sleep 60
 done

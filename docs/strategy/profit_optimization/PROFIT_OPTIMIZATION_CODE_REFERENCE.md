@@ -39,46 +39,46 @@ def _calculate_optimal_position_size(self, symbol: str, confidence: float, avail
     - Available capital
     - Symbol volatility
     - Current portfolio concentration
-    
+
     Args:
         symbol: Trading symbol
         confidence: Signal confidence (0.0-1.0)
         available_capital: Free capital available for this trade
-        
+
     Returns:
         Position size in quote asset
     """
     # Base allocation: higher confidence = larger position
     base_allocation = available_capital * 0.02  # Start with 2% base
-    
+
     # Confidence multiplier (0.5x to 2.0x)
     confidence_mult = 0.5 + (confidence * 1.5)  # Maps 0.0→0.5x, 1.0→2.0x
-    
+
     # Portfolio concentration check (diversification)
     current_positions = len(self.open_trades) if hasattr(self, 'open_trades') else 0
     max_positions = self._get_max_positions()
-    
+
     # Reduce position if concentrated in few symbols
     if current_positions > 0:
         concentration = 1.0 / max(1, current_positions)
         concentration_mult = concentration * 1.2  # Slightly favor fewer positions
     else:
         concentration_mult = 1.0
-    
+
     # Final position size
     position_size = base_allocation * confidence_mult * concentration_mult
-    
+
     # Safety caps
     position_size = min(position_size, available_capital * 0.15)  # Max 15% per trade
     position_size = max(position_size, available_capital * 0.005)  # Min 0.5%
-    
+
     self.logger.debug(
         "[ProfitOpt:Sizing] symbol=%s, confidence=%.2f, capital_free=%.2f, "
         "position_size=%.2f (confidence_mult=%.2fx, concentration_mult=%.2fx)",
         symbol, confidence, available_capital, position_size,
         confidence_mult, concentration_mult
     )
-    
+
     return position_size
 
 def _calculate_dynamic_take_profit(self, symbol: str, entry_price: float, entry_confidence: float) -> float:
@@ -87,35 +87,35 @@ def _calculate_dynamic_take_profit(self, symbol: str, entry_price: float, entry_
     - Entry confidence (higher confidence = tighter TP)
     - Symbol characteristics
     - Current volatility
-    
+
     Args:
         symbol: Trading symbol
         entry_price: Entry execution price
         entry_confidence: Signal confidence at entry
-        
+
     Returns:
         Take-profit price (in quote currency)
     """
     # Base TP: 0.3% for high confidence, 0.5% for medium
     base_tp_pct = 0.003 if entry_confidence > 0.7 else 0.005
-    
+
     # Volatility adjustment (if available)
     volatility_mult = 1.0  # Default: no adjustment
-    
+
     # Symbol-specific adjustments
     if symbol in ["BTCUSDT", "ETHUSDT"]:
         base_tp_pct *= 0.8  # Slightly tighter for major coins
     elif symbol.endswith("USDT") and not symbol.startswith("BTC") and not symbol.startswith("ETH"):
         base_tp_pct *= 1.2  # Slightly looser for altcoins
-    
+
     tp_price = entry_price * (1.0 + base_tp_pct * volatility_mult)
-    
+
     self.logger.debug(
         "[ProfitOpt:TP] symbol=%s, entry=%.8f, confidence=%.2f, "
         "tp_price=%.8f, tp_pct=%.4f%%",
         symbol, entry_price, entry_confidence, tp_price, base_tp_pct * 100
     )
-    
+
     return tp_price
 
 def _calculate_dynamic_stop_loss(self, symbol: str, entry_price: float, entry_confidence: float) -> float:
@@ -124,52 +124,52 @@ def _calculate_dynamic_stop_loss(self, symbol: str, entry_price: float, entry_co
     - Entry confidence (higher confidence = looser SL)
     - Risk management rules
     - Position size
-    
+
     Args:
         symbol: Trading symbol
         entry_price: Entry execution price
         entry_confidence: Signal confidence at entry
-        
+
     Returns:
         Stop-loss price (in quote currency)
     """
     # Base SL: 0.5% for high confidence, 1.0% for medium
     base_sl_pct = 0.005 if entry_confidence > 0.7 else 0.010
-    
+
     # Tighten SL if many positions held (risk management)
     current_positions = len(self.open_trades) if hasattr(self, 'open_trades') else 0
     if current_positions > 3:
         base_sl_pct *= 0.7  # 30% tighter if portfolio getting large
-    
+
     sl_price = entry_price * (1.0 - base_sl_pct)
-    
+
     self.logger.debug(
         "[ProfitOpt:SL] symbol=%s, entry=%.8f, confidence=%.2f, "
         "sl_price=%.8f, sl_pct=%.4f%%",
         symbol, entry_price, entry_confidence, sl_price, base_sl_pct * 100
     )
-    
+
     return sl_price
 
 def _should_scale_position(self, symbol: str, entry_price: float, current_price: float, entry_confidence: float) -> bool:
     """
     Determine if position should be scaled (add to winning trade)
-    
+
     Args:
         symbol: Trading symbol
         entry_price: Entry price
         current_price: Current market price
         entry_confidence: Original signal confidence
-        
+
     Returns:
         True if should add to position
     """
     if entry_price <= 0:
         return False
-    
+
     # Only scale winners that are up 0.2% or more
     pnl_pct = (current_price - entry_price) / entry_price
-    
+
     # Scale if:
     # 1. Position is in profit
     # 2. High confidence signal
@@ -179,33 +179,33 @@ def _should_scale_position(self, symbol: str, entry_price: float, current_price:
         entry_confidence > 0.75 and
         len(self.open_trades) < self._get_max_positions() * 0.8
     )
-    
+
     self.logger.debug(
         "[ProfitOpt:Scale] symbol=%s, entry=%.8f, current=%.8f, "
         "pnl_pct=%.4f%%, should_scale=%s",
         symbol, entry_price, current_price, pnl_pct * 100, should_scale
     )
-    
+
     return should_scale
 
 def _should_take_partial_profit(self, symbol: str, entry_price: float, current_price: float, position_age_seconds: float) -> bool:
     """
     Determine if should take partial profit on winning position
-    
+
     Args:
         symbol: Trading symbol
         entry_price: Entry price
         current_price: Current market price
         position_age_seconds: How long position has been open
-        
+
     Returns:
         True if should take partial profit
     """
     if entry_price <= 0:
         return False
-    
+
     pnl_pct = (current_price - entry_price) / entry_price
-    
+
     # Take profit if:
     # 1. Position up 0.5% or more
     # 2. Position older than 30 seconds
@@ -213,13 +213,13 @@ def _should_take_partial_profit(self, symbol: str, entry_price: float, current_p
         pnl_pct > 0.005 and  # 0.5% profit
         position_age_seconds > 30
     )
-    
+
     self.logger.debug(
         "[ProfitOpt:PartialTP] symbol=%s, entry=%.8f, current=%.8f, "
         "pnl_pct=%.4f%%, age=%.1fs, should_take_profit=%s",
         symbol, entry_price, current_price, pnl_pct * 100, position_age_seconds, should_take_profit
     )
-    
+
     return should_take_profit
 ```
 
@@ -295,6 +295,6 @@ All integration points are identified and documented in:
 
 ---
 
-**Code Status**: ✅ **COMPLETE & VALIDATED**  
-**Deployment Status**: 🟢 **READY**  
+**Code Status**: ✅ **COMPLETE & VALIDATED**
+**Deployment Status**: 🟢 **READY**
 **Integration Status**: 📝 **DOCUMENTED & PLANNED**

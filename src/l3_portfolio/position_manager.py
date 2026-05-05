@@ -9,9 +9,9 @@
 import asyncio
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
-from src.l0_core.stubs import maybe_await, maybe_call  # safe sync/async invocation
+from src.l0_core.stubs import maybe_call  # safe sync/async invocation
 
 logger = logging.getLogger("PositionManager")
 
@@ -95,7 +95,7 @@ class PositionManager:
         for sym in vanished:
             bulk[sym] = {
                 "symbol": sym,
-                "quantity": 0.0, # Modified to use "quantity"
+                "quantity": 0.0,  # Modified to use "quantity"
                 "side": "LONG",
                 "avg_price": None,
                 "entry_ts": None,
@@ -142,7 +142,9 @@ class PositionManager:
 
         # Emit audit + health
         await self._emit_audit(active=len(curr_syms), closed=len(vanished))
-        await self._emit_health("Running", f"Reconciled {len(curr_syms)} active, {len(vanished)} closed")
+        await self._emit_health(
+            "Running", f"Reconciled {len(curr_syms)} active, {len(vanished)} closed"
+        )
 
     async def finalize_position(
         self,
@@ -183,7 +185,11 @@ class PositionManager:
         entry_price = 0.0
         try:
             sym = str(symbol or "").upper()
-            pos = getattr(self.ss, "positions", {}).get(sym, {}) if hasattr(self.ss, "positions") else {}
+            pos = (
+                getattr(self.ss, "positions", {}).get(sym, {})
+                if hasattr(self.ss, "positions")
+                else {}
+            )
             entry_price = float(pos.get("avg_price", 0.0) or 0.0)
             if entry_price <= 0 and hasattr(self.ss, "open_trades"):
                 ot = (self.ss.open_trades or {}).get(sym, {})
@@ -193,9 +199,13 @@ class PositionManager:
             side_hint = str(pos.get("side") or pos.get("position") or "long").lower()
             if entry_price > 0:
                 if side_hint in ("short", "sell"):
-                    realized_pnl = (entry_price - float(executed_price or 0.0)) * float(executed_qty or 0.0)
+                    realized_pnl = (entry_price - float(executed_price or 0.0)) * float(
+                        executed_qty or 0.0
+                    )
                 else:
-                    realized_pnl = (float(executed_price or 0.0) - entry_price) * float(executed_qty or 0.0)
+                    realized_pnl = (float(executed_price or 0.0) - entry_price) * float(
+                        executed_qty or 0.0
+                    )
                 realized_pnl -= float(fee_quote or 0.0)
         except Exception:
             realized_pnl = 0.0
@@ -218,7 +228,9 @@ class PositionManager:
         # ExecutionManager handles realized PnL persistence and emits RealizedPnlUpdated/POSITION_CLOSED.
         try:
             if hasattr(self.ss, "record_exit_reason"):
-                self.ss.record_exit_reason(symbol, reason or "SELL_FILLED", source="PositionManager")
+                self.ss.record_exit_reason(
+                    symbol, reason or "SELL_FILLED", source="PositionManager"
+                )
         except Exception:
             pass
         try:
@@ -261,7 +273,7 @@ class PositionManager:
             return
 
         registered = False
-        pos: Dict[str, Any] = {}
+        pos: dict[str, Any] = {}
         try:
             positions = getattr(self.ss, "positions", {}) or {}
             if isinstance(positions, dict):
@@ -312,7 +324,9 @@ class PositionManager:
             qty_now = float((pos or {}).get("quantity", 0.0) or (pos or {}).get("qty", 0.0) or qty)
             price_now = float((pos or {}).get("avg_price", 0.0) or price or 0.0)
             if price_now <= 0:
-                price_now = float((getattr(self.ss, "latest_prices", {}) or {}).get(sym, 0.0) or 0.0)
+                price_now = float(
+                    (getattr(self.ss, "latest_prices", {}) or {}).get(sym, 0.0) or 0.0
+                )
         except Exception:
             qty_now = float(qty or 0.0)
             price_now = float(price or 0.0)
@@ -325,7 +339,9 @@ class PositionManager:
         if significant_floor <= 0:
             try:
                 if hasattr(self.ss, "get_significant_position_floor"):
-                    significant_floor = float(await maybe_call(self.ss, "get_significant_position_floor", sym) or 0.0)
+                    significant_floor = float(
+                        await maybe_call(self.ss, "get_significant_position_floor", sym) or 0.0
+                    )
             except Exception:
                 significant_floor = 0.0
         if significant_floor <= 0:
@@ -395,10 +411,14 @@ class PositionManager:
             positions = getattr(self.ss, "positions", {}) or {}
             if isinstance(positions, dict):
                 pos = dict(positions.get(sym, {}) or pos)
-                qty_now = float((pos or {}).get("quantity", 0.0) or (pos or {}).get("qty", 0.0) or qty_now)
+                qty_now = float(
+                    (pos or {}).get("quantity", 0.0) or (pos or {}).get("qty", 0.0) or qty_now
+                )
                 price_now = float((pos or {}).get("avg_price", 0.0) or price_now or 0.0)
                 value_usdt = float((pos or {}).get("value_usdt", 0.0) or value_usdt)
-                significant_floor = float((pos or {}).get("significant_floor_usdt", 0.0) or significant_floor)
+                significant_floor = float(
+                    (pos or {}).get("significant_floor_usdt", 0.0) or significant_floor
+                )
                 significant = bool(pos.get("is_significant", significant))
                 registered = qty_now > 0.0
         except Exception:
@@ -448,7 +468,7 @@ class PositionManager:
         try:
             have_symbols = False
             if hasattr(self.ss, "accepted_symbols"):
-                syms = getattr(self.ss, "accepted_symbols") or {}
+                syms = self.ss.accepted_symbols or {}
                 have_symbols = bool(syms)
 
             have_market = False
@@ -460,7 +480,7 @@ class PositionManager:
         except Exception:
             return False
 
-    async def _get_open_positions_safe(self) -> Dict[str, Any]:
+    async def _get_open_positions_safe(self) -> dict[str, Any]:
         """
         ExchangeClient.get_open_positions() should return a mapping like:
           {"<SYMBOL>": {"qty": 0.5, "avg_price": 64200.0, ...}, ...}
@@ -471,7 +491,7 @@ class PositionManager:
         res = self.ex.get_open_positions()
         return await res if asyncio.iscoroutine(res) else (res or {})
 
-    async def _normalize_positions(self, raw: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    async def _normalize_positions(self, raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
         """
         Normalize varied shapes into:
                 "symbol": "<SYMBOL>",
@@ -483,14 +503,16 @@ class PositionManager:
                 "notional": float
             }, ... }
         """
-        out: Dict[str, Dict[str, Any]] = {}
+        out: dict[str, dict[str, Any]] = {}
 
         async def _get_mark_price(sym: str) -> float:
             # Prefer SharedState.safe price, fallback to ExchangeClient
             px = None
             if hasattr(self.ss, "get_latest_price_safe"):
                 try:
-                    px = await maybe_call(self.ss, "get_latest_price_safe", sym) # Modified to use maybe_call
+                    px = await maybe_call(
+                        self.ss, "get_latest_price_safe", sym
+                    )  # Modified to use maybe_call
                 except Exception:
                     px = None
             if px is None and hasattr(self.ex, "get_current_price"):
@@ -551,7 +573,9 @@ class PositionManager:
                     or rec.get("avgPrice")
                     or None
                 )
-                avg_price = float(avg_price) if (avg_price is not None and float(avg_price) > 0.0) else None
+                avg_price = (
+                    float(avg_price) if (avg_price is not None and float(avg_price) > 0.0) else None
+                )
 
                 # timestamps (optional)
                 entry_ts = rec.get("entry_ts") or rec.get("timestamp") or rec.get("time") or None
@@ -559,17 +583,19 @@ class PositionManager:
 
                 # mark price & notional
                 mark_price = await _get_mark_price(sym)
-                
+
                 # WALLET ENTRY PRICE RECONSTRUCTION: If entry_price is missing or 0, fallback to mark_price
                 # This prevents crashes when avg_price is None. The execution layer can refine it later.
                 if avg_price is None and mark_price > 0:
                     avg_price = float(mark_price)
-                
-                notional = abs(qty) * (mark_price if mark_price > 0 else avg_price if avg_price > 0 else 0.0)
+
+                notional = abs(qty) * (
+                    mark_price if mark_price > 0 else avg_price if avg_price > 0 else 0.0
+                )
 
                 out[sym] = {
                     "symbol": sym,
-                    "quantity": float(qty), # Modified to use "quantity"
+                    "quantity": float(qty),  # Modified to use "quantity"
                     "side": side,
                     "avg_price": avg_price,
                     "entry_ts": entry_ts,
@@ -587,7 +613,7 @@ class PositionManager:
 
         return out
 
-    async def _get_prev_positions_snapshot(self) -> Dict[str, Any]:
+    async def _get_prev_positions_snapshot(self) -> dict[str, Any]:
         if hasattr(self.ss, "get_positions_snapshot"):
             try:
                 snap = self.ss.get_positions_snapshot()
@@ -601,7 +627,7 @@ class PositionManager:
         Looks for ExchangeClient.get_balances() -> {"USDT": {"free": x, "locked": y}, ...}
         Updates SharedState if the corresponding methods exist, and emits a WalletSnapshot event.
         """
-        balances: Dict[str, Any] = {}
+        balances: dict[str, Any] = {}
         try:
             if self.ex and hasattr(self.ex, "get_balances"):
                 res = self.ex.get_balances()
@@ -643,7 +669,11 @@ class PositionManager:
             "timestamp": time.time(),
         }
         if balances:
-            payload["assets"] = {k: {"free": (v or {}).get("free", 0.0), "locked": (v or {}).get("locked", 0.0)} for k, v in balances.items() if isinstance(v, dict)}
+            payload["assets"] = {
+                k: {"free": (v or {}).get("free", 0.0), "locked": (v or {}).get("locked", 0.0)}
+                for k, v in balances.items()
+                if isinstance(v, dict)
+            }
 
         if self.ss and hasattr(self.ss, "emit_event"):
             await maybe_call(self.ss, "emit_event", "WalletSnapshot", payload)

@@ -2,20 +2,19 @@
 # Imports
 # =============================
 import asyncio
+import inspect
 import logging
 import os
 import time
-import inspect
 from functools import partial
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Set
 from math import inf
+from typing import Any, Optional
 
-import numpy as np
 try:
     import tensorflow as tf
 except ImportError:
     tf = None
+
 
 # =============================
 # Utilities
@@ -30,7 +29,7 @@ async def _await_maybe(x):
 # =============================
 _HAS_TALIB = True
 try:
-    import talib
+    pass
 except Exception:
     _HAS_TALIB = False
 
@@ -38,32 +37,23 @@ except Exception:
 # =============================
 # Local Imports
 # =============================
-from src.l0_core.stubs import TradeIntent, ExecOrder
-from src.l5_strategy.model_manager import load_model as _load_model, build_model_path, safe_load_model
 from src.l0_core.component_status_logger import log_component_status
-from utils.indicators import compute_ema, compute_macd
-from utils.volatility_adjusted_confidence import (
-    compute_heuristic_confidence,
-    categorize_signal,
-    get_signal_quality_metrics,
-)
-
-from agents.edge_calculator import compute_agent_edge, merge_signal_with_edge  # ALPHA AMPLIFIER
+from src.l5_strategy.model_manager import build_model_path, safe_load_model
 
 try:
     from utils.ta_indicators import calculate_volume_surge as _calc_volume_surge
+
     _HAS_TA_INDICATORS = True
 except Exception:
     _HAS_TA_INDICATORS = False
     _calc_volume_surge = None
 try:
     from utils.tuned_params import get_tuned_params as _get_tuned_params
+
     _HAS_TUNED_PARAMS = True
 except Exception:
     _HAS_TUNED_PARAMS = False
     _get_tuned_params = None
-
-
 
 
 # =============================
@@ -81,7 +71,10 @@ logger.setLevel(logging.DEBUG)
 _log_path = f"logs/agents/{AGENT_NAME.lower()}.log"
 os.makedirs(os.path.dirname(_log_path), exist_ok=True)
 
-if not any(isinstance(h, logging.FileHandler) and getattr(h, "_trendhunter", False) for h in logger.handlers):
+if not any(
+    isinstance(h, logging.FileHandler) and getattr(h, "_trendhunter", False)
+    for h in logger.handlers
+):
     fh = logging.FileHandler(_log_path)
     fh._trendhunter = True  # mark to avoid duplicates
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
@@ -93,7 +86,7 @@ def _as_bool(value: Any) -> bool:
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
 
-    
+
 # =============================
 # Agent
 # =============================
@@ -133,7 +126,7 @@ class TrendHunter:
         if not ec:
             return True
         try:
-            if getattr(self, 'require_trading_status', True) and hasattr(ec, "symbol_info"):
+            if getattr(self, "require_trading_status", True) and hasattr(ec, "symbol_info"):
                 info = ec.symbol_info(symbol)
                 info = await info if inspect.isawaitable(info) else info
                 if not info:
@@ -159,7 +152,7 @@ class TrendHunter:
                             except Exception:
                                 min_notional = None
                             break
-                cap = float(getattr(self, 'max_per_trade_usdt', 100.0))
+                cap = float(getattr(self, "max_per_trade_usdt", 100.0))
                 if min_notional is not None and min_notional > cap:
                     logger.warning(
                         "[%s] %s MIN_NOTIONAL %.4f exceeds cap %.2f; deferring to execution layer.",
@@ -173,7 +166,7 @@ class TrendHunter:
             logger.debug("[%s] prefilter failed for %s", self.name, symbol, exc_info=True)
             return False
 
-    async def generate_signals(self) -> List[Dict[str, Any]]:
+    async def generate_signals(self) -> list[dict[str, Any]]:
         """
         Main entry point for signal generation.
         TrendHunter is not yet fully implemented, returning empty signals.
@@ -191,7 +184,7 @@ class TrendHunter:
         tp_sl_engine,
         model_manager,
         timeframe: str = "5m",
-        symbols: Optional[List[str]] = None,
+        symbols: Optional[list[str]] = None,
         name: str = AGENT_NAME,
         # optional/wired deps
         symbol: Optional[str] = None,
@@ -237,18 +230,20 @@ class TrendHunter:
         _allowed_regimes = self._cfg("TRENDHUNTER_ALLOWED_REGIMES", ["", "low", "moderate", "high"])
         if isinstance(_allowed_regimes, str):
             _allowed_regimes = [r.strip().lower() for r in _allowed_regimes.split(",") if r.strip()]
-        self.allowed_regimes = set([str(r).lower() for r in (_allowed_regimes or ["", "low", "moderate", "high"])])
+        self.allowed_regimes = set(
+            [str(r).lower() for r in (_allowed_regimes or ["", "low", "moderate", "high"])]
+        )
         # Back-compat: map legacy "moderate" to the current "normal" regime label.
         if "moderate" in self.allowed_regimes and "normal" not in self.allowed_regimes:
             self.allowed_regimes.add("normal")
 
         # symbol and model caches
         self.symbols = symbols  # can be None → lazy load
-        self._accepted_snapshot: Optional[List[str]] = None
+        self._accepted_snapshot: Optional[list[str]] = None
         self._accepted_snapshot_ts: float = 0.0
         self._snapshot_ttl_sec = 15.0  # throttle SharedState hits
 
-        self.model_cache: Dict[str, Optional[Any]] = {}
+        self.model_cache: dict[str, Optional[Any]] = {}
 
         # if symbols provided, pre-warm model cache
         if self.symbols:
@@ -258,14 +253,19 @@ class TrendHunter:
         self.trades_count = 0
         self.win_count = 0
         self.loss_count = 0
-        self._collected_signals: List[Dict[str, Any]] = []
+        self._collected_signals: list[dict[str, Any]] = []
         self._collecting_for_agent_manager = False
-        self._training_in_progress: Set[str] = set()
-        self._retrain_last_attempt_ts: Dict[str, float] = {}
-        self._retrain_last_failure_ts: Dict[str, float] = {}
+        self._training_in_progress: set[str] = set()
+        self._retrain_last_attempt_ts: dict[str, float] = {}
+        self._retrain_last_failure_ts: dict[str, float] = {}
 
         log_component_status(self.name, "Initialized")
-        logger.info("🚀 %s initialized (timeframe=%s, symbols=%d)", self.name, self.timeframe, len(self.symbols or []))
+        logger.info(
+            "🚀 %s initialized (timeframe=%s, symbols=%d)",
+            self.name,
+            self.timeframe,
+            len(self.symbols or []),
+        )
 
     # ------------- helpers -------------
     def _cfg(self, key: str, default: Any = None) -> Any:
@@ -286,8 +286,7 @@ class TrendHunter:
         return float(
             self._cfg(
                 "TREND_MIN_CONF",
-                self._cfg("TRENDHUNTER_MIN_SIGNAL_CONF",
-                    self._cfg("MIN_SIGNAL_CONF", 0.35))
+                self._cfg("TRENDHUNTER_MIN_SIGNAL_CONF", self._cfg("MIN_SIGNAL_CONF", 0.35)),
             )
         )
 
@@ -296,9 +295,10 @@ class TrendHunter:
         """Dynamic access to maximum trade size."""
         return float(self._cfg("MAX_PER_TRADE_USDT", 100.0))
 
-    def _load_tuned(self) -> Dict[str, Any]:
+    def _load_tuned(self) -> dict[str, Any]:
         try:
             from src.l5_strategy.agent_optimizer import load_tuned_params
+
             result = load_tuned_params(self.name) or {}
             if result:
                 return result
@@ -319,7 +319,9 @@ class TrendHunter:
             path = build_model_path(self.name, sym, version=self.timeframe)
             model = safe_load_model(path)
             if model is None:
-                logger.info("[%s] No pre-trained model for %s (will train on first run).", self.name, sym)
+                logger.info(
+                    "[%s] No pre-trained model for %s (will train on first run).", self.name, sym
+                )
             self.model_cache[sym] = model
         except Exception as e:
             logger.debug("[%s] safe_load_model failed for %s: %s", self.name, sym, e)
@@ -328,12 +330,12 @@ class TrendHunter:
     def _is_auto_train_enabled(self) -> bool:
         return _as_bool(self._cfg("TREND_AUTO_TRAIN", self._cfg("AUTO_TRAIN", False)))
 
-    def _normalize_training_rows(self, data: Any) -> List[Dict[str, float]]:
+    def _normalize_training_rows(self, data: Any) -> list[dict[str, float]]:
         """
         Normalize OHLCV payload into canonical rows expected by ModelTrainer:
         {'timestamp','open','high','low','close','volume'}.
         """
-        rows: List[Dict[str, float]] = []
+        rows: list[dict[str, float]] = []
         if not isinstance(data, list):
             return rows
 
@@ -372,7 +374,7 @@ class TrendHunter:
         # Keep last value for duplicate timestamps and preserve chronological order.
         if not rows:
             return rows
-        dedup: Dict[float, Dict[str, float]] = {}
+        dedup: dict[float, dict[str, float]] = {}
         for r in rows:
             dedup[float(r["timestamp"])] = r
         return [dedup[k] for k in sorted(dedup.keys())]
@@ -384,18 +386,26 @@ class TrendHunter:
         """
         if self.model_cache.get(symbol) is not None:
             return True
-        
+
         # Check if already training
         if symbol in self._training_in_progress:
             return False
 
         if tf is None:
-            logger.debug("[%s] Model missing for %s; TensorFlow unavailable, staying in indicator-only mode.", self.name, symbol)
+            logger.debug(
+                "[%s] Model missing for %s; TensorFlow unavailable, staying in indicator-only mode.",
+                self.name,
+                symbol,
+            )
             return True
 
         # Check config to authorize CPU-heavy training
         if not self._is_auto_train_enabled():
-            logger.debug("[%s] Model missing for %s; TREND_AUTO_TRAIN/AUTO_TRAIN disabled.", self.name, symbol)
+            logger.debug(
+                "[%s] Model missing for %s; TREND_AUTO_TRAIN/AUTO_TRAIN disabled.",
+                self.name,
+                symbol,
+            )
             return True  # Fallback to heuristic logic if training disabled
 
         now_ts = time.time()
@@ -427,15 +437,17 @@ class TrendHunter:
         self._retrain_last_attempt_ts[symbol] = now_ts
         self._training_in_progress.add(symbol)
         logger.info(f"[{self.name}] 🧠 Triggering background training for {symbol}...")
-        
+
         asyncio.create_task(self._run_background_training(symbol))
-        return False # Skip this tick while training
+        return False  # Skip this tick while training
 
     async def _run_background_training(self, symbol: str):
         try:
             lookback = int(self._cfg("TRENDHUNTER_RETRAIN_LOOKBACK", 100) or 100)
             min_rows = max(lookback + 50, int(self._cfg("TREND_RETRAIN_MIN_BARS", 220) or 220))
-            fetch_limit = max(min_rows + 50, int(self._cfg("TREND_RETRAIN_FETCH_LIMIT", 750) or 750))
+            fetch_limit = max(
+                min_rows + 50, int(self._cfg("TREND_RETRAIN_FETCH_LIMIT", 750) or 750)
+            )
             max_rows = max(min_rows, int(self._cfg("TREND_RETRAIN_MAX_ROWS", 1200) or 1200))
 
             # 1) Start from cached shared-state OHLCV.
@@ -443,10 +455,14 @@ class TrendHunter:
             rows = self._normalize_training_rows(cached)
 
             # 2) If cache is shallow, request a deeper pull directly from exchange.
-            exchange_client = self.exchange_client or getattr(self.execution_manager, "exchange_client", None)
+            exchange_client = self.exchange_client or getattr(
+                self.execution_manager, "exchange_client", None
+            )
             if len(rows) < min_rows and exchange_client and hasattr(exchange_client, "get_klines"):
                 try:
-                    raw = await exchange_client.get_klines(symbol, self.timeframe, limit=int(fetch_limit))
+                    raw = await exchange_client.get_klines(
+                        symbol, self.timeframe, limit=int(fetch_limit)
+                    )
                     exchange_rows = self._normalize_training_rows(raw)
                     if len(exchange_rows) > len(rows):
                         rows = exchange_rows
@@ -470,10 +486,11 @@ class TrendHunter:
                 )
                 return
 
-            train_rows = rows[-int(max_rows):]
+            train_rows = rows[-int(max_rows) :]
 
             # 3) Run Trainer in ThreadPool to avoid blocking main loop.
             from src.l5_strategy.model_trainer import ModelTrainer
+
             trainer = ModelTrainer(
                 symbol,
                 timeframe=self.timeframe,
@@ -501,9 +518,11 @@ class TrendHunter:
 
             self._training_in_progress.discard(symbol)
         except Exception as e:
-            logger.error(f"[{self.name}] Exception in _run_background_training for {symbol}: {e}", exc_info=True)
+            logger.error(
+                f"[{self.name}] Exception in _run_background_training for {symbol}: {e}",
+                exc_info=True,
+            )
             self._training_in_progress.discard(symbol)
-
 
 
 def _trendhunter_eof_marker():

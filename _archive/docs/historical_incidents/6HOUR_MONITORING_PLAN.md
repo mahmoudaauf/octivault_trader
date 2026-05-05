@@ -1,9 +1,9 @@
 # 6-Hour Bot Monitoring Plan
 
-**Start Time:** 2026-05-04 01:40 (approximate)  
-**Expected End Time:** 2026-05-04 07:40  
-**Bot PID:** 96511  
-**Status:** ✅ RUNNING  
+**Start Time:** 2026-05-04 01:40 (approximate)
+**Expected End Time:** 2026-05-04 07:40
+**Bot PID:** 96511
+**Status:** ✅ RUNNING
 
 ---
 
@@ -148,7 +148,7 @@ tail -20 monitoring_report.txt
 ## Common Issues & Fixes
 
 ### Issue 1: Bot Still Shows 35 Positions After 15 Minutes
-**Problem:** Auto-recovery not activating  
+**Problem:** Auto-recovery not activating
 **Fix:**
 ```bash
 # Check if RECOVERY mode was set
@@ -164,7 +164,7 @@ nohup python3 🎯_MASTER_SYSTEM_ORCHESTRATOR.py > logs/octivault_master_orchest
 ```
 
 ### Issue 2: Kill-Switch Still Enabled After 30 Minutes
-**Problem:** Dust not fully cleared  
+**Problem:** Dust not fully cleared
 **Fix:**
 ```bash
 # Check remaining dust positions
@@ -178,7 +178,7 @@ grep -i "liquidat\|heal" logs/octivault_master_orchestrator.log | tail -10
 ```
 
 ### Issue 3: No Trades After 1 Hour Despite Kill-Switch Disabled
-**Problem:** PRETRADE thresholds still too high  
+**Problem:** PRETRADE thresholds still too high
 **Fix:**
 ```bash
 # Check what threshold is blocking trades
@@ -192,7 +192,7 @@ grep "StallRelief" logs/octivault_master_orchestrator.log | tail -5
 ```
 
 ### Issue 4: WebSocket Disconnection
-**Problem:** "WebSocket connection failed"  
+**Problem:** "WebSocket connection failed"
 **Fix:**
 ```bash
 # Bot auto-reconnects, check if it succeeded
@@ -224,7 +224,7 @@ wc -l logs/octivault_master_orchestrator.log > /tmp/log_size_start.txt
 
 ```bash
 # Quick status (can run while bot is running)
-echo "=== Status Check: $(date) ===" 
+echo "=== Status Check: $(date) ==="
 pgrep -f "MASTER" && echo "✅ Bot alive" || echo "❌ Bot down"
 tail -1 logs/octivault_master_orchestrator.log
 echo "Trades executed: $(grep TRADE_EXECUTED logs/octivault_master_orchestrator.log | wc -l)"
@@ -371,5 +371,5 @@ After 6 hours, you should see:
 
 **Let it run! System is stable and healing. Check back periodically and enjoy the gains! 🚀**
 
-**Log files for analysis:** `logs/octivault_master_orchestrator.log`  
+**Log files for analysis:** `logs/octivault_master_orchestrator.log`
 **Emergency file:** `/tmp/run_final_report.txt` (after 6 hours)

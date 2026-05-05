@@ -16,7 +16,7 @@ Trading Loop:
   3. ✅ Pre-trade validation triggered
   4. ❌ BLOCKED: "net_pct_below_threshold" gate rejects all trades
   5. ❌ Trade skipped
-  
+
 Result: 113+ consecutive TRADE_SKIPPED events
 ```
 
@@ -157,7 +157,7 @@ Risk:             More marginal trades execute
 Current:  confidence=0.65 (old code still running)
 Fixed To: confidence=0.80 (new code, needs restart)
 
-Impact:  May help signal confidence stage, but won't fix 
+Impact:  May help signal confidence stage, but won't fix
          pretrade_effect_gate (that gate is independent)
 ```
 

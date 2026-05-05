@@ -1,32 +1,37 @@
-import os
 import asyncio
 import logging
+import os
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Any, Optional
 
 logger = logging.getLogger("IPOChaser")  # inherit level from app
+
 
 # Light optional import helper (avoid import-time hard failures)
 def _lazy_imports():
     mods = {}
     try:
         import numpy as np
+
         mods["np"] = np
     except Exception:
         mods["np"] = None
     try:
         import pandas as pd
+
         mods["pd"] = pd
     except Exception:
         mods["pd"] = None
     return mods
 
-def _safe_bool_tuple(res) -> Tuple[bool, str]:
+
+def _safe_bool_tuple(res) -> tuple[bool, str]:
     if isinstance(res, tuple):
         ok = bool(res[0])
         reason = str(res[1]) if len(res) > 1 else ""
         return ok, reason
     return bool(res), ""
+
 
 class IPOChaser:
     """
@@ -36,6 +41,7 @@ class IPOChaser:
     - Discovery path (propose newly listed *USDT pairs*) is lightweight.
     - ML path (run single-symbol decision) is lazy-imported and guarded.
     """
+
     agent_type = "discovery"
 
     def __init__(
@@ -61,8 +67,8 @@ class IPOChaser:
         self.timeframe = str(getattr(self.config, "IPO_TIMEFRAME", "5m"))
 
         # runtime caches for ML mode
-        self.model_cache: Dict[str, Any] = {}
-        self._model_locks: Dict[str, asyncio.Lock] = {}
+        self.model_cache: dict[str, Any] = {}
+        self._model_locks: dict[str, asyncio.Lock] = {}
         self._model_ttl = int(getattr(self.config, "MODEL_TTL_SECONDS", 0))  # 0 = no TTL
         self._lookback_default = 50
         # lifecycle & concurrency
@@ -103,7 +109,9 @@ class IPOChaser:
             try:
                 t.cancel()
                 try:
-                    await asyncio.wait_for(t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0)))
+                    await asyncio.wait_for(
+                        t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0))
+                    )
                 except asyncio.CancelledError:
                     pass
             except Exception:
@@ -137,7 +145,9 @@ class IPOChaser:
 
                 logger.info(f"[{self.name}] run_once: scanning new listings...")
                 try:
-                    listings = await asyncio.wait_for(self.exchange_client.get_new_listings(), timeout=15)
+                    listings = await asyncio.wait_for(
+                        self.exchange_client.get_new_listings(), timeout=15
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(f"[{self.name}] ⏰ get_new_listings timeout.")
                     return
@@ -158,14 +168,18 @@ class IPOChaser:
                 for sym in usdt_pairs:
                     try:
                         res = await asyncio.wait_for(
-                            self.symbol_manager.propose_symbol(sym, source=self.name, metadata={"reason": "IPO candidate"}),
+                            self.symbol_manager.propose_symbol(
+                                sym, source=self.name, metadata={"reason": "IPO candidate"}
+                            ),
                             timeout=10,
                         )
                         ok, reason = _safe_bool_tuple(res)
                         if ok:
                             logger.info(f"✅ Accepted {sym} from {self.name}.")
                         else:
-                            logger.warning(f"❌ {sym} rejected from {self.name}: {reason or 'no reason'}")
+                            logger.warning(
+                                f"❌ {sym} rejected from {self.name}: {reason or 'no reason'}"
+                            )
                     except asyncio.TimeoutError:
                         logger.warning(f"[{self.name}] ⏰ propose_symbol timeout for {sym}")
                     except Exception as e:
@@ -181,7 +195,7 @@ class IPOChaser:
                 await self.run_once()
             except Exception as e:
                 logger.error(f"[{self.name}] discovery error: {e}", exc_info=True)
-            
+
             # ✅ PHASE 2a: ADAPTIVE INTERVALS based on volatility
             wait_time = await self._get_adaptive_interval()
             await asyncio.sleep(wait_time)
@@ -189,12 +203,12 @@ class IPOChaser:
     async def _get_adaptive_interval(self) -> float:
         """
         Adjust scan interval based on market volatility regime.
-        
+
         Strategy:
           - High volatility: scan more frequently (faster response to IPOs)
           - Normal volatility: use base interval
           - Low volatility: scan less frequently (no IPOs expected)
-        
+
         Returns: seconds to wait before next scan
         """
         try:
@@ -204,29 +218,35 @@ class IPOChaser:
                     regime_result = self.shared_state.get_volatility_regime(
                         "GLOBAL", timeframe="1h", max_age_seconds=300
                     )
-                    regime_result = await regime_result if asyncio.iscoroutine(regime_result) else regime_result
-                    
+                    regime_result = (
+                        await regime_result if asyncio.iscoroutine(regime_result) else regime_result
+                    )
+
                     if isinstance(regime_result, dict):
                         regime = str(regime_result.get("regime", "normal")).lower()
-                        
+
                         # Adjust interval based on regime
                         if regime == "high":
                             # High volatility: scan 2x more frequently
                             adjusted = self.interval / 2.0
-                            logger.debug(f"[{self.name}] High volatility regime: scanning every {adjusted:.0f}s")
+                            logger.debug(
+                                f"[{self.name}] High volatility regime: scanning every {adjusted:.0f}s"
+                            )
                             return adjusted + 0.1  # Slight jitter
                         elif regime == "low":
                             # Low volatility: scan 2x less frequently
                             adjusted = self.interval * 2.0
-                            logger.debug(f"[{self.name}] Low volatility regime: scanning every {adjusted:.0f}s")
+                            logger.debug(
+                                f"[{self.name}] Low volatility regime: scanning every {adjusted:.0f}s"
+                            )
                             return adjusted + 0.1
                         # else: normal, use base interval
                 except Exception as e:
                     logger.debug(f"[{self.name}] Volatility regime check failed: {e}")
-            
+
             # Fallback: use base interval with mild jitter
             return self.interval + min(1.0, 0.05 * self.interval)
-        
+
         except Exception as e:
             logger.debug(f"[{self.name}] Unexpected error in _get_adaptive_interval: {e}")
             return self.interval + 0.1  # Safe default
@@ -237,7 +257,7 @@ class IPOChaser:
 
     # -------------------- Optional ML signaler (lazy deps) --------------------
 
-    async def run(self, symbol: Optional[str], **kwargs) -> Tuple[Dict[str, Any], float]:
+    async def run(self, symbol: Optional[str], **kwargs) -> tuple[dict[str, Any], float]:
         """
         Single-symbol decision path (optional ML).
         Safe even if ML deps are not present; returns HOLD.
@@ -270,7 +290,7 @@ class IPOChaser:
 
     # -------------------- Internals (ML path) --------------------
 
-    def _signal(self, action: str, predicted_gain: float, **kwargs) -> Dict[str, Any]:
+    def _signal(self, action: str, predicted_gain: float, **kwargs) -> dict[str, Any]:
         safe_meta = {k: v for k, v in (kwargs or {}).items() if not asyncio.iscoroutine(v)}
         return {
             "source": self.name,
@@ -304,9 +324,10 @@ class IPOChaser:
             return self.config.get(key, default)
         return getattr(self.config, key, default)
 
-    def _load_tuned(self, key: str) -> Dict[str, Any]:
+    def _load_tuned(self, key: str) -> dict[str, Any]:
         try:
             from src.l5_strategy.agent_optimizer import load_tuned_params
+
             return load_tuned_params(key) or {}
         except Exception:
             return {}
@@ -320,7 +341,11 @@ class IPOChaser:
 
         # try shared cache first
         try:
-            cached = (getattr(self.shared_state, "historical_data", {}) or {}).get(symbol, {}).get(self.timeframe, [])
+            cached = (
+                (getattr(self.shared_state, "historical_data", {}) or {})
+                .get(symbol, {})
+                .get(self.timeframe, [])
+            )
         except Exception:
             cached = []
 
@@ -329,7 +354,9 @@ class IPOChaser:
                 return None
             try:
                 cached = await asyncio.wait_for(
-                    self.exchange_client.get_ohlcv(symbol, timeframe=self.timeframe, limit=lookback),
+                    self.exchange_client.get_ohlcv(
+                        symbol, timeframe=self.timeframe, limit=lookback
+                    ),
                     timeout=15,
                 )
             except asyncio.TimeoutError:
@@ -347,7 +374,10 @@ class IPOChaser:
         if not all(isinstance(c, dict) and all(k in c for k in req) for c in sample):
             return None
 
-        arr = np.asarray([[c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in sample], dtype=np.float32)
+        arr = np.asarray(
+            [[c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in sample],
+            dtype=np.float32,
+        )
         return arr.reshape(1, lookback, 5)
 
     async def _ensure_model(self, symbol: str, ohlcv_np):
@@ -375,6 +405,7 @@ class IPOChaser:
     def _model_path(self, symbol: str) -> str:
         try:
             from src.l5_strategy.model_manager import build_model_path
+
             return build_model_path(self.name, symbol)
         except Exception:
             # fallback location
@@ -383,6 +414,7 @@ class IPOChaser:
     def _model_exists(self, path: str) -> bool:
         try:
             from src.l5_strategy.model_manager import model_exists
+
             return bool(model_exists(path))
         except Exception:
             return os.path.exists(path)
@@ -403,21 +435,28 @@ class IPOChaser:
             logger.warning(f"[{self.name}] pandas not available; cannot train.")
             return False
         try:
-            from src.l5_strategy.model_trainer import ModelTrainer
             from src.l5_strategy.model_manager import save_model
+            from src.l5_strategy.model_trainer import ModelTrainer
         except Exception as e:
             logger.warning(f"[{self.name}] Trainer/manager imports failed: {e}")
             return False
 
         try:
-            df = pd.DataFrame(ohlcv_np.reshape(-1, 5), columns=["open", "high", "low", "close", "volume"])
-            trainer = ModelTrainer(symbol, self.timeframe, model_dir=os.path.dirname(path) or "models")
+            df = pd.DataFrame(
+                ohlcv_np.reshape(-1, 5), columns=["open", "high", "low", "close", "volume"]
+            )
+            trainer = ModelTrainer(
+                symbol, self.timeframe, model_dir=os.path.dirname(path) or "models"
+            )
             trained = trainer.train_model(df)
             if trained not in (True, False, None):
                 try:
                     save_model(trained, path)
                 except Exception:
-                    logger.debug(f"[{self.name}] save_model failed (trainer likely persisted).", exc_info=True)
+                    logger.debug(
+                        f"[{self.name}] save_model failed (trainer likely persisted).",
+                        exc_info=True,
+                    )
             return True
         except Exception as e:
             logger.error(f"[{self.name}] Training failed for {symbol}: {e}", exc_info=True)
@@ -426,6 +465,7 @@ class IPOChaser:
     def _safe_load_model(self, path: str):
         try:
             from src.l5_strategy.model_manager import safe_load_model
+
             return safe_load_model(path)
         except Exception as e:
             logger.error(f"[{self.name}] safe_load_model failed: {e}")
@@ -434,14 +474,16 @@ class IPOChaser:
     async def _predict_gain(self, model, ohlcv_np) -> float:
         try:
             loop = asyncio.get_running_loop()
-            out = await loop.run_in_executor(None, lambda: float(model.predict(ohlcv_np, verbose=0)[0][0]))
-            if not (out == out) or out == float("inf") or out == float("-inf"):
+            out = await loop.run_in_executor(
+                None, lambda: float(model.predict(ohlcv_np, verbose=0)[0][0])
+            )
+            if out != out or out == float("inf") or out == float("-inf"):
                 return 0.0
             return max(min(out, 5.0), -5.0)
         except Exception as e:
             logger.error(f"[{self.name}] Prediction failed: {e}", exc_info=True)
             return 0.0
 
-    async def _emit_signal(self, symbol: str, signal: Dict[str, Any]) -> None:
+    async def _emit_signal(self, symbol: str, signal: dict[str, Any]) -> None:
         # Event bus publishing happens in _publish_trade_intent
         pass

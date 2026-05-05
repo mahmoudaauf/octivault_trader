@@ -19,7 +19,6 @@ Rules:
   4. Drawdown Guard: Drops to 1 symbol if drawdown > 8%
 """
 
-import asyncio
 import logging
 from typing import Any, Optional
 
@@ -27,7 +26,7 @@ from typing import Any, Optional
 class CapitalSymbolGovernor:
     """
     Governor that dynamically limits active symbols based on capital and system health.
-    
+
     Usage:
       governor = CapitalSymbolGovernor(shared_state, config)
       symbol_cap = await governor.compute_symbol_cap()
@@ -45,18 +44,12 @@ class CapitalSymbolGovernor:
         self.logger = logger or logging.getLogger("CapitalSymbolGovernor")
 
         # Config parameters
-        self.exposure_ratio = float(
-            getattr(config, "MAX_EXPOSURE_RATIO", 0.6) if config else 0.6
-        )
+        self.exposure_ratio = float(getattr(config, "MAX_EXPOSURE_RATIO", 0.6) if config else 0.6)
         self.min_trade_size_usdt = float(
             getattr(config, "MIN_ECONOMIC_TRADE_USDT", 30) if config else 30
         )
-        self.max_drawdown_guard = float(
-            getattr(config, "MAX_DRAWDOWN_PCT", 8.0) if config else 8.0
-        )
-        self.max_retrain_skips = int(
-            getattr(config, "MAX_RETRAIN_SKIPS", 2) if config else 2
-        )
+        self.max_drawdown_guard = float(getattr(config, "MAX_DRAWDOWN_PCT", 8.0) if config else 8.0)
+        self.max_retrain_skips = int(getattr(config, "MAX_RETRAIN_SKIPS", 2) if config else 2)
 
         # Health state tracking
         self._api_rate_limited = False
@@ -66,24 +59,20 @@ class CapitalSymbolGovernor:
     async def compute_symbol_cap(self) -> int:
         """
         Compute the dynamic symbol cap based on capital and health rules.
-        
+
         Returns:
           int: Number of symbols to trade (minimum 1, typically 2-4)
         """
         # Rule 1: Capital Floor mapping
         equity = await self._get_equity()
         cap = self._capital_floor_cap(equity)
-        
-        self.logger.info(
-            f"🎛️  Capital Floor: equity={equity:.2f} USDT → cap={cap} symbols"
-        )
+
+        self.logger.info(f"🎛️  Capital Floor: equity={equity:.2f} USDT → cap={cap} symbols")
 
         # Rule 2: API Health Guard
         if self._api_rate_limited:
             cap = max(1, cap - 1)
-            self.logger.warning(
-                f"⚠️  API Rate Limited detected → reduce cap to {cap}"
-            )
+            self.logger.warning(f"⚠️  API Rate Limited detected → reduce cap to {cap}")
 
         # Rule 3: Retrain Stability Guard
         if self._retrain_skipped_count > self.max_retrain_skips:
@@ -105,7 +94,7 @@ class CapitalSymbolGovernor:
     def _capital_floor_cap(self, equity: float) -> int:
         """
         Map equity to symbol cap using static tiers.
-        
+
         Equity Range    | Cap
         ───────────────────────
         < 250           | 2
@@ -128,7 +117,7 @@ class CapitalSymbolGovernor:
     async def _get_equity(self) -> float:
         """
         Fetch total USDT equity from SharedState.balances.
-        
+
         Returns:
           float: Total USDT equity (free + locked)
         """
@@ -153,7 +142,7 @@ class CapitalSymbolGovernor:
     async def _get_drawdown_pct(self) -> Optional[float]:
         """
         Fetch current drawdown percentage from SharedState.
-        
+
         Returns:
           float or None: Current drawdown as percentage (e.g., 5.2 for 5.2%)
         """
@@ -164,19 +153,21 @@ class CapitalSymbolGovernor:
             # Try to get drawdown from shared_state (various possible attributes)
             if hasattr(self.shared_state, "current_drawdown"):
                 return float(self.shared_state.current_drawdown)
-            
+
             if hasattr(self.shared_state, "metrics"):
                 metrics = self.shared_state.metrics
                 if isinstance(metrics, dict) and "drawdown_pct" in metrics:
                     return float(metrics["drawdown_pct"])
-            
+
             # Fallback: compute from peak equity if available
-            if hasattr(self.shared_state, "peak_equity") and hasattr(self.shared_state, "current_equity"):
+            if hasattr(self.shared_state, "peak_equity") and hasattr(
+                self.shared_state, "current_equity"
+            ):
                 peak = float(self.shared_state.peak_equity)
                 current = float(self.shared_state.current_equity)
                 if peak > 0:
                     return ((peak - current) / peak) * 100.0
-            
+
             return None
 
         except Exception as e:
@@ -202,9 +193,7 @@ class CapitalSymbolGovernor:
         Triggers Rule 3 if count exceeds max_retrain_skips.
         """
         self._retrain_skipped_count += 1
-        self.logger.debug(
-            f"📊 Retrain skip recorded ({self._retrain_skipped_count} total)"
-        )
+        self.logger.debug(f"📊 Retrain skip recorded ({self._retrain_skipped_count} total)")
 
     def reset_retrain_skips(self):
         """Reset the retrain skip counter after successful retrain."""

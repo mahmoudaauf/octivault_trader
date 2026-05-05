@@ -115,7 +115,7 @@ Save as `dashboard.sh` and run: `bash dashboard.sh` (runs every 2 seconds with w
 
 ### NORMAL STARTUP SEQUENCE (Should see these in order)
 1. ✅ "Config initialized" - Configuration loaded
-2. ✅ "Exchange connected" - Binance API responding  
+2. ✅ "Exchange connected" - Binance API responding
 3. ✅ "Capital loaded" - NAV and balance determined
 4. ✅ "Symbol bootstrap" - 10 symbols initialized
 5. ✅ "Signal processor ready" - Hunters activated
@@ -153,7 +153,7 @@ Save as `dashboard.sh` and run: `bash dashboard.sh` (runs every 2 seconds with w
 ```
 Every BUY signal should show:
   quote=25.00
-  
+
 Track: grep -c "quote=25.00"
 Expected to grow linearly with trading activity
 ```
@@ -284,4 +284,3 @@ Run this every minute to get instant status update.
 **At 30-minute mark, system reaches FULL OPERATIONAL status**
 
 ---
-

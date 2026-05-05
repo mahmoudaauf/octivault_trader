@@ -41,15 +41,15 @@ else:  # position_value > significant_floor
 def _regime_check_max_positions(self) -> bool:
     """
     Check if we've reached max open positions for regime.
-    
+
     MICRO_SNIPER: Max 1 open position    ← Current regime
     STANDARD: Max 2 open positions
     MULTI_AGENT: Max 3+ open positions
     """
-    
+
     max_pos = self._get_max_positions()
     active_pos_count = count_active_positions()
-    
+
     if active_pos_count >= max_pos:
         return False  # Blocks trade
     return True  # Allows trade
@@ -76,33 +76,33 @@ async def classify_position(symbol: str, qty: float) -> PositionTier:
     """
     Classify position into tier based on multiple factors
     """
-    
+
     # Get position value
     price = await safe_price(symbol)
     position_value = qty * price
-    
+
     # Check 1: Dust floor
     if position_value < DUST_FLOOR_USDT:  # $1
         return PositionTier.TIER3
-    
+
     # Check 2: Unhealable dust
     _, min_notional = await compute_symbol_trade_rules(symbol)
     if position_value < min_notional:  # $10-50 exchange minimum
         return PositionTier.UNHEALABLE
-    
+
     # Check 3: Secondary micro threshold
     if position_value < SECONDARY_THRESHOLD_USDT:  # $10-15
         return PositionTier.TIER2
-    
+
     # Check 4: Primary active position
     if position_value >= PRIMARY_THRESHOLD_USDT:  # $25+
         return PositionTier.TIER1
-    
+
     # Check 5: Time-based classification
     # Position > 4 hours old → may be marked TIER2 (aging)
     if position_age > 4 * 3600:
         return PositionTier.TIER2
-    
+
     return PositionTier.TIER1  # Default: primary
 
 
@@ -119,20 +119,20 @@ UNHEALABLE_THRESHOLD_USDT = 50.0
 async def position_blocks_new_buy(self, symbol: str, qty: float) -> Tuple[bool, str]:
     """
     Enhanced blocking logic with tier support
-    
+
     Returns: (is_blocked, reason)
     """
-    
+
     if qty <= 0:
         return False, "no_position"
-    
+
     # Classify existing position
     tier = await classify_position(symbol, qty)
-    
+
     # Decision matrix
     if tier == PositionTier.TIER1:
         return True, f"tier1_active_position_blocks"
-    
+
     elif tier == PositionTier.TIER2:
         # Check if Tier2 slot available
         tier2_count = count_tier2_positions()
@@ -140,13 +140,13 @@ async def position_blocks_new_buy(self, symbol: str, qty: float) -> Tuple[bool, 
         if tier2_count >= tier2_max:
             return True, f"tier2_slots_full"
         return False, "tier2_allows_parallel"
-    
+
     elif tier == PositionTier.TIER3:
         return False, "dust_never_blocks"
-    
+
     elif tier == PositionTier.UNHEALABLE:
         return False, "unhealable_never_blocks"
-    
+
     return True, "unknown_tier"
 ```
 
@@ -165,16 +165,16 @@ async def calculate_new_position_size(
     - Profitability history
     - Tier requirements
     """
-    
+
     # Get available capital
     total_balance = await get_balance()
     allocated = sum_tier1_allocations()
     reserved = sum_tier2_allocations()
     available = total_balance - allocated - reserved
-    
+
     # Base size from config
     base_size = config_entry_size
-    
+
     # Regime adjustment
     regime_factor = {
         "MICRO_SNIPER": 0.8,   # Conservative: 80% of config
@@ -182,10 +182,10 @@ async def calculate_new_position_size(
         "MULTI_AGENT": 1.0,     # Aggressive: 100% of config
     }.get(regime, 1.0)
     base_size *= regime_factor
-    
+
     # Capital constraint
     max_by_capital = available / (regime_max_positions + 1)
-    
+
     # Profitability multiplier (compounding)
     cumulative_pnl = await get_cumulative_pnl()
     starting_balance = 103.89  # Historical starting point
@@ -193,20 +193,20 @@ async def calculate_new_position_size(
         compounding_mult = 1.0 + (cumulative_pnl / starting_balance)
     else:
         compounding_mult = 1.0  # No boost on losses
-    
+
     # Final size
     final_size = min(
         base_size,
         max_by_capital,
         available
     )
-    
+
     # Apply compounding multiplier (gradual increase)
     if compounding_mult > 1.0:
         # Only boost if still within constraints
         boosted_size = final_size * min(compounding_mult, 1.15)  # Cap at 15% boost
         final_size = min(boosted_size, available)
-    
+
     return max(final_size, MIN_POSITION_USDT)  # Floor at minimum
 ```
 
@@ -478,7 +478,7 @@ async def test_tier_classification():
 async def test_entry_blocking():
     existing = PositionRecord(qty=0.005, tier=TIER2)
     assert position_blocks(existing) == False  # TIER2 doesn't block
-    
+
     existing = PositionRecord(qty=0.02, tier=TIER1)
     assert position_blocks(existing) == True   # TIER1 blocks
 
@@ -499,11 +499,11 @@ async def test_tier1_entry_to_exit():
     await execute_signal(symbol="BTC", tier=TIER1)
     assert count_tier1() == 1
     assert available_capital < 100
-    
+
     # Try to enter second Tier1 (should be blocked)
     ok = await can_enter_new_symbol("ETH")
     assert ok == True  # Different symbol, should allow
-    
+
     # Exit Tier1 position
     await exit_on_tp_signal()
     assert count_tier1() == 0
@@ -513,13 +513,13 @@ async def test_tier1_entry_to_exit():
 async def test_tier2_parallel():
     # Enter Tier1
     await execute_signal(symbol="BTC", tier=TIER1)
-    
+
     # Enter Tier2 in different symbol
     await execute_signal(symbol="ETH", tier=TIER2)
-    
+
     # Both running simultaneously
     assert count_positions() == 2
-    
+
     # Exit Tier2 (doesn't affect Tier1)
     await exit_on_sl_signal("ETH")
     assert count_tier2() == 0
@@ -534,11 +534,11 @@ async def test_capital_fragmentation():
     for i in range(10):
         signal = await get_next_signal()
         await execute_signal(signal)
-    
+
     # Verify no deadlock
     assert count_positions() <= regime_max + tier2_max
     assert available_capital > MIN_OPERATIONAL_RESERVE
-    
+
     # Force liquidate dust
     dust_value = await liquidate_all_dust()
     assert available_capital >= previous + dust_value
@@ -552,7 +552,7 @@ async def test_continuous_trading_48h():
         await manage_exits()
         await consolidate_dust()
         await log_metrics()
-    
+
     assert error_count == 0
     assert capital_recovered > starting_capital
 ```
@@ -630,4 +630,3 @@ METRIC 7: Account Recovery
 ├─ Measure: Total balance over time
 ├─ Success: Exponential recovery curve
 ```
-

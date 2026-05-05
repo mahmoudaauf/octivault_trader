@@ -1,8 +1,8 @@
 # System Profitability Root Cause Analysis & Solutions
 
-**Date:** May 4, 2026  
-**Session Start:** 08:16:38  
-**Status:** Running live trading (8-hour evaluation)  
+**Date:** May 4, 2026
+**Session Start:** 08:16:38
+**Status:** Running live trading (8-hour evaluation)
 **Capital:** $33.59 (CRITICAL - Micro Account)
 
 ---
@@ -14,7 +14,7 @@
 - ⏳ **It IS a matter of time**, but not in a good way—it's time until liquidation
 - ✅ **FIXABLE with immediate changes** - Multiple root causes identified with specific solutions
 
-**Expected outcome without changes:** 60% probability of -48% loss ($22 final value)  
+**Expected outcome without changes:** 60% probability of -48% loss ($22 final value)
 **Expected outcome WITH fixes:** 40% probability of +50-100% gain (compounding possible)
 
 ---
@@ -73,7 +73,7 @@ Historical Metrics:
 For profitability with current metrics:
   At 38% win rate and 3.3:1 loss ratio:
   Expected PnL = (0.38 × +0.205%) + (0.62 × -0.67%) = -0.3365%
-  
+
   This means EVERY SINGLE TRADE loses money on average
   Over 160 trades in 8 hours:
   Total expected loss = 160 × -0.3365% = -53.8% (liquidation)
@@ -92,11 +92,11 @@ Current logic:
 ```python
 position_size = (NAV × 0.15) for low volatility
               = (NAV × 0.25) for high volatility
-              
+
 At NAV = $33.59:
   Low vol:  $33.59 × 0.15 = $5.04 (TOO SMALL!)
   High vol: $33.59 × 0.25 = $8.40 (TOO SMALL!)
-  
+
 Then system tries to enforce min_notional = $10 USDT
 Result: Conflicts where position is $25-30 USDT
          (just above min but too small to trade profitably)
@@ -161,8 +161,8 @@ Result: ~$19 remaining (breakeven best case at 5% probability)
 
 ### **SOLUTION #1: Capital Raise (Highest Priority) 🚀**
 
-**Current state:** $33.59 is not tradeable  
-**Minimum viable:** $500  
+**Current state:** $33.59 is not tradeable
+**Minimum viable:** $500
 **Target:** $5,000
 
 **Why:**
@@ -251,13 +251,13 @@ if nav < 500:
     position_size = nav * 0.50  # Use 50% per trade (aggressive but necessary)
     if position_size < min_viable_position:
         # Don't trade, save capital
-        skip_all_trades()  
+        skip_all_trades()
         return
-        
+
 elif nav < 2000:
     # SMALL ACCOUNT MODE
     position_size = nav * 0.25  # Use 25% per trade
-    
+
 else:
     # NORMAL MODE
     position_size = nav * 0.15  # Use 15% per trade
@@ -277,7 +277,7 @@ position_size = max(position_size, min_viable_position)
 
 ### **SOLUTION #4: Disable Healing Cycle (Temporary) ⏸**
 
-**Current problem:** 
+**Current problem:**
 ```
 Healing cycle auto-liquidates $30 positions after 22 seconds
 This creates the loss pattern we're seeing
@@ -292,7 +292,7 @@ This creates the loss pattern we're seeing
 # if should_trigger_dust_healing():
 #     execute_healing_exit()  ← COMMENT THIS OUT
 
-# Reason: With proper capital + signal filtering, 
+# Reason: With proper capital + signal filtering,
 #         we won't CREATE dust positions to begin with
 #         So healing cycle becomes unnecessary
 
@@ -316,25 +316,25 @@ This creates the loss pattern we're seeing
 if current_nav < 500:
     # CAPITAL PRESERVATION MODE
     mode = "CAPITAL_PRESERVATION"
-    
+
     # Don't trade for profit—save capital
     allow_trading = False
-    
+
     # But DO:
     # - Heal existing dust positions
     # - Collect daily interest (if available)
     # - Wait for capital injection
     # - Monitor for recovery opportunities
-    
+
     # Timeline: Until NAV reaches $500+
     logger.warning(f"⏸ PRESERVATION MODE: NAV=${current_nav:.2f} < $500. Paused trading.")
-    
+
 elif current_nav < 2000:
     # SURVIVAL MODE (only trade with VERY high confidence)
     mode = "SURVIVAL"
     signal_floor = 0.90  # Only 90%+ confidence signals
     position_size_pct = 0.20  # Small positions
-    
+
 elif current_nav >= 2000:
     # NORMAL MODE (trade regularly)
     mode = "NORMAL"
@@ -451,12 +451,12 @@ Implementation:
 
 Results (8 hour session):
   Initial: $500.00
-  
+
   Hour 1: $500 × (1.005)^20 = $551 (+10%)
   Hour 2: $551 × (1.005)^20 = $607 (+10%)
   Hour 4: $607 × (1.005)^40 = $746 (+23%)
   Hour 8: $746 × (1.005)^80 = $1,097 (+119%)
-  
+
   Expected final: $1,000-1,500 range
   Probability: 60%+ with signal filtering
 ```
@@ -465,15 +465,15 @@ Results (8 hour session):
 ```
 Results (8 hour session):
   Initial: $2,000
-  
+
   With 70% win rate (after signal filtering):
   Expectancy per trade: +0.5% (vs -0.34% now)
-  
+
   Hour 1-2: $2000 × (1.005)^40 = $2,430 (+21.5%)
   Hour 3-4: $2430 × (1.005)^40 = $2,956 (+21.5%)
   Hour 5-6: $2956 × (1.005)^40 = $3,595 (+21.5%)
   Hour 7-8: $3595 × (1.005)^40 = $4,376 (+21.5%)
-  
+
   Final: $4,000-5,000 (100%+ gain)
   Probability: 70%+ with proper capitalization
 ```
@@ -598,13 +598,12 @@ if current_nav < 500:
 | Bad position sizing | ❌ NO (repeats cycle) | ✅ YES (algorithm fix) | 🔴 3 |
 | Healing destruction | ❌ NO (repeats churn) | ✅ YES (disable temp) | 🔴 4 |
 
-**Time WITHOUT fixes = Liquidation in 3-4 hours**  
+**Time WITHOUT fixes = Liquidation in 3-4 hours**
 **Fixes + Capital = Compounding in 2-3 hours**
 
-The system is **NOT** capable of compounding with current configuration.  
+The system is **NOT** capable of compounding with current configuration.
 The system **IS** capable of compounding with proper fixes + capital.
 
 **Choose your path:**
 - Path A: Wait → Liquidation 🔴
 - Path B: Fix → Compounding 🟢
-

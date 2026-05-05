@@ -1,7 +1,7 @@
 # 🚨 REVISED FIX STRATEGY: SYMBOL CHURN ROOT CAUSE
 
-**Date:** May 3, 2026  
-**Session:** Critical Reanalysis Post-Discovery  
+**Date:** May 3, 2026
+**Session:** Critical Reanalysis Post-Discovery
 **Status:** URGENT - Symbol churn identified as PRIMARY bleed mechanism
 
 ---
@@ -98,7 +98,7 @@ Result: Zero bleed from untested symbols, healing cycle succeeds on winners
 - ✅ FIX #5: Buffer capital rebuild (20% target)
 
 ### PART 6: SYMBOL CONVERGENCE - Lock in Proven Winners
-**File:** `src/l0_core/config.py`  
+**File:** `src/l0_core/config.py`
 **Purpose:** Define "proven" vs "experimental" symbols
 
 ```python
@@ -121,43 +121,43 @@ CONVERGENCE_MAX_EXPERIMENTAL_SYMBOLS = 2  # Allow 2 experiments at a time
 ```
 
 ### PART 7: SYMBOL SCREENER GATING - Prevent Junk Symbol Entry
-**File:** `agents/symbol_screener.py`  
+**File:** `agents/symbol_screener.py`
 **Purpose:** Filter out one-time symbols before they even trade
 
 ```python
 # Add to SymbolScreener._propose() method
 def _should_accept_symbol(self, symbol):
     """Gate new symbols based on convergence rules"""
-    
+
     # Is it a proven winner?
     if symbol in CONVERGENCE_PROVEN_SYMBOLS:
         return True  # Always accept proven symbols
-    
+
     # Is system in convergence mode?
     if not SYMBOL_CONVERGENCE_MODE:
         return True  # Old behavior: try everything
-    
+
     # Count current experimental symbols
     current_experimental = [
         s for s in self.accepted_symbols
         if s not in CONVERGENCE_PROVEN_SYMBOLS
     ]
-    
+
     # Are we already at max experiments?
     if len(current_experimental) >= CONVERGENCE_MAX_EXPERIMENTAL_SYMBOLS:
         return False  # Block new experiments
-    
+
     # New symbol: check quality metrics
     if self._atr_pct(symbol) > 0.01:  # Volatility too high?
         return False
     if self._volume(symbol) < 50000:  # Volume too low?
         return False
-    
+
     return True  # Accept (with caution)
 ```
 
 ### PART 8: AGENT DISCIPLINE - Force Focus on Proven Symbols
-**File:** `agents/swing_trade_hunter.py` (or similar)  
+**File:** `agents/swing_trade_hunter.py` (or similar)
 **Purpose:** Allocate 80% of capital to proven, 20% to experiments
 
 ```python
@@ -167,7 +167,7 @@ ALLOCATION_EXPERIMENTAL = 0.20  # 20% to test new symbols
 
 def get_available_capital(self, symbol):
     """Return capital available for this symbol"""
-    
+
     if symbol in CONVERGENCE_PROVEN_SYMBOLS:
         # Proven symbols get larger allocations
         return total_capital * (ALLOCATION_PROVEN / len(CONVERGENCE_PROVEN_SYMBOLS))
@@ -177,7 +177,7 @@ def get_available_capital(self, symbol):
 ```
 
 ### PART 9: AGENT THROTTLING - Prevent New Symbol Spam
-**File:** `agents/symbol_screener.py`  
+**File:** `agents/symbol_screener.py`
 **Purpose:** Limit how many new symbols can be discovered per day
 
 ```python
@@ -191,25 +191,25 @@ symbol_add_timestamps = {}  # symbol -> timestamp
 
 def discover_new_symbols(self):
     """Discover new symbols with throttling"""
-    
+
     new_symbols_today = sum(
         1 for sym, ts in symbol_add_timestamps.items()
         if datetime.now() - ts < timedelta(days=1)
     )
-    
+
     if new_symbols_today >= MAX_NEW_SYMBOLS_PER_DAY:
         return []  # Already hit daily limit
-    
+
     # Standard discovery
     candidates = self._find_candidates()
-    
+
     # Filter to only 1 new symbol
     new_candidates = [s for s in candidates if s not in self.accepted_symbols]
     return new_candidates[:1]  # Return only 1
 ```
 
 ### PART 10: EXCLUSION SYSTEM - Remember Bad Symbols
-**File:** `src/l0_core/shared_state.py`  
+**File:** `src/l0_core/shared_state.py`
 **Purpose:** Prevent re-proposing symbols that lost money
 
 ```python
@@ -337,4 +337,3 @@ Before restart with combined fix:
 **Status:** ✅ **READY FOR IMPLEMENTATION**
 
 **Recommendation:** Implement Parts 6-10 alongside the original 5-part fix for maximum impact.
-

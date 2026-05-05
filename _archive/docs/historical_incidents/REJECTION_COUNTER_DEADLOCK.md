@@ -35,10 +35,10 @@ MetaController: "RejectionThreshold >= 10, SKIPPING ETHUSDT"
 ### Evidence from Logs:
 
 ```
-2026-05-02 20:52:23,580 INFO [Meta:Block:RejectionThreshold] 
+2026-05-02 20:52:23,580 INFO [Meta:Block:RejectionThreshold]
   Skipping ETHUSDT BUY: rejected 10 times >= threshold 10 (micro=True)
 
-2026-05-02 20:52:25,588 CRITICAL [Deadlock:TRIGGER] 
+2026-05-02 20:52:25,588 CRITICAL [Deadlock:TRIGGER]
   ❌ REPEATED FAILURES DETECTED: CAPITAL_INSUFFICIENT count=10 >= threshold=10
 ```
 
@@ -82,9 +82,9 @@ Two options:
 
 ## Where to Make the Fix
 
-**File:** `src/l8_lifecycle/meta_controller.py`  
-**Function:** Any rejection counter management function (need to find it)  
-**Logic:** 
+**File:** `src/l8_lifecycle/meta_controller.py`
+**Function:** Any rejection counter management function (need to find it)
+**Logic:**
 
 ```python
 if rejection_reason == "CAPITAL_INSUFFICIENT" and count == 5:
@@ -146,7 +146,7 @@ This way:
 
 ---
 
-**Root Cause**: Rejection threshold (10) blocking signals before escalation point  
-**Impact**: System stuck in infinite rejection loop  
-**Liquidation Fix Applied**: ✅ (but unreachable due to rejection threshold)  
+**Root Cause**: Rejection threshold (10) blocking signals before escalation point
+**Impact**: System stuck in infinite rejection loop
+**Liquidation Fix Applied**: ✅ (but unreachable due to rejection threshold)
 **Proper Fix Needed**: Escalate on CAPITAL_INSUFFICIENT before hitting threshold

@@ -24,21 +24,21 @@ State A: BTCUSDT position = 0.05 BTC ($2,150)
 ```python
 async def _position_blocks_new_buy(self, symbol: str, existing_qty: float):
     """
-    Determines if existing position blocks new BUY under 
+    Determines if existing position blocks new BUY under
     one-position-per-symbol rules.
     """
     # If position value < $1 (permanent dust), doesn't block
     if pos_value < permanent_dust_threshold:
         return False  # Can enter new trade
-    
+
     # If position value < significant floor ($10-25), doesn't block
     if pos_value < significant_floor:
         return False  # Can enter new trade
-    
+
     # If position is "unhealable dust" (< minNotional), doesn't block
     if dust_classification == "UNHEALABLE_LT_MIN_NOTIONAL":
         return False  # Can enter new trade
-    
+
     # Otherwise, position blocks new entry
     return True  # BLOCKS new trade
 ```
@@ -49,9 +49,9 @@ async def _position_blocks_new_buy(self, symbol: str, existing_qty: float):
 def _regime_check_max_positions(self) -> bool:
     """
     Check if we've reached max open positions for regime.
-    
+
     MICRO_SNIPER: Max 1 open position
-    STANDARD:     Max 2 open positions  
+    STANDARD:     Max 2 open positions
     MULTI_AGENT:  Max 3+ open positions
     """
 ```
@@ -77,7 +77,7 @@ Trade 2: ETH/USDT
   ├─ Result: ❌ BLOCKED by BTC position
   └─ Impact: Missed opportunity ($2-5 potential profit)
 
-Total Impact: 
+Total Impact:
   • Only 25% of capital deployed (1 out of 4 possible positions)
   • 75% of capital idle/locked
   • Compounding disabled (no profit reinvestment)
@@ -86,7 +86,7 @@ Total Impact:
 ### Problem B: Capital Inefficiency Under Current Constraint
 ```
 With $103.89 account and $25 entry size:
-  
+
 Ideal Deployment: 4 positions × $25 = $100
 Current Deployment: 1-2 positions × $25 = $25-50
 
@@ -150,7 +150,7 @@ Logic:
   IF (Tier1_position > $20 AND NOT_FULLY_ALLOCATED):
     └─ Can open Tier 2 micro position
     └─ Even if Tier 1 still running
-  
+
 Example:
   ETHUSDT: $50 position (Tier 1)
   + LTCUSDT: $5 position (Tier 2)
@@ -340,12 +340,12 @@ Example:
   Available: $105
   Configured: $25
   Active positions: 1
-  
+
   New_Position_Size = MIN(25, 105/1, 100) = $25
   Cumulative_Profit: $26
   Compounding_Mult: 1 + (26/103.89) = 1.25
   Adjusted_Size: 25 × 1.25 = $31.25
-  
+
   → Enter next position at $31.25 (up to $31.25 max)
 ```
 
@@ -395,7 +395,7 @@ UNHEALABLE (does not block)
   └─ Rule: Does not prevent new trades
 
 Example:
-  BTCUSDT @ $25 (ACTIVE) + BTCUSDT @ $0.50 (DUST) 
+  BTCUSDT @ $25 (ACTIVE) + BTCUSDT @ $0.50 (DUST)
   = Only ACTIVE blocks new entries
   = Can enter new BTCUSDT if capital + opportunity
 ```
@@ -412,7 +412,7 @@ Metric 1: Win Rate
   Target: > 50% for sustainability
   Current: 0% (16/16 losses) ❌
   Improvement: Debug TrendHunter signal quality
-  
+
   Win Rate Impact on $100 account:
     30% win rate: Breaks even long-term
     50% win rate: ~1-2% weekly gain
@@ -423,7 +423,7 @@ Metric 2: Average Win/Loss Ratio
   Definition: (Avg profit per win / Avg loss per loss)
   Target: > 1.5:1 (win should be 1.5× loss size)
   Current: UNDEFINED (no wins yet)
-  
+
   R:R Impact (assuming 50% win rate):
     1:1 ratio: Net 0% (break even)
     1.5:1 ratio: +25% expected return
@@ -434,32 +434,32 @@ Metric 3: Drawdown Percentage
   Definition: (Peak-to-Trough / Peak) × 100
   Target: < 30% maximum drawdown
   Current: 96.4% drawdown (CRITICAL) ❌
-  
+
   Recovery from different drawdowns:
     30% loss: Requires 43% gain to recover
     50% loss: Requires 100% gain to recover
     75% loss: Requires 300% gain to recover
     96% loss: Requires 2400% gain to recover ← Current state
-    
+
   → Explains why dust trap is so problematic
 
 Metric 4: Capital Utilization
   Definition: (Deployed Capital / Total Capital) × 100
   Target: 80-95% utilization
   Current: 24% utilization (capital idle) ⚠️
-  
+
   Impact of low utilization:
     25% utilization: $26 annual return on $103
     50% utilization: $52 annual return
     80% utilization: $83 annual return
-    
+
   → Entry size reduction ($25→$5) fixes this immediately
 
 Metric 5: Compounding Frequency
   Definition: Number of reinvestment cycles per month
   Target: 8-12 cycles (2-3 per week)
   Current: 1-2 cycles (insufficient) ⚠️
-  
+
   Compounding Impact (50% win rate, $5 entry):
     Monthly cycles:  1 → Account grows ~1% (no effect)
     Monthly cycles:  4 → Account grows ~15% (exponential)
@@ -473,7 +473,7 @@ Monthly_Profit = (Win_Rate × Avg_Win) - ((1 - Win_Rate) × Avg_Loss)
 
 Breakeven Point:
   Win_Rate × Avg_Win = (1 - Win_Rate) × Avg_Loss
-  
+
 Example 1: No risk management (current state)
   Win_Rate: 0%
   Avg_Win: Unknown (no wins)
@@ -563,4 +563,3 @@ This maintains risk discipline while enabling:
 ✅ Parallel trading (2-4 positions)
 ✅ Faster compounding (8-12 cycles/month)
 ✅ Profitability scaling ($103 → $500+)
-

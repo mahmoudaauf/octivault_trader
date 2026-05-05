@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Capital Velocity Optimizer - Institutional Capital Velocity Coordination
 
@@ -28,59 +27,62 @@ Architecture:
   Rotation Recommendations  ──→ MetaController
 """
 
-import time
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+import time
 from dataclasses import dataclass
+from typing import Any, Optional
 
 
 @dataclass
 class PositionVelocityMetric:
     """Real-time velocity snapshot for a position."""
+
     symbol: str
-    pnl_pct: float              # Unrealized P&L %
-    entry_time: float           # Unix timestamp
-    age_hours: float            # How long held
-    pnl_per_hour: float         # P&L % / hours held
-    holding_cost_bps: float     # Fees as basis points per hour
-    net_velocity: float         # P&L per hour minus holding cost
-    is_recyclable: bool         # Can be exited for better opportunity
+    pnl_pct: float  # Unrealized P&L %
+    entry_time: float  # Unix timestamp
+    age_hours: float  # How long held
+    pnl_per_hour: float  # P&L % / hours held
+    holding_cost_bps: float  # Fees as basis points per hour
+    net_velocity: float  # P&L per hour minus holding cost
+    is_recyclable: bool  # Can be exited for better opportunity
 
 
 @dataclass
 class OpportunityVelocityMetric:
     """Estimated velocity for a candidate symbol."""
+
     symbol: str
-    expected_return_pct: float   # ML-based edge estimate
-    expected_move_pct: float     # Volatility/movement estimate from ML
-    ml_confidence: float         # MLForecaster confidence (0-1)
+    expected_return_pct: float  # ML-based edge estimate
+    expected_move_pct: float  # Volatility/movement estimate from ML
+    ml_confidence: float  # MLForecaster confidence (0-1)
     estimated_velocity_pct: float  # Expected return per hour
-    liquidity_score: float       # How easy to enter/exit (0-1)
+    liquidity_score: float  # How easy to enter/exit (0-1)
     time_to_breakeven_hours: float  # How long to recover fees
 
 
 @dataclass
 class VelocityOptimizationPlan:
     """Output: structured recommendation for capital reallocation."""
+
     timestamp: float
-    portfolio_velocity_pct_per_hour: float   # Current weighted average
-    opportunity_velocity_pct_per_hour: float # Best available opportunity
-    velocity_gap: float                       # Opportunity - Portfolio
-    rotations_recommended: List[Dict[str, Any]]  # [{"exit_symbol": X, "reason": Y, ...}]
-    hold_positions: List[str]                 # Symbols to keep
-    analysis: Dict[str, Any]                 # Debug metrics
+    portfolio_velocity_pct_per_hour: float  # Current weighted average
+    opportunity_velocity_pct_per_hour: float  # Best available opportunity
+    velocity_gap: float  # Opportunity - Portfolio
+    rotations_recommended: list[dict[str, Any]]  # [{"exit_symbol": X, "reason": Y, ...}]
+    hold_positions: list[str]  # Symbols to keep
+    analysis: dict[str, Any]  # Debug metrics
 
 
 class CapitalVelocityOptimizer:
     """
     Institutional capital velocity coordinator.
-    
+
     Responsibilities:
     1. Measure position velocity (realized P&L per unit time)
     2. Estimate opportunity velocity (forward-looking from ML + market metrics)
     3. Identify recyclable positions (low velocity relative to opportunities)
     4. Recommend optimal rotation timing
-    
+
     Design:
     - Reads from existing authorities (PortfolioAuthority, MLForecaster, performance metrics)
     - Outputs structured recommendations to MetaController
@@ -108,9 +110,7 @@ class CapitalVelocityOptimizer:
         self.holding_cost_fee_bps = float(
             getattr(config, "VELOCITY_HOLDING_COST_FEE_BPS", 10.0)  # 10 bps per trade
         )
-        self.velocity_confidence_min = float(
-            getattr(config, "VELOCITY_CONFIDENCE_MIN", 0.55)
-        )
+        self.velocity_confidence_min = float(getattr(config, "VELOCITY_CONFIDENCE_MIN", 0.55))
         self.enable_velocity_optimization = bool(
             getattr(config, "ENABLE_CAPITAL_VELOCITY_OPTIMIZATION", True)
         )
@@ -119,20 +119,24 @@ class CapitalVelocityOptimizer:
     # SECTION A: POSITION VELOCITY MEASUREMENT
     # ════════════════════════════════════════════════════════════════════════════════
 
-    def evaluate_position_velocity(self, symbol: str, position: Dict[str, Any], now: float) -> PositionVelocityMetric:
+    def evaluate_position_velocity(
+        self, symbol: str, position: dict[str, Any], now: float
+    ) -> PositionVelocityMetric:
         """
         Measure real-time velocity of an open position.
-        
+
         Args:
             symbol: Position symbol
             position: Position dict from SharedState
             now: Current timestamp (unix)
-            
+
         Returns:
             PositionVelocityMetric with velocity components
         """
         pnl_pct = float((position or {}).get("unrealized_pnl_pct", 0.0) or 0.0)
-        entry_time = float((position or {}).get("entry_time", 0.0) or (position or {}).get("opened_at", 0.0) or now)
+        entry_time = float(
+            (position or {}).get("entry_time", 0.0) or (position or {}).get("opened_at", 0.0) or now
+        )
         age_hours = max(0.001, (now - entry_time) / 3600.0)
 
         # P&L per hour (annualized velocity)
@@ -161,11 +165,11 @@ class CapitalVelocityOptimizer:
         )
 
     async def measure_portfolio_velocity(
-        self, owned_positions: Dict[str, Any]
-    ) -> Tuple[float, Dict[str, PositionVelocityMetric]]:
+        self, owned_positions: dict[str, Any]
+    ) -> tuple[float, dict[str, PositionVelocityMetric]]:
         """
         Measure aggregate portfolio velocity.
-        
+
         Returns:
             (weighted_avg_velocity_pct_per_hour, position_metrics_dict)
         """
@@ -199,24 +203,24 @@ class CapitalVelocityOptimizer:
     # ════════════════════════════════════════════════════════════════════════════════
 
     def estimate_opportunity_velocity(
-        self, symbol: str, ml_signal: Dict[str, Any]
+        self, symbol: str, ml_signal: dict[str, Any]
     ) -> Optional[OpportunityVelocityMetric]:
         """
         Estimate velocity potential of a candidate symbol using ML signal data.
-        
+
         Uses MLForecaster outputs:
         - confidence: probability of direction correctness
         - _expected_move_pct: volatility / movement estimate
         - action: BUY/SELL direction
-        
+
         Formula:
           expected_return = confidence * expected_move_pct
           estimated_velocity = expected_return / time_to_achieve
-          
+
         Args:
             symbol: Candidate symbol
             ml_signal: Signal dict from MLForecaster (must contain confidence, _expected_move_pct)
-            
+
         Returns:
             OpportunityVelocityMetric or None if signal too weak
         """
@@ -269,14 +273,14 @@ class CapitalVelocityOptimizer:
         )
 
     async def estimate_universe_opportunity(
-        self, candidate_symbols: List[str]
-    ) -> Dict[str, OpportunityVelocityMetric]:
+        self, candidate_symbols: list[str]
+    ) -> dict[str, OpportunityVelocityMetric]:
         """
         Estimate velocity for all candidate symbols using latest ML signals.
-        
+
         Args:
             candidate_symbols: List of symbols to evaluate
-            
+
         Returns:
             Dict[symbol] -> OpportunityVelocityMetric (only for viable candidates)
         """
@@ -310,17 +314,15 @@ class CapitalVelocityOptimizer:
     # SECTION C: OPTIMAL HOLD TIME ESTIMATION
     # ════════════════════════════════════════════════════════════════════════════════
 
-    def estimate_optimal_exit_time(
-        self, position_metric: PositionVelocityMetric
-    ) -> Dict[str, Any]:
+    def estimate_optimal_exit_time(self, position_metric: PositionVelocityMetric) -> dict[str, Any]:
         """
         Estimate when to exit a position based on velocity and aging.
-        
+
         Simple heuristic:
         - If velocity is positive and recent (< 1 hour): hold
         - If velocity turns negative: consider exit
         - If velocity stagnates for extended period: rotate
-        
+
         Returns dict with recommendation and rationale.
         """
         hold_recommendation = {
@@ -365,23 +367,23 @@ class CapitalVelocityOptimizer:
 
     def recommend_rotation(
         self,
-        portfolio_metrics: Dict[str, PositionVelocityMetric],
-        opportunity_metrics: Dict[str, OpportunityVelocityMetric],
+        portfolio_metrics: dict[str, PositionVelocityMetric],
+        opportunity_metrics: dict[str, OpportunityVelocityMetric],
         portfolio_velocity_avg: float,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Generate rotation recommendations by comparing position vs opportunity velocity.
-        
+
         Logic:
         1. Identify low-velocity positions (recyclable)
         2. Compare vs best opportunities
         3. If velocity_gap > threshold, recommend rotation
-        
+
         Args:
             portfolio_metrics: Position velocity metrics
             opportunity_metrics: Candidate velocity estimates
             portfolio_velocity_avg: Weighted portfolio velocity
-            
+
         Returns:
             List of rotation recommendations [{exit_symbol, opportunity_symbol, gap, confidence}, ...]
         """
@@ -405,9 +407,7 @@ class CapitalVelocityOptimizer:
 
         # Find recyclable positions
         recyclable = [
-            (sym, metric)
-            for sym, metric in portfolio_metrics.items()
-            if metric.is_recyclable
+            (sym, metric) for sym, metric in portfolio_metrics.items() if metric.is_recyclable
         ]
 
         if not recyclable:
@@ -442,16 +442,16 @@ class CapitalVelocityOptimizer:
 
     async def optimize_capital_velocity(
         self,
-        owned_positions: Dict[str, Any],
-        candidate_symbols: List[str],
+        owned_positions: dict[str, Any],
+        candidate_symbols: list[str],
     ) -> VelocityOptimizationPlan:
         """
         Main entry point: coordinate all velocity measurements and generate optimization plan.
-        
+
         Args:
             owned_positions: Dict of current positions from SharedState
             candidate_symbols: List of symbols being considered for entry
-            
+
         Returns:
             VelocityOptimizationPlan with recommendations
         """
@@ -468,7 +468,9 @@ class CapitalVelocityOptimizer:
 
         try:
             # Step 1: Measure current portfolio velocity
-            portfolio_velocity_avg, position_metrics = await self.measure_portfolio_velocity(owned_positions)
+            portfolio_velocity_avg, position_metrics = await self.measure_portfolio_velocity(
+                owned_positions
+            )
 
             # Step 2: Estimate opportunity velocity
             opportunity_metrics = await self.estimate_universe_opportunity(candidate_symbols)
@@ -498,7 +500,9 @@ class CapitalVelocityOptimizer:
                 analysis={
                     "position_count": len(owned_positions),
                     "candidate_count": len(candidate_symbols),
-                    "recyclable_count": sum(1 for m in position_metrics.values() if m.is_recyclable),
+                    "recyclable_count": sum(
+                        1 for m in position_metrics.values() if m.is_recyclable
+                    ),
                     "opportunity_count": len(opportunity_metrics),
                     "position_metrics": {
                         sym: {
@@ -531,7 +535,9 @@ class CapitalVelocityOptimizer:
             return plan
 
         except Exception as e:
-            self.logger.error("[VelocityOptimizer] Exception in optimize_capital_velocity", exc_info=True)
+            self.logger.error(
+                "[VelocityOptimizer] Exception in optimize_capital_velocity", exc_info=True
+            )
             return VelocityOptimizationPlan(
                 timestamp=time.time(),
                 portfolio_velocity_pct_per_hour=0.0,

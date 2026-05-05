@@ -1,7 +1,7 @@
 # 📊 Backtest Performance Analysis Report
 
-**Report Date**: April 23, 2026  
-**Session**: 2-Hour Trading Session (20:17 current time)  
+**Report Date**: April 23, 2026
+**Session**: 2-Hour Trading Session (20:17 current time)
 **Backtest Data Source**: `regime_exposure_backtest_results.json`
 
 ---
@@ -35,7 +35,7 @@ Max Drawdown:     -3.02% (acceptable)
 Win Rate:         51.75% ✅ (profitable)
 ```
 
-**2. Dynamic Strategy** 
+**2. Dynamic Strategy**
 ```
 Total Return:     +0.98% (slightly worse)
 Annual Return:    +6.08%
@@ -150,7 +150,7 @@ Verdict: ✅ Drawdown is MANAGEABLE
 ### For BTC Trading: Use AGGRESSIVE ⭐
 
 ```
-Why: 
+Why:
 ✅ Highest total return (+1.44%)
 ✅ Best Sharpe ratio (0.78)
 ✅ SAME max drawdown as conservative (-3.02%)
@@ -325,7 +325,7 @@ Better: Let them build history first
    - Record actual returns
    - Compare to backtest predictions
 
-2. **Aggressive strategy evaluation**: 
+2. **Aggressive strategy evaluation**:
    - If BTCUSDT performs well → Continue
    - If ETH improves → Consider trading
    - If new symbols prove > 50% → Add to rotation

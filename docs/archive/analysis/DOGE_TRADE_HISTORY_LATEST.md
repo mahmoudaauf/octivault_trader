@@ -1,7 +1,7 @@
 # 📊 DOGE TRADE HISTORY - LAST TRADES ANALYSIS
 
-**Date:** April 28, 2026, 00:03-00:22 UTC  
-**Status:** Recent trades analyzed from system logs  
+**Date:** April 28, 2026, 00:03-00:22 UTC
+**Status:** Recent trades analyzed from system logs
 **Log Source:** `system_restart_20260428_000327.log`
 
 ---
@@ -118,7 +118,7 @@ Feature Dims:     29 features
 Model Output:
   Buy Probability:   76.67%
   Hold Probability:  23.33%
-  
+
 Final Decision:   BUY
 Confidence:       0.77 (77%)
 Position Scale:   1.50x
@@ -127,7 +127,7 @@ Suppression Reason:
   Expected Move:  0.2350% < Required 0.6080%
   Multiplier:     1.60x
   Round Trip Cost: 0.3800%
-  
+
 Status:           ❌ BUY SUPPRESSED
 ```
 
@@ -246,12 +246,12 @@ Status:           CLEAN - No dust left
    - EMA-based strategy
    - Currently generating SELL signals
    - Confidence: 0.65 (65%)
-   
+
 2. **TrendHunter** (Active)
    - ML-enhanced trend following
    - Currently low-confidence (0.41 < 0.60 min)
    - Prefilter: PASSED
-   
+
 3. **MLForecaster** (Active)
    - Full OHLCV feature analysis
    - Predicts BUY (77% confidence)
@@ -290,7 +290,6 @@ System will execute a BUY when:
 
 ---
 
-**Report Generated:** April 28, 2026, 00:22:45 UTC  
-**Data Source:** system_restart_20260428_000327.log  
+**Report Generated:** April 28, 2026, 00:22:45 UTC
+**Data Source:** system_restart_20260428_000327.log
 **Status:** ✅ ANALYSIS COMPLETE
-

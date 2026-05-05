@@ -1,22 +1,23 @@
-
 import logging
 import os
-import time
 import platform
-import numpy as np
-from typing import Any, Dict, Optional, Union
+import time
 from pathlib import Path
+from typing import Any, Optional, Union
+
+import numpy as np
 
 try:
     import tensorflow as tf
+    from tensorflow.keras.layers import GRU, LSTM, Dense, Dropout
     from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
     from tensorflow.keras.optimizers import Adam
+
     try:
         from tensorflow.keras.optimizers.legacy import Adam as LegacyAdam
     except Exception:
         LegacyAdam = None
-    from tensorflow.keras.callbacks import EarlyStopping, Callback
+    from tensorflow.keras.callbacks import Callback, EarlyStopping
 except ImportError:
     tf = None
     EarlyStopping = None
@@ -29,27 +30,36 @@ except ImportError:
     pd = None
 
 try:
-    from sklearn.preprocessing import StandardScaler
     from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.preprocessing import StandardScaler
     from sklearn.utils.class_weight import compute_class_weight
 except ImportError:
     StandardScaler = None
     CalibratedClassifierCV = None
     compute_class_weight = None
 
-# Using ModelManager's helper to build paths if needed, 
+# Using ModelManager's helper to build paths if needed,
 # or we can redefine it locally to keep it standalone.
 # We'll rely on the caller to handle paths or import from model_manager.
-from src.l5_strategy.model_manager import build_model_path, save_model, model_exists
+from src.l5_strategy.model_manager import build_model_path, model_exists, save_model
+
 
 class ModelTrainer:
     """
     Supervised Learning Trainer for binary classification.
     Trains a model to predict BUY (1) or HOLD/SELL (0) actions based on market data states.
     """
-    def __init__(self, symbol: str, timeframe: str = "5m", input_lookback: int = 20, 
-                 epochs: int = 15, learning_rate: float = 0.001,
-                 agent_name: str = "TrendHunter", model_manager: Any = None):
+
+    def __init__(
+        self,
+        symbol: str,
+        timeframe: str = "5m",
+        input_lookback: int = 20,
+        epochs: int = 15,
+        learning_rate: float = 0.001,
+        agent_name: str = "TrendHunter",
+        model_manager: Any = None,
+    ):
         self.logger = logging.getLogger(f"ModelTrainer_{symbol}")
         self.symbol = symbol
         self.timeframe = timeframe
@@ -62,40 +72,65 @@ class ModelTrainer:
         self.max_train_rows = int(os.getenv("ML_TRAIN_MAX_ROWS", "256") or 256)
         self.progress_every = max(1, int(os.getenv("ML_TRAIN_LOG_EVERY_EPOCHS", "1") or 1))
         self.early_stop_patience = max(0, int(os.getenv("ML_TRAIN_EARLY_STOP_PATIENCE", "2") or 2))
-        self.early_stop_min_delta = float(os.getenv("ML_TRAIN_EARLY_STOP_MIN_DELTA", "0.0005") or 0.0005)
+        self.early_stop_min_delta = float(
+            os.getenv("ML_TRAIN_EARLY_STOP_MIN_DELTA", "0.0005") or 0.0005
+        )
         self.cpu_epoch_cap = max(1, int(os.getenv("ML_TRAIN_CPU_EPOCH_CAP", "15") or 15))
-        
+
         # New improvements
-        self.label_threshold_pct = float(os.getenv("ML_TRAIN_LABEL_THRESHOLD_PCT", "0.0005") or 0.0005)
+        self.label_threshold_pct = float(
+            os.getenv("ML_TRAIN_LABEL_THRESHOLD_PCT", "0.0005") or 0.0005
+        )
         self.use_gru = bool(os.getenv("ML_TRAIN_USE_GRU", "true").lower() == "true")
         self.gru_units_1 = max(8, int(os.getenv("ML_TRAIN_GRU_UNITS_1", "24") or 24))
         self.gru_units_2 = max(4, int(os.getenv("ML_TRAIN_GRU_UNITS_2", "12") or 12))
         self.dense_units = max(4, int(os.getenv("ML_TRAIN_DENSE_UNITS", "8") or 8))
-        
+
         # PHASE 3: Regime-aware label thresholds
-        self.regime_aware_labels_enabled = bool(os.getenv("ML_REGIME_AWARE_LABELS_ENABLED", "true").lower() == "true")
-        self.label_trend_threshold_pct = float(os.getenv("ML_LABEL_TREND_THRESHOLD_PCT", "0.0020") or 0.0020)
-        self.label_sideways_threshold_pct = float(os.getenv("ML_LABEL_SIDEWAYS_THRESHOLD_PCT", "0.0010") or 0.0010)
-        self.label_extreme_threshold_pct = float(os.getenv("ML_LABEL_EXTREME_THRESHOLD_PCT", "0.0030") or 0.0030)
-        
+        self.regime_aware_labels_enabled = bool(
+            os.getenv("ML_REGIME_AWARE_LABELS_ENABLED", "true").lower() == "true"
+        )
+        self.label_trend_threshold_pct = float(
+            os.getenv("ML_LABEL_TREND_THRESHOLD_PCT", "0.0020") or 0.0020
+        )
+        self.label_sideways_threshold_pct = float(
+            os.getenv("ML_LABEL_SIDEWAYS_THRESHOLD_PCT", "0.0010") or 0.0010
+        )
+        self.label_extreme_threshold_pct = float(
+            os.getenv("ML_LABEL_EXTREME_THRESHOLD_PCT", "0.0030") or 0.0030
+        )
+
         # IMPROVED LABELING: Triple Barrier Method
-        self.use_triple_barrier_labels = bool(os.getenv("ML_USE_TRIPLE_BARRIER_LABELS", "true").lower() == "true")
-        self.triple_barrier_fee_pct = float(os.getenv("ML_TRIPLE_BARRIER_FEE_PCT", "0.001") or 0.001)
-        self.triple_barrier_slippage_pct = float(os.getenv("ML_TRIPLE_BARRIER_SLIPPAGE_PCT", "0.0005") or 0.0005)
-        self.triple_barrier_buffer_pct = float(os.getenv("ML_TRIPLE_BARRIER_BUFFER_PCT", "0.0005") or 0.0005)
-        self.triple_barrier_lookforward = max(1, int(os.getenv("ML_TRIPLE_BARRIER_LOOKFORWARD_BARS", "5") or 5))
-        
+        self.use_triple_barrier_labels = bool(
+            os.getenv("ML_USE_TRIPLE_BARRIER_LABELS", "true").lower() == "true"
+        )
+        self.triple_barrier_fee_pct = float(
+            os.getenv("ML_TRIPLE_BARRIER_FEE_PCT", "0.001") or 0.001
+        )
+        self.triple_barrier_slippage_pct = float(
+            os.getenv("ML_TRIPLE_BARRIER_SLIPPAGE_PCT", "0.0005") or 0.0005
+        )
+        self.triple_barrier_buffer_pct = float(
+            os.getenv("ML_TRIPLE_BARRIER_BUFFER_PCT", "0.0005") or 0.0005
+        )
+        self.triple_barrier_lookforward = max(
+            1, int(os.getenv("ML_TRIPLE_BARRIER_LOOKFORWARD_BARS", "5") or 5)
+        )
+
         # Feature scaling persistence
         self.feature_scalers = {}  # Will store sklearn scalers
-        
+
         # Probability calibration
-        self.calibration_method = os.getenv("ML_TRAIN_CALIBRATION_METHOD", "isotonic")  # isotonic or sigmoid
+        self.calibration_method = os.getenv(
+            "ML_TRAIN_CALIBRATION_METHOD", "isotonic"
+        )  # isotonic or sigmoid
         self.enable_calibration = bool(
-            os.getenv("ML_TRAIN_ENABLE_CALIBRATION", "false").strip().lower() in {"1", "true", "yes", "on"}
+            os.getenv("ML_TRAIN_ENABLE_CALIBRATION", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
         )
-        
+
         self.model = None
-        self._last_train_metrics: Dict[str, Any] = {}
+        self._last_train_metrics: dict[str, Any] = {}
 
         if tf is None:
             self.logger.warning("TensorFlow not available. Training will be disabled.")
@@ -121,41 +156,75 @@ class ModelTrainer:
                 use_legacy = bool(is_apple_arm)
 
         if use_legacy:
-            self.logger.info("Using legacy Adam optimizer for improved Apple Silicon training performance.")
+            self.logger.info(
+                "Using legacy Adam optimizer for improved Apple Silicon training performance."
+            )
             return LegacyAdam(learning_rate=self.learning_rate, clipnorm=1.0)
         return Adam(learning_rate=self.learning_rate, clipnorm=1.0)
 
     def _build_model(self, state_shape):
-        if tf is None: return None
-        
+        if tf is None:
+            return None
+
         # Lightweight GRU architecture for CPU efficiency
         layers = []
         if self.use_gru:
-            self.logger.info(f"Building lightweight GRU model for {self.symbol} (units: {self.gru_units_1}, {self.gru_units_2}, dense: {self.dense_units})")
-            layers.append(GRU(self.gru_units_1, input_shape=state_shape, return_sequences=True, 
-                             kernel_regularizer=tf.keras.regularizers.l2(0.001)))
+            self.logger.info(
+                f"Building lightweight GRU model for {self.symbol} (units: {self.gru_units_1}, {self.gru_units_2}, dense: {self.dense_units})"
+            )
+            layers.append(
+                GRU(
+                    self.gru_units_1,
+                    input_shape=state_shape,
+                    return_sequences=True,
+                    kernel_regularizer=tf.keras.regularizers.l2(0.001),
+                )
+            )
             layers.append(Dropout(0.3))
-            layers.append(GRU(self.gru_units_2, return_sequences=False,
-                             kernel_regularizer=tf.keras.regularizers.l2(0.001)))
+            layers.append(
+                GRU(
+                    self.gru_units_2,
+                    return_sequences=False,
+                    kernel_regularizer=tf.keras.regularizers.l2(0.001),
+                )
+            )
         else:
             # Fallback to lightweight LSTM if GRU disabled
-            self.logger.info(f"Building lightweight LSTM model for {self.symbol} (units: {self.gru_units_1}, {self.gru_units_2}, dense: {self.dense_units})")
-            layers.append(LSTM(self.gru_units_1, input_shape=state_shape, return_sequences=True,
-                              kernel_regularizer=tf.keras.regularizers.l2(0.001)))
+            self.logger.info(
+                f"Building lightweight LSTM model for {self.symbol} (units: {self.gru_units_1}, {self.gru_units_2}, dense: {self.dense_units})"
+            )
+            layers.append(
+                LSTM(
+                    self.gru_units_1,
+                    input_shape=state_shape,
+                    return_sequences=True,
+                    kernel_regularizer=tf.keras.regularizers.l2(0.001),
+                )
+            )
             layers.append(Dropout(0.3))
-            layers.append(LSTM(self.gru_units_2, return_sequences=False,
-                              kernel_regularizer=tf.keras.regularizers.l2(0.001)))
-            
+            layers.append(
+                LSTM(
+                    self.gru_units_2,
+                    return_sequences=False,
+                    kernel_regularizer=tf.keras.regularizers.l2(0.001),
+                )
+            )
+
         layers.append(Dropout(0.3))
-        layers.append(Dense(self.dense_units, activation='relu', 
-                           kernel_regularizer=tf.keras.regularizers.l2(0.001)))
-        layers.append(Dense(1, activation='sigmoid')) # Binary classification: Buy probability
-        
+        layers.append(
+            Dense(
+                self.dense_units,
+                activation="relu",
+                kernel_regularizer=tf.keras.regularizers.l2(0.001),
+            )
+        )
+        layers.append(Dense(1, activation="sigmoid"))  # Binary classification: Buy probability
+
         model = Sequential(layers)
         model.compile(
-            loss='binary_crossentropy',
+            loss="binary_crossentropy",
             optimizer=self._build_optimizer(),
-            metrics=['accuracy'],
+            metrics=["accuracy"],
         )
         return model
 
@@ -167,35 +236,35 @@ class ModelTrainer:
         metadata_path = model_path_obj.with_name(f"{model_path_obj.stem}_metadata.pkl")
         try:
             metadata = {
-                'feature_scalers': self.feature_scalers,
-                'label_threshold_pct': self.label_threshold_pct,
-                'input_lookback': self.input_lookback,
-                'model_version': self.timeframe,
-                'use_gru': self.use_gru,
-                'architecture': {
-                    'gru_units_1': self.gru_units_1,
-                    'gru_units_2': self.gru_units_2,
-                    'dense_units': self.dense_units
+                "feature_scalers": self.feature_scalers,
+                "label_threshold_pct": self.label_threshold_pct,
+                "input_lookback": self.input_lookback,
+                "model_version": self.timeframe,
+                "use_gru": self.use_gru,
+                "architecture": {
+                    "gru_units_1": self.gru_units_1,
+                    "gru_units_2": self.gru_units_2,
+                    "dense_units": self.dense_units,
                 },
-                'calibration_method': self.calibration_method,
-                'training_config': {
-                    'learning_rate': self.learning_rate,
-                    'batch_size': self.batch_size,
-                    'max_train_rows': self.max_train_rows,
-                    'enable_calibration': self.enable_calibration,
+                "calibration_method": self.calibration_method,
+                "training_config": {
+                    "learning_rate": self.learning_rate,
+                    "batch_size": self.batch_size,
+                    "max_train_rows": self.max_train_rows,
+                    "enable_calibration": self.enable_calibration,
                 },
-                'training_metrics': dict(self._last_train_metrics or {}),
-                'model_last_trained_ts': float(time.time()),
-                'model_val_accuracy': (
-                    float(self._last_train_metrics.get('val_accuracy'))
-                    if (self._last_train_metrics or {}).get('val_accuracy') is not None
+                "training_metrics": dict(self._last_train_metrics or {}),
+                "model_last_trained_ts": float(time.time()),
+                "model_val_accuracy": (
+                    float(self._last_train_metrics.get("val_accuracy"))
+                    if (self._last_train_metrics or {}).get("val_accuracy") is not None
                     else None
                 ),
             }
-            
-            with metadata_path.open('wb') as f:
+
+            with metadata_path.open("wb") as f:
                 pickle.dump(metadata, f)
-                
+
             self.logger.info("Training metadata saved for %s at %s", self.symbol, metadata_path)
         except Exception as e:
             self.logger.warning("Failed to save training metadata for %s: %s", self.symbol, e)
@@ -211,7 +280,7 @@ class ModelTrainer:
     def _infer_regime_from_volatility(self, df, window: int = 20) -> str:
         """
         PHASE 3: Infer volatility regime from historical data.
-        
+
         Uses ATR (Average True Range) relative to price to classify regime:
         - extreme: ATR/price > 2.0% (very volatile)
         - high: ATR/price 1.0-2.0%
@@ -221,24 +290,24 @@ class ModelTrainer:
         try:
             if len(df) < window:
                 return "medium"  # Default
-            
+
             # Calculate ATR
             df_copy = df.copy()
             df_copy["tr"] = np.maximum(
                 df_copy["high"] - df_copy["low"],
                 np.maximum(
                     np.abs(df_copy["high"] - df_copy["close"].shift(1)),
-                    np.abs(df_copy["low"] - df_copy["close"].shift(1))
-                )
+                    np.abs(df_copy["low"] - df_copy["close"].shift(1)),
+                ),
             )
             atr = df_copy["tr"].rolling(window=window).mean().iloc[-1]
             price = float(df_copy["close"].iloc[-1])
-            
+
             if price <= 0:
                 return "medium"
-            
+
             atr_pct = atr / price
-            
+
             if atr_pct > 0.02:
                 return "extreme"
             elif atr_pct > 0.01:
@@ -251,74 +320,84 @@ class ModelTrainer:
             self.logger.debug("Regime inference failed: %s", e)
             return "medium"
 
-    def _create_labels_triple_barrier(self, df, fee_pct: float = 0.001, slippage_pct: float = 0.0005,
-                                      buffer_pct: float = 0.0005, lookforward_bars: int = 5,
-                                      volatility_window: int = 20) -> np.ndarray:
+    def _create_labels_triple_barrier(
+        self,
+        df,
+        fee_pct: float = 0.001,
+        slippage_pct: float = 0.0005,
+        buffer_pct: float = 0.0005,
+        lookforward_bars: int = 5,
+        volatility_window: int = 20,
+    ) -> np.ndarray:
         """
         IMPROVED LABELING: Triple Barrier Method (Real Quant Standard)
-        
+
         Creates labels based on:
         1. Forward return > (fees + slippage + buffer) AND within N bars
         2. Volatility-normalized thresholds
         3. Realistic transaction costs
-        
+
         Returns:
             np.ndarray: Binary labels (1=BUY profitable, 0=HOLD/NO trade)
         """
         try:
             df_copy = df.copy()
-            
+
             # Calculate volatility (ATR-based)
             df_copy["tr"] = np.maximum(
                 df_copy["high"] - df_copy["low"],
                 np.maximum(
                     np.abs(df_copy["high"] - df_copy["close"].shift(1)),
-                    np.abs(df_copy["low"] - df_copy["close"].shift(1))
-                )
+                    np.abs(df_copy["low"] - df_copy["close"].shift(1)),
+                ),
             )
             df_copy["atr"] = df_copy["tr"].rolling(window=volatility_window).mean()
             df_copy["volatility"] = df_copy["atr"] / df_copy["close"]
-            
+
             # Cost threshold: fees + slippage + buffer (normalized)
             cost_threshold = fee_pct + slippage_pct + buffer_pct
-            
+
             labels = np.zeros(len(df_copy), dtype=np.float32)
-            
+
             for i in range(len(df_copy) - lookforward_bars):
                 current_price = df_copy.iloc[i]["close"]
                 current_vol = df_copy.iloc[i]["volatility"]
-                
+
                 if current_price <= 0 or pd.isna(current_vol):
                     labels[i] = 0
                     continue
-                
+
                 # Look ahead N bars for best high
-                future_bars = df_copy.iloc[i:i + lookforward_bars + 1]
+                future_bars = df_copy.iloc[i : i + lookforward_bars + 1]
                 max_high = future_bars["high"].max()
-                
+
                 # Profit target: cost + vol-adjusted expectancy
-                vol_adjusted_threshold = cost_threshold + (current_vol * 0.5)  # Half volatility as minimum target
+                vol_adjusted_threshold = cost_threshold + (
+                    current_vol * 0.5
+                )  # Half volatility as minimum target
                 profit_pct = (max_high - current_price) / current_price
-                
+
                 # Label as BUY if profit exceeds cost + volatility buffer
                 labels[i] = 1 if profit_pct > vol_adjusted_threshold else 0
-            
+
             # Log distribution
             unique, counts = np.unique(labels, return_counts=True)
-            label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist()))
+            label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist(), strict=False))
             self.logger.info(
                 f"[ML DEBUG] Triple Barrier Labels: fee={fee_pct:.4f} "
                 f"slippage={slippage_pct:.4f} buffer={buffer_pct:.4f} "
                 f"lookforward={lookforward_bars} dist={label_dist}"
             )
-            
+
             return labels
         except Exception as e:
-            self.logger.warning(f"Triple Barrier labeling failed: {e}, falling back to simple threshold")
+            self.logger.warning(
+                f"Triple Barrier labeling failed: {e}, falling back to simple threshold"
+            )
             return None
 
     @staticmethod
-    def _last_history_metric(history: Dict[str, Any], keys: Union[str, tuple]) -> Optional[float]:
+    def _last_history_metric(history: dict[str, Any], keys: Union[str, tuple]) -> Optional[float]:
         key_list = [keys] if isinstance(keys, str) else list(keys)
         for key in key_list:
             vals = history.get(key)
@@ -335,10 +414,14 @@ class ModelTrainer:
             self.logger.warning("No trained model to persist for %s.", self.symbol)
             return False
         try:
-            resolved = Path(model_path) if model_path is not None else build_model_path(
-                self.agent_name,
-                self.symbol,
-                self.timeframe,
+            resolved = (
+                Path(model_path)
+                if model_path is not None
+                else build_model_path(
+                    self.agent_name,
+                    self.symbol,
+                    self.timeframe,
+                )
             )
             save_model(self.model, resolved)
             self._save_training_metadata(str(resolved))
@@ -365,8 +448,9 @@ class ModelTrainer:
         Main entry point to train the model on the provided DataFrame.
         This blocking call runs the training loop.
         """
+
         def _ret(ok: bool, reason: str, **extra):
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "ok": bool(ok),
                 "reason": str(reason),
                 "symbol": self.symbol,
@@ -390,11 +474,15 @@ class ModelTrainer:
             try:
                 df = pd.DataFrame(df)
             except Exception:
-                self.logger.warning("Cannot train %s: unable to coerce training data to DataFrame.", self.symbol)
+                self.logger.warning(
+                    "Cannot train %s: unable to coerce training data to DataFrame.", self.symbol
+                )
                 return _ret(False, "invalid_dataframe")
-            
+
         if df is None or len(df) < (self.input_lookback + 50):
-            self.logger.warning(f"Insufficient data for training {self.symbol} (rows={len(df) if df is not None else 0}).")
+            self.logger.warning(
+                f"Insufficient data for training {self.symbol} (rows={len(df) if df is not None else 0})."
+            )
             return _ret(False, "insufficient_rows", rows=int(len(df) if df is not None else 0))
 
         if task != "supervised_learning":
@@ -445,15 +533,19 @@ class ModelTrainer:
             self.input_lookback,
             device,
         )
-        
+
         # Prepare Data features
         # If engineered features are provided, use all numeric columns (except timestamp).
         # This keeps training aligned with inference input space.
         if "close" not in df.columns:
-            self.logger.error("Training DataFrame missing required 'close' column for label computation.")
+            self.logger.error(
+                "Training DataFrame missing required 'close' column for label computation."
+            )
             return _ret(False, "missing_close_column")
 
-        numeric_cols = [c for c in df.columns if c != "timestamp" and pd.api.types.is_numeric_dtype(df[c])]
+        numeric_cols = [
+            c for c in df.columns if c != "timestamp" and pd.api.types.is_numeric_dtype(df[c])
+        ]
         if not numeric_cols:
             self.logger.error("No numeric feature columns available for training.")
             return _ret(False, "no_numeric_features")
@@ -476,7 +568,7 @@ class ModelTrainer:
         # Create labels using improved Triple Barrier Method or fallback to simple threshold
         df_copy = df.copy()
         df_copy["future_return"] = df_copy["close"].pct_change().shift(-1)
-        
+
         # IMPROVED LABELING: Try Triple Barrier first
         if self.use_triple_barrier_labels:
             triple_barrier_labels = self._create_labels_triple_barrier(
@@ -484,11 +576,11 @@ class ModelTrainer:
                 fee_pct=self.triple_barrier_fee_pct,
                 slippage_pct=self.triple_barrier_slippage_pct,
                 buffer_pct=self.triple_barrier_buffer_pct,
-                lookforward_bars=self.triple_barrier_lookforward
+                lookforward_bars=self.triple_barrier_lookforward,
             )
             if triple_barrier_labels is not None:
                 df_copy["label"] = triple_barrier_labels
-                self.logger.info(f"Using Triple Barrier Labeling (improved method)")
+                self.logger.info("Using Triple Barrier Labeling (improved method)")
             else:
                 # Fallback to regime-aware
                 self.logger.warning("Triple Barrier failed, falling back to regime-aware labels")
@@ -508,8 +600,12 @@ class ModelTrainer:
                         f"positive samples: {df_copy['label'].sum()}/{len(df_copy)}"
                     )
                 else:
-                    df_copy["label"] = (df_copy["future_return"] > self.label_threshold_pct).astype(int)
-                    self.logger.info(f"Label threshold: {self.label_threshold_pct:.6f}, positive samples: {df_copy['label'].sum()}/{len(df_copy)}")
+                    df_copy["label"] = (df_copy["future_return"] > self.label_threshold_pct).astype(
+                        int
+                    )
+                    self.logger.info(
+                        f"Label threshold: {self.label_threshold_pct:.6f}, positive samples: {df_copy['label'].sum()}/{len(df_copy)}"
+                    )
         # PHASE 3: Regime-aware label generation (fallback)
         elif self.regime_aware_labels_enabled:
             regime = self._infer_regime_from_volatility(df)
@@ -521,7 +617,7 @@ class ModelTrainer:
                 threshold = self.label_extreme_threshold_pct
             else:  # medium or unknown
                 threshold = self.label_threshold_pct
-            
+
             df_copy["label"] = (df_copy["future_return"] > threshold).astype(int)
             self.logger.info(
                 f"Regime-aware labels: regime={regime} threshold={threshold:.6f} "
@@ -530,7 +626,9 @@ class ModelTrainer:
         else:
             # Simple threshold fallback
             df_copy["label"] = (df_copy["future_return"] > self.label_threshold_pct).astype(int)
-            self.logger.info(f"Label threshold: {self.label_threshold_pct:.6f}, positive samples: {df_copy['label'].sum()}/{len(df_copy)}")
+            self.logger.info(
+                f"Label threshold: {self.label_threshold_pct:.6f}, positive samples: {df_copy['label'].sum()}/{len(df_copy)}"
+            )
 
         X = []
         y = []
@@ -539,7 +637,7 @@ class ModelTrainer:
         # This keeps training aligned with live inference, which uses the latest bar.
         for i in range(self.input_lookback - 1, len(raw_model_df) - 1):
             start_idx = i - self.input_lookback + 1
-            window = raw_model_df.iloc[start_idx:i + 1].values
+            window = raw_model_df.iloc[start_idx : i + 1].values
             X.append(window)
             y.append(df_copy.iloc[i]["label"])
 
@@ -554,7 +652,7 @@ class ModelTrainer:
 
         # === DEBUG LABEL DISTRIBUTION ===
         unique, counts = np.unique(y, return_counts=True)
-        label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist()))
+        label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist(), strict=False))
         self.logger.info(f"[ML DEBUG] Label distribution for {self.symbol}: {label_dist}")
         # ================================
 
@@ -575,7 +673,7 @@ class ModelTrainer:
         # DEBUG validation distribution
         if has_validation and y_val is not None:
             unique_val, counts_val = np.unique(y_val, return_counts=True)
-            val_dist = dict(zip(unique_val.astype(int).tolist(), counts_val.tolist()))
+            val_dist = dict(zip(unique_val.astype(int).tolist(), counts_val.tolist(), strict=False))
             self.logger.info(f"[ML DEBUG] Validation distribution for {self.symbol}: {val_dist}")
 
         # Leakage fix: fit feature scalers on training split only, then transform train/val.
@@ -597,16 +695,22 @@ class ModelTrainer:
                     )
                 self.feature_scalers[col] = scaler
         else:
-            self.logger.warning("sklearn not available, using manual scaling (train-split fit only)")
+            self.logger.warning(
+                "sklearn not available, using manual scaling (train-split fit only)"
+            )
             X_train = np.empty_like(X_train_raw, dtype=np.float32)
             X_val = np.empty_like(X_val_raw, dtype=np.float32) if X_val_raw is not None else None
             for feat_idx, col in enumerate(feature_cols):
                 train_flat = X_train_raw[:, :, feat_idx].reshape(-1)
                 col_mean = float(np.mean(train_flat))
                 col_std = float(np.std(train_flat) + 1e-8)
-                X_train[:, :, feat_idx] = ((X_train_raw[:, :, feat_idx] - col_mean) / col_std).astype(np.float32)
+                X_train[:, :, feat_idx] = (
+                    (X_train_raw[:, :, feat_idx] - col_mean) / col_std
+                ).astype(np.float32)
                 if X_val_raw is not None and X_val is not None:
-                    X_val[:, :, feat_idx] = ((X_val_raw[:, :, feat_idx] - col_mean) / col_std).astype(np.float32)
+                    X_val[:, :, feat_idx] = (
+                        (X_val_raw[:, :, feat_idx] - col_mean) / col_std
+                    ).astype(np.float32)
                 self.feature_scalers[col] = {"mean": col_mean, "std": col_std}
 
         X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -674,27 +778,28 @@ class ModelTrainer:
 
         # Add class imbalance weighting using sklearn's balanced approach
         unique_labels = np.unique(y_train)
-        
+
         # Use sklearn's compute_class_weight with balanced strategy
         if compute_class_weight is not None:
             weights = compute_class_weight(
-                class_weight="balanced",
-                classes=unique_labels,
-                y=y_train
+                class_weight="balanced", classes=unique_labels, y=y_train
             )
-            class_weights = dict(zip(unique_labels.astype(int), weights))
+            class_weights = dict(zip(unique_labels.astype(int), weights, strict=False))
         else:
             # Fallback to manual calculation if sklearn is unavailable
             unique_labels, counts = np.unique(y_train, return_counts=True)
             total_samples = len(y_train)
             class_weights = {}
-            for label, count in zip(unique_labels, counts):
+            for label, count in zip(unique_labels, counts, strict=False):
                 class_weights[int(label)] = total_samples / (len(unique_labels) * count)
-        
+
         if len(class_weights) > 1:
             fit_kwargs["class_weight"] = class_weights
-            self.logger.info("Applied balanced class weights for %s (forces BUY importance): %s", self.symbol, 
-                           {k: f"{v:.2f}" for k, v in class_weights.items()})
+            self.logger.info(
+                "Applied balanced class weights for %s (forces BUY importance): %s",
+                self.symbol,
+                {k: f"{v:.2f}" for k, v in class_weights.items()},
+            )
 
         history = self.model.fit(**fit_kwargs)
         history_map = history.history if hasattr(history, "history") else {}
@@ -728,7 +833,9 @@ class ModelTrainer:
         if save_model_artifact:
             saved = self.persist_model(model_path=resolved_model_path)
         else:
-            self.logger.info("Skipping model persistence for %s (save_model_artifact=False).", self.symbol)
+            self.logger.info(
+                "Skipping model persistence for %s (save_model_artifact=False).", self.symbol
+            )
 
         return _ret(
             True,

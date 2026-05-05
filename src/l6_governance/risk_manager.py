@@ -2,13 +2,13 @@
 Octivault Trader - Risk Manager Module
 """
 # core/risk_manager.py
-import logging
+import asyncio as _asyncio
 import contextlib
 import inspect
+import logging
 import math
 import time
-from typing import Dict, Any, Optional, Tuple, Union
-import asyncio as _asyncio
+from typing import Any, Optional
 
 from src.l0_core.component_status_logger import ComponentStatusLogger
 
@@ -53,15 +53,15 @@ class RiskManager:
         self._health_task: Optional[_asyncio.Task] = None
         self._running: bool = False
         self._p6_task: Optional[_asyncio.Task] = None
-        self.metrics: Dict[str, Any] = {}
+        self.metrics: dict[str, Any] = {}
         self._last_utc_day_key: Optional[int] = None
-        
+
         # Kill-Switch: Global freeze flag (survives daily reset, requires manual unfreeze)
         self._global_freeze: bool = False
         self._global_freeze_reason: Optional[str] = None
 
         # Phase 3: Balance cache for event-driven updates (0 API calls)
-        self._balance_cache: Dict[str, float] = {}
+        self._balance_cache: dict[str, float] = {}
         self._last_balance_update: float = 0.0
 
         # time helpers
@@ -70,7 +70,7 @@ class RiskManager:
 
         # expose to shared_state for convenience
         with contextlib.suppress(Exception):
-            setattr(self.shared_state, "risk_manager", self)
+            self.shared_state.risk_manager = self
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         # 1. Check SharedState for live/dynamic overrides
@@ -88,9 +88,13 @@ class RiskManager:
         return float(self._cfg("EXIT_FEE_BPS", self._cfg("CR_FEE_BPS", 10.0)) or 0.0)
 
     def _exit_slippage_bps(self) -> float:
-        return float(self._cfg("EXIT_SLIPPAGE_BPS", self._cfg("CR_PRICE_SLIPPAGE_BPS", 15.0)) or 0.0)
+        return float(
+            self._cfg("EXIT_SLIPPAGE_BPS", self._cfg("CR_PRICE_SLIPPAGE_BPS", 15.0)) or 0.0
+        )
 
-    async def _get_exit_floor_info(self, symbol: str, price: Optional[float] = None) -> Dict[str, float]:
+    async def _get_exit_floor_info(
+        self, symbol: str, price: Optional[float] = None
+    ) -> dict[str, float]:
         if hasattr(self.shared_state, "compute_symbol_exit_floor"):
             return await self.shared_state.compute_symbol_exit_floor(
                 symbol,
@@ -177,46 +181,48 @@ class RiskManager:
         planned_quote: Optional[float] = None,
         tier: Optional[str] = None,
         is_liquidation: bool = False,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """
         Tier-aware permission check with FIX #4: liquidation bypass support.
-        
+
         RiskManager answers: "Is this intent allowed to exist at all?"
-        
+
         Does NOT:
         - Calculate order size
         - Check minNotional
         - Touch prices
-        
+
         Only returns:
         - ✅ (True, "ok") - allowed
         - ❌ (False, reason) - denied with reason
-        
+
         Args:
             symbol: Trading pair
             side: BUY or SELL
             planned_quote: Intended quote amount (for BUY)
             tier: "A" (normal) or "B" (micro)
             is_liquidation: If True, bypass min_trade_quote for dust recovery
-        
+
         Returns:
             (ok: bool, reason: str)
         """
         await self._ensure_initialized()
-        
+
         s = (side or "").upper()
         if s not in ("BUY", "SELL"):
             return False, "invalid_side"
-        
+
         # Global halts
         if self.metrics.get("daily_trading_halt"):
             # G027: DailyTradingHalt gate - ELEVATED to INFO
-            self.logger.info(f"[EXEC_BLOCK] gate=DAILY_TRADING_HALT reason=SYSTEM_HALTED component=RiskManager action=DENY_EXECUTION symbol={symbol} side={side}")
+            self.logger.info(
+                f"[EXEC_BLOCK] gate=DAILY_TRADING_HALT reason=SYSTEM_HALTED component=RiskManager action=DENY_EXECUTION symbol={symbol} side={side}"
+            )
             return False, "daily_halt"
-        
+
         if s == "BUY" and self.is_buy_freeze_active():
             return False, "buy_freeze_active"
-        
+
         # Tier-aware quote caps (BUY only)
         if s == "BUY" and planned_quote is not None:
             q = float(planned_quote)
@@ -224,7 +230,10 @@ class RiskManager:
             # Exit-feasibility floor (symbol-aware)
             try:
                 if hasattr(self.shared_state, "compute_min_entry_quote"):
-                    base_quote = float(self._cfg("DEFAULT_PLANNED_QUOTE", self._cfg("MIN_ENTRY_QUOTE_USDT", 0.0)) or 0.0)
+                    base_quote = float(
+                        self._cfg("DEFAULT_PLANNED_QUOTE", self._cfg("MIN_ENTRY_QUOTE_USDT", 0.0))
+                        or 0.0
+                    )
                     min_entry = await self.shared_state.compute_min_entry_quote(
                         symbol,
                         default_quote=base_quote,
@@ -235,7 +244,7 @@ class RiskManager:
                         return False, "below_exit_floor"
             except Exception:
                 pass
-            
+
             # Tier B: Micro-sizing cap
             if tier == "B":
                 if q > self.tier_b_max_quote:
@@ -244,18 +253,24 @@ class RiskManager:
             # Enforce minimum trade quote for all tiers (unless liquidation)
             if q < self.min_trade_quote:
                 if not is_liquidation:
-                    self.logger.debug(f"[Risk:pre_check] {symbol} {side} ${q:.2f} below min ${self.min_trade_quote:.2f}")
+                    self.logger.debug(
+                        f"[Risk:pre_check] {symbol} {side} ${q:.2f} below min ${self.min_trade_quote:.2f}"
+                    )
                     return False, "below_min_trade_quote"
-                self.logger.info(f"[Risk:pre_check] {symbol} {side} ${q:.2f} LIQUIDATION_BYPASS min_trade_quote")
+                self.logger.info(
+                    f"[Risk:pre_check] {symbol} {side} ${q:.2f} LIQUIDATION_BYPASS min_trade_quote"
+                )
 
             if self.max_trade_quote > 0 and q > self.max_trade_quote:
                 return False, "exceeds_max_trade_quote"
-        
+
         # FIX #4: Liquidation SELL bypasses min_trade_quote entirely
         if s == "SELL" and is_liquidation and planned_quote is not None:
             q = float(planned_quote)
             if q < self.min_trade_quote:
-                self.logger.info(f"[Risk:pre_check] {symbol} SELL ${q:.2f} LIQUIDATION_BYPASS (normal min=${self.min_trade_quote:.2f})")
+                self.logger.info(
+                    f"[Risk:pre_check] {symbol} SELL ${q:.2f} LIQUIDATION_BYPASS (normal min=${self.min_trade_quote:.2f})"
+                )
 
         if s == "SELL" and not is_liquidation and planned_quote is not None:
             try:
@@ -265,7 +280,7 @@ class RiskManager:
                     return False, "sell_below_exit_floor"
             except Exception:
                 pass
-        
+
         return True, "ok"
 
     @staticmethod
@@ -290,15 +305,21 @@ class RiskManager:
         return 0.0
 
     @classmethod
-    def _balances_to_map(cls, balances_raw: Any) -> Dict[str, float]:
+    def _balances_to_map(cls, balances_raw: Any) -> dict[str, float]:
         if isinstance(balances_raw, dict):
             return {str(a).upper(): cls._free_amount(v) for a, v in balances_raw.items()}
         if isinstance(balances_raw, list):
-            out: Dict[str, float] = {}
+            out: dict[str, float] = {}
             for item in balances_raw:
                 if not isinstance(item, dict):
                     continue
-                asset = (item.get("asset") or item.get("currency") or item.get("coin") or item.get("symbol") or "")
+                asset = (
+                    item.get("asset")
+                    or item.get("currency")
+                    or item.get("coin")
+                    or item.get("symbol")
+                    or ""
+                )
                 asset = str(asset).upper()
                 if asset:
                     out[asset] = cls._free_amount(item)
@@ -307,14 +328,16 @@ class RiskManager:
 
     async def _get_free_quote_balance(self) -> float:
         """Phase 3: 3-strategy cascade for quote balance (memory → fallback → REST optional)."""
-        quote = str(getattr(self.config, "QUOTE_ASSET", self.base_currency) or self.base_currency).upper()
-        
+        quote = str(
+            getattr(self.config, "QUOTE_ASSET", self.base_currency) or self.base_currency
+        ).upper()
+
         # Strategy 1: Internal cache (WebSocket-updated, 0 API, <1ms)
         if quote in self._balance_cache:
             cached = self._balance_cache[quote]
             if cached >= 0:
                 return float(cached)
-        
+
         # Strategy 2: SharedState balances (in-memory, 0 API, <1ms)
         try:
             getter = getattr(self.shared_state, "get_spendable_balance", None)
@@ -327,7 +350,7 @@ class RiskManager:
                     return free_quote
         except Exception:
             pass
-        
+
         try:
             getter = getattr(self.shared_state, "get_free_balance", None)
             if callable(getter):
@@ -339,7 +362,7 @@ class RiskManager:
                     return free_quote
         except Exception:
             pass
-        
+
         try:
             snap_getter = getattr(self.shared_state, "get_balance_snapshot", None)
             if callable(snap_getter):
@@ -351,7 +374,7 @@ class RiskManager:
                     return free
         except Exception:
             pass
-        
+
         # Strategy 3: REST API (optional, only if RM_ALLOW_REST=True)
         allow_rest = getattr(self.config, "RM_ALLOW_REST", False)
         if allow_rest and self.exchange_client:
@@ -363,7 +386,7 @@ class RiskManager:
                     return free
             except Exception:
                 pass
-        
+
         # Fallback: Return cached value even if stale
         return self._balance_cache.get(quote, 0.0)
 
@@ -382,7 +405,7 @@ class RiskManager:
         except Exception as e:
             self.logger.debug(f"Balance cache sync failed: {e}")
 
-    async def _on_balance_updated(self, asset: str, balance_data: Dict[str, float]) -> None:
+    async def _on_balance_updated(self, asset: str, balance_data: dict[str, float]) -> None:
         """Phase 3: Handle WebSocket balance update events (0 API calls)."""
         try:
             free = balance_data.get("free", 0.0)
@@ -393,7 +416,9 @@ class RiskManager:
         except Exception as e:
             self.logger.debug(f"Balance event handler failed: {e}")
 
-    async def _projected_buy_exposure_violation(self, symbol: str, quote_qty: float) -> Optional[str]:
+    async def _projected_buy_exposure_violation(
+        self, symbol: str, quote_qty: float
+    ) -> Optional[str]:
         q = float(max(0.0, quote_qty or 0.0))
         if q <= 0:
             return None
@@ -402,11 +427,15 @@ class RiskManager:
         if account_value <= 0:
             return None
 
-        open_trades = self.shared_state.get_all_open_trades() if hasattr(self.shared_state, "get_all_open_trades") else {}
+        open_trades = (
+            self.shared_state.get_all_open_trades()
+            if hasattr(self.shared_state, "get_all_open_trades")
+            else {}
+        )
         open_trades = open_trades or {}
         latest_prices = getattr(self.shared_state, "latest_prices", {}) or {}
 
-        def _px(sym: str, tr: Dict[str, Any]) -> Optional[float]:
+        def _px(sym: str, tr: dict[str, Any]) -> Optional[float]:
             p = latest_prices.get(sym) or tr.get("entry_price") or tr.get("price")
             try:
                 return float(p) if p is not None else None
@@ -416,7 +445,7 @@ class RiskManager:
         sym_norm = str(symbol or "").replace("/", "").upper()
         symbol_open_value = 0.0
         total_open_value = 0.0
-        for tr_symbol, tr in (open_trades.items() if isinstance(open_trades, dict) else []):
+        for tr_symbol, tr in open_trades.items() if isinstance(open_trades, dict) else []:
             if not isinstance(tr, dict):
                 continue
             price = _px(tr_symbol, tr)
@@ -500,16 +529,18 @@ class RiskManager:
         cur_key = self._utc_day_key()
         if self._last_utc_day_key != cur_key:
             self.logger.info("New UTC day → resetting daily risk metrics")
-            self.metrics.update({
-                "start_of_day_value": self.metrics.get("current_portfolio_value", 0.0),
-                "daily_loss": 0.0,
-                "trades_count_daily": 0,
-                "wins_count_daily": 0,
-                "losses_count_daily": 0,
-                "last_reset_time": self._epoch(),
-                "daily_trading_halt": False,
-                "trading_restricted": False,
-            })
+            self.metrics.update(
+                {
+                    "start_of_day_value": self.metrics.get("current_portfolio_value", 0.0),
+                    "daily_loss": 0.0,
+                    "trades_count_daily": 0,
+                    "wins_count_daily": 0,
+                    "losses_count_daily": 0,
+                    "last_reset_time": self._epoch(),
+                    "daily_trading_halt": False,
+                    "trading_restricted": False,
+                }
+            )
             self._last_utc_day_key = cur_key
             await self._safe_health("RiskManager", "Operational", "Daily metrics reset")
 
@@ -532,7 +563,9 @@ class RiskManager:
 
         self.logger.debug(
             "Risk Metrics | PV: %.2f | DailyLoss: %.2f | Drawdown: %.2f%%",
-            total, self.metrics["daily_loss"], self.metrics["overall_drawdown"] * 100.0
+            total,
+            self.metrics["daily_loss"],
+            self.metrics["overall_drawdown"] * 100.0,
         )
 
     # ---------- core periodic evaluation ----------
@@ -546,7 +579,10 @@ class RiskManager:
         if self.max_drawdown_pct > 0 and self.metrics["overall_drawdown"] >= self.max_drawdown_pct:
             msg = f"Overall Drawdown {self.metrics['overall_drawdown']:.2%} >= {self.max_drawdown_pct:.2%}"
             self.logger.critical("🛑 %s", msg)
-            await self._set_cot_safe("Application", f"Veto: drawdown {self.metrics['overall_drawdown']:.2%} > {self.max_drawdown_pct:.2%}")
+            await self._set_cot_safe(
+                "Application",
+                f"Veto: drawdown {self.metrics['overall_drawdown']:.2%} > {self.max_drawdown_pct:.2%}",
+            )
             await self._emergency_shutdown(msg)
             return
 
@@ -556,7 +592,10 @@ class RiskManager:
         if self.max_daily_loss_pct > 0 and daily_loss_pct >= self.max_daily_loss_pct:
             msg = f"Max Daily Loss {daily_loss_pct:.2%} >= {self.max_daily_loss_pct:.2%}"
             self.logger.warning("🚨 %s", msg)
-            await self._set_cot_safe("Application", f"Veto: daily loss {daily_loss_pct:.2%} > {self.max_daily_loss_pct:.2%}")
+            await self._set_cot_safe(
+                "Application",
+                f"Veto: daily loss {daily_loss_pct:.2%} > {self.max_daily_loss_pct:.2%}",
+            )
             self.metrics["daily_trading_halt"] = True
             await self._emergency_shutdown(msg)
             return
@@ -568,7 +607,7 @@ class RiskManager:
             open_trades = self.shared_state.get_all_open_trades() or {}
             latest_prices = getattr(self.shared_state, "latest_prices", {}) or {}
 
-            def _px(s: str, tr: Dict[str, Any]) -> Optional[float]:
+            def _px(s: str, tr: dict[str, Any]) -> Optional[float]:
                 return latest_prices.get(s) or tr.get("entry_price")
 
             total_open_value = 0.0
@@ -583,7 +622,10 @@ class RiskManager:
                 if self.max_pos_exposure_pct > 0 and exposure_pct > self.max_pos_exposure_pct:
                     warn = f"High exposure {symbol}: {exposure_pct:.2%} > {self.max_pos_exposure_pct:.2%}"
                     self.logger.warning("⚠️ %s", warn)
-                    await self._set_cot_safe(symbol, f"Veto: position exposure {exposure_pct:.2%} > {self.max_pos_exposure_pct:.2%}")
+                    await self._set_cot_safe(
+                        symbol,
+                        f"Veto: position exposure {exposure_pct:.2%} > {self.max_pos_exposure_pct:.2%}",
+                    )
                     await self._safe_health("RiskManager", "Warning", warn)
 
             total_exposure_pct = (total_open_value / account_value) if account_value > 0 else 0.0
@@ -591,7 +633,10 @@ class RiskManager:
                 warn = f"Total exposure {total_exposure_pct:.2%} > {self.max_total_exposure_pct:.2%}. Restricting trades."
                 self.logger.warning("⚠️ %s", warn)
                 self.metrics["trading_restricted"] = True
-                await self._set_cot_safe("Portfolio", f"Veto: total exposure {total_exposure_pct:.2%} > {self.max_total_exposure_pct:.2%}")
+                await self._set_cot_safe(
+                    "Portfolio",
+                    f"Veto: total exposure {total_exposure_pct:.2%} > {self.max_total_exposure_pct:.2%}",
+                )
                 await self._safe_health("RiskManager", "Warning", warn)
             elif self.metrics.get("trading_restricted"):
                 self.logger.info("Total exposure within limits. Lifting restrictions.")
@@ -600,7 +645,7 @@ class RiskManager:
         self.logger.debug(
             "RiskManager: DailyLossPct=%s TotalExposurePct=%s",
             f"{daily_loss_pct:.2%}" if sod > 0 else "N/A",
-            f"{total_exposure_pct:.2%}" if account_value > 0 else "N/A"
+            f"{total_exposure_pct:.2%}" if account_value > 0 else "N/A",
         )
 
     # ---------- order-level gate (ExecutionManager calls this) ----------
@@ -612,8 +657,8 @@ class RiskManager:
         qty: Optional[float] = None,
         quote_qty: Optional[float] = None,
         order_type: str = "MARKET",
-        order: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, str, Optional[float], Optional[float]]:
+        order: Optional[dict[str, Any]] = None,
+    ) -> tuple[bool, str, Optional[float], Optional[float]]:
         """
         Flexible API:
           - EM style: validate_order(symbol=..., side=..., qty=..., quote_qty=..., order_type="MARKET")
@@ -677,7 +722,9 @@ class RiskManager:
 
                 exposure_reason = await self._projected_buy_exposure_violation(sym, q)
                 if exposure_reason:
-                    self.logger.warning("[RiskManager] BUY rejected by projected exposure: %s", exposure_reason)
+                    self.logger.warning(
+                        "[RiskManager] BUY rejected by projected exposure: %s", exposure_reason
+                    )
                     return False, exposure_reason, None, None
 
                 # ════════════════════════════════════════════════════════════════════════════════
@@ -694,17 +741,24 @@ class RiskManager:
                                 nav = float(getattr(self.shared_state, "nav", 0.0) or 0.0)
                         except Exception:
                             nav = 0.0
-                        
-                        trade_size = float(self._cfg("TRADE_AMOUNT_USDT", self._cfg("DEFAULT_PLANNED_QUOTE", 30.0)) or 30.0)
-                        capital_floor = self.shared_state.calculate_capital_floor(nav=nav, trade_size=trade_size)
-                        
+
+                        trade_size = float(
+                            self._cfg("TRADE_AMOUNT_USDT", self._cfg("DEFAULT_PLANNED_QUOTE", 30.0))
+                            or 30.0
+                        )
+                        capital_floor = self.shared_state.calculate_capital_floor(
+                            nav=nav, trade_size=trade_size
+                        )
+
                         # Get current free USDT balance
                         quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
                         if hasattr(self.shared_state, "get_spendable_balance"):
-                            free_usdt = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
+                            free_usdt = float(
+                                await self.shared_state.get_spendable_balance(quote_asset) or 0.0
+                            )
                         else:
                             free_usdt = float(await self._get_free_quote_balance() or 0.0)
-                        
+
                         # Check if trade would breach capital floor
                         # Allow trade only if: free_usdt - quote_qty > capital_floor
                         remaining_after_trade = free_usdt - q
@@ -721,7 +775,9 @@ class RiskManager:
                                 f"remaining=${remaining_after_trade:.2f} >= floor=${capital_floor:.2f}"
                             )
                     except Exception as e:
-                        self.logger.warning(f"[RiskManager] Capital floor check error: {e}, continuing...")
+                        self.logger.warning(
+                            f"[RiskManager] Capital floor check error: {e}, continuing..."
+                        )
 
                 # CRITICAL FIX: Validate against CapitalAllocator agent budgets to prevent risk multiplication
                 # Extract agent from order context
@@ -733,17 +789,31 @@ class RiskManager:
 
                 if agent and hasattr(self.shared_state, "get_authoritative_reservation"):
                     try:
-                        agent_budget = float(self.shared_state.get_authoritative_reservation(agent) or 0.0)
-                        shared_wallet_mode = bool(getattr(self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True))
-                        if agent_budget <= 0.0 and shared_wallet_mode and hasattr(self.shared_state, "get_authoritative_reservations"):
+                        agent_budget = float(
+                            self.shared_state.get_authoritative_reservation(agent) or 0.0
+                        )
+                        shared_wallet_mode = bool(
+                            getattr(self.config, "CAPITAL_ALLOCATOR_SHARED_WALLET", True)
+                        )
+                        if (
+                            agent_budget <= 0.0
+                            and shared_wallet_mode
+                            and hasattr(self.shared_state, "get_authoritative_reservations")
+                        ):
                             reservations = self.shared_state.get_authoritative_reservations() or {}
                             if isinstance(reservations, dict) and reservations:
-                                agent_budget = float(max(float(v or 0.0) for v in reservations.values()))
+                                agent_budget = float(
+                                    max(float(v or 0.0) for v in reservations.values())
+                                )
                         if agent_budget > 0 and q > agent_budget:
-                            self.logger.warning(f"[RiskManager] Agent {agent} quote {q:.2f} exceeds budget {agent_budget:.2f}")
+                            self.logger.warning(
+                                f"[RiskManager] Agent {agent} quote {q:.2f} exceeds budget {agent_budget:.2f}"
+                            )
                             return False, f"exceeds_agent_budget_{agent}", None, None
                         elif agent_budget <= 0:
-                            self.logger.warning(f"[RiskManager] Agent {agent} has zero budget, rejecting trade")
+                            self.logger.warning(
+                                f"[RiskManager] Agent {agent} has zero budget, rejecting trade"
+                            )
                             return False, f"zero_agent_budget_{agent}", None, None
                     except Exception as e:
                         self.logger.debug(f"Budget validation failed for agent {agent}: {e}")
@@ -766,7 +836,7 @@ class RiskManager:
                         return False, "sell_below_exit_floor", None, None
                 except Exception:
                     pass
-            base_ccy = sym[:-len(self.base_currency)] if sym.endswith(self.base_currency) else None
+            base_ccy = sym[: -len(self.base_currency)] if sym.endswith(self.base_currency) else None
             free_ok = None
             try:
                 if base_ccy and self.exchange_client:
@@ -782,7 +852,8 @@ class RiskManager:
                             # Assuming get_balances returns [{'asset': 'ASSET', 'free': X, ...}]
                             for it in bals:
                                 if str(it.get("asset", "")).upper() == base_ccy:
-                                    free_ok = float((it or {}).get("free", 0.0)); break
+                                    free_ok = float((it or {}).get("free", 0.0))
+                                    break
             except Exception:
                 free_ok = None
             if free_ok is not None and qty is not None:
@@ -807,15 +878,20 @@ class RiskManager:
                 "symbol": order.get("symbol"),
                 "side": order.get("side"),
                 "qty": order.get("quantity") or order.get("qty"),
-                "quote_qty": order.get("planned_quote") or order.get("quote_quantity") or order.get("quote"),
+                "quote_qty": order.get("planned_quote")
+                or order.get("quote_quantity")
+                or order.get("quote"),
                 "order_type": order.get("type") or order.get("order_type") or "MARKET",
             }
         return {
-                "symbol": getattr(order, "symbol", None),
-                "side": getattr(order, "side", None),
-                "qty": getattr(order, "quantity", None),
-                "quote_qty": getattr(order, "planned_quote", None) or getattr(order, "quote_quantity", None),
-                "order_type": getattr(order, "order_type", None) or getattr(order, "type", None) or "MARKET",
+            "symbol": getattr(order, "symbol", None),
+            "side": getattr(order, "side", None),
+            "qty": getattr(order, "quantity", None),
+            "quote_qty": getattr(order, "planned_quote", None)
+            or getattr(order, "quote_quantity", None),
+            "order_type": getattr(order, "order_type", None)
+            or getattr(order, "type", None)
+            or "MARKET",
         }
 
     def _apply_adjustments_to_order(self, order, adj_qty, adj_quote):
@@ -826,7 +902,7 @@ class RiskManager:
                 order["quantity"] = float(adj_qty)
             else:
                 with contextlib.suppress(Exception):
-                    setattr(order, "quantity", float(adj_qty))
+                    order.quantity = float(adj_qty)
 
         if adj_quote is not None:
             if isinstance(order, dict):
@@ -836,12 +912,12 @@ class RiskManager:
                 # set BOTH if they exist; never rely on only one name
                 with contextlib.suppress(Exception):
                     if hasattr(order, "planned_quote"):
-                        setattr(order, "planned_quote", float(adj_quote))
+                        order.planned_quote = float(adj_quote)
                 with contextlib.suppress(Exception):
                     if hasattr(order, "quote_quantity"):
-                        setattr(order, "quote_quantity", float(adj_quote))
+                        order.quote_quantity = float(adj_quote)
 
-    async def approve(self, order=None, **kwargs) -> Tuple[bool, str]:
+    async def approve(self, order=None, **kwargs) -> tuple[bool, str]:
         params = self._order_to_kwargs(order)
         params.update({k: v for k, v in kwargs.items() if v is not None})
         ok, reason, adj_qty, adj_quote = await self.validate_order(
@@ -860,7 +936,7 @@ class RiskManager:
         ok, _ = await self.approve(order)
         return bool(ok)
 
-    async def should_allow(self, order) -> Tuple[bool, str]:
+    async def should_allow(self, order) -> tuple[bool, str]:
         # EM prefers this if present
         return await self.approve(order)
 
@@ -873,7 +949,14 @@ class RiskManager:
         base += 0.2 if sentiment < -0.5 else (-0.2 if sentiment > 0.5 else 0.0)
         base += 0.2 if volatility == "high" else (-0.1 if volatility == "low" else 0.0)
         risk = min(1.0, max(0.0, base))
-        self.logger.debug("Risk score %s @ %.8f → %.2f | Sent=%.2f Vol=%s", symbol, price, risk, sentiment, volatility)
+        self.logger.debug(
+            "Risk score %s @ %.8f → %.2f | Sent=%.2f Vol=%s",
+            symbol,
+            price,
+            risk,
+            sentiment,
+            volatility,
+        )
         return risk
 
     async def run_diagnostics(self, symbol: str):
@@ -891,9 +974,9 @@ class RiskManager:
         general trading restrictions, or global kill-switch.
         """
         return bool(
-            self._global_freeze or 
-            self.metrics.get("daily_trading_halt") or 
-            self.metrics.get("trading_restricted")
+            self._global_freeze
+            or self.metrics.get("daily_trading_halt")
+            or self.metrics.get("trading_restricted")
         )
 
     def freeze_trading(self, reason: str = "Manual freeze") -> None:
@@ -931,21 +1014,27 @@ class RiskManager:
         if open_positions:
             self.logger.warning("Attempting to close %d open positions...", len(open_positions))
             close_tasks = [
-                _asyncio.create_task(self.execution_manager.close_trade(sym, reason="Emergency Shutdown"))
+                _asyncio.create_task(
+                    self.execution_manager.close_trade(sym, reason="Emergency Shutdown")
+                )
                 for sym in open_positions.keys()
             ]
             done, pending = await _asyncio.wait(
-                close_tasks,
-                timeout=self.shutdown_timeout,
-                return_when=_asyncio.ALL_COMPLETED
+                close_tasks, timeout=self.shutdown_timeout, return_when=_asyncio.ALL_COMPLETED
             )
             for t in done:
                 if t.exception():
-                    self.logger.error("Error closing position during emergency shutdown: %s", t.exception(), exc_info=True)
+                    self.logger.error(
+                        "Error closing position during emergency shutdown: %s",
+                        t.exception(),
+                        exc_info=True,
+                    )
             if pending:
                 for t in pending:
                     t.cancel()
-                self.logger.warning("%d positions not closed within %ss.", len(pending), self.shutdown_timeout)
+                self.logger.warning(
+                    "%d positions not closed within %ss.", len(pending), self.shutdown_timeout
+                )
 
         # Notify
         if getattr(self.execution_manager, "alert_callback", None):
@@ -955,7 +1044,9 @@ class RiskManager:
                 )
 
         await self._safe_health("RiskManager", "CRITICAL", f"Emergency shutdown: {reason}")
-        await self._safe_health("Application", "SHUTDOWN", "Risk limit breached, application terminating.")
+        await self._safe_health(
+            "Application", "SHUTDOWN", "Risk limit breached, application terminating."
+        )
         raise SystemExit(f"Risk limit breached: {reason}")
 
     async def _safe_health(self, component: str, status: str, detail: str):
@@ -1004,7 +1095,9 @@ class RiskManager:
         Best-effort hook to notify CoT/Meta components about vetoes.
         """
         try:
-            cot = getattr(self.shared_state, "cot_assistant", None) or getattr(self, "cot_assistant", None)
+            cot = getattr(self.shared_state, "cot_assistant", None) or getattr(
+                self, "cot_assistant", None
+            )
             if cot and hasattr(cot, "set_veto"):
                 res = cot.set_veto(scope, message)
                 if inspect.isawaitable(res):
@@ -1025,7 +1118,9 @@ class RiskManager:
         """
         # Initial announce
         try:
-            await self._safe_health("RiskManager", "STARTING", f"P6 check loop @ {interval_sec:.1f}s")
+            await self._safe_health(
+                "RiskManager", "STARTING", f"P6 check loop @ {interval_sec:.1f}s"
+            )
         except Exception:
             pass
 
@@ -1056,7 +1151,7 @@ class RiskManager:
         """
         Lightweight start() for P6: emit HealthStatus and schedule periodic checks.
         Idempotent and non-blocking. Safe to call multiple times.
-        
+
         Phase 3: Initialize balance cache and subscribe to balance update events.
         """
         if self._running:
@@ -1065,7 +1160,7 @@ class RiskManager:
 
         # Phase 3: Load initial balances from SharedState (0 API calls)
         await self._sync_balance_cache()
-        
+
         # Phase 3: Subscribe to balance update events (WebSocket-driven, 0 API)
         try:
             if hasattr(self.shared_state, "subscribe"):
@@ -1083,10 +1178,14 @@ class RiskManager:
 
         # Kick a health reporter if not already running
         if self._health_task is None or self._health_task.done():
-            self._health_task = _asyncio.create_task(self.report_health_loop(), name="RiskManager:health")
+            self._health_task = _asyncio.create_task(
+                self.report_health_loop(), name="RiskManager:health"
+            )
 
         # Launch the lightweight periodic check loop
-        self._p6_task = _asyncio.create_task(self._p6_periodic_check_loop(beat), name="RiskManager:P6")
+        self._p6_task = _asyncio.create_task(
+            self._p6_periodic_check_loop(beat), name="RiskManager:P6"
+        )
         with contextlib.suppress(Exception):
             await self._safe_health("RiskManager", "Operational", "P6 start scheduled")
 
@@ -1170,23 +1269,33 @@ class RiskManager:
 
 import time
 from datetime import datetime
-from typing import Optional, Dict, Any
-
-
+from typing import Any, Optional
 
 # ===== Exceptions =====
 
-class RiskViolation(Exception): ...
-class ExposureViolation(RiskViolation): ...
-class BuyFreezeActive(RiskViolation): ...
-class IntegrityError(RiskViolation): ...
 
+class RiskViolation(Exception):
+    ...
+
+
+class ExposureViolation(RiskViolation):
+    ...
+
+
+class BuyFreezeActive(RiskViolation):
+    ...
+
+
+class IntegrityError(RiskViolation):
+    ...
 
 
 # ===== Helpers =====
 
+
 def _iso_now() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
 
 def _get_cfg_val(cfg, key: str, default):
     try:

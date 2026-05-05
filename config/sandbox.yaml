@@ -56,7 +56,7 @@ fragmentation_testing:
   # Initial state: Healthy portfolio
   phase_1_duration_hours: 8
   phase_1_description: "Monitor healthy portfolio state"
-  
+
   # Add dust positions to create fragmentation
   phase_2_duration_hours: 12
   phase_2_description: "Inject small positions to create FRAGMENTED state"
@@ -64,7 +64,7 @@ fragmentation_testing:
     count: 15
     min_value_usd: 10
     max_value_usd: 50
-  
+
   # Further fragmentation to reach SEVERE state
   phase_3_duration_hours: 12
   phase_3_description: "Add more dust to trigger SEVERE fragmentation"
@@ -72,7 +72,7 @@ fragmentation_testing:
     count: 20
     min_value_usd: 5
     max_value_usd: 25
-  
+
   # Monitor recovery
   phase_4_duration_hours: 16
   phase_4_description: "Monitor automatic recovery via consolidation"
@@ -161,7 +161,7 @@ logging:
     - "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/logs/sandbox_phase4.log"
     - "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/logs/metrics.log"
   metrics_file: "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/logs/phase4_metrics.json"
-  
+
   # Archive and backup
   archive_interval_hours: 24
   backup_enabled: true
@@ -192,7 +192,7 @@ deployment:
 phase_4_timeline:
   start_date: "2026-04-26"
   total_duration_days: 3
-  
+
   day_1:
     tasks:
       - "Setup sandbox environment"
@@ -200,14 +200,14 @@ phase_4_timeline:
       - "Verify health check functionality"
       - "Validate consolidation logic"
       - "Start continuous monitoring"
-  
+
   day_2:
     tasks:
       - "Monitor 24 hours of data"
       - "Check for any anomalies"
       - "Verify metrics collection"
       - "Test error recovery paths"
-  
+
   day_3:
     tasks:
       - "Complete 48+ hour monitoring"
@@ -228,12 +228,12 @@ rollback:
 documentation:
   report_template: "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/templates/phase4_report.md"
   final_report_path: "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/PHASE_4_VALIDATION_REPORT.md"
-  
+
 notes: |
   Phase 4 will validate the portfolio fragmentation fixes in a production-like
   sandbox environment with 48+ hours of continuous monitoring. This ensures
   that all fixes are working correctly before production deployment.
-  
+
   Key objectives:
   1. Deploy all 5 fixes to sandbox
   2. Inject fragmentation to test detection and recovery

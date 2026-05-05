@@ -1,7 +1,7 @@
 # 🔧 COMPREHENSIVE FIX EXECUTION PLAN
 
-**Status:** Ready to Execute  
-**Estimated Time:** 60-90 minutes  
+**Status:** Ready to Execute
+**Estimated Time:** 60-90 minutes
 **Risk Level:** LOW (all changes are backward-compatible)
 
 ---
@@ -18,8 +18,8 @@
 
 ## 🔧 FIX #1: Install Missing Dependencies
 
-**File:** `requirements.txt`  
-**Lines:** Add after line 50  
+**File:** `requirements.txt`
+**Lines:** Add after line 50
 **Effort:** 5 minutes
 
 **What's Missing:**
@@ -37,8 +37,8 @@
 
 ## 🔧 FIX #2: Adjust PRETRADE_EFFECT_GATE Threshold
 
-**File:** `src/l6_governance/risk_manager.py`  
-**Key Parameter:** `PRETRADE_EFFECT_GATE_MIN_PROFIT_PCT`  
+**File:** `src/l6_governance/risk_manager.py`
+**Key Parameter:** `PRETRADE_EFFECT_GATE_MIN_PROFIT_PCT`
 **Effort:** 10-15 minutes
 
 **Current Problem:**
@@ -66,8 +66,8 @@ Lower threshold from 0.06% to 0.02% so tighter spreads can trade
 
 ## 🔧 FIX #3: Implement TrendHunter.generate_signals()
 
-**File:** `agents/trend_hunter.py`  
-**Current Status:** Method missing (confirmed by grep)  
+**File:** `agents/trend_hunter.py`
+**Current Status:** Method missing (confirmed by grep)
 **Effort:** 20-30 minutes (implement) OR 2 minutes (disable)
 
 **Option A: Quick Disable (2 minutes)**
@@ -81,19 +81,19 @@ self.enabled = False  # Disable this agent for now
 async def generate_signals(self, symbols: List[str]) -> List[TradeIntent]:
     """Generate trend-following signals using ADX + EMA crossover."""
     signals = []
-    
+
     for symbol in symbols:
         try:
             # Get market data
             ohlcv = await self.market_data_feed.get_ohlcv(symbol, "1h")
             if not ohlcv or len(ohlcv) < 50:
                 continue
-            
+
             # Calculate indicators
             closes = np.array([c[4] for c in ohlcv])
             ema20 = compute_ema(closes, 20)
             ema50 = compute_ema(closes, 50)
-            
+
             # Trend signal
             if ema20[-1] > ema50[-1]:  # Uptrend
                 signal = TradeIntent(
@@ -103,11 +103,11 @@ async def generate_signals(self, symbols: List[str]) -> List[TradeIntent]:
                     agent_name="TrendHunter"
                 )
                 signals.append(signal)
-            
+
         except Exception as e:
             logger.debug(f"[TrendHunter] {symbol} error: {e}")
             continue
-    
+
     return signals
 ```
 
@@ -120,8 +120,8 @@ async def generate_signals(self, symbols: List[str]) -> List[TradeIntent]:
 
 ## 🔧 FIX #4: Add fastapi & uvicorn to requirements.txt
 
-**File:** `requirements.txt`  
-**Action:** Add 2 lines after line 50  
+**File:** `requirements.txt`
+**Action:** Add 2 lines after line 50
 **Effort:** 1 minute
 
 **What to Add:**
@@ -139,8 +139,8 @@ uvicorn>=0.23.0
 
 ## 🔧 FIX #5: Type Annotation Suppression (Optional Lint Fix)
 
-**File:** `src/l4_execution/execution_manager.py`  
-**Lines:** 5773, 5788  
+**File:** `src/l4_execution/execution_manager.py`
+**Lines:** 5773, 5788
 **Effort:** 2 minutes (optional)
 
 **Current:**
@@ -162,8 +162,8 @@ intent_override: Optional[PendingPositionIntent] = None,  # type: ignore
 
 ## 🔧 FIX #6: Rename Master Orchestrator (Optional Polish)
 
-**Current:** `🎯_MASTER_SYSTEM_ORCHESTRATOR.py`  
-**Rename To:** `master_system_orchestrator.py`  
+**Current:** `🎯_MASTER_SYSTEM_ORCHESTRATOR.py`
+**Rename To:** `master_system_orchestrator.py`
 **Effort:** 20-30 minutes (includes updating imports)
 
 **Files to Update:**
@@ -354,16 +354,16 @@ Before starting fixes:
 ```
 [ ] Git repository is clean (no uncommitted changes)
     $ git status
-    
+
 [ ] Current state is documented
     $ cat logs/octivault_master_orchestrator.log | tail -50 > fix_baseline.log
-    
+
 [ ] Rollback plan ready
     $ git status --short
-    
+
 [ ] Have terminal access ready
     $ pwd  # Should show octivault_trader
-    
+
 [ ] Know how to stop/start system
     $ ps aux | grep master_orchestrator
 ```

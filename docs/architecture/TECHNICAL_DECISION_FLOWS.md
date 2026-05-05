@@ -1,6 +1,6 @@
 # 🎯 OCTI AI TRADING BOT - TECHNICAL DECISION FLOWS
 
-**Reference Document** | **For:** Developers & Advanced Operators  
+**Reference Document** | **For:** Developers & Advanced Operators
 **Date:** 2026-02-14
 
 ---
@@ -734,6 +734,6 @@ Error Detected in Cycle
 
 ---
 
-**Document Version:** 1.0  
-**Created:** 2026-02-14  
+**Document Version:** 1.0
+**Created:** 2026-02-14
 **For:** Technical Reference

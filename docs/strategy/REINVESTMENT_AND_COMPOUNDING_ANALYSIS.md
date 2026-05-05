@@ -40,7 +40,7 @@ async def _fetch_and_sync_balance(self) -> None:
 def _regime_get_available_capital(self, total_available: float) -> float:
     """Get available capital for allocation based on regime."""
     regime = self.regime_manager.get_regime()
-    
+
     if regime == "MICRO_SNIPER":
         # Bypass reservations, use full available capital
         return total_available  # ← All profits reinvested
@@ -100,7 +100,7 @@ The system enforces safety checks to prevent over-allocation:
 # From balance_manager.py
 class BalanceValidator:
     """Pre-flight balance validation before trade allocation."""
-    
+
     async def validate_allocation(self, amount: float, symbol: str) -> Tuple[bool, Status, str]:
         """
         Checks:

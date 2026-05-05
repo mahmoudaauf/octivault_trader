@@ -23,24 +23,25 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import os
+import random
 import time
 import urllib.parse
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Optional, List, Tuple, Union
-import logging
+from decimal import ROUND_DOWN, Decimal
+from typing import Any, Optional, Union
 
 import aiohttp
 from binance.async_client import AsyncClient
-import random
 
 # Ed25519 signing support — using PyNaCl (libsodium) for Binance WS API v3
 # Guarded so the module still loads on stripped deployments (HMAC-only path unaffected).
 try:
     from nacl.signing import SigningKey as _NaClSigningKey
+
     _NACL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _NaClSigningKey = None  # type: ignore
@@ -63,17 +64,20 @@ except Exception:
     try:
         from src.l0_core.stubs import BinanceAPIException  # type: ignore
     except Exception:
+
         class BinanceAPIException(Exception):
             def __init__(self, message: str, code: Optional[int] = None):
                 super().__init__(message)
                 self.message = message
                 self.code = code
 
+
 # -----------------------------------------
 # Import-compat shim for legacy module path
 # -----------------------------------------
 import sys as _sys
 from pathlib import Path as _Path
+
 try:
     _P = _Path(__file__).resolve().parent
     if str(_P) not in _sys.path:
@@ -87,6 +91,7 @@ _sys.modules.setdefault("core.exchange_client", _sys.modules[__name__])
 # ---------------------------
 
 _GLOBAL_EXCHANGE_CLIENT: Optional["ExchangeClient"] = None
+
 
 def get_global_exchange_client(
     *,
@@ -110,6 +115,7 @@ def get_global_exchange_client(
         )
     return _GLOBAL_EXCHANGE_CLIENT
 
+
 async def ensure_public_bootstrap(
     *,
     config: Optional[dict] = None,
@@ -127,6 +133,7 @@ async def ensure_public_bootstrap(
     await client._ensure_started_public()
     return client
 
+
 # Convenience helpers for early-phase symbol/exchange info access
 async def public_get_exchange_info(
     *,
@@ -134,11 +141,12 @@ async def public_get_exchange_info(
     logger: Optional[logging.Logger] = None,
     app: Optional[Any] = None,
     shared_state: Optional[Any] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     client = await ensure_public_bootstrap(
         config=config, logger=logger, app=app, shared_state=shared_state
     )
     return await client.get_exchange_info()
+
 
 async def public_get_symbol_info(
     symbol: str,
@@ -147,7 +155,7 @@ async def public_get_symbol_info(
     logger: Optional[logging.Logger] = None,
     app: Optional[Any] = None,
     shared_state: Optional[Any] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     client = await ensure_public_bootstrap(
         config=config, logger=logger, app=app, shared_state=shared_state
     )
@@ -168,16 +176,20 @@ __all__ = [
 try:
     from src.l0_core.stubs import ExecutionError
 except Exception:
+
     class ExecutionError(Exception):
         pass
+
 
 class NetworkException(Exception):
     pass
 
+
 class ExchangeClient:
-    async def symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
+    async def symbol_info(self, symbol: str) -> Optional[dict[str, Any]]:
         """Compatibility alias used by some agents (e.g., WalletScanner)."""
         return await self.get_symbol_info(symbol)
+
     async def _resync_time(self) -> None:
         """
         Best-effort server time resync used when Binance returns -1021.
@@ -190,15 +202,17 @@ class ExchangeClient:
         except Exception:
             # Non-fatal; keep previous offset
             return
+
     # ---- tiny in-memory hot caches (low TTL) ----
     _BOOK_TTL = 0.75  # seconds
     _INFO_TTL = 10.0  # seconds (symbol info/tradable probe microcache)
-    async def get_exchange_info(self) -> Dict[str, Any]:
+
+    async def get_exchange_info(self) -> dict[str, Any]:
         """Public getter used by SymbolManager; ensures cache is populated."""
         await self._sync_exchange_info()
         return self._exchange_info or {}
 
-    async def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
+    async def get_symbol_info(self, symbol: str) -> Optional[dict[str, Any]]:
         """Lookup a single symbol from cached exchangeInfo; refresh if needed, with microcache."""
         sym = self._norm_symbol(symbol)
         # microcache
@@ -213,7 +227,9 @@ class ExchangeClient:
                 return s
         # Optional: try a direct query if not found in cache
         try:
-            data = await self._request("GET", "/api/v3/exchangeInfo", {"symbol": sym}, api="spot_api")
+            data = await self._request(
+                "GET", "/api/v3/exchangeInfo", {"symbol": sym}, api="spot_api"
+            )
             syms = (data or {}).get("symbols", [])
             val = syms[0] if syms else None
             self._sym_info_cache[sym] = {"ts": time.time(), "val": val}
@@ -231,10 +247,12 @@ class ExchangeClient:
         try:
             return await self.get_spot_balances()
         except Exception:
-            self.logger.warning("[ExchangeClient] get_account_balances fallback → empty dict", exc_info=True)
+            self.logger.warning(
+                "[ExchangeClient] get_account_balances fallback → empty dict", exc_info=True
+            )
             return {}
 
-    async def get_all_tickers(self) -> List[Dict[str, Any]]:
+    async def get_all_tickers(self) -> list[dict[str, Any]]:
         """
         SymbolScreener expects this. Compatible shape with keys:
         symbol, priceChangePercent, quoteVolume, volume.
@@ -242,13 +260,13 @@ class ExchangeClient:
         """
         return await self.get_24hr_tickers()
 
-    async def get_24hr_stats(self) -> Dict[str, Dict[str, Any]]:
+    async def get_24hr_stats(self) -> dict[str, dict[str, Any]]:
         """
         SymbolScreener.run_discovery() expects a plural 'stats' map.
         Return { SYMBOL: { 'volume': float, 'priceChangePercent': float, ... }, ... }.
         """
         tickers = await self.get_24hr_tickers()
-        out: Dict[str, Dict[str, Any]] = {}
+        out: dict[str, dict[str, Any]] = {}
         for t in tickers:
             try:
                 out[t["symbol"]] = {
@@ -289,7 +307,9 @@ class ExchangeClient:
             if self.symbol_exists_cached(sym):
                 return True
             # direct query for robustness
-            data = await self._request("GET", "/api/v3/exchangeInfo", {"symbol": sym}, api="spot_api")
+            data = await self._request(
+                "GET", "/api/v3/exchangeInfo", {"symbol": sym}, api="spot_api"
+            )
             syms = (data or {}).get("symbols", [])
             if not syms:
                 return False
@@ -307,7 +327,7 @@ class ExchangeClient:
 
     # --------- IPO/new listings (used by IPOChaser & SymbolManager.recent) ---------
 
-    async def get_new_listings(self) -> List[str]:
+    async def get_new_listings(self) -> list[str]:
         """
         Lightweight heuristic: we don't have a perfect 'listing date' on public testnet.
         Return an empty list on testnet; on mainnet you could implement scraping/alt feed.
@@ -317,7 +337,7 @@ class ExchangeClient:
         # treat every symbol as a new listing. Return [] until a real feed is integrated.
         return []
 
-    async def get_new_listings_cached(self) -> List[str]:
+    async def get_new_listings_cached(self) -> list[str]:
         """
         Cached wrapper for get_new_listings(); keep same signature agents call.
         """
@@ -341,7 +361,10 @@ class ExchangeClient:
         if not self._exchange_info:
             return False
         try:
-            return any(str(s.get("symbol", "")).upper() == sym for s in self._exchange_info.get("symbols", []))
+            return any(
+                str(s.get("symbol", "")).upper() == sym
+                for s in self._exchange_info.get("symbols", [])
+            )
         except Exception:
             return False
 
@@ -364,7 +387,7 @@ class ExchangeClient:
         self._tradable_cache[sym] = {"ts": time.time(), "val": ok}
         return ok
 
-    def get_known_quotes(self) -> List[str]:
+    def get_known_quotes(self) -> list[str]:
         """Expose known quote assets for WalletScanner."""
         return list(self._known_quotes)
 
@@ -382,13 +405,13 @@ class ExchangeClient:
         """
         return await self.get_current_price(symbol)
 
-    async def get_order_book_ticker(self, symbol: str) -> Dict[str, str]:
+    async def get_order_book_ticker(self, symbol: str) -> dict[str, str]:
         """
         Legacy alias that returns the /api/v3/ticker/bookTicker shape:
         {'bidPrice': '...', 'askPrice': '...'} using the internal best bid/ask.
         """
         bid, ask = await self.get_best_bid_ask(symbol)
-        out: Dict[str, str] = {}
+        out: dict[str, str] = {}
         if bid is not None:
             out["bidPrice"] = f"{bid:.16g}"
         if ask is not None:
@@ -399,9 +422,11 @@ class ExchangeClient:
         sym = self._norm_symbol(symbol)
         try:
             raw = await self._request(
-                "GET", "/api/v3/order",
+                "GET",
+                "/api/v3/order",
                 {"symbol": sym, "origClientOrderId": client_order_id},
-                signed=True, api="spot_api"
+                signed=True,
+                api="spot_api",
             )
             return raw
         except Exception:
@@ -413,12 +438,12 @@ class ExchangeClient:
         *,
         order_id: Optional[int] = None,
         client_order_id: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """
         Fetch a single order by exchange order id or client order id.
         """
         sym = self._norm_symbol(symbol)
-        params: Dict[str, Any] = {"symbol": sym}
+        params: dict[str, Any] = {"symbol": sym}
         if order_id is not None:
             params["orderId"] = int(order_id)
         elif client_order_id:
@@ -431,11 +456,11 @@ class ExchangeClient:
         except Exception:
             return None
 
-    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_open_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
         """
         Fetch open orders (optionally per symbol).
         """
-        params: Dict[str, Any] = {}
+        params: dict[str, Any] = {}
         if symbol:
             params["symbol"] = self._norm_symbol(symbol)
         try:
@@ -450,7 +475,7 @@ class ExchangeClient:
         except Exception:
             return []
 
-    async def get_all_orders(self, symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
+    async def get_all_orders(self, symbol: str, limit: int = 50) -> list[dict[str, Any]]:
         """
         Fetch recent order history for a symbol.
         """
@@ -468,7 +493,7 @@ class ExchangeClient:
         except Exception:
             return []
 
-    async def get_my_trades(self, symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
+    async def get_my_trades(self, symbol: str, limit: int = 50) -> list[dict[str, Any]]:
         """
         Fetch recent account trades (fill-level) for a symbol.
         Uses /api/v3/myTrades — the most granular, authoritative proof-of-fill.
@@ -494,7 +519,9 @@ class ExchangeClient:
         logger: Optional[logging.Logger] = None,
         app: Optional[Any] = None,
         shared_state: Optional[Any] = None,
-        exchange_client: Optional[Any] = None,  # ignored; keeps compatibility with _try_construct kwargs
+        exchange_client: Optional[
+            Any
+        ] = None,  # ignored; keeps compatibility with _try_construct kwargs
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         testnet: Optional[bool] = None,
@@ -506,7 +533,9 @@ class ExchangeClient:
         self.app = app
 
         # logger
-        self.logger = logger if hasattr(logger, "level") else logging.getLogger("octi.ExchangeClient")
+        self.logger = (
+            logger if hasattr(logger, "level") else logging.getLogger("octi.ExchangeClient")
+        )
         if self.logger.level == logging.NOTSET:
             self.logger.setLevel(logging.INFO)
 
@@ -544,7 +573,7 @@ class ExchangeClient:
         self.paper_trade = bool(paper_trade)
         if self.paper_trade:
             self.logger.info("Paper trading mode is enabled. No real orders will be placed.")
-        
+
         # Diagnostic: Log mode configuration
         self.logger.info(f"[EC:Init] Mode: testnet={self.testnet}, paper_trade={self.paper_trade}")
 
@@ -552,7 +581,9 @@ class ExchangeClient:
         # Use self.testnet which was correctly set above (avoiding local variable shadowing)
         if self.testnet:
             api_key = _cfg("BINANCE_TESTNET_API_KEY")
-            api_secret_hmac = _cfg("BINANCE_TESTNET_API_SECRET_HMAC") or _cfg("BINANCE_TESTNET_API_SECRET")
+            api_secret_hmac = _cfg("BINANCE_TESTNET_API_SECRET_HMAC") or _cfg(
+                "BINANCE_TESTNET_API_SECRET"
+            )
             api_secret_ed25519 = _cfg("BINANCE_TESTNET_API_SECRET_ED25519")
             base_url = "https://testnet.binance.vision"
         else:
@@ -564,7 +595,9 @@ class ExchangeClient:
         # Normalize credential strings defensively (trim accidental whitespace/newlines).
         self.api_key = str(api_key or "").strip()
         self.api_secret_hmac = str(api_secret_hmac or "").strip()  # For REST signed endpoints
-        self.api_secret_ed25519 = str(api_secret_ed25519 or "").strip()  # For WS API v3 session.logon
+        self.api_secret_ed25519 = str(
+            api_secret_ed25519 or ""
+        ).strip()  # For WS API v3 session.logon
         # Backward compatibility: prioritize HMAC for REST signing paths.
         self.api_secret = self.api_secret_hmac or self.api_secret_ed25519
 
@@ -589,7 +622,11 @@ class ExchangeClient:
                 self.api_key = self.api_key or ""
                 self.api_secret = self.api_secret or ""
             else:
-                self.logger.info("[EC] API keys validated (key_len=%d, secret_len=%d)", len(self.api_key), len(self.api_secret))
+                self.logger.info(
+                    "[EC] API keys validated (key_len=%d, secret_len=%d)",
+                    len(self.api_key),
+                    len(self.api_secret),
+                )
 
         # aiohttp/binance client handles
         self.client: Optional[AsyncClient] = None
@@ -599,9 +636,10 @@ class ExchangeClient:
         # API base URLs (spot /api + /sapi, UM futures kept available)
         # Allow override from config or environment, else derive by testnet flag.
         base_override = (
-            (getattr(self.config, "BINANCE_BASE_URL", "") if not isinstance(self.config, dict) else self.config.get("BINANCE_BASE_URL", ""))
-            or os.getenv("BINANCE_BASE_URL", "").strip()
-        )
+            getattr(self.config, "BINANCE_BASE_URL", "")
+            if not isinstance(self.config, dict)
+            else self.config.get("BINANCE_BASE_URL", "")
+        ) or os.getenv("BINANCE_BASE_URL", "").strip()
 
         if self.testnet:
             spot_api = "https://testnet.binance.vision"
@@ -625,25 +663,27 @@ class ExchangeClient:
         self._known_quotes = {"USDT", "FDUSD", "USDC", "BUSD", "TUSD", "DAI"}
 
         # caches & tuning
-        self.price_cache: Dict[str, Tuple[float, float]] = {}  # (price, ts)
-        self.symbol_filters: Dict[str, Dict[str, Any]] = {}
-        self._exchange_info: Optional[Dict[str, Any]] = None
+        self.price_cache: dict[str, tuple[float, float]] = {}  # (price, ts)
+        self.symbol_filters: dict[str, dict[str, Any]] = {}
+        self._exchange_info: Optional[dict[str, Any]] = None
         self._exchange_info_timestamp: float = 0
         self._sync_lock = None  # Lazy-init when needed to avoid event loop issues in sync tests
-        self._paper_trade_orders: Dict[str, Dict[str, Any]] = {}
+        self._paper_trade_orders: dict[str, dict[str, Any]] = {}
         self._time_offset_ms: int = 0  # server - local
         self._weight_counters = defaultdict(lambda: {"ts": 0.0, "w": 0})
         self._weight_window = float(_cfg("WEIGHT_WINDOW_SEC", 1.0))  # seconds
-        self._weight_limit = int(_cfg("WEIGHT_LIMIT_PER_WINDOW", 10))    # conservative per second
+        self._weight_limit = int(_cfg("WEIGHT_LIMIT_PER_WINDOW", 10))  # conservative per second
         # Correct Binance endpoint weights (https://binance-docs.github.io/apidocs/spot/en/#limits)
         _default_path_weights = {
-            "/api/v3/openOrders": 6,   # weight 6 (all symbols); main polling endpoint
-            "/api/v3/account": 20,     # weight 20
-            "/api/v3/allOrders": 10,   # weight 10
+            "/api/v3/openOrders": 6,  # weight 6 (all symbols); main polling endpoint
+            "/api/v3/account": 20,  # weight 20
+            "/api/v3/allOrders": 10,  # weight 10
             "/api/v3/klines": 2,
             "/api/v3/ticker/price": 2,
         }
-        self._path_weight_overrides = dict(_cfg("PATH_WEIGHTS", _default_path_weights) or _default_path_weights)
+        self._path_weight_overrides = dict(
+            _cfg("PATH_WEIGHTS", _default_path_weights) or _default_path_weights
+        )
         # Configurable REST polling interval for _user_data_polling_loop (Tier-3 fallback)
         self._user_data_poll_interval_sec = float(_cfg("USER_DATA_POLL_INTERVAL_SEC", 25.0))
         self._acct_cache = None
@@ -656,17 +696,17 @@ class ExchangeClient:
         # Binance recvWindow parameter (milliseconds) used for signed requests
         self.recv_window_ms = int(_cfg("RECV_WINDOW_MS", 5000))
         # 24h ticker cache
-        self._ticker_24h_cache: Dict[str, Dict[str, Any]] = {}
+        self._ticker_24h_cache: dict[str, dict[str, Any]] = {}
         self._ticker_24h_cache_ts: float = 0.0
         self._ticker_24h_ttl_sec = float(_cfg("TICKER_24H_TTL_SEC", 15.0))
 
         # Micro-caches (symbol info, tradability, book ticker)
-        self._sym_info_cache: Dict[str, Any] = {}
-        self._tradable_cache: Dict[str, Any] = {}
-        self._book_cache: Dict[str, Any] = {}
+        self._sym_info_cache: dict[str, Any] = {}
+        self._tradable_cache: dict[str, Any] = {}
+        self._book_cache: dict[str, Any] = {}
 
         # IPO / new-listings cache
-        self._ipo_cache: List[str] = []
+        self._ipo_cache: list[str] = []
         self._ipo_cache_ts: float = 0.0
 
         # No remainder below quote threshold
@@ -685,11 +725,15 @@ class ExchangeClient:
         self.user_data_ws_reconnect_backoff_sec = float(
             _cfg("USER_DATA_WS_RECONNECT_BACKOFF_SEC", 3.0) or 3.0
         )
-        self.user_data_ws_max_backoff_sec = float(_cfg("USER_DATA_WS_MAX_BACKOFF_SEC", 30.0) or 30.0)
+        self.user_data_ws_max_backoff_sec = float(
+            _cfg("USER_DATA_WS_MAX_BACKOFF_SEC", 30.0) or 30.0
+        )
         self.user_data_ws_api_request_timeout_sec = float(
             _cfg("USER_DATA_WS_API_REQUEST_TIMEOUT_SEC", 12.0) or 12.0
         )
-        self.user_data_ws_auth_mode = str(_cfg("USER_DATA_WS_AUTH_MODE", "auto") or "auto").strip().lower()
+        self.user_data_ws_auth_mode = (
+            str(_cfg("USER_DATA_WS_AUTH_MODE", "auto") or "auto").strip().lower()
+        )
         if self.user_data_ws_auth_mode not in {"auto", "session", "signature", "polling"}:
             self.user_data_ws_auth_mode = "auto"
 
@@ -753,7 +797,9 @@ class ExchangeClient:
 
         # Circuit breakers
         class _Breaker:
-            def __init__(self, window_sec=60, open_error_rate_pct=10, min_requests=10, half_open_after_sec=15):
+            def __init__(
+                self, window_sec=60, open_error_rate_pct=10, min_requests=10, half_open_after_sec=15
+            ):
                 self.window_sec = window_sec
                 self.open_error_rate_pct = open_error_rate_pct
                 self.min_requests = min_requests
@@ -864,13 +910,16 @@ class ExchangeClient:
             and str(getattr(self, "_order_scope_owner", "")) == "ExecutionManager"
         )
 
-    async def _guard_execution_path(self, *, method: str, symbol: str, side: str, tag: str = "") -> None:
+    async def _guard_execution_path(
+        self, *, method: str, symbol: str, side: str, tag: str = ""
+    ) -> None:
         """
         Fail closed if someone tries to place orders outside ExecutionManager.
         Also enforces TRADING_MODE safety gate: only live mode allowed.
         """
         # ✅ EXTRA SAFETY: Check TRADING_MODE before any order submission
         import os
+
         mode = os.getenv("TRADING_MODE", "live").lower()
         if mode != "live":
             sym = self._norm_symbol(symbol)
@@ -893,7 +942,7 @@ class ExchangeClient:
             except Exception:
                 pass
             raise RuntimeError(f"Real order blocked: system not in LIVE mode (TRADING_MODE={mode})")
-        
+
         if not bool(getattr(self, "_enforce_execution_manager_path", True)):
             return
         if self._is_execution_scope_active():
@@ -966,13 +1015,15 @@ class ExchangeClient:
         """Emit P9 HealthStatus: topic=events.health.status, schema={component,level,details,ts}"""
         payload = {
             "component": "ExchangeClient",
-            "level": level,                     # "OK" | "DEGRADED" | "ERROR"
+            "level": level,  # "OK" | "DEGRADED" | "ERROR"
             "details": details or {},
             "ts": self._now_iso(),
         }
         try:
             if hasattr(self.shared_state, "emit_event"):
-                await self._maybe_await(self.shared_state.emit_event("events.health.status", payload))
+                await self._maybe_await(
+                    self.shared_state.emit_event("events.health.status", payload)
+                )
         except Exception:
             self.logger.debug("emit_event failed for events.health.status", exc_info=True)
 
@@ -991,18 +1042,22 @@ class ExchangeClient:
         self.last_any_ws_event_ts = ts
         return ts
 
-    def mark_user_data_event(self, event_name: str = "", payload: Optional[Dict[str, Any]] = None) -> float:
+    def mark_user_data_event(
+        self, event_name: str = "", payload: Optional[dict[str, Any]] = None
+    ) -> float:
         ts = time.time()
         self.last_user_data_event_ts = ts
         self.last_any_ws_event_ts = ts
         return ts
 
-    def record_successful_force_sync(self, *, reason: str = "", ts: Optional[float] = None) -> float:
+    def record_successful_force_sync(
+        self, *, reason: str = "", ts: Optional[float] = None
+    ) -> float:
         now = float(ts if ts is not None else time.time())
         self.last_successful_force_sync_ts = now
         return now
 
-    def get_ws_health_snapshot(self) -> Dict[str, Any]:
+    def get_ws_health_snapshot(self) -> dict[str, Any]:
         now = time.time()
         user_ts = float(getattr(self, "last_user_data_event_ts", 0.0) or 0.0)
         any_ts = float(getattr(self, "last_any_ws_event_ts", 0.0) or 0.0)
@@ -1012,7 +1067,9 @@ class ExchangeClient:
             "user_data_stream_enabled": bool(getattr(self, "user_data_stream_enabled", False)),
             "ws_connected": bool(getattr(self, "ws_connected", False)),
             "ws_reconnect_count": int(getattr(self, "ws_reconnect_count", 0) or 0),
-            "user_data_ws_auth_mode": str(getattr(self, "_user_data_auth_mode_active", "none") or "none"),
+            "user_data_ws_auth_mode": str(
+                getattr(self, "_user_data_auth_mode_active", "none") or "none"
+            ),
             "user_data_subscription_id": getattr(self, "_user_data_subscription_id", None),
             "last_user_data_event_ts": user_ts,
             "last_any_ws_event_ts": any_ts,
@@ -1047,28 +1104,27 @@ class ExchangeClient:
         """
         Create a new listenKey for WebSocket Streams API.
         Works with HMAC keys (no Ed25519 required).
-        
+
         Returns:
             listenKey string or None if failed
         """
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                self.logger.info(f"[EC:ListenKey] Creating new listenKey (attempt {attempt+1}/{max_retries})...")
+                self.logger.info(
+                    f"[EC:ListenKey] Creating new listenKey (attempt {attempt+1}/{max_retries})..."
+                )
                 # POST /api/v3/userDataStream
                 # Call directly using aiohttp to avoid recvWindow being added automatically
                 if not self.session or self.session.closed:
                     self.logger.error("[EC:ListenKey] ❌ Session not available")
                     return None
-                
+
                 # Spot listenKey uses API-key header auth (no timestamp/signature payload).
-                
+
                 url = f"{self.base_url_spot_api}/api/v3/userDataStream"
-                headers = {
-                    "User-Agent": "octivault-trader/2.1",
-                    "X-MBX-APIKEY": self.api_key or ""
-                }
-                
+                headers = {"User-Agent": "octivault-trader/2.1", "X-MBX-APIKEY": self.api_key or ""}
+
                 async with self.session.request("POST", url, headers=headers) as response:
                     text = await response.text()
                     if response.status >= 400:
@@ -1079,7 +1135,7 @@ class ExchangeClient:
                         code = err.get("code", response.status)
                         msg = err.get("msg", text)
                         raise BinanceAPIException(msg, code=code)
-                    
+
                     data = json.loads(text) if text else {}
                     listen_key = data.get("listenKey")
                     if listen_key:
@@ -1088,19 +1144,23 @@ class ExchangeClient:
                     else:
                         self.logger.error("[EC:ListenKey] ❌ No listenKey in response: %s", data)
                         return None
-                        
+
             except Exception as e:
                 error_str = str(e).lower()
                 if "410" in str(e) or "gone" in error_str:
-                    self.logger.warning("[EC:ListenKey] Got 410 Gone; listenKey stream unavailable in this environment. Falling back.")
+                    self.logger.warning(
+                        "[EC:ListenKey] Got 410 Gone; listenKey stream unavailable in this environment. Falling back."
+                    )
                     return None
                 elif "429" in str(e) or "rate" in error_str:
-                    self.logger.warning(f"[EC:ListenKey] ❌ Rate limited, waiting before retry {attempt+1}...")
+                    self.logger.warning(
+                        f"[EC:ListenKey] ❌ Rate limited, waiting before retry {attempt+1}..."
+                    )
                     await asyncio.sleep(5.0 * (attempt + 1))  # Longer backoff for rate limits
                 else:
                     self.logger.error("[EC:ListenKey] ❌ Failed to create: %s", e)
                     return None
-        
+
         self.logger.error("[EC:ListenKey] ❌ Failed after %d attempts", max_retries)
         return None
 
@@ -1108,13 +1168,13 @@ class ExchangeClient:
         """
         Refresh an existing listenKey (keep it alive).
         Must be called every 30 minutes or listenKey expires.
-        
+
         Returns:
             True if successful, False otherwise
         """
         if not listen_key:
             return False
-        
+
         try:
             self.logger.debug("[EC:ListenKey] Refreshing...")
             # Spot listenKey keepalive also uses API-key header auth only.
@@ -1125,10 +1185,14 @@ class ExchangeClient:
                 "User-Agent": "octivault-trader/2.1",
                 "X-MBX-APIKEY": self.api_key or "",
             }
-            async with self.session.request("PUT", url, headers=headers, params={"listenKey": listen_key}) as response:
+            async with self.session.request(
+                "PUT", url, headers=headers, params={"listenKey": listen_key}
+            ) as response:
                 if response.status >= 400:
                     text = await response.text()
-                    self.logger.warning("[EC:ListenKey] ❌ Refresh HTTP %s: %s", response.status, text)
+                    self.logger.warning(
+                        "[EC:ListenKey] ❌ Refresh HTTP %s: %s", response.status, text
+                    )
                     return False
             self.logger.debug("[EC:ListenKey] ✅ Refreshed")
             return True
@@ -1143,7 +1207,7 @@ class ExchangeClient:
         """
         if not listen_key:
             return ""
-        
+
         host = self.base_url_spot_api or "api.binance.com"
         if "testnet" in host:
             return f"wss://stream.testnet.binance.vision/ws/{listen_key}"
@@ -1157,42 +1221,42 @@ class ExchangeClient:
     def _sign_ed25519(self, payload: str) -> Optional[str]:
         """
         Sign payload with Ed25519 private key for WS API v3 session.logon.
-        
+
         Uses PyNaCl (libsodium) for Ed25519 signing.
-        
+
         Input Format:
         - Base64-encoded 32-byte Ed25519 seed (standard)
         - Base64-encoded 48-byte seed (extended, uses first 32 bytes)
         - Raw 32-byte seed (not base64-encoded)
-        
+
         Returns: Base64-encoded signature, or None if key unavailable.
         """
         # Validate payload
         if not payload:
             self.logger.error("[EC] Ed25519 signing called with empty payload")
             return None
-        
+
         if payload is None:
             self.logger.error("[EC] Ed25519 signing called with None payload")
             return None
-        
+
         if not self.api_secret_ed25519:
             self.logger.warning("[EC] Ed25519 signing requested but api_secret_ed25519 is empty")
             return None
-        
+
         if not _NACL_AVAILABLE:
             self.logger.error("[EC] PyNaCl library not available for Ed25519 signing")
             return None
-        
+
         try:
             seed_input = self.api_secret_ed25519.strip()
             ed25519_seed = None
-            
+
             # First, try to treat it as a base64-encoded seed
             try:
                 seed_bytes = base64.b64decode(seed_input)
                 self.logger.debug("[EC] Decoded base64 seed: %d bytes", len(seed_bytes))
-                
+
                 # Handle 32-byte (standard) or 48-byte (extended) seeds
                 if len(seed_bytes) == 32:
                     ed25519_seed = seed_bytes
@@ -1204,65 +1268,69 @@ class ExchangeClient:
                 else:
                     self.logger.debug(
                         "[EC] Base64-decoded seed is %d bytes (not 32 or 48), trying as raw seed",
-                        len(seed_bytes)
+                        len(seed_bytes),
                     )
             except Exception as b64_err:
-                self.logger.debug("[EC] Base64 decode failed: %s, trying as raw bytes", str(b64_err))
-            
+                self.logger.debug(
+                    "[EC] Base64 decode failed: %s, trying as raw bytes", str(b64_err)
+                )
+
             # If base64 decode didn't yield valid seed, try raw bytes interpretation
             if ed25519_seed is None:
                 try:
                     # Try treating the input as raw UTF-8 bytes
-                    raw_bytes = seed_input.encode('utf-8')
+                    raw_bytes = seed_input.encode("utf-8")
                     if len(raw_bytes) == 32:
                         ed25519_seed = raw_bytes
                         self.logger.debug("[EC] Using raw 32-byte seed from UTF-8 encoding")
                     else:
                         self.logger.error(
-                            "[EC] Raw UTF-8 seed is %d bytes (not 32), cannot use",
-                            len(raw_bytes)
+                            "[EC] Raw UTF-8 seed is %d bytes (not 32), cannot use", len(raw_bytes)
                         )
                 except Exception as raw_err:
                     self.logger.error("[EC] Raw seed interpretation failed: %s", str(raw_err))
-            
+
             if ed25519_seed is None or len(ed25519_seed) != 32:
                 self.logger.error(
                     "[EC] Ed25519 seed must be 32 bytes (after base64 decode or raw interpretation)"
                 )
                 return None
-            
+
             # Create signing key from seed
             try:
                 signing_key = _NaClSigningKey(ed25519_seed)
             except Exception as sk_err:
                 self.logger.error("[EC] Failed to create SigningKey from seed: %s", str(sk_err))
                 return None
-            
+
             # Sign the payload
             payload_str = str(payload) if payload else ""
             if not payload_str:
                 self.logger.error("[EC] Payload is empty after conversion to string")
                 return None
-            
-            signed_message = signing_key.sign(payload_str.encode('utf-8'))
+
+            signed_message = signing_key.sign(payload_str.encode("utf-8"))
             signature_bytes = signed_message.signature
-            
+
             # Base64 encode the signature
-            signature_b64 = base64.b64encode(signature_bytes).decode('utf-8')
-            
-            self.logger.debug("[EC] Ed25519 signature created successfully (len=%d)", len(signature_b64))
+            signature_b64 = base64.b64encode(signature_bytes).decode("utf-8")
+
+            self.logger.debug(
+                "[EC] Ed25519 signature created successfully (len=%d)", len(signature_b64)
+            )
             return signature_b64
-            
+
         except Exception as e:
             self.logger.error("[EC] Ed25519 signing failed: %s", str(e))
             import traceback
+
             self.logger.debug("[EC] Traceback: %s", traceback.format_exc())
             return None
 
-    def _ws_api_signed_params(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _ws_api_signed_params(self, extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """
         WS API v3 params for session.logon WITH HMAC signature.
-        
+
         CRITICAL: Binance WS API v3 REQUIRES HMAC signatures for HMAC-based API keys.
         - Only Ed25519 keys use a different method (not applicable here)
         - For HMAC keys:
@@ -1272,23 +1340,21 @@ class ExchangeClient:
         * Append signature to params
         - Query string format: MUST be ALPHABETICALLY SORTED
         * Format: "apiKey=...&timestamp=..." (NOT timestamp first)
-        
+
         ⚠️ CRITICAL FIXES:
         - DO NOT use urllib.parse.urlencode() (order not guaranteed)
         - DO NOT JSON encode
         - DO NOT include signature in the sorted list
         - MUST sort params alphabetically BEFORE calculating signature
         """
-        params: Dict[str, Any] = dict(extra or {})
+        params: dict[str, Any] = dict(extra or {})
         params["apiKey"] = str(self.api_key or "")
         timestamp = int(time.time() * 1000 + self._time_offset_ms)
         params["timestamp"] = timestamp
-        
+
         # MUST be alphabetically sorted: apiKey comes before timestamp
-        query_string = "&".join(
-            f"{k}={v}" for k, v in sorted(params.items())
-        )
-        
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
         # Calculate HMAC-SHA256 signature BEFORE adding to params
         # REST API ALWAYS uses HMAC, never Ed25519
         # Use api_secret_hmac if available, fall back to api_secret for tests
@@ -1296,22 +1362,20 @@ class ExchangeClient:
         if not secret_for_hmac:
             self.logger.warning("[EC] HMAC secret not available for REST signing")
             return params
-        
+
         signature = hmac.new(
-            secret_for_hmac.encode('utf-8'),
-            query_string.encode('utf-8'),
-            hashlib.sha256
+            secret_for_hmac.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256
         ).hexdigest()
-        
+
         # Add signature AFTER calculation (not included in signed payload)
         params["signature"] = signature
-        
+
         return params
 
-    def _ws_api_session_logon_params(self) -> Dict[str, Any]:
+    def _ws_api_session_logon_params(self) -> dict[str, Any]:
         """
         WS API v3 params for session.logon WITH Ed25519 signature.
-        
+
         CRITICAL: Binance WS API v3 session.logon REQUIRES Ed25519 signatures.
         - Include: apiKey
         - Include: timestamp
@@ -1322,24 +1386,24 @@ class ExchangeClient:
         if not self.api_key:
             self.logger.error("[EC] api_key is missing, cannot create session.logon params")
             return {}
-        
+
         if not self.api_secret_ed25519:
             self.logger.error("[EC] api_secret_ed25519 is missing, cannot sign session.logon")
             return {}
-        
-        params: Dict[str, Any] = {}
+
+        params: dict[str, Any] = {}
         params["apiKey"] = str(self.api_key)
         params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
-        
+
         # Create payload for signing (apiKey + timestamp, alphabetically sorted)
         payload = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        
+
         if not payload:
             self.logger.error("[EC] Failed to construct payload for session.logon signing")
             return {}
-        
+
         self.logger.debug("[EC] session.logon payload: %s", payload)
-        
+
         # Sign with Ed25519
         signature = self._sign_ed25519(payload)
         if signature:
@@ -1347,13 +1411,13 @@ class ExchangeClient:
             self.logger.debug("[EC] session.logon signature created (len=%d)", len(signature))
         else:
             self.logger.warning("[EC] Ed25519 signing failed, session.logon will fail")
-        
+
         return params
 
-    def _ws_api_signature_params(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _ws_api_signature_params(self, extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """
         WS API v3 params for userDataStream subscription WITH HMAC signature.
-        
+
         CRITICAL: Binance WS API v3 REQUIRES HMAC signatures for HMAC-based API keys.
         - For HMAC keys:
         * Include: apiKey (MUST BE IN PARAMS)
@@ -1362,7 +1426,7 @@ class ExchangeClient:
         * Append signature to params
         - Query string format: "apiKey=...&timestamp=..."
         """
-        params: Dict[str, Any] = dict(extra or {})
+        params: dict[str, Any] = dict(extra or {})
         params["apiKey"] = str(self.api_key or "")
         params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
         params.setdefault("recvWindow", self.recv_window_ms)
@@ -1372,12 +1436,10 @@ class ExchangeClient:
         # Use HMAC secret if available (hybrid mode), otherwise use api_secret
         secret_for_signing = self.api_secret_hmac or self.api_secret
         signature = hmac.new(
-            secret_for_signing.encode('utf-8'),
-            query_string.encode('utf-8'),
-            hashlib.sha256
+            secret_for_signing.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256
         ).hexdigest()
         params["signature"] = signature
-        
+
         return params
 
     def _extract_ws_error_code(self, value: Any) -> Optional[int]:
@@ -1424,11 +1486,11 @@ class ExchangeClient:
             return True
         return False
 
-    def _ingest_user_data_ws_payload(self, payload: Dict[str, Any]) -> str:
+    def _ingest_user_data_ws_payload(self, payload: dict[str, Any]) -> str:
         if not isinstance(payload, dict):
             return ""
 
-        event_payload: Dict[str, Any] = {}
+        event_payload: dict[str, Any] = {}
         subscription_id = payload.get("subscriptionId")
         raw_event = payload.get("event")
         if isinstance(raw_event, dict):
@@ -1475,11 +1537,11 @@ class ExchangeClient:
         ws: aiohttp.ClientWebSocketResponse,
         *,
         method: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
         timeout_sec: Optional[float] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         request_id = f"octi-{uuid.uuid4()}"
-        payload: Dict[str, Any] = {"id": request_id, "method": str(method or "")}
+        payload: dict[str, Any] = {"id": request_id, "method": str(method or "")}
         if params:
             payload["params"] = params
 
@@ -1488,7 +1550,7 @@ class ExchangeClient:
         self.logger.warning(f"[EC:WS] SENDING RPC: method={method} payload={json_payload}")
         try:
             await ws.send_str(json_payload)
-            self.logger.warning(f"[EC:WS] RPC sent successfully")
+            self.logger.warning("[EC:WS] RPC sent successfully")
         except Exception as e:
             self.logger.error(f"[EC:WS] Failed to send RPC: {e}")
             raise
@@ -1496,10 +1558,16 @@ class ExchangeClient:
 
         timeout_val = max(
             1.0,
-            float(timeout_sec if timeout_sec is not None else self.user_data_ws_api_request_timeout_sec or 12.0),
+            float(
+                timeout_sec
+                if timeout_sec is not None
+                else self.user_data_ws_api_request_timeout_sec or 12.0
+            ),
         )
         deadline = time.time() + timeout_val
-        self.logger.debug("[EC:WS] waiting for response method=%s timeout=%.1fs", method, timeout_val)
+        self.logger.debug(
+            "[EC:WS] waiting for response method=%s timeout=%.1fs", method, timeout_val
+        )
 
         while True:
             remaining = deadline - time.time()
@@ -1515,14 +1583,18 @@ class ExchangeClient:
                 except Exception:
                     frame = {}
 
-                self.logger.debug("[EC:WS] TEXT frame id=%s status=%s", frame.get("id"), frame.get("status"))
+                self.logger.debug(
+                    "[EC:WS] TEXT frame id=%s status=%s", frame.get("id"), frame.get("status")
+                )
                 self.mark_any_ws_event("user_data_ws_text")
                 frame_evt = self._ingest_user_data_ws_payload(frame)
                 if frame_evt == "eventStreamTerminated":
                     raise RuntimeError("USER_DATA_STREAM_TERMINATED")
 
                 if str(frame.get("id", "")) != request_id:
-                    self.logger.debug("[EC:WS] frame id mismatch expected=%s got=%s", request_id, frame.get("id"))
+                    self.logger.debug(
+                        "[EC:WS] frame id mismatch expected=%s got=%s", request_id, frame.get("id")
+                    )
                     continue
 
                 status = self._extract_ws_error_code(frame.get("status"))
@@ -1560,25 +1632,32 @@ class ExchangeClient:
                 if _close_code == 1008:
                     self.logger.warning(
                         "[EC:WS] Policy-close during %s request: type=%s code=%s reason=%r",
-                        method, msg.type, _close_code, _close_reason,
+                        method,
+                        msg.type,
+                        _close_code,
+                        _close_reason,
                     )
                 else:
                     self.logger.error(
                         "[EC:WS] ❌ SERVER CLOSED CONNECTION during %s request: type=%s code=%s reason=%r",
-                        method, msg.type, _close_code, _close_reason,
+                        method,
+                        msg.type,
+                        _close_code,
+                        _close_reason,
                     )
                 raise RuntimeError(
-                    "USER_DATA_WS_CLOSED:%s ws_code=%s reason=%r" % (msg.type, _close_code, _close_reason)
+                    "USER_DATA_WS_CLOSED:%s ws_code=%s reason=%r"
+                    % (msg.type, _close_code, _close_reason)
                 )
 
     async def _ws_api_subscribe_with_session(
         self, ws: aiohttp.ClientWebSocketResponse
-    ) -> Tuple[str, Optional[int]]:
+    ) -> tuple[str, Optional[int]]:
         self.logger.debug("[EC:WS] sending session.logon")
-        
+
         # Get Ed25519 session.logon params
         logon_params = self._ws_api_session_logon_params()
-        
+
         # Check if signature was successfully created
         if "signature" not in logon_params:
             self.logger.warning(
@@ -1586,7 +1665,7 @@ class ExchangeClient:
                 "falling back to listenKey (Tier 2)"
             )
             raise RuntimeError("Ed25519 session.logon unavailable (key or signing failed)")
-        
+
         await self._ws_api_request(
             ws,
             method="session.logon",
@@ -1600,7 +1679,10 @@ class ExchangeClient:
             method="userDataStream.subscribe",
             params=self._ws_api_signature_params(),  # HMAC signing
         )
-        self.logger.debug("[EC:WS] subscribe response keys=%s", list(sub_resp.keys()) if isinstance(sub_resp, dict) else sub_resp)
+        self.logger.debug(
+            "[EC:WS] subscribe response keys=%s",
+            list(sub_resp.keys()) if isinstance(sub_resp, dict) else sub_resp,
+        )
         sub_res = sub_resp.get("result") if isinstance(sub_resp.get("result"), dict) else {}
         sub_id = self._extract_ws_error_code(sub_res.get("subscriptionId"))
         self._user_data_subscription_id = sub_id
@@ -1610,14 +1692,17 @@ class ExchangeClient:
 
     async def _ws_api_subscribe_with_signature(
         self, ws: aiohttp.ClientWebSocketResponse
-    ) -> Tuple[str, Optional[int]]:
+    ) -> tuple[str, Optional[int]]:
         self.logger.debug("[EC:WS] sending userDataStream.subscribe.signature")
         sub_resp = await self._ws_api_request(
             ws,
             method="userDataStream.subscribe.signature",
             params=self._ws_api_signature_params(),
         )
-        self.logger.debug("[EC:WS] subscribe response keys=%s", list(sub_resp.keys()) if isinstance(sub_resp, dict) else sub_resp)
+        self.logger.debug(
+            "[EC:WS] subscribe response keys=%s",
+            list(sub_resp.keys()) if isinstance(sub_resp, dict) else sub_resp,
+        )
         sub_res = sub_resp.get("result") if isinstance(sub_resp.get("result"), dict) else {}
         sub_id = self._extract_ws_error_code(sub_res.get("subscriptionId"))
         self._user_data_subscription_id = sub_id
@@ -1627,7 +1712,7 @@ class ExchangeClient:
 
     async def _ws_api_subscribe_user_data(
         self, ws: aiohttp.ClientWebSocketResponse
-    ) -> Tuple[str, Optional[int]]:
+    ) -> tuple[str, Optional[int]]:
         pref = str(getattr(self, "user_data_ws_auth_mode", "auto") or "auto").strip().lower()
         self.logger.debug("[EC:WS] subscribe user_data auth_mode=%s", pref)
         if pref == "signature":
@@ -1635,7 +1720,9 @@ class ExchangeClient:
 
         try:
             result = await self._ws_api_subscribe_with_session(ws)
-            self.logger.debug("[EC:WS] session mode succeeded mode=%s sub_id=%s", result[0], result[1])
+            self.logger.debug(
+                "[EC:WS] session mode succeeded mode=%s sub_id=%s", result[0], result[1]
+            )
             return result
         except Exception as e:
             self.logger.debug("[EC:WS] session mode failed: %s", e)
@@ -1650,7 +1737,7 @@ class ExchangeClient:
     async def _user_data_listen_key_loop(self) -> None:
         """
         WebSocket Streams API loop using listenKey (works with HMAC keys).
-        
+
         This is the fallback when WS API v3 is not available (no Ed25519 keys).
         Uses REST-based listenKey authentication which is compatible with HMAC-SHA256 keys.
         """
@@ -1676,7 +1763,9 @@ class ExchangeClient:
                 if not hasattr(self, "_listen_key") or not self._listen_key:
                     self._listen_key = await self._create_listen_key()
                     if not self._listen_key:
-                        raise RuntimeError("Failed to create listenKey - likely HTTP 410 Gone (account doesn't support user-data streams)")
+                        raise RuntimeError(
+                            "Failed to create listenKey - likely HTTP 410 Gone (account doesn't support user-data streams)"
+                        )
                     last_listen_key_refresh = time.time()
 
                 ws_url = self._user_data_ws_stream_url(self._listen_key)
@@ -1704,7 +1793,9 @@ class ExchangeClient:
                                 if success:
                                     last_listen_key_refresh = now
 
-                            remaining = listen_key_refresh_interval - (now - last_listen_key_refresh)
+                            remaining = listen_key_refresh_interval - (
+                                now - last_listen_key_refresh
+                            )
                             timeout = max(1.0, min(30.0, remaining))
 
                             msg = await asyncio.wait_for(ws.receive(), timeout=timeout)
@@ -1715,7 +1806,9 @@ class ExchangeClient:
                                     if evt == "eventStreamTerminated":
                                         raise RuntimeError("USER_DATA_STREAM_TERMINATED")
                                 except Exception as e:
-                                    self.logger.debug("[EC:ListenKeyWS] Payload processing error: %s", e)
+                                    self.logger.debug(
+                                        "[EC:ListenKeyWS] Payload processing error: %s", e
+                                    )
                                 continue
 
                             if msg.type == aiohttp.WSMsgType.PING:
@@ -1727,11 +1820,22 @@ class ExchangeClient:
                                 self.mark_any_ws_event("user_data_pong")
                                 continue
 
-                            if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR):
+                            if msg.type in (
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.CLOSING,
+                                aiohttp.WSMsgType.ERROR,
+                            ):
                                 _close_code = getattr(msg, "data", None)
                                 _close_reason = str(getattr(msg, "extra", "") or "")
-                                self.logger.warning("[EC:ListenKeyWS] Server closed: code=%s reason=%r", _close_code, _close_reason)
-                                raise RuntimeError(f"USER_DATA_WS_CLOSED: {msg.type} code={_close_code}")
+                                self.logger.warning(
+                                    "[EC:ListenKeyWS] Server closed: code=%s reason=%r",
+                                    _close_code,
+                                    _close_reason,
+                                )
+                                raise RuntimeError(
+                                    f"USER_DATA_WS_CLOSED: {msg.type} code={_close_code}"
+                                )
 
                         except asyncio.TimeoutError:
                             continue
@@ -1747,9 +1851,12 @@ class ExchangeClient:
                 # Check if this is a fatal listen key error - if so, re-raise to trigger polling fallback
                 error_str = str(e).lower()
                 if "failed to create listenkey" in error_str or "doesn't support" in error_str:
-                    self.logger.warning("[EC:ListenKeyWS] listenKey unavailable; handing off to polling fallback: %s", e)
+                    self.logger.warning(
+                        "[EC:ListenKeyWS] listenKey unavailable; handing off to polling fallback: %s",
+                        e,
+                    )
                     raise
-                
+
                 self.ws_connected = False
                 self._user_data_ws_conn = None
                 self._user_data_subscription_id = None
@@ -1777,7 +1884,7 @@ class ExchangeClient:
     async def _user_data_polling_loop(self) -> None:
         """
         ✅ POLLING MODE: Deterministic account reconciliation via REST.
-        
+
         Every poll cycle (2.0s):
         1. Fetch open orders via /api/v3/openOrders
         2. Fetch account balances via /api/v3/account
@@ -1788,36 +1895,38 @@ class ExchangeClient:
             - Closed positions
             - Trade execution confirmation
         5. Emit reconciliation events to update position state
-        
+
         This is more stable than WebSocket because:
         - No authentication state to manage
         - Deterministic comparison logic (not event-driven)
         - Easy to test and audit
         - Works reliably under market stress
         """
-        poll_interval = self._user_data_poll_interval_sec  # Default 25s; set USER_DATA_POLL_INTERVAL_SEC to tune
+        poll_interval = (
+            self._user_data_poll_interval_sec
+        )  # Default 25s; set USER_DATA_POLL_INTERVAL_SEC to tune
         backoff = max(1.0, float(self.user_data_ws_reconnect_backoff_sec or 3.0))
         max_backoff = max(backoff, float(self.user_data_ws_max_backoff_sec or 30.0))
-        
+
         # Track previous state to detect changes
-        prev_balances: Dict[str, Dict[str, float]] = {}
-        prev_open_orders: Dict[str, Any] = {}  # order_id -> order_data
-        prev_filled_qty: Dict[str, float] = {}  # order_id -> filled_qty
+        prev_balances: dict[str, dict[str, float]] = {}
+        prev_open_orders: dict[str, Any] = {}  # order_id -> order_data
+        prev_filled_qty: dict[str, float] = {}  # order_id -> filled_qty
         last_poll_time = 0.0
-        
+
         while self.is_started and not self._user_data_stop.is_set():
             try:
                 now = time.time()
-                
+
                 # Mark as connected in polling mode
                 self.ws_connected = True
                 self._user_data_auth_mode_active = "polling"
                 self.ws_reconnect_count = 0
                 self.mark_any_ws_event("user_data_connected")
                 self.last_user_data_event_ts = now
-                
+
                 self.logger.info("[EC:Polling] Polling mode active (interval=%.1fs)", poll_interval)
-                
+
                 while self.is_started and not self._user_data_stop.is_set():
                     # Wait until next poll time
                     now = time.time()
@@ -1825,48 +1934,58 @@ class ExchangeClient:
                     if time_since_poll < poll_interval:
                         await asyncio.sleep(min(0.5, poll_interval - time_since_poll))
                         continue
-                    
+
                     try:
                         now = time.time()
                         self.logger.debug("[EC:Polling] Starting reconciliation cycle at %.3f", now)
-                        
+
                         # ====== PHASE 1: Fetch Current State ======
                         # Fetch open orders — skip when idle to conserve weight (6/call)
                         _ss = getattr(self, "shared_state", None)
-                        _has_positions = bool(_ss and getattr(_ss, "open_positions_count", lambda: 0)() > 0)
+                        _has_positions = bool(
+                            _ss and getattr(_ss, "open_positions_count", lambda: 0)() > 0
+                        )
                         if prev_open_orders or _has_positions:
                             try:
                                 open_orders_resp = await self._request(
-                                    "GET", "/api/v3/openOrders",
-                                    api="spot_api", signed=True,
-                                    timeout=5.0
+                                    "GET",
+                                    "/api/v3/openOrders",
+                                    api="spot_api",
+                                    signed=True,
+                                    timeout=5.0,
                                 )
                                 current_open_orders = {
                                     str(o.get("orderId")): o for o in (open_orders_resp or [])
                                 }
                             except Exception as e:
-                                self.logger.warning("[EC:Polling] Failed to fetch open orders: %s", e)
+                                self.logger.warning(
+                                    "[EC:Polling] Failed to fetch open orders: %s", e
+                                )
                                 current_open_orders = prev_open_orders  # Use previous state
                         else:
                             # No tracked orders and no open positions — skip the call
-                            self.logger.debug("[EC:Polling] Idle — skipping openOrders poll (no active orders/positions)")
+                            self.logger.debug(
+                                "[EC:Polling] Idle — skipping openOrders poll (no active orders/positions)"
+                            )
                             current_open_orders = {}
-                        
+
                         # Fetch account balances
                         try:
                             acct = await self._request(
-                                "GET", "/api/v3/account", 
-                                api="spot_api", signed=True,
-                                timeout=5.0
+                                "GET", "/api/v3/account", api="spot_api", signed=True, timeout=5.0
                             )
                             current_balances = {}
                             # Get quote asset for tradable pair validation
-                            quote_asset = str(getattr(self.config, "DEFAULT_QUOTE_CURRENCY", "USDT")).upper() if self.config else "USDT"
+                            quote_asset = (
+                                str(getattr(self.config, "DEFAULT_QUOTE_CURRENCY", "USDT")).upper()
+                                if self.config
+                                else "USDT"
+                            )
                             for bal in acct.get("balances", []):
                                 asset = bal.get("asset", "")
                                 free = float(bal.get("free", 0.0))
                                 locked = float(bal.get("locked", 0.0))
-                                
+
                                 # FILTER: Skip non-tradable assets
                                 # Only include quote asset or assets that form valid trading pairs
                                 a = asset.upper()
@@ -1874,17 +1993,19 @@ class ExchangeClient:
                                     # For non-quote assets, verify they form tradable pairs
                                     symbol = f"{a}{quote_asset}"
                                     if not self.has_symbol(symbol):
-                                        self.logger.debug(f"[EC:Polling] Ignoring non-tradable asset {asset} (symbol {symbol})")
+                                        self.logger.debug(
+                                            f"[EC:Polling] Ignoring non-tradable asset {asset} (symbol {symbol})"
+                                        )
                                         continue
-                                
+
                                 current_balances[asset] = {"free": free, "locked": locked}
                         except Exception as e:
                             self.logger.warning("[EC:Polling] Failed to fetch account: %s", e)
                             current_balances = prev_balances  # Use previous state
-                        
+
                         last_poll_time = now
                         self.last_user_data_event_ts = now
-                        
+
                         # ====== PHASE 2: Detect Balance Changes ======
                         # Skip logging on first snapshot (prev_balances is empty)
                         if prev_balances:
@@ -1893,11 +2014,17 @@ class ExchangeClient:
                                 # Skip logging for zero-balance assets (dust)
                                 if curr["free"] == 0 and curr["locked"] == 0:
                                     continue
-                                if (prev.get("free") != curr["free"] or prev.get("locked") != curr["locked"]):
+                                if (
+                                    prev.get("free") != curr["free"]
+                                    or prev.get("locked") != curr["locked"]
+                                ):
                                     self.logger.info(
                                         "[EC:Polling:Balance] %s changed: free=%.8f (was %.8f) locked=%.8f (was %.8f)",
-                                        asset, curr["free"], prev.get("free", 0), 
-                                        curr["locked"], prev.get("locked", 0)
+                                        asset,
+                                        curr["free"],
+                                        prev.get("free", 0),
+                                        curr["locked"],
+                                        prev.get("locked", 0),
                                     )
                                     # Emit balanceUpdate event
                                     evt_payload = {
@@ -1905,10 +2032,10 @@ class ExchangeClient:
                                         "E": int(now * 1000),
                                         "a": asset,
                                         "d": curr["free"],
-                                        "l": curr["locked"]
+                                        "l": curr["locked"],
                                     }
                                     self._ingest_user_data_ws_payload(evt_payload)
-                        
+
                         # ====== PHASE 3: Detect Order Fills (Critical!) ======
                         # Check for orders that disappeared (filled or cancelled)
                         for order_id, prev_order in prev_open_orders.items():
@@ -1919,9 +2046,12 @@ class ExchangeClient:
                                 status = prev_order.get("status", "UNKNOWN")
                                 self.logger.info(
                                     "[EC:Polling:Fill] Order %s (%s) CLOSED: status=%s filled_qty=%.8f",
-                                    order_id, symbol, status, filled_qty
+                                    order_id,
+                                    symbol,
+                                    status,
+                                    filled_qty,
                                 )
-                                
+
                                 # Emit executionReport to notify position manager
                                 evt_payload = {
                                     "e": "executionReport",
@@ -1949,10 +2079,10 @@ class ExchangeClient:
                                     "O": prev_order.get("time", int(now * 1000)),
                                     "Z": 0,
                                     "Y": 0,
-                                    "Q": 0
+                                    "Q": 0,
                                 }
                                 self._ingest_user_data_ws_payload(evt_payload)
-                        
+
                         # ====== PHASE 4: Detect Partial Fills ======
                         # Check for quantity changes in open orders
                         for order_id, curr_order in current_open_orders.items():
@@ -1960,7 +2090,7 @@ class ExchangeClient:
                                 prev_order = prev_open_orders[order_id]
                                 prev_filled = float(prev_order.get("executedQty", 0.0))
                                 curr_filled = float(curr_order.get("executedQty", 0.0))
-                                
+
                                 if curr_filled > prev_filled:
                                     # Partial fill detected
                                     fill_qty = curr_filled - prev_filled
@@ -1968,9 +2098,12 @@ class ExchangeClient:
                                     self.logger.info(
                                         "[EC:Polling:PartialFill] Order %s (%s) partial fill: +%.8f qty "
                                         "(total filled=%.8f)",
-                                        order_id, symbol, fill_qty, curr_filled
+                                        order_id,
+                                        symbol,
+                                        fill_qty,
+                                        curr_filled,
                                     )
-                                    
+
                                     # Emit executionReport for partial fill
                                     evt_payload = {
                                         "e": "executionReport",
@@ -1998,25 +2131,26 @@ class ExchangeClient:
                                         "O": curr_order.get("time", int(now * 1000)),
                                         "Z": 0,
                                         "Y": 0,
-                                        "Q": 0
+                                        "Q": 0,
                                     }
                                     self._ingest_user_data_ws_payload(evt_payload)
-                        
+
                         # ====== PHASE 5: Truth Audit ======
                         # Run truth auditor to detect any state mismatches
                         with contextlib.suppress(Exception):
                             await self._run_truth_auditor(current_balances, current_open_orders)
-                        
+
                         # Update previous state for next cycle
                         prev_balances = current_balances
                         prev_open_orders = current_open_orders
                         self.mark_any_ws_event("user_data_account_update")
-                        
+
                         self.logger.debug(
                             "[EC:Polling] Reconciliation complete: %d open orders, %d balance assets",
-                            len(current_open_orders), len(current_balances)
+                            len(current_open_orders),
+                            len(current_balances),
                         )
-                        
+
                     except asyncio.CancelledError:
                         raise
                     except Exception as poll_err:
@@ -2025,13 +2159,14 @@ class ExchangeClient:
                             _rl_sleep = min(120.0, poll_interval * 2)
                             self.logger.warning(
                                 "[EC:Polling] Rate limit hit, backing off %.1fs before retry: %s",
-                                _rl_sleep, poll_err,
+                                _rl_sleep,
+                                poll_err,
                             )
                             await asyncio.sleep(_rl_sleep)
                         else:
                             self.logger.warning("[EC:Polling] Reconciliation error: %s", poll_err)
                             await asyncio.sleep(1.0)
-            
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -2039,20 +2174,23 @@ class ExchangeClient:
                 self._user_data_auth_mode_active = "none"
                 self.ws_reconnect_count = int(getattr(self, "ws_reconnect_count", 0) or 0) + 1
                 self.logger.warning(
-                    "[EC:Polling] Main loop error (reconnect_count=%d): %s", 
-                    int(self.ws_reconnect_count), e
+                    "[EC:Polling] Main loop error (reconnect_count=%d): %s",
+                    int(self.ws_reconnect_count),
+                    e,
                 )
                 await asyncio.sleep(backoff + random.uniform(0.0, min(1.0, backoff / 2.0)))
                 backoff = min(max_backoff, backoff * 1.7)
-            
+
             finally:
                 self.ws_connected = False
                 self._user_data_auth_mode_active = "none"
 
-    async def _run_truth_auditor(self, current_balances: Dict[str, Any], current_open_orders: Dict[str, Any]) -> None:
+    async def _run_truth_auditor(
+        self, current_balances: dict[str, Any], current_open_orders: dict[str, Any]
+    ) -> None:
         """
         ✅ Truth Auditor: Validate state consistency.
-        
+
         Checks:
         - All open orders reference symbols that exist
         - Balance values are reasonable (non-negative)
@@ -2065,9 +2203,11 @@ class ExchangeClient:
                 if balance.get("free", 0) < 0 or balance.get("locked", 0) < 0:
                     self.logger.error(
                         "[EC:TruthAuditor] ❌ NEGATIVE BALANCE detected: %s free=%.8f locked=%.8f",
-                        asset, balance.get("free"), balance.get("locked")
+                        asset,
+                        balance.get("free"),
+                        balance.get("locked"),
                     )
-            
+
             # Validate open orders reference valid symbols
             for order_id, order in current_open_orders.items():
                 symbol = order.get("symbol", "")
@@ -2076,11 +2216,14 @@ class ExchangeClient:
                 if filled > qty:
                     self.logger.error(
                         "[EC:TruthAuditor] ❌ FILLED > ORDERED: order %s (%s) qty=%.8f filled=%.8f",
-                        order_id, symbol, qty, filled
+                        order_id,
+                        symbol,
+                        qty,
+                        filled,
                     )
-            
+
             self.logger.debug("[EC:TruthAuditor] ✅ State consistency check passed")
-        
+
         except Exception as e:
             self.logger.error("[EC:TruthAuditor] Auditor failed: %s", e)
 
@@ -2096,12 +2239,16 @@ class ExchangeClient:
         while self.is_started and not self._user_data_stop.is_set():
             try:
                 if not bool(getattr(self, "user_data_stream_enabled", True)):
-                    self.logger.info("[EC:UserDataWS] USER_DATA_STREAM_ENABLED=false; using polling mode.")
+                    self.logger.info(
+                        "[EC:UserDataWS] USER_DATA_STREAM_ENABLED=false; using polling mode."
+                    )
                     await self._user_data_polling_loop()
                     continue
 
                 if not self._has_signed_credentials():
-                    self.logger.warning("[EC:UserDataWS] Signed credentials unavailable; using polling mode.")
+                    self.logger.warning(
+                        "[EC:UserDataWS] Signed credentials unavailable; using polling mode."
+                    )
                     await self._user_data_polling_loop()
                     continue
 
@@ -2204,10 +2351,14 @@ class ExchangeClient:
                 # stream. Automatic control frames interfere with the RPC auth sequence.
                 # Authentication: API key goes in X-MBX-APIKEY header, then session.logon RPC
                 headers = {"X-MBX-APIKEY": str(self.api_key or "")}
-                async with self.session.ws_connect(ws_url, headers=headers, heartbeat=None, autoping=False) as ws:
+                async with self.session.ws_connect(
+                    ws_url, headers=headers, heartbeat=None, autoping=False
+                ) as ws:
                     self._user_data_ws_conn = ws
                     auth_mode, sub_id = await self._ws_api_subscribe_user_data(ws)
-                    self.logger.debug("[EC:WS] subscribed auth_mode=%s sub_id=%s", auth_mode, sub_id)
+                    self.logger.debug(
+                        "[EC:WS] subscribed auth_mode=%s sub_id=%s", auth_mode, sub_id
+                    )
                     self.ws_connected = True
                     # RESET reconnect counter on successful connection
                     self.ws_reconnect_count = 0
@@ -2242,7 +2393,9 @@ class ExchangeClient:
                             # Send a session.status keepalive instead of disconnecting
                             # immediately — avoids constant reconnect on quiet accounts.
                             try:
-                                await self._ws_api_request(ws, method="session.status", timeout_sec=8.0)
+                                await self._ws_api_request(
+                                    ws, method="session.status", timeout_sec=8.0
+                                )
                                 self.mark_any_ws_event("user_data_keepalive")
                             except Exception as _ka_err:
                                 raise RuntimeError(
@@ -2251,7 +2404,7 @@ class ExchangeClient:
                             continue
 
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            payload: Dict[str, Any]
+                            payload: dict[str, Any]
                             try:
                                 raw_payload = json.loads(msg.data) if msg.data else {}
                                 payload = raw_payload if isinstance(raw_payload, dict) else {}
@@ -2281,10 +2434,13 @@ class ExchangeClient:
                             _close_reason = str(getattr(msg, "extra", "") or "")
                             self.logger.warning(
                                 "[EC:UserDataWS] server closed stream type=%s ws_code=%s reason=%r",
-                                msg.type, _close_code, _close_reason,
+                                msg.type,
+                                _close_code,
+                                _close_reason,
                             )
                             raise RuntimeError(
-                                "USER_DATA_WS_CLOSED:%s ws_code=%s reason=%r" % (msg.type, _close_code, _close_reason)
+                                "USER_DATA_WS_CLOSED:%s ws_code=%s reason=%r"
+                                % (msg.type, _close_code, _close_reason)
                             )
 
             except asyncio.CancelledError:
@@ -2297,15 +2453,15 @@ class ExchangeClient:
                 self.ws_reconnect_count = int(getattr(self, "ws_reconnect_count", 0) or 0) + 1
                 auth_error = self._is_user_data_ws_auth_error(e)
                 is_policy_error = "1008" in str(e) or "POLICY" in str(e)
-                
+
                 # Re-raise policy errors for fallback to listenKey mode
                 if is_policy_error:
                     self.logger.warning(
                         "[EC:UserDataWS:v3] Policy violation error (1008) - will trigger fallback: %s",
-                        e
+                        e,
                     )
                     raise
-                
+
                 self.logger.warning(
                     "[EC:UserDataWS] disconnected: %s (reconnect_count=%d auth_error=%s)",
                     e,
@@ -2396,7 +2552,7 @@ class ExchangeClient:
         return started
 
     # public passthrough to SharedState event bus (compat)
-    async def emit_event(self, event_type: str, payload: Dict[str, Any]):
+    async def emit_event(self, event_type: str, payload: dict[str, Any]):
         try:
             if hasattr(self.shared_state, "emit_event"):
                 v = self.shared_state.emit_event(event_type, payload)
@@ -2406,14 +2562,14 @@ class ExchangeClient:
             self.logger.debug("emit_event passthrough failed", exc_info=True)
 
     # ------------- public helpers -------------
-    async def get_all_symbols(self) -> List[str]:
+    async def get_all_symbols(self) -> list[str]:
         """
         Return tradable spot symbols (uppercased) using cached exchangeInfo when possible.
         AppContext uses this to prune accepted symbols.
         """
         await self._sync_exchange_info()
         info = self._exchange_info or {}
-        out: List[str] = []
+        out: list[str] = []
         try:
             for s in info.get("symbols", []):
                 status = s.get("status")
@@ -2439,9 +2595,9 @@ class ExchangeClient:
         price_filter = f.get("PRICE_FILTER", {})
         return {
             "min_notional": float(notional.get("minNotional", 0.0)),
-            "step_size":     str(lot.get("stepSize", "0.000001")),
-            "min_qty":       float(lot.get("minQty", 0)),
-            "tick_size":     str(price_filter.get("tickSize", "0.000001")),
+            "step_size": str(lot.get("stepSize", "0.000001")),
+            "min_qty": float(lot.get("minQty", 0)),
+            "tick_size": str(price_filter.get("tickSize", "0.000001")),
             "quote_precision": f.get("_precisions", {}).get("quotePrecision"),
         }
 
@@ -2455,15 +2611,18 @@ class ExchangeClient:
             norm_sym = self._norm_symbol(symbol)
             filters = self.symbol_filters.get(norm_sym, {})
             if not filters:
-                raise RuntimeError(f"Symbol filters could not be loaded for {symbol} (normalized: {norm_sym})")
+                raise RuntimeError(
+                    f"Symbol filters could not be loaded for {symbol} (normalized: {norm_sym})"
+                )
             return filters
         return {}
-    async def get_symbol_filters_raw(self, symbol: str) -> Dict[str, Any]:
+
+    async def get_symbol_filters_raw(self, symbol: str) -> dict[str, Any]:
         """Raw Binance filters map for a symbol (e.g., NOTIONAL/MIN_NOTIONAL, MARKET_LOT_SIZE/LOT_SIZE, PRICE_FILTER)."""
         await self._sync_exchange_info()
         return self.symbol_filters.get(self._norm_symbol(symbol), {})
 
-    async def get_symbol_filters(self, symbol: str) -> Dict[str, Any]:
+    async def get_symbol_filters(self, symbol: str) -> dict[str, Any]:
         """Normalized filters (min_notional, step_size, tick_size, quote_precision)."""
         return await self.get_exchange_filters(symbol)
 
@@ -2493,15 +2652,15 @@ class ExchangeClient:
         # If already started but we have API keys and the client might be public-only, recreate with signed keys
         rest_secret = self.api_secret_hmac or self.api_secret
         _has_real_keys = (
-            self.api_key and rest_secret
-            and self.api_key != "paper_key"
-            and not self.paper_trade
+            self.api_key and rest_secret and self.api_key != "paper_key" and not self.paper_trade
         )
         if self.is_started and _has_real_keys:
             try:
                 if self.client:
                     await self.client.close_connection()
-                self.client = await AsyncClient.create(self.api_key, rest_secret, testnet=self.testnet)
+                self.client = await AsyncClient.create(
+                    self.api_key, rest_secret, testnet=self.testnet
+                )
                 self.logger.info("Exchange client upgraded to signed mode.")
                 with contextlib.suppress(Exception):
                     await self.start_user_data_stream()
@@ -2521,9 +2680,13 @@ class ExchangeClient:
         # Never pass "paper_key"/"paper_secret" to AsyncClient — Binance rejects them with -2014.
         if not _has_real_keys:
             if self.paper_trade:
-                self.logger.info("ExchangeClient starting in paper mode — using public-only AsyncClient.")
+                self.logger.info(
+                    "ExchangeClient starting in paper mode — using public-only AsyncClient."
+                )
             else:
-                self.logger.warning("ExchangeClient starting without API keys — public endpoints only.")
+                self.logger.warning(
+                    "ExchangeClient starting without API keys — public endpoints only."
+                )
             self.client = await AsyncClient.create(api_key="", api_secret="", testnet=self.testnet)
         else:
             self.client = await AsyncClient.create(self.api_key, rest_secret, testnet=self.testnet)
@@ -2537,7 +2700,9 @@ class ExchangeClient:
             server_ms = int(t.get("serverTime", 0))
             local_ms = int(time.time() * 1000)
             self._time_offset_ms = server_ms - local_ms
-            self.logger.info("[EC:StartupSync] Server time synced (offset: %dms)", self._time_offset_ms)
+            self.logger.info(
+                "[EC:StartupSync] Server time synced (offset: %dms)", self._time_offset_ms
+            )
 
             # Verify authentication (non-paper mode only)
             if not self.paper_trade and (self.api_key and self.api_key != "paper_key"):
@@ -2547,9 +2712,13 @@ class ExchangeClient:
                     self.logger.info("[EC:Authentication] Verified (trading_enabled=%s)", can_trade)
                 except Exception as auth_err:
                     if "401" in str(auth_err) or "Unauthorized" in str(auth_err):
-                        raise RuntimeError(f"[EC] Authentication failed - invalid API keys: {auth_err}")
+                        raise RuntimeError(
+                            f"[EC] Authentication failed - invalid API keys: {auth_err}"
+                        )
                     # IP restrictions or other non-auth errors are non-fatal
-                    self.logger.warning("[EC] Cannot verify authentication (might be IP restriction): %s", auth_err)
+                    self.logger.warning(
+                        "[EC] Cannot verify authentication (might be IP restriction): %s", auth_err
+                    )
 
             # Health check
             await self._request("GET", "/api/v3/ping", api="spot_api")
@@ -2568,26 +2737,19 @@ class ExchangeClient:
             with contextlib.suppress(Exception):
                 try:
                     await asyncio.wait_for(
-                        self.stop_user_data_stream(close_listen_key=True),
-                        timeout=5.0
+                        self.stop_user_data_stream(close_listen_key=True), timeout=5.0
                     )
                 except (asyncio.TimeoutError, Exception):
                     pass
             if self.client:
                 try:
-                    await asyncio.wait_for(
-                        self.client.close_connection(),
-                        timeout=5.0
-                    )
+                    await asyncio.wait_for(self.client.close_connection(), timeout=5.0)
                 except (asyncio.TimeoutError, Exception):
                     pass
         finally:
             if self.session and not self.session.closed:
                 try:
-                    await asyncio.wait_for(
-                        self.session.close(),
-                        timeout=5.0
-                    )
+                    await asyncio.wait_for(self.session.close(), timeout=5.0)
                 except (asyncio.TimeoutError, Exception):
                     pass
         self.client = None
@@ -2611,9 +2773,14 @@ class ExchangeClient:
 
     @property
     def is_ready(self) -> bool:
-        return self._ready and self.session is not None and not self.session.closed and self.client is not None
+        return (
+            self._ready
+            and self.session is not None
+            and not self.session.closed
+            and self.client is not None
+        )
 
-    async def healthcheck(self) -> Dict[str, Any]:
+    async def healthcheck(self) -> dict[str, Any]:
         """
         Lightweight health check that pings the API and validates time sync.
         Returns a dict: {"ok": bool, "latency_ms": float, "time_offset_ms": int}
@@ -2646,8 +2813,11 @@ class ExchangeClient:
             return
         try:
             from aiohttp import ClientTimeout, TCPConnector
+
             connector = TCPConnector(limit=50, ttl_dns_cache=300)
-            self.session = aiohttp.ClientSession(timeout=ClientTimeout(total=15), connector=connector)
+            self.session = aiohttp.ClientSession(
+                timeout=ClientTimeout(total=15), connector=connector
+            )
             # Public-only AsyncClient (empty keys) is fine for unsigned endpoints
             self.client = await AsyncClient.create(api_key="", api_secret="", testnet=self.testnet)
             self._ready = True
@@ -2662,145 +2832,155 @@ class ExchangeClient:
         self,
         method: str,
         path: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
         *,
         signed: bool = False,
         api: str = "spot_api",
         timeout: Optional[float] = None,
     ) -> Any:
-            """
-            Unified request wrapper.
-            api: "spot_api" | "spot_sapi" | "um_futures"
-            """
-            # PAPER MODE: Return mock data for account endpoints
-            if self.paper_trade and signed:
-                if path == "/api/v3/account":
-                    # Return empty balances in paper mode
-                    self.logger.debug("[EC] Paper mode: returning mock account data for /api/v3/account")
-                    return {"balances": [], "permissions": []}
-                elif path.startswith("/api/v3/order") or path == "/api/v3/openOrders":
-                    # Return empty orders in paper mode
-                    self.logger.debug("[EC] Paper mode: returning mock order data for %s", path)
-                    return [] if "openOrders" in path else {}
-            
-            # Allow lazy public bootstrap for unsigned/public GETs used during early phases
-            if not self.is_started:
-                if not signed and method.upper() == "GET":
-                    await self._ensure_started_public()
-                else:
-                    raise RuntimeError("ExchangeClient session not started. Call await start() first.")
-    
-            if api == "spot_api":
-                base = self.base_url_spot_api
-            elif api == "spot_sapi":
-                base = self.base_url_spot_sapi
-            elif api == "um_futures":
-                base = self.base_url_um
+        """
+        Unified request wrapper.
+        api: "spot_api" | "spot_sapi" | "um_futures"
+        """
+        # PAPER MODE: Return mock data for account endpoints
+        if self.paper_trade and signed:
+            if path == "/api/v3/account":
+                # Return empty balances in paper mode
+                self.logger.debug(
+                    "[EC] Paper mode: returning mock account data for /api/v3/account"
+                )
+                return {"balances": [], "permissions": []}
+            elif path.startswith("/api/v3/order") or path == "/api/v3/openOrders":
+                # Return empty orders in paper mode
+                self.logger.debug("[EC] Paper mode: returning mock order data for %s", path)
+                return [] if "openOrders" in path else {}
+
+        # Allow lazy public bootstrap for unsigned/public GETs used during early phases
+        if not self.is_started:
+            if not signed and method.upper() == "GET":
+                await self._ensure_started_public()
             else:
-                raise ValueError(f"Unknown api family: {api}")
-    
-            url = f"{base}{path}"
-            headers = {"User-Agent": "octivault-trader/2.1"}
-            if self.api_key:
-                headers["X-MBX-APIKEY"] = self.api_key
-            params = params or {}
-    
-            # configurable weight guard per path
-            weight = self._path_weight_overrides.get(path, 2 if path.startswith("/api/v3/klines") else 1)
-            now = time.time()
-            # Prune stale buckets to prevent unbounded defaultdict growth
-            if len(self._weight_counters) > 50:
-                stale = [p for p, b in list(self._weight_counters.items()) if now - b["ts"] > 60.0]
-                for p in stale:
-                    del self._weight_counters[p]
-            bucket = self._weight_counters[path]
-            if now - bucket["ts"] > self._weight_window:
-                bucket["ts"], bucket["w"] = now, 0
-            if bucket["w"] + weight > self._weight_limit:
-                await asyncio.sleep(max(0.0, self._weight_window - (now - bucket["ts"])))
-                bucket["ts"], bucket["w"] = time.time(), 0
-            bucket["w"] += weight
-    
-            if signed:
-                if not (self.api_key and self.api_secret_hmac):
-                    raise BinanceAPIException(
-                        "Signed endpoint requires API_KEY and HMAC_SECRET (Binance -2015 likely).",
-                        code=-2015
-                    )
-                params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
-                params.setdefault("recvWindow", self.recv_window_ms)
-                query_string = urllib.parse.urlencode(params)
-                # REST API ALWAYS uses HMAC, never Ed25519
-                signature = hmac.new(
-                    self.api_secret_hmac.encode("utf-8"),
-                    query_string.encode("utf-8"),
-                    hashlib.sha256,
-                ).hexdigest()
-                params["signature"] = signature
-    
-            # exponential backoff + jitter for transient cases
-            backoffs = [0.2, 0.5, 1.0, 2.0]
-            last_err = None
-            for delay in [0.0, *backoffs]:
-                if delay:
-                    await asyncio.sleep(delay + random.uniform(0, delay / 4))
-                try:
-                    req_kwargs: Dict[str, Any] = {"headers": headers, "params": params}
-                    if timeout is not None:
-                        req_kwargs["timeout"] = aiohttp.ClientTimeout(total=max(0.1, float(timeout)))
-                    async with self.session.request(method, url, **req_kwargs) as response:
-                        text = await response.text()
-                        if response.status >= 400:
-                            # Try parse JSON error and surface native Binance codes
-                            try:
-                                err = json.loads(text) if text else {}
-                            except Exception:
-                                err = {"msg": text}
-                            code = err.get("code", response.status)
-                            msg = err.get("msg", text)
-                            if code == -2015:
-                                self.logger.error("Binance -2015 on %s %s (api=%s): %s", method, path, api, msg)
-                            # Handle time skew (-1021): resync once and retry on next backoff iteration
-                            if code == -1021:
-                                try:
-                                    await self._resync_time()
-                                except Exception:
-                                    pass
-                                # Continue to next retry iteration
-                                continue
-                            # honor server-suggested retry for RL
-                            if response.status in (418, 429):
-                                try:
-                                    ra = float(response.headers.get("Retry-After", "0"))
-                                    if ra > 0:
-                                        await asyncio.sleep(min(ra, 3.0))
-                                except Exception:
-                                    pass
-                            raise BinanceAPIException(msg, code=code)
-                        return json.loads(text) if text else {}
-                except aiohttp.ClientResponseError as e:
-                    last_err = e
-                    # rate-limit
-                    if e.status in (418, 429):
+                raise RuntimeError("ExchangeClient session not started. Call await start() first.")
+
+        if api == "spot_api":
+            base = self.base_url_spot_api
+        elif api == "spot_sapi":
+            base = self.base_url_spot_sapi
+        elif api == "um_futures":
+            base = self.base_url_um
+        else:
+            raise ValueError(f"Unknown api family: {api}")
+
+        url = f"{base}{path}"
+        headers = {"User-Agent": "octivault-trader/2.1"}
+        if self.api_key:
+            headers["X-MBX-APIKEY"] = self.api_key
+        params = params or {}
+
+        # configurable weight guard per path
+        weight = self._path_weight_overrides.get(
+            path, 2 if path.startswith("/api/v3/klines") else 1
+        )
+        now = time.time()
+        # Prune stale buckets to prevent unbounded defaultdict growth
+        if len(self._weight_counters) > 50:
+            stale = [p for p, b in list(self._weight_counters.items()) if now - b["ts"] > 60.0]
+            for p in stale:
+                del self._weight_counters[p]
+        bucket = self._weight_counters[path]
+        if now - bucket["ts"] > self._weight_window:
+            bucket["ts"], bucket["w"] = now, 0
+        if bucket["w"] + weight > self._weight_limit:
+            await asyncio.sleep(max(0.0, self._weight_window - (now - bucket["ts"])))
+            bucket["ts"], bucket["w"] = time.time(), 0
+        bucket["w"] += weight
+
+        if signed:
+            if not (self.api_key and self.api_secret_hmac):
+                raise BinanceAPIException(
+                    "Signed endpoint requires API_KEY and HMAC_SECRET (Binance -2015 likely).",
+                    code=-2015,
+                )
+            params["timestamp"] = int(time.time() * 1000 + self._time_offset_ms)
+            params.setdefault("recvWindow", self.recv_window_ms)
+            query_string = urllib.parse.urlencode(params)
+            # REST API ALWAYS uses HMAC, never Ed25519
+            signature = hmac.new(
+                self.api_secret_hmac.encode("utf-8"),
+                query_string.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            params["signature"] = signature
+
+        # exponential backoff + jitter for transient cases
+        backoffs = [0.2, 0.5, 1.0, 2.0]
+        last_err = None
+        for delay in [0.0, *backoffs]:
+            if delay:
+                await asyncio.sleep(delay + random.uniform(0, delay / 4))
+            try:
+                req_kwargs: dict[str, Any] = {"headers": headers, "params": params}
+                if timeout is not None:
+                    req_kwargs["timeout"] = aiohttp.ClientTimeout(total=max(0.1, float(timeout)))
+                async with self.session.request(method, url, **req_kwargs) as response:
+                    text = await response.text()
+                    if response.status >= 400:
+                        # Try parse JSON error and surface native Binance codes
                         try:
-                            ra = float(e.headers.get("Retry-After", "0"))
-                            if ra > 0:
-                                await asyncio.sleep(min(ra, 2.0))
+                            err = json.loads(text) if text else {}
                         except Exception:
-                            pass
-                        continue
-                    if e.status == 400:
-                        raise BinanceAPIException(f"API error: {getattr(e, 'message', str(e))}", code=e.status)
-                    if e.status in (408,) or (500 <= e.status < 600):
-                        continue
-                    raise NetworkException(f"{method} {path} (api={api}) failed: {e}") from e
-                except aiohttp.ClientError as e:
-                    last_err = e
+                            err = {"msg": text}
+                        code = err.get("code", response.status)
+                        msg = err.get("msg", text)
+                        if code == -2015:
+                            self.logger.error(
+                                "Binance -2015 on %s %s (api=%s): %s", method, path, api, msg
+                            )
+                        # Handle time skew (-1021): resync once and retry on next backoff iteration
+                        if code == -1021:
+                            try:
+                                await self._resync_time()
+                            except Exception:
+                                pass
+                            # Continue to next retry iteration
+                            continue
+                        # honor server-suggested retry for RL
+                        if response.status in (418, 429):
+                            try:
+                                ra = float(response.headers.get("Retry-After", "0"))
+                                if ra > 0:
+                                    await asyncio.sleep(min(ra, 3.0))
+                            except Exception:
+                                pass
+                        raise BinanceAPIException(msg, code=code)
+                    return json.loads(text) if text else {}
+            except aiohttp.ClientResponseError as e:
+                last_err = e
+                # rate-limit
+                if e.status in (418, 429):
+                    try:
+                        ra = float(e.headers.get("Retry-After", "0"))
+                        if ra > 0:
+                            await asyncio.sleep(min(ra, 2.0))
+                    except Exception:
+                        pass
                     continue
-            raise NetworkException(f"{method} {path} (api={api}) network error after retries: {last_err}")
+                if e.status == 400:
+                    raise BinanceAPIException(
+                        f"API error: {getattr(e, 'message', str(e))}", code=e.status
+                    )
+                if e.status in (408,) or (500 <= e.status < 600):
+                    continue
+                raise NetworkException(f"{method} {path} (api={api}) failed: {e}") from e
+            except aiohttp.ClientError as e:
+                last_err = e
+                continue
+        raise NetworkException(
+            f"{method} {path} (api={api}) network error after retries: {last_err}"
+        )
 
     # ------------- market data helpers -------------
-    async def get_24hr_tickers(self) -> List[Dict[str, Any]]:
+    async def get_24hr_tickers(self) -> list[dict[str, Any]]:
         """
         Cached view of /api/v3/ticker/24hr with a short TTL.
         Returns a list of dicts with at least: symbol, lastPrice, priceChangePercent, quoteVolume, volume.
@@ -2811,7 +2991,7 @@ class ExchangeClient:
             return list(self._ticker_24h_cache.values())
 
         data = await self._request("GET", "/api/v3/ticker/24hr", api="spot_api")
-        cache: Dict[str, Dict[str, Any]] = {}
+        cache: dict[str, dict[str, Any]] = {}
         for t in data or []:
             try:
                 sym = str(t.get("symbol", "")).upper()
@@ -2828,7 +3008,7 @@ class ExchangeClient:
         self._ticker_24h_cache_ts = now
         return list(cache.values())
 
-    async def get_ticker_24h_normalized(self, symbol: str) -> Dict[str, Any]:
+    async def get_ticker_24h_normalized(self, symbol: str) -> dict[str, Any]:
         """
         Return a normalized 24h ticker dict with snake_case keys for a single symbol.
         Keys: symbol, last_price, price_change_pct, base_volume, quote_volume, trade_count, ts_exchange.
@@ -2846,16 +3026,20 @@ class ExchangeClient:
                     "price_change_pct": float(t.get("priceChangePercent", 0.0)),
                     "base_volume": float(t.get("volume", 0.0)),
                     "quote_volume": float(t.get("quoteVolume", 0.0)),
-                    "trade_count": int(t.get("count", 0)) if isinstance(t.get("count", 0), (int, float)) else 0,
+                    "trade_count": int(t.get("count", 0))
+                    if isinstance(t.get("count", 0), (int, float))
+                    else 0,
                     "ts_exchange": 0.0,
                 }
         # Fetch single from API if not in cache
         raw = await self._request("GET", "/api/v3/ticker/24hr", {"symbol": sym}, api="spot_api")
+
         def _f(x, default=0.0):
             try:
                 return float(x)
             except Exception:
                 return default
+
         out = {
             "symbol": sym,
             "last_price": _f(raw.get("lastPrice")),
@@ -2902,7 +3086,7 @@ class ExchangeClient:
         except Exception:
             return 0.0
 
-    async def get_best_bid_ask(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    async def get_best_bid_ask(self, symbol: str) -> tuple[Optional[float], Optional[float]]:
         """
         Return (bid, ask) with a tiny microcache to avoid double hits during validation/submit.
         """
@@ -2912,7 +3096,9 @@ class ExchangeClient:
         if ent and (now - ent["ts"] < self._BOOK_TTL):
             return ent["bid"], ent["ask"]
         try:
-            data = await self._request("GET", "/api/v3/ticker/bookTicker", {"symbol": sym}, api="spot_api")
+            data = await self._request(
+                "GET", "/api/v3/ticker/bookTicker", {"symbol": sym}, api="spot_api"
+            )
             bid = float(data.get("bidPrice")) if data and data.get("bidPrice") else None
             ask = float(data.get("askPrice")) if data and data.get("askPrice") else None
             self._book_cache[sym] = {"ts": now, "bid": bid, "ask": ask}
@@ -2929,7 +3115,9 @@ class ExchangeClient:
             return self.price_cache[sym][0]
 
         try:
-            response = await self._request("GET", "/api/v3/ticker/price", {"symbol": sym}, api="spot_api")
+            response = await self._request(
+                "GET", "/api/v3/ticker/price", {"symbol": sym}, api="spot_api"
+            )
             price = float(response["price"])
             self.price_cache[sym] = (price, now)
             return price
@@ -2943,7 +3131,7 @@ class ExchangeClient:
         limit: int = 500,
         start_time: Optional[Union[int, float]] = None,
         end_time: Optional[Union[int, float]] = None,
-    ) -> List[List[float]]:
+    ) -> list[list[float]]:
         """
         Return OHLCV rows from /api/v3/klines.
         Each row = [openTime, open, high, low, close, volume] as floats.
@@ -2955,14 +3143,24 @@ class ExchangeClient:
         if end_time is not None:
             params["endTime"] = int(float(end_time))
         data = await self._request("GET", "/api/v3/klines", params, api="spot_api")
-        return [[float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in data]
+        return [
+            [float(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])]
+            for x in data
+        ]
 
-    async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 500) -> List[List[float]]:
+    async def get_klines(
+        self, symbol: str, interval: str = "1h", limit: int = 500
+    ) -> list[list[float]]:
         """
         Compatibility alias returning raw klines as lists (Binance shape preserved).
         """
         sym = self._norm_symbol(symbol)
-        data = await self._request("GET", "/api/v3/klines", {"symbol": sym, "interval": interval, "limit": limit}, api="spot_api")
+        data = await self._request(
+            "GET",
+            "/api/v3/klines",
+            {"symbol": sym, "interval": interval, "limit": limit},
+            api="spot_api",
+        )
         return data
 
     async def _sync_exchange_info(self):
@@ -2993,10 +3191,10 @@ class ExchangeClient:
                     filters = {f["filterType"]: f for f in s.get("filters", [])}
                     # Attach precisions from symbol info:
                     filters["_precisions"] = {
-                        "baseAssetPrecision":  s.get("baseAssetPrecision"),
-                        "quotePrecision":      s.get("quotePrecision"),
+                        "baseAssetPrecision": s.get("baseAssetPrecision"),
+                        "quotePrecision": s.get("quotePrecision"),
                         "quoteAssetPrecision": s.get("quoteAssetPrecision"),
-                        "baseCommissionPrecision":  s.get("baseCommissionPrecision"),
+                        "baseCommissionPrecision": s.get("baseCommissionPrecision"),
                         "quoteCommissionPrecision": s.get("quoteCommissionPrecision"),
                     }
                     self.symbol_filters[sym] = filters
@@ -3004,7 +3202,9 @@ class ExchangeClient:
                 await self._report_status("OK", {"event": "exchange_info_synced"})
             except Exception as e:
                 self.logger.error("Failed to sync exchange info: %s", e)
-                await self._report_status("ERROR", {"event": "exchange_info_sync_failed", "reason": str(e)})
+                await self._report_status(
+                    "ERROR", {"event": "exchange_info_sync_failed", "reason": str(e)}
+                )
 
     def _pick_lot_filter(self, filters: dict) -> dict:
         # P9 Fix 4: Prefer LOT_SIZE for micro trading
@@ -3073,23 +3273,25 @@ class ExchangeClient:
             if px is None:
                 px = await self.get_current_price(symbol)
         except Exception:
-            self.logger.warning("Price unavailable for MIN_NOTIONAL check; proceeding with caution.")
+            self.logger.warning(
+                "Price unavailable for MIN_NOTIONAL check; proceeding with caution."
+            )
         if px is not None and qty_f * float(px) < min_notional:
             raise ValueError(f"MIN_NOTIONAL violation: {qty_f} * {px:.8f} < {min_notional}")
         return qty_f
 
     # ------------- dust conversion (Binance API) -------------
-    async def convert_dust(self, assets: Optional[List[str]] = None) -> Dict[str, Any]:
+    async def convert_dust(self, assets: Optional[list[str]] = None) -> dict[str, Any]:
         """
         FIX #2B: Convert dust balances to USDT using Binance /sapi/v1/asset/dust endpoint.
-        
+
         This is the official Binance dust converter API which converts small amounts
         of crypto dust into BNB (or USDT via BNB swap).
-        
+
         Args:
             assets: List of asset symbols to convert (e.g., ["PEPE", "LUNC", "AVAX"])
                    If None, Binance will auto-detect convertible dust
-        
+
         Returns:
             {
                 "ok": bool,
@@ -3104,7 +3306,7 @@ class ExchangeClient:
             params = {}
             if assets:
                 params["asset"] = ",".join([str(a).upper() for a in assets])
-            
+
             result = await self._request(
                 "POST",
                 "/sapi/v1/asset/dust",
@@ -3112,7 +3314,7 @@ class ExchangeClient:
                 api="spot_api",
                 data=params,
             )
-            
+
             if not result or not isinstance(result, dict):
                 return {
                     "ok": False,
@@ -3120,18 +3322,18 @@ class ExchangeClient:
                     "details": [],
                     "error": "Invalid response from Binance dust endpoint",
                 }
-            
+
             # Parse Binance response
             total_usdt = 0.0
             details = []
-            
+
             # Response typically contains:
             # {"totalTransfered": "0.05123456", "transferResult": [...]}
             try:
                 total_usdt = float(result.get("totalTransfered", 0.0) or 0.0)
             except (ValueError, TypeError):
                 pass
-            
+
             transfer_results = result.get("transferResult", [])
             if isinstance(transfer_results, list):
                 for item in transfer_results:
@@ -3139,30 +3341,32 @@ class ExchangeClient:
                         try:
                             amount = float(item.get("amount", 0.0) or 0.0)
                             if amount > 0:
-                                details.append({
-                                    "asset": item.get("asset", "UNKNOWN"),
-                                    "transferred": amount,
-                                    "from_asset": item.get("fromAsset"),
-                                    "transfer_id": item.get("tranId"),
-                                })
+                                details.append(
+                                    {
+                                        "asset": item.get("asset", "UNKNOWN"),
+                                        "transferred": amount,
+                                        "from_asset": item.get("fromAsset"),
+                                        "transfer_id": item.get("tranId"),
+                                    }
+                                )
                         except (ValueError, TypeError):
                             pass
-            
+
             self.logger.info(
                 "[EC:DustConvert] ✅ Converted dust: total_usdt=%.8f, conversions=%d",
                 total_usdt,
                 len(details),
             )
-            
+
             return {
                 "ok": True,
                 "total_transferred": total_usdt,
                 "details": details,
                 "error": None,
             }
-        
+
         except BinanceAPIException as e:
-            error_msg = f"Binance API error: {e.message}" if hasattr(e, 'message') else str(e)
+            error_msg = f"Binance API error: {e.message}" if hasattr(e, "message") else str(e)
             self.logger.warning("[EC:DustConvert] ❌ Dust conversion failed: %s", error_msg)
             return {
                 "ok": False,
@@ -3172,7 +3376,9 @@ class ExchangeClient:
             }
         except Exception as e:
             error_msg = str(e)
-            self.logger.warning("[EC:DustConvert] ❌ Unexpected error: %s", error_msg, exc_info=True)
+            self.logger.warning(
+                "[EC:DustConvert] ❌ Unexpected error: %s", error_msg, exc_info=True
+            )
             return {
                 "ok": False,
                 "total_transferred": 0.0,
@@ -3208,11 +3414,13 @@ class ExchangeClient:
         recovered as if it belonged to the current submit. Keep the hint only
         as a compact fingerprint, never as the actual id.
         """
-        side_char = (str(side or "X").upper()[:1] or "X")
+        side_char = str(side or "X").upper()[:1] or "X"
         hint = str(client_order_id_hint or tag or "meta")
         hint_hash = hashlib.sha1(hint.encode("utf-8", errors="ignore")).hexdigest()[:8]
         tag_frag = self._client_order_id_fragment(tag or "meta", limit=7) or "meta"
-        return f"octi{ts_ms % 10_000_000_000:010d}{uuid.uuid4().hex[:6]}{side_char}{hint_hash}{tag_frag}"[:36]
+        return f"octi{ts_ms % 10_000_000_000:010d}{uuid.uuid4().hex[:6]}{side_char}{hint_hash}{tag_frag}"[
+            :36
+        ]
 
     @staticmethod
     def _raw_order_time_ms(raw: Optional[dict]) -> int:
@@ -3238,7 +3446,7 @@ class ExchangeClient:
         expected_side: str,
         expected_client_order_id: str,
         stale_grace_ms: Optional[int] = None,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         if not isinstance(raw, dict) or not raw:
             return False, "missing_recovered_order"
 
@@ -3255,7 +3463,11 @@ class ExchangeClient:
             return False, f"side_mismatch:{raw_side}"
 
         order_ms = self._raw_order_time_ms(raw)
-        grace_ms = int(stale_grace_ms if stale_grace_ms is not None else self.config.get("ORDER_RECOVERY_FRESHNESS_GRACE_MS", 30_000) or 30_000)
+        grace_ms = int(
+            stale_grace_ms
+            if stale_grace_ms is not None
+            else self.config.get("ORDER_RECOVERY_FRESHNESS_GRACE_MS", 30_000) or 30_000
+        )
         grace_ms = max(0, min(grace_ms, 300_000))
         if order_ms <= 0:
             return False, "missing_recovered_order_timestamp"
@@ -3279,7 +3491,7 @@ class ExchangeClient:
         """
         Canonical MARKET order entrypoint (spec §3.6, §3.19).
         Supports either `quantity` or `quoteOrderQty` (via quote or quote_order_qty).
-        
+
         Parameters:
             quote_order_qty: Alias for `quote` (for backwards compatibility with ExecutionManager)
             quote: Quote asset amount for BUY orders
@@ -3287,8 +3499,10 @@ class ExchangeClient:
         # Handle quote_order_qty alias (ExecutionManager uses this parameter name)
         if quote_order_qty is not None and quote is None:
             quote = quote_order_qty
-        
-        await self._guard_execution_path(method="place_market_order", symbol=symbol, side=side, tag=tag)
+
+        await self._guard_execution_path(
+            method="place_market_order", symbol=symbol, side=side, tag=tag
+        )
         sym = self._norm_symbol(symbol)
 
         # Fee-safety padding for quote orders (defaults to config or 10 bps)
@@ -3314,8 +3528,22 @@ class ExchangeClient:
         # Circuit breaker check (submit)
         if not self._submit_breaker.allow():
             reason = "circuit_open_submit"
-            await self._emit_summary("ORDER_BLOCKED", symbol=sym, side=side, tag=tag, status="ERROR", reason=reason, error_code="CB_OPEN")
-            return self._normalize_exec_result(base_coid, {"status": "REJECTED"}, False, error_code="CB_OPEN", error_msg="Submit breaker open")
+            await self._emit_summary(
+                "ORDER_BLOCKED",
+                symbol=sym,
+                side=side,
+                tag=tag,
+                status="ERROR",
+                reason=reason,
+                error_code="CB_OPEN",
+            )
+            return self._normalize_exec_result(
+                base_coid,
+                {"status": "REJECTED"},
+                False,
+                error_code="CB_OPEN",
+                error_msg="Submit breaker open",
+            )
 
         try:
             # Ensure spend meets minNotional (if we have a last price)
@@ -3332,15 +3560,36 @@ class ExchangeClient:
                 spend = float(qty_dec) * float(px)
 
             if spend < (min_notional * 1.0):
-                await self._emit_summary("ORDER_REJECTED", symbol=sym, side=side, tag=tag, status="ERROR", reason="MinNotionalViolation", error_code="MIN_NOTIONAL")
-                return self._normalize_exec_result(base_coid, {"status": "REJECTED"}, False, error_code="MIN_NOTIONAL", error_msg="Below minNotional")
+                await self._emit_summary(
+                    "ORDER_REJECTED",
+                    symbol=sym,
+                    side=side,
+                    tag=tag,
+                    status="ERROR",
+                    reason="MinNotionalViolation",
+                    error_code="MIN_NOTIONAL",
+                )
+                return self._normalize_exec_result(
+                    base_coid,
+                    {"status": "REJECTED"},
+                    False,
+                    error_code="MIN_NOTIONAL",
+                    error_msg="Below minNotional",
+                )
 
             # Submit MARKET order (quantity OR quote)
-            payload = {"symbol": sym, "side": side.upper(), "type": "MARKET", "newClientOrderId": base_coid}
+            payload = {
+                "symbol": sym,
+                "side": side.upper(),
+                "type": "MARKET",
+                "newClientOrderId": base_coid,
+            }
             # NOTE: timeInForce is not used with MARKET on Binance; do not include it.
             if quote is not None:
                 if side.upper() != "BUY":
-                    raise ValueError("quoteOrderQty is only supported for MARKET BUY in this build.")
+                    raise ValueError(
+                        "quoteOrderQty is only supported for MARKET BUY in this build."
+                    )
                 q = self._normalize_quote_order_qty(sym, quote)
                 payload["quoteOrderQty"] = format(q, "f")
             else:
@@ -3376,17 +3625,26 @@ class ExchangeClient:
                     slip_bps = (abs(res["price"] - ref_px) / ref_px) * 10_000
                     if slip_bps > max_slippage_bps:
                         await self._emit_summary(
-                            "SLIPPAGE_WARN", symbol=sym, side=side, tag=tag,
-                            status="WARN", reason="max_slippage_bps_exceeded",
-                            slippage_bps=round(slip_bps, 2)
+                            "SLIPPAGE_WARN",
+                            symbol=sym,
+                            side=side,
+                            tag=tag,
+                            status="WARN",
+                            reason="max_slippage_bps_exceeded",
+                            slippage_bps=round(slip_bps, 2),
                         )
             except Exception:
                 pass
 
             await self._emit_summary(
                 "ORDER_FILLED" if res["status"] == "FILLED" else "ORDER_ACCEPTED",
-                symbol=sym, side=side, qty=res["executedQty"], price=res["price"], tag=tag,
-                status=res["status"], reason="filled" if res["status"] == "FILLED" else "accepted"
+                symbol=sym,
+                side=side,
+                qty=res["executedQty"],
+                price=res["price"],
+                tag=tag,
+                status=res["status"],
+                reason="filled" if res["status"] == "FILLED" else "accepted",
             )
             return res
 
@@ -3396,12 +3654,20 @@ class ExchangeClient:
             if code == -1013:
                 # Filter failure (e.g., MIN_NOTIONAL) → map to MIN_NOTIONAL for clearer observability
                 await self._emit_summary(
-                    "ORDER_REJECTED", symbol=sym, side=side, tag=tag, status="ERROR",
-                    reason="MinNotionalViolation", error_code="MIN_NOTIONAL"
+                    "ORDER_REJECTED",
+                    symbol=sym,
+                    side=side,
+                    tag=tag,
+                    status="ERROR",
+                    reason="MinNotionalViolation",
+                    error_code="MIN_NOTIONAL",
                 )
                 return self._normalize_exec_result(
-                    base_coid, {"status": "REJECTED"}, False,
-                    error_code="MIN_NOTIONAL", error_msg=str(e)
+                    base_coid,
+                    {"status": "REJECTED"},
+                    False,
+                    error_code="MIN_NOTIONAL",
+                    error_msg=str(e),
                 )
             # Idempotent status check (query breaker)
             if self._query_breaker.allow():
@@ -3439,17 +3705,37 @@ class ExchangeClient:
                     res = self._normalize_exec_result(base_coid, qraw, q_status_ok)
                     # Invalidate balances cache if exchange confirms order existence
                     self._acct_cache_ts = 0.0
-                    await self._emit_summary("ORDER_STATUS_RECOVERED", symbol=sym, side=side, tag=tag, status=res["status"], reason="recovered")
+                    await self._emit_summary(
+                        "ORDER_STATUS_RECOVERED",
+                        symbol=sym,
+                        side=side,
+                        tag=tag,
+                        status=res["status"],
+                        reason="recovered",
+                    )
                     return res
                 except Exception:
                     self._query_breaker.record(False)
             await self._emit_summary(
-                "ORDER_REJECTED", symbol=sym, side=side, tag=tag, status="ERROR",
-                reason="ExternalAPIError", error_code="EXTERNAL_API"
+                "ORDER_REJECTED",
+                symbol=sym,
+                side=side,
+                tag=tag,
+                status="ERROR",
+                reason="ExternalAPIError",
+                error_code="EXTERNAL_API",
             )
-            return self._normalize_exec_result(base_coid, {"status": "REJECTED"}, False, error_code="EXTERNAL_API", error_msg=str(e))
+            return self._normalize_exec_result(
+                base_coid,
+                {"status": "REJECTED"},
+                False,
+                error_code="EXTERNAL_API",
+                error_msg=str(e),
+            )
 
-    def _normalize_exec_result(self, order_id: str, raw: dict, status_ok: bool, error_code=None, error_msg=None) -> dict:
+    def _normalize_exec_result(
+        self, order_id: str, raw: dict, status_ok: bool, error_code=None, error_msg=None
+    ) -> dict:
         # Canonical ExecResult (§3.7)
         executed_qty = 0.0
         cumm_quote = 0.0
@@ -3458,7 +3744,7 @@ class ExchangeClient:
         with contextlib.suppress(Exception):
             cumm_quote = float(raw.get("cummulativeQuoteQty", 0.0) or 0.0)
 
-        fills_out: List[Dict[str, Any]] = []
+        fills_out: list[dict[str, Any]] = []
         weighted_num = 0.0
         weighted_den = 0.0
         for f in raw.get("fills", []) or []:
@@ -3497,7 +3783,9 @@ class ExchangeClient:
             inferred_avg = fill_avg
 
         # Prefer effective avg price for MARKET fills; fallback to explicit raw price.
-        effective_price = inferred_avg if inferred_avg > 0 else (raw_price if raw_price > 0 else 0.0)
+        effective_price = (
+            inferred_avg if inferred_avg > 0 else (raw_price if raw_price > 0 else 0.0)
+        )
         res = {
             "order_id": order_id,
             "ok": bool(status_ok),
@@ -3540,8 +3828,11 @@ class ExchangeClient:
             raise ValueError("Must specify either quantity or quote, but not both.")
         if quote is not None and side.upper() != "BUY":
             raise ValueError("Quote orders are only supported for market buy.")
-        return await (self._send_real_order_quantity(symbol, side, quantity, tag) if quantity is not None
-                    else self._send_real_order_quote(symbol, side, quote, tag))
+        return await (
+            self._send_real_order_quantity(symbol, side, quantity, tag)
+            if quantity is not None
+            else self._send_real_order_quote(symbol, side, quote, tag)
+        )
 
     async def _send_real_order_quantity(
         self,
@@ -3599,7 +3890,12 @@ class ExchangeClient:
             raise ValueError(f"MIN_NOTIONAL violation: quote {quote} < {min_notional}")
 
         q = self._normalize_quote_order_qty(sym, quote)
-        params = {"symbol": sym, "side": side.upper(), "type": "MARKET", "quoteOrderQty": format(q, "f")}
+        params = {
+            "symbol": sym,
+            "side": side.upper(),
+            "type": "MARKET",
+            "quoteOrderQty": format(q, "f"),
+        }
         cid = client_order_id or f"octi-{int(time.time()*1000)}-{tag or 'meta'}"
         params["newClientOrderId"] = str(cid)[:36]
         raw = await self._request("POST", "/api/v3/order", params, signed=True, api="spot_api")
@@ -3631,7 +3927,9 @@ class ExchangeClient:
             "executedQty": quantity,
             "cummulativeQuoteQty": (quantity or 0.0) * float(fill_price),
             "price": float(fill_price),
-            "fills": [{"price": float(fill_price), "qty": float(quantity or 0.0), "commission": fee}]
+            "fills": [
+                {"price": float(fill_price), "qty": float(quantity or 0.0), "commission": fee}
+            ],
         }
         self._paper_trade_orders[str(order_id)] = order
         return str(order_id)
@@ -3653,16 +3951,16 @@ class ExchangeClient:
             or "too many requests" in msg
         )
 
-    async def get_spot_balances(self) -> Dict[str, Dict[str, float]]:
+    async def get_spot_balances(self) -> dict[str, dict[str, float]]:
         """Spot balances via /api/v3/account (safe; no SAPI permission required).
-        
+
         Returns all non-zero balances including assets that may not be tradable.
         Filtering of non-tradable pairs should be done at SharedState level.
         """
         # Allow balances even in paper/testnet mode
         # Diagnostic: Log the decision gate
         self.logger.debug(f"[EC:Balances] paper_trade={self.paper_trade}, testnet={self.testnet}")
-        
+
         if self.paper_trade and not self.testnet:
             self.logger.debug("[EC] Paper simulation: returning empty balances")
             return {}
@@ -3684,7 +3982,9 @@ class ExchangeClient:
                 }
 
             try:
-                self.logger.debug(f"[EC] Fetching real balances from {'testnet' if self.testnet else 'live'}")
+                self.logger.debug(
+                    f"[EC] Fetching real balances from {'testnet' if self.testnet else 'live'}"
+                )
                 data = await self._request("GET", "/api/v3/account", signed=True, api="spot_api")
                 out = {}
                 for b in data.get("balances", []):
@@ -3703,7 +4003,10 @@ class ExchangeClient:
                             max(0.0, time.time() - self._acct_cache_ts),
                         )
                         return {
-                            k: {"free": float(v.get("free", 0.0)), "locked": float(v.get("locked", 0.0))}
+                            k: {
+                                "free": float(v.get("free", 0.0)),
+                                "locked": float(v.get("locked", 0.0)),
+                            }
                             for k, v in dict(self._acct_cache).items()
                         }
                     self.logger.warning("[EC:Balances] Rate limited and no cache available")
@@ -3720,7 +4023,10 @@ class ExchangeClient:
             if self._acct_cache and (now - self._acct_cache_ts) < self._acct_ttl:
                 bal = self._acct_cache.get(asset.upper())
                 if bal is not None:
-                    return {"free": float(bal.get("free", 0.0)), "locked": float(bal.get("locked", 0.0))}
+                    return {
+                        "free": float(bal.get("free", 0.0)),
+                        "locked": float(bal.get("locked", 0.0)),
+                    }
             # Refresh cache
             data = await self._request("GET", "/api/v3/account", signed=True, api="spot_api")
             cache = {}

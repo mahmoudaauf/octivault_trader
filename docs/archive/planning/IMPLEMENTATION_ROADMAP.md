@@ -326,20 +326,20 @@ async def can_enter_new_symbol(symbol: str) -> bool:
     if count_tier1_positions() >= regime_max:
         if count_tier2_positions() >= tier2_max:
             return False  # Both tiers full
-    
+
     # Check 2: Existing position check
     existing = get_position_in_symbol(symbol)
     if existing and existing.is_tier1_active():
         return False  # Tier 1 blocks new entry
-    
+
     # Check 3: Dust exclusion
     if existing and existing.is_dust():
         return True  # Dust doesn't block, can enter
-    
+
     # Check 4: Capital availability
     if available_capital < min_position_size:
         return False  # No capital to deploy
-    
+
     return True  # Approved
 ```
 
@@ -529,4 +529,3 @@ Level 4: Emergency Shutdown
 ├─ Rescue: Preserve remaining capital
 └─ Result: Halt losses, preserve $50+
 ```
-

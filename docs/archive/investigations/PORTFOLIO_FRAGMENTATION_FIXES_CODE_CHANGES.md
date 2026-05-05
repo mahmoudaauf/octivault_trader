@@ -10,7 +10,7 @@ This document provides exact line numbers and code snippets of all changes made.
 
 ### Change 1: Portfolio Health Check Integration in Cleanup Cycle
 
-**Location:** Lines 9414-9431  
+**Location:** Lines 9414-9431
 **In Method:** `async def _run_cleanup_cycle()`
 
 **Code Added:**
@@ -40,7 +40,7 @@ except Exception as e:
 
 ### Change 2: Consolidation Automation Integration in Cleanup Cycle
 
-**Location:** Lines 9432-9448  
+**Location:** Lines 9432-9448
 **In Method:** `async def _run_cleanup_cycle()`
 
 **Code Added:**
@@ -66,7 +66,7 @@ except Exception as e:
 
 ### Change 3: Portfolio Health Check Method
 
-**Location:** After `_reset_dust_flags_after_24h()` method  
+**Location:** After `_reset_dust_flags_after_24h()` method
 **New Method:** `async def _check_portfolio_health()`
 
 **Code Added (Full Method):**
@@ -74,18 +74,18 @@ except Exception as e:
 async def _check_portfolio_health(self) -> Optional[Dict[str, Any]]:
     """
     FIX 3: Detect and measure portfolio fragmentation patterns.
-    
+
     Detects fragmentation through multiple lenses:
     1. Position Count: How many symbols are held
     2. Position Size Distribution: Are they evenly sized or fragmented?
     3. Zero-Quantity Positions: Dust or ghost positions
     4. Concentration Ratio: Is portfolio concentrated or dispersed?
-    
+
     Fragmentation Levels:
     - HEALTHY: < 5 positions, or < 10 positions with good concentration (Herfindahl > 0.3)
     - FRAGMENTED: 5-15 positions with even distribution
     - SEVERE: > 15 positions, many small positions, high dust count
-    
+
     Returns:
         dict with keys:
         - fragmentation_level: "HEALTHY", "FRAGMENTED", or "SEVERE"
@@ -107,7 +107,7 @@ async def _check_portfolio_health(self) -> Optional[Dict[str, Any]]:
         except Exception as e:
             self.logger.debug("[Meta:PortfolioHealth] Could not get positions: %s", str(e))
             return None
-        
+
         if not all_positions:
             # No positions = healthy empty portfolio
             return {
@@ -118,20 +118,20 @@ async def _check_portfolio_health(self) -> Optional[Dict[str, Any]]:
                 "concentration_ratio": 0.0,
                 "largest_position_pct": 0.0,
             }
-        
+
         # Count positions by quantity status
         active_positions = []
         zero_positions = 0
-        
+
         for symbol, pos_data in all_positions.items():
             qty = float(pos_data.get("qty", 0.0) if isinstance(pos_data, dict) else 0.0)
             if qty > 0:
                 active_positions.append(qty)
             elif qty == 0:
                 zero_positions += 1
-        
+
         active_count = len(active_positions)
-        
+
         # If no active positions (only zeros), portfolio is fragmented
         if active_count == 0:
             return {
@@ -142,22 +142,22 @@ async def _check_portfolio_health(self) -> Optional[Dict[str, Any]]:
                 "concentration_ratio": 0.0,
                 "largest_position_pct": 0.0,
             }
-        
+
         # Calculate portfolio statistics
         total_size = sum(active_positions)
         avg_size = total_size / len(active_positions) if active_positions else 0.0
-        
+
         # Herfindahl concentration index: sum of (position/total)^2
         # Range: 1/N (perfect dispersion) to 1.0 (all in one position)
         concentration_ratio = sum((pos / total_size) ** 2 for pos in active_positions)
-        
+
         # Largest position percentage
         largest_pos = max(active_positions) if active_positions else 0
         largest_pct = (largest_pos / total_size * 100.0) if total_size > 0 else 0.0
-        
+
         # Determine fragmentation level
         fragmentation_level = "HEALTHY"
-        
+
         if active_count > 15:
             # Many positions = likely fragmented
             if zero_positions > 5 or concentration_ratio < 0.2:
@@ -172,11 +172,11 @@ async def _check_portfolio_health(self) -> Optional[Dict[str, Any]]:
             # Reasonable count but check concentration
             if concentration_ratio < 0.1:
                 fragmentation_level = "FRAGMENTED"
-        
+
         # Additional severity check: if many zeros relative to active positions
         if zero_positions > active_count and fragmentation_level == "HEALTHY":
             fragmentation_level = "FRAGMENTED"
-        
+
         return {
             "fragmentation_level": fragmentation_level,
             "active_symbols": active_count,
@@ -185,7 +185,7 @@ async def _check_portfolio_health(self) -> Optional[Dict[str, Any]]:
             "concentration_ratio": concentration_ratio,
             "largest_position_pct": largest_pct,
         }
-        
+
     except Exception as e:
         self.logger.debug("[Meta:PortfolioHealth] Health check exception: %s", str(e))
         return None
@@ -197,7 +197,7 @@ async def _check_portfolio_health(self) -> Optional[Dict[str, Any]]:
 
 ### Change 4: Adaptive Position Sizing Method
 
-**Location:** After `_calculate_dynamic_take_profit()` method  
+**Location:** After `_calculate_dynamic_take_profit()` method
 **New Method:** `async def _get_adaptive_position_size()`
 
 **Code Added (Full Method):**
@@ -205,38 +205,38 @@ async def _check_portfolio_health(self) -> Optional[Dict[str, Any]]:
 async def _get_adaptive_position_size(self, symbol: str, confidence: float, available_capital: float) -> float:
     """
     FIX 4: Calculate adaptive position size based on portfolio health.
-    
+
     Wraps _calculate_optimal_position_size() with portfolio fragmentation awareness.
     Reduces position size if portfolio is fragmented to avoid adding more dust.
-    
+
     Sizing Adjustments:
     - HEALTHY portfolio: Use standard sizing (base_allocation * confidence_mult * concentration_mult)
     - FRAGMENTED portfolio: 50% of standard sizing (reduce new fragmentation)
     - SEVERE fragmentation: 25% of standard sizing (healing mode - minimal new positions)
-    
+
     This prevents the feedback loop where small positions create fragmentation,
     which reduces capital efficiency, which leads to even smaller positions.
-    
+
     Args:
         symbol: Trading symbol
         confidence: Signal confidence (0.0-1.0)
         available_capital: Free capital available for this trade
-        
+
     Returns:
         Adaptive position size in quote asset
     """
     try:
         # Get base position size from standard calculator
         base_size = self._calculate_optimal_position_size(symbol, confidence, available_capital)
-        
+
         # Get current portfolio health
         health = await self._check_portfolio_health()
         if not health:
             # If health check fails, return base size (don't break trading)
             return base_size
-        
+
         frag_level = health.get("fragmentation_level", "HEALTHY")
-        
+
         # Apply fragmentation-based adjustment
         if frag_level == "SEVERE":
             adaptive_size = base_size * 0.25  # 25% of base
@@ -247,15 +247,15 @@ async def _get_adaptive_position_size(self, symbol: str, confidence: float, avai
         else:  # HEALTHY
             adaptive_size = base_size
             reason = "Portfolio healthy - standard sizing"
-        
+
         self.logger.debug(
             "[Meta:AdaptiveSizing] symbol=%s, confidence=%.2f, base_size=%.2f, "
             "adaptive_size=%.2f, fragmentation=%s (%s)",
             symbol, confidence, base_size, adaptive_size, frag_level, reason
         )
-        
+
         return adaptive_size
-        
+
     except Exception as e:
         self.logger.debug("[Meta:AdaptiveSizing] Exception, reverting to base sizing: %s", str(e))
         # Fall back to base sizing if anything goes wrong
@@ -268,7 +268,7 @@ async def _get_adaptive_position_size(self, symbol: str, confidence: float, avai
 
 ### Change 5: Consolidation Trigger Method
 
-**Location:** After `_get_adaptive_position_size()` method  
+**Location:** After `_get_adaptive_position_size()` method
 **New Method:** `async def _should_trigger_portfolio_consolidation()`
 
 **Code Added (Full Method):**
@@ -276,17 +276,17 @@ async def _get_adaptive_position_size(self, symbol: str, confidence: float, avai
 async def _should_trigger_portfolio_consolidation(self) -> Tuple[bool, Optional[List[str]]]:
     """
     FIX 5: Determine if portfolio consolidation should be triggered.
-    
+
     Consolidation is triggered when:
     1. Portfolio fragmentation is SEVERE (>15 positions or high dust)
     2. At least 2 hours since last consolidation attempt (rate limiting)
     3. Consolidation list can be identified (positions with qty approaching dust limits)
-    
+
     Consolidation Strategy:
     - Identify positions with qty < 2x minimum notional (likely dust)
     - Consolidate them into fewer, more efficient positions
     - Rate limit to prevent thrashing (max once per 2 hours)
-    
+
     Returns:
         tuple: (should_consolidate: bool, symbols_to_consolidate: list[str] or None)
     """
@@ -295,12 +295,12 @@ async def _should_trigger_portfolio_consolidation(self) -> Tuple[bool, Optional[
         health = await self._check_portfolio_health()
         if not health:
             return False, None
-        
+
         frag_level = health.get("fragmentation_level", "HEALTHY")
         if frag_level != "SEVERE":
             # Only consolidate if SEVERE fragmentation
             return False, None
-        
+
         # Check rate limiting - don't consolidate too frequently
         last_consolidation = getattr(self, "_last_consolidation_attempt", 0.0)
         time_since_last = time.time() - last_consolidation
@@ -310,7 +310,7 @@ async def _should_trigger_portfolio_consolidation(self) -> Tuple[bool, Optional[
                 time_since_last / 60.0
             )
             return False, None
-        
+
         # Identify dust positions to consolidate
         try:
             all_positions = {}
@@ -318,10 +318,10 @@ async def _should_trigger_portfolio_consolidation(self) -> Tuple[bool, Optional[
                 all_positions = self.shared_state.get_all_positions() or {}
             elif hasattr(self.shared_state, "positions"):
                 all_positions = self.shared_state.positions or {}
-            
+
             if not all_positions:
                 return False, None
-            
+
             # Find positions that look like dust
             dust_candidates = []
             for symbol, pos_data in all_positions.items():
@@ -332,11 +332,11 @@ async def _should_trigger_portfolio_consolidation(self) -> Tuple[bool, Optional[
                         min_notional = await self._get_min_notional_sync(symbol) if hasattr(self, '_get_min_notional_sync') else 100.0
                     except Exception:
                         min_notional = 100.0  # Fallback default
-                    
+
                     # If qty < 2x min notional, it's dust
                     if qty < min_notional * 2.0:
                         dust_candidates.append(symbol)
-            
+
             if dust_candidates and len(dust_candidates) >= 3:
                 # Need at least 3 dust positions to consolidate
                 self.logger.info(
@@ -347,15 +347,15 @@ async def _should_trigger_portfolio_consolidation(self) -> Tuple[bool, Optional[
                 )
                 self._last_consolidation_attempt = time.time()
                 return True, dust_candidates
-            
+
             # Mark that we attempted (to rate-limit even if not consolidating)
             self._last_consolidation_attempt = time.time()
             return False, None
-            
+
         except Exception as e:
             self.logger.debug("[Meta:Consolidation] Error identifying dust positions: %s", str(e))
             return False, None
-            
+
     except Exception as e:
         self.logger.debug("[Meta:Consolidation] Consolidation check exception: %s", str(e))
         return False, None
@@ -367,7 +367,7 @@ async def _should_trigger_portfolio_consolidation(self) -> Tuple[bool, Optional[
 
 ### Change 6: Consolidation Execution Method
 
-**Location:** After `_should_trigger_portfolio_consolidation()` method  
+**Location:** After `_should_trigger_portfolio_consolidation()` method
 **New Method:** `async def _execute_portfolio_consolidation()`
 
 **Code Added (Full Method):**
@@ -375,20 +375,20 @@ async def _should_trigger_portfolio_consolidation(self) -> Tuple[bool, Optional[
 async def _execute_portfolio_consolidation(self, dust_symbols: List[str]) -> Dict[str, Any]:
     """
     FIX 5: Execute portfolio consolidation for identified dust positions.
-    
+
     Consolidation workflow:
     1. Liquidate dust positions (sell at market to convert to USDT)
     2. Accumulate proceeds
     3. Reallocate proceeds to highest-conviction positions or hold for opportunities
-    
+
     Consolidation Results tracked:
     - symbols_liquidated: Symbols that were dust
     - total_proceeds: Total USDT recovered
     - reallocation_target: Where proceeds were reallocated (if any)
-    
+
     Args:
         dust_symbols: List of symbols with dust positions to consolidate
-        
+
     Returns:
         dict with consolidation results:
         - success: bool - if consolidation executed
@@ -403,15 +403,15 @@ async def _execute_portfolio_consolidation(self, dust_symbols: List[str]) -> Dic
         "total_proceeds": 0.0,
         "actions_taken": "No consolidation actions taken",
     }
-    
+
     try:
         if not dust_symbols or len(dust_symbols) == 0:
             return results
-        
+
         # For each dust position, prepare liquidation
         liquidation_count = 0
         total_usdt_recovered = 0.0
-        
+
         for symbol in dust_symbols[:10]:  # Limit to first 10 to avoid overload
             try:
                 # Get current position
@@ -420,44 +420,44 @@ async def _execute_portfolio_consolidation(self, dust_symbols: List[str]) -> Dic
                     all_positions = self.shared_state.get_all_positions() or {}
                 elif hasattr(self.shared_state, "positions"):
                     all_positions = self.shared_state.positions or {}
-                
+
                 pos_data = all_positions.get(symbol)
                 if not pos_data:
                     continue
-                
+
                 qty = float(pos_data.get("qty", 0.0))
                 entry_price = float(pos_data.get("entry_price", 0.0))
-                
+
                 if qty <= 0 or entry_price <= 0:
                     continue
-                
+
                 # Calculate USDT value of position
                 position_value = qty * entry_price
-                
+
                 # Log consolidation action (don't actually execute - that's trading logic)
                 self.logger.info(
                     "[Meta:Consolidation] CONSOLIDATE: %s - qty=%.8f @ %.8f = %.2f USDT",
                     symbol, qty, entry_price, position_value
                 )
-                
+
                 # Mark this symbol as being consolidated
                 if symbol not in self._consolidated_dust_symbols:
                     self._consolidated_dust_symbols.add(symbol)
-                
+
                 # Update dust state
                 dust_state = self._symbol_dust_state.get(symbol, {})
                 dust_state["consolidated"] = True
                 dust_state["last_dust_tx"] = time.time()
                 self._symbol_dust_state[symbol] = dust_state
-                
+
                 liquidation_count += 1
                 total_usdt_recovered += position_value
                 results["symbols_liquidated"].append(symbol)
-                
+
             except Exception as e:
                 self.logger.debug("[Meta:Consolidation] Error processing %s: %s", symbol, str(e))
                 continue
-        
+
         if liquidation_count > 0:
             results["success"] = True
             results["total_proceeds"] = total_usdt_recovered
@@ -465,16 +465,16 @@ async def _execute_portfolio_consolidation(self, dust_symbols: List[str]) -> Dic
                 f"Marked {liquidation_count} dust positions for consolidation, "
                 f"recovered ~{total_usdt_recovered:.2f} USDT"
             )
-            
+
             self.logger.info(
                 "[Meta:Consolidation] COMPLETE: Consolidated %d positions, "
                 "total proceeds = %.2f USDT",
                 liquidation_count,
                 total_usdt_recovered
             )
-        
+
         return results
-        
+
     except Exception as e:
         self.logger.debug("[Meta:Consolidation] Consolidation execution error: %s", str(e))
         return results

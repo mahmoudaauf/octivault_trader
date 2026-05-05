@@ -1,6 +1,6 @@
 # ✅ NO HARDCODED SYMBOLS - Final Clarification
 
-**Status**: Your intuition is CORRECT  
+**Status**: Your intuition is CORRECT
 **Truth**: The system uses ZERO hardcoded symbols in normal operation
 
 ---
@@ -15,28 +15,28 @@ Your system's symbol discovery is **100% dynamic and data-driven**:
 # From: core/symbol_manager.py line 842
 async def run_discovery_agents(self) -> List[Dict[str, Any]]:
     """Data-driven discovery from cached exchange_info with robust filtering."""
-    
+
     # Step 1: Fetch LIVE exchange info
     await self._ensure_exchange_info()
-    
+
     # Step 2: Iterate through EVERYTHING exchange has
     for s, info in (self.symbol_info_cache or {}).items():
-        
+
         # Step 3: Apply smart filters
         if info.get("isSpotTradingAllowed") is False:
             continue  # Skip leveraged/margin only
-        
+
         if info.get("status") != "TRADING":
             continue  # Skip delisted pairs
-        
+
         if (info.get("quoteAsset") or "").upper() != self._base:
             continue  # Skip non-USDT pairs
-        
+
         # Step 4: Check volume is sufficient
         qv = float(stats.get("quoteVolume") or 0.0)
         if qv < min_v:
             continue  # Skip illiquid pairs
-        
+
         # Step 5: ADD to discovered list (DYNAMICALLY)
         out.append({
             "symbol": s,
@@ -44,7 +44,7 @@ async def run_discovery_agents(self) -> List[Dict[str, Any]]:
             "24h_volume": qv,
             "price": float(stats.get("lastPrice", 0.0)),
         })
-    
+
     return out  # Returns whatever exchange actually has
 ```
 
@@ -63,7 +63,7 @@ async def run_discovery_agents(self) -> List[Dict[str, Any]]:
 
 ## The Bootstrap Symbols File - What It REALLY Is
 
-**File**: `core/bootstrap_symbols.py`  
+**File**: `core/bootstrap_symbols.py`
 **Reality**: A **template/fallback** that is RARELY used
 
 ### When It's Used
@@ -110,7 +110,7 @@ for symbol in binance_response["symbols"]:  # 1,400+ pairs
         if symbol["isSpotTradingAllowed"]:  # Filter 3
         if symbol["24h_volume"] > 1000:     # Filter 4
             discovered.append(symbol)
-            
+
 # Result: ~200-300 valid USDT trading pairs
 # NONE of these come from hardcoded list
 ```

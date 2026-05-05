@@ -21,7 +21,7 @@ This index organizes all documentation around your core requirement:
 - Capital allocation formulas
 - Sustainability metrics
 
-**Key Insight**: 
+**Key Insight**:
 > "One-position-per-symbol rule prevents deadlock, but requires proper exit planning"
 
 **Action Items from this doc**:
@@ -48,13 +48,13 @@ This index organizes all documentation around your core requirement:
 ```
 1. TAKE PROFIT: Price reaches +2-3% gain
    → Close immediately (capture profit)
-   
+
 2. STOP LOSS: Price reaches -1.5% loss
    → Close immediately (cut loss)
-   
+
 3. TIME-BASED: 4 hours elapsed
    → Force close (prevent deadlock)
-   
+
 4. DUST LIQUIDATION: Position becomes dust
    → Emergency liquidation (fallback)
 ```
@@ -362,7 +362,7 @@ Timeline:
 
 **Answer**: Implement the Exit-First Strategy with 4 guaranteed pathways
 
-**Action**: 
+**Action**:
 1. Read `EXIT_FIRST_STRATEGY.md` (understand philosophy)
 2. Read `EXIT_FIRST_IMPLEMENTATION.md` (understand code)
 3. Implement Phase 1 changes (30 minutes)
@@ -413,4 +413,3 @@ Timeline:
 **Validation**: Measurable success metrics (hold time, exit distribution, account growth)
 
 **Status**: ✅ READY TO IMPLEMENT
-

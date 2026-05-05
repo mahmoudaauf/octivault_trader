@@ -126,12 +126,10 @@ COMMANDS = {
 # Install test dependencies
 pip install pytest pytest-asyncio pytest-mock pytest-cov
 """,
-    
     "run_all": """
 # Run all tests with verbose output
 pytest tests/test_portfolio_fragmentation_fixes.py -v
 """,
-    
     "run_with_coverage": """
 # Run all tests with code coverage report
 pytest tests/test_portfolio_fragmentation_fixes.py \\
@@ -140,38 +138,31 @@ pytest tests/test_portfolio_fragmentation_fixes.py \\
   --cov-report=term-missing \\
   -v
 """,
-    
     "run_health_check": """
 # Run FIX 3 health check tests only
 pytest tests/test_portfolio_fragmentation_fixes.py::TestPortfolioHealthCheck -v
 """,
-    
     "run_adaptive_sizing": """
 # Run FIX 4 adaptive sizing tests only
 pytest tests/test_portfolio_fragmentation_fixes.py::TestAdaptivePositionSizing -v
 """,
-    
     "run_consolidation": """
 # Run FIX 5 consolidation tests (both trigger and execution)
 pytest tests/test_portfolio_fragmentation_fixes.py::TestConsolidationTrigger -v
 pytest tests/test_portfolio_fragmentation_fixes.py::TestConsolidationExecution -v
 """,
-    
     "run_integration": """
 # Run integration lifecycle tests
 pytest tests/test_portfolio_fragmentation_fixes.py::TestFragmentationLifecycle -v
 """,
-    
     "run_errors": """
 # Run error handling tests
 pytest tests/test_portfolio_fragmentation_fixes.py::TestErrorHandling -v
 """,
-    
     "run_edge_cases": """
 # Run edge case tests
 pytest tests/test_portfolio_fragmentation_fixes.py::TestEdgeCases -v
 """,
-    
     "run_fast": """
 # Run tests without coverage (faster)
 pytest tests/test_portfolio_fragmentation_fixes.py -v --tb=short
@@ -268,7 +259,7 @@ OVERALL COVERAGE: 90%+ minimum
 # TROUBLESHOOTING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TROUBLESHOOTING = """
+TROUBLESHOOTING = r"""
 Common Issues & Solutions
 ─────────────────────────────────────────────────────────────────────────────
 
@@ -280,7 +271,7 @@ Common Issues & Solutions
               cd /Users/mauf/Desktop/Octi\ AI\ Trading\ Bot/octivault_trader
 
 ❌ ISSUE: Some tests are failing
-   ✅ SOLUTION: 
+   ✅ SOLUTION:
    - Run with -v flag to see detailed output: pytest -v
    - Run specific test: pytest tests/test_portfolio_fragmentation_fixes.py::TestName::test_name -v
    - Check recent changes to meta_controller.py
@@ -294,7 +285,7 @@ Common Issues & Solutions
               Or run: python -m pytest tests/test_portfolio_fragmentation_fixes.py -v
 
 ❌ ISSUE: Coverage report not generating
-   ✅ SOLUTION: 
+   ✅ SOLUTION:
    - Install coverage: pip install pytest-cov
    - Run: pytest --cov=core.meta_controller --cov-report=html
    - Check htmlcov/index.html for report
@@ -327,7 +318,7 @@ After Unit Tests Pass:
    - Test full lifecycle: create fragmented → health check → sizing → consolidation
    - Test cleanup cycle integration
    - Test error scenarios
-   
+
    Key Tests:
    1. test_full_lifecycle_fragmentation
    2. test_cleanup_cycle_with_all_fixes
@@ -367,7 +358,7 @@ KEY SUCCESS CRITERIA:
 
 if __name__ == "__main__":
     print(TEST_SUMMARY)
-    print("\n" + "="*80 + "\n")
+    print("\n" + "=" * 80 + "\n")
     print(COMMANDS["run_all"])
-    print("\n" + "="*80 + "\n")
+    print("\n" + "=" * 80 + "\n")
     print(EXPECTED_RESULTS)

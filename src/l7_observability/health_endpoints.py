@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Health Check HTTP Endpoints - Issue #20
 
@@ -21,13 +20,13 @@ JSON Response Format:
 """
 
 import logging
-from typing import Dict, Any, Optional
+from typing import Any, Optional
+
 from fastapi import FastAPI, Response, status
-from starlette.responses import JSONResponse
-import json
 
 try:
     from src.l7_observability.health_monitor import get_health_monitor
+
     HEALTH_MONITOR_AVAILABLE = True
 except ImportError:
     HEALTH_MONITOR_AVAILABLE = False
@@ -37,32 +36,32 @@ logger = logging.getLogger(__name__)
 
 class HealthEndpoints:
     """Health check endpoints for Kubernetes integration."""
-    
+
     def __init__(self, app: Optional[FastAPI] = None):
         self.app = app
         self.health_monitor = None
-        
+
         if HEALTH_MONITOR_AVAILABLE:
             try:
                 self.health_monitor = get_health_monitor()
             except Exception as e:
                 logger.warning(f"Could not initialize health monitor: {e}")
-    
+
     def register_endpoints(self, app: FastAPI) -> None:
         """Register health check endpoints with FastAPI app."""
         self.app = app
-        
+
         app.add_api_route("/health", self.health_check, methods=["GET"])
         app.add_api_route("/ready", self.readiness_probe, methods=["GET"])
         app.add_api_route("/live", self.liveness_probe, methods=["GET"])
         app.add_api_route("/healthz", self.health_check, methods=["GET"])  # Kubernetes alias
-        
+
         logger.info("✅ Health check endpoints registered")
-    
-    async def health_check(self, response: Response) -> Dict[str, Any]:
+
+    async def health_check(self, response: Response) -> dict[str, Any]:
         """
         GET /health
-        
+
         Overall health status endpoint.
         Returns 200 if healthy, 503 if degraded/unhealthy.
         """
@@ -72,10 +71,10 @@ class HealthEndpoints:
                 "status": "unhealthy",
                 "message": "Health monitor not available",
             }
-        
+
         try:
             report = self.health_monitor.get_health_report()
-            
+
             if report["status"] == "unhealthy":
                 response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
             elif report["status"] == "degraded":
@@ -83,9 +82,9 @@ class HealthEndpoints:
                 response.status_code = status.HTTP_200_OK
             else:
                 response.status_code = status.HTTP_200_OK
-            
+
             return report
-        
+
         except Exception as e:
             logger.error(f"Error generating health report: {e}")
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -93,11 +92,11 @@ class HealthEndpoints:
                 "status": "unhealthy",
                 "message": f"Error checking health: {e}",
             }
-    
-    async def readiness_probe(self, response: Response) -> Dict[str, Any]:
+
+    async def readiness_probe(self, response: Response) -> dict[str, Any]:
         """
         GET /ready
-        
+
         Kubernetes readiness probe endpoint.
         Returns 200 if ready to accept traffic, 503 if not.
         """
@@ -108,17 +107,17 @@ class HealthEndpoints:
                 "status": "not_ready",
                 "message": "Health monitor not available",
             }
-        
+
         try:
             report = self.health_monitor.get_readiness_report()
-            
+
             if report["ready"]:
                 response.status_code = status.HTTP_200_OK
             else:
                 response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            
+
             return report
-        
+
         except Exception as e:
             logger.error(f"Error checking readiness: {e}")
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -127,11 +126,11 @@ class HealthEndpoints:
                 "status": "not_ready",
                 "message": f"Error checking readiness: {e}",
             }
-    
-    async def liveness_probe(self, response: Response) -> Dict[str, Any]:
+
+    async def liveness_probe(self, response: Response) -> dict[str, Any]:
         """
         GET /live
-        
+
         Kubernetes liveness probe endpoint.
         Returns 200 if alive, 503 if dead.
         Triggers container restart if returns 503.
@@ -143,17 +142,17 @@ class HealthEndpoints:
                 "status": "dead",
                 "message": "Health monitor not available",
             }
-        
+
         try:
             report = self.health_monitor.get_liveness_report()
-            
+
             if report["alive"]:
                 response.status_code = status.HTTP_200_OK
             else:
                 response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            
+
             return report
-        
+
         except Exception as e:
             logger.error(f"Error checking liveness: {e}")
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE

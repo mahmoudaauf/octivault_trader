@@ -1,16 +1,15 @@
-import os
 import asyncio
-import logging
-import csv
-import time
 import contextlib
-import numpy as np
-from datetime import datetime
-import pandas as pd
-from typing import Dict, Any, Optional, Tuple, List, Set
-from pathlib import Path
+import csv
+import logging
+import os
+import time
 from collections import defaultdict, deque
-import inspect  # <-- added
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import pandas as pd
 
 try:
     from src.l5_strategy.agent_optimizer import load_tuned_params
@@ -20,8 +19,10 @@ except Exception as _e:
         _e,
         exc_info=True,
     )
+
     def load_tuned_params(_name: str):  # type: ignore
         return {}
+
 
 try:
     from src.l0_core.component_status_logger import log_component_status
@@ -31,8 +32,10 @@ except Exception as _e:
         _e,
         exc_info=True,
     )
+
     def log_component_status(*_args, **_kwargs):  # type: ignore
         return None
+
 
 try:
     from src.l0_core.stubs import is_fresh  # freshness gate
@@ -42,8 +45,10 @@ except Exception as _e:
         _e,
         exc_info=True,
     )
+
     async def is_fresh(*_args, **_kwargs):  # type: ignore
         return True
+
 
 try:
     from src.l5_strategy.model_trainer import ModelTrainer
@@ -63,8 +68,10 @@ except Exception as _e:
         _e,
         exc_info=True,
     )
+
     def fee_bps(*_args, **_kwargs):  # type: ignore
         return 10.0
+
 
 logger = logging.getLogger("MLForecaster")
 if not logger.handlers:
@@ -72,7 +79,6 @@ if not logger.handlers:
 
 
 class MLForecaster:
-
     async def _get_market_data_safe(self, symbol: str, timeframe: str):
         fn = getattr(self.shared_state, "get_market_data", None)
         if not callable(fn):
@@ -81,6 +87,7 @@ class MLForecaster:
         if asyncio.iscoroutine(data):
             data = await data
         return data
+
     """
     ML-based forecaster that PRODUCES signals and delegates execution to MetaController.
     - Emits via meta_controller.receive_signal(name, symbol, payload, confidence)
@@ -102,7 +109,9 @@ class MLForecaster:
 
         # Freshness & emission controls
         self.fresh_max_age_s = float(getattr(self.config, "FRESH_MAX_AGE_S", 120.0))
-        self.allow_sell_without_position = bool(getattr(self.config, "ALLOW_SELL_WITHOUT_POSITION", False))
+        self.allow_sell_without_position = bool(
+            getattr(self.config, "ALLOW_SELL_WITHOUT_POSITION", False)
+        )
 
         # Optional deps
         self.market_data_feed = kwargs.get("market_data_feed")
@@ -122,7 +131,7 @@ class MLForecaster:
         )
 
         # Symbols & tf
-        self.symbols: List[str] = list(kwargs.get("symbols", []) or [])
+        self.symbols: list[str] = list(kwargs.get("symbols", []) or [])
         self.timeframe = kwargs.get("timeframe", "5m")
 
         # Tuned params (safe)
@@ -148,10 +157,12 @@ class MLForecaster:
         )
 
         # Caching / performance
-        self.model_cache: Dict[str, Any] = {}
-        self._model_mtime: Dict[str, float] = {}
-        self._predict_fns: Dict[Tuple[str, int, int], Any] = {}  # (model_path, lookback, feature_dim) -> tf.function
-        self._retrained_feature_models: Set[str] = set()
+        self.model_cache: dict[str, Any] = {}
+        self._model_mtime: dict[str, float] = {}
+        self._predict_fns: dict[
+            tuple[str, int, int], Any
+        ] = {}  # (model_path, lookback, feature_dim) -> tf.function
+        self._retrained_feature_models: set[str] = set()
 
         # Concurrency & limits
         self.max_concurrency = int(getattr(self.config, "MLF_MAX_CONCURRENCY", 6))
@@ -160,9 +171,9 @@ class MLForecaster:
         self.max_symbols_per_tick = 5
         self._sem = asyncio.Semaphore(self.max_concurrency)
         self._stop_event = asyncio.Event()
-        
+
         # ARCHITECTURAL FIX: Signal collection buffer for generate_signals()
-        self._collected_signals: List[Dict[str, Any]] = []
+        self._collected_signals: list[dict[str, Any]] = []
 
         # Confidence calibration / EV floor state
         self._conf_eval_enabled = self._cfg_bool("ML_CONF_EVAL_ENABLED", True)
@@ -178,10 +189,12 @@ class MLForecaster:
         self._conf_hard_emit_floor = float(self._cfg("ML_MIN_CONF_EMIT_HARD", 0.05) or 0.05)
         self._regime_vol_low_pct = float(self._cfg("ML_REGIME_VOL_LOW_PCT", 0.0045) or 0.0045)
         self._regime_vol_high_pct = float(self._cfg("ML_REGIME_VOL_HIGH_PCT", 0.0150) or 0.0150)
-        self._expected_move_fallback_pct = float(self._cfg("ML_EXPECTED_MOVE_FALLBACK_PCT", 0.0065) or 0.0065)
+        self._expected_move_fallback_pct = float(
+            self._cfg("ML_EXPECTED_MOVE_FALLBACK_PCT", 0.0065) or 0.0065
+        )
         self._expected_move_min_pct = float(self._cfg("ML_EXPECTED_MOVE_MIN_PCT", 0.0010) or 0.0010)
         self._expected_move_max_pct = float(self._cfg("ML_EXPECTED_MOVE_MAX_PCT", 0.0500) or 0.0500)
-        
+
         # Regime-dependent horizon scaling (professional recommendation)
         # Bull regime: shorter horizon (60m), wider expected moves available
         # Normal regime: standard horizon (120m), moderate expected moves
@@ -189,7 +202,9 @@ class MLForecaster:
         self._regime_horizon_map = {
             "bull": float(self._cfg("ML_REGIME_BULL_HORIZON_MIN", 60.0) or 60.0),
             "normal": float(self._cfg("ML_REGIME_NORMAL_HORIZON_MIN", 120.0) or 120.0),
-            "bear": float(self._cfg("ML_REGIME_BEAR_HORIZON_MIN", 9999.0) or 9999.0),  # Effectively disable
+            "bear": float(
+                self._cfg("ML_REGIME_BEAR_HORIZON_MIN", 9999.0) or 9999.0
+            ),  # Effectively disable
             "trend": float(self._cfg("ML_REGIME_TREND_HORIZON_MIN", 90.0) or 90.0),
             "sideways": float(self._cfg("ML_REGIME_SIDEWAYS_HORIZON_MIN", 240.0) or 240.0),
             "high_vol": float(self._cfg("ML_REGIME_HIGHVOL_HORIZON_MIN", 60.0) or 60.0),
@@ -212,14 +227,24 @@ class MLForecaster:
             "ML_EXPECTED_MOVE_CALIBRATION_ENABLED",
             True,
         )
-        self._expected_move_calib_alpha = float(self._cfg("ML_EXPECTED_MOVE_CALIB_ALPHA", 0.15) or 0.15)
-        self._expected_move_calib_min_mult = float(self._cfg("ML_EXPECTED_MOVE_CALIB_MIN_MULT", 0.5) or 0.5)
-        self._expected_move_calib_max_mult = float(self._cfg("ML_EXPECTED_MOVE_CALIB_MAX_MULT", 1.8) or 1.8)
-        self._expected_move_calib_min_samples = int(self._cfg("ML_EXPECTED_MOVE_CALIB_MIN_SAMPLES", 25) or 25)
+        self._expected_move_calib_alpha = float(
+            self._cfg("ML_EXPECTED_MOVE_CALIB_ALPHA", 0.15) or 0.15
+        )
+        self._expected_move_calib_min_mult = float(
+            self._cfg("ML_EXPECTED_MOVE_CALIB_MIN_MULT", 0.5) or 0.5
+        )
+        self._expected_move_calib_max_mult = float(
+            self._cfg("ML_EXPECTED_MOVE_CALIB_MAX_MULT", 1.8) or 1.8
+        )
+        self._expected_move_calib_min_samples = int(
+            self._cfg("ML_EXPECTED_MOVE_CALIB_MIN_SAMPLES", 25) or 25
+        )
         self._expected_move_calib_global = 1.0
-        self._expected_move_calib_by_regime: Dict[str, float] = {}
-        self._expected_move_calib_counts: Dict[str, int] = {}
-        self._sideways_conf_compression_enabled = self._cfg_bool("ML_SIDEWAYS_CONF_COMPRESSION_ENABLED", True)
+        self._expected_move_calib_by_regime: dict[str, float] = {}
+        self._expected_move_calib_counts: dict[str, int] = {}
+        self._sideways_conf_compression_enabled = self._cfg_bool(
+            "ML_SIDEWAYS_CONF_COMPRESSION_ENABLED", True
+        )
         self._sideways_conf_compressed_floor = float(
             self._cfg("ML_SIDEWAYS_CONF_COMPRESSED_FLOOR", 0.65) or 0.65
         )
@@ -237,14 +262,14 @@ class MLForecaster:
         self._completed_conf_samples: deque = deque(maxlen=max(200, self._conf_max_completed))
         self._last_conf_recalc_ts = 0.0
         self._dynamic_required_conf: Optional[float] = None
-        self._dynamic_required_conf_by_regime: Dict[str, float] = {}
+        self._dynamic_required_conf_by_regime: dict[str, float] = {}
         self._startup_backtest_submitted = False
         self._startup_backtest_task: Optional[asyncio.Task] = None
         self._startup_backtest_done = False
 
         # Regime-aware feature stack (pattern guesser -> probabilistic edge detector)
-        self._legacy_feature_columns: List[str] = ["open", "high", "low", "close", "volume"]
-        self._edge_feature_columns: List[str] = [
+        self._legacy_feature_columns: list[str] = ["open", "high", "low", "close", "volume"]
+        self._edge_feature_columns: list[str] = [
             "returns_1",
             "returns_3",
             "returns_5",
@@ -271,7 +296,9 @@ class MLForecaster:
             "high_vol_flag",
         ]
         self._feature_force_upgrade = self._cfg_bool("ML_FEATURE_FORCE_UPGRADE", True)
-        self._auto_retrain_feature_mismatch = self._cfg_bool("ML_AUTO_RETRAIN_FEATURE_MISMATCH", True)
+        self._auto_retrain_feature_mismatch = self._cfg_bool(
+            "ML_AUTO_RETRAIN_FEATURE_MISMATCH", True
+        )
 
         # Keep inference non-blocking: training is queued in background.
         self.train_cooldown_s = float(getattr(self.config, "MLF_TRAIN_COOLDOWN_S", 180.0))
@@ -281,9 +308,9 @@ class MLForecaster:
         self.train_timeout_s = float(getattr(self.config, "MLF_TRAIN_TIMEOUT_S", 300.0))
         self.max_background_trains = int(getattr(self.config, "MLF_MAX_BACKGROUND_TRAINS", 1))
         self._train_sem = asyncio.Semaphore(max(1, self.max_background_trains))
-        self._train_tasks: Dict[str, asyncio.Task] = {}
-        self._train_last_attempt_ts: Dict[Tuple[str, str], float] = {}
-        self._feature_upgrade_pending: Set[str] = set()
+        self._train_tasks: dict[str, asyncio.Task] = {}
+        self._train_last_attempt_ts: dict[tuple[str, str], float] = {}
+        self._feature_upgrade_pending: set[str] = set()
 
         # Retrain orchestration guards (avoid hot-loop retraining on CPU).
         self._retrain_lock = asyncio.Lock()
@@ -293,10 +320,14 @@ class MLForecaster:
             self._cfg("ML_RETRAIN_MIN_GAP_S", os.getenv("ML_RETRAIN_MIN_GAP_S", 900.0)) or 900.0
         )
         self._retrain_symbol_timeout_s = float(
-            self._cfg("ML_RETRAIN_SYMBOL_TIMEOUT_S", os.getenv("ML_RETRAIN_SYMBOL_TIMEOUT_S", 180.0)) or 180.0
+            self._cfg(
+                "ML_RETRAIN_SYMBOL_TIMEOUT_S", os.getenv("ML_RETRAIN_SYMBOL_TIMEOUT_S", 180.0)
+            )
+            or 180.0
         )
         self._retrain_run_budget_s = float(
-            self._cfg("ML_RETRAIN_RUN_BUDGET_S", os.getenv("ML_RETRAIN_RUN_BUDGET_S", 240.0)) or 240.0
+            self._cfg("ML_RETRAIN_RUN_BUDGET_S", os.getenv("ML_RETRAIN_RUN_BUDGET_S", 240.0))
+            or 240.0
         )
         self._retrain_max_rows = int(
             self._cfg("ML_RETRAIN_MAX_ROWS", os.getenv("ML_RETRAIN_MAX_ROWS", 500)) or 500
@@ -313,7 +344,8 @@ class MLForecaster:
         self._full_train_on_startup = self._cfg_bool("ML_FULL_TRAIN_ON_STARTUP", True)
         self._full_train_force_first_boot = self._cfg_bool("ML_FULL_TRAIN_FORCE_FIRST_BOOT", False)
         self._full_train_target_rows = int(
-            self._cfg("ML_FULL_TRAIN_TARGET_ROWS", os.getenv("ML_FULL_TRAIN_TARGET_ROWS", 3000)) or 3000
+            self._cfg("ML_FULL_TRAIN_TARGET_ROWS", os.getenv("ML_FULL_TRAIN_TARGET_ROWS", 3000))
+            or 3000
         )
         self._full_train_max_rows = int(
             self._cfg("ML_FULL_TRAIN_MAX_ROWS", os.getenv("ML_FULL_TRAIN_MAX_ROWS", 10000)) or 10000
@@ -322,10 +354,12 @@ class MLForecaster:
             self._cfg("ML_FULL_TRAIN_EPOCHS", os.getenv("ML_FULL_TRAIN_EPOCHS", 15)) or 15
         )
         self._full_train_cpu_epoch_cap = int(
-            self._cfg("ML_FULL_TRAIN_CPU_EPOCH_CAP", os.getenv("ML_FULL_TRAIN_CPU_EPOCH_CAP", 20)) or 20
+            self._cfg("ML_FULL_TRAIN_CPU_EPOCH_CAP", os.getenv("ML_FULL_TRAIN_CPU_EPOCH_CAP", 20))
+            or 20
         )
         self._full_train_interval_s = float(
-            self._cfg("ML_FULL_TRAIN_INTERVAL_S", os.getenv("ML_FULL_TRAIN_INTERVAL_S", 86400.0)) or 86400.0
+            self._cfg("ML_FULL_TRAIN_INTERVAL_S", os.getenv("ML_FULL_TRAIN_INTERVAL_S", 86400.0))
+            or 86400.0
         )
         self._full_train_min_rows = int(
             self._cfg("ML_FULL_TRAIN_MIN_ROWS", os.getenv("ML_FULL_TRAIN_MIN_ROWS", 3000)) or 3000
@@ -335,36 +369,52 @@ class MLForecaster:
         self._retrain_cpu_epoch_cap = max(3, int(self._retrain_cpu_epoch_cap))
         self._retrain_min_val_acc = max(0.52, min(0.99, float(self._retrain_min_val_acc)))
         self._full_train_min_rows = max(int(self._full_train_min_rows), 3000)
-        self._full_train_target_rows = max(int(self._full_train_target_rows), int(self._full_train_min_rows))
-        self._full_train_max_rows = max(int(self._full_train_max_rows), int(self._full_train_target_rows))
+        self._full_train_target_rows = max(
+            int(self._full_train_target_rows), int(self._full_train_min_rows)
+        )
+        self._full_train_max_rows = max(
+            int(self._full_train_max_rows), int(self._full_train_target_rows)
+        )
         self._full_train_epochs = max(15, min(20, int(self._full_train_epochs)))
         self._full_train_cpu_epoch_cap = max(15, int(self._full_train_cpu_epoch_cap))
         self._lookback_default = max(60, int(self._lookback_default))
         self._lookback_min = max(40, min(int(self._lookback_default), int(self._lookback_min)))
         self._lookback_max = max(int(self._lookback_default), int(self._lookback_max))
-        self._inst_high_vol_min_conf = max(self._conf_floor_min, min(self._conf_floor_max, float(self._inst_high_vol_min_conf)))
-        self._inst_sideways_min_conf = max(self._conf_floor_min, min(self._conf_floor_max, float(self._inst_sideways_min_conf)))
-        self._inst_normal_min_conf = max(self._conf_floor_min, min(self._conf_floor_max, float(self._inst_normal_min_conf)))
-        self._inst_bull_min_conf = max(self._conf_floor_min, min(self._conf_floor_max, float(self._inst_bull_min_conf)))
+        self._inst_high_vol_min_conf = max(
+            self._conf_floor_min, min(self._conf_floor_max, float(self._inst_high_vol_min_conf))
+        )
+        self._inst_sideways_min_conf = max(
+            self._conf_floor_min, min(self._conf_floor_max, float(self._inst_sideways_min_conf))
+        )
+        self._inst_normal_min_conf = max(
+            self._conf_floor_min, min(self._conf_floor_max, float(self._inst_normal_min_conf))
+        )
+        self._inst_bull_min_conf = max(
+            self._conf_floor_min, min(self._conf_floor_max, float(self._inst_bull_min_conf))
+        )
         self._inst_high_vol_ev_mult = max(1.0, float(self._inst_high_vol_ev_mult))
         self._inst_sideways_ev_mult = max(1.0, float(self._inst_sideways_ev_mult))
         self._inst_normal_ev_mult = max(1.0, float(self._inst_normal_ev_mult))
         self._inst_bull_ev_mult = max(1.0, float(self._inst_bull_ev_mult))
-        self._expected_move_calib_alpha = max(0.01, min(1.0, float(self._expected_move_calib_alpha)))
+        self._expected_move_calib_alpha = max(
+            0.01, min(1.0, float(self._expected_move_calib_alpha))
+        )
         self._expected_move_calib_min_mult = max(0.1, float(self._expected_move_calib_min_mult))
         self._expected_move_calib_max_mult = max(
             float(self._expected_move_calib_min_mult),
             float(self._expected_move_calib_max_mult),
         )
         self._expected_move_calib_min_samples = max(1, int(self._expected_move_calib_min_samples))
-        self._full_train_last_ts: Dict[str, float] = {}
-        self._startup_full_train_pending: Set[str] = set()
-        self._startup_full_train_done: Set[str] = set()
+        self._full_train_last_ts: dict[str, float] = {}
+        self._startup_full_train_pending: set[str] = set()
+        self._startup_full_train_done: set[str] = set()
 
     @property
     def min_conf(self) -> float:
         """Dynamic access to minimum signal confidence (Phase A)."""
-        base = float(self._tuned_global.get("ML_MIN_CONF_EMIT", self._cfg("ML_MIN_CONF_EMIT", 0.55)))
+        base = float(
+            self._tuned_global.get("ML_MIN_CONF_EMIT", self._cfg("ML_MIN_CONF_EMIT", 0.55))
+        )
         dyn = None
         try:
             dyn_cfg = getattr(self.shared_state, "dynamic_config", {}) or {}
@@ -400,7 +450,7 @@ class MLForecaster:
             return bool(default)
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
-    def _resolve_lookback(self, tuned: Optional[Dict[str, Any]] = None) -> int:
+    def _resolve_lookback(self, tuned: Optional[dict[str, Any]] = None) -> int:
         raw = None
         if isinstance(tuned, dict) and tuned.get("lookback") is not None:
             raw = tuned.get("lookback")
@@ -416,7 +466,9 @@ class MLForecaster:
         """Return True if we hold a positive position for symbol. Safe across sync/async branches."""
         qty = 0.0
         try:
-            fn = getattr(self.shared_state, "get_position_qty", None) or getattr(self.shared_state, "get_position_quantity", None)
+            fn = getattr(self.shared_state, "get_position_qty", None) or getattr(
+                self.shared_state, "get_position_quantity", None
+            )
             if callable(fn):
                 res = fn(symbol)
                 qty = await res if asyncio.iscoroutine(res) else (res or 0.0)
@@ -460,7 +512,9 @@ class MLForecaster:
 
     async def run_once(self):
         # ITERATION 1 FIX: Bypass market data ready check - symbols available, data flowing
-        self.logger.info(f"[{self.name}] run_once starting. SharedState ID: {id(self.shared_state)}")
+        self.logger.info(
+            f"[{self.name}] run_once starting. SharedState ID: {id(self.shared_state)}"
+        )
         # if hasattr(self.shared_state, "is_market_data_ready"):
         #     try:
         #         if not self.shared_state.is_market_data_ready():
@@ -487,7 +541,9 @@ class MLForecaster:
                 syms = await self._safe_get_symbols()
                 if syms:
                     self.symbols = list(syms)
-                    self.logger.info(f"[{self.name}] Synced symbols from SharedState: {self.symbols}")
+                    self.logger.info(
+                        f"[{self.name}] Synced symbols from SharedState: {self.symbols}"
+                    )
             except Exception:
                 pass
         if not self.symbols:
@@ -497,7 +553,7 @@ class MLForecaster:
 
         # ARCHITECTURAL FIX: Process ALL symbols, not a subset
         # AgentManager contract: generate_signals() must scan ALL symbols per tick
-        batch = self.symbols[:self.max_symbols_per_tick]
+        batch = self.symbols[: self.max_symbols_per_tick]
 
         async def _one(sym: str):
             async with self._sem:
@@ -509,16 +565,20 @@ class MLForecaster:
                     )
                     return {"action": "hold", "confidence": 0.0, "reason": "timeout"}
                 except Exception:
-                    self.logger.exception("[%s] %s processing failed; dropping to NO_DECISION.", self.name, sym)
+                    self.logger.exception(
+                        "[%s] %s processing failed; dropping to NO_DECISION.", self.name, sym
+                    )
                     return {"action": "hold", "confidence": 0.0, "reason": "processing_error"}
 
         # Capture results (currently unused but good practice)
         results = await asyncio.gather(*[_one(s) for s in batch], return_exceptions=False)
-        self.logger.debug(f"[{self.name}] Finished run_once (processed={len(batch)} symbols, generated={len(self._collected_signals)} signals).")
+        self.logger.debug(
+            f"[{self.name}] Finished run_once (processed={len(batch)} symbols, generated={len(self._collected_signals)} signals)."
+        )
 
     # ---------------- Helpers ----------------
 
-    async def _safe_get_symbols(self) -> List[str]:
+    async def _safe_get_symbols(self) -> list[str]:
         """
         SharedState.get_accepted_symbols may return dict/list and may be sync/async across branches.
         Normalize to List[str].
@@ -534,22 +594,25 @@ class MLForecaster:
             if isinstance(res, dict):
                 return list(res.keys())
             result = list(res or [])
-            
+
             # ITERATION 2 FIX: If empty, use DEFAULT_SYMBOLS as fallback
             if not result:
                 try:
                     from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
+
                     result = list(DEFAULT_SYMBOLS.keys())
-                    self.logger.warning(f"[{self.name}] ⚠️  accepted_symbols empty! Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback")
+                    self.logger.warning(
+                        f"[{self.name}] ⚠️  accepted_symbols empty! Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback"
+                    )
                 except Exception as e:
                     self.logger.debug(f"[{self.name}] DEFAULT_SYMBOLS fallback failed: {e}")
-            
+
             return result
         except Exception:
             return []
 
     def _cleanup_train_tasks(self) -> None:
-        done_keys: List[str] = []
+        done_keys: list[str] = []
         for model_path, task in list(self._train_tasks.items()):
             if not task.done():
                 continue
@@ -587,7 +650,7 @@ class MLForecaster:
         train_df: pd.DataFrame,
         model_path: str,
         reason: str,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         if ModelTrainer is None:
             return False, "model_trainer_unavailable"
         self._cleanup_train_tasks()
@@ -654,7 +717,9 @@ class MLForecaster:
             if ok:
                 self.model_cache.pop(model_path, None)
                 self._model_mtime.pop(model_path, None)
-                self._predict_fns = {k: v for k, v in self._predict_fns.items() if k[0] != model_path}
+                self._predict_fns = {
+                    k: v for k, v in self._predict_fns.items() if k[0] != model_path
+                }
                 if group == "feature_upgrade":
                     self._retrained_feature_models.add(model_path)
                 self.logger.info(
@@ -685,6 +750,7 @@ class MLForecaster:
     def _has_gpu(self) -> bool:
         try:
             import tensorflow as tf  # local import: keep module import cheap
+
             return bool(tf.config.list_physical_devices("GPU"))
         except Exception:
             return False
@@ -711,10 +777,10 @@ class MLForecaster:
         except Exception:
             return 0
 
-    def _dedupe_sort_ohlcv(self, rows: List[Any]) -> List[Any]:
+    def _dedupe_sort_ohlcv(self, rows: list[Any]) -> list[Any]:
         if not rows:
             return []
-        by_ts: Dict[int, Any] = {}
+        by_ts: dict[int, Any] = {}
         for row in rows:
             ts_ms = self._candle_ts_ms(row)
             if ts_ms <= 0:
@@ -730,14 +796,14 @@ class MLForecaster:
         timeframe: str,
         limit: int,
         end_time_ms: Optional[int] = None,
-    ) -> List[Any]:
+    ) -> list[Any]:
         ec = self.exchange_client or getattr(self.market_data_feed, "exchange_client", None)
         getter = getattr(ec, "get_ohlcv", None) if ec is not None else None
         if not callable(getter):
             return []
         lim = max(1, int(limit))
 
-        def _candidates(include_end_time: bool) -> List[Dict[str, Any]]:
+        def _candidates(include_end_time: bool) -> list[dict[str, Any]]:
             base = [
                 {"symbol": symbol, "interval": timeframe, "limit": lim},
                 {"symbol": symbol, "timeframe": timeframe, "limit": lim},
@@ -746,7 +812,14 @@ class MLForecaster:
             if include_end_time and end_time_ms is not None:
                 for item in base:
                     item["end_time"] = int(end_time_ms)
-                base.append({"symbol": symbol, "interval": timeframe, "limit": lim, "endTime": int(end_time_ms)})
+                base.append(
+                    {
+                        "symbol": symbol,
+                        "interval": timeframe,
+                        "limit": lim,
+                        "endTime": int(end_time_ms),
+                    }
+                )
             return base
 
         tried_with_end = False
@@ -790,10 +863,10 @@ class MLForecaster:
         *,
         target_rows: int,
         max_rows: int,
-    ) -> List[Any]:
+    ) -> list[Any]:
         target = max(1, int(target_rows))
         cap = max(target, int(max_rows))
-        collected: List[Any] = []
+        collected: list[Any] = []
         end_time_ms: Optional[int] = None
 
         for _ in range(24):
@@ -837,7 +910,7 @@ class MLForecaster:
 
         return list(collected[-cap:]) if collected else []
 
-    def _build_train_df_from_ohlcv(self, ohlcv: List[Any], row_cap: int) -> Optional[pd.DataFrame]:
+    def _build_train_df_from_ohlcv(self, ohlcv: list[Any], row_cap: int) -> Optional[pd.DataFrame]:
         feature_df = self._build_edge_feature_frame(ohlcv)
         if feature_df is None or feature_df.empty:
             return None
@@ -848,7 +921,7 @@ class MLForecaster:
             train_df = train_df.tail(cap).copy().reset_index(drop=True)
         return train_df
 
-    def _load_model_metadata(self, model_path: str) -> Dict[str, Any]:
+    def _load_model_metadata(self, model_path: str) -> dict[str, Any]:
         try:
             import pickle
 
@@ -862,7 +935,9 @@ class MLForecaster:
         except Exception:
             return {}
 
-    def _model_val_accuracy_from_metadata(self, metadata: Optional[Dict[str, Any]]) -> Optional[float]:
+    def _model_val_accuracy_from_metadata(
+        self, metadata: Optional[dict[str, Any]]
+    ) -> Optional[float]:
         if not isinstance(metadata, dict) or not metadata:
             return None
         candidates = [
@@ -881,11 +956,11 @@ class MLForecaster:
 
     def _passes_retrain_quality_guard(
         self,
-        train_result: Dict[str, Any],
+        train_result: dict[str, Any],
         *,
         has_existing_model: bool,
         prior_val_accuracy: Optional[float] = None,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         val_acc_raw = train_result.get("val_accuracy")
         if val_acc_raw is None:
             return False, "missing_val_accuracy"
@@ -894,7 +969,10 @@ class MLForecaster:
         except Exception:
             return False, "invalid_val_accuracy"
         if val_acc < float(self._retrain_min_val_acc):
-            return False, f"val_accuracy_below_guard:{val_acc:.4f}<{float(self._retrain_min_val_acc):.4f}"
+            return (
+                False,
+                f"val_accuracy_below_guard:{val_acc:.4f}<{float(self._retrain_min_val_acc):.4f}",
+            )
         if not has_existing_model:
             return True, "no_existing_model_threshold_passed"
         baseline = 0.0
@@ -934,7 +1012,9 @@ class MLForecaster:
             epochs = min(epochs, max(15, int(self._full_train_cpu_epoch_cap or 15)))
         return max(15, min(20, int(epochs)))
 
-    def _is_full_train_due(self, symbol: str, model_path: str, now_ts: float, force_startup: bool = False) -> bool:
+    def _is_full_train_due(
+        self, symbol: str, model_path: str, now_ts: float, force_startup: bool = False
+    ) -> bool:
         if not self.model_manager:
             return False
         if not self.model_manager.model_exists(model_path):
@@ -945,7 +1025,11 @@ class MLForecaster:
         if prev_val_acc is not None and float(prev_val_acc) < float(self._retrain_min_val_acc):
             return True
 
-        if force_startup and self._full_train_force_first_boot and model_path not in self._startup_full_train_done:
+        if (
+            force_startup
+            and self._full_train_force_first_boot
+            and model_path not in self._startup_full_train_done
+        ):
             return True
 
         interval = float(self._full_train_interval_s or 0.0)
@@ -968,7 +1052,7 @@ class MLForecaster:
         lookback: int,
         model_path: str,
         reason: str,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         if not self._full_train_on_startup:
             return False, "full_training_startup_disabled"
         if ModelTrainer is None:
@@ -998,8 +1082,12 @@ class MLForecaster:
             sym = str(symbol or "").upper()
             try:
                 async with self._train_sem:
-                    has_existing_model = bool(self.model_manager and self.model_manager.model_exists(model_path))
-                    prior_metadata = self._load_model_metadata(model_path) if has_existing_model else {}
+                    has_existing_model = bool(
+                        self.model_manager and self.model_manager.model_exists(model_path)
+                    )
+                    prior_metadata = (
+                        self._load_model_metadata(model_path) if has_existing_model else {}
+                    )
                     prior_val_acc = self._model_val_accuracy_from_metadata(prior_metadata)
                     target_rows = max(int(self._full_train_target_rows), int(lookback) + 50)
                     min_rows_required = max(int(self._full_train_min_rows), int(lookback) + 50)
@@ -1020,7 +1108,9 @@ class MLForecaster:
                         )
                         return
 
-                    train_df = self._build_train_df_from_ohlcv(ohlcv, int(self._full_train_max_rows))
+                    train_df = self._build_train_df_from_ohlcv(
+                        ohlcv, int(self._full_train_max_rows)
+                    )
                     if train_df is None or train_df.empty or len(train_df) < (int(lookback) + 50):
                         self.logger.warning(
                             "[%s] full training skipped for %s (%s): insufficient_features rows=%d",
@@ -1135,13 +1225,13 @@ class MLForecaster:
         self._train_tasks[model_path] = task
         return True, "full_training_queued"
 
-    async def retrain(self) -> Dict[str, Any]:
+    async def retrain(self) -> dict[str, Any]:
         """
         Phase 9-compatible async retrain entrypoint.
         Runs blocking training in an executor, then explicitly reloads saved models.
         """
         start_ts = time.time()
-        summary: Dict[str, Any] = {
+        summary: dict[str, Any] = {
             "ok": True,
             "symbols_total": 0,
             "success": 0,
@@ -1172,8 +1262,13 @@ class MLForecaster:
             return summary
 
         now_ts = time.time()
-        if self._retrain_min_gap_s > 0 and (now_ts - float(self._retrain_last_end_ts or 0.0)) < self._retrain_min_gap_s:
-            remain = max(0.0, self._retrain_min_gap_s - (now_ts - float(self._retrain_last_end_ts or 0.0)))
+        if (
+            self._retrain_min_gap_s > 0
+            and (now_ts - float(self._retrain_last_end_ts or 0.0)) < self._retrain_min_gap_s
+        ):
+            remain = max(
+                0.0, self._retrain_min_gap_s - (now_ts - float(self._retrain_last_end_ts or 0.0))
+            )
             self.logger.info(
                 "[%s:Retrain] skipped: cooldown_active remaining=%.1fs",
                 self.name,
@@ -1194,7 +1289,11 @@ class MLForecaster:
                     symbols = []
 
                 max_symbols = int(
-                    self._cfg("ML_RETRAIN_MAX_SYMBOLS_PER_RUN", os.getenv("ML_RETRAIN_MAX_SYMBOLS_PER_RUN", 1)) or 1
+                    self._cfg(
+                        "ML_RETRAIN_MAX_SYMBOLS_PER_RUN",
+                        os.getenv("ML_RETRAIN_MAX_SYMBOLS_PER_RUN", 1),
+                    )
+                    or 1
                 )
                 max_symbols = max(1, max_symbols)
                 if symbols:
@@ -1215,7 +1314,10 @@ class MLForecaster:
                 )
                 timeout_s = max(
                     30.0,
-                    min(float(self.train_timeout_s or 300.0), float(self._retrain_symbol_timeout_s or 180.0)),
+                    min(
+                        float(self.train_timeout_s or 300.0),
+                        float(self._retrain_symbol_timeout_s or 180.0),
+                    ),
                 )
                 has_gpu = self._has_gpu()
                 adaptive_epochs = self._effective_adaptive_epochs()
@@ -1260,7 +1362,9 @@ class MLForecaster:
                             tuned = {}
                         lookback = self._resolve_lookback(tuned)
                         if not self.model_manager:
-                            self.logger.warning(f"[{self.name}] model_manager not available for {sym}")
+                            self.logger.warning(
+                                f"[{self.name}] model_manager not available for {sym}"
+                            )
                             continue
                         model_path = self.model_manager.build_model_path(
                             agent_name=self.name,
@@ -1268,14 +1372,20 @@ class MLForecaster:
                             version=self.timeframe,
                         )
                         has_existing_model = bool(self.model_manager.model_exists(model_path))
-                        prior_metadata = self._load_model_metadata(model_path) if has_existing_model else {}
+                        prior_metadata = (
+                            self._load_model_metadata(model_path) if has_existing_model else {}
+                        )
                         prior_val_acc = self._model_val_accuracy_from_metadata(prior_metadata)
-                        full_due = self._is_full_train_due(sym, model_path, time.time(), force_startup=False)
+                        full_due = self._is_full_train_due(
+                            sym, model_path, time.time(), force_startup=False
+                        )
 
                         if full_due:
                             tier = "full"
                             target_rows = max(int(self._full_train_target_rows), int(lookback) + 50)
-                            min_rows_required = max(int(self._full_train_min_rows), int(lookback) + 50)
+                            min_rows_required = max(
+                                int(self._full_train_min_rows), int(lookback) + 50
+                            )
                             ohlcv = await self._fetch_training_ohlcv(
                                 sym,
                                 self.timeframe,
@@ -1293,7 +1403,9 @@ class MLForecaster:
                                     int(min_rows_required),
                                 )
                                 continue
-                            train_df = self._build_train_df_from_ohlcv(ohlcv, int(self._full_train_max_rows))
+                            train_df = self._build_train_df_from_ohlcv(
+                                ohlcv, int(self._full_train_max_rows)
+                            )
                             tier_epochs = int(full_epochs)
                             tier_max_rows = int(self._full_train_max_rows)
                         else:
@@ -1308,7 +1420,9 @@ class MLForecaster:
                                     tier,
                                 )
                                 continue
-                            train_df = self._build_train_df_from_ohlcv(ohlcv, int(self._retrain_max_rows))
+                            train_df = self._build_train_df_from_ohlcv(
+                                ohlcv, int(self._retrain_max_rows)
+                            )
                             tier_epochs = int(adaptive_epochs)
                             tier_max_rows = int(self._retrain_max_rows)
 
@@ -1468,7 +1582,7 @@ class MLForecaster:
             finally:
                 self._retrain_last_end_ts = time.time()
 
-    def _std_row(self, r) -> Optional[List[float]]:
+    def _std_row(self, r) -> Optional[list[float]]:
         """
         Accept either short-key (o/h/l/c/v) or long-key (open/high/low/close/volume) dicts,
         or a sequence ending with [open, high, low, close, volume].
@@ -1494,9 +1608,9 @@ class MLForecaster:
             return None
         return None
 
-    def _to_ohlcv_dataframe(self, ohlcv: List[Any]) -> pd.DataFrame:
-        rows: List[Dict[str, float]] = []
-        for candle in (ohlcv or []):
+    def _to_ohlcv_dataframe(self, ohlcv: list[Any]) -> pd.DataFrame:
+        rows: list[dict[str, float]] = []
+        for candle in ohlcv or []:
             std = self._std_row(candle)
             if std is None:
                 continue
@@ -1551,7 +1665,7 @@ class MLForecaster:
         # Center and scale to roughly [-1, 1] for stationarity.
         return ((rsi - 50.0) / 50.0).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-1.0, 1.0)
 
-    def _build_edge_feature_frame(self, ohlcv: List[Any]) -> pd.DataFrame:
+    def _build_edge_feature_frame(self, ohlcv: list[Any]) -> pd.DataFrame:
         """
         Build a regime-aware, volatility-aware feature frame.
         Output keeps legacy OHLCV columns and adds engineered edge features.
@@ -1661,15 +1775,17 @@ class MLForecaster:
             df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
         df = df.dropna(subset=["open", "high", "low", "close"])
         if df.empty:
-            return pd.DataFrame(columns=["timestamp"] + self._legacy_feature_columns + self._edge_feature_columns)
+            return pd.DataFrame(
+                columns=["timestamp"] + self._legacy_feature_columns + self._edge_feature_columns
+            )
         df["volume"] = df["volume"].fillna(0.0).clip(lower=0.0)
         return df.reset_index(drop=True)
 
-    def _training_feature_columns(self) -> List[str]:
+    def _training_feature_columns(self) -> list[str]:
         """Canonical training/inference column order used for full-feature models."""
         return list(dict.fromkeys(self._legacy_feature_columns + self._edge_feature_columns))
 
-    def _model_input_shape(self, model: Any) -> Tuple[Optional[int], Optional[int]]:
+    def _model_input_shape(self, model: Any) -> tuple[Optional[int], Optional[int]]:
         try:
             shape = getattr(model, "input_shape", None)
             if isinstance(shape, list) and shape:
@@ -1703,7 +1819,9 @@ class MLForecaster:
         except Exception:
             return False
 
-    def _resolve_input_columns_for_model(self, expected_dim: Optional[int]) -> Tuple[List[str], str]:
+    def _resolve_input_columns_for_model(
+        self, expected_dim: Optional[int]
+    ) -> tuple[list[str], str]:
         full_cols = self._training_feature_columns()
         full_dim = len(full_cols)
         edge_dim = len(self._edge_feature_columns)
@@ -1726,7 +1844,7 @@ class MLForecaster:
         self,
         feature_df: pd.DataFrame,
         lookback: int,
-        input_columns: List[str],
+        input_columns: list[str],
     ) -> Optional[np.ndarray]:
         lb = max(2, int(lookback))
         if feature_df is None or feature_df.empty or len(feature_df) < lb:
@@ -1753,7 +1871,7 @@ class MLForecaster:
             return np.zeros_like(exp_arr, dtype=np.float64)
         return exp_arr / denom
 
-    def _decode_model_output(self, y_raw: np.ndarray) -> Tuple[str, float, np.ndarray, str]:
+    def _decode_model_output(self, y_raw: np.ndarray) -> tuple[str, float, np.ndarray, str]:
         """
         Decode model outputs to (action, confidence, normalized_probs, schema).
 
@@ -1807,16 +1925,18 @@ class MLForecaster:
         idx = int(c / size)
         return round(idx * size, 4)
 
-    def _magnitude_aware_confidence(self, base_confidence: float, expected_move_pct: float) -> float:
+    def _magnitude_aware_confidence(
+        self, base_confidence: float, expected_move_pct: float
+    ) -> float:
         """
         PHASE 2: Magnitude-aware confidence scoring.
-        
+
         Boosts confidence based on magnitude of expected move relative to threshold.
         Model learns magnitude implicitly through this feedback mechanism.
-        
+
         Formula: adjusted_conf = base_conf * min(1.0 + magnitude_factor, MAX_BOOST)
         Where magnitude_factor = (expected_move_pct - threshold) / threshold
-        
+
         Example:
         - threshold=0.15%, expected_move=0.15% → magnitude_factor=0.0 → adjusted=base_conf
         - threshold=0.15%, expected_move=0.30% → magnitude_factor=1.0 → adjusted=base_conf*1.5
@@ -1824,26 +1944,26 @@ class MLForecaster:
         """
         if not self._cfg("ML_MAGNITUDE_CONFIDENCE_ENABLED", True):
             return float(base_confidence)
-        
+
         try:
             base_threshold = float(self._cfg("ML_MAGNITUDE_BASE_THRESHOLD", 0.0015) or 0.0015)
             multiplier = float(self._cfg("ML_MAGNITUDE_MULTIPLIER", 1.5) or 1.5)
-            
+
             # Ensure we have positive expected move
             move = float(expected_move_pct or 0.0)
             if move <= base_threshold:
                 return float(base_confidence)  # No boost if below threshold
-            
+
             # Calculate magnitude factor (how much move exceeds threshold)
             magnitude_factor = (move - base_threshold) / max(base_threshold, 1e-9)
-            
+
             # Boost confidence (capped at 2.0x multiplier to avoid extreme confidence)
             boost = min(multiplier, 1.0 + magnitude_factor)
             adjusted_conf = float(base_confidence) * float(boost)
-            
+
             # Clip to valid range [0, 1]
             adjusted_conf = max(0.0, min(1.0, adjusted_conf))
-            
+
             self.logger.debug(
                 "[%s] magnitude_aware_conf: base=%.3f move=%.5f threshold=%.5f factor=%.2f boost=%.2f adjusted=%.3f",
                 self.name,
@@ -1854,7 +1974,7 @@ class MLForecaster:
                 boost,
                 adjusted_conf,
             )
-            
+
             return float(adjusted_conf)
         except Exception as e:
             self.logger.debug("[%s] magnitude_aware_confidence failed: %s", self.name, e)
@@ -1862,7 +1982,9 @@ class MLForecaster:
 
     async def _safe_current_price(self, symbol: str) -> Optional[float]:
         try:
-            p = float((getattr(self.shared_state, "latest_prices", {}) or {}).get(symbol, 0.0) or 0.0)
+            p = float(
+                (getattr(self.shared_state, "latest_prices", {}) or {}).get(symbol, 0.0) or 0.0
+            )
             if p > 0:
                 return p
         except Exception:
@@ -1915,21 +2037,23 @@ class MLForecaster:
             return 86400.0
         return 300.0
 
-    def _infer_candle_seconds(self, ohlcv: List[Any], fallback_tf: str) -> float:
-        ts_vals: List[float] = []
+    def _infer_candle_seconds(self, ohlcv: list[Any], fallback_tf: str) -> float:
+        ts_vals: list[float] = []
         for row in ohlcv[-40:]:
             ts = self._extract_row_timestamp(row)
             if ts:
                 ts_vals.append(ts)
         if len(ts_vals) >= 2:
-            diffs = [b - a for a, b in zip(ts_vals[:-1], ts_vals[1:]) if b > a]
+            diffs = [b - a for a, b in zip(ts_vals[:-1], ts_vals[1:], strict=False) if b > a]
             if diffs:
                 med = float(np.median(np.asarray(diffs, dtype=np.float64)))
                 if med > 0:
                     return med
         return self._timeframe_seconds(fallback_tf)
 
-    def _calc_signal_pnl_pct(self, action: str, entry_price: float, exit_price: float, net_cost_pct: float) -> Tuple[float, float]:
+    def _calc_signal_pnl_pct(
+        self, action: str, entry_price: float, exit_price: float, net_cost_pct: float
+    ) -> tuple[float, float]:
         a = str(action or "").upper()
         if entry_price <= 0 or exit_price <= 0:
             return 0.0, 0.0
@@ -1948,7 +2072,15 @@ class MLForecaster:
             return "bull"
         if r in {"bear", "bearish", "risk_off"}:
             return "bear"
-        if r in {"high", "high_vol", "volatile", "volatility_high", "extreme", "extreme_vol", "crisis"}:
+        if r in {
+            "high",
+            "high_vol",
+            "volatile",
+            "volatility_high",
+            "extreme",
+            "extreme_vol",
+            "crisis",
+        }:
             return "high_vol"
         if r in {"sideways", "chop", "range", "low_vol", "flat", "compression"}:
             return "sideways"
@@ -1962,13 +2094,13 @@ class MLForecaster:
             return "normal"
         return "normal"
 
-    def _atr_from_numeric_rows(self, rows: List[List[float]], lookback: int = 14) -> float:
+    def _atr_from_numeric_rows(self, rows: list[list[float]], lookback: int = 14) -> float:
         try:
             if len(rows) < lookback + 1:
                 return 0.0
-            window = rows[-(lookback + 1):]
+            window = rows[-(lookback + 1) :]
             prev_c = float(window[0][3])
-            trs: List[float] = []
+            trs: list[float] = []
             for i in range(1, len(window)):
                 h = float(window[i][1])
                 l = float(window[i][2])
@@ -1981,11 +2113,11 @@ class MLForecaster:
         except Exception:
             return 0.0
 
-    def _rv_pct_from_numeric_rows(self, rows: List[List[float]], lookback: int = 20) -> float:
+    def _rv_pct_from_numeric_rows(self, rows: list[list[float]], lookback: int = 20) -> float:
         try:
             if len(rows) < lookback + 1:
                 return 0.0
-            closes = np.asarray([float(r[3]) for r in rows[-(lookback + 1):]], dtype=np.float64)
+            closes = np.asarray([float(r[3]) for r in rows[-(lookback + 1) :]], dtype=np.float64)
             if np.any(closes <= 0):
                 return 0.0
             rets = (closes[1:] / closes[:-1]) - 1.0
@@ -1995,7 +2127,7 @@ class MLForecaster:
         except Exception:
             return 0.0
 
-    def _infer_regime_from_numeric_rows(self, rows: List[List[float]]) -> str:
+    def _infer_regime_from_numeric_rows(self, rows: list[list[float]]) -> str:
         if not rows:
             return "normal"
         close = float(rows[-1][3] or 0.0)
@@ -2011,7 +2143,9 @@ class MLForecaster:
             return "sideways"
         return "trend"
 
-    def _estimate_expected_move_pct_from_rows(self, rows: List[List[float]], horizon_steps: int) -> float:
+    def _estimate_expected_move_pct_from_rows(
+        self, rows: list[list[float]], horizon_steps: int
+    ) -> float:
         """
         Better expected move estimator:
         blend ATR-based move scaling + realized-vol scaling for the target horizon.
@@ -2031,11 +2165,14 @@ class MLForecaster:
         expected = (0.6 * atr_move) + (0.4 * rv_move)
         if expected <= 0:
             expected = float(self._expected_move_fallback_pct)
-        expected = max(float(self._expected_move_min_pct), min(float(self._expected_move_max_pct), float(expected)))
+        expected = max(
+            float(self._expected_move_min_pct),
+            min(float(self._expected_move_max_pct), float(expected)),
+        )
         return float(expected)
 
-    def _derive_expected_move_pct(self, records: List[Dict[str, Any]]) -> float:
-        vals: List[float] = []
+    def _derive_expected_move_pct(self, records: list[dict[str, Any]]) -> float:
+        vals: list[float] = []
         for rec in records:
             em = float(rec.get("expected_move_pct", 0.0) or 0.0)
             if em <= 0:
@@ -2064,7 +2201,7 @@ class MLForecaster:
             min(float(self._expected_move_calib_max_mult), float(mult)),
         )
 
-    def _update_expected_move_calibration(self, matured: List[Dict[str, Any]]) -> None:
+    def _update_expected_move_calibration(self, matured: list[dict[str, Any]]) -> None:
         if not self._expected_move_calibration_enabled or not matured:
             return
         alpha = max(0.01, min(1.0, float(self._expected_move_calib_alpha or 0.15)))
@@ -2074,21 +2211,34 @@ class MLForecaster:
             if expected <= 0.0 or realized <= 0.0:
                 continue
             ratio = realized / max(expected, 1e-9)
-            ratio = max(float(self._expected_move_calib_min_mult), min(float(self._expected_move_calib_max_mult), ratio))
+            ratio = max(
+                float(self._expected_move_calib_min_mult),
+                min(float(self._expected_move_calib_max_mult), ratio),
+            )
 
             prev_global = float(self._expected_move_calib_global or 1.0)
             self._expected_move_calib_global = ((1.0 - alpha) * prev_global) + (alpha * ratio)
             self._expected_move_calib_global = max(
                 float(self._expected_move_calib_min_mult),
-                min(float(self._expected_move_calib_max_mult), float(self._expected_move_calib_global)),
+                min(
+                    float(self._expected_move_calib_max_mult),
+                    float(self._expected_move_calib_global),
+                ),
             )
 
             rg = self._normalize_regime(rec.get("regime", "normal"))
-            prev_rg = float(self._expected_move_calib_by_regime.get(rg, self._expected_move_calib_global))
+            prev_rg = float(
+                self._expected_move_calib_by_regime.get(rg, self._expected_move_calib_global)
+            )
             new_rg = ((1.0 - alpha) * prev_rg) + (alpha * ratio)
-            new_rg = max(float(self._expected_move_calib_min_mult), min(float(self._expected_move_calib_max_mult), float(new_rg)))
+            new_rg = max(
+                float(self._expected_move_calib_min_mult),
+                min(float(self._expected_move_calib_max_mult), float(new_rg)),
+            )
             self._expected_move_calib_by_regime[rg] = float(new_rg)
-            self._expected_move_calib_counts[rg] = int(self._expected_move_calib_counts.get(rg, 0) or 0) + 1
+            self._expected_move_calib_counts[rg] = (
+                int(self._expected_move_calib_counts.get(rg, 0) or 0) + 1
+            )
 
     def _institutional_regime_gate(
         self,
@@ -2099,7 +2249,7 @@ class MLForecaster:
         required_conf: float,
         expected_move_pct: float,
         round_trip_cost_ev_pct: float,
-    ) -> Tuple[bool, float, str]:
+    ) -> tuple[bool, float, str]:
         if not self._institutional_regime_filter_enabled:
             return True, float(required_conf), "inst_filter_disabled"
         if str(action or "").upper() != "BUY":
@@ -2129,9 +2279,17 @@ class MLForecaster:
         min_move = max(0.0, float(round_trip_cost_ev_pct) * float(regime_ev_mult))
 
         if float(expected_move_pct or 0.0) < float(min_move):
-            return False, conf_floor, f"inst_move_floor:{float(expected_move_pct or 0.0):.5f}<{float(min_move):.5f}"
+            return (
+                False,
+                conf_floor,
+                f"inst_move_floor:{float(expected_move_pct or 0.0):.5f}<{float(min_move):.5f}",
+            )
         if float(confidence or 0.0) < float(conf_floor):
-            return False, conf_floor, f"inst_conf_floor:{float(confidence or 0.0):.4f}<{float(conf_floor):.4f}"
+            return (
+                False,
+                conf_floor,
+                f"inst_conf_floor:{float(confidence or 0.0):.4f}<{float(conf_floor):.4f}",
+            )
         return True, conf_floor, "inst_regime_ok"
 
     def _scale_expected_move_by_regime(
@@ -2142,33 +2300,33 @@ class MLForecaster:
     ) -> float:
         """
         Scale expected move based on regime and trading horizon.
-        
+
         Professional recommendation:
         - Bull (60m): Market moving, wider expected moves available
         - Normal (120m): Standard horizon, moderate expected moves
         - Bear (disabled): Market stalled, no positive EV for longs
-        
+
         Longer horizon → need wider expected move (sqrt scaling)
         Shorter horizon → narrower expected move acceptable
-        
+
         Args:
             base_expected_move_pct: Raw expected move (e.g., 0.0065)
             regime: Market regime (bull, normal, bear, high_vol, low_vol)
             horizon_minutes: Target horizon in minutes
-        
+
         Returns:
             Regime-scaled expected move
         """
         regime_norm = self._normalize_regime(regime)
-        
+
         # Get target horizon for this regime
         target_horizon = self._regime_horizon_map.get(regime_norm, 120.0)
-        
+
         # If market is in a regime we shouldn't trade (e.g., bear),
         # return 0 to signal "disabled"
         if target_horizon >= 9999.0:
             return 0.0
-        
+
         # Scale expected move based on horizon ratio
         # longer_horizon → need wider move
         # Formula: scaled_move = base_move × sqrt(horizon_ratio)
@@ -2177,23 +2335,22 @@ class MLForecaster:
             horizon_scale = float(np.sqrt(max(0.1, horizon_ratio)))
         else:
             horizon_scale = 1.0
-        
+
         scaled = float(base_expected_move_pct) * float(horizon_scale)
-        
+
         # Clamp to min/max
         return max(
-            float(self._expected_move_min_pct),
-            min(float(self._expected_move_max_pct), scaled)
+            float(self._expected_move_min_pct), min(float(self._expected_move_max_pct), scaled)
         )
 
     def _derive_regime_views(
         self,
-        records: List[Dict[str, Any]],
+        records: list[dict[str, Any]],
         bucket_size: float,
         round_trip_cost_pct: float,
-    ) -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        by_regime: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    ) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        by_regime: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for rec in records:
             rg = self._normalize_regime(rec.get("regime", "normal"))
             by_regime[rg].append(rec)
@@ -2218,10 +2375,12 @@ class MLForecaster:
         rg = self._normalize_regime(regime)
         cfg_map = {}
         try:
-            cfg_map = (getattr(self.shared_state, "dynamic_config", {}) or {}).get("ML_DYNAMIC_REQUIRED_CONF_BY_REGIME", {}) or {}
+            cfg_map = (getattr(self.shared_state, "dynamic_config", {}) or {}).get(
+                "ML_DYNAMIC_REQUIRED_CONF_BY_REGIME", {}
+            ) or {}
         except Exception:
             cfg_map = {}
-        merged: Dict[str, float] = dict(self._dynamic_required_conf_by_regime or {})
+        merged: dict[str, float] = dict(self._dynamic_required_conf_by_regime or {})
         if isinstance(cfg_map, dict):
             for k, v in cfg_map.items():
                 try:
@@ -2242,7 +2401,7 @@ class MLForecaster:
             chosen = max(chosen, base_floor)
         return max(self._conf_floor_min, min(self._conf_floor_max, float(chosen)))
 
-    async def _live_regime_and_expected_move(self, symbol: str) -> Tuple[str, float]:
+    async def _live_regime_and_expected_move(self, symbol: str) -> tuple[str, float]:
         regime = "normal"
         try:
             get_regime = getattr(self.shared_state, "get_volatility_regime", None)
@@ -2262,22 +2421,26 @@ class MLForecaster:
                 rows = [r for r in rows if r is not None]
                 if rows:
                     candle_sec = max(1.0, self._infer_candle_seconds(ohlcv, self.timeframe))
-                    
+
                     # Get regime-specific horizon (professional recommendation)
                     regime_norm = self._normalize_regime(regime)
                     target_horizon_min = self._regime_horizon_map.get(regime_norm, 120.0)
-                    
+
                     # Check if regime should be disabled (bear regime)
                     if target_horizon_min >= 9999.0:
                         # Bear regime: no longs possible
                         return regime_norm, 0.0
-                    
+
                     # Calculate horizon steps using regime-specific horizon
-                    horizon_steps = max(1, int(round((float(target_horizon_min) * 60.0) / candle_sec)))
-                    
+                    horizon_steps = max(
+                        1, int(round((float(target_horizon_min) * 60.0) / candle_sec))
+                    )
+
                     # Estimate base expected move
-                    base_expected_move = self._estimate_expected_move_pct_from_rows(rows, horizon_steps)
-                    
+                    base_expected_move = self._estimate_expected_move_pct_from_rows(
+                        rows, horizon_steps
+                    )
+
                     # Scale by regime
                     expected_move_pct = self._scale_expected_move_by_regime(
                         base_expected_move,
@@ -2299,14 +2462,16 @@ class MLForecaster:
 
         return self._normalize_regime(regime), float(expected_move_pct)
 
-    def _build_bucket_rows(self, records: List[Dict[str, Any]], bucket_size: Optional[float] = None) -> List[Dict[str, Any]]:
-        grouped: Dict[float, List[Dict[str, Any]]] = defaultdict(list)
+    def _build_bucket_rows(
+        self, records: list[dict[str, Any]], bucket_size: Optional[float] = None
+    ) -> list[dict[str, Any]]:
+        grouped: dict[float, list[dict[str, Any]]] = defaultdict(list)
         for rec in records:
             conf = float(rec.get("confidence", 0.0) or 0.0)
             bf = self._confidence_bucket_floor(conf, bucket_size=bucket_size)
             grouped[bf].append(rec)
 
-        rows: List[Dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
         size = float(bucket_size or self._conf_bucket_size or 0.05)
         for low in sorted(grouped.keys()):
             arr = grouped[low]
@@ -2314,20 +2479,45 @@ class MLForecaster:
                 continue
             sample_count = len(arr)
             wins = sum(1 for x in arr if int(x.get("outcome", 0) or 0) > 0)
-            avg_net = float(np.mean(np.asarray([float(x.get("net_pnl_pct", 0.0) or 0.0) for x in arr], dtype=np.float64)))
-            avg_gross = float(np.mean(np.asarray([abs(float(x.get("gross_move_pct", 0.0) or 0.0)) for x in arr], dtype=np.float64)))
+            avg_net = float(
+                np.mean(
+                    np.asarray(
+                        [float(x.get("net_pnl_pct", 0.0) or 0.0) for x in arr], dtype=np.float64
+                    )
+                )
+            )
+            avg_gross = float(
+                np.mean(
+                    np.asarray(
+                        [abs(float(x.get("gross_move_pct", 0.0) or 0.0)) for x in arr],
+                        dtype=np.float64,
+                    )
+                )
+            )
             avg_expected_move = float(
                 np.mean(
                     np.asarray(
                         [
-                            float(x.get("expected_move_pct", abs(float(x.get("gross_move_pct", 0.0) or 0.0)) or 0.0) or 0.0)
+                            float(
+                                x.get(
+                                    "expected_move_pct",
+                                    abs(float(x.get("gross_move_pct", 0.0) or 0.0)) or 0.0,
+                                )
+                                or 0.0
+                            )
                             for x in arr
                         ],
                         dtype=np.float64,
                     )
                 )
             )
-            mean_conf = float(np.mean(np.asarray([float(x.get("confidence", 0.0) or 0.0) for x in arr], dtype=np.float64)))
+            mean_conf = float(
+                np.mean(
+                    np.asarray(
+                        [float(x.get("confidence", 0.0) or 0.0) for x in arr], dtype=np.float64
+                    )
+                )
+            )
             rows.append(
                 {
                     "bucket_low": float(low),
@@ -2343,7 +2533,9 @@ class MLForecaster:
             )
         return rows
 
-    def _derive_required_confidence(self, rows: List[Dict[str, Any]], expected_move_pct: float, round_trip_cost_pct: float) -> Dict[str, Any]:
+    def _derive_required_confidence(
+        self, rows: list[dict[str, Any]], expected_move_pct: float, round_trip_cost_pct: float
+    ) -> dict[str, Any]:
         if expected_move_pct <= 0:
             break_even_prob = 1.0
         else:
@@ -2377,30 +2569,34 @@ class MLForecaster:
     async def _apply_dynamic_required_conf(
         self,
         required_conf: float,
-        derivation: Dict[str, Any],
+        derivation: dict[str, Any],
         source: str,
-        regime_views: Optional[Dict[str, Dict[str, Any]]] = None,
+        regime_views: Optional[dict[str, dict[str, Any]]] = None,
     ) -> None:
         alpha = max(0.01, min(1.0, float(self._conf_floor_ema_alpha or 0.35)))
         if self._dynamic_required_conf is None:
             smoothed = float(required_conf)
         else:
-            smoothed = ((1.0 - alpha) * float(self._dynamic_required_conf)) + (alpha * float(required_conf))
+            smoothed = ((1.0 - alpha) * float(self._dynamic_required_conf)) + (
+                alpha * float(required_conf)
+            )
         smoothed = max(self._conf_floor_min, min(self._conf_floor_max, smoothed))
         self._dynamic_required_conf = smoothed
 
-        be_by_regime: Dict[str, float] = {}
+        be_by_regime: dict[str, float] = {}
         if isinstance(regime_views, dict):
             for rg, view in regime_views.items():
                 try:
-                    req = float(((view or {}).get("derivation") or {}).get("required_conf", smoothed))
+                    req = float(
+                        ((view or {}).get("derivation") or {}).get("required_conf", smoothed)
+                    )
                     rg_key = self._normalize_regime(rg)
                     prev = float(self._dynamic_required_conf_by_regime.get(rg_key, req) or req)
                     rg_smoothed = ((1.0 - alpha) * prev) + (alpha * req)
                     rg_smoothed = max(self._conf_floor_min, min(self._conf_floor_max, rg_smoothed))
                     self._dynamic_required_conf_by_regime[rg_key] = rg_smoothed
                     be_by_regime[rg_key] = float(
-                        (((view or {}).get("derivation") or {}).get("break_even_prob", 0.0) or 0.0)
+                        ((view or {}).get("derivation") or {}).get("break_even_prob", 0.0) or 0.0
                     )
                 except Exception:
                     continue
@@ -2425,11 +2621,16 @@ class MLForecaster:
                 if asyncio.iscoroutine(res):
                     await res
             else:
-                if not hasattr(self.shared_state, "dynamic_config") or getattr(self.shared_state, "dynamic_config", None) is None:
+                if (
+                    not hasattr(self.shared_state, "dynamic_config")
+                    or getattr(self.shared_state, "dynamic_config", None) is None
+                ):
                     self.shared_state.dynamic_config = {}
                 self.shared_state.dynamic_config.update(update_payload)
         except Exception:
-            self.logger.debug("[%s] failed to apply dynamic confidence floor", self.name, exc_info=True)
+            self.logger.debug(
+                "[%s] failed to apply dynamic confidence floor", self.name, exc_info=True
+            )
 
         self.logger.info(
             "[%s:ConfFloor] source=%s required=%.4f (break_even=%.4f min_ev=%s min_cal=%s)",
@@ -2437,16 +2638,20 @@ class MLForecaster:
             source,
             smoothed,
             float(derivation.get("break_even_prob", 0.0) or 0.0),
-            f"{float(derivation.get('min_positive_ev_conf')):.4f}" if derivation.get("min_positive_ev_conf") is not None else "None",
-            f"{float(derivation.get('min_calibrated_conf')):.4f}" if derivation.get("min_calibrated_conf") is not None else "None",
+            f"{float(derivation.get('min_positive_ev_conf')):.4f}"
+            if derivation.get("min_positive_ev_conf") is not None
+            else "None",
+            f"{float(derivation.get('min_calibrated_conf')):.4f}"
+            if derivation.get("min_calibrated_conf") is not None
+            else "None",
         )
 
     def _write_confidence_report_artifacts(
         self,
-        rows: List[Dict[str, Any]],
-        derivation: Dict[str, Any],
+        rows: list[dict[str, Any]],
+        derivation: dict[str, Any],
         source: str,
-        regime_views: Optional[Dict[str, Dict[str, Any]]] = None,
+        regime_views: Optional[dict[str, dict[str, Any]]] = None,
     ) -> None:
         if not rows:
             return
@@ -2506,7 +2711,9 @@ class MLForecaster:
                             rr["regime"] = rg_norm
                             writer.writerow(rr)
             except Exception:
-                self.logger.debug("[%s] failed writing regime confidence CSV", self.name, exc_info=True)
+                self.logger.debug(
+                    "[%s] failed writing regime confidence CSV", self.name, exc_info=True
+                )
 
         if not self._conf_plot_enabled:
             return
@@ -2528,8 +2735,12 @@ class MLForecaster:
             ax.plot([0.0, 1.0], [0.0, 1.0], "--", color="#9e9e9e", label="Perfect calibration")
             be = float(derivation.get("break_even_prob", 0.0) or 0.0)
             req = float(derivation.get("required_conf", 0.0) or 0.0)
-            ax.axhline(be, color="#e74c3c", linestyle=":", linewidth=1.5, label=f"Break-even p={be:.3f}")
-            ax.axvline(req, color="#2ca02c", linestyle=":", linewidth=1.5, label=f"Required conf={req:.3f}")
+            ax.axhline(
+                be, color="#e74c3c", linestyle=":", linewidth=1.5, label=f"Break-even p={be:.3f}"
+            )
+            ax.axvline(
+                req, color="#2ca02c", linestyle=":", linewidth=1.5, label=f"Required conf={req:.3f}"
+            )
             ax.set_xlim(0.0, 1.0)
             ax.set_ylim(0.0, 1.0)
             ax.set_xlabel("Predicted confidence")
@@ -2545,14 +2756,14 @@ class MLForecaster:
 
     def _log_backtest_rows(
         self,
-        rows: List[Dict[str, Any]],
-        records: List[Dict[str, Any]],
+        rows: list[dict[str, Any]],
+        records: list[dict[str, Any]],
         source: str,
-        derivation: Dict[str, Any],
-        regime_views: Optional[Dict[str, Dict[str, Any]]] = None,
+        derivation: dict[str, Any],
+        regime_views: Optional[dict[str, dict[str, Any]]] = None,
     ) -> None:
         self.logger.info("[%s:ConfBacktest] source=%s samples=%d", self.name, source, len(records))
-        recent = records[-max(0, self._conf_print_rows):] if self._conf_print_rows > 0 else []
+        recent = records[-max(0, self._conf_print_rows) :] if self._conf_print_rows > 0 else []
         for rec in recent:
             self.logger.info(
                 "[%s:ConfSample] conf=%.3f outcome=%s horizon=%.1fmin net_pnl=%.3f%% exp_move=%.3f%% regime=%s symbol=%s action=%s",
@@ -2584,7 +2795,9 @@ class MLForecaster:
             self.name,
             float(derivation.get("required_conf", 0.0) or 0.0),
             float(derivation.get("break_even_prob", 0.0) or 0.0),
-            f"{float(derivation.get('min_positive_ev_conf')):.4f}" if derivation.get("min_positive_ev_conf") is not None else "None",
+            f"{float(derivation.get('min_positive_ev_conf')):.4f}"
+            if derivation.get("min_positive_ev_conf") is not None
+            else "None",
         )
         if isinstance(regime_views, dict):
             for rg, view in regime_views.items():
@@ -2603,7 +2816,7 @@ class MLForecaster:
             return 0
         horizon_sec = max(60.0, float(self._conf_horizon_min) * 60.0)
         now = time.time()
-        matured: List[Dict[str, Any]] = []
+        matured: list[dict[str, Any]] = []
         retained: deque = deque(maxlen=self._pending_conf_samples.maxlen)
         rt_cost_pct = self._round_trip_cost_pct()
 
@@ -2623,10 +2836,16 @@ class MLForecaster:
             if exit_price is None or exit_price <= 0:
                 retained.append(rec)
                 continue
-            gross_pct, net_pct = self._calc_signal_pnl_pct(action, entry_price, float(exit_price), rt_cost_pct)
+            gross_pct, net_pct = self._calc_signal_pnl_pct(
+                action, entry_price, float(exit_price), rt_cost_pct
+            )
             expected_move_pct = float(rec.get("expected_move_pct", 0.0) or 0.0)
             if expected_move_pct <= 0:
-                fallback = abs(gross_pct) if abs(gross_pct) > 0 else float(self._expected_move_fallback_pct)
+                fallback = (
+                    abs(gross_pct)
+                    if abs(gross_pct) > 0
+                    else float(self._expected_move_fallback_pct)
+                )
                 expected_move_pct = max(
                     float(self._expected_move_min_pct),
                     min(float(self._expected_move_max_pct), float(fallback)),
@@ -2656,7 +2875,9 @@ class MLForecaster:
             self._update_expected_move_calibration(matured)
         return len(matured)
 
-    async def _maybe_recalibrate_confidence_floor(self, source: str = "live") -> Optional[Dict[str, Any]]:
+    async def _maybe_recalibrate_confidence_floor(
+        self, source: str = "live"
+    ) -> Optional[dict[str, Any]]:
         if not self._conf_eval_enabled:
             return None
         now = time.time()
@@ -2679,9 +2900,18 @@ class MLForecaster:
             source=source,
             regime_views=regime_views,
         )
-        self._log_backtest_rows(rows, records, source=source, derivation=derivation, regime_views=regime_views)
-        self._write_confidence_report_artifacts(rows, derivation, source=source, regime_views=regime_views)
-        return {"rows": rows, "records": records, "derivation": derivation, "regime_views": regime_views}
+        self._log_backtest_rows(
+            rows, records, source=source, derivation=derivation, regime_views=regime_views
+        )
+        self._write_confidence_report_artifacts(
+            rows, derivation, source=source, regime_views=regime_views
+        )
+        return {
+            "rows": rows,
+            "records": records,
+            "derivation": derivation,
+            "regime_views": regime_views,
+        }
 
     async def _maybe_schedule_startup_backtest(self) -> None:
         if self._startup_backtest_submitted or self._startup_backtest_done:
@@ -2707,16 +2937,18 @@ class MLForecaster:
             finally:
                 self._startup_backtest_done = True
 
-        self._startup_backtest_task = asyncio.create_task(_runner(), name=f"{self.name}:conf_backtest")
+        self._startup_backtest_task = asyncio.create_task(
+            _runner(), name=f"{self.name}:conf_backtest"
+        )
 
     async def backtest_confidence_buckets(
         self,
-        symbols: Optional[List[str]] = None,
+        symbols: Optional[list[str]] = None,
         horizon_min: Optional[float] = None,
         max_samples_per_symbol: Optional[int] = None,
         bucket_size: Optional[float] = None,
         source: str = "manual",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Historical confidence backtest:
         - Replays model predictions across available OHLCV windows
@@ -2738,13 +2970,17 @@ class MLForecaster:
         tf = self.timeframe
         rt_cost_pct = self._round_trip_cost_pct()
 
-        records: List[Dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
         for sym in syms:
             try:
                 if not self.model_manager:
-                    self.logger.warning(f"[{self.name}] model_manager not available for backtest of {sym}")
+                    self.logger.warning(
+                        f"[{self.name}] model_manager not available for backtest of {sym}"
+                    )
                     continue
-                model_path = self.model_manager.build_model_path(agent_name=self.name, symbol=sym, version=tf)
+                model_path = self.model_manager.build_model_path(
+                    agent_name=self.name, symbol=sym, version=tf
+                )
                 if not self.model_manager.model_exists(model_path):
                     continue
                 try:
@@ -2776,7 +3012,11 @@ class MLForecaster:
                 if not isinstance(ohlcv, list) or len(ohlcv) < (effective_lookback + 5):
                     continue
                 feature_df = self._build_edge_feature_frame(ohlcv)
-                if feature_df is None or feature_df.empty or len(feature_df) < (effective_lookback + 5):
+                if (
+                    feature_df is None
+                    or feature_df.empty
+                    or len(feature_df) < (effective_lookback + 5)
+                ):
                     continue
                 rows = [self._std_row(c) for c in ohlcv]
                 rows = [r for r in rows if r is not None]
@@ -2816,10 +3056,16 @@ class MLForecaster:
                 if not idxs:
                     continue
 
-                windows: List[np.ndarray] = []
-                valid_idxs: List[int] = []
+                windows: list[np.ndarray] = []
+                valid_idxs: list[int] = []
                 for i in idxs:
-                    window = feature_df[input_cols].iloc[i - effective_lookback:i].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+                    window = (
+                        feature_df[input_cols]
+                        .iloc[i - effective_lookback : i]
+                        .replace([np.inf, -np.inf], np.nan)
+                        .fillna(0.0)
+                        .values
+                    )
                     if window.shape != (effective_lookback, len(input_cols)):
                         continue
                     windows.append(np.asarray(window, dtype=np.float32))
@@ -2846,8 +3092,12 @@ class MLForecaster:
                         continue
                     context_rows = rows[:i]
                     regime = self._infer_regime_from_numeric_rows(context_rows)
-                    expected_move_pct = self._estimate_expected_move_pct_from_rows(context_rows, horizon_steps)
-                    gross_pct, net_pct = self._calc_signal_pnl_pct(action.upper(), entry_price, exit_price, rt_cost_pct)
+                    expected_move_pct = self._estimate_expected_move_pct_from_rows(
+                        context_rows, horizon_steps
+                    )
+                    gross_pct, net_pct = self._calc_signal_pnl_pct(
+                        action.upper(), entry_price, exit_price, rt_cost_pct
+                    )
                     records.append(
                         {
                             "symbol": sym,
@@ -2865,7 +3115,9 @@ class MLForecaster:
                         }
                     )
             except Exception:
-                self.logger.debug("[%s] confidence backtest failed for %s", self.name, sym, exc_info=True)
+                self.logger.debug(
+                    "[%s] confidence backtest failed for %s", self.name, sym, exc_info=True
+                )
 
         if not records:
             return {"ok": False, "reason": "no_records"}
@@ -2876,16 +3128,22 @@ class MLForecaster:
 
         expected_move_pct = self._derive_expected_move_pct(records)
         derivation = self._derive_required_confidence(rows, expected_move_pct, rt_cost_pct)
-        regime_views = self._derive_regime_views(records, bucket_size or self._conf_bucket_size, rt_cost_pct)
+        regime_views = self._derive_regime_views(
+            records, bucket_size or self._conf_bucket_size, rt_cost_pct
+        )
         await self._apply_dynamic_required_conf(
             float(derivation["required_conf"]),
             derivation,
             source=source,
             regime_views=regime_views,
         )
-        self._log_backtest_rows(rows, records, source=source, derivation=derivation, regime_views=regime_views)
-        self._write_confidence_report_artifacts(rows, derivation, source=source, regime_views=regime_views)
-        for rec in records[-self._conf_max_completed:]:
+        self._log_backtest_rows(
+            rows, records, source=source, derivation=derivation, regime_views=regime_views
+        )
+        self._write_confidence_report_artifacts(
+            rows, derivation, source=source, regime_views=regime_views
+        )
+        for rec in records[-self._conf_max_completed :]:
             self._completed_conf_samples.append(rec)
 
         return {
@@ -2897,29 +3155,42 @@ class MLForecaster:
             "source": source,
         }
 
-    async def _collect_signal(self, symbol: str, action: str, confidence: float, reason: str, extras: Optional[Dict[str, Any]] = None):
+    async def _collect_signal(
+        self,
+        symbol: str,
+        action: str,
+        confidence: float,
+        reason: str,
+        extras: Optional[dict[str, Any]] = None,
+    ):
         """
         ARCHITECTURAL FIX: Build signal dict instead of emitting to Meta.
         AgentManager will collect these and forward them.
         """
         if action.upper() not in ("BUY", "SELL"):
             return
-            
+
         # DYNAMIC THRESHOLD (P9 Profit Feedback)
         # Check system-wide aggression to relax standards if behind profit target
         agg_factor = 1.0
         if hasattr(self.shared_state, "get_dynamic_param"):
             agg_factor = float(self.shared_state.get_dynamic_param("aggression_factor", 1.0))
-        self.logger.info(f"[{self.name}] [DEBUG:CollectSignal:Start] {symbol} {action} conf={confidence:.3f}, hard_emit_floor={self._conf_hard_emit_floor:.3f}")
+        self.logger.info(
+            f"[{self.name}] [DEBUG:CollectSignal:Start] {symbol} {action} conf={confidence:.3f}, hard_emit_floor={self._conf_hard_emit_floor:.3f}"
+        )
         if float(confidence) < float(self._conf_hard_emit_floor):
-            self.logger.warning(f"[{self.name}] [DEBUG:CollectSignal:Blocked] {symbol} {action} conf={confidence:.3f} < hard_emit_floor={self._conf_hard_emit_floor:.3f} - EARLY RETURN")
+            self.logger.warning(
+                f"[{self.name}] [DEBUG:CollectSignal:Blocked] {symbol} {action} conf={confidence:.3f} < hard_emit_floor={self._conf_hard_emit_floor:.3f} - EARLY RETURN"
+            )
             return
 
         regime, expected_move_pct = await self._live_regime_and_expected_move(symbol)
 
         # PHASE 2: Apply magnitude-aware confidence adjustment
         # Boosts confidence if expected move is significantly above threshold
-        confidence = self._magnitude_aware_confidence(float(confidence), float(expected_move_pct or 0.0))
+        confidence = self._magnitude_aware_confidence(
+            float(confidence), float(expected_move_pct or 0.0)
+        )
 
         # Hard EV gate: require expected_move >= 2x round-trip costs.
         round_trip_cost_pct = float(self._round_trip_cost_pct())
@@ -2929,7 +3200,7 @@ class MLForecaster:
         except Exception:
             buffer_bps = 0.0
         round_trip_cost_ev_pct = float(round_trip_cost_pct) + (float(buffer_bps) / 10000.0)
-        
+
         ev_positive = False
         if action.upper() == "BUY":
             # PHASE H: Dynamic EV Multiplier based on volatility regime
@@ -2965,7 +3236,9 @@ class MLForecaster:
 
         effective_min_conf = float(self._required_conf_for_regime(regime))
         if agg_factor > 1.0:
-            effective_min_conf = max(self._conf_floor_min, effective_min_conf / max(1.0, agg_factor))
+            effective_min_conf = max(
+                self._conf_floor_min, effective_min_conf / max(1.0, agg_factor)
+            )
         logger.info(
             "[MLForecaster:EV] symbol=%s conf=%.3f expected_move=%.5f round_trip_cost=%.5f break_even=%.3f",
             symbol,
@@ -3055,16 +3328,20 @@ class MLForecaster:
         if action.upper() == "SELL" and not self.allow_sell_without_position:
             try:
                 if not await self._has_position(symbol):
-                    self.logger.info(f"[{self.name}] Skip SELL for {symbol} — no position (signal suppressed).")
+                    self.logger.info(
+                        f"[{self.name}] Skip SELL for {symbol} — no position (signal suppressed)."
+                    )
                     return
             except Exception:
                 pass
-                
+
         # Quote hint
         qh = getattr(
             self.config,
             "EMIT_BUY_QUOTE",
-            getattr(self.config, "MIN_ENTRY_USDT", getattr(self.config, "DEFAULT_PLANNED_QUOTE", 25.0)),
+            getattr(
+                self.config, "MIN_ENTRY_USDT", getattr(self.config, "DEFAULT_PLANNED_QUOTE", 25.0)
+            ),
         )
         try:
             if isinstance(qh, dict):
@@ -3087,7 +3364,9 @@ class MLForecaster:
             "agent": self.name,
             "_required_conf": float(required_conf),
             "_confidence_gap": float(confidence - required_conf),
-            "_tradeability_hint": "pass" if float(confidence) >= float(required_conf) else "below_required_conf",
+            "_tradeability_hint": "pass"
+            if float(confidence) >= float(required_conf)
+            else "below_required_conf",
             "_break_even_prob": float(break_even_prob),
             "_expected_move_pct": float(expected_move_pct),
             "_regime": str(regime),
@@ -3116,9 +3395,13 @@ class MLForecaster:
             return  # Don't emit sub-minimum signals
 
         # Add to collection buffer (AgentManager will forward to Meta)
-        self.logger.info(f"[{self.name}] [DEBUG:AppendingSignal] {symbol} {signal['action']} to _collected_signals (count before={len(self._collected_signals)})")
+        self.logger.info(
+            f"[{self.name}] [DEBUG:AppendingSignal] {symbol} {signal['action']} to _collected_signals (count before={len(self._collected_signals)})"
+        )
         self._collected_signals.append(signal)
-        self.logger.info(f"[{self.name}] [DEBUG:AppendedSignal] {symbol} {signal['action']} appended (count after={len(self._collected_signals)})")
+        self.logger.info(
+            f"[{self.name}] [DEBUG:AppendedSignal] {symbol} {signal['action']} appended (count after={len(self._collected_signals)})"
+        )
         self.logger.info(
             "[%s] SIGNAL: %s %s conf=%.2f req=%.2f break_even=%.2f regime=%s hint=%s",
             self.name,
@@ -3148,7 +3431,12 @@ class MLForecaster:
                         }
                     )
             except Exception:
-                self.logger.debug("[%s] failed to queue confidence sample for %s", self.name, symbol, exc_info=True)
+                self.logger.debug(
+                    "[%s] failed to queue confidence sample for %s",
+                    self.name,
+                    symbol,
+                    exc_info=True,
+                )
 
     def _indicator_fallback_decision(
         self,
@@ -3157,7 +3445,7 @@ class MLForecaster:
         symbol: str,
         confidence_threshold: float,
         context: str,
-    ) -> Tuple[str, float, str]:
+    ) -> tuple[str, float, str]:
         """Rule-based fallback used when ML models are unavailable/unloadable."""
         if feature_df is None or feature_df.empty:
             return "hold", 0.0, f"{context}:insufficient_features"
@@ -3239,7 +3527,9 @@ class MLForecaster:
             f"{context}:indicator_fallback action={action} conf={confidence:.3f} "
             f"dom={dominance:.3f} floor={conf_floor:.3f}"
         )
-        self.logger.info("[%s] %s fallback decision for %s -> %s", self.name, context, symbol, reason)
+        self.logger.info(
+            "[%s] %s fallback decision for %s -> %s", self.name, context, symbol, reason
+        )
         return action, confidence, reason
 
     # ---------------- Run per symbol ----------------
@@ -3259,9 +3549,13 @@ class MLForecaster:
         except Exception:
             tuned = {}
         lookback = self._resolve_lookback(tuned)
-        confidence_threshold = float(tuned.get("confidence_threshold", getattr(self.config, "CONFIDENCE_THRESHOLD", 0.7)))
+        confidence_threshold = float(
+            tuned.get("confidence_threshold", getattr(self.config, "CONFIDENCE_THRESHOLD", 0.7))
+        )
         is_active = bool(tuned.get("active", True))
-        self.logger.debug(f"[{self.name}] Tuned for {cur_sym}: lookback={lookback}, active={is_active}")
+        self.logger.debug(
+            f"[{self.name}] Tuned for {cur_sym}: lookback={lookback}, active={is_active}"
+        )
 
         if not is_active:
             self.logger.info(f"⚠️ {self.name} for {cur_sym}@{cur_tf} is deactivated.")
@@ -3272,7 +3566,9 @@ class MLForecaster:
             return {"action": "hold", "confidence": 0.0, "reason": "ModelManager not available"}
 
         # Ensure model path
-        model_path = self.model_manager.build_model_path(agent_name=self.name, symbol=cur_sym, version=cur_tf)
+        model_path = self.model_manager.build_model_path(
+            agent_name=self.name, symbol=cur_sym, version=cur_tf
+        )
 
         # Data fetch + feature build
         try:
@@ -3283,7 +3579,11 @@ class MLForecaster:
                 return {"action": "hold", "confidence": 0.0, "reason": "Insufficient OHLCV"}
             feature_df = self._build_edge_feature_frame(ohlcv)
             if feature_df is None or feature_df.empty or len(feature_df) < lookback:
-                return {"action": "hold", "confidence": 0.0, "reason": "Insufficient engineered features"}
+                return {
+                    "action": "hold",
+                    "confidence": 0.0,
+                    "reason": "Insufficient engineered features",
+                }
         except Exception as e:
             self.logger.error(f"❌ OHLCV fetch failed for {cur_sym}@{cur_tf}: {e}", exc_info=True)
             return {"action": "hold", "confidence": 0.0, "reason": "Data fetch error"}
@@ -3454,7 +3754,9 @@ class MLForecaster:
                 needs_retrain_arch = not has_expected_arch
 
                 retrain_reason = (
-                    f"feature_dim_upgrade_{expected_dim}_to_{desired_dim}" if needs_upgrade else "architecture_upgrade_to_gru"
+                    f"feature_dim_upgrade_{expected_dim}_to_{desired_dim}"
+                    if needs_upgrade
+                    else "architecture_upgrade_to_gru"
                 )
                 if (
                     (needs_upgrade or needs_retrain_arch)
@@ -3531,7 +3833,9 @@ class MLForecaster:
                             context="model_feature_mismatch",
                         )
                     else:
-                        X = self._build_model_input_tensor(feature_df, effective_lookback, input_cols)
+                        X = self._build_model_input_tensor(
+                            feature_df, effective_lookback, input_cols
+                        )
                         if X is None:
                             self.logger.error(
                                 "[%s] Failed input tensor build for %s (lookback=%d model_lookback=%s mode=%s expected_dim=%s mapped_dim=%d).",
@@ -3563,7 +3867,9 @@ class MLForecaster:
                                 confidence_threshold=confidence_threshold,
                                 context="tensor_feature_mismatch",
                             )
-                        elif expected_lookback is not None and int(X.shape[1]) != int(expected_lookback):
+                        elif expected_lookback is not None and int(X.shape[1]) != int(
+                            expected_lookback
+                        ):
                             self.logger.warning(
                                 "[%s] Skip %s inference: tensor lookback mismatch expected=%s got=%d",
                                 self.name,
@@ -3584,28 +3890,39 @@ class MLForecaster:
                             # Predict
                             try:
                                 import tensorflow as tf  # local import to avoid import-time cost when unused
+
                                 key = (model_path, effective_lookback, feature_dim)
                                 predict_fn = self._predict_fns.get(key)
-                                spec = tf.TensorSpec(shape=[None, effective_lookback, feature_dim], dtype=tf.float32)
+                                spec = tf.TensorSpec(
+                                    shape=[None, effective_lookback, feature_dim], dtype=tf.float32
+                                )
                                 if predict_fn is None:
+
                                     @tf.function(input_signature=[spec], reduce_retracing=True)
                                     def _predict_fn(x):
                                         return model(x, training=False)
+
                                     self._predict_fns[key] = _predict_fn
                                     predict_fn = _predict_fn
 
                                 # Safety: ensure cached function was built with same lookback
                                 try:
                                     _ = predict_fn.get_concrete_function(
-                                        tf.TensorSpec(shape=[None, effective_lookback, feature_dim], dtype=tf.float32)
+                                        tf.TensorSpec(
+                                            shape=[None, effective_lookback, feature_dim],
+                                            dtype=tf.float32,
+                                        )
                                     )
                                 except Exception:
                                     # Rebuild if signature mismatched for any reason (including architecture changes)
-                                    self.logger.info(f"Rebuilding prediction function for {cur_sym} due to signature mismatch")
+                                    self.logger.info(
+                                        f"Rebuilding prediction function for {cur_sym} due to signature mismatch"
+                                    )
 
                                     @tf.function(input_signature=[spec], reduce_retracing=True)
                                     def _predict_fn(x):
                                         return model(x, training=False)
+
                                     self._predict_fns[key] = _predict_fn
                                     predict_fn = _predict_fn
 
@@ -3613,7 +3930,9 @@ class MLForecaster:
 
                                 def _infer():
                                     x_tf = tf.convert_to_tensor(X, dtype=tf.float32)
-                                    x_tf = tf.ensure_shape(x_tf, [None, effective_lookback, feature_dim])
+                                    x_tf = tf.ensure_shape(
+                                        x_tf, [None, effective_lookback, feature_dim]
+                                    )
                                     return predict_fn(x_tf).numpy()[0]
 
                                 y_raw = await loop.run_in_executor(None, _infer)
@@ -3633,7 +3952,9 @@ class MLForecaster:
                                         f"lb={effective_lookback} fdim={feature_dim} probs={probs} action={action}, conf={confidence:.2f}"
                                     )
                             except Exception as e:
-                                self.logger.error(f"❌ Prediction failed for {cur_sym}: {e}", exc_info=True)
+                                self.logger.error(
+                                    f"❌ Prediction failed for {cur_sym}: {e}", exc_info=True
+                                )
                                 action, confidence, emit_reason = self._indicator_fallback_decision(
                                     feature_df,
                                     symbol=cur_sym,
@@ -3657,7 +3978,9 @@ class MLForecaster:
 
         reginfo = None
         try:
-            reginfo = await self.shared_state.get_volatility_regime(cur_sym, timeframe=self.timeframe)
+            reginfo = await self.shared_state.get_volatility_regime(
+                cur_sym, timeframe=self.timeframe
+            )
         except Exception:
             reginfo = None
         regime = self._normalize_regime((reginfo or {}).get("regime", "normal"))
@@ -3678,7 +4001,9 @@ class MLForecaster:
         if (sentiment < -0.5) or (regime in {"high_vol", "bear"}) or (cot_num < 0):
             action = "hold"
 
-        self.logger.info(f"[{self.name}] Final decision for {cur_sym} => Action: {action.upper()}, Confidence: {confidence:.2f}")
+        self.logger.info(
+            f"[{self.name}] Final decision for {cur_sym} => Action: {action.upper()}, Confidence: {confidence:.2f}"
+        )
 
         # Store a brief CoT/debug explanation for UI/debuggers
         try:
@@ -3694,12 +4019,12 @@ class MLForecaster:
         # ML POSITION SCALING: Calculate position scale based on buy probability
         # ═══════════════════════════════════════════════════════════════════════
         position_scale = 1.0  # Default: no scaling
-        
+
         if action.upper() == "BUY":
             # Extract buy probability from the model output
             # The confidence here represents our prediction strength
             prob = float(confidence)
-            
+
             # Tiered position scaling based on confidence bands
             if prob >= 0.75:
                 position_scale = 1.5  # 50% larger position
@@ -3711,7 +4036,7 @@ class MLForecaster:
                 position_scale = 0.8  # 20% smaller position
             else:
                 position_scale = 0.6  # 40% smaller position
-            
+
             # Store ML position scale in SharedState for downstream use by MetaController
             try:
                 if hasattr(self.shared_state, "set_ml_position_scale"):
@@ -3751,15 +4076,17 @@ class MLForecaster:
                         price_now = self.shared_state.get_price(cur_sym)
                     except Exception:
                         price_now = None
-                
+
                 if hasattr(self.shared_state, "register_signal_outcome"):
-                    self.shared_state.register_signal_outcome({
-                        "symbol": cur_sym,
-                        "timestamp": now,
-                        "price_at_signal": price_now,
-                        "confidence": confidence,
-                        "agent": "MLForecaster"
-                    })
+                    self.shared_state.register_signal_outcome(
+                        {
+                            "symbol": cur_sym,
+                            "timestamp": now,
+                            "price_at_signal": price_now,
+                            "confidence": confidence,
+                            "agent": "MLForecaster",
+                        }
+                    )
             except Exception:
                 pass
 

@@ -54,13 +54,13 @@ async def _inject_signals_loop(self):
         # Get current state
         positions = await self.shared_state.get_positions_snapshot()
         total_equity = await self.shared_state.get_total_nav()
-        
+
         # Classify into buckets
         bucket_state = await self.three_bucket_manager.update_bucket_state(
             positions=positions,
             total_equity=total_equity
         )
-        
+
         # Every 10 cycles, log status
         if cycle % 10 == 0:
             self.three_bucket_manager.log_bucket_status()
@@ -76,7 +76,7 @@ def classify_portfolio(self, positions, total_equity) -> PortfolioBucketState:
         if symbol == 'USDT':
             bucket_state.operating_cash_usdt = pos_data.get('value', 0)
             continue
-        
+
         # Classify each position
         classification = self.classify_position(
             symbol=symbol,
@@ -85,13 +85,13 @@ def classify_portfolio(self, positions, total_equity) -> PortfolioBucketState:
             current_price=current_price,
             entry_price=entry_price
         )
-        
+
         # Add to bucket
         if classification.bucket == BucketType.PRODUCTIVE:
             bucket_state.productive_total_value += current_value
         elif classification.bucket == BucketType.DEAD_CAPITAL:
             bucket_state.dead_total_value += current_value
-    
+
     return bucket_state
 ```
 
@@ -124,7 +124,7 @@ async def get_portfolio_snapshot():
                 sym = f"{asset}USDT"
                 # Found a holding!
                 positions_to_add[sym] = {...}
-    
+
     return snapshot  # Contains all held symbols
 ```
 
@@ -136,12 +136,12 @@ async def hydrate_positions_from_balances():
     Mirror non-quote wallet balances into spot positions
     """
     snapshot = dict(self.balances)
-    
+
     for asset, bal in snapshot.items():
         # Skip USDT
         if asset.upper() == "USDT":
             continue
-        
+
         qty = float(bal.get("free", 0.0)) + float(bal.get("locked", 0.0))
         if qty > 0:
             # Create position for this symbol
@@ -155,10 +155,10 @@ async def hydrate_positions_from_balances():
 async def get_spot_balances():
     """Fetch all non-zero balances from Binance"""
     balances = await self._fetch_from_binance("/api/v3/account")
-    
+
     # Returns: {"USDT": {...}, "BTC": {...}, "ETH": {...}, ...}
     # Each asset with balance > 0 is returned
-    
+
     return balances
 ```
 
@@ -199,18 +199,18 @@ async def _handle_phantom_position(symbol):
     """
     SCENARIO A: Position in state but not on exchange
     - Delete from local state
-    
+
     SCENARIO B: Position on exchange but not in state
     - Sync from exchange
     - Update local state with exchange quantity
     """
     exchange_qty = await self._get_exchange_position_qty(symbol)
     state_qty = await self.shared_state.get_position_quantity(symbol)
-    
+
     if state_qty > 0 and exchange_qty == 0:
         # Phantom: exists locally but not on exchange
         await self.shared_state.delete_position(symbol)
-    
+
     if exchange_qty > 0 and state_qty == 0:
         # Lost position: exists on exchange but not locally
         pos["quantity"] = exchange_qty
@@ -223,14 +223,14 @@ async def _handle_phantom_position(symbol):
 async def _reconcile_balances(symbols):
     balances = await self._get_exchange_balances()
     positions = await self.shared_state.get_open_positions()
-    
+
     for sym, pos in positions.items():
         state_qty = self._position_qty(pos)
         base_asset = self._split_base_quote(sym)[0]
-        
+
         bal = balances.get(base_asset.upper(), {})
         exchange_qty = float(bal.get("free", 0.0)) + float(bal.get("locked", 0.0))
-        
+
         # Check mismatch
         if abs(state_qty - exchange_qty) > tolerance:
             # Mismatch found - report for correction
@@ -268,7 +268,7 @@ bucket, pct = DynamicBalanceThresholds.classify_balance(104.04, 104.04)
 ```python
 # Get your current holdings:
 snapshot = await shared_state.get_portfolio_snapshot()
-# Result: 
+# Result:
 # {
 #   "holdings": [],  # Empty - USDT only
 #   "total_nav": 104.04,

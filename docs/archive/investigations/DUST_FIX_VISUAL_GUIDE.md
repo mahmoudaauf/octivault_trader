@@ -73,7 +73,7 @@
 Time    Action              Qty         Dust      Status
 ────────────────────────────────────────────────────────
 T+1s    BUY BTC            +0.001234    0         ✓
-T+2s    SELL BTC           -0.001000    0.000234  ⚠️  
+T+2s    SELL BTC           -0.001000    0.000234  ⚠️
 T+3s    SELL Dust (fails)  -0          0.000234  ❌ Stuck
 T+4s    Try again...       -0          0.000234  ❌ Stuck
 T+5s    Still stuck        -0          0.000234  ❌ Frozen
@@ -161,7 +161,7 @@ if position_pct_remaining > 0 and position_pct_remaining < 5.0:
 ```
 Cycle 1: remainder = 0.0001 ← Store it
 Cycle 2: remainder = 0.0001 ← Same? stuck_count = 1
-Cycle 3: remainder = 0.0001 ← Same? stuck_count = 2  
+Cycle 3: remainder = 0.0001 ← Same? stuck_count = 2
 Cycle 4: remainder = 0.0001 ← Same? stuck_count = 3
          ↓
     TRIGGER: FORCE LIQUIDATE ✅
@@ -228,8 +228,8 @@ System freeze events: Yes ❌    System freeze events: No ✅
 
 ### ✅ Good Logs (Dust Prevention Working)
 ```
-[EM:SellRoundUp] BTCUSDT: qty ROUND_UP 0.001→0.001234 
-                 (remainder=0.000234 notional=9.36 < floor=5.00 
+[EM:SellRoundUp] BTCUSDT: qty ROUND_UP 0.001→0.001234
+                 (remainder=0.000234 notional=9.36 < floor=5.00
                   | qty_dust=False notional_dust=True pct_exit=18.9%)
 ```
 
@@ -240,7 +240,7 @@ System freeze events: Yes ❌    System freeze events: No ✅
 
 ### ❌ Emergency Logs (Would Trigger Forced Exit)
 ```
-[DUST_TRAP] BTCUSDT: Stuck on remainder 0.0001 (4.00 USDT) 
+[DUST_TRAP] BTCUSDT: Stuck on remainder 0.0001 (4.00 USDT)
             for 3 cycles. FORCING LIQUIDATION.
 ```
 
@@ -295,4 +295,3 @@ RISK:     None (defensive measures, no aggressive changes)
 
 RESULT:   Capital freed, trading resumed, system working ✅
 ```
-

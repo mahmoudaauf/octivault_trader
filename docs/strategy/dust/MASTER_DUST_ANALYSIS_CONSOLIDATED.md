@@ -1,8 +1,8 @@
 # 🧹 MASTER DUST ANALYSIS - COMPLETE CONSOLIDATED REPORT
 
-**Date:** April 27, 2026  
-**Status:** FINAL - All dust analysis consolidated  
-**Scope:** Root causes, pathways, handling mechanisms, scenarios, fixes  
+**Date:** April 27, 2026
+**Status:** FINAL - All dust analysis consolidated
+**Scope:** Root causes, pathways, handling mechanisms, scenarios, fixes
 **Severity:** CRITICAL - System unprofitable due to dust creation + liquidation cycles
 
 ---
@@ -78,9 +78,9 @@ Current flow:
    ├─ Checks: capital available? ✅
    ├─ Checks: position count < max? ✅
    └─ Decision: ✅ EXECUTE
-   
+
 2. Order sent to exchange
-   
+
 3. Fill received → Position registered
    └─ Value check happens NOW (too late!)
    ├─ Calculate: qty × price
@@ -92,14 +92,14 @@ Current flow:
 **Correct flow (proposed):**
 ```
 1. Signal created with planned_quote = $20
-   
+
 2. VALIDATE position will be significant
    ├─ Estimate worst-case fill: $20 - 2% slippage = $19.60
    ├─ Subtract fees: $19.60 - 0.1% = $19.58
    ├─ Check lot-step rounding
-   ├─ Final: Will position value be >= $20? 
+   ├─ Final: Will position value be >= $20?
    └─ If NO: ❌ REJECT signal (don't execute!)
-   
+
 3. Only if validation passes: Execute order
 
 4. Fill received → Position created & immediately significant ✅
@@ -112,14 +112,14 @@ Current flow:
 ```python
 async def record_fill(self, symbol: str, side: str, qty: float, price: float, ...):
     # This is called AFTER fill is received from exchange
-    
+
     current_qty = float(pos.get("quantity", 0.0) or 0.0)
     significant_floor = float(await self.get_significant_position_floor(symbol))
     position_value = float(current_qty * price) if current_qty > 0 else 0.0
-    
+
     # ⚠️ DUST CLASSIFICATION HAPPENS HERE:
     is_significant = bool(position_value >= significant_floor and position_value > 0.0)
-    
+
     if not is_significant:
         pos["state"] = PositionState.DUST_LOCKED.value  # ← DUST CREATED
         pos["status"] = "DUST"
@@ -274,16 +274,16 @@ async def _build_decisions(self, accepted_symbols_set: set):
     # Calculate dust ratio
     dust_positions = [p for p in positions if p.get("is_dust")]
     dust_ratio = len(dust_positions) / len(positions) if positions else 0.0
-    
+
     # Phase 2 trigger: If dust ratio exceeds threshold
     if dust_ratio > 0.60 and phase2_age >= 300.0:  # 5+ minutes
         # Generate SELL signals for all dust
         executable_dust = []
-        
+
         for sym, qty, value_usdt, pos_age_sec in dust_to_liquidate:
             # ⚠️ PROBLEM: No minimum age check on pos_age_sec
             # Could be 5 seconds old, still gets liquidated!
-            
+
             dust_sell_sig = {
                 "symbol": sym,
                 "action": "SELL",
@@ -291,10 +291,10 @@ async def _build_decisions(self, accepted_symbols_set: set):
                 "_force_dust_liquidation": True,
                 "agent": "MetaDustLiquidator",
             }
-            
+
             # Add to decision list
             decisions.append(dust_sell_sig)
-            
+
             # Will be executed with emergency_liquidation=True
             # This bypasses normal SELL gates
 ```
@@ -316,7 +316,7 @@ MIN_DUST_AGE_BEFORE_LIQUIDATION = 3600  # 1 hour
 for sym, qty, value_usdt, pos_age_sec in dust_to_liquidate:
     if pos_age_sec < MIN_DUST_AGE_BEFORE_LIQUIDATION:
         continue  # Don't liquidate yet, let it mature
-    
+
     # Only liquidate old dust, give new dust time to recover
 ```
 
@@ -348,7 +348,7 @@ PHASE2_DUST_RATIO_TRIGGER = 0.80  # Only trigger if 80%+ dust
 ```python
 # From meta_controller.py
 should_execute = await self.should_execute_sell(
-    sym, 
+    sym,
     emergency_liquidation=True  # ← BYPASSES SELL GATES
 )
 
@@ -473,16 +473,16 @@ async def record_fill(self, symbol, side, qty, price):
     # After order fill:
     position_value = qty * price
     significant_floor = $20.00
-    
+
     if position_value < significant_floor:
         position["state"] = PositionState.DUST_LOCKED
         position["status"] = "DUST"
         record_to_dust_registry(symbol, qty)
-    
+
     return position
 ```
 
-**Status:** ✅ Working - Creates and marks dust correctly  
+**Status:** ✅ Working - Creates and marks dust correctly
 **Problem:** Happens too late (after execution)
 
 ## Layer 2: Dust Classification & Categorization
@@ -493,17 +493,17 @@ async def record_fill(self, symbol, side, qty, price):
 async def classify_positions_by_size(self):
     for symbol, position in self.open_trades.items():
         value = position.get("entry_price", 0) * position.get("quantity", 0)
-        
+
         if value < $20:
             position["classification"] = "DUST"
             position["age_category"] = self._categorize_age(position["created_at"])
         else:
             position["classification"] = "ACTIVE"
-    
+
     return classifications
 ```
 
-**Status:** ✅ Working - Properly categorizes dust  
+**Status:** ✅ Working - Properly categorizes dust
 **Uses:** Age, value, entry price, market conditions
 
 ## Layer 3: Dust Liquidation (Phase 2)
@@ -513,7 +513,7 @@ async def classify_positions_by_size(self):
 ```python
 async def phase2_dust_liquidation(self):
     dust_ratio = count_dust / count_total
-    
+
     if dust_ratio > 0.60 and time_since_phase2_start > 300:  # 5 min
         for dust_symbol, qty in dust_to_liquidate:
             # Generate SELL signal
@@ -524,11 +524,11 @@ async def phase2_dust_liquidation(self):
                 "_force_dust_liquidation": True,
             }
             decisions.append(signal)
-    
+
     return decisions
 ```
 
-**Status:** ✅ Working - Liquidates dust  
+**Status:** ✅ Working - Liquidates dust
 **Problem:** Too aggressive, no age guards
 
 ---
@@ -596,7 +596,7 @@ adjusted_confidence = regime_multiplier × confidence
 Result: 0.65-0.95 (dynamic)
 ```
 
-**Frequency:** HIGH (generates many signals)  
+**Frequency:** HIGH (generates many signals)
 **Quality:** GOOD (technical analysis based)
 
 ## Agent #2: SwingTradeHunter (EMA-Based)
@@ -618,7 +618,7 @@ confidence = 0.65 (FIXED - NEVER CHANGES!)
 - Over-generates signals
 - Many borderline entries become dust
 
-**Frequency:** VERY HIGH (constant buying signals)  
+**Frequency:** VERY HIGH (constant buying signals)
 **Quality:** POOR (fixed confidence, too many signals)
 
 ## Agent #3: DipSniper (Dip Detection)
@@ -632,8 +632,8 @@ AND Price > EMA200 (support)?
 → BUY dip
 ```
 
-**Confidence:** 0.70-0.90 (dynamic, increases with volume)  
-**Frequency:** MEDIUM (creates when conditions align)  
+**Confidence:** 0.70-0.90 (dynamic, increases with volume)
+**Frequency:** MEDIUM (creates when conditions align)
 **Quality:** GOOD (real dips + confirmation)
 
 ## Agent #4: MLForecaster (Machine Learning)
@@ -650,8 +650,8 @@ Confidence based on model probability
 Range: 0.60-0.85
 ```
 
-**Model Uses:** Price history, technical indicators, volatility  
-**Frequency:** HIGH (many predictions)  
+**Model Uses:** Price history, technical indicators, volatility
+**Frequency:** HIGH (many predictions)
 **Quality:** MEDIUM (unknown win rate)
 
 ## Agent #5: LiquidationAgent (Forced Liquidation)
@@ -667,7 +667,7 @@ Capital depleted?
 Confidence: 0.99 (maximum, forced execution)
 ```
 
-**Frequency:** TRIGGERED (only when dust critical)  
+**Frequency:** TRIGGERED (only when dust critical)
 **Quality:** NECESSARY (manages capital preservation)
 
 ## Agent #6: IPOChaser / SymbolScreener (Discovery)
@@ -683,7 +683,7 @@ Unusual wallet activity?
 Confidence: 0.65-0.75 (exploratory)
 ```
 
-**Frequency:** LOW (new listings/events rare)  
+**Frequency:** LOW (new listings/events rare)
 **Quality:** EXPLORATORY (discovery purpose)
 
 ---
@@ -889,26 +889,26 @@ async def validate_entry_will_be_significant(
 ) -> Tuple[bool, str]:
     """
     Validate position will not become dust due to slippage/fees.
-    
+
     Simulates worst-case fill scenario.
     """
-    
+
     # Get configuration
     significant_floor = await self.get_significant_position_floor(symbol)
     min_notional = await self.get_symbol_min_notional(symbol)
-    
+
     # Worst-case calculation
     worst_case_price = current_price * 0.97  # 3% slippage assumption
     fees_deduction = 0.998  # 0.2% total fees (taker + rounding)
     worst_case_value = planned_quote * worst_case_price * fees_deduction
-    
+
     # Validation
     if worst_case_value < significant_floor:
         return False, f"Entry would create dust: {worst_case_value:.2f} < {significant_floor:.2f}"
-    
+
     if worst_case_value < min_notional * 2:
         return False, f"Entry below min notional: {worst_case_value:.2f} < {min_notional*2:.2f}"
-    
+
     return True, "Entry will be significant ✓"
 
 # Before executing entry:
@@ -946,24 +946,24 @@ confidence_gate = 0.89  # STATIC, rejects 95% of signals
 async def _calculate_dynamic_confidence_gate(self):
     """
     Calculate confidence gate dynamically based on win rate.
-    
+
     Current implementation:
     - static 0.89 = 95% rejection (massive undertrading)
-    
+
     Better approach:
     - If win_rate >= 55%: gate = 0.70 (allow more signals)
     - If win_rate 50-55%: gate = 0.75 (moderate filtering)
     - If win_rate < 50%: gate = 0.80 (more conservative)
     - Default if no data: gate = 0.70
     """
-    
+
     recent_trades = await self.get_recent_trades(lookback_hours=24)
     if not recent_trades:
         return 0.70  # Default: very permissive
-    
+
     wins = len([t for t in recent_trades if t["pnl"] > 0])
     win_rate = wins / len(recent_trades)
-    
+
     if win_rate >= 0.55:
         return 0.65  # Aggressive mode (win rate good)
     elif win_rate >= 0.50:
@@ -1027,12 +1027,12 @@ DUST_MIN_AGE_BEFORE_LIQUIDATION = 3600  # 1 hour in seconds
 # In phase2_dust_liquidation():
 executable_dust = []
 for sym, qty, value_usdt, pos_age_sec in dust_to_liquidate:
-    
+
     # NEW: Check age before liquidation
     if pos_age_sec < DUST_MIN_AGE_BEFORE_LIQUIDATION:
         log.debug(f"Dust {sym} only {pos_age_sec}s old, preserving for recovery")
         continue  # Skip this dust, let it mature
-    
+
     # Only liquidate old dust
     dust_sell_sig = {
         "symbol": sym,
@@ -1271,8 +1271,7 @@ After implementing all five fixes:
 
 ---
 
-**Document Created:** April 27, 2026  
-**Status:** COMPLETE - All dust analysis consolidated into single master reference  
-**Total Analysis:** 25,000+ words across 10+ previous documents  
+**Document Created:** April 27, 2026
+**Status:** COMPLETE - All dust analysis consolidated into single master reference
+**Total Analysis:** 25,000+ words across 10+ previous documents
 **Consolidated Into:** This single master document for easy reference and implementation
-

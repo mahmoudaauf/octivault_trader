@@ -31,10 +31,10 @@ Once $30+ free:
 
 ### Step 4: Growth Loop
 ```
-Close winner (+$5) 
-  → Free capital now $15.02 
-  → Can enter new trade with $10 
-  → Ride trend to +$3-5 
+Close winner (+$5)
+  → Free capital now $15.02
+  → Can enter new trade with $10
+  → Ride trend to +$3-5
   → Close and repeat
 ```
 

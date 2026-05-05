@@ -1,9 +1,10 @@
-import logging
 import asyncio
+import logging
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Any, Optional
 
 logger = logging.getLogger("WalletScannerAgent")
+
 
 class WalletScannerAgent:
     """
@@ -11,6 +12,7 @@ class WalletScannerAgent:
     Safe to instantiate early (Phase 3) without full deps; it will no-op until ready.
     Additionally, it can optionally request liquidations to restore quote balance if free quote is below a configurable threshold.
     """
+
     agent_type = "discovery"
 
     def __init__(
@@ -33,7 +35,9 @@ class WalletScannerAgent:
         self.liquidation_agent = liquidation_agent
         self.position_manager = position_manager
         # thresholds for quote restoration
-        self.quote_free_threshold = float(getattr(config, "QUOTE_FREE_THRESHOLD", 5.0))  # in quote units (e.g., USDT)
+        self.quote_free_threshold = float(
+            getattr(config, "QUOTE_FREE_THRESHOLD", 5.0)
+        )  # in quote units (e.g., USDT)
         self.dust_liq_min_quote = float(getattr(config, "DUST_LIQUIDATION_MIN_QUOTE", 5.0))
         self.max_liqs_per_scan = int(getattr(config, "MAX_LIQUIDATIONS_PER_SCAN", 3))
 
@@ -51,7 +55,7 @@ class WalletScannerAgent:
         self.propose_symbols = bool(getattr(config, "WALLET_SCANNER_PROPOSE_SYMBOLS", False))
 
         self.name = "WalletScannerAgent"
-        self.is_discovery_agent = True      # contract flag
+        self.is_discovery_agent = True  # contract flag
         self.last_run: Optional[str] = None
         self._stop_event = asyncio.Event()
         self._task = None
@@ -77,7 +81,7 @@ class WalletScannerAgent:
         self._stop_event.clear()
         self._task = asyncio.create_task(self.run_loop(), name="agent.wallet_scanner")
         logger.info(f"[{self.name}] start() launched background loop.")
-    
+
     async def stop(self):
         """
         P9 contract: stop() should exist and gracefully stop the loop.
@@ -89,7 +93,9 @@ class WalletScannerAgent:
             try:
                 t.cancel()
                 try:
-                    await asyncio.wait_for(t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0)))
+                    await asyncio.wait_for(
+                        t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0))
+                    )
                 except asyncio.CancelledError:
                     pass
             except Exception:
@@ -104,7 +110,7 @@ class WalletScannerAgent:
                 await self.run_once()
             except Exception as e:
                 logger.exception(f"[{self.name}] Error in run_loop: {e}")
-            
+
             # ✅ PHASE 2a: ADAPTIVE INTERVALS based on regime
             wait_time = await self._get_adaptive_interval()
             await asyncio.sleep(wait_time)
@@ -112,12 +118,12 @@ class WalletScannerAgent:
     async def _get_adaptive_interval(self) -> float:
         """
         Adjust scan interval based on market volatility regime.
-        
+
         Strategy:
           - High volatility: scan more frequently (faster wallet response to market moves)
           - Normal volatility: use base interval
           - Low volatility: scan less frequently (stable, no urgent changes)
-        
+
         Returns: seconds to wait before next scan
         """
         try:
@@ -127,29 +133,35 @@ class WalletScannerAgent:
                     regime_result = self.shared_state.get_volatility_regime(
                         "GLOBAL", timeframe="1h", max_age_seconds=300
                     )
-                    regime_result = await regime_result if asyncio.iscoroutine(regime_result) else regime_result
-                    
+                    regime_result = (
+                        await regime_result if asyncio.iscoroutine(regime_result) else regime_result
+                    )
+
                     if isinstance(regime_result, dict):
                         regime = str(regime_result.get("regime", "normal")).lower()
-                        
+
                         # Adjust interval based on regime
                         if regime == "high":
                             # High volatility: scan 1.5x more frequently
                             adjusted = self.interval / 1.5
-                            logger.debug(f"[{self.name}] High volatility regime: scanning every {adjusted:.0f}s")
+                            logger.debug(
+                                f"[{self.name}] High volatility regime: scanning every {adjusted:.0f}s"
+                            )
                             return adjusted
                         elif regime == "low":
                             # Low volatility: scan 1.5x less frequently
                             adjusted = self.interval * 1.5
-                            logger.debug(f"[{self.name}] Low volatility regime: scanning every {adjusted:.0f}s")
+                            logger.debug(
+                                f"[{self.name}] Low volatility regime: scanning every {adjusted:.0f}s"
+                            )
                             return adjusted
                         # else: normal, use base interval
                 except Exception as e:
                     logger.debug(f"[{self.name}] Volatility regime check failed: {e}")
-            
+
             # Fallback: use base interval
             return self.interval
-        
+
         except Exception as e:
             logger.debug(f"[{self.name}] Unexpected error in _get_adaptive_interval: {e}")
             return self.interval  # Safe default
@@ -186,7 +198,7 @@ class WalletScannerAgent:
     async def _get_price(self, symbol: str) -> Optional[float]:
         """
         Phase 4: Get price from memory-first cascade (0 API calls by default).
-        
+
         Strategy 1: Check SharedState.prices (WebSocket, <1ms, 0 API)
         Strategy 2: Check helpers/cache (Database, <10ms, 0 API)
         Strategy 3: Optional REST (REST, 100-600ms, 1 API) - if WS_ALLOW_REST=True
@@ -197,7 +209,7 @@ class WalletScannerAgent:
             if price is not None:
                 logger.debug(f"[{self.name}] Got price {symbol} from memory: {price}")
                 return float(price)
-        
+
         # Strategy 2: Fallback helpers
         ec = self.exchange_client
         if ec and hasattr(ec, "get_cached_price"):
@@ -209,18 +221,22 @@ class WalletScannerAgent:
                     logger.debug(f"[{self.name}] Got price {symbol} from cache: {p}")
                     return float(p)
             except Exception:
-                logger.debug(f"[{self.name}] cached price lookup failed for {symbol}", exc_info=True)
-        
+                logger.debug(
+                    f"[{self.name}] cached price lookup failed for {symbol}", exc_info=True
+                )
+
         # Strategy 3: Optional REST (if allowed by config)
         allow_rest = bool(getattr(self.config, "WS_ALLOW_REST", False))
         if not allow_rest:
-            logger.debug(f"[{self.name}] No price for {symbol} - market data not streaming, REST disabled")
+            logger.debug(
+                f"[{self.name}] No price for {symbol} - market data not streaming, REST disabled"
+            )
             return None
-        
+
         # REST fallback (institutional trading: disabled by default)
         if not ec:
             return None
-        
+
         try:
             if hasattr(ec, "get_ticker_price"):
                 p = ec.get_ticker_price(symbol)
@@ -238,7 +254,7 @@ class WalletScannerAgent:
                     return float(p)
         except Exception:
             logger.debug(f"[{self.name}] REST price fetch failed for {symbol}", exc_info=True)
-        
+
         return None
 
     async def _prefilter_symbol(self, symbol: str) -> bool:
@@ -274,7 +290,12 @@ class WalletScannerAgent:
                                 min_notional = None
                             break
                 if min_notional is not None and min_notional > self.max_per_trade_usdt:
-                    logger.info(f"[{self.name}] %s MIN_NOTIONAL %.4f exceeds cap %.2f; skipping.", symbol, min_notional, self.max_per_trade_usdt)
+                    logger.info(
+                        f"[{self.name}] %s MIN_NOTIONAL %.4f exceeds cap %.2f; skipping.",
+                        symbol,
+                        min_notional,
+                        self.max_per_trade_usdt,
+                    )
                     return False
             return True
         except Exception:
@@ -286,7 +307,8 @@ class WalletScannerAgent:
         Try multiple known method names on liquidation_agent or position_manager to request liquidation.
         Returns True if any call succeeded (did not raise).
         """
-        async def _try_call(obj: Any, names: List[str]) -> bool:
+
+        async def _try_call(obj: Any, names: list[str]) -> bool:
             for nm in names:
                 if hasattr(obj, nm):
                     fn = getattr(obj, nm)
@@ -303,15 +325,27 @@ class WalletScannerAgent:
                                 await res
                             return True
                         except Exception:
-                            logger.debug(f"[{self.name}] call variant failed for {obj}.{nm}", exc_info=True)
+                            logger.debug(
+                                f"[{self.name}] call variant failed for {obj}.{nm}", exc_info=True
+                            )
                     except Exception:
-                        logger.debug(f"[{self.name}] liquidation call failed for {obj}.{nm}", exc_info=True)
+                        logger.debug(
+                            f"[{self.name}] liquidation call failed for {obj}.{nm}", exc_info=True
+                        )
             return False
+
         # Try liquidation_agent first
         if self.liquidation_agent:
             ok = await _try_call(
                 self.liquidation_agent,
-                ["enqueue_async", "enqueue", "request_liquidation", "suggest_liquidation", "propose", "submit"]
+                [
+                    "enqueue_async",
+                    "enqueue",
+                    "request_liquidation",
+                    "suggest_liquidation",
+                    "propose",
+                    "submit",
+                ],
             )
             if ok:
                 return True
@@ -319,13 +353,21 @@ class WalletScannerAgent:
         if self.position_manager:
             ok = await _try_call(
                 self.position_manager,
-                ["request_liquidation", "close_position", "market_sell", "market_close", "reduce_position"]
+                [
+                    "request_liquidation",
+                    "close_position",
+                    "market_sell",
+                    "market_close",
+                    "reduce_position",
+                ],
             )
             if ok:
                 return True
         return False
 
-    async def _classify_and_register_wallet_assets(self, balances: Optional[Dict[str, Any]]) -> None:
+    async def _classify_and_register_wallet_assets(
+        self, balances: Optional[dict[str, Any]]
+    ) -> None:
         """
         PHASE 2: Classify wallet assets with professional metadata.
         Wallet assets are classified as EXTERNAL_POSITION or STABLE based on asset type.
@@ -333,11 +375,17 @@ class WalletScannerAgent:
         """
         if not balances or not isinstance(balances, dict):
             return
-        
+
         try:
             # Get stable asset list
             quote = str(getattr(self.config, "DEFAULT_QUOTE_CURRENCY", "USDT")).upper()
-            known_quotes = set(getattr(self.exchange_client, "_known_quotes", {"USDT", "FDUSD", "USDC", "BUSD", "TUSD", "DAI"}))
+            known_quotes = set(
+                getattr(
+                    self.exchange_client,
+                    "_known_quotes",
+                    {"USDT", "FDUSD", "USDC", "BUSD", "TUSD", "DAI"},
+                )
+            )
             if self.exchange_client and hasattr(self.exchange_client, "get_known_quotes"):
                 try:
                     kq = self.exchange_client.get_known_quotes()
@@ -347,28 +395,28 @@ class WalletScannerAgent:
                         known_quotes = set([str(x).upper() for x in kq]) or known_quotes
                 except Exception:
                     pass
-            
+
             # Process each balance in wallet
             for asset, info in balances.items():
                 if not isinstance(info, dict):
                     continue
-                
+
                 free = float(info.get("free", 0.0) or 0.0)
                 locked = float(info.get("locked", 0.0) or 0.0)
                 total = free + locked
-                
+
                 # Skip dust (no quantity)
                 if total <= 0.0:
                     continue
-                
+
                 asset_upper = str(asset).upper()
-                
+
                 # Classify asset
                 if asset_upper == quote or asset_upper in known_quotes:
                     classification = "STABLE"
                 else:
                     classification = "EXTERNAL_POSITION"
-                
+
                 # Try to register with SharedState classification system
                 try:
                     if hasattr(self.shared_state, "register_position_classified"):
@@ -382,17 +430,17 @@ class WalletScannerAgent:
                                     price = 1.0
                             except Exception:
                                 price = 1.0
-                        
+
                         # Import AssetClassification enum
                         from src.l0_core.shared_state import AssetClassification
-                        
+
                         # Convert string classification to enum
                         try:
                             classification_enum = AssetClassification(classification)
                         except (ValueError, KeyError):
                             # Default to EXTERNAL_POSITION if unknown classification
                             classification_enum = AssetClassification.EXTERNAL_POSITION
-                        
+
                         # Register position with classification.
                         # IMPORTANT: classification keys must use trading symbols (e.g. AVAXUSDT),
                         # because validators/liquidators query by symbol, not by base asset code.
@@ -408,14 +456,22 @@ class WalletScannerAgent:
                             classification=classification_enum,
                             origin="wallet_balance_sync",
                             created_by_agent="WalletScannerAgent",
-                            management_strategy="HOLD" if classification == "STABLE" else "DISCRETIONARY"
+                            management_strategy="HOLD"
+                            if classification == "STABLE"
+                            else "DISCRETIONARY",
                         )
-                        logger.debug(f"[{self.name}] Classified {asset_upper} as {classification} (qty={total}, price={price})")
+                        logger.debug(
+                            f"[{self.name}] Classified {asset_upper} as {classification} (qty={total}, price={price})"
+                        )
                 except Exception as e:
-                    logger.debug(f"[{self.name}] Failed to register classification for {asset_upper}: {e}")
-        
+                    logger.debug(
+                        f"[{self.name}] Failed to register classification for {asset_upper}: {e}"
+                    )
+
         except Exception as e:
-            logger.error(f"[{self.name}] Error in _classify_and_register_wallet_assets: {e}", exc_info=True)
+            logger.error(
+                f"[{self.name}] Error in _classify_and_register_wallet_assets: {e}", exc_info=True
+            )
 
     async def run_once(self):
         """
@@ -431,13 +487,17 @@ class WalletScannerAgent:
                 return
             self._running = True
             try:
-                logger.info(f"[{self.name}] Initiating wallet scan (min_balance_threshold={self.min_balance_threshold})")
+                logger.info(
+                    f"[{self.name}] Initiating wallet scan (min_balance_threshold={self.min_balance_threshold})"
+                )
 
                 if not self.exchange_client:
                     logger.info(f"[{self.name}] Skipping: exchange_client not wired yet.")
                     return
                 if not hasattr(self.exchange_client, "get_account_balances"):
-                    logger.warning(f"[{self.name}] Skipping: exchange_client lacks get_account_balances()")
+                    logger.warning(
+                        f"[{self.name}] Skipping: exchange_client lacks get_account_balances()"
+                    )
                     return
 
                 try:
@@ -445,7 +505,7 @@ class WalletScannerAgent:
                     # FIX: Persist wallet universe immediately so SharedState knows about held assets
                     if balances and hasattr(self.shared_state, "update_balances"):
                         await self.shared_state.update_balances(balances)
-                    
+
                     # PHASE 2: Classify wallet assets with professional metadata
                     await self._classify_and_register_wallet_assets(balances)
                 except Exception as e:
@@ -454,7 +514,13 @@ class WalletScannerAgent:
 
                 # Determine quote & free quote amount
                 quote = str(getattr(self.config, "DEFAULT_QUOTE_CURRENCY", "USDT")).upper()
-                known_quotes = set(getattr(self.exchange_client, "_known_quotes", {"USDT","FDUSD","USDC","BUSD","TUSD","DAI"}))
+                known_quotes = set(
+                    getattr(
+                        self.exchange_client,
+                        "_known_quotes",
+                        {"USDT", "FDUSD", "USDC", "BUSD", "TUSD", "DAI"},
+                    )
+                )
                 if hasattr(self.exchange_client, "get_known_quotes"):
                     try:
                         kq = self.exchange_client.get_known_quotes()
@@ -472,7 +538,7 @@ class WalletScannerAgent:
                 try:
                     if quote_free < self.quote_free_threshold:
                         # Build candidate bases to liquidate (exclude quotes themselves)
-                        liq_candidates: List[Tuple[str, float]] = []
+                        liq_candidates: list[tuple[str, float]] = []
                         for asset, info in (balances or {}).items():
                             if not isinstance(info, dict):
                                 continue
@@ -485,7 +551,9 @@ class WalletScannerAgent:
                             symbol = f"{base}{quote}"
                             # ensure tradable
                             if not await self._is_tradable_symbol(symbol):
-                                logger.debug(f"[{self.name}] Skip non-tradable for liquidation: {symbol}")
+                                logger.debug(
+                                    f"[{self.name}] Skip non-tradable for liquidation: {symbol}"
+                                )
                                 continue
                             # estimate quote value
                             price = await self._get_price(symbol)
@@ -497,18 +565,26 @@ class WalletScannerAgent:
                         # Limit and request liquidations
                         liq_count = 0
                         for symbol, qty in liq_candidates[: self.max_liqs_per_scan]:
-                            ok = await self._request_liquidation(symbol, qty, reason="reclaim_quote_balance")
+                            ok = await self._request_liquidation(
+                                symbol, qty, reason="reclaim_quote_balance"
+                            )
                             if ok:
                                 liq_count += 1
-                                logger.info(f"[{self.name}] 📉 Requested liquidation: {symbol} qty={qty} (quote free {quote_free} &lt; {self.quote_free_threshold})")
+                                logger.info(
+                                    f"[{self.name}] 📉 Requested liquidation: {symbol} qty={qty} (quote free {quote_free} &lt; {self.quote_free_threshold})"
+                                )
                             await asyncio.sleep(0)  # yield
                         if liq_count == 0:
-                            logger.info(f"[{self.name}] Quote below threshold but no liquidation candidates found (threshold={self.quote_free_threshold}, min_q={self.dust_liq_min_quote})")
+                            logger.info(
+                                f"[{self.name}] Quote below threshold but no liquidation candidates found (threshold={self.quote_free_threshold}, min_q={self.dust_liq_min_quote})"
+                            )
                 except Exception:
-                    logger.debug(f"[{self.name}] liquidation attempt failed (non-fatal)", exc_info=True)
+                    logger.debug(
+                        f"[{self.name}] liquidation attempt failed (non-fatal)", exc_info=True
+                    )
 
                 # Filter non-zero > threshold
-                filtered: Dict[str, float] = {}
+                filtered: dict[str, float] = {}
                 for asset, info in (balances or {}).items():
                     if not isinstance(info, dict):
                         continue
@@ -538,12 +614,13 @@ class WalletScannerAgent:
                         continue
 
                     symbol = f"{base}{quote}"
-                    
+
                     # Exchange status & minNotional prefilter (defensive)
                     try:
                         if not await self._prefilter_symbol(symbol):
                             continue
-                    except Exception: continue
+                    except Exception:
+                        continue
 
                     # tradability gate (avoid proposing delisted or paused symbols)
                     tradable = await self._is_tradable_symbol(symbol)
@@ -562,11 +639,13 @@ class WalletScannerAgent:
                         f"(propose_symbols={self.propose_symbols})"
                     )
                 if self.propose_symbols and candidates and self.symbol_manager:
-                    logger.info(f"[{self.name}] Proposing batch of {len(candidates)} symbol(s) to trading universe...")
+                    logger.info(
+                        f"[{self.name}] Proposing batch of {len(candidates)} symbol(s) to trading universe..."
+                    )
                     try:
                         accepted_list = await asyncio.wait_for(
                             self.symbol_manager.propose_symbols(candidates, source=self.name),
-                            timeout=30
+                            timeout=30,
                         )
 
                         for s in accepted_list:
@@ -575,8 +654,11 @@ class WalletScannerAgent:
                             # Emit events for accepted ones
                             if self.emit_accept_event and hasattr(self.shared_state, "emit_event"):
                                 try:
-                                    await self.shared_state.emit_event("AcceptedSymbol", {"symbol": s, "source": self.name})
-                                except Exception: pass
+                                    await self.shared_state.emit_event(
+                                        "AcceptedSymbol", {"symbol": s, "source": self.name}
+                                    )
+                                except Exception:
+                                    pass
                     except Exception as e:
                         logger.error(f"[{self.name}] Batch proposal failed: {e}")
                 elif candidates and not self.propose_symbols:

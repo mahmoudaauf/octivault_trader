@@ -9,10 +9,9 @@
 import asyncio
 import logging
 import time
-from typing import Any, Dict, Optional
-from typing import Tuple
+from typing import Any, Optional
 
-from src.l0_core.stubs import maybe_await, maybe_call  # safe sync/async invocation
+from src.l0_core.stubs import maybe_call  # safe sync/async invocation
 
 logger = logging.getLogger("PerformanceEvaluator")
 
@@ -100,7 +99,7 @@ class PerformanceEvaluator:
         """Public entry point (compatible with AppContext.initialize_all)."""
         self._stop_event.clear()
         self.logger.info("🎯 Starting PerformanceEvaluator loop...")
-        
+
         # Emit Initialized so Watchdog doesn't flag no-report
         try:
             await self._emit_health("Initialized", "Ready")
@@ -153,7 +152,9 @@ class PerformanceEvaluator:
                 "WarmingUp",
                 "Awaiting symbols + market data + first portfolio snapshot",
             )
-            await _touch_watchdog(self.ss, "PerformanceEvaluator", "WarmingUp", "Awaiting symbols/market/snapshot")
+            await _touch_watchdog(
+                self.ss, "PerformanceEvaluator", "WarmingUp", "Awaiting symbols/market/snapshot"
+            )
             return
 
         # Collect inputs (best-effort; tolerate missing bits)
@@ -169,11 +170,21 @@ class PerformanceEvaluator:
             "usdt_per_hour": await self._estimate_usdt_per_hour(default=0.0),
             "drawdown_pct": await self._estimate_drawdown_pct(default=0.0),
             # Capital-quality buckets (published by SharedState.update_capital_bucket_metrics)
-            "free_cash_ratio": float(getattr(self.ss, "metrics", {}).get("free_cash_ratio", 0.0) or 0.0),
-            "operating_cash_ratio": float(getattr(self.ss, "metrics", {}).get("operating_cash_ratio", 0.0) or 0.0),
-            "productive_capital_ratio": float(getattr(self.ss, "metrics", {}).get("productive_capital_ratio", 0.0) or 0.0),
-            "dead_capital_ratio": float(getattr(self.ss, "metrics", {}).get("dead_capital_ratio", 0.0) or 0.0),
-            "dust_class_breakdown": dict(getattr(self.ss, "metrics", {}).get("dust_class_breakdown", {}) or {}),
+            "free_cash_ratio": float(
+                getattr(self.ss, "metrics", {}).get("free_cash_ratio", 0.0) or 0.0
+            ),
+            "operating_cash_ratio": float(
+                getattr(self.ss, "metrics", {}).get("operating_cash_ratio", 0.0) or 0.0
+            ),
+            "productive_capital_ratio": float(
+                getattr(self.ss, "metrics", {}).get("productive_capital_ratio", 0.0) or 0.0
+            ),
+            "dead_capital_ratio": float(
+                getattr(self.ss, "metrics", {}).get("dead_capital_ratio", 0.0) or 0.0
+            ),
+            "dust_class_breakdown": dict(
+                getattr(self.ss, "metrics", {}).get("dust_class_breakdown", {}) or {}
+            ),
             "breaches": int(getattr(self.ss, "kpi_breaches", 0) or 0),
         }
 
@@ -211,7 +222,7 @@ class PerformanceEvaluator:
                 target_usdt_h,
                 ignore_breach,
             )
-            
+
         status = "Running"
         msg = "OK"
 
@@ -245,7 +256,7 @@ class PerformanceEvaluator:
         ignore_reasons = {r.strip().upper() for r in ignore_csv.split(",") if r.strip()}
         rej_ttl_sec = 300.0  # 5 minutes (must match shared_state.py TTL)
         now_ts_local = time.time()
-        
+
         if hasattr(self.ss, "rejection_counters"):
             for (sym, side, reason), count in self.ss.rejection_counters.items():
                 # Apply TTL decay: if no rejection in past 5 min, treat as expired
@@ -258,7 +269,7 @@ class PerformanceEvaluator:
                 total_rejections += count
                 if count > max_rejection_count:
                     max_rejection_count = count
-        
+
         if max_rejection_count >= deadlock_threshold:
             status = "Error"
             msg = f"DEADLOCK: Symbol stuck with {max_rejection_count} consecutive rejections"
@@ -273,12 +284,12 @@ class PerformanceEvaluator:
         # Use SharedState _trading_start_time if available, or current
         start_ts = getattr(self.ss, "_start_time_unix", now_ts)
         uptime_sec = now_ts - start_ts
-        
+
         if status not in ("Error", "Degraded"):  # Don't override deadlock status
             # GLOBAL SYSTEMIC DEGRADATION GUARD - INSTITUTIONAL FEATURE
             # Check for system-wide performance degradation that requires global risk reduction
             global_degradation_triggered = False
-            
+
             # 1. Global Sharpe Ratio Floor
             sharpe_floor = float(getattr(self.config, "GLOBAL_SHARPE_RATIO_FLOOR", 0.0) or 0.0)
             if sharpe_floor > 0:
@@ -286,22 +297,25 @@ class PerformanceEvaluator:
                     # Calculate rolling Sharpe ratio from recent performance
                     sharpe_window_hours = int(getattr(self.config, "SHARPE_WINDOW_HOURS", 24) or 24)
                     sharpe_cutoff = now_ts - (sharpe_window_hours * 3600)
-                    
+
                     returns = []
                     if hasattr(self.ss, "trade_history"):
-                        for trade in (self.ss.trade_history or []):
+                        for trade in self.ss.trade_history or []:
                             if isinstance(trade, dict):
                                 ts = float(trade.get("ts", 0) or 0)
                                 if ts >= sharpe_cutoff:
                                     pnl = float(trade.get("realized_delta", 0) or 0)
                                     if abs(pnl) > 1e-8:  # Only count meaningful trades
                                         returns.append(pnl)
-                    
+
                     if len(returns) >= 10:  # Need minimum sample size
                         import numpy as np
+
                         returns_array = np.array(returns)
                         if returns_array.std() > 0:
-                            sharpe = returns_array.mean() / returns_array.std() * np.sqrt(365*24)  # Annualized
+                            sharpe = (
+                                returns_array.mean() / returns_array.std() * np.sqrt(365 * 24)
+                            )  # Annualized
                             if sharpe < sharpe_floor:
                                 status = "Degraded"
                                 msg = f"GLOBAL_DEGRADATION: Sharpe {sharpe:.2f} < floor {sharpe_floor:.2f}"
@@ -309,29 +323,33 @@ class PerformanceEvaluator:
                                 self.logger.warning(f"[PerfEval:GlobalDegradation] {msg}")
                 except Exception as e:
                     self.logger.debug(f"Sharpe ratio calculation failed: {e}")
-            
+
             # 2. Global Drawdown Threshold
             if not global_degradation_triggered:
-                drawdown_threshold = float(getattr(self.config, "GLOBAL_DRAWDOWN_THRESHOLD_PCT", 0.0) or 0.0)
+                drawdown_threshold = float(
+                    getattr(self.config, "GLOBAL_DRAWDOWN_THRESHOLD_PCT", 0.0) or 0.0
+                )
                 if drawdown_threshold > 0:
                     try:
                         # Calculate system-wide drawdown
                         start_equity = float(getattr(self.ss, "_total_value_start", 0.0) or 0.0)
                         current_equity = float(getattr(self.ss, "_total_value", 0.0) or 0.0)
-                        
+
                         if start_equity > 0 and current_equity > 0:
                             drawdown_pct = (start_equity - current_equity) / start_equity
                             if drawdown_pct >= drawdown_threshold:
-                                status = "Degraded" 
+                                status = "Degraded"
                                 msg = f"GLOBAL_DRAWDOWN: {drawdown_pct:.1%} >= threshold {drawdown_threshold:.1%}"
                                 global_degradation_triggered = True
                                 self.logger.warning(f"[PerfEval:GlobalDegradation] {msg}")
                     except Exception as e:
                         self.logger.debug(f"Drawdown calculation failed: {e}")
-            
+
             # 3. All Agents Degraded Check
             if not global_degradation_triggered:
-                all_agents_degraded_threshold = float(getattr(self.config, "ALL_AGENTS_DEGRADED_THRESHOLD", 0.0) or 0.0)
+                all_agents_degraded_threshold = float(
+                    getattr(self.config, "ALL_AGENTS_DEGRADED_THRESHOLD", 0.0) or 0.0
+                )
                 if all_agents_degraded_threshold > 0:
                     try:
                         # Check if all agents have degraded performance
@@ -339,14 +357,14 @@ class PerformanceEvaluator:
                         if perf_map and len(perf_map) > 1:  # Need multiple agents to check
                             degraded_count = 0
                             total_agents = len(perf_map)
-                            
+
                             for agent_stats in perf_map.values():
                                 roi = float(agent_stats.get("roi", 0.0))
                                 win_rate = float(agent_stats.get("win_rate", 0.5))
                                 # Agent is degraded if both ROI negative and win rate below threshold
                                 if roi < 0 and win_rate < all_agents_degraded_threshold:
                                     degraded_count += 1
-                            
+
                             if degraded_count == total_agents:
                                 status = "Degraded"
                                 msg = f"ALL_AGENTS_DEGRADED: {degraded_count}/{total_agents} agents below threshold {all_agents_degraded_threshold:.1%}"
@@ -354,43 +372,48 @@ class PerformanceEvaluator:
                                 self.logger.warning(f"[PerfEval:GlobalDegradation] {msg}")
                     except Exception as e:
                         self.logger.debug(f"All agents degraded check failed: {e}")
-            
+
             # 4. Trigger Global Risk Reduction if Degradation Detected
             if global_degradation_triggered:
                 try:
                     # Signal global risk reduction to CapitalAllocator and other components
                     if hasattr(self.ss, "emit_event"):
-                        await self.ss.emit_event("GLOBAL_SYSTEMIC_DEGRADATION", {
-                            "status": status,
-                            "reason": msg,
-                            "timestamp": now_ts,
-                            "component": "PerformanceEvaluator"
-                        })
-                    
+                        await self.ss.emit_event(
+                            "GLOBAL_SYSTEMIC_DEGRADATION",
+                            {
+                                "status": status,
+                                "reason": msg,
+                                "timestamp": now_ts,
+                                "component": "PerformanceEvaluator",
+                            },
+                        )
+
                     # Update metrics for dashboard visibility
                     if hasattr(self.ss, "metrics") and isinstance(self.ss.metrics, dict):
                         self.ss.metrics["global_systemic_degradation"] = True
                         self.ss.metrics["global_degradation_reason"] = msg
                         self.ss.metrics["global_degradation_timestamp"] = now_ts
-                        
+
                 except Exception as e:
                     self.logger.debug(f"Global degradation signaling failed: {e}")
 
-        # UPTIME GRACE (PHASE A): Ignore noise during first 30 mins
+            # UPTIME GRACE (PHASE A): Ignore noise during first 30 mins
             if uptime_sec < (uptime_grace_min * 60):
-                 msg = f"WarmUp Grace: uptime={uptime_sec/60:.1f}m < {uptime_grace_min}m"
+                msg = f"WarmUp Grace: uptime={uptime_sec/60:.1f}m < {uptime_grace_min}m"
             elif target_usdt_h > 0.0 and kpi_metrics["usdt_per_hour"] < target_usdt_h:
                 status = "Breach"
                 msg = f"usdt/h={kpi_metrics['usdt_per_hour']:.3f} < target={target_usdt_h:.2f}"
-        
+
         # P9 ECONOMIC READINESS CHECK
         economically_ready = True
         if hasattr(self.ss, "is_economically_ready"):
             try:
-                economically_ready = await self.ss.is_economically_ready(min_executable_symbols=1, threshold=deadlock_threshold)
+                economically_ready = await self.ss.is_economically_ready(
+                    min_executable_symbols=1, threshold=deadlock_threshold
+                )
             except Exception:
                 pass
-        
+
         if not economically_ready and status == "Running":
             status = "Degraded"
             msg = "ECONOMIC_STARVATION: No executable symbols available"
@@ -400,7 +423,11 @@ class PerformanceEvaluator:
         await self._emit_report(kpi_metrics, status_msg=msg)
 
         # Emit HealthStatus - respect deadlock/degraded status
-        final_status = status if status in ("Error", "Degraded") else ("Running" if status != "Breach" else "Breach")
+        final_status = (
+            status
+            if status in ("Error", "Degraded")
+            else ("Running" if status != "Breach" else "Breach")
+        )
         await self._emit_health(final_status, msg)
         await _touch_watchdog(self.ss, "PerformanceEvaluator", final_status, msg)
 
@@ -420,31 +447,33 @@ class PerformanceEvaluator:
             has_some_market = False
             ev = getattr(self.ss, "market_data_ready_event", None)
             if ev and hasattr(ev, "is_set") and ev.is_set():
-                 has_some_market = True
+                has_some_market = True
             else:
-                 # Check manually if we have at least 1 bar for any symbol
-                 md = getattr(self.ss, "market_data", {})
-                 if md and len(md) > 0:
-                      # If we have bars for symbols we OWN, we are definitely ready
-                      owned = getattr(self.ss, "positions", {})
-                      if any( (s, "5m") in md for s in owned):
-                           has_some_market = True
-                      elif len(md) > 3: # Or generic coverage
-                           has_some_market = True
+                # Check manually if we have at least 1 bar for any symbol
+                md = getattr(self.ss, "market_data", {})
+                if md and len(md) > 0:
+                    # If we have bars for symbols we OWN, we are definitely ready
+                    owned = getattr(self.ss, "positions", {})
+                    if any((s, "5m") in md for s in owned):
+                        has_some_market = True
+                    elif len(md) > 3:  # Or generic coverage
+                        has_some_market = True
 
             # Get current NAV and Bootstrap status from SharedState
             nav = 0.0
             if hasattr(self.ss, "get_nav_quote"):
                 nav = self.ss.get_nav_quote()
-                if asyncio.iscoroutine(nav): nav = await nav
+                if asyncio.iscoroutine(nav):
+                    nav = await nav
             elif hasattr(self.ss, "metrics"):
                 nav = float(self.ss.metrics.get("nav", 0.0))
 
             is_bootstrap = False
             if hasattr(self.ss, "is_bootstrap_mode"):
                 is_bootstrap = self.ss.is_bootstrap_mode()
-                if asyncio.iscoroutine(is_bootstrap): is_bootstrap = await is_bootstrap
-            
+                if asyncio.iscoroutine(is_bootstrap):
+                    is_bootstrap = await is_bootstrap
+
             return bool(has_some_market and (nav > 0 or is_bootstrap))
         except Exception as e:
             self.logger.debug("PerfEval readiness check failed: %s", e)
@@ -457,27 +486,27 @@ class PerformanceEvaluator:
         try:
             # 1. Try SharedState trade_history (canonical source)
             history = getattr(self.ss, "trade_history", [])
-            
+
             # 2. Fallback to PnLCalculator's lightweight deque if history is empty/missing
             if not history and hasattr(self.ss, "_realized_pnl"):
                 history = [{"ts": x[0], "realized_delta": x[1]} for x in self.ss._realized_pnl]
-            
+
             if not history:
                 return default
-            
+
             now = time.time()
             one_hour_ago = now - 3600
-            
+
             # Sum realized_delta for trades within the last hour
             hourly_pnl = sum(
-                float(t.get("realized_delta", 0.0)) 
-                for t in history 
+                float(t.get("realized_delta", 0.0))
+                for t in history
                 if t.get("ts", 0) > one_hour_ago
             )
-            
+
             # Store it back to SS for other consumers (e.g. MetaController)
-            setattr(self.ss, "kpi_usdt_per_hour", hourly_pnl)
-            
+            self.ss.kpi_usdt_per_hour = hourly_pnl
+
             return hourly_pnl
         except Exception:
             self.logger.debug("Failed to estimate usdt_per_hour", exc_info=True)
@@ -505,7 +534,7 @@ class PerformanceEvaluator:
             # As a last resort (shouldn’t happen in P9), log only
             self.logger.debug("HealthStatus (no SS): %s", payload)
 
-    async def _emit_report(self, report: Dict[str, Any], status_msg: str = "OK"):
+    async def _emit_report(self, report: dict[str, Any], status_msg: str = "OK"):
         payload = {
             "source": "PerformanceEvaluator",
             "status": "OK",

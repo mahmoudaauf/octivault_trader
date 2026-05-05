@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import math
 import random
 import time
-import math
-from typing import Any, Dict, List, Optional, Iterable, Tuple, Callable
-import logging
+from collections.abc import Callable, Iterable
+from typing import Any, Optional
 
 # ── Optional enums from SharedState (don’t hard-fail if missing) ──────────────
 try:
@@ -35,28 +36,27 @@ except Exception:
 
 # ── OHLCV disk cache (reduces cold-start API calls) ──────────────────────────
 try:
-    from utils.ohlcv_cache import load_ohlcv_from_cache, save_ohlcv_to_csv, fetch_and_cache_ohlcv
+    from utils.ohlcv_cache import load_ohlcv_from_cache, save_ohlcv_to_csv
+
     _HAS_OHLCV_CACHE = True
 except Exception:
     _HAS_OHLCV_CACHE = False
 
 # ── TA indicators (volume surge, RSI, EMA helpers) ────────────────────────────
 try:
-    from utils.ta_indicators import calculate_ema, calculate_rsi, calculate_volume_surge
     _HAS_TA_INDICATORS = True
 except Exception:
     _HAS_TA_INDICATORS = False
 
 # ── Tuned symbol params ───────────────────────────────────────────────────────
 try:
-    from utils.tuned_params import get_tuned_params, get_symbol_volatility_class
     _HAS_TUNED_PARAMS = True
 except Exception:
     _HAS_TUNED_PARAMS = False
 
 
-API_AUTH_ERR_CODES = {-2015, -2014}        # Invalid key/permissions/signature
-API_RATELIMIT_ERR_CODES = {-1003, -1015, -1021}   # Rate limit, too many requests, time skew
+API_AUTH_ERR_CODES = {-2015, -2014}  # Invalid key/permissions/signature
+API_RATELIMIT_ERR_CODES = {-1003, -1015, -1021}  # Rate limit, too many requests, time skew
 
 
 class MarketDataFeed:
@@ -87,8 +87,8 @@ class MarketDataFeed:
         shared_state: Any,
         exchange_client: Any,
         *,
-        config: Optional[Dict[str, Any]] = None,
-        ohlcv_timeframes: Optional[List[str]] = None,
+        config: Optional[dict[str, Any]] = None,
+        ohlcv_timeframes: Optional[list[str]] = None,
         ohlcv_limit: int = 100,
         poll_interval: float = 15.0,
         max_concurrency: int = 8,
@@ -107,20 +107,20 @@ class MarketDataFeed:
         self._logger = logger or logging.getLogger("MarketDataFeed")
         if self._logger.level == logging.NOTSET:
             self._logger.setLevel(logging.INFO)
-        
+
         self.shared_state = shared_state
         self.exchange_client = exchange_client
         self._ec_public_ok: bool = True  # allow public-only bootstrap for unsigned endpoints
 
         cfg = config or {}
         self.config = cfg
-        
+
         # Helper to access config whether it's a dict or object
         def _cfg(key, default=None):
             if isinstance(cfg, dict):
                 return cfg.get(key, default)
             return getattr(cfg, key, default)
-        
+
         tfs = (
             _cfg("ohlcv_timeframes")
             or _cfg("SUPPORTED_TIMEFRAMES")
@@ -129,7 +129,7 @@ class MarketDataFeed:
         )
         if isinstance(tfs, str):
             tfs = [t.strip() for t in tfs.split(",") if t.strip()]
-        self.timeframes: List[str] = [str(t).strip() for t in tfs]
+        self.timeframes: list[str] = [str(t).strip() for t in tfs]
         # MDF_OHLCV_LIMIT supports higher candle fetches for better training data
         raw_limit = _cfg("MDF_OHLCV_LIMIT") or _cfg("ohlcv_limit", ohlcv_limit)
         try:
@@ -145,11 +145,20 @@ class MarketDataFeed:
         self.jitter_max: float = float(_cfg("jitter_max", 0.7))
         self.health_cadence_sec: float = float(_cfg("health_cadence_sec", health_cadence_sec))
         self.warmup_timeout_sec: float = float(_cfg("warmup_timeout_sec", warmup_timeout_sec))
-        self.retry_after_no_symbols_sec: float = float(_cfg("retry_after_no_symbols_sec", retry_after_no_symbols_sec))
-        self.max_retry_backoff_sec: float = float(_cfg("max_retry_backoff_sec", max_retry_backoff_sec))
+        self.retry_after_no_symbols_sec: float = float(
+            _cfg("retry_after_no_symbols_sec", retry_after_no_symbols_sec)
+        )
+        self.max_retry_backoff_sec: float = float(
+            _cfg("max_retry_backoff_sec", max_retry_backoff_sec)
+        )
         self.max_retry_attempts: int = int(_cfg("max_retry_attempts", 6))
         self.min_bars_required: int = int(_cfg("min_bars_required", min_bars_required))
-        self._logger.info("[MDF] OHLCV limit=%d min_bars_required=%d timeframes=%s", self.ohlcv_limit, self.min_bars_required, self.timeframes)
+        self._logger.info(
+            "[MDF] OHLCV limit=%d min_bars_required=%d timeframes=%s",
+            self.ohlcv_limit,
+            self.min_bars_required,
+            self.timeframes,
+        )
         self.readiness_emit: bool = bool(_cfg("readiness_emit", readiness_emit))
         self.per_symbol_readiness: bool = bool(_cfg("per_symbol_readiness", per_symbol_readiness))
         self._declared_ready: bool = False
@@ -160,7 +169,7 @@ class MarketDataFeed:
         self._websocket_task: Optional[asyncio.Task] = None
         if self.enable_websocket and MarketDataWebSocket:
             self._logger.info("[MDF] WebSocket support enabled (hybrid mode)")
-        
+
         # Helper to access config
         self._cfg = _cfg
 
@@ -178,10 +187,12 @@ class MarketDataFeed:
         self._missing_exchange_cycles: int = 0
         self._poll_cycle: int = 0
         self._known_symbols: set[str] = set()
-        self._backfill_tasks: Dict[str, asyncio.Task] = {}
+        self._backfill_tasks: dict[str, asyncio.Task] = {}
 
         # Initialize symbols dict for WebSocket feed (hybrid mode)
-        self.symbols: Dict[str, Any] = {}  # Will be populated at runtime from _get_accepted_symbols()
+        self.symbols: dict[
+            str, Any
+        ] = {}  # Will be populated at runtime from _get_accepted_symbols()
 
         # Resolve component and code values (enum if present, else strings)
         self._component_key = getattr(_ComponentEnum, "MARKET_DATA_FEED", "MarketDataFeed")
@@ -243,8 +254,10 @@ class MarketDataFeed:
             return int(float(tf[:-1]) * 604800)
         return 60
 
-    def _sanitize_ohlcv(self, rows: Iterable[Iterable[float]], timeframe: Optional[str] = None) -> List[List[float]]:
-        cleaned: List[List[float]] = []
+    def _sanitize_ohlcv(
+        self, rows: Iterable[Iterable[float]], timeframe: Optional[str] = None
+    ) -> list[list[float]]:
+        cleaned: list[list[float]] = []
         for r in rows or []:
             if r is None or len(r) < 6:
                 continue
@@ -271,14 +284,17 @@ class MarketDataFeed:
             interval = self._timeframe_to_seconds(timeframe)
             if interval > 0:
                 gaps = []
-                for prev, curr in zip(cleaned, cleaned[1:]):
+                for prev, curr in zip(cleaned, cleaned[1:], strict=False):
                     delta = curr[0] - prev[0]
                     if delta > interval * 1.5:
                         gaps.append(delta)
                 if gaps:
                     self._logger.warning(
                         "[MDF] Detected %d gap(s) in OHLCV for timeframe=%s: max_gap=%.0fs, expected=%ds",
-                        len(gaps), timeframe, max(gaps), interval,
+                        len(gaps),
+                        timeframe,
+                        max(gaps),
+                        interval,
                     )
         return cleaned
 
@@ -289,14 +305,14 @@ class MarketDataFeed:
         return val
 
     @staticmethod
-    def _normalize_symbol_payload(payload: Any) -> List[str]:
+    def _normalize_symbol_payload(payload: Any) -> list[str]:
         if isinstance(payload, dict):
             raw = list(payload.keys())
         elif isinstance(payload, (list, tuple, set)):
             raw = list(payload)
         else:
             raw = []
-        out: List[str] = []
+        out: list[str] = []
         for item in raw:
             sym = str(item or "").strip().upper()
             if sym:
@@ -387,7 +403,7 @@ class MarketDataFeed:
             )
             return False
 
-    async def _set_health(self, code, msg: str, metrics: Optional[Dict[str, Any]] = None):
+    async def _set_health(self, code, msg: str, metrics: Optional[dict[str, Any]] = None):
         """
         Send health via SharedState.set_component_health if available.
         Works with enums or strings; never crashes the caller.
@@ -395,7 +411,7 @@ class MarketDataFeed:
         """
         try:
             merged_metrics = metrics or {}
-            
+
             # ⚡ Include WebSocket metrics if available (NEW)
             if self.websocket_feed and hasattr(self.websocket_feed, "get_stats"):
                 try:
@@ -404,7 +420,7 @@ class MarketDataFeed:
                         merged_metrics["websocket"] = ws_stats
                 except Exception:
                     pass
-            
+
             fn = getattr(self.shared_state, "set_component_health", None)
             if not fn:
                 return
@@ -412,7 +428,7 @@ class MarketDataFeed:
         except Exception:
             self._logger.debug("set_component_health failed", exc_info=True)
 
-    async def _get_accepted_symbols(self) -> List[str]:
+    async def _get_accepted_symbols(self) -> list[str]:
         getters = ("get_accepted_symbols", "get_accepted_symbols_snapshot")
         for name in getters:
             try:
@@ -426,7 +442,9 @@ class MarketDataFeed:
             except Exception:
                 self._logger.debug("%s failed", name, exc_info=True)
         try:
-            syms = self._normalize_symbol_payload(getattr(self.shared_state, "accepted_symbols", {}))
+            syms = self._normalize_symbol_payload(
+                getattr(self.shared_state, "accepted_symbols", {})
+            )
             if syms:
                 return syms
         except Exception:
@@ -511,7 +529,7 @@ class MarketDataFeed:
         except Exception:
             self._logger.debug("mark_symbol_ready failed for %s", sym, exc_info=True)
 
-    async def _schedule_symbol_backfill(self, symbols: List[str]) -> None:
+    async def _schedule_symbol_backfill(self, symbols: list[str]) -> None:
         """
         Schedule full-window backfill for newly accepted symbols.
         Keeps symbol ATR/indicator paths warm instead of waiting on tail polling.
@@ -542,7 +560,9 @@ class MarketDataFeed:
                 except Exception:
                     return
                 if exc is not None:
-                    self._logger.warning("[MDF] accepted-symbol backfill failed for %s: %s", symbol, exc)
+                    self._logger.warning(
+                        "[MDF] accepted-symbol backfill failed for %s: %s", symbol, exc
+                    )
 
             task.add_done_callback(_done)
 
@@ -573,7 +593,7 @@ class MarketDataFeed:
             pass
         return None
 
-    def _classify_error(self, err: Exception) -> Tuple[str, Dict[str, Any]]:
+    def _classify_error(self, err: Exception) -> tuple[str, dict[str, Any]]:
         code = self._extract_api_code(err)
         kind = "ExternalAPIError"
         if code in API_AUTH_ERR_CODES:
@@ -582,10 +602,14 @@ class MarketDataFeed:
             kind = "RateLimit"
             # 🎛️ Notify governor of rate limit
             try:
-                if (hasattr(self, 'shared_state') and self.shared_state and 
-                    hasattr(self.shared_state, '_app_context') and self.shared_state._app_context):
+                if (
+                    hasattr(self, "shared_state")
+                    and self.shared_state
+                    and hasattr(self.shared_state, "_app_context")
+                    and self.shared_state._app_context
+                ):
                     app = self.shared_state._app_context
-                    if hasattr(app, 'capital_symbol_governor') and app.capital_symbol_governor:
+                    if hasattr(app, "capital_symbol_governor") and app.capital_symbol_governor:
                         app.capital_symbol_governor.mark_api_rate_limited()
             except Exception:
                 pass  # Silently fail if governor unavailable
@@ -597,12 +621,12 @@ class MarketDataFeed:
         return kind, meta
 
     @staticmethod
-    def _parse_op_label(what: str) -> Dict[str, Any]:
+    def _parse_op_label(what: str) -> dict[str, Any]:
         """
         Parse op label like "warmup.get_ohlcv[BTCUSDT,1m]" or
         "poll.get_price[ETHUSDT]" into structured fields.
         """
-        out: Dict[str, Any] = {"op": str(what)}
+        out: dict[str, Any] = {"op": str(what)}
         try:
             label = str(what)
             if "[" in label and "]" in label:
@@ -674,14 +698,24 @@ class MarketDataFeed:
                 syms = await self._get_accepted_symbols()
                 try:
                     ec = await self._get_exchange_client()
-                    if ec is not None and hasattr(ec, "api_key") and not getattr(ec, "api_key", None):
+                    if (
+                        ec is not None
+                        and hasattr(ec, "api_key")
+                        and not getattr(ec, "api_key", None)
+                    ):
                         recent_err = False
                         try:
-                            recent_err = (time.time() - float(self._last_error_ts or 0.0)) <= (self.health_cadence_sec * 2.0)
+                            recent_err = (time.time() - float(self._last_error_ts or 0.0)) <= (
+                                self.health_cadence_sec * 2.0
+                            )
                         except Exception:
                             recent_err = False
                         code = self._code_warn if recent_err else self._code_ok
-                        msg = "heartbeat(public-only, recent_errors)" if recent_err else "heartbeat(public-only)"
+                        msg = (
+                            "heartbeat(public-only, recent_errors)"
+                            if recent_err
+                            else "heartbeat(public-only)"
+                        )
                         await self._set_health(code, msg, metrics={"symbols": len(syms)})
                         await asyncio.sleep(self.health_cadence_sec)
                         continue
@@ -689,7 +723,9 @@ class MarketDataFeed:
                     pass
                 recent_err = False
                 try:
-                    recent_err = (time.time() - float(self._last_error_ts or 0.0)) <= (self.health_cadence_sec * 2.0)
+                    recent_err = (time.time() - float(self._last_error_ts or 0.0)) <= (
+                        self.health_cadence_sec * 2.0
+                    )
                 except Exception:
                     recent_err = False
                 code = self._code_warn if recent_err else self._code_ok
@@ -755,26 +791,41 @@ class MarketDataFeed:
                     if _HAS_OHLCV_CACHE:
                         try:
                             import pandas as _pd
+
                             _cached_df = load_ohlcv_from_cache(_cache_key)
                         except Exception:
                             _cached_df = None
                     if _cached_df is not None and len(_cached_df) >= self.ohlcv_limit // 2:
                         # Use cached data — convert df rows to list format
                         try:
-                            rows = _cached_df[["open", "high", "low", "close", "volume"]].values.tolist()
-                            self._logger.debug("[MDF:Cache] Loaded %d bars for %s/%s from disk cache", len(rows), sym, tf)
+                            rows = _cached_df[
+                                ["open", "high", "low", "close", "volume"]
+                            ].values.tolist()
+                            self._logger.debug(
+                                "[MDF:Cache] Loaded %d bars for %s/%s from disk cache",
+                                len(rows),
+                                sym,
+                                tf,
+                            )
                         except Exception:
                             rows = []
                     else:
+
                         async def _fetch_ohlcv():
                             return await ec.get_ohlcv(sym, tf, limit=self.ohlcv_limit)
-                        rows = await self._with_retries(_fetch_ohlcv, f"warmup.get_ohlcv[{sym},{tf}]")
+
+                        rows = await self._with_retries(
+                            _fetch_ohlcv, f"warmup.get_ohlcv[{sym},{tf}]"
+                        )
                         rows = self._sanitize_ohlcv(rows or [], tf)
                         # Persist to disk cache for next startup
                         if rows and _HAS_OHLCV_CACHE:
                             try:
                                 import pandas as _pd
-                                _df = _pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"])
+
+                                _df = _pd.DataFrame(
+                                    rows, columns=["open", "high", "low", "close", "volume"]
+                                )
                                 save_ohlcv_to_csv(_cache_key, _df)
                             except Exception:
                                 pass
@@ -784,6 +835,7 @@ class MarketDataFeed:
                 # Last price
                 async def _fetch_price():
                     return await ec.get_current_price(sym)
+
                 price = await self._with_retries(_fetch_price, f"warmup.get_price[{sym}]")
                 price_f = self._coerce_positive_price(price)
                 if price_f > 0:
@@ -804,7 +856,9 @@ class MarketDataFeed:
                     if await self._symbol_meets_depth(sym):
                         await self._mark_symbol_ready(sym)
                 except Exception:
-                    self._logger.debug("per-symbol readiness check failed for %s", sym, exc_info=True)
+                    self._logger.debug(
+                        "per-symbol readiness check failed for %s", sym, exc_info=True
+                    )
 
         # Execute warmup with bounded concurrency
         t0 = time.perf_counter()
@@ -819,13 +873,15 @@ class MarketDataFeed:
         all_ok = True
         has_fn = getattr(self.shared_state, "has_ohlcv", None)
         count_fn = getattr(self.shared_state, "get_ohlcv_count", None)
-        missing: Dict[str, Dict[str, int]] = {}
+        missing: dict[str, dict[str, int]] = {}
         for s in symbols:
             for tf in self.timeframes:
                 enough = False
                 try:
                     if callable(has_fn):
-                        enough = bool(await self._maybe_await(has_fn(s, tf, self.min_bars_required)))
+                        enough = bool(
+                            await self._maybe_await(has_fn(s, tf, self.min_bars_required))
+                        )
                     elif callable(count_fn):
                         n = await self._maybe_await(count_fn(s, tf))
                         enough = int(n or 0) >= self.min_bars_required
@@ -833,7 +889,9 @@ class MarketDataFeed:
                         # If no API exists, assume ok if we fetched anything
                         get_fn = getattr(self.shared_state, "get_ohlcv", None)
                         if callable(get_fn):
-                            rows = await self._maybe_await(get_fn(s, tf, limit=self.min_bars_required))
+                            rows = await self._maybe_await(
+                                get_fn(s, tf, limit=self.min_bars_required)
+                            )
                             enough = len(list(rows or [])) >= self.min_bars_required
                 except Exception:
                     self._logger.debug("depth check failed for %s %s", s, tf, exc_info=True)
@@ -841,10 +899,21 @@ class MarketDataFeed:
                     all_ok = False
                     missing.setdefault(s, {})[tf] = self.min_bars_required
         if all_ok:
-            await self._set_health(self._code_ok, "warmup:depth_ok", metrics={"symbols": len(symbols), "min_bars": self.min_bars_required})
+            await self._set_health(
+                self._code_ok,
+                "warmup:depth_ok",
+                metrics={"symbols": len(symbols), "min_bars": self.min_bars_required},
+            )
             await self._maybe_set_ready()
         else:
-            await self._set_health(self._code_warn, "warmup:insufficient_bars", metrics={"missing": {k: sorted(v.keys()) for k, v in missing.items()}, "min_bars": self.min_bars_required})
+            await self._set_health(
+                self._code_warn,
+                "warmup:insufficient_bars",
+                metrics={
+                    "missing": {k: sorted(v.keys()) for k, v in missing.items()},
+                    "min_bars": self.min_bars_required,
+                },
+            )
             # Allow partial readiness to unblock degraded-mode trading
             try:
                 for s in symbols:
@@ -855,8 +924,14 @@ class MarketDataFeed:
                 self._logger.debug("partial readiness check failed", exc_info=True)
 
         # Readiness: SharedState flips MarketDataReady internally once thresholds are met.
-        await self._set_health(self._code_ok, "warmup:done", metrics={"symbols": len(symbols), "latency_ms": latency_ms})
-        self._known_symbols = {str(s or "").strip().upper() for s in symbols if str(s or "").strip()}
+        await self._set_health(
+            self._code_ok,
+            "warmup:done",
+            metrics={"symbols": len(symbols), "latency_ms": latency_ms},
+        )
+        self._known_symbols = {
+            str(s or "").strip().upper() for s in symbols if str(s or "").strip()
+        }
 
     async def on_symbol_accepted(self, sym: str) -> None:
         """Blocking backfill for a single symbol; can be wired to an AcceptedSymbol event."""
@@ -868,17 +943,27 @@ class MarketDataFeed:
                 return
             # Fetch full window for each timeframe
             for tf in self.timeframes:
+
                 async def _fetch_ohlcv():
                     return await ec.get_ohlcv(sym, tf, limit=self.ohlcv_limit)
+
                 rows = await self._with_retries(_fetch_ohlcv, f"accept.get_ohlcv[{sym},{tf}]")
                 rows = self._sanitize_ohlcv(rows or [], tf)
                 for r in rows:
-                    bar = {"ts": float(r[0]), "o": float(r[1]), "h": float(r[2]), "l": float(r[3]), "c": float(r[4]), "v": float(r[5])}
+                    bar = {
+                        "ts": float(r[0]),
+                        "o": float(r[1]),
+                        "h": float(r[2]),
+                        "l": float(r[3]),
+                        "c": float(r[4]),
+                        "v": float(r[5]),
+                    }
                     await self._maybe_await(self.shared_state.add_ohlcv(sym, tf, bar))
 
             # Price
             async def _fetch_price():
                 return await ec.get_current_price(sym)
+
             price = await self._with_retries(_fetch_price, f"accept.get_price[{sym}]")
             price_f = self._coerce_positive_price(price)
             if price_f > 0:
@@ -905,7 +990,9 @@ class MarketDataFeed:
                     if depth_ok:
                         await self._maybe_set_ready()
                 except Exception:
-                    self._logger.debug("global readiness check failed in on_symbol_accepted", exc_info=True)
+                    self._logger.debug(
+                        "global readiness check failed in on_symbol_accepted", exc_info=True
+                    )
         except Exception as e:
             kind, meta = self._classify_error(e)
             await self._set_health(self._code_error, f"on_symbol_accepted:{kind}", metrics=meta)
@@ -933,20 +1020,24 @@ class MarketDataFeed:
         while not self._stop.is_set():
             self._poll_cycle += 1
             symbols = await self._get_accepted_symbols()
-            current_symbols = {str(s or "").strip().upper() for s in symbols if str(s or "").strip()}
+            current_symbols = {
+                str(s or "").strip().upper() for s in symbols if str(s or "").strip()
+            }
             new_symbols = sorted(current_symbols - self._known_symbols)
             if new_symbols:
                 self._logger.info("[MDF] accepted-symbol delta detected; backfill=%s", new_symbols)
                 await self._schedule_symbol_backfill(new_symbols)
-                
+
                 # === FIX: Subscribe WebSocket to new symbols ===
-                if self.websocket_feed and hasattr(self.websocket_feed, 'subscribe'):
+                if self.websocket_feed and hasattr(self.websocket_feed, "subscribe"):
                     try:
                         await self.websocket_feed.subscribe(new_symbols)
-                        self._logger.info(f"[MDF] WebSocket subscribed to {len(new_symbols)} new symbols")
+                        self._logger.info(
+                            f"[MDF] WebSocket subscribed to {len(new_symbols)} new symbols"
+                        )
                     except Exception as e:
                         self._logger.debug(f"[MDF] Failed to subscribe WebSocket: {e}")
-            
+
             self._known_symbols = current_symbols
 
             # 🔎 1) Log symbols at every cycle
@@ -1019,7 +1110,10 @@ class MarketDataFeed:
                 await self._set_health(
                     self._code_warn,
                     "poll:no_exchange_client",
-                    metrics={"symbols": len(symbols), "missing_exchange_cycles": self._missing_exchange_cycles},
+                    metrics={
+                        "symbols": len(symbols),
+                        "missing_exchange_cycles": self._missing_exchange_cycles,
+                    },
                 )
                 if self._missing_exchange_cycles == 1 or self._missing_exchange_cycles % 5 == 0:
                     self._logger.warning(
@@ -1053,7 +1147,7 @@ class MarketDataFeed:
 
             await asyncio.sleep(self.poll_interval)
 
-    async def _poll_symbol(self, sym: str, sem: asyncio.Semaphore) -> Dict[str, Any]:
+    async def _poll_symbol(self, sym: str, sem: asyncio.Semaphore) -> dict[str, Any]:
         async with sem:
             ec = await self._get_exchange_client()
             if ec is None:
@@ -1080,14 +1174,18 @@ class MarketDataFeed:
                             price_tuple = cache.get(norm_sym)
                             if isinstance(price_tuple, (tuple, list)) and len(price_tuple) >= 1:
                                 price = price_tuple[0]
-                                self._logger.debug("[MDF] using WebSocket price for %s: %.10f", sym, price)
+                                self._logger.debug(
+                                    "[MDF] using WebSocket price for %s: %.10f", sym, price
+                                )
                     except Exception:
                         pass
-                
+
                 # Fall back to REST if WebSocket price not available
                 if price is None:
+
                     async def _fetch_price():
                         return await ec.get_current_price(sym)
+
                     price = await self._with_retries(_fetch_price, f"poll.get_price[{sym}]")
             except Exception:
                 price = None
@@ -1105,8 +1203,10 @@ class MarketDataFeed:
             self._logger.warning("[DEBUG_MDF] fetching OHLCV for %s", sym)
             for tf in self.timeframes:
                 try:
+
                     async def _fetch_tail():
                         return await ec.get_ohlcv(sym, tf, limit=3)
+
                     rows = await self._with_retries(_fetch_tail, f"poll.get_ohlcv[{sym},{tf}]")
                     rows = self._sanitize_ohlcv(rows or [], tf)
                     for r in rows:
@@ -1133,7 +1233,9 @@ class MarketDataFeed:
             # TEMPORARY DEBUG — remove after confirming data flow is healthy
             self._logger.debug(
                 "[MDF:POLL] %s price=%s tfs=%s",
-                sym, price, self.timeframes,
+                sym,
+                price,
+                self.timeframes,
             )
             return {
                 "symbol": sym,
@@ -1147,14 +1249,14 @@ class MarketDataFeed:
     async def stop(self):
         self._stop.set()
         await self._cancel_backfill_tasks()
-        
+
         # ⚡ Clean up WebSocket feed (NEW)
         if self.websocket_feed:
             try:
                 await self.websocket_feed.stop()
             except Exception as e:
                 self._logger.debug("[MDF] WebSocket cleanup error: %s", str(e))
-        
+
         if self._websocket_task and not self._websocket_task.done():
             self._websocket_task.cancel()
             try:

@@ -19,7 +19,7 @@ Your system detects symbols through THREE REDUNDANT MECHANISMS that work togethe
 
 #### **Tier 1: Startup Auto-Subscribe (Immediate)**
 - **When:** Bot starts up
-- **How:** WebSocket reads `SharedState.accepted_symbols` 
+- **How:** WebSocket reads `SharedState.accepted_symbols`
 - **Fallback:** If empty, reads `bootstrap_symbols.DEFAULT_SYMBOLS`
 - **Result:** All symbols ready for streaming in <1 second
 - **Code:** `src/l1_exchange/ws_market_data.py` line 243-250
@@ -175,7 +175,7 @@ For each position in portfolio:
     1. Get symbol's minNotional from exchange filter
     2. Calculate position notional value:
        notional = quantity × current_price
-    
+
     3. Classify:
        if notional >= minNotional:
            classification = CLEAN          # Normal tradeable
@@ -185,7 +185,7 @@ For each position in portfolio:
            classification = HARD_DUST       # Locked/unsellable
        else:  # notional < minNotional
            classification = DUST_LOCKED     # Below minimum notional
-    
+
     4. Update position metadata:
        position.dust_class = classification
        position.is_dust = (classification != CLEAN)
@@ -272,12 +272,12 @@ A position is marked for healing when ALL of these are true:
 ```
 1. ✓ Value < dead_min_size ($25)
    OR value < exchange minNotional
-   
+
 2. ✓ Age > stale_threshold (30 days old)
    OR no activity for extended period
-   
+
 3. ✓ Status is DUST_LOCKED or MICRO_DUST
-   
+
 4. ✓ Healing attempts < max_attempts (3)
    AND no circuit breaker
 ```
@@ -304,7 +304,7 @@ def execute_healing_cycle():
     candidates, total_value = identify_liquidation_candidates()
     # Result: List of symbols sorted by value (largest first)
     # Limit: max 10 per cycle
-    
+
     # Step 2: Prepare orders
     orders = create_liquidation_orders(candidates)
     # Each order:
@@ -312,7 +312,7 @@ def execute_healing_cycle():
     #   - Symbol: from candidates
     #   - Quantity: position quantity
     #   - Expected value: qty × current_price
-    
+
     # Step 3: Execute batch
     report = execute_liquidation_batch(orders)
     # For each order:
@@ -321,7 +321,7 @@ def execute_healing_cycle():
     #   - Increment healing attempt counter
     #   - If successful: position → HEALED
     #   - If failed: record failure (circuit breaker)
-    
+
     # Step 4: Report
     return report  # Summary of what was healed
 ```
@@ -333,13 +333,13 @@ def execute_healing_cycle():
 ```python
 class PortfolioBucketState:
     # Adaptive based on total account equity
-    
+
     # For small accounts (<$500):
     min_dead_to_heal = $10           # Heal when dead capital > $10
     dead_min_size = $25              # Size threshold for "productive"
     batch_heal_enabled = True        # Process multiple at once
     max_liquidations_per_cycle = 10  # Max 10 per healing run
-    
+
     # Healing urgency levels:
     CRITICAL = "critical"            # Dead > 50% of equity
     HIGH = "high"                     # Dead > 20% of equity
@@ -408,11 +408,11 @@ class DustRegistry:
     def mark_position_as_dust(symbol, qty, value):
         # Records: created_at, status, healing_attempts
         # Persists to: dust_registry.json
-    
+
     def record_healing_attempt(symbol):
         # Increments: healing_attempts
         # Updates: last_healing_attempt_at, healing_days_elapsed
-    
+
     def trip_circuit_breaker(symbol):
         # Records: circuit_breaker_tripped_at = now
         # Status: HEALING → PERMANENT_DUST
@@ -615,19 +615,19 @@ Output:
 Diagnosis tree:
 1. Is symbol traded on Binance?
    → Check: https://www.binance.com/en/trade/<SYMBOL>
-   
+
 2. Is symbol in MarketDataFeed's accepted_symbols?
    → Check: grep "symbol" /logs/active_*_run.logpath
    → Search: "SymbolScreener.*proposed"
-   
+
 3. Is symbol passing convergence gating?
    → Check: "convergence gate" in logs
    → If blocked: SYMBOL_CONVERGENCE_MODE=True
-   
+
 4. Is WebSocket subscribed?
    → Check: "Subscribed to N symbols" in logs
    → If missing: Check startup logs for "auto-subscribe"
-   
+
 5. Is OHLCV data ready?
    → Check: "SymbolDataReady" event in logs
    → If missing: Check market_data_feed backfill logs
@@ -637,14 +637,14 @@ Diagnosis tree:
 
 ```
 Diagnosis:
-1. Check minNotional: 
+1. Check minNotional:
    → Position value must be ≥ exchange's minNotional
    → Example: RAYUSDT minNotional=$10, but position=$8
-   
+
 2. Check qty:
    → If qty extremely small, classified as MICRO_DUST
    → Example: 0.000001 BTC
-   
+
 3. Check age:
    → If position >30 days old + below threshold
    → Marked as DUST_LOCKED for eventual cleanup
@@ -661,15 +661,15 @@ Diagnosis:
 1. Is DeadCapitalHealer active?
    → Check: "Executing N liquidation orders" in logs
    → If missing: May not be triggered yet
-   
+
 2. Is dead capital > threshold?
    → Minimum: $10 dead capital
    → Check: metrics["dead_capital_usdt"]
-   
+
 3. Circuit breaker tripped?
    → Check: "Circuit breaker TRIPPED" in logs
    → If yes: Position blocked after 3 failed attempts
-   
+
 4. Healing frequency?
    → Default: Every 30 minutes
    → Check logs for "DeadCapitalHealer" timestamp
@@ -914,7 +914,7 @@ Hard limit: 1000+ symbols → Would exceed Binance connection limits
 
 Recommendation:
 - 50-100 symbols: Optimal for diverse strategies
-- 100-200 symbols: Good for discovery-heavy systems  
+- 100-200 symbols: Good for discovery-heavy systems
 - 200+ symbols: May need multiple WebSocket connections
 ```
 
@@ -925,7 +925,7 @@ Recommendation:
 Your symbol universe management system is **production-grade**, handling:
 
 ✅ **40+ symbols detected** automatically across 3 tiers
-✅ **4-tier classification** for sophisticated dust tracking  
+✅ **4-tier classification** for sophisticated dust tracking
 ✅ **Automatic healing** of dead capital every 30 minutes
 ✅ **Persistent state** surviving system restarts
 ✅ **Massive scale** capability (50x current usage headroom)
@@ -934,7 +934,7 @@ The system is designed for **resilience, scalability, and professionalism** — 
 
 ---
 
-**Document Version:** 1.0  
-**Last Updated:** 2025-12-20  
-**System Status:** ✅ Operational & Verified  
+**Document Version:** 1.0
+**Last Updated:** 2025-12-20
+**System Status:** ✅ Operational & Verified
 **Scale Tested:** 40+ symbols across 6h session

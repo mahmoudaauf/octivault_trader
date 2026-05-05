@@ -16,7 +16,7 @@
           current_mode = str(self.mode_manager.get_mode()).upper()
       except Exception as e:
           current_mode = "NORMAL"
-  
+
   if current_mode in ("BOOTSTRAP", "BOOTSTRAP_VIRTUAL", "RECOVERY"):
       # ✅ RETURN TRUE immediately - bypass capital floor check
       return True
@@ -55,13 +55,13 @@ When system restarts and reaches `_build_decisions()`:
 ```
 Phase 1: BOOTSTRAP mode, first trade not yet executed
 ↓
-NAV = phantom $199 (calculated from past session positions)  
+NAV = phantom $199 (calculated from past session positions)
 ↓
 Capital floor check: floor = max($10, $199 × 0.20) = $39.99 needed
 ↓
-Available balance: $32.46 < $39.99 
+Available balance: $32.46 < $39.99
 ↓
-capital_ok = FALSE 
+capital_ok = FALSE
 ↓
 capital_stable = FALSE
 ↓

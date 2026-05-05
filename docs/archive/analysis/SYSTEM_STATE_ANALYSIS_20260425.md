@@ -12,7 +12,7 @@ Your system is **STUCK in an infinite rejection loop** with a phantom position, 
 
 ### Pattern: 100+ Consecutive ETHUSDT Sell Rejections
 ```
-2026-04-24 15:42:07 [EXEC_REJECT] symbol=ETHUSDT side=SELL 
+2026-04-24 15:42:07 [EXEC_REJECT] symbol=ETHUSDT side=SELL
 reason=balance_guard:invalid_amount:Amount must be positive, got 0.0
 status=rejected
 ```
@@ -150,7 +150,7 @@ Before I propose a solution, I need to understand:
    - **Check**: `curl -X GET "https://fapi.binance.com/fapi/v2/openOrders?symbol=ETHUSDT"` OR spot equivalent
 
 ### 2. **Position Quantity Origin**
-   - Where is the 0.0 qty coming from? 
+   - Where is the 0.0 qty coming from?
    - Is `_get_sellable_qty()` returning 0.0?
    - Or is `round_step()` rounding something down to 0.0?
 
@@ -196,7 +196,7 @@ Once we understand the above, the fix should:
 ## Immediate Action Plan
 
 **STEP 1**: Scan portfolio to answer critical questions
-**STEP 2**: Understand phantom position origin  
+**STEP 2**: Understand phantom position origin
 **STEP 3**: Propose targeted fix (not general dust prevention)
 **STEP 4**: Implement position repair logic
 **STEP 5**: Add guards to prevent restart from creating new phantoms
@@ -209,4 +209,3 @@ Once we understand the above, the fix should:
 ❌ Don't just liquidate everything (loses valid positions)
 ❌ Don't restart again without fix (creates new restarts in infinite loop)
 ❌ Don't assume dust fix from previous session solved this (it didn't - this is different issue)
-

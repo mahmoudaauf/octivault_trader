@@ -1,6 +1,6 @@
 # 📊 SYSTEM BEHAVIOR - VISUAL SUMMARY
 
-**Updated:** April 27, 2026  
+**Updated:** April 27, 2026
 **Source:** Latest logs, diagnostics, and session reports
 
 ---
@@ -133,7 +133,7 @@ INITIAL SIGNALS: 5,000
      ▼
 AFTER GATE 1: 2,500 signals remain
      │
-     ├─ Capital insufficient  
+     ├─ Capital insufficient
      │  └─ Rejected: 1,250 (50% of remaining)
      ▼
 AFTER GATE 2: 1,250 signals remain
@@ -235,7 +235,7 @@ Trade #1: BUY ETHUSDT
 ├─ Status:            ✅ SUCCESS
 └─ trade_opened:      True
 
-Trade #2: SELL ETHUSDT  
+Trade #2: SELL ETHUSDT
 ├─ Hold Duration:     22 seconds
 ├─ Exit Time:         Loop 6 (13:05:47)
 ├─ Proceeds:          $27.12 (99.78% recovery)

@@ -8,7 +8,7 @@ After aggressive diagnostic thresholds and execution tracing, **the system execu
 
 ```
 Loop ID: 8
-Trade: ETHUSDT BUY 
+Trade: ETHUSDT BUY
 Quantity: 0.0129 ETH
 Capital Deployed: $27.17 (from $49.63 → $22.46 available)
 Confidence: 0.80
@@ -67,7 +67,7 @@ Result: SUCCESS ✅
    - tier_a_conf=0.70 was rejecting signals in 0.65-0.85 range
    - Fixed: Lowered to 0.55 initially, then 0.15 for aggressive testing
 
-2. **Signal Cache Timing Issue**  
+2. **Signal Cache Timing Issue**
    - Decisions running before signals cached
    - Signal ingestion happens in async background task
    - Decisions run on 6-8 second cycles
@@ -96,7 +96,7 @@ Result: SUCCESS ✅
 # Line 2240: Min execution confidence
 - default=0.45  → default=0.08  (EXTREME)
 
-# Line 2278: Tier A confidence threshold  
+# Line 2278: Tier A confidence threshold
 - default=0.55  → default=0.15  (EXTREME)
 
 # Line 2241: Tier B confidence
@@ -120,7 +120,7 @@ These extreme settings are **DIAGNOSTIC ONLY** and must be reverted for producti
 
 2. **Verify trade execution with normalized thresholds**
    - Should see multiple trades executing
-   - Capital deploying  
+   - Capital deploying
    - Trades capturing signals
 
 3. **Monitor for side effects**
@@ -202,6 +202,5 @@ These extreme settings are **DIAGNOSTIC ONLY** and must be reverted for producti
 
 ---
 
-**Session Completed**: Diagnostic root cause found and first successful trade executed.  
+**Session Completed**: Diagnostic root cause found and first successful trade executed.
 **Next Session**: Fine-tune thresholds and prepare for extended live trading.
-

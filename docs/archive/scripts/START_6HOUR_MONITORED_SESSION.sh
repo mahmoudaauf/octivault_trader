@@ -137,16 +137,16 @@ if [ -f "6hour_session_monitored.log" ]; then
     echo ""
     echo "✅ 6hour_session_monitored.log"
     echo "   Size: $(wc -l < 6hour_session_monitored.log) lines"
-    
+
     echo ""
     echo "🔍 PHASE 2 INDICATORS IN LOGS:"
-    
+
     RECOVERY_COUNT=$(grep -c "Bypassing min-hold" "6hour_session_monitored.log" || echo 0)
     echo "   Recovery Bypasses: $RECOVERY_COUNT"
-    
+
     ROTATION_COUNT=$(grep -c "MICRO restriction OVERRIDDEN" "6hour_session_monitored.log" || echo 0)
     echo "   Forced Rotations: $ROTATION_COUNT"
-    
+
     ENTRY_COUNT=$(grep -c "Entry:" "6hour_session_monitored.log" || echo 0)
     echo "   Total Entries: $ENTRY_COUNT"
 fi

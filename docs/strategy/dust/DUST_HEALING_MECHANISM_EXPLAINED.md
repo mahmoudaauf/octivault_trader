@@ -1,7 +1,7 @@
 # DUST HEALING BUY - HOW THE SYSTEM CAN BUY TO CONSOLIDATE DUST
 
-**Date:** April 28, 2026  
-**Topic:** The Missing Mechanism - How to Use BUY Orders to Heal Dust  
+**Date:** April 28, 2026
+**Topic:** The Missing Mechanism - How to Use BUY Orders to Heal Dust
 **Status:** ✅ FEATURE EXISTS BUT NOT TRIGGERED
 
 ---
@@ -11,7 +11,7 @@
 Your question is **exactly right**! The system HAS a mechanism to:
 
 1. **Detect dust** (0.898 DOGE stuck)
-2. **Wait for a BUY signal** 
+2. **Wait for a BUY signal**
 3. **Buy small amount** to add to dust
 4. **Convert dust to tradeable position**
 5. **Then SELL everything together**
@@ -77,7 +77,7 @@ This is called **DUST HEALING BUY** and it's already coded into `execution_manag
 
 ## 📍 WHERE THIS IS CODED
 
-**File:** `core/execution_manager.py`  
+**File:** `core/execution_manager.py`
 **Lines:** 7113-7150+
 
 ```python
@@ -97,14 +97,14 @@ if side == "buy" and not is_dust_healing_buy and planned_quote is not None:
                 if dust_price > 0.0:
                     dust_notional = dust_qty * dust_price
                     reduced_quote = max(0.0, float(planned_quote) - dust_notional)
-                    
+
                     # LOG THE REUSE
                     self.logger.info(
                         "[Dust:REUSE] %s dust_qty=%.6f dust_notional=%.4f "
                         "planned_quote %.4f → %.4f",
                         sym, dust_qty, dust_notional, float(planned_quote), reduced_quote,
                     )
-                    
+
                     planned_quote = reduced_quote  # Reduce capital needed
                     policy_ctx["_dust_reused_qty"] = dust_qty
                     policy_ctx["_dust_reused_notional"] = dust_notional
@@ -246,7 +246,7 @@ Then:        ML Forecaster generates BUY
              Dust healing triggered automatically
              Dust consolidated into tradeable position
              Next exit sells full amount
-             
+
 Probability: WILL happen eventually as price moves
 Timeline:    Hours to days depending on market
 ```
@@ -257,11 +257,11 @@ Now:         0.898 DOGE stuck
 Option A:    Manually buy ~$9 more DOGE via Binance
              Creates ~$10 position (tradeable)
              System will then manage normal exit
-             
+
 Option B:    Manually sell via Binance dust function
              Accept any losses, recover $0.088
              Dust gone immediately
-             
+
 Timeline:    Minutes - you decide
 ```
 
@@ -272,7 +272,7 @@ Deploy:      New dust healing logic
 When:        Every X minutes/hours
 Then:        System buys to heal dust proactively
 Result:      No dust ever gets stuck
-             
+
 Timeline:    Requires code deployment
 ```
 
@@ -353,4 +353,3 @@ Add a third dust healing mode:
 - ❌ Doesn't aggressively heal sub-$1 dust
 
 **Fix:** Add threshold-based aggressive healing for very small dust amounts.
-

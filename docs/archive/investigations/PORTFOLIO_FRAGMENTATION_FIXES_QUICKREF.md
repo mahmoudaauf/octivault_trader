@@ -13,9 +13,9 @@
 ---
 
 ## FIX 1: Minimum Notional Validation
-**When?** Before every buy order  
-**Check:** Will position qty × entry_price ≥ min_notional?  
-**Action:** Block if too small  
+**When?** Before every buy order
+**Check:** Will position qty × entry_price ≥ min_notional?
+**Action:** Block if too small
 
 ```python
 # Flow:
@@ -25,9 +25,9 @@ signal → position_size_calc → notional_check → {execute | skip}
 ---
 
 ## FIX 2: Intelligent Dust Merging
-**When?** Detected during analysis  
-**Merge:** Similar small positions together  
-**Result:** Fewer, larger positions  
+**When?** Detected during analysis
+**Merge:** Similar small positions together
+**Result:** Fewer, larger positions
 
 ```python
 # Criteria:
@@ -40,8 +40,8 @@ If all 3: MERGE
 ---
 
 ## FIX 3: Portfolio Health Check
-**Location:** `meta_controller.py::_check_portfolio_health()`  
-**Returns:** Health metrics dictionary  
+**Location:** `meta_controller.py::_check_portfolio_health()`
+**Returns:** Health metrics dictionary
 
 ```python
 health = await _check_portfolio_health()
@@ -64,8 +64,8 @@ health = await _check_portfolio_health()
 ---
 
 ## FIX 4: Adaptive Position Sizing
-**Location:** `meta_controller.py::_get_adaptive_position_size()`  
-**Usage:** Replace standard sizing with adaptive version  
+**Location:** `meta_controller.py::_get_adaptive_position_size()`
+**Usage:** Replace standard sizing with adaptive version
 
 ```python
 # Old way:
@@ -121,12 +121,12 @@ All fixes automatically run in `_run_cleanup_cycle()`:
 ```python
 async def _run_cleanup_cycle(self):
     # ... existing cleanup ...
-    
+
     # FIX 3: Health check
     health = await self._check_portfolio_health()
     if fragmentation detected:
         log warning
-    
+
     # FIX 5: Consolidation automation
     should_consolidate, dust = await self._should_trigger_portfolio_consolidation()
     if should_consolidate:
@@ -197,7 +197,7 @@ print(f"Concentration: {health['concentration_ratio']:.3f}")
 ### Monitor adaptive sizing:
 ```python
 # Look for these log messages:
-# [Meta:AdaptiveSizing] symbol=ETHUSDT, base_size=125.50, 
+# [Meta:AdaptiveSizing] symbol=ETHUSDT, base_size=125.50,
 # adaptive_size=62.75, fragmentation=FRAGMENTED
 ```
 
@@ -258,6 +258,6 @@ That's it! The system will now automatically reduce position sizes during fragme
 
 ---
 
-**Status:** ✅ Ready for integration and testing  
-**Last Updated:** Current session  
+**Status:** ✅ Ready for integration and testing
+**Last Updated:** Current session
 **Maintained By:** Core Development Team

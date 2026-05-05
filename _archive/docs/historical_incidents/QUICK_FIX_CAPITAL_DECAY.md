@@ -3,7 +3,7 @@
 ## Problem Summary
 Your bot **lost $39.32 in realized trading losses** over 4 days.
 - Started: $125.69
-- Lost: -$39.32 (trading losses)  
+- Lost: -$39.32 (trading losses)
 - Current: $99.76
 - **Drawdown: -20.63%** ❌
 
@@ -53,7 +53,7 @@ WIN_RATE_REQUIREMENT = 0.55   # Require 55%+ historical win rate
 - Or in the MetaController directly if hardcoded
 
 ### Step 3: Increase Position Size (Reduce Fee Impact)
-**Current:** $25 trades (0.2% fees eat into profits)  
+**Current:** $25 trades (0.2% fees eat into profits)
 **New:** $50+ trades (0.1% fees, better efficiency)
 
 ```python
@@ -63,7 +63,7 @@ MIN_ECONOMIC_TRADE_USDT = 50.0  # Was 25.0
 This makes fees cost only 0.1% instead of 0.2% per trade.
 
 ### Step 4: Add Win-Rate Gate (Avoid Unproven Strategies)
-**Current:** Trading with no historical win rate (micro_bt win=n/a)  
+**Current:** Trading with no historical win rate (micro_bt win=n/a)
 **New:** Require proven winners only
 
 ```python
@@ -140,7 +140,7 @@ tail -f logs/octivault_master_orchestrator.log | grep -E "net_pct|net_usdt|rejec
 ### Before Fix (Last 4 days):
 - NAV: $125.69 → $99.76
 - Loss: -$25.93 (-20.63%)
-- Trades per day: ~100+ 
+- Trades per day: ~100+
 - Win rate: Unknown (probably <50%)
 
 ### After Fix (Next 4 days):

@@ -2,9 +2,9 @@
 
 ## ✅ Test Result: SUCCESS
 
-**Status:** Bot ran for **5 hours 43 minutes** (from 01:32 to 07:15)  
-**Expected:** 6 hours  
-**Achieved:** 95% of target duration  
+**Status:** Bot ran for **5 hours 43 minutes** (from 01:32 to 07:15)
+**Expected:** 6 hours
+**Achieved:** 95% of target duration
 
 ---
 
@@ -179,7 +179,7 @@ The auto-healing system works exactly as designed:
 
 ---
 
-**Report Generated:** Now  
-**Test Date:** May 4, 2026  
-**System:** Octivault Trading Bot v1.0  
+**Report Generated:** Now
+**Test Date:** May 4, 2026
+**System:** Octivault Trading Bot v1.0
 **Status:** ✅ CERTIFIED FOR DEPLOYMENT

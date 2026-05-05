@@ -90,10 +90,10 @@ def _record_execution_result(self, exec_attempted: bool, execution_successful: b
     if exec_attempted:
         self._execution_attempts_total += 1
         self._recent_attempts_window.append((now, execution_successful))
-        
+
         if execution_successful:
             self._execution_fills_total += 1
-        
+
         # Recalculate success rate from recent window
         successes = sum(1 for _, success in self._recent_attempts_window if success)
         self._gating_success_rate = successes / len(self._recent_attempts_window)
@@ -109,14 +109,14 @@ Updates current phase based on elapsed time:
 def _update_gating_phase(self) -> str:
     """Update the current gating phase based on elapsed time and success rate."""
     elapsed_sec = time.time() - self._gating_start_time
-    
+
     if elapsed_sec < 300:  # 5 min
         self._gating_phase = "BOOTSTRAP"
     elif elapsed_sec < 1200:  # 20 min
         self._gating_phase = "INITIALIZATION"
     else:
         self._gating_phase = "STEADY_STATE"
-    
+
     return self._gating_phase
 ```
 
@@ -128,10 +128,10 @@ Determines if gates should be relaxed based on phase and success rate:
 def _should_relax_gates(self) -> bool:
     """Determine if gates should be relaxed based on current phase and success rate."""
     phase = self._update_gating_phase()
-    
+
     if phase == "BOOTSTRAP":
         return False  # Always strict during bootstrap
-    
+
     if phase == "INITIALIZATION":
         # Relax if we have enough attempts and success rate is good
         if len(self._recent_attempts_window) >= 2:
@@ -140,7 +140,7 @@ def _should_relax_gates(self) -> bool:
                 return True
         self._gates_strict_count += 1
         return False
-    
+
     # STEADY_STATE: Always relax
     self._gates_relaxed_count += 1
     return True
@@ -171,7 +171,7 @@ if not should_relax_gates:
 else:
     # Relaxed gating: only gate on critical issues (balances) during relaxed phase
     snap = await self._readiness_snapshot()
-    if not snap.get("balances_ready", True): 
+    if not snap.get("balances_ready", True):
         gated_reasons.append("Balances_CRITICAL")
 
 # Log gating status with phase information
@@ -315,7 +315,7 @@ After implementation, verify:
 ## 🔍 Troubleshooting
 
 ### Issue: "Still getting decision=NONE after 10 minutes"
-**Check**: 
+**Check**:
 - Are execution attempts being recorded? (`[Meta:Gating] Recorded execution` logs?)
 - What's the success_rate? If 0%, gates stay strict even in INIT phase
 - Check if SELL/HOLD signals are being generated (only these allowed when gated)

@@ -1,12 +1,13 @@
-from dataclasses import dataclass
-from typing import Optional, Any, Dict
 import time
+from dataclasses import dataclass
+from typing import Any, Optional
+
 
 @dataclass
 class TradeIntent:
     """
     Canonical domain object representing a validated trading decision approved for execution.
-    
+
     Single source of truth for all trading intents across all agents:
     - MetaController intents
     - Liquidation intents
@@ -14,10 +15,11 @@ class TradeIntent:
     - Rebalancer intents
     - Arbitrage intents
     - Manual override intents
-    
+
     ExecutionManager receives TradeIntent, not loose parameters.
     This eliminates coupling between controllers and execution logic.
     """
+
     symbol: str
     side: str
     quantity: Optional[float] = None
@@ -26,24 +28,25 @@ class TradeIntent:
     trace_id: Optional[str] = None
     tier: Optional[str] = None
     is_liquidation: bool = False
-    policy_context: Optional[Dict[str, Any]] = None
+    policy_context: Optional[dict[str, Any]] = None
     agent: Optional[str] = None
     tag: str = "meta"
     reason: str = ""  # CRITICAL: Added to support _determine_execution_tier in MetaController
     timestamp: Optional[float] = None
     execution_mode: str = "live"  # "live" or "shadow"
-    
+
     # Legacy hints (keep for backwards compatibility during transition)
     qty_hint: Optional[float] = None
     quote_hint: Optional[float] = None
     rationale: Optional[str] = None
     ttl_sec: int = 30
     timeframe: Optional[str] = None
-    
+
     def __post_init__(self):
         """Ensure timestamp is set."""
         if self.timestamp is None:
             self.timestamp = time.time()
+
 
 @dataclass
 class ExecOrder:
@@ -57,20 +60,21 @@ class ExecOrder:
     status: str = "NEW"
     id: Optional[str] = None
 
+
 @dataclass
 class MetaDecision:
     """
     Typed decision object with full source traceability and audit trail.
-    
+
     Replaces the legacy tuple-based decision format (symbol, side, dict).
-    
+
     Purpose:
     - Type-safe decision representation
     - Full traceability from intent → decision → order
     - Gate application tracking (which gates filtered, which passed)
     - Enriched context for execution and audit
     - Support for decision rejection reasons
-    
+
     Usage:
         decision = MetaDecision(
             symbol="BTCUSDT",
@@ -88,31 +92,32 @@ class MetaDecision:
             rationale="DipSniper: dip 2.5% below EMA",
         )
     """
+
     # Core decision
-    symbol: str                                    # BTCUSDT
-    side: str                                      # "BUY" or "SELL"
-    confidence: float                              # 0.0-1.0
-    planned_quote: float                           # USDT amount
-    
+    symbol: str  # BTCUSDT
+    side: str  # "BUY" or "SELL"
+    confidence: float  # 0.0-1.0
+    planned_quote: float  # USDT amount
+
     # Source traceability
-    source_intent: 'TradeIntent'                   # Original intent that created this decision
-    trace_id: str                                  # Unique ID for end-to-end tracing
-    
+    source_intent: "TradeIntent"  # Original intent that created this decision
+    trace_id: str  # Unique ID for end-to-end tracing
+
     # Gate processing
-    applied_gates: list = None                     # ["min_confidence", "concentration", "position_limit"]
-    rejection_reasons: list = None                 # ["confidence_below_min", "position_limit_exceeded"]
-    
+    applied_gates: list = None  # ["min_confidence", "concentration", "position_limit"]
+    rejection_reasons: list = None  # ["confidence_below_min", "position_limit_exceeded"]
+
     # Execution context
-    execution_tier: str = "immediate"              # "immediate", "pending", "deferred", "rejected"
-    
+    execution_tier: str = "immediate"  # "immediate", "pending", "deferred", "rejected"
+
     # Enriched data
-    enrichment: Dict[str, Any] = None              # {"dip_percent": 2.5, "bb_breach": True, ...}
-    
+    enrichment: dict[str, Any] = None  # {"dip_percent": 2.5, "bb_breach": True, ...}
+
     # Metadata
-    timestamp: Optional[float] = None              # When decision was made
-    policy_context: Optional[Dict[str, Any]] = None  # Policy parameters that influenced decision
-    rationale: str = ""                            # Human-readable explanation
-    
+    timestamp: Optional[float] = None  # When decision was made
+    policy_context: Optional[dict[str, Any]] = None  # Policy parameters that influenced decision
+    rationale: str = ""  # Human-readable explanation
+
     def __post_init__(self):
         """Initialize defaults and validate."""
         if self.timestamp is None:
@@ -125,7 +130,7 @@ class MetaDecision:
             self.enrichment = {}
         if self.policy_context is None:
             self.policy_context = {}
-        
+
         # Validation
         if self.side not in ("BUY", "SELL"):
             raise ValueError(f"Invalid side: {self.side}")
@@ -133,29 +138,29 @@ class MetaDecision:
             raise ValueError(f"Confidence must be 0.0-1.0, got {self.confidence}")
         if self.execution_tier not in ("immediate", "pending", "deferred", "rejected"):
             raise ValueError(f"Invalid execution_tier: {self.execution_tier}")
-    
+
     @property
     def is_rejected(self) -> bool:
         """Check if this decision was rejected."""
         return self.execution_tier == "rejected"
-    
+
     @property
     def is_approved(self) -> bool:
         """Check if this decision is approved for execution."""
         return not self.is_rejected
-    
+
     def add_gate(self, gate_name: str) -> None:
         """Record that a gate was applied."""
         if gate_name not in self.applied_gates:
             self.applied_gates.append(gate_name)
-    
+
     def add_rejection_reason(self, reason: str) -> None:
         """Record a rejection reason."""
         if reason not in self.rejection_reasons:
             self.rejection_reasons.append(reason)
         self.execution_tier = "rejected"
-    
-    def to_dict(self) -> Dict[str, Any]:
+
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
             "symbol": self.symbol,
@@ -175,13 +180,14 @@ class MetaDecision:
         }
 
 
-from typing import Callable
 import inspect as _inspect
+
 
 async def maybe_await(obj):
     if _inspect.isawaitable(obj):
         return await obj
     return obj
+
 
 async def maybe_call(obj: Any, method_name: str, *args, **kwargs):
     if not obj:
@@ -194,23 +200,27 @@ async def maybe_call(obj: Any, method_name: str, *args, **kwargs):
         return await res
     return res
 
+
 import time
+
 
 class KernelState:
     def __init__(self):
         self.metrics = {}
 
+
 class MetaPolicy:
     def __init__(self, state, min_conf=0.0):
         self.state = state
         self.min_conf = min_conf
-        
+
     def evaluate(self, signal):
         # Basic pass-through policy
         conf = signal.get("confidence", 0.0)
         if conf >= self.min_conf:
             return True
         return False
+
 
 async def is_fresh(shared_state, symbol, max_age_sec=300):
     if not shared_state:
@@ -220,14 +230,17 @@ async def is_fresh(shared_state, symbol, max_age_sec=300):
         return (time.time() - ts) < max_age_sec
     return False
 
+
 class BinanceAPIException(Exception):
     def __init__(self, message: str, code: Optional[int] = None):
         super().__init__(message)
         self.message = message
         self.code = code
 
+
 class ExecutionError(Exception):
     pass
+
 
 class HealthStatus:
     STARTING = "STARTING"
@@ -235,6 +248,7 @@ class HealthStatus:
     STOPPED = "STOPPED"
     DEGRADED = "DEGRADED"
     CRITICAL = "CRITICAL"
+
 
 def resilient_trade(component_name="Component", max_attempts=3):
     def decorator(func):
@@ -247,9 +261,7 @@ def resilient_trade(component_name="Component", max_attempts=3):
                     last_err = e
                     await asyncio.sleep(0.5 * (i + 1))
             raise last_err
+
         return wrapper
+
     return decorator
-
-
-
-

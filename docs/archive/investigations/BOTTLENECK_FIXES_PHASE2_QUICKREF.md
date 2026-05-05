@@ -102,11 +102,11 @@ M core/config.py               (+3 -2 lines: logging enhancement)
 
 ## Validation Status
 
-✅ Compilation: `python3 -m compileall core agents utils` → OK  
-✅ Imports: `MetaController`, `RotationExitAuthority`, `Config` → OK  
-✅ Signatures: `_safe_passes_min_hold(symbol, bypass=False)` → OK  
-✅ No new dependencies  
-✅ Type hints preserved  
+✅ Compilation: `python3 -m compileall core agents utils` → OK
+✅ Imports: `MetaController`, `RotationExitAuthority`, `Config` → OK
+✅ Signatures: `_safe_passes_min_hold(symbol, bypass=False)` → OK
+✅ No new dependencies
+✅ Type hints preserved
 
 ---
 

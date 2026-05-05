@@ -2,7 +2,7 @@
 
 ## The Problem You're Experiencing
 
-**Your Fear:** "The balance is decaying instead of growing"  
+**Your Fear:** "The balance is decaying instead of growing"
 **The Reality:** ✅ This is **PARTIALLY TRUE but MISUNDERSTOOD**
 
 Your logs show:
@@ -107,7 +107,7 @@ May 01:    $99.72    -$82.04     +$0.49       Lost $42 more in 4 days
 ### 🔴 CRITICAL: Fix Strategy Profitability
 
 #### Solution 1: Increase Position Size Threshold
-**Current:** Trades $25 positions (fees = 0.2% of position)  
+**Current:** Trades $25 positions (fees = 0.2% of position)
 **Fix:** Trade only $50+ positions (fees = 0.1% of position)
 
 ```python
@@ -119,7 +119,7 @@ MIN_TRADE_SIZE_FOR_SIGNAL = 50.0
 **Impact:** Reduces fee drag from 0.2% to 0.1% per trade → 50% fee savings
 
 #### Solution 2: Tighten Entry Filters
-**Current:** Taking trades with exp_net as low as 0.1%  
+**Current:** Taking trades with exp_net as low as 0.1%
 **Fix:** Require minimum 0.5% expected profit
 
 ```python
@@ -131,7 +131,7 @@ MIN_EXPECTED_NET_USDT = 0.50  # Was $0.04
 **Impact:** Only take highest-conviction trades → higher win rate
 
 #### Solution 3: Add Win Rate Gate
-**Current:** micro_bt win=n/a (no history, trades anyway)  
+**Current:** micro_bt win=n/a (no history, trades anyway)
 **Fix:** Require minimum win rate of 55%
 
 ```python
@@ -143,7 +143,7 @@ if "win_rate" in backtesting and win_rate < 0.55:
 **Impact:** Avoid unproven strategies → better P&L
 
 #### Solution 4: Reduce Trade Frequency
-**Current:** Multiple trades per minute  
+**Current:** Multiple trades per minute
 **Fix:** Maximum 2-3 active positions (already set, verify it's working)
 
 ```python
@@ -170,7 +170,7 @@ Dashboard:
   Free USDT:           $46.26
   Productive Positions: $53.46
   Dead/Dust:           $0.00    ← Healing working!
-  
+
 Capital Status: DECLINING (due to strategy losses, not decay)
 ```
 
@@ -206,7 +206,7 @@ Monitor for **unaccounted** capital loss (system bugs):
 def check_capital_integrity():
     expected_nav = cash + sum(positions) + realized_pnl
     actual_nav = get_nav()
-    
+
     if abs(expected_nav - actual_nav) > 1.0:
         ALERT: "Unaccounted capital decay detected!"
 ```
@@ -228,7 +228,7 @@ def check_capital_integrity():
 # - total_value: current NAV
 # - realized_pnl: actual losses
 # - unrealized_pnl: mark-to-market change
-# 
+#
 # SUM = total_equity (should match Binance balance)
 ```
 
@@ -236,7 +236,7 @@ def check_capital_integrity():
 ```bash
 # Count trades in logs: ~100+ trades in 4 days
 # Estimated fee cost: 100 * $25 * 0.2% = $5.00
-# Actual loss ($82) >> fee cost ($5) 
+# Actual loss ($82) >> fee cost ($5)
 # Conclusion: TRADING LOSSES are the problem, not fee tracking
 ```
 

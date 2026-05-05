@@ -47,7 +47,7 @@ required_move_pct = 0.38% × 1.60 = 0.6080%
 
 # For each symbol:
 # BNBUSDT:  expected_move=0.2456% < 0.6080% → SUPPRESSED ✅ Correct
-# SOLUSDT:  expected_move=0.2801% < 0.6080% → SUPPRESSED ✅ Correct  
+# SOLUSDT:  expected_move=0.2801% < 0.6080% → SUPPRESSED ✅ Correct
 # XRPUSDT:  expected_move=0.1993% < 0.6080% → SUPPRESSED ✅ Correct
 
 # Logic: Prevent entry when expected move can't cover round-trip costs + margin
@@ -78,7 +78,7 @@ required_move_pct = 0.38% × 1.60 = 0.6080%
 Expected P&L = Expected_Move - RoundTrip_Cost
              = 0.25% - 0.76%
              = -0.51% LOSS
-             
+
 Action: Correctly SUPPRESS entry
 ```
 
@@ -207,4 +207,3 @@ grep "\[DEBUG:CollectSignal\]" logs/octivault_master_orchestrator.log | tail -20
 # Check model predictions
 grep "Final decision for" logs/octivault_master_orchestrator.log | tail -10
 ```
-

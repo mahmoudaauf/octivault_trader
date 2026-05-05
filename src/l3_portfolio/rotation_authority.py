@@ -3,12 +3,13 @@ Rotation & Exit Authority (REA) - P9 Canonical Design
 Provides capital velocity governance by authorizing forced exits for rotation.
 """
 
+import logging
 import os
 import time
-import logging
-from typing import Dict, Any, List, Optional, Tuple
-from utils.shared_state_tools import fee_bps
+from typing import Any, Optional
+
 from src.l3_portfolio.holding_utility import compute_holding_utility
+from utils.shared_state_tools import fee_bps
 
 
 def _dynamic_exposure_cap(nav: float) -> float:
@@ -26,12 +27,15 @@ def _dynamic_exposure_cap(nav: float) -> float:
     else:
         return 0.30
 
+
 class RotationExitAuthority:
-    def __init__(self, logger: logging.Logger, config: Any, shared_state: Any, capital_governor=None):
+    def __init__(
+        self, logger: logging.Logger, config: Any, shared_state: Any, capital_governor=None
+    ):
         self.logger = logger
         self.config = config
         self.ss = shared_state
-        
+
         # ═══════════════════════════════════════════════════════════════════
         # PHASE C: Capital Governor Integration
         # Enforce bracket-based rotation restrictions
@@ -41,25 +45,36 @@ class RotationExitAuthority:
             # Try to import if not provided (fallback)
             try:
                 from src.l6_governance.capital_governor import CapitalGovernor
+
                 self.capital_governor = CapitalGovernor(config, shared_state=shared_state)
-                self.logger.info("[REA:Init] Capital Governor initialized for rotation enforcement (PHASE C)")
+                self.logger.info(
+                    "[REA:Init] Capital Governor initialized for rotation enforcement (PHASE C)"
+                )
             except ImportError:
-                self.logger.warning("[REA:Init] Capital Governor not available, rotation will not be restricted by bracket")
+                self.logger.warning(
+                    "[REA:Init] Capital Governor not available, rotation will not be restricted by bracket"
+                )
                 self.capital_governor = None
-        
+
         # Configuration
-        self.base_alpha_gap = float(getattr(config, "ROTATION_BASE_ALPHA_GAP", 0.005)) # 0.5% alpha gap
-        self.winner_protection_threshold = float(getattr(config, "ROTATION_WINNER_PROTECTION_PNL", 0.002)) # 0.2% PnL
-        self.winner_extra_alpha = float(getattr(config, "ROTATION_WINNER_EXTRA_ALPHA", 0.03)) # 3% extra alpha to kick winner
-        
+        self.base_alpha_gap = float(
+            getattr(config, "ROTATION_BASE_ALPHA_GAP", 0.005)
+        )  # 0.5% alpha gap
+        self.winner_protection_threshold = float(
+            getattr(config, "ROTATION_WINNER_PROTECTION_PNL", 0.002)
+        )  # 0.2% PnL
+        self.winner_extra_alpha = float(
+            getattr(config, "ROTATION_WINNER_EXTRA_ALPHA", 0.03)
+        )  # 3% extra alpha to kick winner
+
         # Mode-based thresholds
         self.mode_thresholds = {
-            "BOOTSTRAP": 0.3,   # Aggressive rotation
-            "NORMAL": 0.6,      # Balanced
-            "RECOVERY": 0.8,    # Conservative
+            "BOOTSTRAP": 0.3,  # Aggressive rotation
+            "NORMAL": 0.6,  # Balanced
+            "RECOVERY": 0.8,  # Conservative
             "AGGRESSIVE": 0.4,  # High velocity
-            "SAFE": 1.0,        # Disabled
-            "PROTECTIVE": 0.9   # Minimal
+            "SAFE": 1.0,  # Disabled
+            "PROTECTIVE": 0.9,  # Minimal
         }
 
         # Stagnation-based forced rotation controls
@@ -74,9 +89,7 @@ class RotationExitAuthority:
             )
             or 3
         )
-        self.stagnation_force_age_sec = float(
-            getattr(config, "STAGNATION_AGE_SEC", 0.0) or 0.0
-        )
+        self.stagnation_force_age_sec = float(getattr(config, "STAGNATION_AGE_SEC", 0.0) or 0.0)
         self.stagnation_force_age_mult = float(
             getattr(config, "STAGNATION_FORCE_ROTATION_MIN_AGE_MULT", 2.5) or 2.5
         )
@@ -94,11 +107,11 @@ class RotationExitAuthority:
         self.stagnation_continuation_min_score = float(
             getattr(config, "STAGNATION_CONTINUATION_MIN_SCORE", 0.65) or 0.65
         )
-        self._stagnation_streaks: Dict[str, int] = {}
+        self._stagnation_streaks: dict[str, int] = {}
         # Track latest seen entry timestamp per symbol to detect new buys / re-entries
-        self._stagnation_entry_ts: Dict[str, float] = {}
-    # (legacy) we track latest seen entry timestamp per symbol in
-    # _stagnation_entry_ts; no separate last_known or purge accumulators needed
+        self._stagnation_entry_ts: dict[str, float] = {}
+        # (legacy) we track latest seen entry timestamp per symbol in
+        # _stagnation_entry_ts; no separate last_known or purge accumulators needed
         # Grace period after opening a position during which stagnation purge is disabled
         self.hold_grace_seconds = float(getattr(self.config, "HOLD_GRACE_SECONDS", 180.0) or 180.0)
 
@@ -112,24 +125,26 @@ class RotationExitAuthority:
                     # Coroutine returned — close it to avoid RuntimeWarning,
                     # then fall through to attribute check.
                     res.close()
-                    self.logger.warning("[REA] is_cold_bootstrap is async; falling back to attribute check")
+                    self.logger.warning(
+                        "[REA] is_cold_bootstrap is async; falling back to attribute check"
+                    )
                 else:
                     return bool(res)
             except Exception:
                 return False
         return bool(getattr(self.ss, "cold_bootstrap", False))
 
-    def should_restrict_rotation(self, symbol: str) -> Tuple[bool, str]:
+    def should_restrict_rotation(self, symbol: str) -> tuple[bool, str]:
         """
         PHASE C: Check if rotation should be restricted for this symbol.
-        
+
         Uses Capital Governor to enforce bracket-based rotation rules:
         - MICRO: ✅ Restrict (no rotation allowed - focused learning)
         - SMALL+: ❌ Allow (rotation permitted within tier limits)
-        
+
         Args:
             symbol: Symbol being considered for rotation
-            
+
         Returns:
             Tuple[bool, str]: (should_restrict, reason)
             - (True, "micro_bracket_restriction") if rotation should be blocked
@@ -138,12 +153,13 @@ class RotationExitAuthority:
         if not self.capital_governor:
             # No Governor available, allow rotation
             return False, ""
-        
+
         try:
             # CRITICAL: Sync authoritative balance to get fresh NAV
             if hasattr(self.ss, "sync_authoritative_balance"):
                 try:
                     import asyncio
+
                     # Check if we're already in an async context
                     try:
                         loop = asyncio.get_running_loop()
@@ -157,21 +173,18 @@ class RotationExitAuthority:
                             self.ss.sync_authoritative_balance(force=True)
                         )
                 except Exception as e:
-                    self.logger.debug(
-                        "[REA:RotationRestriction] Balance sync unavailable: %s", e
-                    )
-            
+                    self.logger.debug("[REA:RotationRestriction] Balance sync unavailable: %s", e)
+
             # Get current NAV from SharedState after sync
-            nav = float(getattr(self.ss, "nav", 0.0) or 
-                       getattr(self.ss, "total_value", 0.0) or 0.0)
-            
+            nav = float(getattr(self.ss, "nav", 0.0) or getattr(self.ss, "total_value", 0.0) or 0.0)
+
             if nav <= 0:
                 # Default to allowing if NAV unavailable
                 self.logger.debug(
                     "[REA:RotationRestriction] NAV unavailable (%.2f), allowing rotation", nav
                 )
                 return False, ""
-            
+
             # Check if rotation should be restricted (MICRO bracket only)
             should_restrict = self.capital_governor.should_restrict_rotation(nav)
             allow_micro_rotation = str(
@@ -188,30 +201,32 @@ class RotationExitAuthority:
                     nav,
                 )
                 return False, "micro_bracket_override"
-            
+
             if should_restrict:
                 self.logger.warning(
                     "[REA:RotationRestriction] Rotation blocked for %s: "
                     "MICRO bracket (NAV=$%.2f) - focused learning phase",
-                    symbol, nav
+                    symbol,
+                    nav,
                 )
                 return True, "micro_bracket_restriction"
             else:
                 # Rotation allowed for this bracket
                 bracket = self.capital_governor.get_bracket(nav).value
                 self.logger.debug(
-                    "[REA:RotationRestriction] Rotation allowed for %s: "
-                    "%s bracket (NAV=$%.2f)",
-                    symbol, bracket, nav
+                    "[REA:RotationRestriction] Rotation allowed for %s: " "%s bracket (NAV=$%.2f)",
+                    symbol,
+                    bracket,
+                    nav,
                 )
                 return False, ""
-            
+
         except Exception as e:
             self.logger.error("[REA:RotationRestriction] Check failed: %s", e)
             # Graceful fallback: allow rotation on error
             return False, ""
 
-    def _continuation_score(self, pos: Dict[str, Any]) -> float:
+    def _continuation_score(self, pos: dict[str, Any]) -> float:
         """Best-effort continuation strength used to avoid rotating strong trend holds."""
         if not isinstance(pos, dict):
             return 0.0
@@ -235,14 +250,18 @@ class RotationExitAuthority:
         try:
             taker_bps = float(fee_bps(self.ss, "taker") or 10.0)
             slippage_bps = float(
-                getattr(self.config, "EXIT_SLIPPAGE_BPS",
-                        getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0
+                getattr(
+                    self.config,
+                    "EXIT_SLIPPAGE_BPS",
+                    getattr(self.config, "CR_PRICE_SLIPPAGE_BPS", 0.0),
+                )
+                or 0.0
             )
             return ((taker_bps * 2.0) + slippage_bps) / 10000.0
         except Exception:
             return 0.002  # conservative fallback: 20bps round-trip
 
-    def _is_permanent_dust_position(self, symbol: str, pos: Dict[str, Any]) -> bool:
+    def _is_permanent_dust_position(self, symbol: str, pos: dict[str, Any]) -> bool:
         """Permanent dust is invisible to rotation governance."""
         sym = str(symbol or "").upper()
         try:
@@ -266,7 +285,7 @@ class RotationExitAuthority:
 
     def calculate_rotation_score(
         self,
-        position: Dict[str, Any],
+        position: dict[str, Any],
         best_opp_score: float,
         *,
         symbol: Optional[str] = None,
@@ -300,22 +319,22 @@ class RotationExitAuthority:
         return rotation_score
 
     async def authorize_rotation(
-        self, 
-        sig_pos: int, 
-        max_pos: int, 
-        owned_positions: Dict[str, Any], 
-        best_opp: Dict[str, Any],
+        self,
+        sig_pos: int,
+        max_pos: int,
+        owned_positions: dict[str, Any],
+        best_opp: dict[str, Any],
         current_mode: str,
         is_starved: bool = False,
         force_rotation: bool = False,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """
         R4: Authorize a FORCED_EXIT if rotation criteria met.
         Returns the signal for the position to exit, or None.
-        
+
         OVERRIDE AUTHORITY: This can override standard TPSL and mode constraints
         if the alpha gap (opportunity cost) is sufficient.
-        
+
         PRECEDENCE: force_rotation flag overrides MICRO bracket restrictions.
         """
         # ─────────────────────────────────────────────────────────────────
@@ -336,7 +355,8 @@ class RotationExitAuthority:
                 if should_restrict:
                     self.logger.warning(
                         "[REA:authorize_rotation] PHASE_C_BLOCK: Rotation denied for %s: %s",
-                        first_symbol, reason
+                        first_symbol,
+                        reason,
                     )
                     return None  # Block rotation
         elif owned_positions and force_rotation:
@@ -350,37 +370,37 @@ class RotationExitAuthority:
                         first_symbol,
                         reason or "no_reason",
                     )
-        
+
         # Condition Check: Either we are full OR we are out of capital
         if sig_pos < max_pos and not is_starved:
-            return None # Sufficient slots and capital; no rotation needed
-            
+            return None  # Sufficient slots and capital; no rotation needed
+
         if not best_opp:
-            return None # Don't churn into nothing
-            
+            return None  # Don't churn into nothing
+
         best_opp_sym = best_opp.get("symbol")
         opp_score = float(best_opp.get("_opp_score", 0.0))
-        
+
         # Find candidates
         candidates = []
         now = time.time()
         cooldown = float(getattr(self.config, "ROTATION_COOLDOWN_SEC", 600))
         keep_utility_min = float(getattr(self.config, "ROTATION_KEEP_UTILITY_MIN", 0.72) or 0.72)
-        
+
         # Bootstrap bypass: ignore cooldown if we need velocity
         if current_mode == "BOOTSTRAP":
-            cooldown = 60.0 # 1 min during bootstrap
-            
+            cooldown = 60.0  # 1 min during bootstrap
+
         for sym, pos in owned_positions.items():
             if self._is_permanent_dust_position(sym, pos):
                 continue
             if sym == best_opp_sym:
                 continue
-            
+
             # Filter check (e.g. TPSL protect)
             if pos.get("state") == "EXITING":
                 continue
-                
+
             entry_ts = float(pos.get("entry_time") or pos.get("opened_at") or 0.0)
             if (now - entry_ts) < cooldown:
                 continue
@@ -392,7 +412,10 @@ class RotationExitAuthority:
                 if alpha_gap < self.winner_extra_alpha:
                     self.logger.debug(
                         "[REA:WinnerProtect] %s pnl=%.2f%% protected (alpha_gap=%.2f%% < required=%.2f%%)",
-                        sym, pos_pnl * 100, alpha_gap * 100, self.winner_extra_alpha * 100,
+                        sym,
+                        pos_pnl * 100,
+                        alpha_gap * 100,
+                        self.winner_extra_alpha * 100,
                     )
                     continue
 
@@ -408,31 +431,37 @@ class RotationExitAuthority:
             if utility >= keep_utility_min and not is_starved:
                 self.logger.debug(
                     "[REA:UtilityKeep] %s utility=%.3f >= %.3f (kept; no starvation override)",
-                    sym, utility, keep_utility_min
+                    sym,
+                    utility,
+                    keep_utility_min,
                 )
                 continue
 
             r_score = float(utility_snapshot.get("rotation_pressure", 0.0) or 0.0)
             candidates.append((sym, r_score, utility, pos, utility_snapshot))
-            
+
         if not candidates:
             return None
-            
+
         # Find best exit candidate (highest rotation score)
-        worst_sym, highest_r_score, worst_utility, worst_pos, worst_snapshot = max(candidates, key=lambda x: x[1])
-        
+        worst_sym, highest_r_score, worst_utility, worst_pos, worst_snapshot = max(
+            candidates, key=lambda x: x[1]
+        )
+
         # Threshold logic
         threshold = self.mode_thresholds.get(current_mode, 0.6)
-        
+
         # Starvation override: Be more aggressive if starved
         if is_starved:
-            threshold *= 0.8 # 20% easier to authorize if capital is zero
-        
+            threshold *= 0.8  # 20% easier to authorize if capital is zero
+
         max_hold_sec = float(getattr(self.config, "MAX_HOLD_SEC", 1800))
         stagnation_mult = float(getattr(self.config, "STAGNATION_HOLD_MULT", 4.0))
         stagnation_time = max_hold_sec * stagnation_mult
         stagnation_band = float(getattr(self.config, "STAGNATION_PNL_BAND", 0.001))
-        stagnation_override_enabled = bool(getattr(self.config, "STAGNATION_OVERRIDE_ENABLED", True))
+        stagnation_override_enabled = bool(
+            getattr(self.config, "STAGNATION_OVERRIDE_ENABLED", True)
+        )
 
         entry_ts = float(worst_pos.get("entry_time") or worst_pos.get("opened_at") or 0.0)
         age_sec = now - entry_ts
@@ -449,9 +478,15 @@ class RotationExitAuthority:
                 reason = "ROTATION_STAGNATION_OVERRIDE"
             self.logger.info(
                 "[REA:Authorized] 🔄 Rotation GRANTED: %s (pressure=%.2f, utility=%.2f) -> %s (opp=%.2f) [Mode: %s, Starved: %s]",
-                worst_sym, highest_r_score, worst_utility, best_opp_sym, opp_score, current_mode, is_starved
+                worst_sym,
+                highest_r_score,
+                worst_utility,
+                best_opp_sym,
+                opp_score,
+                current_mode,
+                is_starved,
             )
-            
+
             return {
                 "symbol": worst_sym,
                 "action": "SELL",
@@ -466,28 +501,30 @@ class RotationExitAuthority:
                 "_rotation_score": highest_r_score,
                 "_holding_utility": float(worst_snapshot.get("utility", 0.0) or 0.0),
                 "_rotation_pressure": float(worst_snapshot.get("rotation_pressure", 0.0) or 0.0),
-                "_utility_opportunity_penalty": float(worst_snapshot.get("opportunity_penalty", 0.0) or 0.0),
+                "_utility_opportunity_penalty": float(
+                    worst_snapshot.get("opportunity_penalty", 0.0) or 0.0
+                ),
                 "_stagnation_override": stagnation_override,
                 "allow_partial": True,
-                "target_fraction": 0.5
+                "target_fraction": 0.5,
             }
-            
+
         return None
 
     def authorize_stagnation_exit(
-        self,
-        owned_positions: Dict[str, Any],
-        current_mode: str
-    ) -> Optional[Dict[str, Any]]:
+        self, owned_positions: dict[str, Any], current_mode: str
+    ) -> Optional[dict[str, Any]]:
         """
-        STAGNATION AUTHORITY: Identify and purge positions that are dragging down 
+        STAGNATION AUTHORITY: Identify and purge positions that are dragging down
         capital velocity, even if no immediate replacement is waiting.
-        
+
         This prevents the "zombie portfolio" where all capital is stuck in flat trades.
         """
         if self._is_cold_bootstrap_active():
             self._stagnation_streaks.clear()
-            self.logger.debug("[REA:Stagnation] Cold bootstrap active; stagnation rotation disabled.")
+            self.logger.debug(
+                "[REA:Stagnation] Cold bootstrap active; stagnation rotation disabled."
+            )
             return None
 
         # ─────────────────────────────────────────────────────────────────
@@ -502,21 +539,29 @@ class RotationExitAuthority:
                     self.logger.warning(
                         "[REA:authorize_stagnation_exit] PHASE_C_BLOCK: "
                         "Stagnation-based rotation denied for %s: %s",
-                        first_symbol, reason
+                        first_symbol,
+                        reason,
                     )
                     return None
 
         # Startup grace: avoid purge during initial warm-up period after process start
         try:
-            grace_min = float(getattr(self.config, "STARTUP_STAGNATION_GRACE_MINUTES", 30.0) or 30.0)
+            grace_min = float(
+                getattr(self.config, "STARTUP_STAGNATION_GRACE_MINUTES", 30.0) or 30.0
+            )
             start_ts = None
             if hasattr(self.ss, "_start_time_unix"):
                 start_ts = float(getattr(self.ss, "_start_time_unix", 0.0) or 0.0)
             else:
                 # fallback to common metric keys
-                start_ts = float((getattr(self.ss, "metrics", {}) or {}).get("startup_time", 0.0) or 0.0)
+                start_ts = float(
+                    (getattr(self.ss, "metrics", {}) or {}).get("startup_time", 0.0) or 0.0
+                )
             if start_ts and ((time.time() - start_ts) < (float(grace_min) * 60.0)):
-                self.logger.debug("[REA:Stagnation] Startup grace active (%.1fmin) — skipping stagnation purge.", grace_min)
+                self.logger.debug(
+                    "[REA:Stagnation] Startup grace active (%.1fmin) — skipping stagnation purge.",
+                    grace_min,
+                )
                 return None
         except Exception:
             pass
@@ -524,7 +569,7 @@ class RotationExitAuthority:
         candidates = []
         forced_candidates = []
         now = time.time()
-        
+
         # Stagnation Thresholds
         # If held for N x MAX_HOLD_SEC and PnL < 0.1%, it's a zombie.
         max_hold = float(getattr(self.config, "MAX_HOLD_SEC", 1800))
@@ -535,7 +580,7 @@ class RotationExitAuthority:
             if float(self.stagnation_force_age_sec) > 0
             else max_hold * self.stagnation_force_age_mult
         )
-        
+
         rt_fee = self._round_trip_fee_pct()
         active_symbols = set()
         for sym, pos in owned_positions.items():
@@ -545,7 +590,7 @@ class RotationExitAuthority:
                 continue
             if pos.get("state") == "EXITING":
                 continue
-                
+
             # Age is strictly computed from the open position's entry timestamp (NOT symbol activity)
             entry_ts = float(pos.get("entry_time") or pos.get("opened_at") or 0.0)
             age = now - entry_ts
@@ -568,13 +613,16 @@ class RotationExitAuthority:
 
             # Hold grace: do not consider positions younger than configured hold_grace_seconds
             try:
-                if entry_ts and age < float(getattr(self.config, "HOLD_GRACE_SECONDS", self.hold_grace_seconds) or self.hold_grace_seconds):
+                if entry_ts and age < float(
+                    getattr(self.config, "HOLD_GRACE_SECONDS", self.hold_grace_seconds)
+                    or self.hold_grace_seconds
+                ):
                     # Reset any transient stagnation state for fresh positions
                     self._stagnation_streaks.pop(sym, None)
                     continue
             except Exception:
                 pass
-            
+
             pnl_pct = float(pos.get("unrealized_pnl_pct", 0.0) or 0.0)
             net_pnl_pct = pnl_pct - rt_fee
             continuation_score = self._continuation_score(pos)
@@ -591,7 +639,9 @@ class RotationExitAuthority:
                 continue
 
             # Use net PnL (after fees) for stagnation: position is stagnant if net profit < 0
-            qualifies_soft = age >= stagnation_time and net_pnl_pct < 0.0 and not continuation_strong
+            qualifies_soft = (
+                age >= stagnation_time and net_pnl_pct < 0.0 and not continuation_strong
+            )
             qualifies_force = (
                 self.stagnation_force_enabled
                 and age >= force_age
@@ -620,7 +670,9 @@ class RotationExitAuthority:
                     0.0,
                     (self.stagnation_force_consec_cycles / 10.0),
                 )
-                forced_candidates.append((sym, force_score, age, pnl_pct, streak, continuation_score))
+                forced_candidates.append(
+                    (sym, force_score, age, pnl_pct, streak, continuation_score)
+                )
 
         # Prune symbols that no longer exist to keep streak map bounded.
         stale = [s for s in list(self._stagnation_streaks.keys()) if s not in active_symbols]
@@ -629,7 +681,9 @@ class RotationExitAuthority:
             self._stagnation_entry_ts.pop(s, None)
 
         if forced_candidates:
-            worst_sym, force_score, age, pnl_pct, streak, continuation_score = max(forced_candidates, key=lambda x: x[1])
+            worst_sym, force_score, age, pnl_pct, streak, continuation_score = max(
+                forced_candidates, key=lambda x: x[1]
+            )
             self.logger.warning(
                 "[REA:StagnationForce] 🚨 FORCED_ROTATION: %s age=%.1fh pnl=%.3f%% streak=%d score=%.2f continuation=%.2f",
                 worst_sym,
@@ -661,23 +715,25 @@ class RotationExitAuthority:
                 "allow_partial": True,
                 "target_fraction": max(0.10, min(1.0, self.stagnation_force_sell_fraction)),
             }
-                
+
         if not candidates:
             return None
-            
+
         # Best stagnation candidate
         worst_sym, highest_score, worst_age, worst_pnl = max(candidates, key=lambda x: x[1])
-        
+
         # High threshold for non-replacement exit to avoid churn
         # But RECOVERY mode might want it higher, BOOTSTRAP might want it lower.
         stagnation_threshold = self.mode_thresholds.get(current_mode, 0.6) + 0.2
-        
+
         if highest_score >= stagnation_threshold:
             self.logger.warning(
                 "[REA:Stagnation] 🔥 AUTHORIZING PURGE: %s (age=%.1fh, score=%.2f) - Clearing for future velocity.",
-                worst_sym, (worst_age / 3600.0), highest_score
+                worst_sym,
+                (worst_age / 3600.0),
+                highest_score,
             )
-            
+
             return {
                 "symbol": worst_sym,
                 "action": "SELL",
@@ -695,24 +751,25 @@ class RotationExitAuthority:
                 "_stagnation_pnl_pct": float(worst_pnl),
                 "_rotation_stage": "nomination",
             }
-            
+
         return None
 
     def authorize_concentration_exit(
-        self,
-        owned_positions: Dict[str, Any],
-        nav: float
-    ) -> Optional[Dict[str, Any]]:
+        self, owned_positions: dict[str, Any], nav: float
+    ) -> Optional[dict[str, Any]]:
         """
         Layer 2: Identify if a single symbol is consuming too much portfolio bandwidth.
         Different from Layer 3 rebalancing, this is about ALPHA-weighted concentration.
         """
-        if nav <= 0: return None
+        if nav <= 0:
+            return None
 
         # Dynamic cap: config override takes precedence; fallback to NAV-bracket table.
         config_cap = float(getattr(self.config, "MAX_REA_CONCENTRATION_PCT", 0.0) or 0.0)
         cap = config_cap if config_cap > 0 else _dynamic_exposure_cap(nav)
-        self.logger.debug("[REA:Concentration] DynamicExposure NAV=%.2f → cap=%.0f%%", nav, cap * 100)
+        self.logger.debug(
+            "[REA:Concentration] DynamicExposure NAV=%.2f → cap=%.0f%%", nav, cap * 100
+        )
 
         for sym, pos in owned_positions.items():
             if self._is_permanent_dust_position(sym, pos):
@@ -721,7 +778,9 @@ class RotationExitAuthority:
             if (val / nav) > cap:
                 self.logger.warning(
                     "[REA:Concentration] 🛡️ BANDWIDTH LIMIT: %s consuming over %.0f%% of NAV (NAV=%.2f). Triggering tactical exit.",
-                    sym, cap * 100, nav
+                    sym,
+                    cap * 100,
+                    nav,
                 )
                 return {
                     "symbol": sym,
@@ -731,16 +790,16 @@ class RotationExitAuthority:
                     "reason": "CONCENTRATION_LIMIT",
                     "_forced_exit": True,
                     "allow_partial": True,
-                    "target_fraction": 0.5 
+                    "target_fraction": 0.5,
                 }
         return None
 
     def authorize_liquidity_restoration_exit(
         self,
-        owned_positions: Dict[str, Any],
+        owned_positions: dict[str, Any],
         nav: float,
         free_usdt: float,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """
         Rule 3.5: Liquidity restoration / optionality preservation.
 
@@ -752,10 +811,17 @@ class RotationExitAuthority:
 
         shared_cfg = getattr(self.ss, "config", None)
         reserve_ratio = float(
-            getattr(shared_cfg, "quote_reserve_ratio", getattr(self.config, "CAPITAL_FLOOR_PCT", 0.20)) or 0.20
+            getattr(
+                shared_cfg, "quote_reserve_ratio", getattr(self.config, "CAPITAL_FLOOR_PCT", 0.20)
+            )
+            or 0.20
         )
         abs_floor = float(
-            getattr(self.config, "ABSOLUTE_MIN_FLOOR", getattr(self.config, "CAPITAL_PRESERVATION_FLOOR", 10.0))
+            getattr(
+                self.config,
+                "ABSOLUTE_MIN_FLOOR",
+                getattr(self.config, "CAPITAL_PRESERVATION_FLOOR", 10.0),
+            )
             or 10.0
         )
         reserve_target = max(abs_floor, float(nav or 0.0) * reserve_ratio)
@@ -764,15 +830,23 @@ class RotationExitAuthority:
             return None
 
         # Avoid micro-churn for tiny reserve drift.
-        min_shortfall = float(getattr(self.config, "LIQUIDITY_RESTORE_MIN_SHORTFALL_USDT", 1.0) or 1.0)
+        min_shortfall = float(
+            getattr(self.config, "LIQUIDITY_RESTORE_MIN_SHORTFALL_USDT", 1.0) or 1.0
+        )
         ss_metrics = getattr(self.ss, "metrics", {}) if hasattr(self.ss, "metrics") else {}
         dead_cap_ratio = float((ss_metrics or {}).get("dead_capital_ratio", 0.0) or 0.0)
-        min_dead_cap_ratio = float(getattr(self.config, "LIQUIDITY_RESTORE_MIN_DEAD_CAP_RATIO", 0.08) or 0.08)
+        min_dead_cap_ratio = float(
+            getattr(self.config, "LIQUIDITY_RESTORE_MIN_DEAD_CAP_RATIO", 0.08) or 0.08
+        )
         if shortfall < min_shortfall and dead_cap_ratio < min_dead_cap_ratio:
             return None
 
-        keep_utility_min = float(getattr(self.config, "LIQUIDITY_RESTORE_KEEP_UTILITY_MIN", 0.86) or 0.86)
-        target_buffer_mult = float(getattr(self.config, "LIQUIDITY_RESTORE_BUFFER_MULT", 1.10) or 1.10)
+        keep_utility_min = float(
+            getattr(self.config, "LIQUIDITY_RESTORE_KEEP_UTILITY_MIN", 0.86) or 0.86
+        )
+        target_buffer_mult = float(
+            getattr(self.config, "LIQUIDITY_RESTORE_BUFFER_MULT", 1.10) or 1.10
+        )
         desired_recovery = max(shortfall, min_shortfall) * target_buffer_mult
         now_ts = time.time()
 
@@ -804,7 +878,9 @@ class RotationExitAuthority:
             rotation_pressure = float(utility_snapshot.get("rotation_pressure", 0.0) or 0.0)
             try:
                 sig_flag = pos.get("is_significant", 1.0)
-                is_significant = bool(sig_flag) if isinstance(sig_flag, bool) else float(sig_flag or 0.0) > 0.0
+                is_significant = (
+                    bool(sig_flag) if isinstance(sig_flag, bool) else float(sig_flag or 0.0) > 0.0
+                )
             except Exception:
                 is_significant = True
 
@@ -822,20 +898,24 @@ class RotationExitAuthority:
             if utility >= keep_utility_min and not severe_shortfall and not is_dead_like:
                 continue
 
-            candidates.append((
-                0 if is_dead_like else 1,             # dead capital first
-                utility,                               # then lowest utility
-                -rotation_pressure,                    # then highest pressure
-                -value_usdt,                           # then larger recovery impact
-                sym,
-                value_usdt,
-                utility_snapshot,
-            ))
+            candidates.append(
+                (
+                    0 if is_dead_like else 1,  # dead capital first
+                    utility,  # then lowest utility
+                    -rotation_pressure,  # then highest pressure
+                    -value_usdt,  # then larger recovery impact
+                    sym,
+                    value_usdt,
+                    utility_snapshot,
+                )
+            )
 
         if not candidates:
             return None
 
-        _, worst_utility, _, _, chosen_sym, chosen_value, chosen_snapshot = min(candidates, key=lambda x: x[:4])
+        _, worst_utility, _, _, chosen_sym, chosen_value, chosen_snapshot = min(
+            candidates, key=lambda x: x[:4]
+        )
 
         target_fraction = min(1.0, max(0.25, desired_recovery / max(chosen_value, 1e-9)))
         # If this is already low-utility pressure, prefer decisive cleanup.
@@ -876,29 +956,29 @@ class RotationExitAuthority:
         }
 
     def authorize_starvation_efficiency_exit(
-        self,
-        owned_positions: Dict[str, Any],
-        nav: float,
-        free_usdt: float
-    ) -> Optional[Dict[str, Any]]:
+        self, owned_positions: dict[str, Any], nav: float, free_usdt: float
+    ) -> Optional[dict[str, Any]]:
         """
         Rule 4: Capital Starvation Exit
         If free_usdt < capital_floor, EXIT lowest efficiency position.
         Efficiency = unrealized_pnl_pct / hold_time_hours
         """
-        if not owned_positions: return None
-        
+        if not owned_positions:
+            return None
+
         capital_floor = float(getattr(self.config, "ABSOLUTE_MIN_FLOOR", 10.0))
         if free_usdt >= capital_floor:
-            return None # Capital is healthy
-            
+            return None  # Capital is healthy
+
         now = time.time()
         candidates = []
         min_age_min = float(getattr(self.config, "STARVATION_UTILITY_MIN_AGE_MINUTES", 5.0) or 5.0)
         min_age_h = min_age_min / 60.0
 
-        def _collect(require_min_age: bool) -> List[Tuple[str, float, Dict[str, float], Dict[str, Any]]]:
-            tmp: List[Tuple[str, float, Dict[str, float], Dict[str, Any]]] = []
+        def _collect(
+            require_min_age: bool,
+        ) -> list[tuple[str, float, dict[str, float], dict[str, Any]]]:
+            tmp: list[tuple[str, float, dict[str, float], dict[str, Any]]] = []
             for sym, pos in owned_positions.items():
                 if self._is_permanent_dust_position(sym, pos):
                     continue
@@ -949,5 +1029,5 @@ class RotationExitAuthority:
             "_forced_exit": True,
             "_holding_utility": float(worst_snapshot.get("utility", 0.0) or 0.0),
             "_rotation_pressure": float(worst_snapshot.get("rotation_pressure", 0.0) or 0.0),
-            "allow_partial": False # Full exit to maximize recovery
+            "allow_partial": False,  # Full exit to maximize recovery
         }
