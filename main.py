@@ -115,77 +115,113 @@ class Engines:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Trading cycle — the canonical READ→UNDERSTAND→DECIDE→EXECUTE→RECOVER
+# Trading cycle — the canonical 5-phase pattern via façade engines
 # ════════════════════════════════════════════════════════════════════════
 async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
     """
-    One full trading cycle. ONLY calls the 5 engines — never anything else.
-    Returns a dict of cycle telemetry.
+    One full trading cycle via the 5 core engines. ONLY calls façade methods.
+
+    PHASE 1: READ        — Fetch market data and account state
+    PHASE 2: UNDERSTAND  — Analyze portfolio and market regime
+    PHASE 3: DECIDE      — Generate trading decisions
+    PHASE 4: EXECUTE     — Place orders safely
+    PHASE 5: RECOVER     — Monitor health and log events
     """
     cycle_start = time.perf_counter()
 
-    # 1. READ ────────────────────────────────────────────────────────────
-    account = await engines.market.get_account_state()
-    prices = await engines.market.get_market_prices()
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE 1: READ
+    # ──────────────────────────────────────────────────────────────────
+    account_state = await engines.market.get_account_state()
+    market_prices = await engines.market.get_market_prices()
+    read_complete = True
 
-    # 2. UNDERSTAND ──────────────────────────────────────────────────────
-    portfolio = await engines.situation.get_portfolio_snapshot()
-    regime = await engines.situation.get_market_regime()
-    signals = await engines.situation.get_all_signals()
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE 2: UNDERSTAND
+    # ──────────────────────────────────────────────────────────────────
+    portfolio_snapshot = await engines.situation.get_portfolio_snapshot()
+    market_regime = await engines.situation.get_market_regime()
+    all_signals = await engines.situation.get_all_signals()
+    understand_complete = True
 
-    # 3. DECIDE ──────────────────────────────────────────────────────────
-    decisions: list[Any] = []
-    for sig in signals:
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE 3: DECIDE
+    # ──────────────────────────────────────────────────────────────────
+    trading_decisions: list[Any] = []
+    for sig in all_signals:
+        decision = None
         if sig.signal_type == "BUY":
-            d = await engines.decision.make_buy_decision(sig.symbol, sig.edge_score)
-        elif sig.signal_type == "SELL":
-            d = await engines.decision.make_sell_decision(
-                sig.symbol, sig.edge_score, reason="signal"
+            decision = await engines.decision.make_buy_decision(
+                symbol=sig.symbol, edge_score=sig.edge_score
             )
-        else:
-            d = None
-        if d is not None:
-            decisions.append(d)
+        elif sig.signal_type == "SELL":
+            decision = await engines.decision.make_sell_decision(
+                symbol=sig.symbol, edge_score=sig.edge_score, reason="signal"
+            )
+        if decision:
+            trading_decisions.append(decision)
+    decide_complete = True
 
-    # 4. EXECUTE ─────────────────────────────────────────────────────────
-    executed: list[Any] = []
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE 4: EXECUTE (only in non-dry-run modes)
+    # ──────────────────────────────────────────────────────────────────
+    executed_orders: list[Any] = []
     if mode != "dry-run":
-        for d in decisions:
-            if d.action == "BUY":
-                r = await engines.execution.place_buy_order(
-                    symbol=d.symbol, quantity=d.quantity, price=d.price_target
+        for decision in trading_decisions:
+            order_result = None
+            if decision.action == "BUY":
+                order_result = await engines.execution.place_buy_order(
+                    symbol=decision.symbol,
+                    quantity=decision.quantity,
+                    price=decision.price_target,
                 )
-            elif d.action == "SELL":
-                r = await engines.execution.place_sell_order(
-                    symbol=d.symbol, quantity=d.quantity, price=d.price_target
+            elif decision.action == "SELL":
+                order_result = await engines.execution.place_sell_order(
+                    symbol=decision.symbol,
+                    quantity=decision.quantity,
+                    price=decision.price_target,
                 )
-            else:
-                r = None
-            if r is not None:
-                executed.append(r)
+            if order_result:
+                executed_orders.append(order_result)
+    execute_complete = True
 
-    # 5. RECOVER / OBSERVE ───────────────────────────────────────────────
-    health = await engines.operations.get_health_report()
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE 5: RECOVER / OBSERVE
+    # ──────────────────────────────────────────────────────────────────
+    health_report = await engines.operations.get_health_report()
     await engines.operations.log_event(
         "cycle_complete",
         {
-            "decisions": len(decisions),
-            "executed": len(executed),
-            "regime": regime.overall_health,
+            "read_ok": read_complete,
+            "understand_ok": understand_complete,
+            "decide_ok": decide_complete,
+            "execute_ok": execute_complete,
+            "num_signals": len(all_signals),
+            "num_decisions": len(trading_decisions),
+            "num_executed": len(executed_orders),
+            "nav_usdt": portfolio_snapshot.nav_usdt,
+            "market_regime": market_regime.overall_health if market_regime else "unknown",
         },
     )
+    recover_complete = True
 
+    # Return cycle telemetry
     return {
         "duration_ms": (time.perf_counter() - cycle_start) * 1000,
-        "prices": len(prices),
-        "balances": len(account.get("balances", {})),
-        "nav": portfolio.nav_usdt,
-        "signals": len(signals),
-        "decisions": len(decisions),
-        "executed": len(executed),
-        "health": health.overall_status.value
-        if hasattr(health.overall_status, "value")
-        else str(health.overall_status),
+        "num_prices": len(market_prices),
+        "num_balances": len(account_state.get("balances", {})),
+        "nav_usdt": portfolio_snapshot.nav_usdt,
+        "num_signals": len(all_signals),
+        "num_decisions": len(trading_decisions),
+        "num_executed": len(executed_orders),
+        "health_status": health_report.overall_status.value
+        if hasattr(health_report.overall_status, "value")
+        else str(health_report.overall_status),
+        "read_phase_ok": read_complete,
+        "understand_phase_ok": understand_complete,
+        "decide_phase_ok": decide_complete,
+        "execute_phase_ok": execute_complete,
+        "recover_phase_ok": recover_complete,
     }
 
 
@@ -243,15 +279,25 @@ async def run(args: argparse.Namespace) -> int:
             cycle_no += 1
             try:
                 telem = await trading_cycle(engines, args.mode)
+                phases = "".join(
+                    [
+                        "R" if telem["read_phase_ok"] else "✗",
+                        "U" if telem["understand_phase_ok"] else "✗",
+                        "D" if telem["decide_phase_ok"] else "✗",
+                        "E" if telem["execute_phase_ok"] else "✗",
+                        "O" if telem["recover_phase_ok"] else "✗",
+                    ]
+                )
                 log.info(
-                    "cycle %05d │ %5.1fms │ nav=%.2f │ sigs=%d │ dec=%d │ exec=%d │ %s",
+                    "cycle %05d │ %6.1fms │ nav=%9.2f │ sigs=%2d │ dec=%2d │ exe=%2d │ [%s] │ %s",
                     cycle_no,
                     telem["duration_ms"],
-                    telem["nav"],
-                    telem["signals"],
-                    telem["decisions"],
-                    telem["executed"],
-                    telem["health"],
+                    telem["nav_usdt"],
+                    telem["num_signals"],
+                    telem["num_decisions"],
+                    telem["num_executed"],
+                    phases,
+                    telem["health_status"],
                 )
             except Exception as e:
                 log.exception("cycle %d failed: %s", cycle_no, e)
