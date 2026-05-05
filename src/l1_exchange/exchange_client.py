@@ -3078,6 +3078,108 @@ class ExchangeClient:
             raise ValueError(f"MIN_NOTIONAL violation: {qty_f} * {px:.8f} < {min_notional}")
         return qty_f
 
+    # ------------- dust conversion (Binance API) -------------
+    async def convert_dust(self, assets: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        FIX #2B: Convert dust balances to USDT using Binance /sapi/v1/asset/dust endpoint.
+        
+        This is the official Binance dust converter API which converts small amounts
+        of crypto dust into BNB (or USDT via BNB swap).
+        
+        Args:
+            assets: List of asset symbols to convert (e.g., ["PEPE", "LUNC", "AVAX"])
+                   If None, Binance will auto-detect convertible dust
+        
+        Returns:
+            {
+                "ok": bool,
+                "total_transferred": float,  # Total USDT received
+                "details": List[Dict],  # Per-asset conversion results
+                "error": Optional[str],  # Error message if failed
+            }
+        """
+        try:
+            # Convert dust endpoint: POST /sapi/v1/asset/dust
+            # This requires API key (not secret-signed)
+            params = {}
+            if assets:
+                params["asset"] = ",".join([str(a).upper() for a in assets])
+            
+            result = await self._request(
+                "POST",
+                "/sapi/v1/asset/dust",
+                signed=True,
+                api="spot_api",
+                data=params,
+            )
+            
+            if not result or not isinstance(result, dict):
+                return {
+                    "ok": False,
+                    "total_transferred": 0.0,
+                    "details": [],
+                    "error": "Invalid response from Binance dust endpoint",
+                }
+            
+            # Parse Binance response
+            total_usdt = 0.0
+            details = []
+            
+            # Response typically contains:
+            # {"totalTransfered": "0.05123456", "transferResult": [...]}
+            try:
+                total_usdt = float(result.get("totalTransfered", 0.0) or 0.0)
+            except (ValueError, TypeError):
+                pass
+            
+            transfer_results = result.get("transferResult", [])
+            if isinstance(transfer_results, list):
+                for item in transfer_results:
+                    if isinstance(item, dict):
+                        try:
+                            amount = float(item.get("amount", 0.0) or 0.0)
+                            if amount > 0:
+                                details.append({
+                                    "asset": item.get("asset", "UNKNOWN"),
+                                    "transferred": amount,
+                                    "from_asset": item.get("fromAsset"),
+                                    "transfer_id": item.get("tranId"),
+                                })
+                        except (ValueError, TypeError):
+                            pass
+            
+            self.logger.info(
+                "[EC:DustConvert] ✅ Converted dust: total_usdt=%.8f, conversions=%d",
+                total_usdt,
+                len(details),
+            )
+            
+            return {
+                "ok": True,
+                "total_transferred": total_usdt,
+                "details": details,
+                "error": None,
+            }
+        
+        except BinanceAPIException as e:
+            error_msg = f"Binance API error: {e.message}" if hasattr(e, 'message') else str(e)
+            self.logger.warning("[EC:DustConvert] ❌ Dust conversion failed: %s", error_msg)
+            return {
+                "ok": False,
+                "total_transferred": 0.0,
+                "details": [],
+                "error": error_msg,
+            }
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.warning("[EC:DustConvert] ❌ Unexpected error: %s", error_msg, exc_info=True)
+            return {
+                "ok": False,
+                "total_transferred": 0.0,
+                "details": [],
+                "error": error_msg,
+            }
+
     # ------------- canonical order path -------------
     async def market_buy(self, symbol: str, quote_amount: float, *, tag: str = "meta") -> dict:
         """Delegate to place_market_order so circuit breaker and normalization are applied."""

@@ -1,0 +1,15 @@
+/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+🌐 Binance LIVE: https://api.binance.com
+
+🔍 Discovering positions ≥ $5 …
+
+========================================================================
+🛡️  EXCHANGE-NATIVE SAFETY ORDER PLAN  (TP +1.50% / SL -3.00%)
+========================================================================
+SYMBOL    QTY           ENTRY       NOW         TP          SL          SLLim       OK
+ETHUSDT   0.0109        2344.91     2360.33     2380.09     2274.56     2267.73     ✅
+SOLUSDT   0.296         84.4        84.65       85.67       81.86       81.61       ✅
+XRPUSDT   17.8          1.3986      1.4043      1.4196      1.3566      1.3525      ✅
+
+ℹ️  DRY-RUN. Re-run with --live to actually place orders.

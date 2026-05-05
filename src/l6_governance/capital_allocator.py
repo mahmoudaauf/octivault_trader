@@ -800,36 +800,50 @@ class CapitalAllocator:
                 self.logger.warning(f"[Allocator:Bootstrap] Prune failed: {e}")
         
         if is_bootstrap and allocatable_free < effective_bootstrap_reserve:
-            # DEADLOCK PREVENTION: Not enough capital for bootstrap minimum
-            self.logger.warning(
-                f"[Allocator:Bootstrap] ⛔ Reserve insufficient: allocatable={allocatable_free:.2f} < reserve={effective_bootstrap_reserve:.2f}. "
-                f"Blocking all allocations to prevent fragmentation."
-            )
-            # Structured capital block log
-            self.logger.info(f"[CAPITAL_BLOCK] reason=BOOTSTRAP_RESERVE_INSUFFICIENT allocatable={allocatable_free:.2f} required={effective_bootstrap_reserve:.2f} action=WAIT_FOR_INFLOW")
-            
-            # Emit event for observability
+            # MICRO-RECOVERY OVERRIDE: If NAV < $5, allow trading with emergency reserves
             try:
-                await self.ss.emit_event("AllocationBlocked", {
-                    "reason": "BOOTSTRAP_RESERVE_INSUFFICIENT",
-                    "spendable_free": float(spendable_free),
-                    "bootstrap_reserve": float(effective_bootstrap_reserve),
-                    "liquidity_buffer": float(keep_free),
-                    "shortfall": float(effective_bootstrap_reserve - allocatable_free),
-                    "ts": time.time(),
-                    "component": "CapitalAllocator"
-                })
+                nav_for_recovery = await self._nav_quote()
+                is_micro_recovery = nav_for_recovery < 5.0
             except Exception:
-                pass
-            
-            return {
-                "agent_budgets": {},
-                "per_agent_usdt": {},
-                "reason": "bootstrap_reserve_insufficient",
-                "pool_quote": 0.0,
-                "keep_free": round(float(keep_free), 6),
-                "headroom_quote": round(float(headroom), 6),
-            }
+                is_micro_recovery = float(spendable_free) < 5.0
+
+            if not is_micro_recovery:
+                # DEADLOCK PREVENTION: Not enough capital for bootstrap minimum (normal mode)
+                self.logger.warning(
+                    f"[Allocator:Bootstrap] ⛔ Reserve insufficient: allocatable={allocatable_free:.2f} < reserve={effective_bootstrap_reserve:.2f}. "
+                    f"Blocking all allocations to prevent fragmentation."
+                )
+                # Structured capital block log
+                self.logger.info(f"[CAPITAL_BLOCK] reason=BOOTSTRAP_RESERVE_INSUFFICIENT allocatable={allocatable_free:.2f} required={effective_bootstrap_reserve:.2f} action=WAIT_FOR_INFLOW")
+
+                # Emit event for observability
+                try:
+                    await self.ss.emit_event("AllocationBlocked", {
+                        "reason": "BOOTSTRAP_RESERVE_INSUFFICIENT",
+                        "spendable_free": float(spendable_free),
+                        "bootstrap_reserve": float(effective_bootstrap_reserve),
+                        "liquidity_buffer": float(keep_free),
+                        "shortfall": float(effective_bootstrap_reserve - allocatable_free),
+                        "ts": time.time(),
+                        "component": "CapitalAllocator"
+                    })
+                except Exception:
+                    pass
+
+                return {
+                    "agent_budgets": {},
+                    "per_agent_usdt": {},
+                    "reason": "bootstrap_reserve_insufficient",
+                    "pool_quote": 0.0,
+                    "keep_free": round(float(keep_free), 6),
+                    "headroom_quote": round(float(headroom), 6),
+                }
+            else:
+                # MICRO-RECOVERY: Allow trading with minimal reserves (emergency mode)
+                self.logger.warning(
+                    f"[Allocator:MicroRecovery] 🚨 Emergency mode activated (NAV=${nav_for_recovery:.2f} < $5). "
+                    f"Bypassing reserve checks to enable trading. allocatable={allocatable_free:.2f}, spendable={spendable_free:.2f}"
+                )
 
         if is_bootstrap:
             # Bootstrap: Reserve floor, then allocate 90% of remainder

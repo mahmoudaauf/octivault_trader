@@ -8911,6 +8911,35 @@ class ExecutionManager:
                         qty,
                         ",".join(ex.get("_coalesced_tags") or [])
                     )
+                
+                # OPTION A FIX (2026-05-05): Cancel SafetyOrderManager OCO before liquidation
+                # If SafetyOrderManager has an OCO bracket on this symbol, cancel it first
+                # so the SELL doesn't get rejected with "insufficient free balance"
+                try:
+                    open_orders = await self.exchange_client.get_open_orders(sym)
+                    oco_orders = [o for o in open_orders if o.get("type") in ("STOP_LOSS_LIMIT", "LIMIT_MAKER")]
+                    if oco_orders:
+                        self.logger.info(
+                            "[ExecutionManager] OPTION_A: Found %d SafetyOrderManager OCO orders on %s. Cancelling before liquidation SELL.",
+                            len(oco_orders), sym
+                        )
+                        for order in oco_orders:
+                            try:
+                                await self.exchange_client.cancel_order(
+                                    sym,
+                                    order_id=order.get("orderId"),
+                                    client_order_id=order.get("clientOrderId")
+                                )
+                            except Exception as cancel_err:
+                                self.logger.warning(
+                                    "[ExecutionManager] OPTION_A: Failed to cancel OCO order %s: %s",
+                                    order.get("orderId"), cancel_err
+                                )
+                except Exception as oco_check_err:
+                    self.logger.debug(
+                        "[ExecutionManager] OPTION_A: OCO pre-cancel check failed (benign): %s", oco_check_err
+                    )
+                
                 raw = await self._place_market_order_qty(sym, qty, "SELL", tag)
                 # Always reconcile delayed fill and finalize only once with correct policy_ctx
                 merged = await self._reconcile_delayed_fill(

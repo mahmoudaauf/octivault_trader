@@ -1,0 +1,22 @@
+/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+🌐 Binance LIVE: https://api.binance.com
+📊 Testing against 3 known positions
+
+🧪 MODE #1: SIDEWAYS DRIFT ─ time-based forced exit
+────────────────────────────────────────────────────────────────────────
+  ✅ fresh +0.1% (1h)             → exit=False  (hold age=1.0h pct=+0.10%)
+  ✅ flat 12h                     → exit=False  (hold age=12.0h pct=+0.00%)
+  ✅ flat 24h drift -0.2%         → exit=True  (MAX_DURATION_REACHED age=24.0h pct=-0.20%)
+  ✅ flat 24h drift +0.4%         → exit=True  (MAX_DURATION_REACHED age=24.0h pct=+0.40%)
+  ✅ 12h tiny-profit +0.4%        → exit=True  (SIDEWAYS_TINY_TP age=12.0h pct=+0.40%)
+  ✅ 48h drift +0.1%              → exit=True  (MAX_DURATION_REACHED age=48.0h pct=+0.10%)
+  ✅ 48h profit +5%               → exit=False  (hold age=48.0h pct=+5.00%)
+  Result: 7/7 passed
+
+════════════════════════════════════════════════════════════════════════
+📋 FINAL SUMMARY
+════════════════════════════════════════════════════════════════════════
+  ✅ PASS  sideways
+
+  Overall: ✅ ALL PASS

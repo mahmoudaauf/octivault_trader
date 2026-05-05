@@ -2184,12 +2184,72 @@ class ExchangeTruthAuditor:
                 self.logger.error("[TruthAuditor] failed applying recovered fill %s %s", sym, side, exc_info=True)
 
         if side == "SELL" and not skip_recovery:
+            # ── P&L-AWARE DUST PRESERVATION (new) ──
+            # Dynamically decide whether to close this position based on P&L quality.
+            # Bad dust (losing > 5%) gets closed; good dust (neutral or profitable) is preserved
+            # for later dust healing and reinvestment.
+            try:
+                if hasattr(ss, "get_position"):
+                    pos = await ss.get_position(sym)
+                    if pos and isinstance(pos, dict):
+                        qty_current = float(pos.get("quantity", 0.0) or 0.0)
+                        avg_entry = float(pos.get("avg_price") or pos.get("entry_price") or 0.0)
+
+                        # Get current market price
+                        current_price = float(self.shared_state.latest_prices.get(sym, 0.0) or 0.0)
+                        if current_price <= 0 and self.exchange_client:
+                            try:
+                                px_info = await self.exchange_client.get_ticker(sym)
+                                if px_info and "lastPrice" in px_info:
+                                    current_price = float(px_info["lastPrice"] or 0.0)
+                            except Exception:
+                                pass  # Use cached price or 0
+
+                        # BUG5 FIX: If snapshot shows qty=0, use order's executedQty for P&L check
+                        # Snapshot qty=0 means position was already closed in ledger, but order
+                        # may still carry the original qty for P&L calculation purposes
+                        if qty_current <= 0:
+                            qty_current = float(order.get("executedQty", 0.0) or 0.0)
+
+                        # Calculate unrealized P&L %
+                        if avg_entry > 0 and qty_current > 0 and current_price > 0:
+                            unrealized_pnl_pct = ((current_price - avg_entry) / avg_entry) * 100
+
+                            # DYNAMIC THRESHOLD: only close if losing more than configured threshold
+                            min_pnl_to_preserve_pct = float(
+                                os.environ.get("TRUTH_AUDIT_MIN_PNL_PCT_TO_PRESERVE", "-5.0")
+                            )
+
+                            if unrealized_pnl_pct >= min_pnl_to_preserve_pct:
+                                # Position is neutral or profitable — PRESERVE it for dust healing
+                                self.logger.info(
+                                    "[TruthAuditor:P&L_Filter] 📈 PRESERVING %s for reinvestment: "
+                                    "qty=%.8f, entry=$%.4f, current=$%.4f, pnl=%+.2f%% (>= %.1f%% threshold)",
+                                    sym, qty_current, avg_entry, current_price, unrealized_pnl_pct, min_pnl_to_preserve_pct
+                                )
+                                skip_recovery = True  # Skip closing this position
+                            else:
+                                # Position is losing badly — close it to free capital
+                                self.logger.warning(
+                                    "[TruthAuditor:P&L_Filter] 📉 CLOSING losing position %s: "
+                                    "qty=%.8f, entry=$%.4f, current=$%.4f, pnl=%+.2f%% (< %.1f%% threshold)",
+                                    sym, qty_current, avg_entry, current_price, unrealized_pnl_pct, min_pnl_to_preserve_pct
+                                )
+                                # Proceed with normal closure (continues to mark_position_closed below)
+            except Exception as e:
+                self.logger.debug(
+                    "[TruthAuditor:P&L_Filter] P&L check failed for %s: %s; proceeding with closure",
+                    sym, str(e)
+                )
+                # Fall through to mark_position_closed (safe default behavior)
+
             # Ensure stale open lots are finalised even if fill hooks were missed.
+            # But respect P&L preservation flag: if skip_recovery is True, skip closure
             try:
                 pos_qty = 0.0
                 if hasattr(ss, "get_position_qty"):
                     pos_qty = float(ss.get_position_qty(sym) or 0.0)
-                if pos_qty > self.dust_threshold and hasattr(ss, "mark_position_closed"):
+                if not skip_recovery and pos_qty > self.dust_threshold and hasattr(ss, "mark_position_closed"):
                     await self._maybe_call(
                         ss,
                         "mark_position_closed",

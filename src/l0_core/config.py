@@ -282,7 +282,7 @@ class Config:
     DUST_MIN_QUOTE_USDT = 5.0
     DUST_POSITION_QTY = 0.0001
     PERMANENT_DUST_USDT_THRESHOLD = 1.0
-    DUST_LIQUIDATION_ENABLED = True
+    DUST_LIQUIDATION_ENABLED = False
     DUST_REENTRY_OVERRIDE = True
     ALLOW_ENTRY_BELOW_SIGNIFICANT_FLOOR = False
     # Dust priority system thresholds (Reuse > Aggregate > Cleanup)

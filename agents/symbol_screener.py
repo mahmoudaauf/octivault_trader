@@ -509,12 +509,18 @@ class SymbolScreener:
         - Only propose NEW symbols if we have meaningful capital to trade them
         - Prevents unlimited symbol expansion and dust position creation
         - Checks: existing accepted_symbols count + free capital
+        
+        ✅ FIX #3: DISCOVERY GATE RELAXATION (MICRO ACCOUNT ADAPTATION)
+        - Relaxed capital thresholds for micro accounts (NAV < $500)
+        - Allow discovery at 70% of min_entry instead of 1.5x multiplier
+        - Prioritizes symbol pipeline over perfect capital alignment
+        - Prevents discovery starvation on small accounts
         """
         if candidates:
             symbols_only = [str(item.get("symbol", "")) for item in candidates]
             logger.info(f"📊 Candidate symbols found: {symbols_only}")
             
-            # ✅ FIX #7: Check if we have capital for new positions before proposing symbols
+            # ✅ FIX #3: Check if we have capital for new positions before proposing symbols
             try:
                 # Get current universe size
                 current_universe = set()
@@ -525,6 +531,17 @@ class SymbolScreener:
                 
                 # Get free capital
                 free_usdt = float(await self.shared_state.get_spendable_balance('USDT') or 0.0) if self.shared_state else 0.0
+                
+                # Get NAV to determine if this is a micro account
+                nav = 0.0
+                try:
+                    if self.shared_state and hasattr(self.shared_state, 'get_nav'):
+                        nav_result = self.shared_state.get_nav()
+                        nav = float(await nav_result if asyncio.iscoroutine(nav_result) else nav_result or 0.0)
+                except Exception:
+                    pass
+                
+                is_micro_account = nav < 500.0  # FIX #3: Define micro as NAV < $500
                 
                 # Get minimum entry size (same as MetaController uses)
                 min_entry = float(self._cfg("MIN_ENTRY_USDT", self._cfg("SAFE_ENTRY_USDT", 12.0)))
@@ -538,30 +555,53 @@ class SymbolScreener:
                 max_positions = int(self._cfg("MAX_POSITIONS_TOTAL", 2))
                 
                 new_universe_size = len(current_universe) + len([c for c in candidates if self._normalize_symbol(c.get("symbol", "")) not in current_universe])
-                can_afford_new_position = free_usdt >= min_significant * 1.5  # 1.5x safety margin
+                
+                # ✅ FIX #3: Adaptive capital requirement based on account size
+                # Micro accounts: need 70% of min_entry (discovery priority over perfect capital alignment)
+                # Standard accounts: need 1.5x multiplier for safety margin
+                if is_micro_account:
+                    capital_requirement = min_significant * 0.70  # FIX #3: Relaxed threshold
+                    requirement_label = "RELAXED (70% for micro)"
+                else:
+                    capital_requirement = min_significant * 1.5
+                    requirement_label = "STANDARD (1.5x)"
+                
+                can_afford_new_position = free_usdt >= capital_requirement
                 has_universe_capacity = new_universe_size < max_universe
                 
-                logger.info(
-                    "[SymbolScreener] 🔍 FIX #7 DISCOVERY GATE CHECK: "
-                    "current_universe=%d max=%d | free_USDT=%.2f min_entry=%.2f | "
+                logger.warning(
+                    "[SymbolScreener] 🔍 FIX #3 DISCOVERY GATE CHECK: "
+                    "NAV=%.2f (micro=%s) | "
+                    "current_universe=%d max=%d | free_USDT=%.2f required=%.2f (%s) | "
                     "can_afford_new=%s universe_capacity=%s",
-                    len(current_universe), max_universe, free_usdt, min_significant,
+                    nav, is_micro_account,
+                    len(current_universe), max_universe, free_usdt, capital_requirement, requirement_label,
                     can_afford_new_position, has_universe_capacity
                 )
                 
-                # If we can't afford new positions AND universe is full, don't propose
-                if not can_afford_new_position and not has_universe_capacity:
+                # ✅ FIX #3: Only block discovery if BOTH conditions fail
+                # (Don't block just because we're slightly under capital - still allow discovery)
+                if not has_universe_capacity and new_universe_size >= max_universe:
                     logger.warning(
-                        "[SymbolScreener] ❌ FIX #7 DISCOVERY BLOCKED: "
-                        "Insufficient capital (%.2f USDT < %.2f needed) AND universe full (%d/%d). "
-                        "Not proposing %d new symbols to prevent dust.",
-                        free_usdt, min_significant * 1.5, len(current_universe), max_universe,
-                        len(candidates)
+                        "[SymbolScreener] ❌ FIX #3 DISCOVERY BLOCKED: "
+                        "Universe FULL (%d/%d symbols). "
+                        "Can still add if accepted_symbols rotates.",
+                        new_universe_size, max_universe
                     )
-                    return  # Skip discovery entirely
+                    # CHANGED: Don't return here - allow proposals even if universe full
+                    # They just won't be activated until a symbol rotates out
+                
+                # Log capital situation
+                if not can_afford_new_position:
+                    logger.warning(
+                        "[SymbolScreener] ⚠️ FIX #3 LOW CAPITAL: "
+                        "Only %.2f USDT free (need %.2f). "
+                        "Will still propose symbols for future rotation when capital available.",
+                        free_usdt, capital_requirement
+                    )
                 
             except Exception as e:
-                logger.debug(f"[SymbolScreener] FIX #7 capital check failed (non-fatal): {e}")
+                logger.debug(f"[SymbolScreener] FIX #3 capital check failed (non-fatal): {e}")
                 # Continue anyway on error (fail-safe to discovery enabled)
             
             accepted = 0
@@ -589,13 +629,13 @@ class SymbolScreener:
                     )
                     if accepted_flag:
                         accepted += 1
-                        logger.info(f"[SymbolScreener] ✅ Symbol accepted: {symbol}")
+                        logger.warning(f"[SymbolScreener] ✅ PROPOSED: {symbol} (buffered for UURE discovery)")
                     else:
-                        logger.warning(f"[SymbolScreener] ❌ Symbol rejected/buffered: {symbol}")
+                        logger.warning(f"[SymbolScreener] ❌ Proposal failed: {symbol}")
                 except Exception as e:
                     logger.error(f"Failed to propose symbol {symbol} via _propose: {e}", exc_info=True)
-            logger.info(
-                "[SymbolScreener] Proposal pass complete: %d/%d accepted.",
+            logger.warning(
+                "[SymbolScreener] Proposal complete: %d/%d symbols proposed to buffer.",
                 accepted,
                 len(candidates),
             )

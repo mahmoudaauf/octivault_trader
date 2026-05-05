@@ -79,6 +79,7 @@ try:
     from src.l4_execution.execution_manager import ExecutionManager
     from src.l6_governance.risk_manager import RiskManager
     from src.l4_execution.tp_sl_engine import TPSLEngine  # ← CRITICAL: TP/SL monitoring for position management
+    from src.l4_execution.safety_order_manager import SafetyOrderManager  # ← CRITICAL: Exchange-native OCO protection
     from src.l8_lifecycle.meta_controller import MetaController
     from src.l5_strategy.agent_manager import AgentManager
     from src.l2_marketdata.market_data_feed import MarketDataFeed  # ← CRITICAL: Add market data streaming
@@ -612,6 +613,7 @@ class MasterSystemOrchestrator:
         self.risk_manager: Optional[RiskManager] = None
         self.execution_manager: Optional[ExecutionManager] = None
         self.tp_sl_engine: Optional[TPSLEngine] = None  # ← CRITICAL: TP/SL monitoring for exits
+        self.safety_order_manager: Optional[SafetyOrderManager] = None  # ← CRITICAL: Exchange-native OCO protection
         self.meta_controller: Optional[MetaController] = None
         self.agent_manager: Optional[AgentManager] = None
         self.market_data_feed: Optional[MarketDataFeed] = None  # ← CRITICAL: Real-time market data
@@ -1212,6 +1214,24 @@ class MasterSystemOrchestrator:
                 logger.error(f"❌ TPSLEngine initialization failed: {e}", exc_info=True)
                 logger.warning("⚠️  System will continue without TP/SL monitoring (HIGH RISK)")
                 self.tp_sl_engine = None
+            
+            # LAYER 5C: Safety Order Manager (Exchange-Native OCO Protection)
+            # Complements TPSLEngine: posts REAL orders on Binance so SL/TP
+            # survives bot crashes / network loss / process restarts.
+            logger.info("\n[5C/9] LAYER 5C: SafetyOrderManager (Exchange-Native OCO)")
+            try:
+                self.safety_order_manager = SafetyOrderManager(
+                    shared_state=self.shared_state,
+                    config=self.config,
+                    exchange_client=self.exchange_client,
+                    execution_manager=self.execution_manager,
+                    logger=logger,
+                )
+                logger.info("✅ SafetyOrderManager initialized")
+            except Exception as e:
+                logger.error(f"❌ SafetyOrderManager init failed: {e}", exc_info=True)
+                logger.warning("⚠️  System continues without exchange-native SL (MEDIUM RISK)")
+                self.safety_order_manager = None
             
             # LAYER 3B: Meta Controller (decisions)
             logger.info("\n[6/9] LAYER 3B: Meta Controller (Decision Engine)")
@@ -2303,6 +2323,7 @@ class MasterSystemOrchestrator:
                 asyncio.create_task(self.polling_coordinator.start(), name="PollingCoordinator"),
                 # market_data_feed already running — task tracked in _mdf_task above
                 asyncio.create_task(self.tp_sl_engine.start(), name="TPSLEngine") if self.tp_sl_engine else None,
+                asyncio.create_task(self.safety_order_manager.start(), name="SafetyOrderManager") if self.safety_order_manager else None,
                 asyncio.create_task(self.meta_controller.start(), name="MetaController"),
                 asyncio.create_task(self.agent_manager.start(), name="AgentManager"),
                 asyncio.create_task(self.watchdog.run(), name="Watchdog"),

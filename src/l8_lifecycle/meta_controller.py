@@ -1988,6 +1988,12 @@ class MetaController:
             fix8_4th_slot_enabled = getattr(config, 'FIX8_4TH_SLOT_ENABLED', True)
             if fix8_4th_slot_enabled and FourthSlotTracker is not None:
                 self.fourth_slot_tracker = FourthSlotTracker(config)
+                self._forced_exit_intent = None  # Will hold forced exits from 4th-slot tracker
+                # 4th-slot ENTRY-side state (paired with exit watcher above):
+                # last_rotation_ts gates the 30s cooldown between attempts;
+                # loss_cooldown blacklists symbols that just hit -3% SL for 15 min.
+                self._fourth_slot_last_rotation_ts: float = 0.0
+                self._fourth_slot_loss_cooldown: Dict[str, float] = {}
                 self.logger.warning(
                     "[FIX #8: 4TH SLOT] Initialized | "
                     "Target: %+.1f%%, Stop: %.1f%%, Max Hold: %d min",
@@ -1997,6 +2003,7 @@ class MetaController:
                 )
             else:
                 self.fourth_slot_tracker = None
+                self._forced_exit_intent = None
                 if not fix8_4th_slot_enabled:
                     self.logger.info("[FIX #8: 4TH SLOT] DISABLED via config")
                 else:
@@ -4258,6 +4265,42 @@ class MetaController:
         Full exits must go through `close_position(..., force_finalize=True)`.
         """
         # ═════════════════════════════════════════════════════════════════
+        # FIX #1: PRE-FLIGHT CHECK - Detect locked balance blocking SELL
+        # ═════════════════════════════════════════════════════════════════
+        # When TPSLEngine arms OCO orders, all qty gets locked. If MetaController
+        # tries to SELL before OCO fills, Binance returns -2010 (insufficient balance).
+        # This check catches that BEFORE submission and returns a cleaner error.
+        sym_norm = self._norm_symbol(symbol)
+        try:
+            # Get actual free + locked from exchange
+            acct = await self.exchange_client.get_account_balances()
+            bal_info = acct.get(sym_norm.replace("USDT", ""), {}) or {}
+            free_qty = float(bal_info.get("free", 0.0) or 0.0)
+            locked_qty = float(bal_info.get("locked", 0.0) or 0.0)
+            total_qty = free_qty + locked_qty
+            
+            if free_qty <= 1e-8 and locked_qty > 1e-8 and qty > 1e-8:
+                # ALL qty is locked (likely in OCO), SELL is impossible
+                self.logger.warning(
+                    "[FIX#1:LockedBalance] %s: SELL qty=%.8f impossible — all %.8f qty locked (OCO/SL protected). "
+                    "free=%.8f locked=%.8f. Returning early with clear error.",
+                    symbol, qty, total_qty, free_qty, locked_qty
+                )
+                return {
+                    "ok": False,
+                    "status": "REJECTED",
+                    "reason": "ALL_QUANTITY_LOCKED_IN_OCO",
+                    "error_code": "LOCKED_BALANCE_BLOCKER",
+                    "symbol": symbol,
+                    "message": f"Cannot SELL {symbol}: all qty locked in OCO/TP/SL orders. Wait for fill or cancel OCO.",
+                    "free_qty": free_qty,
+                    "locked_qty": locked_qty,
+                    "requested_qty": qty,
+                }
+        except Exception as e:
+            self.logger.debug("[FIX#1:LockedBalance] Pre-flight check failed: %s (will continue to normal flow)", e)
+        
+        # ═════════════════════════════════════════════════════════════════
         # PHASE 4: SAFETY VALIDATION - Check if SELL is allowed on position
         # ═════════════════════════════════════════════════════════════════
         from src.l3_portfolio.position_operation_validator import OperationType
@@ -5197,17 +5240,34 @@ class MetaController:
 
             # 3. Position Lock (One Lifecycle Rule)
             # If position exists (and is not dust), REJECT unless explicit scale-in
-            # This enforces "Buy Once, Hold, Sell" behavior for v1 stability
+            # ENHANCED: Auto-allow scale-in on GOOD DUST (positive P&L) for reinvestment
             if existing_position_notional > 0 and not is_existing_dust:
                 allow_scale_in = False
-                # Future: Check for "scale_in" or "dca" tags in signal
+                is_good_dust = False
+
+                # CHECK 1: Explicit scale-in tag in signal
                 if "scale_in" in reason.lower() or "dca" in reason.lower():
                     allow_scale_in = True
-                
+
+                # CHECK 2: Good dust (dust position with positive P&L) = auto-allow reinvestment
+                if is_existing_dust and existing_position_notional > 0:
+                    unrealized_pnl_pct = float(pos.get("unrealized_pnl_pct", 0.0) or 0.0)
+                    if unrealized_pnl_pct > 0.02:  # Profitable > 2%
+                        allow_scale_in = True
+                        is_good_dust = True
+
                 if not allow_scale_in:
                     self.logger.info("[WHY_NO_TRADE] reason=POSITION_ALREADY_OPEN symbol=%s details=single_entry_rule_active", symbol)
                     await self._record_why_no_trade(symbol, "POSITION_ALREADY_OPEN", "single_entry_rule_active")
                     return False
+
+                # Log reinvestment if triggered by good dust
+                if is_good_dust:
+                    self.logger.info(
+                        "[REINVESTMENT:AUTO_SCALE_IN] 📈 Good dust detected on %s: "
+                        "existing_dust=$%.2f (PnL=%+.2f%%) → AUTO-ENABLING scale-in for compounding",
+                        symbol, existing_position_notional, unrealized_pnl_pct * 100
+                    )
 
             # ═══════════════════════════════════════════════════════════════════════
             # STEP 5: Check balance availability
@@ -6928,6 +6988,18 @@ class MetaController:
             return val
         except Exception:
             return default
+
+    def _cfg_list(self, name: str, default: typing.Optional[typing.List[str]] = None) -> typing.List[str]:
+        """Helper to get config value as a list of strings."""
+        try:
+            v = getattr(self.config, name, None)
+            if isinstance(v, (list, tuple, set)):
+                return [str(x).upper() for x in v]
+            if isinstance(v, str):
+                return [s.strip().upper() for s in v.split(',') if s.strip()]
+        except Exception:
+            pass
+        return list(default or [])
 
     def _resolve_universe_symbol_limit(self, default: int = 5) -> int:
         """
@@ -10462,6 +10534,161 @@ class MetaController:
         except Exception as e:
             self.logger.debug("[Meta:FIX2] Cache reset failed (non-fatal): %s", e)
 
+        # ═════════════════════════════════════════════════════════════════════════════════════
+        # FIX #2A-ENTRY: FOURTH_SLOT_TRACKER ENTRY SELECTOR (new code)
+        # Try to rotate into a new high-volatility candidate if the slot is empty
+        # ═════════════════════════════════════════════════════════════════════════════════════
+        if self.fourth_slot_tracker is not None and self.fourth_slot_tracker.current_symbol is None:
+            try:
+                await self._attempt_fourth_slot_entry()
+            except Exception as e:
+                self.logger.exception("[4thSlot:Entry] Unexpected exception: %s", e)
+
+        # ═════════════════════════════════════════════════════════════════════════════════════
+        # FIX #2A: WIRE FOURTH_SLOT_TRACKER INTO ORCHESTRATOR LOOP
+        # Check for aggressive 4th-slot exits BEFORE building new decisions
+        # Exit conditions: +15% TP, -3% SL, or 120min timeout
+        # ═════════════════════════════════════════════════════════════════════════════════════
+        if self.fourth_slot_tracker and self.fourth_slot_tracker.current_symbol:
+            try:
+                # Get current price for the tracked symbol
+                tracked_symbol = self.fourth_slot_tracker.current_symbol
+                current_price = None
+                
+                # Try to get price from shared_state first
+                if hasattr(self.shared_state, "get_price"):
+                    current_price = self.shared_state.get_price(tracked_symbol)
+                
+                # Fallback: get from exchange if not in shared state
+                if current_price is None or current_price <= 0:
+                    try:
+                        ticker = await self.exchange_client.get_ticker(tracked_symbol)
+                        if ticker and "price" in ticker:
+                            current_price = float(ticker["price"])
+                    except Exception:
+                        pass
+                
+                # If we got a valid price, check exit conditions
+                if current_price and current_price > 0:
+                    exit_decision = self.fourth_slot_tracker.check_exit_conditions(current_price)
+                    
+                    if exit_decision:
+                        # 4th slot should exit — force SELL decision for this symbol
+                        self.logger.warning(
+                            "[FIX#2A:4thSlot] 🎯 EXIT TRIGGERED for %s: %s | P&L: %+.2f%% | "
+                            "Time: %.1f min | Price: $%.8f",
+                            tracked_symbol,
+                            exit_decision.get("exit_reason", "UNKNOWN"),
+                            exit_decision.get("pnl_pct", 0) * 100,
+                            exit_decision.get("time_held_min", 0),
+                            current_price
+                        )
+                        
+                        # Create forced exit decision for this symbol
+                        forced_exit = (
+                            tracked_symbol,
+                            "SELL",
+                            {
+                                "reason": f"4TH_SLOT_EXIT:{exit_decision.get('exit_reason', 'UNKNOWN')}",
+                                "exit_reason": exit_decision.get("exit_reason"),
+                                "pnl": exit_decision.get("pnl", 0.0),
+                                "pnl_pct": exit_decision.get("pnl_pct", 0.0),
+                                "time_held_min": exit_decision.get("time_held_min", 0),
+                                "exit_price": current_price,
+                                "authority": "4TH_SLOT_TRACKER",
+                            }
+                        )
+                        
+                        # Push this forced exit to the decision pipeline
+                        # (will be built into decisions in _build_decisions)
+                        if hasattr(self, "_forced_exit_intent"):
+                            self._forced_exit_intent = forced_exit
+                            self.logger.info(
+                                "[FIX#2A:4thSlot] ✅ Stored forced exit intent for %s (will execute in this cycle)",
+                                tracked_symbol
+                            )
+                        
+                        # Reset tracker after recording the exit
+                        self.fourth_slot_tracker.reset_position()
+                        self.logger.info("[FIX#2A:4thSlot] ✅ Reset tracker, ready for next 4th-slot rotation")
+                else:
+                    self.logger.debug(
+                        "[FIX#2A:4thSlot] Could not get current price for %s (price=%.8f)",
+                        tracked_symbol,
+                        current_price if current_price else 0
+                    )
+            except Exception as e:
+                self.logger.warning("[FIX#2A:4thSlot] Exit check failed (non-fatal): %s", e)
+
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        # FIX #2B: CONVERT DUST PERIODICALLY (Binance /sapi/v1/asset/dust endpoint)
+        # Clean up small balances to free portfolio slots for new entries
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        try:
+            # Run dust conversion every N cycles (default 30 = ~60 seconds at 2s/cycle)
+            dust_convert_interval = int(self._cfg("FIX2B_DUST_CONVERT_INTERVAL_CYCLES", 30) or 30)
+            if not hasattr(self, "_dust_convert_cycle_counter"):
+                self._dust_convert_cycle_counter = 0
+            
+            self._dust_convert_cycle_counter += 1
+            if self._dust_convert_cycle_counter >= dust_convert_interval:
+                self._dust_convert_cycle_counter = 0
+                
+                # Get list of dust assets to convert (from shared_state or config)
+                dust_assets = []
+                try:
+                    if self.shared_state and hasattr(self.shared_state, "get_dust_assets"):
+                        dust_assets = self.shared_state.get_dust_assets() or []
+                except Exception:
+                    pass
+                
+                # Fallback to config list or auto-detect
+                if not dust_assets:
+                    dust_assets = self._cfg_list("FIX2B_DUST_ASSETS", ["PEPE", "LUNC", "AVAX", "XRP", "DOGE"])
+                
+                if dust_assets and self.exchange_client and hasattr(self.exchange_client, "convert_dust"):
+                    self.logger.info(
+                        "[FIX#2B:Dust] 🧹 Running dust conversion for %d assets: %s",
+                        len(dust_assets),
+                        ", ".join(dust_assets[:5]) + ("..." if len(dust_assets) > 5 else "")
+                    )
+                    
+                    result = await self.exchange_client.convert_dust(assets=dust_assets)
+                    
+                    if result and result.get("ok"):
+                        freed_usdt = result.get("total_transferred", 0.0)
+                        num_conversions = len(result.get("details", []))
+                        
+                        self.logger.warning(
+                            "[FIX#2B:Dust] ✅ DUST CONVERSION SUCCESS: freed=$%.2f | conversions=%d",
+                            freed_usdt,
+                            num_conversions,
+                        )
+                        
+                        # Log details per asset
+                        for detail in result.get("details", []):
+                            self.logger.info(
+                                "[FIX#2B:Dust] Asset %s converted: amount=%.8f (transferred to BNB/USDT)",
+                                detail.get("asset", "UNKNOWN"),
+                                detail.get("transferred", 0.0),
+                            )
+                        
+                        # Notify shared_state about freed capital
+                        if freed_usdt > 0 and self.shared_state and hasattr(self.shared_state, "emit_event"):
+                            try:
+                                await self.shared_state.emit_event("dust_conversion_complete", {
+                                    "total_freed_usdt": freed_usdt,
+                                    "conversions": num_conversions,
+                                    "assets": [d.get("asset") for d in result.get("details", [])],
+                                })
+                            except Exception:
+                                pass
+                    elif result and result.get("error"):
+                        self.logger.debug("[FIX#2B:Dust] Dust conversion failed: %s", result.get("error"))
+                    
+        except Exception as e:
+            self.logger.warning("[FIX#2B:Dust] Dust conversion cycle failed (non-fatal): %s", e)
+
         # 🔥 FIX 0: COLLECT AGENT SIGNALS FIRST
         # Ensure all agent signals are published to event bus BEFORE we drain
         # This way bootstrap will find signals when _build_decisions queries cache
@@ -11517,21 +11744,43 @@ class MetaController:
             
             if not liquidatable:
                 return None
-            
-            # Sort: by priority (ascending = meme coins first), then by value (ascending = smallest first)
-            liquidatable.sort(key=lambda x: (x["priority"], x["value_usdt"]))
-            victim = liquidatable[0]
+
+            # ENHANCED: Prioritize by P&L quality (bad dust first, good dust last)
+            # Sort by: (1) P&L score (negative P&L = liquidate first), (2) priority, (3) value
+            scored = []
+            for dust in liquidatable:
+                pos = dust["position"]
+                pnl_pct = float(pos.get("unrealized_pnl_pct", 0.0) or 0.0)
+
+                # Bad dust (losing) = higher priority
+                pnl_score = 0
+                if pnl_pct < -0.10: pnl_score = 100
+                elif pnl_pct < -0.05: pnl_score = 80
+                elif pnl_pct < 0: pnl_score = 60
+                elif pnl_pct < 0.05: pnl_score = 20
+                else: pnl_score = -40  # Good dust - lower priority
+
+                scored.append({
+                    **dust,
+                    "pnl_pct": pnl_pct,
+                    "pnl_score": pnl_score
+                })
+
+            scored.sort(key=lambda x: (-x["pnl_score"], x["priority"], x["value_usdt"]))
+            victim = scored[0]
             
             sym_to_liquidate = victim["symbol"]
             qty_to_liquidate = victim["qty"]
             value_liquidated = victim["value_usdt"]
-            
+            pnl_pct = victim.get("pnl_pct", 0.0)
+            pnl_score = victim.get("pnl_score", 0)
+
             self.logger.critical(
-                "[EMERGENCY_LIQUIDATION] 🚨 BOOTSTRAP CAPITAL: "
-                "Capital=$%.2f (< $1), mode=%s → Emergency SELL %s (qty=%.8f, value=$%.2f) "
-                "to bootstrap healing (priority=%d)",
-                free_usdt, current_mode, sym_to_liquidate, qty_to_liquidate, 
-                value_liquidated, victim["priority"]
+                "[EMERGENCY_LIQUIDATION] 🚨 BOOTSTRAP CAPITAL + SMART DUST: "
+                "Capital=$%.2f (< $1), mode=%s → Emergency SELL %s (qty=%.8f, value=$%.2f, PnL=%+.2f%%) "
+                "to bootstrap healing (quality_score=%d, priority=%d)",
+                free_usdt, current_mode, sym_to_liquidate, qty_to_liquidate,
+                value_liquidated, pnl_pct * 100, pnl_score, victim["priority"]
             )
             
             # Create SELL signal for emergency bootstrap
@@ -11542,19 +11791,22 @@ class MetaController:
                 "confidence": 1.0,
                 "agent": "MetaEmergencyLiquidation",
                 "timestamp": time.time(),
-                "reason": "EMERGENCY_DUST_LIQUIDATION",
+                "reason": "EMERGENCY_DUST_LIQUIDATION_QUALITY_PRIORITY",
                 "_emergency_liquidation": True,
                 "_position_value_liquidated": value_liquidated,
                 "_bootstrap_purpose": "heal_remaining_dust",
                 "_mode": current_mode,
                 "_capital_at_trigger": free_usdt,
-                "_tier": "BOOTSTRAP_CAPITAL"
+                "_tier": "BOOTSTRAP_CAPITAL",
+                "_dust_pnl_pct": pnl_pct,
+                "_dust_quality_score": pnl_score,
+                "_smart_dust_priority": True
             }
-            
+
             self.logger.critical(
-                "[EMERGENCY_LIQUIDATION] 💰 Liquidity bootstrap: SELL %s (qty=%.8f, $%.2f) "
-                "to free minimal capital for dust healing recovery",
-                sym_to_liquidate, qty_to_liquidate, value_liquidated
+                "[EMERGENCY_LIQUIDATION] 💰 Smart dust liquidation: SELL %s (qty=%.8f, value=$%.2f, PnL=%+.2f%%) "
+                "to free capital for healing recovery (prioritized bad dust with negative P&L)",
+                sym_to_liquidate, qty_to_liquidate, value_liquidated, pnl_pct * 100
             )
             
             return [(sym_to_liquidate, "SELL", sell_sig)]
@@ -11688,10 +11940,21 @@ class MetaController:
             quote_asset = str(self._cfg("QUOTE_ASSET") or "USDT").upper()
             free_usdt = float(await self.shared_state.get_spendable_balance(quote_asset) or 0.0)
 
+            # MICRO-RECOVERY: For dust healing, use raw balance when allocator locks capital
+            # This ensures healing can execute even when capital_free=0
+            if free_usdt <= 0.0:
+                try:
+                    raw_balance = await self.shared_state.get_balance(quote_asset)
+                    if raw_balance and float(raw_balance) > 0:
+                        free_usdt = float(raw_balance)
+                        self.logger.warning(f"[DUST_HEALING:RawBalance] Allocator locked capital; using raw exchange balance: ${free_usdt:.2f}")
+                except Exception as e:
+                    self.logger.debug(f"[DUST_HEALING] Raw balance fetch failed: {e}")
+
             # 60/20/20 FIX: Cap dust healing budget to 20% of NAV (prevents crowding out trading pool)
             dust_healing_budget = free_usdt  # Start with available
             try:
-                nav_for_dust = float(await self.shared_state.get_nav_quote() or 0.0)
+                nav_for_dust = float(self.shared_state.get_nav_quote() or 0.0)
                 if nav_for_dust > 0:
                     dust_healing_cap = nav_for_dust * 0.20  # 20% of NAV for dust healing
                     dust_healing_budget = min(free_usdt, dust_healing_cap)
@@ -11704,7 +11967,15 @@ class MetaController:
             free_usdt = dust_healing_budget  # Use capped budget
             min_notional = float(self._cfg("MIN_NOTIONAL", 10.0))
             min_floor = float(self._cfg("MIN_NOTIONAL_FLOOR", 10.0))  # Normal floor
-            healing_floor = min_floor * 0.5  # Healing allows sub-floor (50% of normal floor)
+
+            # MICRO-RECOVERY: Lower healing_floor when NAV is critically low
+            nav_for_healing = self.shared_state.get_nav_quote() if hasattr(self.shared_state, "get_nav_quote") else 0.0
+            if nav_for_healing < 5.0:
+                # Micro-recovery: allow healing with almost any free USDT (0.50 floor)
+                healing_floor = 0.50
+                self.logger.warning(f"[DUST_HEALING:MicroRecovery] NAV=${nav_for_healing:.2f} < $5.00 | healing_floor reduced to ${healing_floor:.2f} to enable recovery")
+            else:
+                healing_floor = min_floor * 0.5  # Normal: Healing allows sub-floor (50% of normal floor)
             
             # Identify healable dust positions
             healable = []
@@ -11716,8 +11987,31 @@ class MetaController:
                 value_usdt = float(pos_data.get("value_usdt", 0.0) or 0.0)
 
                 self.logger.debug(f"[DUST_HEALING] Checking {sym}: qty={qty}, value=\${value_usdt}, state={state}")
-                
+
                 # ═══════════════════════════════════════════════════════════════
+                # ENHANCED: Check wallet balance if snapshot shows qty=0
+                # When position snapshot is stale (qty=0) but state=DUST_LOCKED,
+                # pull actual quantity directly from wallet balances
+                # ═══════════════════════════════════════════════════════════════
+                if qty <= 0 and state == "DUST_LOCKED":
+                    try:
+                        # BUG2 FIX: get_balance may return a dict — extract 'free' key if so
+                        base_asset = sym.replace("USDT", "")
+                        bal = await self.shared_state.get_balance(base_asset)
+                        if isinstance(bal, dict):
+                            wallet_qty = float(bal.get("free") or bal.get("total") or 0.0)
+                        else:
+                            wallet_qty = float(bal or 0.0)
+                        if wallet_qty > 0:
+                            qty = wallet_qty
+                            self.logger.info(
+                                "[DUST_HEALING:WALLET_FALLBACK] 🔄 Snapshot showed qty=0 for %s but wallet has %.8f "
+                                "(state=%s). Using live wallet balance.",
+                                sym, qty, state
+                            )
+                    except Exception as e:
+                        self.logger.debug(f"[DUST_HEALING] Wallet fallback failed for {sym}: {e}")
+
                 # CRITICAL FIX: Skip closed/liquidated positions (qty=0)
                 # These are NOT dust - they're liquidated positions that should not
                 # be healed again. Healing a closed position creates a paradox:
@@ -11805,17 +12099,45 @@ class MetaController:
             
             if not healable:
                 return None  # No healable dust positions
-            
-            # Sort: first by "can_fully_heal" (descending), then by deficit (ascending)
-            healable.sort(key=lambda x: (-int(x["can_fully_heal"]), x["deficit"]))
+
+            # ENHANCED: Prioritize good dust (positive P&L) for reinvestment
+            # Sort by: (1) P&L quality (good dust first), (2) can_fully_heal, (3) deficit
+            scored_healable = []
+            for heal in healable:
+                pos = heal["position"]
+                unrealized_pnl_pct = float(pos.get("unrealized_pnl_pct", 0.0) or 0.0)
+
+                # Score: positive P&L = reinvestment opportunity (higher priority)
+                pnl_score = 0
+                if unrealized_pnl_pct > 0.10:
+                    pnl_score = 100  # Good dust - reinvestment priority
+                elif unrealized_pnl_pct > 0.02:
+                    pnl_score = 80  # Decent dust
+                elif unrealized_pnl_pct >= 0:
+                    pnl_score = 40  # Breaking even
+                else:
+                    pnl_score = -20  # Bad dust (losing) - lower priority
+
+                scored_healable.append({
+                    **heal,
+                    "pnl_pct": unrealized_pnl_pct,
+                    "pnl_score": pnl_score,
+                    "is_good_dust": unrealized_pnl_pct > 0.02
+                })
+
+            # Sort: (1) good dust (positive P&L) first, (2) can_fully_heal, (3) smallest deficit
+            scored_healable.sort(key=lambda x: (-x["pnl_score"], -int(x["can_fully_heal"]), x["deficit"]))
 
             healing_signals = []
+            healed_this_cycle = set()  # BUG1 FIX: track healed symbols to prevent same-symbol repeat
 
-            for heal in healable:
+            for heal in scored_healable:
                 sym_to_heal = heal["symbol"]
                 deficit = heal["deficit"]
                 can_fully_heal = heal["can_fully_heal"]
                 value_usdt = heal["value_usdt"]
+                pnl_pct = heal.get("pnl_pct", 0.0)
+                is_good_dust = heal.get("is_good_dust", False)
                 unheal_reason = str(self.shared_state.dust_unhealable.get(sym_to_heal, "") or "")
                 if unheal_reason == "UNHEALABLE_LT_MIN_NOTIONAL":
                     self.logger.info(
@@ -11824,24 +12146,44 @@ class MetaController:
                         unheal_reason,
                     )
                     continue
+                # BUG1 FIX: Skip if already healed this cycle (prevents runaway same-symbol repeat)
+                if sym_to_heal in healed_this_cycle:
+                    self.logger.info("[DUST_HEALING] %s already healed this cycle, skipping", sym_to_heal)
+                    continue
                 # Enforce lifecycle lock: skip if not allowed
                 if not self._can_act(sym_to_heal, "DUST_HEALING"):
                     continue
-                # Check cooldown
+                # BUG1 FIX: Restore per-symbol cooldown (prevents re-healing same symbol after lifecycle expiry)
+                # Each symbol gets a 120s cooldown after healing, but OTHER symbols are still healed in parallel
                 if sym_to_heal in self.dust_healing_cooldown and self.dust_healing_cooldown[sym_to_heal] > time.time():
-                    self.logger.info(f"[LIFECYCLE] {sym_to_heal}: DUST_HEALING blocked by cooldown")
+                    self.logger.info(f"[LIFECYCLE] {sym_to_heal}: DUST_HEALING blocked by cooldown (parallel healing still active for other symbols)")
                     continue
                 self.shared_state.dust_healing_deficit = getattr(self.shared_state, "dust_healing_deficit", {})
                 self.shared_state.dust_healing_deficit[sym_to_heal] = deficit
                 self._set_lifecycle(sym_to_heal, self.LIFECYCLE_DUST_HEALING)
+
+                # Distinguish between reinvestment (good dust) and recovery (bad dust)
+                action_type = "REINVESTMENT" if is_good_dust else "HEALING"
+                action_emoji = "📈" if is_good_dust else "🔧"
+                action_reason = "DUST_REINVESTMENT_BUY" if is_good_dust else "DUST_HEALING_BUY"
+
                 self.logger.info(
-                    "[DUST_HEALING] 🔧 Healing opportunity found: symbol=%s current_value=$%.2f "
+                    "[DUST_%s] %s Opportunity found: symbol=%s current_value=$%.2f (PnL=%+.2f%%) "
                     "deficit=$%.2f (need to reach minNotional=$%.2f). Free USDT=$%.2f (floor=$%.2f, "
                     "healing_floor=$%.2f). CAN_FULLY_HEAL=%s",
-                    sym_to_heal, value_usdt, deficit, min_notional, free_usdt,
-                    min_floor, healing_floor, can_fully_heal
+                    action_type, action_emoji, sym_to_heal, value_usdt, pnl_pct * 100,
+                    deficit, min_notional, free_usdt, min_floor, healing_floor, can_fully_heal
                 )
+
                 healing_amount = deficit if can_fully_heal else min(deficit, free_usdt)
+                # BUG4 FIX: Cap any single symbol to 50% of free capital to prevent capital starvation
+                max_per_symbol = free_usdt * 0.50
+                if healing_amount > max_per_symbol:
+                    self.logger.info(
+                        "[DUST_HEALING] BUG4_CAP: %s healing capped $%.2f → $%.2f (50%% of free $%.2f)",
+                        sym_to_heal, healing_amount, max_per_symbol, free_usdt
+                    )
+                    healing_amount = max_per_symbol
                 buy_sig = {
                     "symbol": sym_to_heal,
                     "action": "BUY",
@@ -11849,14 +12191,16 @@ class MetaController:
                     "confidence": 1.0,
                     "agent": "MetaDustHealing",
                     "timestamp": time.time(),
-                    "reason": "DUST_HEALING_BUY",
+                    "reason": action_reason,
                     "_dust_healing": True,
+                    "_dust_reinvestment": is_good_dust,
                     "_target_position_value": min_notional,
                     "_current_position_value": value_usdt,
                     "_healing_amount": healing_amount,
                     "_can_fully_heal": can_fully_heal,
                     "_allows_sub_floor": True,
                     "_tier": "DUST_RECOVERY",
+                    "_dust_pnl_pct": pnl_pct,
                     # Bypass flags for dust healing
                     "is_dust_healing": True,
                     "bypass_risk": True,
@@ -11864,14 +12208,16 @@ class MetaController:
                     "bypass_economic_floor": True,
                     "bypass_micro_trade": True
                 }
+
                 self.logger.warning(
-                    "[DUST_HEALING] 💚 Healing signal created: BUY %s with $%.2f "
-                    "(heal position value from $%.2f toward target $%.2f). "
+                    "[DUST_%s] 💚 Signal created: BUY %s with $%.2f "
+                    "(position value from $%.2f → target $%.2f, PnL=%+.2f%%). "
                     "CAN_FULLY_HEAL=%s | BLOCKS_SACRIFICE",
-                    sym_to_heal, healing_amount, value_usdt, min_notional,
+                    action_type, sym_to_heal, healing_amount, value_usdt, min_notional, pnl_pct * 100,
                     can_fully_heal
                 )
                 healing_signals.append((sym_to_heal, "BUY", buy_sig))
+                healed_this_cycle.add(sym_to_heal)  # BUG1 FIX: mark as healed this cycle
                 self.logger.info(
                     f"[HEALING] ✓ Qualified for recovery: symbol={sym_to_heal} "
                     f"(under healing_floor, recovery in progress)"
@@ -12572,6 +12918,16 @@ class MetaController:
             except Exception:
                 nav = 0.0
 
+            # MICRO-RECOVERY OVERRIDE: Allow trading when NAV < $5 even without capital floor
+            # This is CHECKED FIRST before any floor calculations to enable bootstrap from near-zero
+            if nav > 0.0 and nav < 5.0:
+                self.logger.warning(
+                    f"CAPITAL_FLOOR_CHECK: ⚠️ MICRO-RECOVERY BYPASS ACTIVE | "
+                    f"NAV=${nav:.2f} < $5.00 (free_usdt=${free_usdt:.2f}) | "
+                    f"Allowing trades to recover capital (emergency mode)"
+                )
+                return True
+
             # Step 3: Get trade size from config
             trade_size = float(self._cfg("TRADE_AMOUNT_USDT", self._cfg("DEFAULT_PLANNED_QUOTE", 30.0)) or 30.0)
 
@@ -12588,7 +12944,7 @@ class MetaController:
             # Dynamic ratio varies: 0.20 (low vol) → 0.12 (normal) → 0.08 (high vol)
             # This recalculates EVERY CYCLE based on current NAV, trade size, and volatility
             capital_floor = self.shared_state.calculate_capital_floor(nav=nav, trade_size=trade_size, dynamic_ratio=dynamic_ratio)
-            
+
             # Step 6: Check floor (simple comparison)
             capital_ok = free_usdt >= capital_floor
             if capital_ok:
@@ -13535,6 +13891,23 @@ class MetaController:
         if current_mode == "PAUSED":
             self.logger.info("[Meta:PAUSED] Enforcement: Blocking ALL trading activity.")
             return []
+
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        # FIX #2A: INJECT FORCED EXIT FROM FOURTH_SLOT_TRACKER
+        # If 4th-slot tracker has a pending forced exit, prioritize it over normal decisions
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        forced_exits = []
+        if hasattr(self, "_forced_exit_intent") and self._forced_exit_intent:
+            forced_exit = self._forced_exit_intent
+            self._forced_exit_intent = None  # Reset after retrieval
+            forced_exits = [forced_exit]
+            self.logger.warning(
+                "[FIX#2A:4thSlot] 🎯 INJECTED FORCED EXIT into decisions: %s %s (%s)",
+                forced_exit[0],  # symbol
+                forced_exit[1],  # action
+                forced_exit[2].get("reason", "UNKNOWN")  # reason
+            )
+
 
         # ═══════════════════════════════════════════════════════════════════════
         # SOP-BOOT-01: Single Bootstrap Seed Trade (one-cycle TTL)
@@ -18878,7 +19251,19 @@ class MetaController:
         # below into the ranked loop to ensure we don't 'reserve' budget for 
         # trades that fail the EM probe.
 
-        decisions = []
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        # FIX #2A: PREPEND FORCED EXITS FROM FOURTH_SLOT_TRACKER (HIGHEST PRIORITY)
+        # Forced exits must execute before normal decisions to respect exit conditions
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        decisions = forced_exits.copy()  # Start with any forced 4th-slot exits
+        
+        if forced_exits:
+            self.logger.warning(
+                "[FIX#2A:4thSlot] ✅ PREPENDED %d FORCED EXITS to decision list (will execute with priority)",
+                len(forced_exits)
+            )
+        
+        # Then add normal decisions (they will execute after forced exits)
         for sym, action, sig in final_decisions:
             if action == "HOLD":
                 # ISSUE #4 FIX: explicit guard to ensure HOLD never reaches ExecutionManager
@@ -22614,6 +22999,192 @@ class MetaController:
                 return mode.lower()
         
         return "normal"
+
+    def _collect_blocked_symbols(self) -> set:
+        """Return the set of symbols currently on cooldown/blocked."""
+        now = time.time()
+        blocked = set()
+        for (symbol, side), until_ts in (self._symbol_side_block_until or {}).items():
+            if until_ts > now:
+                blocked.add(symbol)
+        return blocked
+
+    async def _attempt_fourth_slot_entry(self) -> None:
+        """
+        Try to open a new 4th-slot position if conditions allow.
+        
+        Lifecycle:
+        1. Pre-flight gates (slot empty, cooldown elapsed, capital available, no pending exit)
+        2. Screen accepted_symbols for highest-volatility candidates
+        3. Rank by ML forecast (BUY action + confidence ≥ 0.55)
+        4. Relaxed EV gate: expected_move ≥ 1.2× round_trip (vs 1.6× for core)
+        5. Execute BUY on first pass; record in tracker
+        6. Set 30s cooldown + per-symbol 15min loss-cooldown if SL exit fires
+        """
+        try:
+            # ─── GATE 1: Tracker availability ───
+            if not self.fourth_slot_tracker or self.fourth_slot_tracker.current_symbol:
+                return  # Slot occupied or tracker disabled
+            
+            # ─── GATE 2: Cooldown enforcement (30s between rotations) ───
+            cooldown_s = float(getattr(self.config, "FIX8_4TH_SLOT_MIN_COOLDOWN_SECONDS", 30))
+            if (time.time() - self._fourth_slot_last_rotation_ts) < cooldown_s:
+                return  # Still in cooldown
+            
+            # ─── GATE 3: Slot is not blocked by pending forced exit ───
+            if self._forced_exit_intent:
+                return  # Wait for the pending exit to complete
+            
+            # ─── GATE 4: Capital check ───
+            nav = float(await _safe_await(self.shared_state.get_nav_quote()) or 0.0)
+            free_quote = float(getattr(self.shared_state, "free_quote", 0.0) or 0.0)
+            
+            alloc_pct = nav * float(getattr(self.config, "FIX8_4TH_SLOT_CAPITAL_PCT", 0.065))
+            alloc_usd = float(getattr(self.config, "FIX8_4TH_SLOT_CAPITAL_ALLOCATION_USD", 5.0))
+            quote_amount = round(min(alloc_usd, alloc_pct), 2)
+            
+            if quote_amount < 4.50:  # Binance MIN_NOTIONAL safety margin
+                return
+            
+            if free_quote < (quote_amount * 1.05):  # 5% buffer
+                return
+            
+            # ─── GATE 5: Portfolio not at max concurrent positions ───
+            limits = self.capital_governor.get_position_limits(nav) if self.capital_governor else {}
+            max_concurrent = limits.get("max_concurrent_positions", 2)
+            current_positions = len([p for p in self.shared_state.positions.values() if p])
+            
+            # Allow 4th slot as +1 overflow if NAV ≥ $50
+            if nav < 50.0 and current_positions >= max_concurrent:
+                return
+            if current_positions >= (max_concurrent + 1):
+                return
+            
+            # ─── CANDIDATE SELECTION ───
+            universe = dict(self.shared_state.accepted_symbols or {})
+            if not universe:
+                return
+            
+            held_symbols = set(self.shared_state.positions.keys())
+            blocked_symbols = self._collect_blocked_symbols()
+            
+            # Filter: exclude held, blocked, stale loss cooldown, dust, non-USDT
+            now = time.time()
+            candidates = []
+            for symbol, meta in universe.items():
+                if symbol in held_symbols or symbol in blocked_symbols:
+                    continue
+                if not symbol.endswith("USDT"):
+                    continue
+                # Skip if in loss-cooldown (SL exit happened < 15 min ago)
+                loss_cd = self._fourth_slot_loss_cooldown.get(symbol, 0.0)
+                if (now - loss_cd) < 900.0:  # 15 min cooldown on losses
+                    continue
+                candidates.append((symbol, meta))
+            
+            if not candidates:
+                return
+            
+            # Rank by volatility (ATR%) desc, secondary by ML confidence
+            def score_candidate(item):
+                sym, meta = item
+                atr_pct = float(meta.get("atr_pct", 0.0))
+                # Try to get ML prediction
+                ml_conf = 0.5  # Default fallback
+                try:
+                    if hasattr(self.shared_state, "get_latest_prediction"):
+                        pred = self.shared_state.get_latest_prediction(sym)
+                        if pred and pred.get("confidence"):
+                            ml_conf = float(pred["confidence"])
+                except Exception:
+                    pass
+                return atr_pct * ml_conf
+            
+            candidates.sort(key=score_candidate, reverse=True)
+            N = int(getattr(self.config, "FIX8_4TH_SLOT_CANDIDATES_TO_CONSIDER", 20))
+            top_candidates = candidates[:N]
+            
+            # ─── EV GATE + ML FILTER ───
+            rt_pct = 0.0038  # ~0.38% round-trip on $5 notional
+            rt_cost = rt_pct * quote_amount
+            ev_threshold = rt_pct * 1.2  # Relaxed gate for 4th slot
+            
+            selected = None
+            for symbol, meta in top_candidates:
+                # Get ML prediction
+                ml_pred = None
+                try:
+                    if hasattr(self.shared_state, "get_latest_prediction"):
+                        ml_pred = self.shared_state.get_latest_prediction(symbol)
+                except Exception:
+                    pass
+                
+                # Require BUY action & confidence ≥ 0.55
+                if not ml_pred or ml_pred.get("action") != "BUY":
+                    continue
+                if float(ml_pred.get("confidence", 0.0)) < 0.55:
+                    continue
+                
+                # Compute expected move (from ML or ATR fallback)
+                expected_move = float(ml_pred.get("expected_move_pct", 0.0))
+                if expected_move <= 0:
+                    atr_pct = float(meta.get("atr_pct", 0.0))
+                    expected_move = atr_pct * 0.5  # Conservative ATR multiple
+                
+                # Pass EV gate?
+                if expected_move >= ev_threshold:
+                    selected = (symbol, meta, ml_pred, expected_move)
+                    break
+            
+            if not selected:
+                self.logger.debug("[4thSlot] No qualifying candidate (N=%d, ev_gate=%.4f)", len(top_candidates), ev_threshold)
+                return
+            
+            symbol, meta, ml_pred, expected_move = selected
+            
+            # ─── ORDER PLACEMENT ───
+            trace_id = self._generate_decision_trace_id()
+            intent = TradeIntent(
+                symbol=symbol,
+                side="buy",
+                planned_quote=quote_amount,
+                confidence=float(ml_pred.get("confidence", 0.0)),
+                reason="4TH_SLOT_ROTATION",
+                agent="FourthSlotEntry",
+                tag="4th_slot/entry",
+                trace_id=trace_id,
+                tier="ROTATION",
+                policy_context={
+                    "fourth_slot": True,
+                    "expected_move_pct": expected_move,
+                    "atr_pct": float(meta.get("atr_pct", 0.0)),
+                    "ev_ratio": expected_move / max(rt_pct, 1e-6),
+                },
+            )
+            
+            result = await self._route_and_execute(intent)
+            
+            if result.get("ok") and float(result.get("executedQty", 0.0)) > 0:
+                avg_px = float(result["avgPrice"])
+                qty = float(result["executedQty"])
+                
+                # Record in tracker
+                self.fourth_slot_tracker.set_position(symbol, avg_px, qty)
+                self._fourth_slot_last_rotation_ts = time.time()
+                
+                # Log to journal
+                self.logger.warning(
+                    "[4thSlot] ✅ ENTRY %s qty=%.6f @ $%.6f (quote=$%.2f, "
+                    "expect_move=+%.2f%%, target=+15%%, stop=-3%%, max_hold=120min)",
+                    symbol, qty, avg_px, quote_amount, expected_move * 100
+                )
+            else:
+                # Apply cooldown on failure too (avoid hammering)
+                self._fourth_slot_last_rotation_ts = time.time()
+                self.logger.info("[4thSlot] Entry failed for %s: %s", symbol, result.get("reason", "unknown"))
+                
+        except Exception as e:
+            self.logger.warning("[4thSlot:Entry] Exception in _attempt_fourth_slot_entry: %s", e, exc_info=False)
 
     async def _route_and_execute(self, intent):
         """Route trading intent through ActionRouter (if available), then execute.

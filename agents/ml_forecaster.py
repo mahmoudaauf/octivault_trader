@@ -2910,7 +2910,9 @@ class MLForecaster:
         agg_factor = 1.0
         if hasattr(self.shared_state, "get_dynamic_param"):
             agg_factor = float(self.shared_state.get_dynamic_param("aggression_factor", 1.0))
+        self.logger.info(f"[{self.name}] [DEBUG:CollectSignal:Start] {symbol} {action} conf={confidence:.3f}, hard_emit_floor={self._conf_hard_emit_floor:.3f}")
         if float(confidence) < float(self._conf_hard_emit_floor):
+            self.logger.warning(f"[{self.name}] [DEBUG:CollectSignal:Blocked] {symbol} {action} conf={confidence:.3f} < hard_emit_floor={self._conf_hard_emit_floor:.3f} - EARLY RETURN")
             return
 
         regime, expected_move_pct = await self._live_regime_and_expected_move(symbol)
@@ -3104,6 +3106,9 @@ class MLForecaster:
         # GAP FIX A: Validate quote against min_notional BEFORE buffering
         # Prevents sub-5 USDT signals from reaching MetaController
         MIN_NOTIONAL_FLOOR = float(getattr(self.config, "MIN_NOTIONAL_FLOOR", 5.0))
+        self.logger.info(
+            f"[{self.name}] [DEBUG:PreCollection] {symbol} BUY: quote={signal['quote']:.2f}, MIN_NOTIONAL_FLOOR={MIN_NOTIONAL_FLOOR}, threshold={MIN_NOTIONAL_FLOOR*0.8:.2f}, pass={signal['quote'] >= MIN_NOTIONAL_FLOOR*0.8}"
+        )
         if signal["quote"] < MIN_NOTIONAL_FLOOR * 0.8:  # 80% headroom for fees
             self.logger.warning(
                 f"[{self.name}] Signal quote {signal['quote']:.2f} < min_notional {MIN_NOTIONAL_FLOOR:.2f}; filtering out"
@@ -3111,7 +3116,9 @@ class MLForecaster:
             return  # Don't emit sub-minimum signals
 
         # Add to collection buffer (AgentManager will forward to Meta)
+        self.logger.info(f"[{self.name}] [DEBUG:AppendingSignal] {symbol} {signal['action']} to _collected_signals (count before={len(self._collected_signals)})")
         self._collected_signals.append(signal)
+        self.logger.info(f"[{self.name}] [DEBUG:AppendedSignal] {symbol} {signal['action']} appended (count after={len(self._collected_signals)})")
         self.logger.info(
             "[%s] SIGNAL: %s %s conf=%.2f req=%.2f break_even=%.2f regime=%s hint=%s",
             self.name,
