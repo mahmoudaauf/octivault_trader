@@ -28,6 +28,13 @@ Exit codes:
     2 = Configuration error
     3 = Prerequisite check failed
 """
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    LEGACY
+# CANONICAL: main.py
+# REASON:    Pre-Step-3 entry point; retained until paper-trade + $1k validation passes
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 
 import asyncio
 import inspect

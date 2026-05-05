@@ -15,25 +15,30 @@ Automatically applies fixes if issues detected:
 - Wallet guard recalibration
 - Emergency circuit breaker triggers
 """
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    LEGACY
+# CANONICAL: src/l6_governance/capital_governor.py
+# REASON:    Standalone monitor; data flows through OperationsEngine
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 
 import asyncio
-import json
 import math
 import re
-import subprocess
 import sys
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional, List, Any, Tuple
-
+from typing import Any, Optional
 
 # ============================================================================
 # ENUMS & MODELS
 # ============================================================================
+
 
 class HealthStatus(Enum):
     HEALTHY = "🟢"
@@ -70,7 +75,7 @@ class HealthMetric:
     status: HealthStatus
     score: float  # 0-100
     timestamp: float
-    details: Dict[str, Any] = field(default_factory=dict)
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -87,6 +92,7 @@ class IssueAlert:
 # ============================================================================
 # CAPITAL GROWTH TRACKER
 # ============================================================================
+
 
 class CapitalGrowthTracker:
     """Tracks capital trajectory and growth rate."""
@@ -172,17 +178,18 @@ class CapitalGrowthTracker:
 # HEALTH ANALYZER
 # ============================================================================
 
+
 class HealthAnalyzer:
     """Analyzes system health from logs and metrics."""
 
     def __init__(self):
         self.last_balance_sync_time: Optional[float] = None
         self.sync_failure_count = 0
-        self.position_mismatches: Dict[str, int] = defaultdict(int)
+        self.position_mismatches: dict[str, int] = defaultdict(int)
         self.last_execution_time: Optional[float] = None
         self.execution_times: deque = deque(maxlen=50)
 
-    def check_balance_sync_health(self, log_lines: List[str]) -> HealthMetric:
+    def check_balance_sync_health(self, log_lines: list[str]) -> HealthMetric:
         """Check if balance sync is working."""
         score = 100.0
         issues = []
@@ -204,8 +211,10 @@ class HealthAnalyzer:
             score -= 20
             issues.append("No recent sync completions")
 
-        status = HealthStatus.HEALTHY if score >= 80 else (
-            HealthStatus.WARNING if score >= 60 else HealthStatus.CRITICAL
+        status = (
+            HealthStatus.HEALTHY
+            if score >= 80
+            else (HealthStatus.WARNING if score >= 60 else HealthStatus.CRITICAL)
         )
 
         return HealthMetric(
@@ -215,7 +224,7 @@ class HealthAnalyzer:
             details={"issues": issues, "sync_count": len(sync_lines)},
         )
 
-    def check_position_alignment(self, log_lines: List[str]) -> HealthMetric:
+    def check_position_alignment(self, log_lines: list[str]) -> HealthMetric:
         """Check if positions align with wallet."""
         score = 100.0
         issues = []
@@ -232,8 +241,10 @@ class HealthAnalyzer:
             score -= len(mismatches) * 5
             issues.append(f"Found {len(mismatches)} position mismatches")
 
-        status = HealthStatus.HEALTHY if score >= 85 else (
-            HealthStatus.WARNING if score >= 70 else HealthStatus.CRITICAL
+        status = (
+            HealthStatus.HEALTHY
+            if score >= 85
+            else (HealthStatus.WARNING if score >= 70 else HealthStatus.CRITICAL)
         )
 
         return HealthMetric(
@@ -243,7 +254,7 @@ class HealthAnalyzer:
             details={"issues": issues, "mismatches": len(mismatches)},
         )
 
-    def check_execution_health(self, log_lines: List[str]) -> HealthMetric:
+    def check_execution_health(self, log_lines: list[str]) -> HealthMetric:
         """Check if trades are executing properly."""
         score = 100.0
         issues = []
@@ -266,8 +277,10 @@ class HealthAnalyzer:
             score -= 10
             issues.append("No recent trades executed")
 
-        status = HealthStatus.HEALTHY if score >= 80 else (
-            HealthStatus.WARNING if score >= 60 else HealthStatus.CRITICAL
+        status = (
+            HealthStatus.HEALTHY
+            if score >= 80
+            else (HealthStatus.WARNING if score >= 60 else HealthStatus.CRITICAL)
         )
 
         return HealthMetric(
@@ -282,19 +295,20 @@ class HealthAnalyzer:
 # AUTO-FIX ENGINE
 # ============================================================================
 
+
 class AutoFixEngine:
     """Detects issues and applies fixes."""
 
     def __init__(self):
-        self.fixes_applied: List[Tuple[IssueType, float]] = []
-        self.last_fix_time: Dict[IssueType, float] = {}
+        self.fixes_applied: list[tuple[IssueType, float]] = []
+        self.last_fix_time: dict[IssueType, float] = {}
 
     def check_and_apply_fixes(
         self,
-        alerts: List[IssueAlert],
+        alerts: list[IssueAlert],
         capital_growth: CapitalGrowthTracker,
         log_path: Path,
-    ) -> List[IssueAlert]:
+    ) -> list[IssueAlert]:
         """Check for issues and apply automatic fixes."""
         fixed_alerts = []
 
@@ -328,8 +342,8 @@ class AutoFixEngine:
         """Force fresh balance sync."""
         try:
             # Write command to shared state to force sync
-            cmd = 'await shared_state.sync_authoritative_balance(force=True)'
-            print(f"  🔧 Applying fix: Force balance sync")
+            cmd = "await shared_state.sync_authoritative_balance(force=True)"
+            print("  🔧 Applying fix: Force balance sync")
             return True
         except Exception as e:
             print(f"  ❌ Failed to apply fix: {e}")
@@ -338,7 +352,7 @@ class AutoFixEngine:
     def _fix_capital_stagnation(self) -> bool:
         """Reset throttles and force fresh evaluation."""
         try:
-            print(f"  🔧 Applying fix: Reset capital stagnation")
+            print("  🔧 Applying fix: Reset capital stagnation")
             return True
         except Exception as e:
             print(f"  ❌ Failed to apply fix: {e}")
@@ -347,7 +361,7 @@ class AutoFixEngine:
     def _fix_position_misalignment(self) -> bool:
         """Realign positions with wallet."""
         try:
-            print(f"  🔧 Applying fix: Realign positions")
+            print("  🔧 Applying fix: Realign positions")
             return True
         except Exception as e:
             print(f"  ❌ Failed to apply fix: {e}")
@@ -357,6 +371,7 @@ class AutoFixEngine:
 # ============================================================================
 # REAL-TIME MONITOR
 # ============================================================================
+
 
 class ActiveCapitalMonitor:
     """Main monitoring loop."""
@@ -373,27 +388,27 @@ class ActiveCapitalMonitor:
         self.loop_count = 0
         self.metrics_history: deque = deque(maxlen=500)
 
-    def get_recent_logs(self, num_lines: int = 100) -> List[str]:
+    def get_recent_logs(self, num_lines: int = 100) -> list[str]:
         """Read recent log lines."""
         if not self.log_path.exists():
             return []
 
         try:
-            with open(self.log_path, "r") as f:
+            with open(self.log_path) as f:
                 lines = f.readlines()
                 return lines[-num_lines:] if lines else []
         except Exception:
             return []
 
-    def parse_capital_snapshot(self, log_lines: List[str]) -> Optional[CapitalSnapshot]:
+    def parse_capital_snapshot(self, log_lines: list[str]) -> Optional[CapitalSnapshot]:
         """Extract capital metrics from logs."""
         # Look for loop summary or capital metric lines
         for line in reversed(log_lines):
             # Pattern: NAV: $101.70 | Free: $97.86 | Invested: $3.84
-            nav_match = re.search(r'NAV[:\s]+\$?([\d.]+)', line)
-            free_match = re.search(r'Free[:\s]+\$?([\d.]+)', line)
-            inv_match = re.search(r'Invested[:\s]+\$?([\d.]+)', line)
-            loop_match = re.search(r'Loop[:\s]+(\d+)', line)
+            nav_match = re.search(r"NAV[:\s]+\$?([\d.]+)", line)
+            free_match = re.search(r"Free[:\s]+\$?([\d.]+)", line)
+            inv_match = re.search(r"Invested[:\s]+\$?([\d.]+)", line)
+            loop_match = re.search(r"Loop[:\s]+(\d+)", line)
 
             if nav_match and free_match:
                 return CapitalSnapshot(
@@ -401,13 +416,13 @@ class ActiveCapitalMonitor:
                     nav=float(nav_match.group(1)),
                     free_usdt=float(free_match.group(1)),
                     invested=float(inv_match.group(1)) if inv_match else 0.0,
-                    positions_count=len(re.findall(r'\w+USDT', line)),
+                    positions_count=len(re.findall(r"\w+USDT", line)),
                     loop_count=int(loop_match.group(1)) if loop_match else 0,
                 )
 
         return None
 
-    def check_health(self) -> Dict[str, HealthMetric]:
+    def check_health(self) -> dict[str, HealthMetric]:
         """Run comprehensive health checks."""
         log_lines = self.get_recent_logs(200)
 
@@ -417,7 +432,7 @@ class ActiveCapitalMonitor:
             "execution": self.health_analyzer.check_execution_health(log_lines),
         }
 
-    def detect_issues(self, health_metrics: Dict[str, HealthMetric]) -> List[IssueAlert]:
+    def detect_issues(self, health_metrics: dict[str, HealthMetric]) -> list[IssueAlert]:
         """Detect issues based on health metrics."""
         alerts = []
         log_lines = self.get_recent_logs(200)
@@ -478,8 +493,8 @@ class ActiveCapitalMonitor:
 
     def print_status_report(
         self,
-        health_metrics: Dict[str, HealthMetric],
-        alerts: List[IssueAlert],
+        health_metrics: dict[str, HealthMetric],
+        alerts: list[IssueAlert],
         snapshot: Optional[CapitalSnapshot],
     ) -> None:
         """Print comprehensive status report."""
@@ -492,7 +507,7 @@ class ActiveCapitalMonitor:
 
         # Capital Status
         if snapshot:
-            print(f"\n💰 CAPITAL STATUS:")
+            print("\n💰 CAPITAL STATUS:")
             print(f"   NAV:              ${snapshot.nav:>10.2f}")
             print(f"   Free USDT:        ${snapshot.free_usdt:>10.2f}")
             print(f"   Invested:         ${snapshot.invested:>10.2f}")
@@ -503,14 +518,14 @@ class ActiveCapitalMonitor:
         if len(self.growth_tracker.snapshots) > 1:
             growth_rate = self.growth_tracker.get_growth_rate()
             volatility = self.growth_tracker.get_volatility()
-            print(f"\n📈 GROWTH METRICS:")
+            print("\n📈 GROWTH METRICS:")
             print(f"   Growth Rate (Ann):   {growth_rate:>6.2f}%")
             print(f"   Volatility:          {volatility:>6.2f}%")
             print(f"   Drawdown:            {self.growth_tracker.drawdown_pct:>6.2f}%")
             print(f"   Elapsed Time:        {elapsed_str}")
 
         # Health Scores
-        print(f"\n🏥 SYSTEM HEALTH:")
+        print("\n🏥 SYSTEM HEALTH:")
         for name, metric in health_metrics.items():
             print(f"   {name.upper():20} {metric.status.value} {metric.score:>5.1f}/100")
 
@@ -519,13 +534,11 @@ class ActiveCapitalMonitor:
             print(f"\n⚠️  ACTIVE ALERTS ({len(alerts)}):")
             for alert in alerts[-5:]:  # Show last 5 alerts
                 fix_status = "✅ FIXED" if alert.auto_fix_applied else "⏳ PENDING"
-                print(
-                    f"   {alert.issue_type.name:20} [{alert.severity:8}] {fix_status}"
-                )
+                print(f"   {alert.issue_type.name:20} [{alert.severity:8}] {fix_status}")
                 print(f"      {alert.message}")
 
         else:
-            print(f"\n✅ NO ACTIVE ALERTS - System operating normally")
+            print("\n✅ NO ACTIVE ALERTS - System operating normally")
 
         print("=" * 80 + "\n")
 
@@ -533,9 +546,7 @@ class ActiveCapitalMonitor:
         """Main monitoring loop."""
         end_time = time.time() + (duration_minutes * 60)
 
-        print(
-            f"🚀 Starting Active Capital Monitor (duration: {duration_minutes} minutes)"
-        )
+        print(f"🚀 Starting Active Capital Monitor (duration: {duration_minutes} minutes)")
         print(f"   Log path: {self.log_path}")
         print(f"   Check interval: {self.check_interval}s\n")
 
@@ -587,6 +598,7 @@ class ActiveCapitalMonitor:
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
+
 
 def main():
     """CLI entry point."""

@@ -7,6 +7,13 @@ Usage:
     python3 capital_health_monitor.py [--watch]  # Continuous monitoring
     python3 capital_health_monitor.py --csv       # Export to CSV for analysis
 """
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    LEGACY
+# CANONICAL: src/l6_governance/capital_governor.py
+# REASON:    Top-level monitor; superseded by OperationsEngine.get_health_report()
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 
 import json
 import re

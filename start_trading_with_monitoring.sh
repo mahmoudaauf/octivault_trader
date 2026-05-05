@@ -1,4 +1,11 @@
 #!/bin/bash
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    LEGACY
+# CANONICAL: main.py
+# REASON:    Duplicate of START_TRADING.sh + LAUNCH_MONITOR.sh combo
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 #
 # 🎯 INTEGRATED TRADING + MONITORING WITH ACTIVE FIXES
 #

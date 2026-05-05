@@ -9,6 +9,13 @@ This ensures the 3-bucket system works correctly regardless of account size.
 Author: System Calibration
 Date: 2026-04-26
 """
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    LEGACY
+# CANONICAL: src/l2_marketdata/balance_manager.py
+# REASON:    Config now lives in core_engine.integration.create_app_context()
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 
 from typing import Dict, Tuple
     """Calculate bucket classification thresholds based on account balance"""

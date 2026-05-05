@@ -2,6 +2,13 @@
 """
 Balance Monitor - Tracks balance growth/decay in real-time
 """
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    LEGACY
+# CANONICAL: src/l2_marketdata/balance_manager.py
+# REASON:    Top-level monitor; superseded by OperationsEngine.get_health_report()
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 
 import re
 import sys

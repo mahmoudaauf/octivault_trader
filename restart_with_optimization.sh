@@ -1,4 +1,11 @@
 #!/bin/bash
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    LEGACY
+# CANONICAL: main.py
+# REASON:    One-shot restart shim — superseded
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 #
 # RESET & RESTART BOT WITH OPTIMIZED STRATEGY
 # ===========================================

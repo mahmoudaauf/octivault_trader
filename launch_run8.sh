@@ -1,4 +1,11 @@
 #!/bin/bash
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    QUARANTINED
+# CANONICAL: main.py
+# REASON:    Numbered debug runner — abandoned
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 # launch_run8.sh — launcher for run #8 with self-healing trio active.
 set -e
 cd "$(dirname "$0")"

@@ -1,4 +1,11 @@
 #!/bin/bash
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    LEGACY
+# CANONICAL: main.py
+# REASON:    Auto-restart now handled by OperationsEngine.recover()
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 # Resilient bot launcher with auto-restart and balance monitoring
 
 export APPROVE_LIVE_TRADING=YES

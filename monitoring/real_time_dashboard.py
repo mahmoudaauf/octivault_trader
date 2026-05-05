@@ -11,6 +11,13 @@ Live dashboard showing:
 
 Updates every 30 seconds with current metrics.
 """
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    LEGACY
+# CANONICAL: src/l7_observability/dashboard.py
+# REASON:    Pre-engine standalone dashboard; superseded by OperationsEngine
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 
 import json
 import os
@@ -20,7 +27,7 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 
 class RealTimeDashboard:
@@ -34,30 +41,30 @@ class RealTimeDashboard:
         self.start_nav = None
         self.metrics_file = Path("monitoring/dashboard_metrics.json")
 
-    def read_recent_logs(self, num_lines: int = 50) -> List[str]:
+    def read_recent_logs(self, num_lines: int = 50) -> list[str]:
         """Read recent log lines."""
         if not self.log_path.exists():
             return []
 
         try:
-            with open(self.log_path, "r") as f:
+            with open(self.log_path) as f:
                 lines = f.readlines()
                 return lines[-num_lines:] if lines else []
         except Exception:
             return []
 
-    def extract_capital_metrics(self) -> Optional[Dict]:
+    def extract_capital_metrics(self) -> Optional[dict]:
         """Extract current capital metrics from logs."""
         lines = self.read_recent_logs(100)
 
         # Look for most recent metrics line
         for line in reversed(lines):
             # Pattern: NAV: $101.70 | Free: $97.86 | Invested: $3.84 | Loop: 42
-            nav_match = re.search(r'NAV[:\s]+\$?([\d.]+)', line)
-            free_match = re.search(r'Free[:\s]+\$?([\d.]+)', line)
-            invested_match = re.search(r'Invested[:\s]+\$?([\d.]+)', line)
-            loop_match = re.search(r'Loop[:\s]+(\d+)', line)
-            pnl_match = re.search(r'PnL[:\s]+\$?([\d.-]+)', line)
+            nav_match = re.search(r"NAV[:\s]+\$?([\d.]+)", line)
+            free_match = re.search(r"Free[:\s]+\$?([\d.]+)", line)
+            invested_match = re.search(r"Invested[:\s]+\$?([\d.]+)", line)
+            loop_match = re.search(r"Loop[:\s]+(\d+)", line)
+            pnl_match = re.search(r"PnL[:\s]+\$?([\d.-]+)", line)
 
             if nav_match and free_match:
                 return {
@@ -105,7 +112,7 @@ class RealTimeDashboard:
         result += "▁" * (width - len(result))
         return result[:width]
 
-    def calculate_returns(self) -> Tuple[float, float, float]:
+    def calculate_returns(self) -> tuple[float, float, float]:
         """Calculate returns metrics."""
         if len(self.capital_history) < 2:
             return 0.0, 0.0, 0.0
@@ -119,7 +126,9 @@ class RealTimeDashboard:
         max_dd = (min(navs) - peak_nav) / peak_nav * 100.0 if peak_nav else 0.0
 
         # Calculate hourly annualized return
-        elapsed_minutes = (self.capital_history[-1]["timestamp"] - self.capital_history[0]["timestamp"]) / 60.0
+        elapsed_minutes = (
+            self.capital_history[-1]["timestamp"] - self.capital_history[0]["timestamp"]
+        ) / 60.0
         if elapsed_minutes > 0:
             hourly_return = (total_return / elapsed_minutes) * 60.0
         else:
@@ -127,7 +136,7 @@ class RealTimeDashboard:
 
         return total_return, hourly_return, max_dd
 
-    def get_health_indicators(self) -> Dict[str, str]:
+    def get_health_indicators(self) -> dict[str, str]:
         """Get system health indicators from logs."""
         lines = self.read_recent_logs(50)
         indicators = {
@@ -160,7 +169,7 @@ class RealTimeDashboard:
 
         return indicators
 
-    def save_metrics(self, metrics: Dict) -> None:
+    def save_metrics(self, metrics: dict) -> None:
         """Save metrics to JSON for external tools."""
         try:
             self.metrics_file.parent.mkdir(exist_ok=True)
@@ -206,7 +215,9 @@ class RealTimeDashboard:
 
         # Header info
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n⏰ {now_str} | ⏱️  Elapsed: {hours}h {minutes}m {seconds}s | 📍 Loop: {current['loop']}\n")
+        print(
+            f"\n⏰ {now_str} | ⏱️  Elapsed: {hours}h {minutes}m {seconds}s | 📍 Loop: {current['loop']}\n"
+        )
 
         # Capital Section
         print("💰 CAPITAL STATUS")
@@ -220,7 +231,9 @@ class RealTimeDashboard:
 
         print(f"  Free Capital:       ${current['free']:>10.2f}")
         print(f"  Invested:           ${current['invested']:>10.2f}")
-        print(f"  Positions:          {len([l for l in self.read_recent_logs(5) if 'USDT' in l]):>10}")
+        print(
+            f"  Positions:          {len([l for l in self.read_recent_logs(5) if 'USDT' in l]):>10}"
+        )
 
         # Returns Section
         print("\n📈 RETURNS ANALYSIS")
@@ -245,8 +258,10 @@ class RealTimeDashboard:
         print("\n📊 METRICS SUMMARY")
         print("─" * 100)
         print(f"  History Window:     {len(self.capital_history)} samples")
-        print(f"  NAV Range:          ${min(self.capital_history, key=lambda x: x['nav'])['nav']:.2f} - "
-              f"${max(self.capital_history, key=lambda x: x['nav'])['nav']:.2f}")
+        print(
+            f"  NAV Range:          ${min(self.capital_history, key=lambda x: x['nav'])['nav']:.2f} - "
+            f"${max(self.capital_history, key=lambda x: x['nav'])['nav']:.2f}"
+        )
 
         # Footer
         print("\n" + "=" * 100)

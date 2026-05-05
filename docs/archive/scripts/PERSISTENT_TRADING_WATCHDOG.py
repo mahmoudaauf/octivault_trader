@@ -5,6 +5,13 @@
 Monitors the trading system and auto-restarts if it crashes.
 Keeps system running 24/7 with continuous profit compounding.
 """
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    QUARANTINED
+# CANONICAL: src/l8_lifecycle/watchdog.py
+# REASON:    Already in docs/archive — retain location, mark as frozen
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 
 import os
 import signal

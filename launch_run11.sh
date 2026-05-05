@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# === OCTIVAULT FREEZE BANNER ===
+# STATUS:    QUARANTINED
+# CANONICAL: main.py
+# REASON:    Numbered debug runner — abandoned
+# POLICY:    See STEP_4_MODULE_FREEZE.md — do not import from main.py / top-level scripts.
+# ===============================
+
 # Run #11 launcher — NAV double-count fix + Heal-C lift (run-#10 hardening)
 set -euo pipefail
 cd "$(dirname "$0")"

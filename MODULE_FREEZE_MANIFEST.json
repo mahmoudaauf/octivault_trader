@@ -1,0 +1,106 @@
+{
+  "version": "1.0",
+  "date": "2026-05-06",
+  "step": "Step 4 — Freeze duplicate modules",
+  "policy": {
+    "ACTIVE":      "Canonical implementation. Used directly by core_engine façades.",
+    "WRAPPED":     "Reachable only via core_engine façade. No direct imports from main.py or other top-level scripts.",
+    "LEGACY":      "Superseded by an ACTIVE/WRAPPED module. Kept for reference. Do not import in new code. Slated for _archive/ after Phase 7 cutover.",
+    "QUARANTINED": "Broken, abandoned, or duplicate of unknown lineage. Do not import. Will be moved to _archive/ in Step 5."
+  },
+  "enforcement": {
+    "ci_check": "scripts/check_frozen_modules.py (Step 5)",
+    "rule_1": "main.py may import only from core_engine.*",
+    "rule_2": "ACTIVE/WRAPPED modules may be edited; LEGACY/QUARANTINED may not.",
+    "rule_3": "New code must import the canonical (ACTIVE) path."
+  },
+  "families": {
+    "dashboards": {
+      "canonical": "src/l7_observability/dashboard.py",
+      "modules": [
+        { "path": "src/l7_observability/dashboard.py",                 "status": "ACTIVE",      "reason": "Canonical observability dashboard — wrapped by OperationsEngine.get_health_report()" },
+        { "path": "src/l7_observability/monitors/balance_dashboard.py","status": "WRAPPED",     "reason": "Balance view inside OperationsEngine" },
+        { "path": "monitoring/real_time_dashboard.py",                 "status": "LEGACY",      "reason": "Pre-engine standalone dashboard; superseded by OperationsEngine" },
+        { "path": "monitoring/capital_dashboard.py",                   "status": "LEGACY",      "reason": "Duplicate of capital_growth_dashboard.py" },
+        { "path": "monitoring/capital_growth_dashboard.py",            "status": "LEGACY",      "reason": "Standalone monitor; data now flows through OperationsEngine" }
+      ]
+    },
+    "websocket": {
+      "canonical": "src/l1_exchange/market_data_websocket.py",
+      "modules": [
+        { "path": "src/l1_exchange/market_data_websocket.py",          "status": "WRAPPED",     "reason": "Sole WS client; reached via MarketAccountEngine.get_market_prices()" }
+      ]
+    },
+    "balance_sync": {
+      "canonical": "src/l2_marketdata/balance_manager.py",
+      "modules": [
+        { "path": "src/l2_marketdata/balance_manager.py",              "status": "WRAPPED",     "reason": "Canonical balance source; reached via MarketAccountEngine.get_account_state()" },
+        { "path": "src/l2_marketdata/balance_sync.py",                 "status": "WRAPPED",     "reason": "Sync coordinator used inside balance_manager" },
+        { "path": "src/l2_marketdata/balance_cache_updater.py",        "status": "WRAPPED",     "reason": "Cache writer used by balance_manager" },
+        { "path": "src/l1_exchange/balance_sync_backoff.py",           "status": "WRAPPED",     "reason": "Backoff helper for L1 sync calls" },
+        { "path": "balance_monitor.py",                                "status": "LEGACY",      "reason": "Top-level monitor; superseded by OperationsEngine.get_health_report()" },
+        { "path": "balance_threshold_config.py",                       "status": "LEGACY",      "reason": "Config now lives in core_engine.integration.create_app_context()" }
+      ]
+    },
+    "runners_launchers": {
+      "canonical": "main.py",
+      "modules": [
+        { "path": "main.py",                                           "status": "ACTIVE",      "reason": "Step 3 façade-only entry point" },
+        { "path": "🎯_MASTER_SYSTEM_ORCHESTRATOR.py",                  "status": "LEGACY",      "reason": "Pre-Step-3 entry point; retained until paper-trade + $1k validation passes" },
+        { "path": "START_TRADING.sh",                                  "status": "ACTIVE",      "reason": "Canonical launcher wrapper around main.py" },
+        { "path": "LAUNCH_BOT.command",                                "status": "ACTIVE",      "reason": "macOS double-click launcher" },
+        { "path": "LAUNCH_MONITOR.sh",                                 "status": "ACTIVE",      "reason": "Monitoring sidecar launcher" },
+        { "path": "start_trading_with_monitoring.sh",                  "status": "LEGACY",      "reason": "Duplicate of START_TRADING.sh + LAUNCH_MONITOR.sh combo" },
+        { "path": "run_bot_resilient.sh",                              "status": "LEGACY",      "reason": "Auto-restart now handled by OperationsEngine.recover()" },
+        { "path": "restart_with_optimization.sh",                      "status": "LEGACY",      "reason": "One-shot restart shim — superseded" },
+        { "path": "launch_run6.sh",                                    "status": "QUARANTINED", "reason": "Numbered debug runner — abandoned" },
+        { "path": "launch_run7.sh",                                    "status": "QUARANTINED", "reason": "Numbered debug runner — abandoned" },
+        { "path": "launch_run8.sh",                                    "status": "QUARANTINED", "reason": "Numbered debug runner — abandoned" },
+        { "path": "launch_run9.sh",                                    "status": "QUARANTINED", "reason": "Numbered debug runner — abandoned" },
+        { "path": "launch_run10.sh",                                   "status": "QUARANTINED", "reason": "Numbered debug runner — abandoned" },
+        { "path": "launch_run11.sh",                                   "status": "QUARANTINED", "reason": "Numbered debug runner — abandoned" }
+      ]
+    },
+    "recovery": {
+      "canonical": "src/l4_execution/recovery_engine.py",
+      "modules": [
+        { "path": "src/l4_execution/recovery_engine.py",               "status": "WRAPPED",     "reason": "Canonical recovery; reached via SafeExecutionEngine + OperationsEngine.recover()" },
+        { "path": "src/l8_lifecycle/runners/auto_recovery.py",         "status": "WRAPPED",     "reason": "Lifecycle-level recovery runner used by OperationsEngine" },
+        { "path": "src/l8_lifecycle/runners/apply_recovery_to_live.py","status": "WRAPPED",     "reason": "Live-mode recovery applier called by OperationsEngine" },
+        { "path": "auto_recovery.py",                                  "status": "LEGACY",      "reason": "Top-level shim; duplicates src/l8_lifecycle/runners/auto_recovery.py" }
+      ]
+    },
+    "capital_engines": {
+      "canonical": "src/l6_governance/capital_governor.py",
+      "modules": [
+        { "path": "src/l6_governance/capital_governor.py",             "status": "WRAPPED",     "reason": "Canonical capital governor; reached via DecisionEngine + OperationsEngine" },
+        { "path": "src/l6_governance/capital_allocator.py",            "status": "WRAPPED",     "reason": "Allocation policy used by capital_governor" },
+        { "path": "src/l6_governance/capital_symbol_governor.py",      "status": "WRAPPED",     "reason": "Per-symbol guardrails used by capital_governor" },
+        { "path": "src/l6_governance/adaptive_capital_engine.py",      "status": "WRAPPED",     "reason": "Adaptive sizing called by DecisionEngine" },
+        { "path": "src/l3_portfolio/dead_capital_healer.py",           "status": "WRAPPED",     "reason": "Idle-position healer in SituationEngine" },
+        { "path": "src/l5_strategy/capital_velocity_optimizer.py",     "status": "WRAPPED",     "reason": "Velocity scoring used by DecisionEngine" },
+        { "path": "capital_health_monitor.py",                         "status": "LEGACY",      "reason": "Top-level monitor; superseded by OperationsEngine.get_health_report()" },
+        { "path": "monitoring/active_capital_monitor.py",              "status": "LEGACY",      "reason": "Standalone monitor; data flows through OperationsEngine" },
+        { "path": "monitoring/capital_growth_monitor.py",              "status": "LEGACY",      "reason": "Duplicate of active_capital_monitor.py" }
+      ]
+    },
+    "watchdogs": {
+      "canonical": "src/l8_lifecycle/watchdog.py",
+      "modules": [
+        { "path": "src/l8_lifecycle/watchdog.py",                      "status": "WRAPPED",     "reason": "Canonical lifecycle watchdog; reached via OperationsEngine" },
+        { "path": "docs/archive/scripts/GATING_WATCHDOG.py",           "status": "QUARANTINED", "reason": "Already in docs/archive — retain location, mark as frozen" },
+        { "path": "docs/archive/scripts/PERSISTENT_TRADING_WATCHDOG.py","status": "QUARANTINED", "reason": "Already in docs/archive — retain location, mark as frozen" }
+      ]
+    },
+    "regime_detectors": {
+      "canonical": "src/l2_marketdata/market_regime_detector.py",
+      "modules": [
+        { "path": "src/l2_marketdata/market_regime_detector.py",       "status": "WRAPPED",     "reason": "Canonical regime detector; reached via SituationEngine.get_market_regime()" },
+        { "path": "src/l2_marketdata/market_regime_integration.py",    "status": "WRAPPED",     "reason": "Integration adapter used by SituationEngine" },
+        { "path": "src/l2_marketdata/regime_proposal_analyzer.py",     "status": "WRAPPED",     "reason": "Proposal analyzer used by DecisionEngine" },
+        { "path": "src/l2_marketdata/volatility_regime.py",            "status": "WRAPPED",     "reason": "Volatility-axis classifier used by SituationEngine" },
+        { "path": "src/l2_marketdata/nav_regime.py",                   "status": "WRAPPED",     "reason": "NAV-state classifier used by SituationEngine" }
+      ]
+    }
+  }
+}
