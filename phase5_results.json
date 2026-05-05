@@ -1,0 +1,16 @@
+{
+  "start_time": "2026-05-05T21:32:09.752865",
+  "end_time": "2026-05-05T21:32:11.785266",
+  "duration_seconds": 2.032401,
+  "cycles_executed": 99,
+  "expected_cycles": 900,
+  "success_rate": 11.0,
+  "avg_latency_ms": 0.29133305405125476,
+  "orders_placed": {
+    "BUY": 198,
+    "SELL": 22
+  },
+  "fix2_activations": 22,
+  "error_count": 0,
+  "status": "\u26a0\ufe0f PARTIAL"
+}
