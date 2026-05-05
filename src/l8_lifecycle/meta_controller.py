@@ -884,6 +884,38 @@ class MetaController:
             self.logger.debug("[Meta:PortfolioHealth] Health check exception: %s", str(e))
             return None
 
+    def _sell_finalize_already_done(self, symbol: str, order_id: int) -> bool:
+        """
+        Check if SELL finalization already occurred for this order.
+
+        IDEMPOTENCY GUARD: Prevents duplicate SELL finalization attempts on
+        Binance partial fills (same order_id, different quantities).
+
+        Args:
+            symbol: Trading symbol (e.g., "AIXBTUSDT")
+            order_id: Binance order ID
+
+        Returns:
+            bool: True if already finalized, False if first-time finalization
+        """
+        key = f"sell_finalize_{symbol}_{order_id}"
+
+        # Already in cache = already finalized
+        if key in self._sell_finalize_cache:
+            return True
+
+        # First-time finalization = mark and allow
+        self._sell_finalize_cache[key] = time.time()
+
+        # Keep cache size bounded (expire oldest entries after 10k)
+        if len(self._sell_finalize_cache) > 10000:
+            # Remove 10% oldest entries
+            sorted_keys = sorted(self._sell_finalize_cache.items(), key=lambda x: x[1])
+            for old_key, _ in sorted_keys[:1000]:
+                self._sell_finalize_cache.pop(old_key, None)
+
+        return False
+
     def _is_bootstrap_mode(self) -> bool:
         """
         Check if system is currently in bootstrap mode.
@@ -2286,6 +2318,14 @@ class MetaController:
         self._tick_counter = 0
         self._last_flat_state_logged = None
         self._last_flat_state_log_ts = 0.0
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # IDEMPOTENCY GUARDS: Prevent Duplicate SELL Finalization
+        # Tracks which orders have already been finalized to prevent re-finalization
+        # on Binance partial fills (same order_id, different quantities)
+        # ═══════════════════════════════════════════════════════════════════════════
+        self._sell_finalize_cache = {}  # key: "sell_finalize_{symbol}_{order_id}" -> timestamp
+        self.logger.info("[Meta:Init] Idempotency guard initialized for duplicate SELL prevention")
 
         # ═══════════════════════════════════════════════════════════════════════════
         # ISSUE #21: PERFORMANCE TRACKING & OPTIMIZATION
