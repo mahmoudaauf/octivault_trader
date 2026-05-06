@@ -31,7 +31,7 @@ façade engines read 23 keys. The intersection is what actually matters.
 | `balance_manager` | (none direct) | ✅ `NativeBalanceSync` | covered |
 | `signal_manager` | (none in façades; orchestrator only) | ✅ `NativeSignalEngine` | covered |
 | `execution_manager` | `setup_core_engines` | ✅ `NativeExecutor` | covered |
-| `portfolio_manager` | `situation_engine`, `setup_core_engines` | ❌ not in native | **shim** (TBD) |
+| `portfolio_manager` | `situation_engine`, `setup_core_engines` | ✅ `NativePortfolioManager` (8.3.7) | **native** |
 | `position_manager` | `situation_engine`, `decision_engine` | ❌ not in native | **shim** (TBD) |
 | `risk_manager` | `situation_engine`, `decision_engine` | partial — risk caps live in `NativeDecisionEngine` | **drop key**, behavior already in DE |
 | `tp_sl_engine` | `decision_engine` | ❌ not in native | **shim** (TBD) |
@@ -115,7 +115,7 @@ For each, we have three options:
 
 | key | reader behavior | recommendation |
 |---|---|---|
-| `portfolio_manager` | `situation_engine.observe()` calls `get_nav()` + `get_positions()` | **stub** that delegates to `NativeBalanceSync.get_balances()` for NAV, returns `[]` for positions until L3 native lands |
+| `portfolio_manager` | `situation_engine.observe()` calls `get_nav()` + `get_positions()` | ✅ resolved in **8.3.7** — `NativePortfolioManager` (read-only aggregator over `NativeSharedState` + `NativeBalanceSync`) |
 | `position_manager` | `situation_engine` reads list; `decision_engine` checks for existing position before opening | **stub** returning empty list — native currently has no notion of open positions outside execution callbacks |
 | `tp_sl_engine` | `decision_engine` consults for protective-order placement decisions | **stub** returning "no action" — decision engine already graceful-degrades |
 | `safety_order_manager` | `safe_execution_engine` calls `place_safety_orders(order)` | **stub** returning `[]` |

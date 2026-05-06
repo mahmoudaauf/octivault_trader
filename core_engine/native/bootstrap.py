@@ -48,6 +48,7 @@ from .executor import NativeExecutor
 from .market_data import NativeMarketData
 from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
+from .portfolio_manager import NativePortfolioManager
 from .shared_state import NativeSharedState
 from .signals import NativeSignalEngine
 from .telemetry_export import NativeTelemetryExporter
@@ -341,6 +342,15 @@ async def build_components(
     # latest poller results.
     portfolio_accessor = _make_portfolio_accessor(shared_state, balance_sync)
 
+    # L3 portfolio manager: read-only aggregator over shared_state +
+    # balance_sync. Replaces the compat null-stub for the
+    # ``portfolio_manager`` app_ctx key consumed by SituationEngine.
+    portfolio_manager = NativePortfolioManager(
+        shared_state=shared_state,
+        balance_sync=balance_sync,
+        min_order_usdt=cfg.min_order_usdt,
+    )
+
     return NativeComponents(
         shared_state=shared_state,
         market_data=market_data,
@@ -352,6 +362,7 @@ async def build_components(
         exchange_client=exchange_client,
         portfolio_accessor=portfolio_accessor,
         telemetry_exporter=telemetry_exporter,
+        portfolio_manager=portfolio_manager,
     )
 
 

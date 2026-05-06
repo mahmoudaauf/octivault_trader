@@ -188,8 +188,10 @@ async def test_build_native_app_ctx_compat_true_does_not_break_cycle():
     app_ctx, orch = build_native_app_ctx(_components(), compat=True)
     metrics = await orch.run_cycle()
     assert metrics.cycle_num == 1
-    # Stubs are present but orchestrator never touches them
-    assert isinstance(app_ctx["portfolio_manager"], _NullStub)
+    # Stubs are present but orchestrator never touches them.
+    # Note: portfolio_manager is now a real NativePortfolioManager (8.3.7),
+    # so we probe a still-stubbed key instead.
+    assert isinstance(app_ctx["recovery_engine"], _NullStub)
 
 
 # ---------------------------------------------------------------------
