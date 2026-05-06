@@ -400,3 +400,43 @@ class TestNativeOrchestrator:
         await orch.stop()
 
         assert m.nav == 12345.67
+
+
+class TestRealSharedStateNavRegression:
+    """
+    Regression: orchestrator must read NAV from the *real*
+    ``NativeSharedState.nav_usdt`` field, not a stub-only ``.nav``.
+
+    Discovered by ``scripts/native_smoke.py`` (Phase 8.2.8 step 5):
+    every cycle was raising ``AttributeError: 'NativeSharedState' object
+    has no attribute 'nav'`` because every L8 stub carries ``.nav`` but
+    the production class exposes ``nav_usdt``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_cycle_reads_nav_usdt_from_real_shared_state(self) -> None:
+        from core_engine.native.shared_state import NativeSharedState
+
+        state = NativeSharedState()
+        state.nav_usdt = 9_999.99
+
+        md = _StubMarketData()
+        sig = _StubSignalEngine()
+        dec = _StubDecisionEngine()
+        exe = _StubExecutor()
+        bal = _StubBalanceSync()
+
+        orch = NativeOrchestrator(
+            market_data=md,
+            signal_engine=sig,
+            decision_engine=dec,
+            executor=exe,
+            balance_sync=bal,
+            shared_state=state,
+        )
+        await orch.start()
+        m = await orch.run_cycle()
+        await orch.stop()
+
+        assert m.errors == [], f"unexpected cycle errors: {m.errors}"
+        assert m.nav == 9_999.99

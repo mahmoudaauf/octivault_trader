@@ -182,7 +182,11 @@ class NativeOrchestrator:
             metrics.phase_times["recover"] = (time.time() - t0) * 1000.0
 
             # Metrics
-            metrics.nav = self._shared_state.nav
+            # NativeSharedState exposes ``nav_usdt`` as the canonical NAV
+            # field; fall back to ``nav`` for duck-typed test stubs.
+            metrics.nav = getattr(
+                self._shared_state, "nav_usdt", getattr(self._shared_state, "nav", 0.0)
+            )
             metrics.duration_ms = (time.time() - cycle_start) * 1000.0
 
         except Exception as e:  # pragma: no cover - defensive
