@@ -160,13 +160,17 @@ async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
     trading_decisions: list[Any] = []
     for sig in all_signals:
         decision = None
-        if sig.signal_type == "BUY":
+        sig_type = get_value(sig, "signal_type", "")
+        symbol = get_value(sig, "symbol", "")
+        edge_score = get_value(sig, "edge_score", 0.0)
+
+        if sig_type == "BUY":
             decision = await engines.decision.make_buy_decision(
-                symbol=sig.symbol, edge_score=sig.edge_score
+                symbol=symbol, edge_score=edge_score
             )
-        elif sig.signal_type == "SELL":
+        elif sig_type == "SELL":
             decision = await engines.decision.make_sell_decision(
-                symbol=sig.symbol, edge_score=sig.edge_score, reason="signal"
+                symbol=symbol, edge_score=edge_score, reason="signal"
             )
         if decision:
             trading_decisions.append(decision)
@@ -179,17 +183,22 @@ async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
     if mode != "dry-run":
         for decision in trading_decisions:
             order_result = None
-            if decision.action == "BUY":
+            action = get_value(decision, "action", "")
+            symbol = get_value(decision, "symbol", "")
+            quantity = get_value(decision, "quantity", 0.0)
+            price_target = get_value(decision, "price_target", 0.0)
+
+            if action == "BUY":
                 order_result = await engines.execution.place_buy_order(
-                    symbol=decision.symbol,
-                    quantity=decision.quantity,
-                    price=decision.price_target,
+                    symbol=symbol,
+                    quantity=quantity,
+                    price=price_target,
                 )
-            elif decision.action == "SELL":
+            elif action == "SELL":
                 order_result = await engines.execution.place_sell_order(
-                    symbol=decision.symbol,
-                    quantity=decision.quantity,
-                    price=decision.price_target,
+                    symbol=symbol,
+                    quantity=quantity,
+                    price=price_target,
                 )
             if order_result:
                 executed_orders.append(order_result)
