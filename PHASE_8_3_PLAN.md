@@ -129,23 +129,23 @@ These belong to Phase 9+.
 These surfaced during 8.3 work but are explicitly **not** Phase 8.3 deliverables.
 Tracked here so they don't get lost:
 
-1. **CLI flag handling in `🎯_MASTER_SYSTEM_ORCHESTRATOR.py`** — `--mode` and
-   `--duration` are silently ignored; the orchestrator defaults to LIVE +
-   24h regardless. Footgun confirmed during a paper-trade test attempt
-   (2026-05-06): three zombie processes accumulated over a day, all booted
-   LIVE despite `--mode=paper-trade`. **Fix**: add an `argparse` block.
-2. **SIGTERM handling** — the three zombies above ignored SIGTERM for 10s+;
-   only SIGKILL terminated them. The orchestrator should install a signal
-   handler that triggers `shutdown_components()` and exits within a few
-   seconds. (Related to G1 but the surface here is the master orchestrator,
-   not `main.py`.)
-3. **`orchestrator.pid` PID file is unmaintained** — written stale, not
-   updated on relaunch, not cleared on exit. Either wire the lifecycle
-   properly or stop relying on it.
-4. **`SymbolScreener` convergence gating** — observed blocking 100% of
+1. **`.claude/worktrees/` orchestrator hygiene** — two worktrees
+   (`competent-yonath-ba6f13`, `frosty-bhaskara-651c14`) contain a
+   `🎯_MASTER_SYSTEM_ORCHESTRATOR.py` script that has **no `argparse`**,
+   ignores `--mode` / `--duration`, and defaults to LIVE + 24h. Three
+   zombie processes accumulated from these worktrees on 2026-05-06 (all
+   running mainnet on a $72 wallet despite `--mode=paper-trade` flags;
+   killed via SIGKILL after they ignored SIGTERM for 10s+). The script
+   is **not** in the main tree (never committed to `phase-3/wiring`).
+   **Mitigation**: either delete the worktrees or audit and fix the
+   script if anyone still launches from there. Real entry point
+   `main.py` is unaffected — it has proper `argparse`, signal handlers
+   for SIGINT+SIGTERM, calls `shutdown_components()` on exit, and
+   defaults to `paper-trade`.
+2. **`SymbolScreener` convergence gating** — observed blocking 100% of
    proposals during the 2026-05-06 zombie run. Productivity issue, not a
    safety issue, but worth investigating before any real launch.
-5. **`core_engine.native.compat` orphan module** — restored by user override
+3. **`core_engine.native.compat` orphan module** — restored by user override
    in `49619d4`; production code no longer imports it but the file +
    `tests/test_native_compat.py` (15 self-contained tests) remain. Harmless
    dead code; can be deleted in a future cleanup pass when convenient.
