@@ -84,6 +84,7 @@ NATIVE_CTX_KEYS: tuple[str, ...] = (
     "watchdog",  # L7 (NativeWatchdog; replaces compat stub in 8.3.12 — last one)
     "trade_journal",  # L0 (NativeTradeJournal; observability — crash-safe audit trail)
     "prometheus_exporter",  # L7 (NativePrometheusExporter; observability — Grafana metrics)
+    "fill_tracker",  # L3 (NativeFillTracker; detects fills and updates positions)
     "_native_orchestrator",  # L8 handle
     "_native_mode",  # marker flag
 )
@@ -117,6 +118,7 @@ class NativeComponents:
     watchdog: Any | None = None  # NativeWatchdog | None
     trade_journal: Any | None = None  # NativeTradeJournal | None
     prometheus_exporter: Any | None = None  # NativePrometheusExporter | None
+    fill_tracker: Any | None = None  # NativeFillTracker | None
 
 
 def build_native_app_ctx(
@@ -159,6 +161,7 @@ def build_native_app_ctx(
         portfolio_accessor=components.portfolio_accessor,
         telemetry=components.telemetry,
         watchdog=components.watchdog,
+        fill_tracker=components.fill_tracker,
     )
 
     app_ctx: dict[str, Any] = {
@@ -193,6 +196,8 @@ def build_native_app_ctx(
         app_ctx["trade_journal"] = components.trade_journal
     if components.prometheus_exporter is not None:
         app_ctx["prometheus_exporter"] = components.prometheus_exporter
+    if components.fill_tracker is not None:
+        app_ctx["fill_tracker"] = components.fill_tracker
 
     return app_ctx, orch
 

@@ -46,6 +46,7 @@ from .capital_allocator import NativeCapitalAllocator
 from .decisions import NativeDecisionEngine
 from .exchange_client import NativeExchangeClient
 from .executor import NativeExecutor
+from .fill_tracker import NativeFillTracker
 from .market_data import NativeMarketData
 from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
@@ -97,6 +98,9 @@ class BootstrapConfig:
 
     # --- balance sync ---
     balance_poll_sec: float = 5.0
+
+    # --- fill detection ---
+    fill_tracker_poll_sec: float = 5.0
 
     # --- decisions / risk ---
     kelly_fraction: float = 0.25
@@ -162,6 +166,7 @@ class BootstrapConfig:
             klines_cache_size=_int(e.get("KLINES_CACHE_SIZE"), 64),
             stale_threshold_sec=_float(e.get("STALE_THRESHOLD_SEC"), 30.0),
             balance_poll_sec=_float(e.get("BALANCE_POLL_SEC"), 5.0),
+            fill_tracker_poll_sec=_float(e.get("FILL_TRACKER_POLL_SEC"), 5.0),
             kelly_fraction=_float(e.get("KELLY_FRACTION"), 0.25),
             max_position_size_pct=_float(e.get("MAX_POSITION_PCT"), 5.0),
             max_concurrent_positions=_int(e.get("MAX_CONCURRENT_POSITIONS"), 10),
@@ -329,6 +334,13 @@ async def build_components(
         klines_cache_size=cfg.klines_cache_size,
     )
 
+    # L3 fill tracker: detect fills and update positions
+    fill_tracker = NativeFillTracker(
+        exchange_client=exchange_client,
+        shared_state=shared_state,
+        poll_interval_sec=cfg.fill_tracker_poll_sec,
+    )
+
     # L3
     signal_engine = NativeSignalEngine(cooldown_sec=cfg.signal_cooldown_sec)
 
@@ -461,6 +473,7 @@ async def build_components(
         watchdog=watchdog,
         trade_journal=trade_journal,
         prometheus_exporter=prometheus_exporter,
+        fill_tracker=fill_tracker,
     )
 
 
@@ -480,8 +493,10 @@ async def shutdown_components(components: NativeComponents) -> None:
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("native shutdown: telemetry_exporter.stop() raised: %r", e)
 
-    # market data + balance sync own background tasks
-    for comp in (components.market_data, components.balance_sync):
+    # market data + balance sync + fill tracker own background tasks
+    for comp in (components.market_data, components.balance_sync, components.fill_tracker):
+        if comp is None:
+            continue
         try:
             await comp.stop()
         except Exception as e:  # pragma: no cover - defensive

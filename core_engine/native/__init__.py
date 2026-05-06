@@ -52,6 +52,9 @@ from .exchange_client import ExchangeClientError, NativeExchangeClient
 # ── L5 ───────────────────────────────────────────────────────────────
 from .executor import ExecutionResult, ExecutionStatus, NativeExecutor
 
+# ── L3 ───────────────────────────────────────────────────────────────
+from .fill_tracker import NativeFillTracker
+
 # ── L2 ───────────────────────────────────────────────────────────────
 from .market_data import NativeMarketData
 from .math_utils import (
@@ -111,6 +114,7 @@ __all__ = [
     "NativeSignalEngine",
     "Signal",
     "AggregatedSignal",
+    "NativeFillTracker",
     # L4
     "NativeDecisionEngine",
     "Decision",

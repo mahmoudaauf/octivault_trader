@@ -77,6 +77,7 @@ class NativeOrchestrator:
         portfolio_accessor: callable | None = None,
         telemetry: Any | None = None,  # NativeTelemetry (L6, optional)
         watchdog: Any | None = None,  # NativeWatchdog (L7, optional)
+        fill_tracker: Any | None = None,  # NativeFillTracker (L3, optional)
     ) -> None:
         self._market_data = market_data
         self._signal_engine = signal_engine
@@ -87,6 +88,7 @@ class NativeOrchestrator:
         self._portfolio_accessor = portfolio_accessor
         self._telemetry = telemetry
         self._watchdog = watchdog
+        self._fill_tracker = fill_tracker
 
         self._cycle_count = 0
         self._stopped = True  # Use bool flag instead of asyncio.Event
@@ -99,12 +101,16 @@ class NativeOrchestrator:
         self._stopped = False
         await self._market_data.start()
         await self._balance_sync.start()
+        if self._fill_tracker is not None:
+            await self._fill_tracker.start()
 
     async def stop(self) -> None:
         """Graceful shutdown."""
         self._stopped = True
         await self._market_data.stop()
         await self._balance_sync.stop()
+        if self._fill_tracker is not None:
+            await self._fill_tracker.stop()
 
     async def run_loop(
         self,
