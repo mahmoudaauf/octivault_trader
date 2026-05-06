@@ -53,6 +53,7 @@ from .position_manager import NativePositionManager
 from .shared_state import NativeSharedState
 from .signals import NativeSignalEngine
 from .telemetry_export import NativeTelemetryExporter
+from .tp_sl_engine import NativeTPSLEngine
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,10 @@ class BootstrapConfig:
     max_drawdown_pct: float = 10.0
     daily_loss_limit_pct: float = 5.0
     risk_per_symbol_pct: float = 2.0
+
+    # --- exit logic (TP/SL) ---
+    tp_pct: float = 0.03  # +3% take profit
+    sl_pct: float = 0.02  # -2% stop loss
 
     # --- signals ---
     signal_cooldown_sec: float = 0.0
@@ -152,6 +157,8 @@ class BootstrapConfig:
             max_drawdown_pct=_float(e.get("MAX_DRAWDOWN_PCT"), 10.0),
             daily_loss_limit_pct=_float(e.get("DAILY_LOSS_LIMIT_PCT"), 5.0),
             risk_per_symbol_pct=_float(e.get("RISK_PER_SYMBOL_PCT"), 2.0),
+            tp_pct=_float(e.get("TP_PCT"), 0.03),
+            sl_pct=_float(e.get("SL_PCT"), 0.02),
             signal_cooldown_sec=_float(e.get("SIGNAL_COOLDOWN_SEC"), 0.0),
             telemetry_capacity=_int(e.get("TELEMETRY_CAPACITY"), 1024),
             telemetry_export_path=(e.get("TELEMETRY_EXPORT_PATH") or "").strip(),
@@ -361,6 +368,15 @@ async def build_components(
         min_order_usdt=cfg.min_order_usdt,
     )
 
+    # L4 TP/SL engine: per-symbol exit-target store. Replaces the
+    # compat null-stub for the ``tp_sl_engine`` app_ctx key consumed
+    # by DecisionEngine.evaluate_exit_signals.
+    tp_sl_engine_native = NativeTPSLEngine(
+        shared_state=shared_state,
+        tp_pct=cfg.tp_pct,
+        sl_pct=cfg.sl_pct,
+    )
+
     return NativeComponents(
         shared_state=shared_state,
         market_data=market_data,
@@ -374,6 +390,7 @@ async def build_components(
         telemetry_exporter=telemetry_exporter,
         portfolio_manager=portfolio_manager,
         position_manager=position_manager,
+        tp_sl_engine=tp_sl_engine_native,
     )
 
 
