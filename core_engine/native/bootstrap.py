@@ -330,21 +330,23 @@ async def build_components(
         poll_interval_sec=cfg.balance_poll_sec,
     )
 
-    # Auto-discover symbols if not explicitly provided
+    # Symbol discovery: defer to per-cycle scanning unless explicitly overridden
     symbols = list(cfg.symbols) if cfg.symbols else []
-    if not symbols and cfg.symbol_discovery_enabled:
+    symbol_discoverer = None
+    if symbols:
+        logger.info("Using %d symbols from config (explicit override)", len(symbols))
+    elif cfg.symbol_discovery_enabled:
+        logger.info("📱 Symbol discovery: will scan wallet each cycle (not at bootstrap)")
         from .symbol_discovery import NativeSymbolDiscovery
 
-        discoverer = NativeSymbolDiscovery(exchange_client, base_currency="USDT")
-        symbols = await discoverer.discover()
-        logger.info("📱 Wallet scan: discovered %d symbols: %s", len(symbols), symbols)
+        symbol_discoverer = NativeSymbolDiscovery(exchange_client, base_currency="USDT")
+        symbols = []  # Start empty; orchestrator will populate from balance
     else:
-        logger.info(
-            "Using %d symbols from config (discovery disabled or explicit override)", len(symbols)
-        )
+        logger.error("No symbols configured and discovery disabled; nothing to trade")
+        symbols = []
 
     logger.info(
-        "native bootstrap: testnet=%s symbols=%d md_poll=%.1fs balance_poll=%.1fs",
+        "native bootstrap: testnet=%s symbols=%d (cycle-dynamic) md_poll=%.1fs balance_poll=%.1fs",
         cfg.testnet,
         len(symbols),
         cfg.market_data_poll_sec,
@@ -355,7 +357,7 @@ async def build_components(
     market_data = NativeMarketData(
         exchange_client,
         poll_interval_sec=cfg.market_data_poll_sec,
-        symbols=symbols,
+        symbols=symbols,  # May be empty; will be updated per-cycle
         stale_threshold_sec=cfg.stale_threshold_sec,
         klines_cache_size=cfg.klines_cache_size,
     )
@@ -519,6 +521,7 @@ async def build_components(
         fill_tracker=fill_tracker,
         adaptive_capital_engine=ace,
         objective_feedback_controller=ofc,
+        symbol_discovery=symbol_discoverer,
     )
 
 

@@ -121,6 +121,7 @@ class NativeComponents:
     fill_tracker: Any | None = None  # NativeFillTracker | None
     adaptive_capital_engine: Any | None = None  # NativeAdaptiveCapitalEngine | None
     objective_feedback_controller: Any | None = None  # NativeObjectiveFeedbackController | None
+    symbol_discovery: Any | None = None  # NativeSymbolDiscovery | None
 
 
 def build_native_app_ctx(
@@ -165,6 +166,7 @@ def build_native_app_ctx(
         watchdog=components.watchdog,
         fill_tracker=components.fill_tracker,
         objective_feedback_controller=components.objective_feedback_controller,
+        symbol_discovery=components.symbol_discovery,
     )
 
     app_ctx: dict[str, Any] = {

@@ -80,6 +80,7 @@ class NativeOrchestrator:
         fill_tracker: Any | None = None,  # NativeFillTracker (L3, optional)
         objective_feedback_controller: Any
         | None = None,  # ObjectiveFeedbackController (OFC, optional)
+        symbol_discovery: Any | None = None,  # NativeSymbolDiscovery (optional)
     ) -> None:
         self._market_data = market_data
         self._signal_engine = signal_engine
@@ -92,6 +93,7 @@ class NativeOrchestrator:
         self._watchdog = watchdog
         self._fill_tracker = fill_tracker
         self._ofc = objective_feedback_controller
+        self._symbol_discovery = symbol_discovery
 
         self._cycle_count = 0
         self._stopped = True  # Use bool flag instead of asyncio.Event
@@ -171,6 +173,10 @@ class NativeOrchestrator:
         )
 
         try:
+            # Phase 0: DISCOVER (optional symbol discovery per cycle)
+            if self._symbol_discovery:
+                await self._phase_discover()
+
             # Phase 1: READ
             t0 = time.time()
             await self._phase_read()
@@ -233,8 +239,23 @@ class NativeOrchestrator:
         return metrics
 
     # ──────────────────────────────────────────────────────────────────
-    # 5-phase implementation
+    # 6-phase implementation (Phase 0 optional: symbol discovery)
     # ──────────────────────────────────────────────────────────────────
+    async def _phase_discover(self) -> None:
+        """Phase 0: Scan wallet and update symbol list (optional, per-cycle)."""
+        if not self._symbol_discovery:
+            return
+        try:
+            symbols = await self._symbol_discovery.discover()
+            if symbols and self._market_data:
+                # Update market data symbols if changed
+                current_symbols = self._market_data._symbols
+                if sorted(symbols) != sorted(current_symbols or []):
+                    logger.info("📱 Symbols updated: %s → %s", current_symbols, symbols)
+                    self._market_data._symbols = symbols
+        except Exception as e:
+            logger.warning("Symbol discovery failed: %s (will retry next cycle)", e)
+
     async def _phase_read(self) -> None:
         """Phase 1: Fetch latest market data. Sync balances."""
         # Market data is background-polled by NativeMarketData.
@@ -275,6 +296,18 @@ class NativeOrchestrator:
             return []
 
         balance_usdt = self._balance_sync.get_balance().get("USDT", 0.0)
+
+        # Debug: log signal details
+        if signals:
+            buy_sigs = [s for s, sig in signals.items() if sig.get("direction") == "BUY"]
+            sell_sigs = [s for s, sig in signals.items() if sig.get("direction") == "SELL"]
+            logger.info(
+                "🔍 _phase_decide: %d total signals → %d BUY, %d SELL (balance=%.2f)",
+                len(signals),
+                len(buy_sigs),
+                len(sell_sigs),
+                balance_usdt,
+            )
 
         # Update SharedState with current NAV (critical for capital allocator)
         if self._shared_state:
