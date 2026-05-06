@@ -292,6 +292,10 @@ async def create_app_context(
             cfg = BootstrapConfig.from_env()
             components = await build_components(cfg)
             app_ctx, _orch = build_native_app_ctx(components, compat=compat)
+            # Stash the components handle so callers can shut down
+            # background polling tasks + the exchange-client HTTP
+            # session via ``shutdown_components(...)``. Phase 8.3.1.
+            app_ctx["_native_components"] = components
             logger.info(
                 "✅ Native app_ctx built: %d keys, testnet=%s, symbols=%d, compat=%s",
                 len(app_ctx),

@@ -338,6 +338,18 @@ async def run(args: argparse.Namespace) -> int:
 
     finally:
         await engines.shutdown()
+        # Phase 8.3.1: tear down native bootstrap (background poll
+        # loops, exchange-client HTTP session). No-op when running in
+        # mock mode (--no-native), since _native_components is absent.
+        native_components = app_ctx.get("_native_components")
+        if native_components is not None:
+            try:
+                from core_engine.native.bootstrap import shutdown_components
+
+                await shutdown_components(native_components)
+                log.info("✅ Native bootstrap shut down")
+            except Exception as e:
+                log.warning("native shutdown error: %s", e)
 
     log.info("Total cycles: %d", cycle_no)
     return rc

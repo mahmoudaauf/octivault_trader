@@ -100,6 +100,40 @@ async def test_setup_core_engines_forwards_native_flag(env_with_creds, patched_n
 
 
 # ---------------------------------------------------------------------
+# Phase 8.3.1: shutdown handle exposed in app_ctx
+# ---------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_native_components_handle_in_app_ctx(env_with_creds, patched_native_factory):
+    """The bootstrap handle must be reachable via _native_components so
+    callers (main.py) can run shutdown_components() on cleanup."""
+    from core_engine.native.app_context import NativeComponents
+    from core_engine.native.bootstrap import shutdown_components
+
+    app_ctx = await create_app_context(native=True)
+    components = app_ctx.get("_native_components")
+    assert components is not None, "missing _native_components handle"
+    assert isinstance(components, NativeComponents)
+
+    # shutdown_components must be idempotent and not raise
+    await shutdown_components(components)
+    # second call must also be a no-op
+    await shutdown_components(components)
+
+
+@pytest.mark.asyncio
+async def test_native_shutdown_closes_exchange_client(env_with_creds, patched_native_factory):
+    from core_engine.native.bootstrap import shutdown_components
+
+    app_ctx = await create_app_context(native=True)
+    components = app_ctx["_native_components"]
+    client = components.exchange_client
+    # The stub records close_calls; before shutdown it's untouched.
+    assert getattr(client, "close_calls", 0) == 0
+    await shutdown_components(components)
+    assert client.close_calls >= 1
+
+
+# ---------------------------------------------------------------------
 # native=True failure -> mock fallback
 # ---------------------------------------------------------------------
 @pytest.mark.asyncio
