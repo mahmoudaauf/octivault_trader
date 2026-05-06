@@ -2,7 +2,11 @@
 
 **Started:** 2026-05-06
 **Predecessor:** Phase 8.2.8 — bridge deletion landed, native is the only path
-**Status:** Planning
+**Status:** ✅ Substantively complete — all six compat stubs replaced with native
+impls (8.3.7-8.3.12), G5 acceptance gate satisfied + codified (G5 cleanup),
+heartbeat wired into the orchestrator cycle (8.3.12-followup). Suite: **549/549
+passing in 17.6s**. Remaining sub-steps (8.3.2 live testnet smoke, 8.3.6 perf
+baseline, 8.3.13 Py 3.11) are optional follow-ups, not migration blockers.
 
 ---
 
@@ -73,8 +77,10 @@ parked behind "land the migration first":
 | **8.3.8** | **Native `position_manager` (read-only per-symbol accessor; replaces compat stub)** | done — this commit | medium | high |
 | **8.3.9** | **Native `tp_sl_engine` (per-symbol target store + crossing detection)** | done — this commit | medium | high |
 | **8.3.10** | **Native `safety_order_manager` (OCO intent store + best-effort TP-leg placement)** | done — this commit | medium | medium |
-| 8.3.11 | **Native `recovery_engine` (in-process self-diagnosis: orphan OCO / stale prices / NAV drift / zero entry — with apply dispatcher)** | done — this commit | medium | medium |
-| 8.3.12 | **Native `watchdog` (heartbeat tracking + 5-detector anomaly sweep) — FINAL compat-stub replacement; G5 unlocked** | done — this commit | low | medium |
+| 8.3.11 | **Native `recovery_engine` (in-process self-diagnosis: orphan OCO / stale prices / NAV drift / zero entry — with apply dispatcher)** | done — `8ec9a51` | medium | medium |
+| 8.3.12 | **Native `watchdog` (heartbeat tracking + 5-detector anomaly sweep) — FINAL compat-stub replacement; G5 unlocked** | done — `5f37566` | low | medium |
+| 8.3.12-followup | **Wire `NativeWatchdog.record_heartbeat()` into orchestrator cycle (5 wiring tests)** | done — `d0cf533` | low | medium |
+| **G5 cleanup** | **Retire `core_engine.native.compat` plumbing — `compat: bool` kwarg becomes deprecated no-op everywhere; production code no longer imports `register_compat_stubs`. Module file kept (orphaned) per user override.** | done — `88787d4` | none | low |
 | 8.3.13 | Python 3.9 → 3.11 migration | 1 day | medium | low — DX |
 
 **Recommended sequence**: 8.3.1 → 8.3.4 → 8.3.5 → 8.3.6 → 8.3.2 (when
@@ -88,13 +94,16 @@ the six compat-stubbed components.
 
 ## Acceptance gates
 
-| Gate | When | What |
-|---|---|---|
-| **G1: clean shutdown** | after 8.3.1 | `python main.py --cycles=2 --no-native`, then SIGINT, exits 0 with no orphan tasks |
-| **G2: live signal** | after 8.3.2 | live testnet smoke completes 60s with non-zero NAV |
-| **G3: observability** | after 8.3.3 | telemetry summary written to disk every N cycles, machine-readable |
-| **G4: clean repo** | after 8.3.4 | repo root has ≤3 `PHASE_*` docs |
-| **G5: full parity** | after 8.3.7-8.3.12 | `compat=False` boots cleanly with full façade-engine coverage |
+| Gate | When | What | Status |
+|---|---|---|---|
+| **G1: clean shutdown** | after 8.3.1 | `python main.py --cycles=2 --no-native`, then SIGINT, exits 0 with no orphan tasks | ✅ closed (`c3fc3a2`) |
+| **G2: live signal** | after 8.3.2 | live testnet smoke completes 60s with non-zero NAV | ⏸ deferred — needs creds; orthogonal to migration |
+| **G3: observability** | after 8.3.3 | telemetry summary written to disk every N cycles, machine-readable | ✅ closed |
+| **G4: clean repo** | after 8.3.4 | repo root has ≤3 `PHASE_*` docs | ✅ closed (`7856404` + `913c543`) |
+| **G5: full parity** | after 8.3.7-8.3.12 | `compat=False` boots cleanly with full façade-engine coverage | ✅ closed — all 6 stubs replaced (8.3.7 → 8.3.12), heartbeat wired (8.3.12-followup), production code de-compatted (G5 cleanup, `88787d4`) |
+
+**Migration-completeness gates (G1, G3, G4, G5) are all closed.** G2 is the
+sole remaining gate and is gated on testnet credentials — not on code work.
 
 ---
 
@@ -111,4 +120,32 @@ These belong to Phase 9+.
 
 **Owner:** @mauf
 **Branch:** `phase-3/wiring`
-**Last updated:** 2026-05-06
+**Last updated:** 2026-05-06 (post G5 cleanup, suite 549/549 green)
+
+---
+
+## Known follow-ups (post-migration, non-blocking)
+
+These surfaced during 8.3 work but are explicitly **not** Phase 8.3 deliverables.
+Tracked here so they don't get lost:
+
+1. **CLI flag handling in `🎯_MASTER_SYSTEM_ORCHESTRATOR.py`** — `--mode` and
+   `--duration` are silently ignored; the orchestrator defaults to LIVE +
+   24h regardless. Footgun confirmed during a paper-trade test attempt
+   (2026-05-06): three zombie processes accumulated over a day, all booted
+   LIVE despite `--mode=paper-trade`. **Fix**: add an `argparse` block.
+2. **SIGTERM handling** — the three zombies above ignored SIGTERM for 10s+;
+   only SIGKILL terminated them. The orchestrator should install a signal
+   handler that triggers `shutdown_components()` and exits within a few
+   seconds. (Related to G1 but the surface here is the master orchestrator,
+   not `main.py`.)
+3. **`orchestrator.pid` PID file is unmaintained** — written stale, not
+   updated on relaunch, not cleared on exit. Either wire the lifecycle
+   properly or stop relying on it.
+4. **`SymbolScreener` convergence gating** — observed blocking 100% of
+   proposals during the 2026-05-06 zombie run. Productivity issue, not a
+   safety issue, but worth investigating before any real launch.
+5. **`core_engine.native.compat` orphan module** — restored by user override
+   in `49619d4`; production code no longer imports it but the file +
+   `tests/test_native_compat.py` (15 self-contained tests) remain. Harmless
+   dead code; can be deleted in a future cleanup pass when convenient.
