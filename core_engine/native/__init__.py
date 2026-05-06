@@ -1,17 +1,11 @@
 """
-Native module: L0 (8.2.1) + L1 exchange (8.2.2) + L2 market data (8.2.3) + L3 signals (8.2.4)
+Native module: L0 (8.2.1) + L1 (8.2.2) + L2 (8.2.3) + L3 (8.2.4) + L4 (8.2.5)
 
-L0 (Phase 8.2.1) — Utilities
-    NativeSharedState, NativeTimeUtils, ConfigLoader, NativeRetryManager
-
-L1 (Phase 8.2.2) — Exchange Integration
-    NativeExchangeClient, NativeBalanceSync, NativeOrderExecution
-
-L2 (Phase 8.2.3) — Market Data
-    NativeMarketData
-
-L3 (Phase 8.2.4) — Signal Engine
-    NativeSignalEngine, Signal, AggregatedSignal
+L0 — Utilities: NativeSharedState, NativeTimeUtils, ConfigLoader, NativeRetryManager
+L1 — Exchange: NativeExchangeClient, NativeBalanceSync, NativeOrderExecution
+L2 — Market Data: NativeMarketData
+L3 — Signals: NativeSignalEngine, Signal, AggregatedSignal
+L4 — Decisions: NativeDecisionEngine, Decision, PortfolioSnapshot
 """
 
 # ── L0 ───────────────────────────────────────────────────────────────
@@ -35,6 +29,9 @@ from .shared_state import NativeSharedState, Order, Position
 
 # ── L3 ───────────────────────────────────────────────────────────────
 from .signals import AggregatedSignal, NativeSignalEngine, Signal
+
+# ── L4 ───────────────────────────────────────────────────────────────
+from .decisions import Decision, NativeDecisionEngine, PortfolioSnapshot
 from .time_utils import NativeTimeUtils
 
 __all__ = [
@@ -62,7 +59,11 @@ __all__ = [
     "NativeSignalEngine",
     "Signal",
     "AggregatedSignal",
+    # L4
+    "NativeDecisionEngine",
+    "Decision",
+    "PortfolioSnapshot",
 ]
 
-__version__ = "0.4.0"
-__phase__ = "8.2.4"
+__version__ = "0.5.0"
+__phase__ = "8.2.5"
