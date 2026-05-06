@@ -58,15 +58,23 @@ class NativeExecutor:
 
     Usage::
 
-        executor = NativeExecutor(order_execution_client, ...)
+        executor = NativeExecutor(order_execution_client, market_data=md)
         results = await executor.execute(decisions)
         # ⇒ list[ExecutionResult] with status + order IDs
     """
 
-    def __init__(self, order_execution: NativeOrderExecution) -> None:
+    def __init__(
+        self,
+        order_execution: NativeOrderExecution,
+        market_data: Optional[Any] = None,
+        exchange_client: Optional[Any] = None,
+    ) -> None:
         self._order_exec = order_execution
+        self._market_data = market_data  # for price lookups when decision.quantity is in USD
+        self._exchange_client = exchange_client  # for symbol filters (LOT_SIZE, MIN_NOTIONAL)
         self._executed_ids: set[str] = set()  # dedup tracking
         self._symbol_locks: dict[str, float] = {}  # symbol → last execution ts
+        self._symbol_filters_cache: dict[str, dict[str, Any]] = {}  # symbol → filters
 
     # ──────────────────────────────────────────────────────────────────
     # Main API
@@ -147,10 +155,45 @@ class NativeExecutor:
             result.error = "expected OPEN action"
             return result
 
+        # Decision.quantity is in USD; convert to base asset using current price
+        qty_to_place = decision.quantity
+        price = None
+        if self._market_data:
+            try:
+                price = self._market_data.get_price(decision.symbol)
+            except Exception as e:
+                logger.warning("price lookup failed for %s: %s", decision.symbol, e)
+
+        if not price or price <= 0:
+            result.status = ExecutionStatus.RETRYABLE
+            result.error = f"price unavailable for {decision.symbol} (current: {price})"
+            logger.warning("❌ Order deferred: %s price lookup failed", decision.symbol)
+            return result
+
+        qty_to_place = decision.quantity / price
+        logger.debug("converted USD %.2f → %.6f @ $%.2f", decision.quantity, qty_to_place, price)
+
+        # Layer 2: Validate LOT_SIZE and MIN_NOTIONAL constraints
+        valid, error_msg, corrected_qty = await self._validate_lot_size(
+            decision.symbol, qty_to_place, price
+        )
+        if not valid:
+            result.status = ExecutionStatus.TERMINAL
+            result.error = f"LOT_SIZE validation failed: {error_msg}"
+            logger.warning(
+                "❌ Order rejected (LOT_SIZE): %s qty=%.6f price=$%.2f reason=%s",
+                decision.symbol,
+                qty_to_place,
+                price,
+                error_msg,
+            )
+            return result
+        qty_to_place = corrected_qty  # Use step-size aligned quantity
+
         # Simple market order: BUY
         order_result = await self._order_exec.place_market_buy(
             decision.symbol,
-            decision.quantity,
+            qty_to_place,
             client_order_id=decision.decision_id,  # idempotency key
         )
 
@@ -160,8 +203,20 @@ class NativeExecutor:
 
         if order_result.success:
             result.status = ExecutionStatus.SUCCESS
+            logger.info(
+                "✅ Order placed: %s qty=%.6f status=%s",
+                decision.symbol,
+                qty_to_place,
+                order_result.status,
+            )
         else:
             # Exchange rejected the order
+            logger.warning(
+                "❌ Order failed: %s qty=%.6f error=%s",
+                decision.symbol,
+                qty_to_place,
+                order_result.error,
+            )
             if "insufficient" in (order_result.error or "").lower():
                 result.status = ExecutionStatus.TERMINAL
             else:
@@ -201,7 +256,102 @@ class NativeExecutor:
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────
-    @staticmethod
+    # Symbol filters (LOT_SIZE, MIN_NOTIONAL validation)
+    # ──────────────────────────────────────────────────────────────────
+    async def _get_symbol_filters(self, symbol: str) -> dict[str, Any]:
+        """Fetch and cache symbol filters from exchange (LOT_SIZE, MIN_NOTIONAL)."""
+        if symbol in self._symbol_filters_cache:
+            return self._symbol_filters_cache[symbol]
+
+        filters: dict[str, Any] = {
+            "step_size": 0.000001,  # LOT_SIZE stepSize default
+            "min_qty": 0.0,  # LOT_SIZE minQty default
+            "min_notional": 10.0,  # MIN_NOTIONAL default
+        }
+
+        if not self._exchange_client:
+            self._symbol_filters_cache[symbol] = filters
+            return filters
+
+        try:
+            info = await self._exchange_client.get_exchange_info(symbol)
+            # info.symbols[0].filters contains the filter list
+            if not isinstance(info, dict) or "symbols" not in info:
+                self._symbol_filters_cache[symbol] = filters
+                return filters
+
+            symbol_info = info.get("symbols", [{}])[0]
+            for f in symbol_info.get("filters", []):
+                ftype = f.get("filterType", "")
+                if ftype == "LOT_SIZE":
+                    try:
+                        filters["step_size"] = float(f.get("stepSize", "0.000001"))
+                        filters["min_qty"] = float(f.get("minQty", "0"))
+                    except (TypeError, ValueError):
+                        pass
+                elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
+                    try:
+                        filters["min_notional"] = float(
+                            f.get("minNotional", f.get("minNot ional", "10"))
+                        )
+                    except (TypeError, ValueError):
+                        pass
+            logger.debug(
+                "filters for %s: step_size=%.8f min_notional=%.2f",
+                symbol,
+                filters["step_size"],
+                filters["min_notional"],
+            )
+        except Exception as e:
+            logger.warning("failed to fetch filters for %s: %s; using defaults", symbol, e)
+
+        self._symbol_filters_cache[symbol] = filters
+        return filters
+
+    async def _validate_lot_size(
+        self, symbol: str, qty: float, price: float
+    ) -> tuple[bool, str, float]:
+        """Validate order qty against LOT_SIZE and MIN_NOTIONAL constraints. Returns (valid, error_msg, corrected_qty)."""
+        filters = await self._get_symbol_filters(symbol)
+        step_size = filters["step_size"]
+        min_notional = filters["min_notional"]
+        min_qty = filters["min_qty"]
+        corrected_qty = qty
+
+        # Check minimum quantity
+        if qty < min_qty:
+            return False, f"qty {qty:.8f} < min {min_qty:.8f}", corrected_qty
+
+        # Check minimum notional (USD value)
+        notional = qty * price
+        if notional < min_notional:
+            return False, f"notional ${notional:.2f} < min ${min_notional:.2f}", corrected_qty
+
+        # Check step size alignment
+        if step_size > 0:
+            remainder = qty % step_size
+            if remainder > 1e-8:  # allow tiny floating-point errors
+                # Round down to nearest step
+                corrected_qty = (qty // step_size) * step_size
+                if corrected_qty <= 0:
+                    return (
+                        False,
+                        f"qty {qty:.8f} rounds to 0 after step_size {step_size:.8f} adjustment",
+                        qty,
+                    )
+                notional_after = corrected_qty * price
+                if notional_after < min_notional:
+                    return (
+                        False,
+                        f"after rounding to step_size, notional ${notional_after:.2f} < min ${min_notional:.2f}",
+                        qty,
+                    )
+                logger.debug(
+                    "rounded qty {:.8f} → {:.8f} (step_size {:.8f})", qty, corrected_qty, step_size
+                )
+
+        return True, "", corrected_qty
+
     def _classify_error(error_msg: str) -> ExecutionStatus:
         """Classify an error as retryable or terminal."""
         error_lower = error_msg.lower()
