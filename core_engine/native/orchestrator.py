@@ -76,6 +76,7 @@ class NativeOrchestrator:
         shared_state: Any,  # NativeSharedState
         portfolio_accessor: callable | None = None,
         telemetry: Any | None = None,  # NativeTelemetry (L6, optional)
+        watchdog: Any | None = None,  # NativeWatchdog (L7, optional)
     ) -> None:
         self._market_data = market_data
         self._signal_engine = signal_engine
@@ -85,6 +86,7 @@ class NativeOrchestrator:
         self._shared_state = shared_state
         self._portfolio_accessor = portfolio_accessor
         self._telemetry = telemetry
+        self._watchdog = watchdog
 
         self._cycle_count = 0
         self._stopped = True  # Use bool flag instead of asyncio.Event
@@ -199,6 +201,15 @@ class NativeOrchestrator:
                 self._telemetry.record(metrics)
             except Exception:  # pragma: no cover - defensive
                 logger.exception("telemetry.record failed (cycle %05d)", self._cycle_count)
+
+        # L7: watchdog heartbeat (optional, never raises). Records
+        # ok=True iff the cycle completed without errors. Done after
+        # telemetry so a watchdog crash can't poison metrics.
+        if self._watchdog is not None:
+            try:
+                self._watchdog.record_heartbeat(ok=not metrics.errors)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("watchdog.record_heartbeat failed (cycle %05d)", self._cycle_count)
 
         return metrics
 

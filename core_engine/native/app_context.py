@@ -148,6 +148,7 @@ def build_native_app_ctx(
         shared_state=components.shared_state,
         portfolio_accessor=components.portfolio_accessor,
         telemetry=components.telemetry,
+        watchdog=components.watchdog,
     )
 
     app_ctx: dict[str, Any] = {

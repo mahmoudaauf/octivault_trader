@@ -440,3 +440,99 @@ class TestRealSharedStateNavRegression:
 
         assert m.errors == [], f"unexpected cycle errors: {m.errors}"
         assert m.nav == 9_999.99
+
+
+# ─────────────────────────────────────────────────────────────────────
+# L7 watchdog wiring (Phase 8.3.12 follow-up)
+# ─────────────────────────────────────────────────────────────────────
+class _RecordingWatchdog:
+    """Captures every record_heartbeat call for assertion."""
+
+    def __init__(self) -> None:
+        self.calls: list[bool] = []
+
+    def record_heartbeat(self, *, ok: bool = True) -> None:
+        self.calls.append(ok)
+
+
+def _orch_with_watchdog(wd: Any | None) -> NativeOrchestrator:
+    return NativeOrchestrator(
+        market_data=_StubMarketData(),
+        signal_engine=_StubSignalEngine(),
+        decision_engine=_StubDecisionEngine(),
+        executor=_StubExecutor(),
+        balance_sync=_StubBalanceSync(),
+        shared_state=_StubSharedState(),
+        watchdog=wd,
+    )
+
+
+class TestOrchestratorWatchdogWiring:
+    @pytest.mark.asyncio
+    async def test_run_cycle_records_heartbeat_ok_when_no_errors(self) -> None:
+        wd = _RecordingWatchdog()
+        orch = _orch_with_watchdog(wd)
+        await orch.start()
+        m = await orch.run_cycle()
+        await orch.stop()
+
+        assert m.errors == []
+        assert wd.calls == [True]
+
+    @pytest.mark.asyncio
+    async def test_run_loop_records_one_heartbeat_per_cycle(self) -> None:
+        wd = _RecordingWatchdog()
+        orch = _orch_with_watchdog(wd)
+        await orch.run_loop(max_cycles=3)
+        assert wd.calls == [True, True, True]
+
+    @pytest.mark.asyncio
+    async def test_run_cycle_records_heartbeat_failed_when_errors_present(self) -> None:
+        """A cycle whose inner phases raise still emits a heartbeat with ok=False."""
+        wd = _RecordingWatchdog()
+
+        class _BoomMD(_StubMarketData):
+            def get_prices(self) -> dict[str, float]:
+                raise RuntimeError("boom")
+
+        orch = NativeOrchestrator(
+            market_data=_BoomMD(),
+            signal_engine=_StubSignalEngine(),
+            decision_engine=_StubDecisionEngine(),
+            executor=_StubExecutor(),
+            balance_sync=_StubBalanceSync(),
+            shared_state=_StubSharedState(),
+            watchdog=wd,
+        )
+        await orch.start()
+        m = await orch.run_cycle()
+        await orch.stop()
+
+        assert m.errors  # cycle did fail
+        assert wd.calls == [False]
+
+    @pytest.mark.asyncio
+    async def test_no_watchdog_is_zero_overhead(self) -> None:
+        """Orchestrator without a watchdog runs cleanly (no AttributeError)."""
+        orch = _orch_with_watchdog(None)
+        await orch.start()
+        m = await orch.run_cycle()
+        await orch.stop()
+        assert m.cycle_num == 1
+        assert m.errors == []
+
+    @pytest.mark.asyncio
+    async def test_watchdog_exception_does_not_break_cycle(self) -> None:
+        """A misbehaving watchdog never poisons a cycle."""
+
+        class _BoomWatchdog:
+            def record_heartbeat(self, *, ok: bool = True) -> None:
+                raise RuntimeError("watchdog exploded")
+
+        orch = _orch_with_watchdog(_BoomWatchdog())
+        await orch.start()
+        m = await orch.run_cycle()  # must NOT raise
+        await orch.stop()
+        assert m.cycle_num == 1
+        # Cycle itself succeeded; watchdog crash is logged, not propagated.
+        assert m.errors == []
