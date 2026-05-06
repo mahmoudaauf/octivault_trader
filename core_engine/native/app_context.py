@@ -1,8 +1,9 @@
 """
-Native L0-L8 application context (Phase 8.2.8 preparation)
+Native L0-L8 application context (Phase 8.2.8)
 
-This is the **seam** that will eventually replace
-``core_engine.production_bridge.build_production_app_ctx``.
+This module is the **canonical** seam for assembling a native app_ctx.
+It replaced the legacy ``core_engine.production_bridge`` (deleted in
+Phase 8.2.8 step 6).
 
 Scope (today)
 -------------
@@ -63,7 +64,7 @@ from .signals import NativeSignalEngine
 # app_ctx key contract
 # ----------------------------------------------------------------------
 # Public, stable keys the 5 facade engines may consume from app_ctx.
-# Mirrors a *subset* of ATTR_TO_CTX_KEY in production_bridge.py — only
+# Mirrors a *subset* of what the legacy bridge once exposed — only
 # what the native stack currently provides. Missing keys remain absent;
 # engines must continue to graceful-degrade.
 NATIVE_CTX_KEYS: tuple[str, ...] = (

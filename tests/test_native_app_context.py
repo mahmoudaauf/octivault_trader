@@ -168,55 +168,11 @@ async def test_orchestrator_built_by_factory_runs_one_cycle():
 
 
 # ---------------------------------------------------------------------
-# production_bridge deprecation warning
+# production_bridge removal sanity (Phase 8.2.8 step 6)
 # ---------------------------------------------------------------------
-@pytest.mark.asyncio
-async def test_production_bridge_emits_deprecation_warning(monkeypatch):
-    """
-    Verify that calling build_production_app_ctx emits DeprecationWarning.
+def test_production_bridge_module_is_removed():
+    """The legacy bridge module must not be importable any more."""
+    import importlib
 
-    We short-circuit before any legacy I/O by raising in _load_legacy_module.
-    The warning fires *before* that raise (it's the first line of the function).
-    """
-    from core_engine import production_bridge
-
-    # Reset the once-flag so this test is order-independent.
-    monkeypatch.setattr(production_bridge, "_DEPRECATION_EMITTED", False)
-
-    def _boom():
-        raise FileNotFoundError("legacy not present in test env")
-
-    monkeypatch.setattr(production_bridge, "_load_legacy_module", _boom)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with pytest.raises(FileNotFoundError):
-            await production_bridge.build_production_app_ctx()
-
-    deprecation_msgs = [
-        str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
-    ]
-    assert any(
-        "production_bridge is deprecated" in m for m in deprecation_msgs
-    ), f"expected DeprecationWarning, got: {deprecation_msgs}"
-
-
-@pytest.mark.asyncio
-async def test_production_bridge_deprecation_warning_emits_only_once(monkeypatch):
-    from core_engine import production_bridge
-
-    monkeypatch.setattr(production_bridge, "_DEPRECATION_EMITTED", False)
-
-    def _boom():
-        raise FileNotFoundError("legacy not present")
-
-    monkeypatch.setattr(production_bridge, "_load_legacy_module", _boom)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        for _ in range(3):
-            with pytest.raises(FileNotFoundError):
-                await production_bridge.build_production_app_ctx()
-
-    deprecation_msgs = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-    assert len(deprecation_msgs) == 1
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("core_engine.production_bridge")

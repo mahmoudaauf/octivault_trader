@@ -265,17 +265,19 @@ async def create_app_context(
         Reads credentials from the environment (``BINANCE_API_KEY`` /
         ``BINANCE_API_SECRET``). On any failure (missing credentials,
         construction error) falls back to mock mode (empty dict) and
-        logs the cause. Takes precedence over ``production``.
+        logs the cause.
 
         ``compat=True`` additionally installs null-object stubs for the
         six legacy app_ctx keys the façade engines reference but native
         does not yet provide (forward-compat; no-ops today).
 
-    production=True (Phase 8.1): delegates to
-        ``core_engine.production_bridge`` which reuses the legacy
-        ``MasterSystemOrchestrator`` to construct all ~50 L0-L8
-        components, then maps them to app_ctx keys.
-        **Deprecated** — see ``PHASE_8_2_8_PREP.md``.
+    production=True (Phase 8.1, **removed in 8.2.8**): the legacy
+        bridge that loaded ``MasterSystemOrchestrator`` has been
+        deleted. The kwarg is retained as a deprecated no-op for
+        backward compat with ``main.py`` / CLI ``--production``. It
+        emits a DeprecationWarning on use and does nothing else; the
+        function falls through to mock mode (or native if ``native=True``
+        is also set, which is the supported migration path).
 
     production=False, native=False (default): returns an empty dict —
         engines run in mock mode via graceful degradation. Used for
@@ -308,14 +310,17 @@ async def create_app_context(
             # Fall through to empty context (mock mode) on bootstrap failure
 
     if production:
-        try:
-            from core_engine.production_bridge import build_production_app_ctx
+        import warnings
 
-            app_ctx, _orch = await build_production_app_ctx()
-            return app_ctx
-        except Exception as e:
-            logger.error(f"❌ Production bridge failed: {e!r} — falling back to mock context")
-            # Fall through to empty context (mock mode) on bridge failure
+        warnings.warn(
+            "create_app_context(production=True) is a no-op since Phase 8.2.8: "
+            "the legacy production_bridge has been removed. Pass native=True "
+            "(with BINANCE_API_KEY/SECRET in env) for a real app_ctx, or omit "
+            "the flag for mock mode.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        # Fall through to mock mode
 
     app_ctx: dict[str, Any] = {}
 
