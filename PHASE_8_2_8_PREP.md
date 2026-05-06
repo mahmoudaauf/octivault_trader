@@ -17,13 +17,20 @@ is the only path that wires the production `app_ctx`.
    - Stable key contract published as `NATIVE_CTX_KEYS`.
    - Pure assembly, no I/O, no credentials. Fully unit-testable.
 
-3. **Tests** in `tests/test_native_app_context.py` (9 tests):
-   - factory returns wired orchestrator
-   - documented `app_ctx` keys present
-   - telemetry inclusion is optional
-   - orchestrator runs one cycle through the factory
-   - `DeprecationWarning` fires
-   - warning fires at most once per process
+3. **Native bootstrap** in `core_engine/native/bootstrap.py`:
+   - `BootstrapConfig` (frozen dataclass) — explicit credential + tuning
+     surface, plus a `from_env()` classmethod with safe coercion.
+   - `build_components(cfg, *, exchange_client_factory=None)` — async
+     builder that constructs all L0-L6 native instances ready to be
+     handed to `build_native_app_ctx`. Tests can inject a stub exchange
+     client to avoid network setup.
+   - `shutdown_components(components)` — best-effort, idempotent
+     teardown of pollers + HTTP session.
+
+4. **Tests**:
+   - `tests/test_native_app_context.py` (9 tests) — factory + warning.
+   - `tests/test_native_bootstrap.py` (13 tests) — config parsing,
+     wiring, injection seam, shutdown idempotence, end-to-end cycle.
 
 ## What still blocks final deletion
 
@@ -69,12 +76,7 @@ features the 5 façade engines treat as optional (graceful degradation).
 
 1. Decide per remaining key: **port to native**, **keep legacy via
    compat shim**, or **drop** (graceful-degrade indefinitely).
-2. Build a dedicated `core_engine/native/bootstrap.py` that:
-   - reads config (env vars / `config/`)
-   - constructs `NativeExchangeClient`, `NativeBalanceSync`, etc., with
-     real credentials
-   - returns a `NativeComponents`
-   - is the only place that performs I/O
+2. ~~Build a dedicated `core_engine/native/bootstrap.py` that:~~ ✅ done.
 3. Update `create_app_context(production=True, native=True)` to call
    `bootstrap.build_components()` then `build_native_app_ctx(...)`,
    without touching the legacy bridge.
@@ -90,6 +92,6 @@ After this prep step:
 ```
 pytest tests/test_native_l0..6.py tests/test_native_l8.py \
        tests/test_integration_full_cycle.py \
-       tests/test_native_app_context.py -q
-# 177 passed
+       tests/test_native_app_context.py tests/test_native_bootstrap.py -q
+# 190 passed
 ```
