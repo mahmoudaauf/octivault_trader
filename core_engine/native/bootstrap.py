@@ -86,15 +86,12 @@ class BootstrapConfig:
 
     # --- market data ---
     symbols: list[str] = field(
-        default_factory=lambda: [
-            "BTCUSDT",
-            "ETHUSDT",
-            "BNBUSDT",
-            "SOLUSDT",
-            "XRPUSDT",
-        ]
-    )
+        default_factory=list
+    )  # Auto-populated via discovery; can be overridden via SYMBOLS env
     market_data_poll_sec: float = 2.0
+    symbol_discovery_enabled: bool = True
+    symbol_discovery_min_volume: float = 100000.0
+    symbol_discovery_max_symbols: int = 30
     klines_cache_size: int = 64
     stale_threshold_sec: float = 30.0
 
@@ -108,10 +105,10 @@ class BootstrapConfig:
     kelly_fraction: float = 0.25
     max_position_size_pct: float = 5.0
     max_concurrent_positions: int = 10
-    min_order_usdt: float = 10.0
+    min_order_usdt: float = 1.0  # Lowered from 10.0 to allow micro trades on small account
     max_drawdown_pct: float = 10.0
     daily_loss_limit_pct: float = 5.0
-    risk_per_symbol_pct: float = 2.0
+    risk_per_symbol_pct: float = 20.0  # Increased from 2.0: micro accounts need higher per-symbol allocation to generate trades
     capital_allocation_pct: float = 5.0
 
     # --- exit logic (TP/SL) ---
@@ -160,17 +157,21 @@ class BootstrapConfig:
                 "BootstrapConfig.from_env: BINANCE_API_KEY and " "BINANCE_API_SECRET must be set."
             )
 
-        symbols_raw = e.get(
-            "SYMBOLS",
-            "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT",
+        # Symbols: prefer auto-discovery unless explicitly overridden in .env
+        symbols_raw = e.get("SYMBOLS", "").strip()
+        symbols = (
+            [s.strip().upper() for s in symbols_raw.split(",") if s.strip()] if symbols_raw else []
         )
-        symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
+        symbol_discovery_enabled = _bool(e.get("SYMBOL_DISCOVERY_ENABLED"), default=True)
 
         return cls(
             api_key=api_key,
             api_secret=api_secret,
             testnet=_bool(e.get("BINANCE_TESTNET"), default=False),
-            symbols=symbols,
+            symbols=symbols,  # Empty list → auto-discover during bootstrap
+            symbol_discovery_enabled=symbol_discovery_enabled,
+            symbol_discovery_min_volume=_float(e.get("SYMBOL_DISCOVERY_MIN_VOLUME"), 100000.0),
+            symbol_discovery_max_symbols=_int(e.get("SYMBOL_DISCOVERY_MAX_SYMBOLS"), 30),
             market_data_poll_sec=_float(e.get("MARKET_DATA_POLL_SEC"), 2.0),
             klines_cache_size=_int(e.get("KLINES_CACHE_SIZE"), 64),
             stale_threshold_sec=_float(e.get("STALE_THRESHOLD_SEC"), 30.0),
@@ -179,10 +180,10 @@ class BootstrapConfig:
             kelly_fraction=_float(e.get("KELLY_FRACTION"), 0.25),
             max_position_size_pct=_float(e.get("MAX_POSITION_PCT"), 5.0),
             max_concurrent_positions=_int(e.get("MAX_CONCURRENT_POSITIONS"), 10),
-            min_order_usdt=_float(e.get("MIN_ORDER_USDT"), 10.0),
+            min_order_usdt=_float(e.get("MIN_ORDER_USDT"), 1.0),
             max_drawdown_pct=_float(e.get("MAX_DRAWDOWN_PCT"), 10.0),
             daily_loss_limit_pct=_float(e.get("DAILY_LOSS_LIMIT_PCT"), 5.0),
-            risk_per_symbol_pct=_float(e.get("RISK_PER_SYMBOL_PCT"), 2.0),
+            risk_per_symbol_pct=_float(e.get("RISK_PER_SYMBOL_PCT"), 20.0),
             capital_allocation_pct=_float(e.get("CAPITAL_ALLOCATION_PCT"), 5.0),
             tp_pct=_float(e.get("TP_PCT"), 0.03),
             sl_pct=_float(e.get("SL_PCT"), 0.02),
@@ -322,14 +323,6 @@ async def build_components(
     """
     factory = exchange_client_factory or _default_exchange_factory
 
-    logger.info(
-        "native bootstrap: testnet=%s symbols=%d md_poll=%.1fs balance_poll=%.1fs",
-        cfg.testnet,
-        len(cfg.symbols),
-        cfg.market_data_poll_sec,
-        cfg.balance_poll_sec,
-    )
-
     # L0
     shared_state = NativeSharedState()
 
@@ -341,11 +334,37 @@ async def build_components(
         poll_interval_sec=cfg.balance_poll_sec,
     )
 
+    # Auto-discover symbols if not explicitly provided
+    symbols = list(cfg.symbols) if cfg.symbols else []
+    if not symbols and cfg.symbol_discovery_enabled:
+        from .symbol_discovery import NativeSymbolDiscovery
+
+        discoverer = NativeSymbolDiscovery(
+            exchange_client,
+            base_currency="USDT",
+            min_24h_volume=cfg.symbol_discovery_min_volume,
+            max_symbols=cfg.symbol_discovery_max_symbols,
+        )
+        symbols = await discoverer.discover()
+        logger.info("🔍 Auto-discovered %d symbols: %s", len(symbols), symbols)
+    else:
+        logger.info(
+            "Using %d symbols from config (discovery disabled or explicit override)", len(symbols)
+        )
+
+    logger.info(
+        "native bootstrap: testnet=%s symbols=%d md_poll=%.1fs balance_poll=%.1fs",
+        cfg.testnet,
+        len(symbols),
+        cfg.market_data_poll_sec,
+        cfg.balance_poll_sec,
+    )
+
     # L2
     market_data = NativeMarketData(
         exchange_client,
         poll_interval_sec=cfg.market_data_poll_sec,
-        symbols=list(cfg.symbols),
+        symbols=symbols,
         stale_threshold_sec=cfg.stale_threshold_sec,
         klines_cache_size=cfg.klines_cache_size,
     )
@@ -369,10 +388,13 @@ async def build_components(
         max_drawdown_pct=cfg.max_drawdown_pct,
         daily_loss_limit_pct=cfg.daily_loss_limit_pct,
         risk_per_symbol_pct=cfg.risk_per_symbol_pct,
+        min_notional_usdt=10.0,  # Layer 1: minimum notional filter for Binance LOT_SIZE compliance
     )
 
     # L5
-    executor = NativeExecutor(order_execution)
+    executor = NativeExecutor(
+        order_execution, market_data=market_data, exchange_client=exchange_client
+    )
 
     # L6
     telemetry = NativeTelemetry(capacity=cfg.telemetry_capacity)

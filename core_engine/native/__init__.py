@@ -89,6 +89,7 @@ from .shared_state import NativeSharedState, Order, Position
 
 # ── L3 ───────────────────────────────────────────────────────────────
 from .signals import AggregatedSignal, NativeSignalEngine, Signal
+from .symbol_discovery import NativeSymbolDiscovery
 from .time_utils import NativeTimeUtils
 from .trade_journal import NativeTradeJournal
 
@@ -113,6 +114,7 @@ __all__ = [
     "OrderResult",
     # L2
     "NativeMarketData",
+    "NativeSymbolDiscovery",
     # L3
     "NativeSignalEngine",
     "Signal",
