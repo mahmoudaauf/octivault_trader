@@ -249,7 +249,6 @@ class CoreEngineIntegration:
 
 
 async def create_app_context(
-    production: bool = False,
     *,
     native: bool = False,
     compat: bool = False,
@@ -271,17 +270,13 @@ async def create_app_context(
         six legacy app_ctx keys the façade engines reference but native
         does not yet provide (forward-compat; no-ops today).
 
-    production=True (Phase 8.1, **removed in 8.2.8**): the legacy
-        bridge that loaded ``MasterSystemOrchestrator`` has been
-        deleted. The kwarg is retained as a deprecated no-op for
-        backward compat with ``main.py`` / CLI ``--production``. It
-        emits a DeprecationWarning on use and does nothing else; the
-        function falls through to mock mode (or native if ``native=True``
-        is also set, which is the supported migration path).
+    native=False (default): returns an empty dict — engines run in
+        mock mode via graceful degradation. Used for dry-run /
+        structural smoke tests.
 
-    production=False, native=False (default): returns an empty dict —
-        engines run in mock mode via graceful degradation. Used for
-        dry-run / structural smoke tests.
+    Note: the legacy ``production=True`` mode (which delegated to the
+    now-deleted ``core_engine.production_bridge``) was removed in
+    Phase 8.2.8 step 7 along with the ``--production`` CLI flag.
 
     Returns:
         app_ctx: Dict with all components wired (or empty in mock mode)
@@ -308,19 +303,6 @@ async def create_app_context(
         except Exception as e:
             logger.error("❌ Native bootstrap failed: %r — falling back to mock context", e)
             # Fall through to empty context (mock mode) on bootstrap failure
-
-    if production:
-        import warnings
-
-        warnings.warn(
-            "create_app_context(production=True) is a no-op since Phase 8.2.8: "
-            "the legacy production_bridge has been removed. Pass native=True "
-            "(with BINANCE_API_KEY/SECRET in env) for a real app_ctx, or omit "
-            "the flag for mock mode.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        # Fall through to mock mode
 
     app_ctx: dict[str, Any] = {}
 
@@ -400,22 +382,20 @@ async def wire_engines(app_ctx: dict[str, Any]) -> None:
 
 # Convenience function for quick setup
 async def setup_core_engines(
-    production: bool = False, *, native: bool = False, compat: bool = False
+    *, native: bool = False, compat: bool = False
 ) -> dict[str, Any]:
     """
     Setup: create context → wire engines → return ready app_ctx
 
     Args:
-        production: If True, build a production app_ctx via the
-            legacy-orchestrator bridge (deprecated, see Phase 8.2.8).
         native: If True, build a native app_ctx via the Phase 8.2.8
-            bootstrap. Takes precedence over ``production``.
+            bootstrap.
         compat: If True (and ``native`` is True), install null-object
             stubs for unmigrated façade keys (forward-compat).
 
     Returns:
         app_ctx: Ready-to-use application context
     """
-    app_ctx = await create_app_context(production=production, native=native, compat=compat)
+    app_ctx = await create_app_context(native=native, compat=compat)
     await wire_engines(app_ctx)
     return app_ctx

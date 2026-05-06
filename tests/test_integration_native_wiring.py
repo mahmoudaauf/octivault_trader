@@ -133,46 +133,6 @@ async def test_native_true_falls_back_when_factory_raises(env_with_creds, monkey
 
 
 # ---------------------------------------------------------------------
-# precedence: native=True bypasses production=True (now a deprecated no-op)
-# ---------------------------------------------------------------------
-@pytest.mark.asyncio
-async def test_native_takes_precedence_over_production(
-    env_with_creds, patched_native_factory
-):
-    """
-    When both flags are True and native succeeds, the legacy
-    production path must not interfere. Since Phase 8.2.8 step 6 the
-    legacy bridge has been deleted and ``production=True`` is a
-    deprecated no-op; this test guarantees the native return value is
-    what callers see.
-    """
-    import warnings
-
-    with warnings.catch_warnings(record=True):
-        warnings.simplefilter("always")
-        app_ctx = await create_app_context(production=True, native=True)
-    assert app_ctx.get("_native_mode") is True
-
-
-@pytest.mark.asyncio
-async def test_production_true_alone_emits_deprecation_and_returns_mock():
-    """
-    With native=False and production=True, the legacy bridge is gone:
-    we must emit a DeprecationWarning and fall through to mock mode
-    (empty dict).
-    """
-    import warnings
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        app_ctx = await create_app_context(production=True)
-
-    assert app_ctx == {}
-    msgs = [str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)]
-    assert any("production=True" in m and "no-op" in m for m in msgs), msgs
-
-
-# ---------------------------------------------------------------------
 # default mode unchanged
 # ---------------------------------------------------------------------
 @pytest.mark.asyncio

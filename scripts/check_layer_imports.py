@@ -131,7 +131,6 @@ FILE_LAYER_MAP: Dict[str, str] = {
     "src/l7_observability/monitors/monitor_4hour_session.py":     "L7",
     # ---- L8: Lifecycle & Recovery -----------------------------------------
     "tools/diagnose_runtime.py":                "L8",
-    "🎯_MASTER_SYSTEM_ORCHESTRATOR.py":         "L8",
     "src/l8_lifecycle/runners/verify_dust_fix.py":        "L8",
     "src/l8_lifecycle/runners/verify_fixes.py":           "L8",
     "src/l8_lifecycle/runners/verify_fixes_detailed.py":  "L8",
