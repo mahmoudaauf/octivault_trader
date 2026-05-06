@@ -75,6 +75,7 @@ class NativeOrchestrator:
         balance_sync: Any,  # NativeBalanceSync
         shared_state: Any,  # NativeSharedState
         portfolio_accessor: callable | None = None,
+        telemetry: Any | None = None,  # NativeTelemetry (L6, optional)
     ) -> None:
         self._market_data = market_data
         self._signal_engine = signal_engine
@@ -83,6 +84,7 @@ class NativeOrchestrator:
         self._balance_sync = balance_sync
         self._shared_state = shared_state
         self._portfolio_accessor = portfolio_accessor
+        self._telemetry = telemetry
 
         self._cycle_count = 0
         self._stopped = asyncio.Event()
@@ -187,6 +189,13 @@ class NativeOrchestrator:
             logger.exception("cycle %05d failed: %s", self._cycle_count, e)
             metrics.errors.append(f"{type(e).__name__}: {e}")
             metrics.duration_ms = (time.time() - cycle_start) * 1000.0
+
+        # L6: telemetry hook (optional, never raises)
+        if self._telemetry is not None:
+            try:
+                self._telemetry.record(metrics)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("telemetry.record failed (cycle %05d)", self._cycle_count)
 
         return metrics
 
