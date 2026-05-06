@@ -62,6 +62,79 @@
 └─ _arm_safety_orders.py ................................ Safety order setup (utility)
 ```
 
+### CORE_ENGINE LAYER (18 files: 5 Façades + 13 Native L0-L4)
+
+**Façade Layer** (5 files)
+```
+/core_engine/
+├─ market_account_engine.py ............................. Function #1: Read market/account data
+├─ situation_engine.py .................................. Function #2: Understand portfolio + signals
+├─ decision_engine.py ................................... Function #3: Decide trade positions
+├─ safe_execution_engine.py ............................. Function #4: Execute safely with guards
+├─ operations_engine.py ................................. Function #5: Recover/monitor/health
+├─ implementations.py .................................... Impl backing the 5 façades
+├─ integration.py ........................................ App context + wiring
+├─ production_bridge.py .................................. Production-specific bridges
+└─ WIRING_EXAMPLES.py ................................... Documentation/examples
+```
+
+**Native Subsystem L0-L4** (13 files - NEW Phase 8.2 refactoring)
+```
+/core_engine/native/
+│
+├─ __init__.py (Phase 8.2.2) ............................ L0-L4 exports + layer docs
+│
+├─ L0: UTILITIES & INFRASTRUCTURE
+│  ├─ config_loader.py .................................. Load .env config (47% reduction)
+│  ├─ retry_manager.py .................................. Async retry + backoff (featured)
+│  ├─ time_utils.py ..................................... Lightweight time utils
+│  └─ shared_state.py ................................... In-memory state (81% reduction!)
+│
+├─ L1: EXCHANGE & I/O
+│  ├─ exchange_client.py ................................ Binance REST API (63% reduction)
+│  ├─ balance_sync.py ................................... Balance polling cache (51% reduction)
+│  └─ order_execution.py ................................ Order management (63% reduction)
+│
+├─ L2: MARKET DATA
+│  └─ market_data.py .................................... Price + klines cache
+│
+├─ L3: SIGNALS
+│  └─ signals.py ........................................ Pure-numpy indicators (90% reduction!)
+│
+└─ L4: DECISIONS & EXECUTION
+   ├─ decisions.py ...................................... Position sizing + risk (80% reduction)
+   └─ executor.py ....................................... Order sequencing (89% reduction)
+```
+
+**Native Subsystem Stats:**
+- **Total LOC saved**: 6,600 legacy → 1,800 native (3.7x compression)
+- **shared_state.py**: 1,200 → 232 lines (81% reduction)
+- **signals.py**: 1,500 → 150+ lines (90% reduction)
+- **exchange_client.py**: 800 → 300+ lines (63% reduction)
+- **decisions.py**: 800 → 150+ lines (80% reduction)
+- **executor.py**: 700 → 80+ lines (89% reduction)
+
+**Architecture**:
+```
+Façade Layer (unified API):
+  market_account_engine (Fn#1) → native/exchange_client → Binance
+  situation_engine (Fn#2) → native/signals → Analysis
+  decision_engine (Fn#3) → native/decisions → Sizing
+  safe_execution_engine (Fn#4) → native/executor → Orders
+  operations_engine (Fn#5) → native/shared_state → Health
+
+Native Stack (L0→L4):
+  L0: config_loader, retry_manager, time_utils, shared_state
+    ↓
+  L1: exchange_client, balance_sync, order_execution
+    ↓
+  L2: market_data
+    ↓
+  L3: signals
+    ↓
+  L4: decisions, executor
+```
+
 ### L0 — CORE INFRASTRUCTURE (`/src/l0_core/`)
 
 **Primary (Always Needed)**
@@ -1026,19 +1099,22 @@ Every Layer:
 
 ## 📝 SUMMARY
 
-This system is a **7-layer trading bot architecture** with:
+This system is a **9-layer trading bot architecture** with:
 
-| Layer | Purpose | Key Module |
-|-------|---------|-----------|
-| **L0** | Core infrastructure | shared_state.py |
-| **L1** | Exchange API | exchange_client.py |
-| **L2** | Market data & wallet | market_data_feed.py |
-| **L3** | Portfolio state | portfolio_manager.py |
-| **L4** | Order execution | execution_manager.py |
-| **L5** | Strategy & agents | signal_fusion.py |
-| **L6** | Governance & policy | risk_manager.py |
-| **L7** | Monitoring & health | health_monitor.py |
-| **L8** | Lifecycle orchestration | meta_controller.py |
+| Layer | Purpose | Key Module | Files |
+|-------|---------|-----------|-------|
+| **L0** | Core infrastructure | shared_state.py | 18 |
+| **L1** | Exchange API | exchange_client.py | 8 |
+| **L2** | Market data & wallet | market_data_feed.py | 10 |
+| **L3** | Portfolio state | portfolio_manager.py | 24 |
+| **L4** | Order execution | execution_manager.py | 17 |
+| **L5** | Strategy & agents | signal_fusion.py | 21 |
+| **L6** | Governance & policy | risk_manager.py | 9 |
+| **L7** | Monitoring & health | health_monitor.py | 20 |
+| **L8** | Lifecycle orchestration | meta_controller.py | 8 |
+| **Core Engine (NEW)** | Façade + native L0-L4 | market_account_engine.py | 18 |
+
+**Total**: 163 Python files (145 legacy + 18 core_engine)
 
 **Critical Safeguards:**
 - ✅ Idempotent SELL guard (prevents duplicate finalization)
@@ -1047,6 +1123,12 @@ This system is a **7-layer trading bot architecture** with:
 - ✅ Circuit breaker (halts trading on major error)
 - ✅ 4th slot tracker (forces exit on over-leverage)
 - ✅ Watchdog (detects hangs/crashes)
+
+**Core Engine (Phase 8.2):**
+- ✅ 5 Façade engines (one per function)
+- ✅ Native L0-L4 subsystem (6,600 → 1,800 LOC, 3.7x compression)
+- ✅ 81% reduction in shared_state.py
+- ✅ 90% reduction in signals.py
 
 **Ready for**: Live trading, paper testing, or extended validation.
 

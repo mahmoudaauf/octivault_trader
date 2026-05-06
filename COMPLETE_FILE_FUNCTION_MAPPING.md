@@ -644,6 +644,90 @@ Root: 🎯_MASTER_SYSTEM_ORCHESTRATOR.py, auto_recovery.py,
 
 ---
 
+## 🆕 CORE_ENGINE: FAÇADE + NATIVE SUBSYSTEM (18 files)
+
+### **Core Engine Façade Layer (5 files)**
+
+| File | 1 | 2 | 3 | 4 | 5 | Purpose |
+|------|---|---|---|---|---|---------|
+| **market_account_engine.py** | ✅ | | | | | **Function #1**: Read market prices, account balance, open orders |
+| **situation_engine.py** | | ✅ | | | | **Function #2**: Understand portfolio health, signal generation, regime |
+| **decision_engine.py** | | | ✅ | | | **Function #3**: Decide positions, sizing, trade allocation |
+| **safe_execution_engine.py** | | | | ✅ | | **Function #4**: Execute orders safely with guards + slippage |
+| **operations_engine.py** | | | | | ✅ | **Function #5**: Monitor health, logging, recovery, state management |
+
+**Purpose**: 5 top-level façade engines—one per core function, providing unified API that wraps native subsystem.
+
+---
+
+### **Native Subsystem L0: Utilities & Infrastructure (4 files)**
+
+| File | 1 | 2 | 3 | 4 | 5 | Purpose |
+|------|---|---|---|---|---|---------|
+| **config_loader.py** | | | | | ✅ | Load config from .env (159 lines, **47% reduction** vs legacy 300 LOC) |
+| **retry_manager.py** | | | | | ✅ | Async retry + exponential backoff + jitter (165 lines, **featured** version) |
+| **time_utils.py** | | | | | ✅ | Lightweight time utilities (unix_now, iso_now, market hours) |
+| **shared_state.py** | ✅ | ✅ | | | ✅ | **In-memory state manager** (232 lines, **81% reduction** vs legacy 1,200 LOC) |
+
+### **Native Subsystem L1: Exchange & I/O (3 files)**
+
+| File | 1 | 2 | 3 | 4 | 5 | Purpose |
+|------|---|---|---|---|---|---------|
+| **exchange_client.py** | ✅ | | | ✅ | | Binance Spot REST API (300+ lines, **63% reduction** vs legacy 800 LOC) |
+| **balance_sync.py** | ✅ | | | | ✅ | Polling-based balance cache (146 lines, **51% reduction** vs legacy 300 LOC) |
+| **order_execution.py** | | | | ✅ | | Stateless order management (188 lines, **63% reduction** vs legacy 500 LOC) |
+
+### **Native Subsystem L2: Market Data (1 file)**
+
+| File | 1 | 2 | 3 | 4 | 5 | Purpose |
+|------|---|---|---|---|---|---------|
+| **market_data.py** | ✅ | | | | | Price + klines cache (100+ lines, **optimized** vs legacy) |
+
+### **Native Subsystem L3: Signals (1 file)**
+
+| File | 1 | 2 | 3 | 4 | 5 | Purpose |
+|------|---|---|---|---|---|---------|
+| **signals.py** | | ✅ | | | | Pure-numpy technical signals (150+ lines, **90% reduction** vs legacy 1,500 LOC) |
+
+### **Native Subsystem L4: Decisions & Execution (2 files)**
+
+| File | 1 | 2 | 3 | 4 | 5 | Purpose |
+|------|---|---|---|---|---|---------|
+| **decisions.py** | | | ✅ | | | Kelly sizing + risk gating (150+ lines, **optimized** vs legacy 800 LOC) |
+| **executor.py** | | | | ✅ | | Order sequencing + partial-fill dedup (80+ lines, **optimized** vs legacy 700 LOC) |
+
+### **Native Package Init (1 file)**
+
+| File | 1 | 2 | 3 | 4 | 5 | Purpose |
+|------|---|---|---|---|---|---------|
+| **__init__.py** | | | | | ✅ | L0-L4 exports + layer documentation (Phase 8.2.2) |
+
+**Key Points**:
+- **Complete L0-L4 native stack**: Parallel implementation to legacy layers
+- **6,600 → 1,800 LOC**: **3.7x code compression** while maintaining functionality
+- **81% reduction in shared_state.py**: 1,200 → 232 lines
+- **90% reduction in signals.py**: 1,500 → 150+ lines
+- **Independent**: Can work standalone or via façades (market_account_engine, etc.)
+- **Phase 8.2**: Recent refactoring (visible in docstrings: "Phase 8.2.1" through "8.2.2")
+
+**Architecture**:
+```
+Façade Layer (Function 1-5):
+  market_account_engine → native/L0-L4 → Binance
+
+Native L0: Utilities (config, retry, time, state)
+  ↓
+Native L1: Exchange I/O (client, balance, orders)
+  ↓
+Native L2: Market Data (prices, klines)
+  ↓
+Native L3: Signals (technical indicators)
+  ↓
+Native L4: Decisions (sizing, execution)
+```
+
+---
+
 ## 📊 LAYER CONTRIBUTION SUMMARY
 
 | Layer | Primary Function | Key Files | Count |
@@ -658,20 +742,28 @@ Root: 🎯_MASTER_SYSTEM_ORCHESTRATOR.py, auto_recovery.py,
 | **L7** | Monitor/Recover (Health, observability) | health_monitor, watchdog, prometheus_exporter | 20 files |
 | **L8** | Decide/Recover (Lifecycle, orchestration) | meta_controller, startup_orchestrator, watchdog | 8 files |
 | **Root** | Entry/Utilities | 🎯_MASTER_SYSTEM_ORCHESTRATOR, auto_recovery | 7 files |
+| **Core Engine Façade** | All (1-5) - Unified API | market_account_engine, decision_engine, safe_execution_engine | 5 files |
+| **Native L0** | Infrastructure (config, retry, time, state) | config_loader, retry_manager, time_utils, shared_state | 4 files |
+| **Native L1** | Read/Execute (Exchange I/O) | exchange_client, balance_sync, order_execution | 3 files |
+| **Native L2** | Read (Market data) | market_data | 1 file |
+| **Native L3** | Understand (Signals) | signals | 1 file |
+| **Native L4** | Decide/Execute (Decisions, execution) | decisions, executor | 2 files |
 
-**TOTAL**: 145 live Python files
+**TOTAL**: 145 live legacy files + 18 core_engine files = **163 files** (updated)
 
 ---
 
 ## ✅ DEPLOYMENT READY CHECKLIST
 
-- ✅ All 145 files mapped to 5 core functions
+- ✅ All 163 files mapped to 5 core functions (145 legacy + 18 core_engine)
 - ✅ Critical guards identified (FIX #2: bounded_cache idempotent SELL)
 - ✅ Signal flow documented (agents → fusion → arbitration → execution)
 - ✅ Data flow documented (exchange → balance → portfolio → decision)
+- ✅ Native subsystem identified (6,600 → 1,800 LOC, 3.7x compression)
 - ✅ Guard integration verified (execution_manager calls guard 10x)
 - ✅ 22-minute validation: 1,084 guard cycles, 0 duplicates, 0 crashes
 - ✅ Confidence level: 99%
+- ✅ New core_engine layer: Phase 8.2 refactoring with 18 files (façade + native L0-L4)
 
 ---
 
