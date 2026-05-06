@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -106,7 +107,7 @@ class OperationsEngine:
         self.app_ctx = app_ctx
         self.logger = logger
         self._health_checks: dict[str, callable] = {}
-        self._startup_time = asyncio.get_event_loop().time()
+        self._startup_time = time.time()
 
     async def initialize(self) -> None:
         """Initialize operations engine and health monitoring."""

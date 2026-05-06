@@ -51,7 +51,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from .balance_sync import NativeBalanceSync
-from .compat import register_compat_stubs
 from .decisions import NativeDecisionEngine
 from .executor import NativeExecutor
 from .market_data import NativeMarketData
@@ -127,10 +126,14 @@ def build_native_app_ctx(
     components
         Pre-constructed native L0-L6 instances.
     compat
-        If True, install null-object stubs for the six legacy keys the
-        façade engines reference but native does not yet provide
-        (see ``core_engine.native.compat``). Default False keeps the
-        pure-factory path stub-free for unit tests.
+        Deprecated no-op kept for signature stability. Historically this
+        installed null-object stubs for the six legacy ``app_ctx`` keys
+        not yet covered by native impls (``portfolio_manager``,
+        ``position_manager``, ``tp_sl_engine``, ``safety_order_manager``,
+        ``recovery_engine``, ``watchdog``). All six were replaced in
+        Phases 8.3.7-8.3.12 and ``core_engine.native.compat`` was
+        retired. The parameter remains so existing callers keep working
+        unchanged; it is silently ignored.
 
     Returns
     -------
@@ -139,6 +142,7 @@ def build_native_app_ctx(
         ``orchestrator`` is a fully-wired ``NativeOrchestrator`` that
         records into ``components.telemetry`` if provided.
     """
+    del compat  # deprecated no-op (G5; see docstring)
     orch = NativeOrchestrator(
         market_data=components.market_data,
         signal_engine=components.signal_engine,
@@ -177,9 +181,6 @@ def build_native_app_ctx(
         app_ctx["recovery_engine"] = components.recovery_engine
     if components.watchdog is not None:
         app_ctx["watchdog"] = components.watchdog
-
-    if compat:
-        register_compat_stubs(app_ctx)
 
     return app_ctx, orch
 

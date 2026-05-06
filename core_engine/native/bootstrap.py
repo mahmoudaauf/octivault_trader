@@ -398,11 +398,11 @@ async def build_components(
         safety_order_manager=safety_order_manager,
     )
 
-    # L7 watchdog: liveness + anomaly detection. Replaces the final
-    # compat null-stub for the ``watchdog`` app_ctx key consumed by
-    # OperationsEngine.check_liveness / detect_anomalies. After this
-    # commit the COMPAT_KEYS tuple is empty and core_engine.native.compat
-    # becomes a no-op module.
+    # L7 watchdog: liveness + anomaly detection. Final native impl
+    # for the ``watchdog`` app_ctx key consumed by
+    # OperationsEngine.check_liveness / detect_anomalies. With this
+    # in place the ``core_engine.native.compat`` module was retired
+    # (G5 cleanup, Phase 8.3.12).
     watchdog = NativeWatchdog(
         shared_state=shared_state,
         balance_sync=balance_sync,

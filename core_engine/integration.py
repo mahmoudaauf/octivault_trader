@@ -266,9 +266,11 @@ async def create_app_context(
         construction error) falls back to mock mode (empty dict) and
         logs the cause.
 
-        ``compat=True`` additionally installs null-object stubs for the
-        six legacy app_ctx keys the façade engines reference but native
-        does not yet provide (forward-compat; no-ops today).
+        ``compat`` is a deprecated no-op kept for signature stability
+        (G5 cleanup, Phase 8.3.12). Historically toggled null-object
+        stubs for six legacy keys; all six were replaced with native
+        impls in Phases 8.3.7-8.3.12 and ``core_engine.native.compat``
+        was retired.
 
     native=False (default): returns an empty dict — engines run in
         mock mode via graceful degradation. Used for dry-run /
@@ -392,8 +394,9 @@ async def setup_core_engines(*, native: bool = False, compat: bool = False) -> d
     Args:
         native: If True, build a native app_ctx via the Phase 8.2.8
             bootstrap.
-        compat: If True (and ``native`` is True), install null-object
-            stubs for unmigrated façade keys (forward-compat).
+        compat: Deprecated no-op (G5, Phase 8.3.12). Kept for
+            signature stability; ``core_engine.native.compat`` was
+            retired once all six legacy keys had native impls.
 
     Returns:
         app_ctx: Ready-to-use application context

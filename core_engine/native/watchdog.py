@@ -1,15 +1,13 @@
 """
 Native L7: Watchdog (Phase 8.3.12).
 
-Liveness + anomaly detection for the running native stack. Replaces
-the final ``compat.py`` null stub (``watchdog`` key), satisfying the
-contract consumed by ``OperationsEngine.check_liveness`` /
+Liveness + anomaly detection for the running native stack. Final
+native implementation behind the ``watchdog`` app_ctx key consumed
+by ``OperationsEngine.check_liveness`` /
 ``OperationsEngine.detect_anomalies``.
 
-This is the **last** compat-stub replacement. After this commit
-``COMPAT_KEYS`` is empty and ``core_engine.native.compat`` becomes a
-no-op module that can be retired (G5 acceptance gate from
-``PHASE_8_3_PLAN.md``).
+This was the **last** compat-stub replacement; ``core_engine.native.compat``
+was subsequently retired (G5 acceptance gate from ``PHASE_8_3_PLAN.md``).
 
 Responsibility
 --------------

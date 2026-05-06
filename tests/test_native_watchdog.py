@@ -9,8 +9,8 @@ Coverage:
 * ``detect_anomalies`` per-detector: stale heartbeat, stale market
   data, stale balance sync, missing exchange client, error rate.
 * ``health()`` reports counters and configured thresholds.
-* Wiring: appears in ``app_ctx``, isn't overwritten (no compat stub
-  exists for it anymore — COMPAT_KEYS is empty after 8.3.12).
+* Wiring: appears in ``app_ctx`` when supplied (no compat stub
+  exists for it; the compat module was retired in G5 cleanup).
 """
 
 from __future__ import annotations
@@ -287,11 +287,3 @@ def test_watchdog_visible_in_app_ctx_when_provided():
     )
     app_ctx, _ = build_native_app_ctx(components)
     assert app_ctx["watchdog"] is wd
-
-
-def test_compat_keys_empty_after_8_3_12():
-    """Final acceptance: COMPAT_KEYS is empty; compat module is a no-op."""
-    from core_engine.native.compat import COMPAT_KEYS, make_compat_stubs
-
-    assert COMPAT_KEYS == ()
-    assert make_compat_stubs() == {}

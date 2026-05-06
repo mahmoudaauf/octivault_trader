@@ -218,7 +218,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--duration", type=float, default=10.0, help="seconds to run (default: 10)")
     p.add_argument("--max-cycles", type=int, default=None, help="stop after N cycles")
     p.add_argument(
-        "--no-compat", action="store_true", help="disable compat stubs (default: enabled)"
+        "--no-compat",
+        action="store_true",
+        help="deprecated no-op (G5, 8.3.12); kept for CLI compat",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG logging")
     return p.parse_args(argv)
