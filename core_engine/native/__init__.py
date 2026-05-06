@@ -1,5 +1,5 @@
 """
-Native module: L0 utilities (8.2.1) + L1 exchange (8.2.2) + L2 market data (8.2.3)
+Native module: L0 (8.2.1) + L1 exchange (8.2.2) + L2 market data (8.2.3) + L3 signals (8.2.4)
 
 L0 (Phase 8.2.1) — Utilities
     NativeSharedState, NativeTimeUtils, ConfigLoader, NativeRetryManager
@@ -9,6 +9,9 @@ L1 (Phase 8.2.2) — Exchange Integration
 
 L2 (Phase 8.2.3) — Market Data
     NativeMarketData
+
+L3 (Phase 8.2.4) — Signal Engine
+    NativeSignalEngine, Signal, AggregatedSignal
 """
 
 # ── L0 ───────────────────────────────────────────────────────────────
@@ -29,6 +32,9 @@ from .retry_manager import (
     NativeRetryManager,
 )
 from .shared_state import NativeSharedState, Order, Position
+
+# ── L3 ───────────────────────────────────────────────────────────────
+from .signals import AggregatedSignal, NativeSignalEngine, Signal
 from .time_utils import NativeTimeUtils
 
 __all__ = [
@@ -52,7 +58,11 @@ __all__ = [
     "OrderResult",
     # L2
     "NativeMarketData",
+    # L3
+    "NativeSignalEngine",
+    "Signal",
+    "AggregatedSignal",
 ]
 
-__version__ = "0.3.0"
-__phase__ = "8.2.3"
+__version__ = "0.4.0"
+__phase__ = "8.2.4"
