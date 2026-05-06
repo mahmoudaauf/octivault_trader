@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .balance_sync import NativeBalanceSync
+from .compat import register_compat_stubs
 from .decisions import NativeDecisionEngine
 from .executor import NativeExecutor
 from .market_data import NativeMarketData
@@ -101,6 +102,8 @@ class NativeComponents:
 
 def build_native_app_ctx(
     components: NativeComponents,
+    *,
+    compat: bool = False,
 ) -> tuple[dict[str, Any], NativeOrchestrator]:
     """
     Assemble a native ``app_ctx`` and wire a ``NativeOrchestrator``.
@@ -109,6 +112,11 @@ def build_native_app_ctx(
     ----------
     components
         Pre-constructed native L0-L6 instances.
+    compat
+        If True, install null-object stubs for the six legacy keys the
+        façade engines reference but native does not yet provide
+        (see ``core_engine.native.compat``). Default False keeps the
+        pure-factory path stub-free for unit tests.
 
     Returns
     -------
@@ -142,6 +150,9 @@ def build_native_app_ctx(
         app_ctx["telemetry"] = components.telemetry
     if components.exchange_client is not None:
         app_ctx["exchange_client"] = components.exchange_client
+
+    if compat:
+        register_compat_stubs(app_ctx)
 
     return app_ctx, orch
 

@@ -252,6 +252,7 @@ async def create_app_context(
     production: bool = False,
     *,
     native: bool = False,
+    compat: bool = False,
 ) -> dict[str, Any]:
     """
     Create application context with all L0-L8 components.
@@ -265,6 +266,10 @@ async def create_app_context(
         ``BINANCE_API_SECRET``). On any failure (missing credentials,
         construction error) falls back to mock mode (empty dict) and
         logs the cause. Takes precedence over ``production``.
+
+        ``compat=True`` additionally installs null-object stubs for the
+        six legacy app_ctx keys the façade engines reference but native
+        does not yet provide (forward-compat; no-ops today).
 
     production=True (Phase 8.1): delegates to
         ``core_engine.production_bridge`` which reuses the legacy
@@ -289,12 +294,13 @@ async def create_app_context(
 
             cfg = BootstrapConfig.from_env()
             components = await build_components(cfg)
-            app_ctx, _orch = build_native_app_ctx(components)
+            app_ctx, _orch = build_native_app_ctx(components, compat=compat)
             logger.info(
-                "✅ Native app_ctx built: %d keys, testnet=%s, symbols=%d",
+                "✅ Native app_ctx built: %d keys, testnet=%s, symbols=%d, compat=%s",
                 len(app_ctx),
                 cfg.testnet,
                 len(cfg.symbols),
+                compat,
             )
             return app_ctx
         except Exception as e:
@@ -388,7 +394,9 @@ async def wire_engines(app_ctx: dict[str, Any]) -> None:
 
 
 # Convenience function for quick setup
-async def setup_core_engines(production: bool = False, *, native: bool = False) -> dict[str, Any]:
+async def setup_core_engines(
+    production: bool = False, *, native: bool = False, compat: bool = False
+) -> dict[str, Any]:
     """
     Setup: create context → wire engines → return ready app_ctx
 
@@ -397,10 +405,12 @@ async def setup_core_engines(production: bool = False, *, native: bool = False) 
             legacy-orchestrator bridge (deprecated, see Phase 8.2.8).
         native: If True, build a native app_ctx via the Phase 8.2.8
             bootstrap. Takes precedence over ``production``.
+        compat: If True (and ``native`` is True), install null-object
+            stubs for unmigrated façade keys (forward-compat).
 
     Returns:
         app_ctx: Ready-to-use application context
     """
-    app_ctx = await create_app_context(production=production, native=native)
+    app_ctx = await create_app_context(production=production, native=native, compat=compat)
     await wire_engines(app_ctx)
     return app_ctx
