@@ -169,6 +169,81 @@ def _default_exchange_factory(cfg: BootstrapConfig) -> NativeExchangeClient:
     )
 
 
+# ----------------------------------------------------------------------
+# Portfolio snapshot helper
+# ----------------------------------------------------------------------
+@dataclass
+class _PortfolioSnapshot:
+    """
+    Minimal duck-typed snapshot consumed by ``NativeDecisionEngine.decide``.
+
+    Attributes match exactly what ``decisions.py`` reads:
+    ``nav`` (float), ``nav_peak`` (float), ``balance`` (dict asset->qty),
+    ``positions`` (dict symbol->qty).
+    """
+
+    nav: float
+    nav_peak: float
+    balance: dict[str, float]
+    positions: dict[str, float]
+
+
+def _make_portfolio_accessor(
+    shared_state: NativeSharedState,
+    balance_sync: NativeBalanceSync,
+) -> Callable[[], _PortfolioSnapshot]:
+    """
+    Build a zero-arg callable returning a fresh ``_PortfolioSnapshot``.
+
+    NAV is sourced from ``shared_state.nav_usdt`` (canonical field).
+    ``nav_peak`` tracks the running maximum so the drawdown gate in
+    ``NativeDecisionEngine`` has a meaningful denominator from cycle 1.
+    Balances come from the L1 poller; positions from L0 shared state
+    (qty extracted from the ``Position`` record).
+    """
+    peak_holder: dict[str, float] = {"peak": 0.0}
+
+    def _accessor() -> _PortfolioSnapshot:
+        nav = float(getattr(shared_state, "nav_usdt", 0.0))
+        balance = balance_sync.get_balance()
+
+        # Positions: shared_state.positions is dict[str, Position]; the
+        # decision engine only needs symbol -> qty.
+        positions_raw = getattr(shared_state, "positions", {}) or {}
+        positions: dict[str, float] = {}
+        for sym, pos in positions_raw.items():
+            qty = getattr(pos, "qty", None)
+            if qty is None and isinstance(pos, (int, float)):
+                qty = float(pos)  # already a scalar
+            positions[sym] = float(qty or 0.0)
+
+        # Fallback: if shared_state hasn't been hydrated with a NAV
+        # (e.g. very early cycles before NAV writer wires up), derive
+        # an approximate NAV from the USDT balance + open positions
+        # marked at the latest cached price. This keeps the drawdown
+        # gate in NativeDecisionEngine from spuriously firing 100%.
+        if nav <= 0.0:
+            usdt = float(balance.get("USDT", 0.0))
+            price_cache = getattr(shared_state, "price_cache", {}) or {}
+            position_value = sum(
+                qty * float(price_cache.get(sym, 0.0)) for sym, qty in positions.items()
+            )
+            nav = usdt + position_value
+
+        if nav > peak_holder["peak"]:
+            peak_holder["peak"] = nav
+        peak = peak_holder["peak"] if peak_holder["peak"] > 0.0 else max(nav, 1.0)
+
+        return _PortfolioSnapshot(
+            nav=nav,
+            nav_peak=peak,
+            balance=balance,
+            positions=positions,
+        )
+
+    return _accessor
+
+
 async def build_components(
     cfg: BootstrapConfig,
     *,
@@ -243,6 +318,13 @@ async def build_components(
     # L6
     telemetry = NativeTelemetry(capacity=cfg.telemetry_capacity)
 
+    # L8 portfolio accessor: minimal snapshot built from L0/L1/L2 state.
+    # Returns a duck-typed object with the four attributes
+    # NativeDecisionEngine.decide() reads: nav, nav_peak, balance,
+    # positions. State is captured by reference so each cycle sees the
+    # latest poller results.
+    portfolio_accessor = _make_portfolio_accessor(shared_state, balance_sync)
+
     return NativeComponents(
         shared_state=shared_state,
         market_data=market_data,
@@ -252,6 +334,7 @@ async def build_components(
         balance_sync=balance_sync,
         telemetry=telemetry,
         exchange_client=exchange_client,
+        portfolio_accessor=portfolio_accessor,
     )
 
 

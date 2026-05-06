@@ -273,4 +273,96 @@ async def test_bootstrap_then_app_ctx_then_cycle_runs():
     assert metrics.cycle_num == 1
     # telemetry recorded the cycle
     assert len(components.telemetry) == 1
-    await shutdown_components(components)
+
+
+# ---------------------------------------------------------------------
+# portfolio_accessor (Phase 8.2.8 step 5a follow-up)
+# ---------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_build_components_attaches_portfolio_accessor():
+    stub = _StubExchangeClient()
+    components = await build_components(_min_cfg(), exchange_client_factory=lambda _c: stub)
+    assert components.portfolio_accessor is not None
+    snap = components.portfolio_accessor()
+    # Duck-typed contract NativeDecisionEngine.decide() relies on:
+    assert hasattr(snap, "nav")
+    assert hasattr(snap, "nav_peak")
+    assert hasattr(snap, "balance")
+    assert hasattr(snap, "positions")
+
+
+@pytest.mark.asyncio
+async def test_portfolio_accessor_falls_back_to_balance_when_nav_zero():
+    """
+    Early in a session (or in offline smoke), nothing has populated
+    ``shared_state.nav_usdt``. The accessor must derive NAV from the
+    USDT balance so the drawdown gate doesn't spuriously fire 100%.
+    """
+    from core_engine.native.balance_sync import NativeBalanceSync
+    from core_engine.native.bootstrap import _make_portfolio_accessor
+    from core_engine.native.shared_state import NativeSharedState
+
+    state = NativeSharedState()
+    # nav_usdt left at 0.0 (default)
+    bs = NativeBalanceSync(_StubExchangeClient(), poll_interval_sec=99.0)
+    bs._balances = {"USDT": 1000.0, "BTC": 0.0}  # simulate post-poll state
+
+    accessor = _make_portfolio_accessor(state, bs)
+    snap = accessor()
+    assert snap.nav == 1000.0  # derived from USDT balance
+    assert snap.nav_peak >= snap.nav  # peak tracked
+
+
+@pytest.mark.asyncio
+async def test_portfolio_accessor_prefers_shared_state_nav_when_set():
+    from core_engine.native.balance_sync import NativeBalanceSync
+    from core_engine.native.bootstrap import _make_portfolio_accessor
+    from core_engine.native.shared_state import NativeSharedState
+
+    state = NativeSharedState()
+    state.nav_usdt = 5_000.0
+    bs = NativeBalanceSync(_StubExchangeClient(), poll_interval_sec=99.0)
+    bs._balances = {"USDT": 1_000.0}  # would derive 1000 if fallback fired
+
+    accessor = _make_portfolio_accessor(state, bs)
+    snap = accessor()
+    assert snap.nav == 5_000.0  # canonical nav_usdt wins
+
+
+@pytest.mark.asyncio
+async def test_portfolio_accessor_tracks_peak_monotonically():
+    from core_engine.native.balance_sync import NativeBalanceSync
+    from core_engine.native.bootstrap import _make_portfolio_accessor
+    from core_engine.native.shared_state import NativeSharedState
+
+    state = NativeSharedState()
+    bs = NativeBalanceSync(_StubExchangeClient(), poll_interval_sec=99.0)
+    accessor = _make_portfolio_accessor(state, bs)
+
+    state.nav_usdt = 100.0
+    s1 = accessor()
+    state.nav_usdt = 200.0
+    s2 = accessor()
+    state.nav_usdt = 50.0  # drawdown
+    s3 = accessor()
+
+    assert s1.nav_peak == 100.0
+    assert s2.nav_peak == 200.0
+    assert s3.nav_peak == 200.0  # peak does not retreat
+
+
+@pytest.mark.asyncio
+async def test_portfolio_accessor_extracts_position_qty_from_position_objects():
+    from core_engine.native.balance_sync import NativeBalanceSync
+    from core_engine.native.bootstrap import _make_portfolio_accessor
+    from core_engine.native.shared_state import NativeSharedState, Position
+
+    state = NativeSharedState()
+    state.positions = {
+        "BTCUSDT": Position(symbol="BTCUSDT", qty=0.5, entry_price=50_000.0, mark_price=51_000.0),
+    }
+    bs = NativeBalanceSync(_StubExchangeClient(), poll_interval_sec=99.0)
+    accessor = _make_portfolio_accessor(state, bs)
+
+    snap = accessor()
+    assert snap.positions == {"BTCUSDT": 0.5}
