@@ -76,6 +76,7 @@ NATIVE_CTX_KEYS: tuple[str, ...] = (
     "execution_manager",  # L5 (NativeExecutor; legacy key name preserved)
     "telemetry",  # L6 (native-only)
     "portfolio_manager",  # L3 (NativePortfolioManager; replaces compat stub in 8.3.7)
+    "capital_allocator",  # L6 (NativeCapitalAllocator; allocates capital for trades)
     "position_manager",  # L3 (NativePositionManager; replaces compat stub in 8.3.8)
     "tp_sl_engine",  # L4 (NativeTPSLEngine; replaces compat stub in 8.3.9)
     "safety_order_manager",  # L4 (NativeSafetyOrderManager; replaces compat stub in 8.3.10)
@@ -108,6 +109,7 @@ class NativeComponents:
     exchange_client: Any | None = None  # NativeExchangeClient | duck-typed stub
     telemetry_exporter: Any | None = None  # NativeTelemetryExporter | None
     portfolio_manager: Any | None = None  # NativePortfolioManager | None
+    capital_allocator: Any | None = None  # NativeCapitalAllocator | None
     position_manager: Any | None = None  # NativePositionManager | None
     tp_sl_engine: Any | None = None  # NativeTPSLEngine | None
     safety_order_manager: Any | None = None  # NativeSafetyOrderManager | None
@@ -175,6 +177,8 @@ def build_native_app_ctx(
         app_ctx["exchange_client"] = components.exchange_client
     if components.portfolio_manager is not None:
         app_ctx["portfolio_manager"] = components.portfolio_manager
+    if components.capital_allocator is not None:
+        app_ctx["capital_allocator"] = components.capital_allocator
     if components.position_manager is not None:
         app_ctx["position_manager"] = components.position_manager
     if components.tp_sl_engine is not None:

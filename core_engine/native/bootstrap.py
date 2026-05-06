@@ -42,6 +42,7 @@ from typing import Any
 
 from .app_context import NativeComponents
 from .balance_sync import NativeBalanceSync
+from .capital_allocator import NativeCapitalAllocator
 from .decisions import NativeDecisionEngine
 from .exchange_client import NativeExchangeClient
 from .executor import NativeExecutor
@@ -105,6 +106,7 @@ class BootstrapConfig:
     max_drawdown_pct: float = 10.0
     daily_loss_limit_pct: float = 5.0
     risk_per_symbol_pct: float = 2.0
+    capital_allocation_pct: float = 5.0
 
     # --- exit logic (TP/SL) ---
     tp_pct: float = 0.03  # +3% take profit
@@ -167,6 +169,7 @@ class BootstrapConfig:
             max_drawdown_pct=_float(e.get("MAX_DRAWDOWN_PCT"), 10.0),
             daily_loss_limit_pct=_float(e.get("DAILY_LOSS_LIMIT_PCT"), 5.0),
             risk_per_symbol_pct=_float(e.get("RISK_PER_SYMBOL_PCT"), 2.0),
+            capital_allocation_pct=_float(e.get("CAPITAL_ALLOCATION_PCT"), 5.0),
             tp_pct=_float(e.get("TP_PCT"), 0.03),
             sl_pct=_float(e.get("SL_PCT"), 0.02),
             signal_cooldown_sec=_float(e.get("SIGNAL_COOLDOWN_SEC"), 0.0),
@@ -372,6 +375,12 @@ async def build_components(
         min_order_usdt=cfg.min_order_usdt,
     )
 
+    # L6 capital allocator: allocates trading capital per buy signal
+    capital_allocator = NativeCapitalAllocator(
+        portfolio_manager=portfolio_manager,
+        allocation_pct=cfg.capital_allocation_pct,
+    )
+
     # L3 position manager: read-only per-symbol accessor over
     # shared_state. Replaces the compat null-stub for the
     # ``position_manager`` app_ctx key consumed by SituationEngine
@@ -443,6 +452,7 @@ async def build_components(
         portfolio_accessor=portfolio_accessor,
         telemetry_exporter=telemetry_exporter,
         portfolio_manager=portfolio_manager,
+        capital_allocator=capital_allocator,
         position_manager=position_manager,
         tp_sl_engine=tp_sl_engine_native,
         safety_order_manager=safety_order_manager,

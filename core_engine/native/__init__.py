@@ -23,6 +23,9 @@ from .bootstrap import (
     build_components,
     shutdown_components,
 )
+
+# ── L6 ───────────────────────────────────────────────────────────────
+from .capital_allocator import NativeCapitalAllocator
 from .config_loader import ConfigLoader, get_config
 
 # ── L4 ───────────────────────────────────────────────────────────────
@@ -117,6 +120,7 @@ __all__ = [
     "ExecutionResult",
     "ExecutionStatus",
     # L6
+    "NativeCapitalAllocator",
     "NativeTelemetry",
     # L8
     "NativeOrchestrator",
