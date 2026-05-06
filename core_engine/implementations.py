@@ -237,6 +237,9 @@ class SituationEngineImpl:
     ) -> list[dict[str, Any]]:
         """
         Get signals from signal_manager (L5).
+
+        For native signal engine (NativeSignalEngine), integrates with
+        market_data to evaluate signals on-demand.
         """
         signal_manager = app_ctx.get("signal_manager")
 
@@ -247,9 +250,14 @@ class SituationEngineImpl:
             return signals
 
         try:
+            # Native signal engine optimization: evaluate with market_data
+            if hasattr(signal_manager, "evaluate_with_market_data"):
+                market_data = app_ctx.get("market_data_feed")
+                symbols_to_eval = [symbol] if symbol else None
+                signals = signal_manager.evaluate_with_market_data(market_data, symbols_to_eval)
             # Legacy signal_manager exposes sync get_all_signals() and
             # get_signals_for_symbol(); newer impls may be async — handle both.
-            if symbol and hasattr(signal_manager, "get_signals_for_symbol"):
+            elif symbol and hasattr(signal_manager, "get_signals_for_symbol"):
                 signals = await _maybe_await(signal_manager.get_signals_for_symbol(symbol))
             elif hasattr(signal_manager, "get_signals"):
                 signals = await _maybe_await(signal_manager.get_signals(symbol))
@@ -629,11 +637,25 @@ class OperationsEngineImpl:
     async def startup_system(app_ctx: dict[str, Any]) -> bool:
         """
         Execute system startup (L0→L8).
-        """
-        startup_orchestrator = app_ctx.get("startup_orchestrator")
 
+        Tries native orchestrator first (Phase 8.2.8), falls back to legacy
+        startup_orchestrator for backward compatibility.
+        """
+        # Try native orchestrator first (L8 — Phase 8.2.8)
+        native_orch = app_ctx.get("_native_orchestrator")
+        if native_orch and hasattr(native_orch, "start"):
+            try:
+                await native_orch.start()
+                logger.info("✅ Native orchestrator started (market_data + balance_sync)")
+                return True
+            except Exception as e:
+                logger.error(f"❌ Native orchestrator startup failed: {e}")
+                return False
+
+        # Fall back to legacy startup_orchestrator
+        startup_orchestrator = app_ctx.get("startup_orchestrator")
         if not startup_orchestrator:
-            logger.warning("⚠️ startup_orchestrator not available")
+            logger.warning("⚠️ Neither native nor legacy orchestrator available")
             return False
 
         try:

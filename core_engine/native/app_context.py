@@ -81,6 +81,8 @@ NATIVE_CTX_KEYS: tuple[str, ...] = (
     "safety_order_manager",  # L4 (NativeSafetyOrderManager; replaces compat stub in 8.3.10)
     "recovery_engine",  # L4 (NativeRecoveryEngine; replaces compat stub in 8.3.11)
     "watchdog",  # L7 (NativeWatchdog; replaces compat stub in 8.3.12 — last one)
+    "trade_journal",  # L0 (NativeTradeJournal; observability — crash-safe audit trail)
+    "prometheus_exporter",  # L7 (NativePrometheusExporter; observability — Grafana metrics)
     "_native_orchestrator",  # L8 handle
     "_native_mode",  # marker flag
 )
@@ -111,6 +113,8 @@ class NativeComponents:
     safety_order_manager: Any | None = None  # NativeSafetyOrderManager | None
     recovery_engine: Any | None = None  # NativeRecoveryEngine | None
     watchdog: Any | None = None  # NativeWatchdog | None
+    trade_journal: Any | None = None  # NativeTradeJournal | None
+    prometheus_exporter: Any | None = None  # NativePrometheusExporter | None
 
 
 def build_native_app_ctx(
@@ -181,6 +185,10 @@ def build_native_app_ctx(
         app_ctx["recovery_engine"] = components.recovery_engine
     if components.watchdog is not None:
         app_ctx["watchdog"] = components.watchdog
+    if components.trade_journal is not None:
+        app_ctx["trade_journal"] = components.trade_journal
+    if components.prometheus_exporter is not None:
+        app_ctx["prometheus_exporter"] = components.prometheus_exporter
 
     return app_ctx, orch
 

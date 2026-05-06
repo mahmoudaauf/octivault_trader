@@ -28,6 +28,21 @@ from .config_loader import ConfigLoader, get_config
 # ── L4 ───────────────────────────────────────────────────────────────
 from .decisions import Decision, NativeDecisionEngine, PortfolioSnapshot
 
+# ── Observability (Legacy features ported) ──────────────────────────
+from .error_types import (
+    BootstrapError,
+    ErrorCategory,
+    ErrorRecovery,
+    ErrorSeverity,
+    ExchangeError,
+    ExecutionError,
+    NetworkError,
+    OctiError,
+    PortfolioError,
+    SignalError,
+    ValidationError,
+)
+
 # ── L1 ───────────────────────────────────────────────────────────────
 from .exchange_client import ExchangeClientError, NativeExchangeClient
 
@@ -36,6 +51,16 @@ from .executor import ExecutionResult, ExecutionStatus, NativeExecutor
 
 # ── L2 ───────────────────────────────────────────────────────────────
 from .market_data import NativeMarketData
+from .math_utils import (
+    calmar_ratio,
+    cumulative_returns,
+    max_drawdown,
+    profit_factor,
+    sharpe_ratio,
+    sortino_ratio,
+    volatility,
+    win_rate,
+)
 
 # ── L6 ───────────────────────────────────────────────────────────────
 from .observability import NativeTelemetry
@@ -43,6 +68,7 @@ from .observability import NativeTelemetry
 # ── L8 ───────────────────────────────────────────────────────────────
 from .orchestrator import CycleMetrics, NativeOrchestrator
 from .order_execution import NativeOrderExecution, OrderResult
+from .prometheus_exporter import MetricsSnapshot, NativePrometheusExporter
 from .retry_manager import (
     RETRY_AGGRESSIVE,
     RETRY_FAST,
@@ -55,6 +81,7 @@ from .shared_state import NativeSharedState, Order, Position
 # ── L3 ───────────────────────────────────────────────────────────────
 from .signals import AggregatedSignal, NativeSignalEngine, Signal
 from .time_utils import NativeTimeUtils
+from .trade_journal import NativeTradeJournal
 
 __all__ = [
     # L0
@@ -103,6 +130,29 @@ __all__ = [
     "ExchangeClientFactory",
     "build_components",
     "shutdown_components",
+    # Observability (Legacy features ported)
+    "OctiError",
+    "ErrorSeverity",
+    "ErrorCategory",
+    "ErrorRecovery",
+    "BootstrapError",
+    "ExchangeError",
+    "ExecutionError",
+    "SignalError",
+    "PortfolioError",
+    "ValidationError",
+    "NetworkError",
+    "NativeTradeJournal",
+    "MetricsSnapshot",
+    "NativePrometheusExporter",
+    "sharpe_ratio",
+    "sortino_ratio",
+    "calmar_ratio",
+    "max_drawdown",
+    "cumulative_returns",
+    "win_rate",
+    "profit_factor",
+    "volatility",
 ]
 
 __version__ = "0.8.2"

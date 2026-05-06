@@ -52,6 +52,8 @@ import sys
 import time
 from typing import Any
 
+from dotenv import load_dotenv
+
 # ── façade imports ONLY (no L0-L8 imports allowed) ──────────────────────
 from core_engine import (
     DecisionEngine,
@@ -70,6 +72,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)-7s] %(name)s — %(message)s",
 )
 log = logging.getLogger("octivault.main")
+
+load_dotenv()
 
 
 # ════════════════════════════════════════════════════════════════════════

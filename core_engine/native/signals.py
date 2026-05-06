@@ -336,3 +336,78 @@ class NativeSignalEngine:
         if normalized < -1e-9:
             return AggregatedSignal(symbol, "SELL", float(min(1.0, -normalized)), sigs)
         return AggregatedSignal(symbol, "HOLD", 0.0, sigs)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Facade adapter methods (for compatibility with SituationEngine)
+    # ──────────────────────────────────────────────────────────────────
+    def get_all_signals(self) -> list[dict[str, Any]]:
+        """
+        Evaluate all symbols and return signals.
+        **This requires market_data to be available in app_ctx.**
+
+        For use by SituationEngine via the implementations bridge.
+        Returns a list of signal dicts with: symbol, signal_type, edge_score.
+        """
+        # This is stateless — we have no klines cached. Real use is through
+        # evaluate_with_market_data() which the facade should call.
+        return []
+
+    def get_signals(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
+        """Alias for get_all_signals() for compatibility."""
+        return self.get_all_signals()
+
+    def evaluate_with_market_data(
+        self, market_data: Any, symbols: Optional[list[str]] = None
+    ) -> list[dict[str, Any]]:
+        """
+        Evaluate signals for all symbols using market_data.market_data_cache.
+
+        Args:
+            market_data: NativeMarketData instance with klines cache
+            symbols: Symbols to evaluate (default: all in cache)
+
+        Returns:
+            List of signal dicts: {symbol, signal_type, edge_score}
+        """
+        signals = []
+
+        if not market_data:
+            return signals
+
+        # Get cache of klines
+        cache = getattr(market_data, "market_data_cache", {}) or {}
+        if not cache:
+            return signals
+
+        # Determine symbols to evaluate
+        eval_symbols = symbols or list(cache.keys())
+
+        for symbol in eval_symbols:
+            # Extract klines for this symbol — cache key is usually (symbol, timeframe)
+            klines = None
+            for key, klines_data in cache.items():
+                if (isinstance(key, tuple) and key[0] == symbol) or (
+                    isinstance(key, str) and key == symbol
+                ):
+                    klines = klines_data
+                    break
+
+            if not klines:
+                continue
+
+            # Evaluate this symbol
+            agg = self.evaluate(symbol, klines)
+            if agg is None or agg.direction == "HOLD":
+                continue
+
+            # Convert to dict for facade
+            signals.append(
+                {
+                    "symbol": agg.symbol,
+                    "signal_type": agg.direction,  # "BUY" or "SELL"
+                    "edge_score": float(agg.score),
+                    "timestamp": agg.ts,
+                }
+            )
+
+        return signals

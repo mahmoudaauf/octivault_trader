@@ -50,12 +50,14 @@ from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
 from .portfolio_manager import NativePortfolioManager
 from .position_manager import NativePositionManager
+from .prometheus_exporter import NativePrometheusExporter
 from .recovery_engine import NativeRecoveryEngine
 from .safety_order_manager import NativeSafetyOrderManager
 from .shared_state import NativeSharedState
 from .signals import NativeSignalEngine
 from .telemetry_export import NativeTelemetryExporter
 from .tp_sl_engine import NativeTPSLEngine
+from .trade_journal import NativeTradeJournal
 from .watchdog import NativeWatchdog
 
 logger = logging.getLogger(__name__)
@@ -118,6 +120,11 @@ class BootstrapConfig:
     duration_sec: float = 3600.0
     request_timeout_sec: float = 10.0
 
+    # --- logging / observability ---
+    trade_journal_dir: str = "logs"
+    prometheus_export_path: str = ""  # empty = disabled
+    prometheus_export_interval_sec: float = 10.0
+
     # ------------------------------------------------------------------
     # Loaders
     # ------------------------------------------------------------------
@@ -168,6 +175,9 @@ class BootstrapConfig:
             telemetry_export_interval_sec=_float(e.get("TELEMETRY_EXPORT_INTERVAL_SEC"), 10.0),
             duration_sec=_float(e.get("DURATION_SEC"), 3600.0),
             request_timeout_sec=_float(e.get("REQUEST_TIMEOUT_SEC"), 10.0),
+            trade_journal_dir=(e.get("TRADE_JOURNAL_DIR") or "logs").strip(),
+            prometheus_export_path=(e.get("PROMETHEUS_EXPORT_PATH") or "").strip(),
+            prometheus_export_interval_sec=_float(e.get("PROMETHEUS_EXPORT_INTERVAL_SEC"), 10.0),
         )
 
 
@@ -410,6 +420,17 @@ async def build_components(
         exchange_client=exchange_client,
     )
 
+    # L0-L7 observability enhancements (legacy features ported)
+    # Trade journal: crash-safe, immutable JSONL audit trail
+    trade_journal = NativeTradeJournal(log_dir=cfg.trade_journal_dir)
+
+    # Prometheus exporter: metrics export for Grafana
+    prometheus_exporter: NativePrometheusExporter | None = None
+    if cfg.prometheus_export_path:
+        prometheus_exporter = NativePrometheusExporter(
+            output_file=cfg.prometheus_export_path,
+        )
+
     return NativeComponents(
         shared_state=shared_state,
         market_data=market_data,
@@ -427,6 +448,8 @@ async def build_components(
         safety_order_manager=safety_order_manager,
         recovery_engine=recovery_engine,
         watchdog=watchdog,
+        trade_journal=trade_journal,
+        prometheus_exporter=prometheus_exporter,
     )
 
 
