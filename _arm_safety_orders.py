@@ -17,10 +17,17 @@ Usage:
   python _arm_safety_orders.py --live --tp 0.015 --sl 0.03
 """
 from __future__ import annotations
-import argparse, asyncio, sys, time, hmac, hashlib, logging
+
+import argparse
+import asyncio
+import hashlib
+import hmac
+import logging
+import sys
+import time
 from pathlib import Path
-from urllib.parse import urlencode
 from types import SimpleNamespace
+from urllib.parse import urlencode
 
 import requests
 
@@ -40,13 +47,14 @@ URL = "https://testnet.binance.vision" if TESTNET else "https://api.binance.com"
 
 # Make repo importable
 sys.path.insert(0, str(Path(__file__).parent))
-from src.l4_execution.safety_order_manager import SafetyOrderManager, CLIENT_ID_PREFIX
+from src.l4_execution.safety_order_manager import CLIENT_ID_PREFIX, SafetyOrderManager
 
 
 # ─── HTTP helpers ──────────────────────────────────────────────────────────
 def _http(method, url, headers=None, **kw):
     kw.setdefault("timeout", 20)
-    h = dict(headers or {}); h["Connection"] = "close"
+    h = dict(headers or {})
+    h["Connection"] = "close"
     last = None
     for i in range(3):
         try:
@@ -63,8 +71,7 @@ def _signed(method, path, params=None):
     params.setdefault("recvWindow", 5000)
     qs = urlencode(params)
     sig = hmac.new(SEC.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    r = _http(method, f"{URL}{path}?{qs}&signature={sig}",
-              headers={"X-MBX-APIKEY": KEY})
+    r = _http(method, f"{URL}{path}?{qs}&signature={sig}", headers={"X-MBX-APIKEY": KEY})
     if r.status_code >= 400:
         raise RuntimeError(f"{method} {path} → HTTP {r.status_code}: {r.text[:300]}")
     return r.json()
@@ -74,9 +81,11 @@ def _signed(method, path, params=None):
 class _StubExchangeClient:
     async def get_account_balances(self) -> dict:
         d = _signed("GET", "/api/v3/account")
-        return {b["asset"]: {"free": float(b["free"]), "locked": float(b["locked"])}
-                for b in d.get("balances", [])
-                if float(b["free"]) + float(b["locked"]) > 0}
+        return {
+            b["asset"]: {"free": float(b["free"]), "locked": float(b["locked"])}
+            for b in d.get("balances", [])
+            if float(b["free"]) + float(b["locked"]) > 0
+        }
 
     async def get_open_orders(self, symbol=None) -> list:
         params = {"symbol": symbol} if symbol else None
@@ -100,7 +109,8 @@ class _StubExchangeClient:
             return _signed(method, path, params)
         qs = urlencode(params or {})
         url = f"{URL}{path}" + (f"?{qs}" if qs else "")
-        r = _http(method, url); r.raise_for_status()
+        r = _http(method, url)
+        r.raise_for_status()
         return r.json()
 
 
@@ -114,15 +124,20 @@ class _StubSharedState:
 # ─── Output helpers ────────────────────────────────────────────────────────
 def print_status():
     orders = _signed("GET", "/api/v3/openOrders")
-    safety = [o for o in orders
-              if str(o.get("clientOrderId", "")).startswith(CLIENT_ID_PREFIX)
-              or str(o.get("origClientOrderId", "")).startswith(CLIENT_ID_PREFIX)]
+    safety = [
+        o
+        for o in orders
+        if str(o.get("clientOrderId", "")).startswith(CLIENT_ID_PREFIX)
+        or str(o.get("origClientOrderId", "")).startswith(CLIENT_ID_PREFIX)
+    ]
     print(f"\n📋 OPEN ORDERS: {len(orders)} total, {len(safety)} are safety_*")
     for o in orders:
-        print(f"   {o['symbol']:<10} {o['side']:<5} {o['type']:<22} "
-              f"qty={o['origQty']:<10} price={o['price']:<10} "
-              f"stop={o.get('stopPrice','-'):<10} id={o['orderId']} "
-              f"client={o.get('clientOrderId','')}")
+        print(
+            f"   {o['symbol']:<10} {o['side']:<5} {o['type']:<22} "
+            f"qty={o['origQty']:<10} price={o['price']:<10} "
+            f"stop={o.get('stopPrice','-'):<10} id={o['orderId']} "
+            f"client={o.get('clientOrderId','')}"
+        )
 
 
 def make_config(args) -> SimpleNamespace:
@@ -140,7 +155,9 @@ def make_config(args) -> SimpleNamespace:
 
 # ─── Main ──────────────────────────────────────────────────────────────────
 async def amain():
-    ap = argparse.ArgumentParser(description="Safety order CLI (delegates to L4 SafetyOrderManager)")
+    ap = argparse.ArgumentParser(
+        description="Safety order CLI (delegates to L4 SafetyOrderManager)"
+    )
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--dry-run", action="store_true", help="Plan only (no orders)")
     g.add_argument("--live", action="store_true", help="Place real OCO orders")

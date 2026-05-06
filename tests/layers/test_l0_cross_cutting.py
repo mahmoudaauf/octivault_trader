@@ -6,6 +6,7 @@ import sys
 def test_l0_modules_import_without_io(monkeypatch):
     """Importing L0 must not perform network/file I/O."""
     import socket
+
     real_connect = socket.socket.connect
 
     def boom(*a, **kw):
@@ -31,13 +32,14 @@ def test_l0_octi_error_hierarchy():
     from src.l0_core.error_types import (
         TraderException as OctiError,  # umbrella class in this codebase
     )
+
     assert issubclass(OctiError, Exception)
 
 
 def test_l0_indicators_are_deterministic():
     from utils.indicators import compute_rsi
-    series = [1.0, 2.0, 1.5, 3.0, 2.5, 4.0, 3.5, 5.0, 4.5, 6.0,
-              5.5, 7.0, 6.5, 8.0, 7.5]
+
+    series = [1.0, 2.0, 1.5, 3.0, 2.5, 4.0, 3.5, 5.0, 4.5, 6.0, 5.5, 7.0, 6.5, 8.0, 7.5]
     a = compute_rsi(series, period=14)
     b = compute_rsi(series, period=14)
     # compute_rsi returns a pandas Series — use .equals for deep equality

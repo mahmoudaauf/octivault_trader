@@ -19,8 +19,6 @@ to fall back to legacy behavior.
 from __future__ import annotations
 
 import time
-import types
-import contextlib
 
 import pytest
 
@@ -169,10 +167,7 @@ def test_heal_c_dust_sweep_skipped_when_dust_count_low():
     heal_min_dust = 10
     nav_now = 97.0
     heal_below_nav = 150.0
-    heal_sweep = (
-        dust_count >= heal_min_dust
-        and 0 < nav_now <= heal_below_nav
-    )
+    heal_sweep = dust_count >= heal_min_dust and 0 < nav_now <= heal_below_nav
     assert heal_sweep is False
 
 
@@ -185,10 +180,7 @@ def test_heal_c_dust_sweep_skipped_when_healthy_nav():
     heal_min_dust = 10
     heal_sweep = False
     if used_ratio < 0.80:
-        if (
-            dust_count >= heal_min_dust
-            and 0 < nav_now <= heal_below_nav
-        ):
+        if dust_count >= heal_min_dust and 0 < nav_now <= heal_below_nav:
             heal_sweep = True
     # Healthy NAV → no heal sweep, legacy returns None
     assert heal_sweep is False
@@ -209,7 +201,7 @@ async def test_heal_b_reads_nav_from_shared_state_nav_attr(monkeypatch):
     mc = MetaController.__new__(MetaController)
 
     class _StubSS:
-        nav = 97.42                # micro-NAV — should engage STRICT
+        nav = 97.42  # micro-NAV — should engage STRICT
         open_trades: dict = {}
         positions: dict = {}
         latest_prices: dict = {"XRPUSDT": 1.38}
@@ -231,11 +223,20 @@ async def test_heal_b_reads_nav_from_shared_state_nav_attr(monkeypatch):
     captured = []
 
     class _Logger:
-        def info(self, *a, **kw):  captured.append(("INFO", a))
-        def warning(self, *a, **kw): captured.append(("WARN", a))
-        def debug(self, *a, **kw): pass
-        def error(self, *a, **kw): pass
-        def exception(self, *a, **kw): pass
+        def info(self, *a, **kw):
+            captured.append(("INFO", a))
+
+        def warning(self, *a, **kw):
+            captured.append(("WARN", a))
+
+        def debug(self, *a, **kw):
+            pass
+
+        def error(self, *a, **kw):
+            pass
+
+        def exception(self, *a, **kw):
+            pass
 
     mc.logger = _Logger()
     mc._is_forced_capacity_recovery_sell = lambda sig: False
@@ -256,8 +257,7 @@ async def test_heal_b_reads_nav_from_shared_state_nav_attr(monkeypatch):
     await mc._passes_meta_sell_profit_gate("XRPUSDT", sig)
 
     heal_log_seen = any(
-        len(args) > 0 and "ProfitGate:Heal" in str(args[0])
-        for level, args in captured
+        len(args) > 0 and "ProfitGate:Heal" in str(args[0]) for level, args in captured
     )
     assert heal_log_seen, (
         "Heal-B prologue must read shared_state.nav and log the auto-engage. "
@@ -297,24 +297,35 @@ async def test_heal_b_no_engage_when_nav_attr_missing_or_healthy(monkeypatch):
     captured = []
 
     class _Logger:
-        def info(self, *a, **kw):  captured.append(("INFO", a))
-        def warning(self, *a, **kw): captured.append(("WARN", a))
-        def debug(self, *a, **kw): pass
-        def error(self, *a, **kw): pass
-        def exception(self, *a, **kw): pass
+        def info(self, *a, **kw):
+            captured.append(("INFO", a))
+
+        def warning(self, *a, **kw):
+            captured.append(("WARN", a))
+
+        def debug(self, *a, **kw):
+            pass
+
+        def error(self, *a, **kw):
+            pass
+
+        def exception(self, *a, **kw):
+            pass
 
     mc.logger = _Logger()
     mc._is_forced_capacity_recovery_sell = lambda sig: False
 
     sig = {
-        "symbol": "XRPUSDT", "side": "SELL", "_forced_exit": True,
-        "reason": "REBALANCE", "tag": "meta_exit",
+        "symbol": "XRPUSDT",
+        "side": "SELL",
+        "_forced_exit": True,
+        "reason": "REBALANCE",
+        "tag": "meta_exit",
     }
     await mc._passes_meta_sell_profit_gate("XRPUSDT", sig)
 
     heal_log_seen = any(
-        len(args) > 0 and "ProfitGate:Heal" in str(args[0])
-        for level, args in captured
+        len(args) > 0 and "ProfitGate:Heal" in str(args[0]) for level, args in captured
     )
     assert heal_log_seen is False, "Heal-B must NOT engage on healthy NAV"
 
@@ -337,12 +348,12 @@ async def test_heal_b_prefers_live_get_nav_quote_over_stale_nav_attr(monkeypatch
     mc = MetaController.__new__(MetaController)
 
     class _StubSS:
-        nav = 97.86                        # STALE — would trigger Heal-B
+        nav = 97.86  # STALE — would trigger Heal-B
         open_trades: dict = {}
         positions: dict = {}
         latest_prices: dict = {"XRPUSDT": 1.38}
 
-        def get_nav_quote(self):           # LIVE — actual healthy NAV
+        def get_nav_quote(self):  # LIVE — actual healthy NAV
             return 153.26
 
         async def safe_price(self, sym):
@@ -362,24 +373,35 @@ async def test_heal_b_prefers_live_get_nav_quote_over_stale_nav_attr(monkeypatch
     captured = []
 
     class _Logger:
-        def info(self, *a, **kw):  captured.append(("INFO", a))
-        def warning(self, *a, **kw): captured.append(("WARN", a))
-        def debug(self, *a, **kw): pass
-        def error(self, *a, **kw): pass
-        def exception(self, *a, **kw): pass
+        def info(self, *a, **kw):
+            captured.append(("INFO", a))
+
+        def warning(self, *a, **kw):
+            captured.append(("WARN", a))
+
+        def debug(self, *a, **kw):
+            pass
+
+        def error(self, *a, **kw):
+            pass
+
+        def exception(self, *a, **kw):
+            pass
 
     mc.logger = _Logger()
     mc._is_forced_capacity_recovery_sell = lambda sig: False
 
     sig = {
-        "symbol": "XRPUSDT", "side": "SELL", "_forced_exit": True,
-        "reason": "CAPITAL_RECOVERY_LIQUIDITY_RESTORATION", "tag": "meta_exit",
+        "symbol": "XRPUSDT",
+        "side": "SELL",
+        "_forced_exit": True,
+        "reason": "CAPITAL_RECOVERY_LIQUIDITY_RESTORATION",
+        "tag": "meta_exit",
     }
     await mc._passes_meta_sell_profit_gate("XRPUSDT", sig)
 
     heal_log_seen = any(
-        len(args) > 0 and "ProfitGate:Heal" in str(args[0])
-        for level, args in captured
+        len(args) > 0 and "ProfitGate:Heal" in str(args[0]) for level, args in captured
     )
     assert heal_log_seen is False, (
         "Heal-B must prefer LIVE get_nav_quote()=$153.26 over stale nav=$97.86. "
@@ -396,6 +418,7 @@ def test_get_nav_quote_skips_assets_already_mirrored_as_positions():
     actual was $102.64 — the $25.02 delta was the ZBT position counted twice.
     """
     import importlib
+
     ss_mod = importlib.import_module("src.l0_core.shared_state")
 
     # Build a minimal SharedState-like object exercising the de-dup branch
@@ -409,18 +432,27 @@ def test_get_nav_quote_skips_assets_already_mirrored_as_positions():
         }
         balances = {
             "USDT": {"free": 37.40, "locked": 0.0},
-            "ZBT":  {"free": 127.77, "locked": 0.0},   # MIRRORED — must NOT double-count
+            "ZBT": {"free": 127.77, "locked": 0.0},  # MIRRORED — must NOT double-count
         }
         latest_prices = {"ZBTUSDT": 0.1962}
 
         # Borrow the real method
         get_nav_quote = ss_mod.SharedState.get_nav_quote
+
         # tame the logger
         class _L:
-            def info(self, *a, **k): pass
-            def debug(self, *a, **k): pass
-            def warning(self, *a, **k): pass
-            def error(self, *a, **k): pass
+            def info(self, *a, **k):
+                pass
+
+            def debug(self, *a, **k):
+                pass
+
+            def warning(self, *a, **k):
+                pass
+
+            def error(self, *a, **k):
+                pass
+
         logger = _L()
 
     nav = _SS().get_nav_quote()
@@ -432,4 +464,3 @@ def test_get_nav_quote_skips_assets_already_mirrored_as_positions():
         f"get_nav_quote() double-counted ZBT. expected=${expected:.2f} got=${nav:.2f}. "
         "Run-#10 bug: same asset summed as both free balance AND position."
     )
-

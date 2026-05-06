@@ -1,8 +1,8 @@
 # 🎯 MIGRATION DIRECTION ANALYSIS
 ## Is Phase 8.2→9 Heading the Right Way?
 
-**Date**: May 6, 2026  
-**Question**: Is the legacy→native migration strategy correct?  
+**Date**: May 6, 2026
+**Question**: Is the legacy→native migration strategy correct?
 **Answer**: **PARTIALLY CORRECT — with significant gaps**
 
 ---
@@ -199,7 +199,7 @@ Problem:
   MetaController was designed to work with L0-L8 legacy
   It doesn't know about native components
   It calls legacy components directly, not via app_ctx
-  
+
 Result:
   Native components are ignored
   Legacy still runs everything
@@ -317,7 +317,7 @@ If you switch before porting:
   ✅ L3 portfolio → trades placed but positions not tracked
   ✅ L5 arbitration → trades placed without gate validation
   ✅ L6 risk → no position/capital limits enforced
-  
+
 Result: FINANCIAL LOSS
 ```
 
@@ -337,7 +337,7 @@ If you try to keep MetaController with new native L0-L6:
   MetaController was designed for legacy orchestration
   Can't easily route to native via app_ctx
   Will create hybrid code (some legacy, some native)
-  
+
 Result: Technical debt, confusion, bugs
 ```
 

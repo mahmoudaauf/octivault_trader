@@ -3,24 +3,27 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Dict, Any, Optional
+from typing import Any, Optional
 
 # --- Compatibility layer: support both maybe_await(value) and maybe_call(obj, method, ...) ---
 try:
     # Newer helper that awaits a single value if it's awaitable
     from src.l0_core.stubs import maybe_await as _maybe_await  # type: ignore
 except Exception:
+
     async def _maybe_await(value):
         import inspect
+
         if inspect.isawaitable(value):
             return await value
         return value
+
 
 try:
     # Older helper that calls obj.method(...) and awaits result iff needed
     from src.l0_core.stubs import maybe_call as _maybe_call  # type: ignore
 except Exception:
-    _maybe_call = None  # noqa: N816
+    _maybe_call = None
 
 
 async def _call(obj: Any, method: str, *args, **kwargs):
@@ -43,6 +46,7 @@ async def _call(obj: Any, method: str, *args, **kwargs):
 
 def _iso(ts: Optional[float] = None) -> str:
     import datetime as _dt
+
     return _dt.datetime.utcfromtimestamp(ts or time.time()).isoformat(timespec="seconds") + "Z"
 
 
@@ -59,16 +63,21 @@ class PerformanceMonitor:
     def __init__(self, cfg, shared_state, sstools=None, db=None, logger=None):
         self.cfg = cfg
         self.ss = shared_state
-        self.sstools = sstools or shared_state  # tolerate missing sstools by falling back to SharedState
+        self.sstools = (
+            sstools or shared_state
+        )  # tolerate missing sstools by falling back to SharedState
         self.db = db
 
         import logging
+
         self.log = logger or logging.getLogger(self.__class__.__name__)
         self.component_name = "PerformanceMonitor"
 
         # Pre-create KPI slots in SharedState
-        if not hasattr(self.ss, "kpi_metrics") or not isinstance(getattr(self.ss, "kpi_metrics", None), dict):
-            setattr(self.ss, "kpi_metrics", {})
+        if not hasattr(self.ss, "kpi_metrics") or not isinstance(
+            getattr(self.ss, "kpi_metrics", None), dict
+        ):
+            self.ss.kpi_metrics = {}
         km = self.ss.kpi_metrics
         km.setdefault("perf_monitor", {})
         km.setdefault("trades", [])
@@ -84,7 +93,7 @@ class PerformanceMonitor:
     # ----------------------------
     # Public recording API
     # ----------------------------
-    def record_trade(self, exec_result: Dict[str, Any]):
+    def record_trade(self, exec_result: dict[str, Any]):
         """
         Caller pushes each executed trade result here (typically from ExecutionManager hooks).
         Expected keys: symbol, side, executedQty, avgPrice, pnl_delta, agent, tag, ts, win
@@ -94,18 +103,20 @@ class PerformanceMonitor:
             km.setdefault("trades", []).append(exec_result)
             agent = exec_result.get("agent") or "unknown"
             per_agent = km.setdefault("per_agent", {})
-            per_agent.setdefault(agent, []).append({
-                "pnl": float(exec_result.get("pnl_delta", 0.0) or 0.0),
-                "win": bool(exec_result.get("win", False)),
-                "ts": exec_result.get("ts", time.time())
-            })
+            per_agent.setdefault(agent, []).append(
+                {
+                    "pnl": float(exec_result.get("pnl_delta", 0.0) or 0.0),
+                    "win": bool(exec_result.get("win", False)),
+                    "ts": exec_result.get("ts", time.time()),
+                }
+            )
         except Exception:
             self.log.debug("record_trade failed", exc_info=True)
 
     # ----------------------------
     # Internal helpers
     # ----------------------------
-    def _snapshot_now(self) -> Dict[str, Any]:
+    def _snapshot_now(self) -> dict[str, Any]:
         try:
             nav = None
             if hasattr(self.sstools, "nav_quote"):
@@ -141,25 +152,25 @@ class PerformanceMonitor:
             "component": self.component_name,
             "status": status,
             "message": message,
-            "timestamp": _iso()
+            "timestamp": _iso(),
         }
         try:
             await _call(self.sstools, "emit_event", "HealthStatus", payload)
         except Exception:
             self.log.debug("HealthStatus emit failed", exc_info=True)
 
-    async def _emit_snapshot_event(self, snapshot: Dict[str, Any]):
+    async def _emit_snapshot_event(self, snapshot: dict[str, Any]):
         try:
             await _call(
                 self.sstools,
                 "emit_event",
                 "PerformanceSnapshot",
-                {"component": self.component_name, **snapshot}
+                {"component": self.component_name, **snapshot},
             )
         except Exception:
             self.log.debug("PerformanceSnapshot emit failed", exc_info=True)
 
-    def _profitability_snapshot(self) -> Dict[str, Any]:
+    def _profitability_snapshot(self) -> dict[str, Any]:
         now = time.time()
         window_sec = float(
             getattr(self.cfg, "PROFITABILITY_STATUS_WINDOW_SEC", self._profitability_interval_sec)

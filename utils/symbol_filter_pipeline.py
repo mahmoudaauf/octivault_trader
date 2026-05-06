@@ -1,15 +1,16 @@
-from typing import List, Dict, Any, Optional
+from typing import Any, Optional
+
 
 def filter_symbols(
-    raw_symbols: List[str],
-    market_stats: Dict[str, Dict[str, Any]],
-    config: Dict[str, Any],
-    blacklist: Optional[List[str]] = None,
+    raw_symbols: list[str],
+    market_stats: dict[str, dict[str, Any]],
+    config: dict[str, Any],
+    blacklist: Optional[list[str]] = None,
     top_n: int = 40,
     min_volume: float = 500_000,
     usdt_only: bool = True,
-    volatility_scores: Optional[Dict[str, float]] = None,
-) -> Dict[str, Dict[str, Any]]:
+    volatility_scores: Optional[dict[str, float]] = None,
+) -> dict[str, dict[str, Any]]:
     """
     Filter and rank symbols. Returns a dict keyed by symbol so callers can do `.items()`.
 
@@ -41,19 +42,19 @@ def filter_symbols(
     disallow_suffixes = tuple(
         config.get(
             "DISALLOW_SUFFIXES",
-            config.get("disallow_suffixes", ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"))
+            config.get("disallow_suffixes", ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")),
         )
     )
 
     # Helper to compute quote volume robustly
-    def _quote_volume(stats: Dict[str, Any]) -> float:
+    def _quote_volume(stats: dict[str, Any]) -> float:
         base_vol = float(stats.get("volume") or 0.0)
         last_price = float(stats.get("lastPrice") or stats.get("price") or 0.0)
         quote_vol = float(stats.get("quoteVolume") or (base_vol * last_price))
         return quote_vol
 
     # Filter quickly
-    candidates: List[str] = []
+    candidates: list[str] = []
     for sym in raw_symbols:
         if not isinstance(sym, str):
             continue
@@ -94,7 +95,7 @@ def filter_symbols(
         )
 
     # Build result dict (slice top_n)
-    out: Dict[str, Dict[str, Any]] = {}
+    out: dict[str, dict[str, Any]] = {}
     limit = max(0, int(top_n))
     for s in candidates[:limit]:
         stats = market_stats.get(s) or {}

@@ -87,21 +87,20 @@ class NativeOrchestrator:
         self._telemetry = telemetry
 
         self._cycle_count = 0
-        self._stopped = asyncio.Event()
-        self._stopped.set()
+        self._stopped = True  # Use bool flag instead of asyncio.Event
 
     # ──────────────────────────────────────────────────────────────────
     # Loop control
     # ──────────────────────────────────────────────────────────────────
     async def start(self) -> None:
         """Prepare orchestrator (e.g., start background tasks)."""
-        self._stopped.clear()
+        self._stopped = False
         await self._market_data.start()
         await self._balance_sync.start()
 
     async def stop(self) -> None:
         """Graceful shutdown."""
-        self._stopped.set()
+        self._stopped = True
         await self._market_data.stop()
         await self._balance_sync.stop()
 
@@ -119,7 +118,7 @@ class NativeOrchestrator:
         metrics: list[CycleMetrics] = []
         start_time = time.time()
         try:
-            while not self._stopped.is_set():
+            while not self._stopped:
                 if duration_sec is not None and (time.time() - start_time) >= duration_sec:
                     break
                 if max_cycles is not None and self._cycle_count >= max_cycles:

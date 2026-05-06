@@ -26,28 +26,30 @@ Priority System:
 
 import asyncio
 import logging
-from typing import Dict, Optional, List, Any
-from dataclasses import dataclass, field
-from enum import Enum
-from datetime import datetime
 from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class IntentSource(Enum):
     """Source of trading intent"""
-    LIQUIDATION = "liquidation"        # LiquidationAgent
-    RISK_EXIT = "risk_exit"           # RiskManager
-    TP_SL = "tp_sl"                   # TPSLEngine
+
+    LIQUIDATION = "liquidation"  # LiquidationAgent
+    RISK_EXIT = "risk_exit"  # RiskManager
+    TP_SL = "tp_sl"  # TPSLEngine
     META_CONTROLLER = "meta/controller"  # MetaController (strategy signals)
-    AGENT = "meta/agent"              # Discovery agents
+    AGENT = "meta/agent"  # Discovery agents
     PORTFOLIO_BALANCER = "portfolio/balancer"  # Rebalancing
-    MANUAL = "manual"                 # Manual intervention
+    MANUAL = "manual"  # Manual intervention
 
 
 class IntentAction(Enum):
     """Action to take"""
+
     BUY = "BUY"
     SELL = "SELL"
     LIQUIDATE = "LIQUIDATE"  # Urgent sell
@@ -56,6 +58,7 @@ class IntentAction(Enum):
 @dataclass
 class TradeIntent:
     """Standard trade intent"""
+
     symbol: str
     action: IntentAction
     source: IntentSource
@@ -64,7 +67,7 @@ class TradeIntent:
     reason: str = ""
     confidence: float = 0.5
     timestamp: float = field(default_factory=lambda: datetime.utcnow().timestamp())
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __hash__(self):
         return hash((self.symbol, self.action.value, self.source.value))
@@ -72,15 +75,17 @@ class TradeIntent:
 
 class ConflictResolution(Enum):
     """How to resolve conflicting intents"""
-    PRIORITY_WINS = "priority"      # Higher priority keeps, lower cancelled
-    CANCEL_BOTH = "cancel"          # Both rejected
-    QUEUE_SEQUENTIAL = "queue"      # Execute in priority order
-    MERGE = "merge"                 # Combine compatible intents
+
+    PRIORITY_WINS = "priority"  # Higher priority keeps, lower cancelled
+    CANCEL_BOTH = "cancel"  # Both rejected
+    QUEUE_SEQUENTIAL = "queue"  # Execute in priority order
+    MERGE = "merge"  # Combine compatible intents
 
 
 @dataclass
 class RoutingDecision:
     """Result of routing a single intent"""
+
     intent: TradeIntent
     decision: str  # "ACCEPTED", "REJECTED", "QUEUED"
     reason: str = ""
@@ -109,13 +114,13 @@ class ActionRouter:
 
     # Priority system (higher = more urgent)
     PRIORITY = {
-        IntentSource.LIQUIDATION: 100,        # Capital/risk protection (highest)
-        IntentSource.RISK_EXIT: 90,           # Loss limits
-        IntentSource.TP_SL: 80,               # Position management
-        IntentSource.META_CONTROLLER: 50,     # Strategy signals
-        IntentSource.AGENT: 50,               # Discovery agents
+        IntentSource.LIQUIDATION: 100,  # Capital/risk protection (highest)
+        IntentSource.RISK_EXIT: 90,  # Loss limits
+        IntentSource.TP_SL: 80,  # Position management
+        IntentSource.META_CONTROLLER: 50,  # Strategy signals
+        IntentSource.AGENT: 50,  # Discovery agents
         IntentSource.PORTFOLIO_BALANCER: 40,  # Rebalancing
-        IntentSource.MANUAL: 95,              # Manual (just below liquidation)
+        IntentSource.MANUAL: 95,  # Manual (just below liquidation)
     }
 
     # Conflict resolution modes per source
@@ -135,8 +140,8 @@ class ActionRouter:
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
         # State tracking
-        self._active_intents: Dict[str, List[TradeIntent]] = defaultdict(list)  # By symbol
-        self._intent_history: List[RoutingDecision] = []
+        self._active_intents: dict[str, list[TradeIntent]] = defaultdict(list)  # By symbol
+        self._intent_history: list[RoutingDecision] = []
         self._conflicts_resolved: int = 0
         self._intents_accepted: int = 0
         self._intents_rejected: int = 0
@@ -162,12 +167,16 @@ class ActionRouter:
         policy_ctx = policy_ctx if isinstance(policy_ctx, dict) else {}
         agent_name = str(getattr(intent, "agent", "") or "").strip().lower()
         tag = str(getattr(intent, "tag", "") or "").strip().lower()
-        authority = str(
-            policy_ctx.get("authority")
-            or policy_ctx.get("governor")
-            or policy_ctx.get("policy_authority")
-            or ""
-        ).strip().lower()
+        authority = (
+            str(
+                policy_ctx.get("authority")
+                or policy_ctx.get("governor")
+                or policy_ctx.get("policy_authority")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
 
         if authority == "metacontroller" or "meta" in tag:
             return IntentSource.META_CONTROLLER
@@ -239,7 +248,7 @@ class ActionRouter:
 
             return decision
 
-    async def route_batch(self, intents: List[TradeIntent]) -> List[RoutingDecision]:
+    async def route_batch(self, intents: list[TradeIntent]) -> list[RoutingDecision]:
         """
         Route multiple intents efficiently
 
@@ -251,17 +260,17 @@ class ActionRouter:
             decisions.append(decision)
         return decisions
 
-    def get_active_intents(self, symbol: Optional[str] = None) -> Dict[str, List[TradeIntent]]:
+    def get_active_intents(self, symbol: Optional[str] = None) -> dict[str, list[TradeIntent]]:
         """Get currently active/queued intents"""
         if symbol:
             return {symbol: self._active_intents.get(symbol, [])}
         return dict(self._active_intents)
 
-    def get_routing_history(self, limit: int = 100) -> List[RoutingDecision]:
+    def get_routing_history(self, limit: int = 100) -> list[RoutingDecision]:
         """Get recent routing decisions"""
         return self._intent_history[-limit:]
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         """Get routing metrics"""
         return {
             "intents_accepted": self._intents_accepted,
@@ -326,10 +335,10 @@ class ActionRouter:
             return RoutingDecision(
                 intent=intent,
                 decision="REJECTED",
-                reason=f"Router error: {str(e)}",
+                reason=f"Router error: {e!s}",
             )
 
-    async def _check_conflicts(self, intent: TradeIntent) -> Dict[str, Any]:
+    async def _check_conflicts(self, intent: TradeIntent) -> dict[str, Any]:
         """
         Check for conflicting intents on same symbol
 
@@ -349,9 +358,15 @@ class ActionRouter:
         for existing in active:
             # Check for opposite action
             is_opposite = (
-                (self._intent_action_name(intent) == "BUY" and self._intent_action_name(existing) == "SELL") or
-                (self._intent_action_name(intent) == "SELL" and self._intent_action_name(existing) == "BUY") or
-                (self._intent_action_name(intent) == "LIQUIDATE")
+                (
+                    self._intent_action_name(intent) == "BUY"
+                    and self._intent_action_name(existing) == "SELL"
+                )
+                or (
+                    self._intent_action_name(intent) == "SELL"
+                    and self._intent_action_name(existing) == "BUY"
+                )
+                or (self._intent_action_name(intent) == "LIQUIDATE")
             )
 
             if not is_opposite:
@@ -427,7 +442,7 @@ class ActionRouter:
     # Diagnostic API
     # ═══════════════════════════════════════════════════════════════════
 
-    async def get_status(self) -> Dict[str, Any]:
+    async def get_status(self) -> dict[str, Any]:
         """Get full router status"""
         return {
             "status": "operational",

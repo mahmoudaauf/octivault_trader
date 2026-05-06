@@ -16,16 +16,16 @@ Design notes:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Tuple
-import math
+from typing import Any
 
 
 @dataclass
 class RankedOpportunity:
     symbol: str
     action: str
-    signal: Dict[str, Any]
+    signal: dict[str, Any]
     score: float
 
 
@@ -62,14 +62,14 @@ class OpportunityRanker:
 
     def rank_and_prune(
         self,
-        decisions: Sequence[Tuple[str, str, Dict[str, Any]]],
+        decisions: Sequence[tuple[str, str, dict[str, Any]]],
         max_buys: int,
-    ) -> List[Tuple[str, str, Dict[str, Any]]]:
+    ) -> list[tuple[str, str, dict[str, Any]]]:
         """
         Rank BUY decisions, keep top `max_buys`, preserve SELLs.
         """
-        sells: List[Tuple[str, str, Dict[str, Any]]] = []
-        buy_candidates: List[RankedOpportunity] = []
+        sells: list[tuple[str, str, dict[str, Any]]] = []
+        buy_candidates: list[RankedOpportunity] = []
 
         for sym, action, sig in decisions:
             if action == "BUY":
@@ -79,7 +79,9 @@ class OpportunityRanker:
                 sells.append((sym, action, sig))
 
         # Sort BUYs by score (desc), tie-breaker: higher confidence then symbol
-        buy_candidates.sort(key=lambda r: (r.score, r.signal.get("confidence", 0.0), r.symbol), reverse=True)
+        buy_candidates.sort(
+            key=lambda r: (r.score, r.signal.get("confidence", 0.0), r.symbol), reverse=True
+        )
 
         kept_buys = buy_candidates[:max_buys] if max_buys > 0 else buy_candidates
 
@@ -93,12 +95,12 @@ class OpportunityRanker:
             )
 
         # Preserve SELL ordering, append ranked BUYs after risk exits
-        ranked_decisions: List[Tuple[str, str, Dict[str, Any]]] = list(sells)
+        ranked_decisions: list[tuple[str, str, dict[str, Any]]] = list(sells)
         ranked_decisions.extend([(r.symbol, r.action, r.signal) for r in kept_buys])
         return ranked_decisions
 
     # ---- Scoring --------------------------------------------------------
-    def score_signal(self, symbol: str, signal: Dict[str, Any]) -> float:
+    def score_signal(self, symbol: str, signal: dict[str, Any]) -> float:
         """
         Compute multi-factor opportunity score. Outputs ~0-1.5 range.
         Safe defaults avoid NaNs if data is missing.
@@ -113,7 +115,9 @@ class OpportunityRanker:
 
         regime_alignment = float(signal.get("regime_alignment", 0.5) or 0.5)
         liquidity_score = float(signal.get("liquidity_score", self._estimate_liquidity(sym)) or 0.0)
-        volatility_score = float(signal.get("volatility_score", self._estimate_volatility(sym)) or 0.0)
+        volatility_score = float(
+            signal.get("volatility_score", self._estimate_volatility(sym)) or 0.0
+        )
         market_quality = self._safe_unified_score(sym)
 
         w = self.weights
@@ -168,4 +172,3 @@ class OpportunityRanker:
             return 0.5
         except Exception:
             return 0.5
-

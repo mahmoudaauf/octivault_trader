@@ -8,10 +8,10 @@ Guarantees:
   4. `dir(src.lN_*)` includes the declared short names.
 """
 import importlib
+
 import pytest
 
 from src._layer_index import LAYER_MODULES
-
 
 LAYER_PACKAGES = [f"src.{layer}" for layer in LAYER_MODULES]
 
@@ -47,20 +47,20 @@ def test_every_short_name_resolves_to_canonical_module():
                 continue
             via_namespace = getattr(pkg, short)
             if via_namespace is not via_canonical:
-                mismatches.append(
-                    f"{layer}.{short}: re-export is NOT the same object as {target}"
-                )
+                mismatches.append(f"{layer}.{short}: re-export is NOT the same object as {target}")
     assert not mismatches, "\n".join(mismatches)
     # Surface skips for visibility but don't fail the test
     if skipped:
-        print(f"\n[info] {len(skipped)} canonical modules unimportable "
-              f"(unrelated to Phase A): {skipped}")
+        print(
+            f"\n[info] {len(skipped)} canonical modules unimportable "
+            f"(unrelated to Phase A): {skipped}"
+        )
 
 
 def test_unknown_attribute_raises_attribute_error():
     pkg = importlib.import_module("src.l1_exchange")
     with pytest.raises(AttributeError) as exc:
-        _ = pkg.nonexistent_module           # noqa: B018
+        _ = pkg.nonexistent_module
     assert "l1_exchange" in str(exc.value)
     assert "nonexistent_module" in str(exc.value)
 
@@ -76,6 +76,7 @@ def test_dir_lists_declared_short_names(layer, mapping):
 
 def test_layer_of_helper():
     from src import layer_of
+
     assert layer_of("exchange_client") == "l1_exchange"
     assert layer_of("portfolio_manager") == "l3_portfolio"
     assert layer_of("execution_manager") == "l4_execution"

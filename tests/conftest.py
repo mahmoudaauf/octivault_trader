@@ -22,17 +22,27 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="function")
 def event_loop():
-    """Create an event loop for async tests"""
+    """Create an event loop for async tests.
+
+    In pytest-asyncio "auto" mode, this fixture provides the event loop
+    that pytest-asyncio creates automatically. We just yield it without
+    closing it, as pytest-asyncio manages cleanup.
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # No running loop; try to get the current event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            # No event loop exists at all; create one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
     yield loop
-    try:
-        loop.close()
-    except Exception:
-        pass
+    # Note: Don't close the loop here. pytest-asyncio manages cleanup.
 
 
 # ============================================================================

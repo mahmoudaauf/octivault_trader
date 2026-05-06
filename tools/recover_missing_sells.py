@@ -19,20 +19,19 @@ import csv
 import logging
 import sys
 from types import SimpleNamespace
-from typing import List, Tuple, Optional
 
-from src.l1_exchange.exchange_client import get_global_exchange_client
 from src.l0_core.shared_state import SharedState
-from src.l4_execution.execution_manager import ExecutionManager
+from src.l1_exchange.exchange_client import get_global_exchange_client
 from src.l1_exchange.exchange_truth_auditor import ExchangeTruthAuditor
+from src.l4_execution.execution_manager import ExecutionManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("recover_missing_sells")
 
 
-def _parse_csv(path: str) -> List[Tuple[str, str]]:
+def _parse_csv(path: str) -> list[tuple[str, str]]:
     out = []
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         rdr = csv.reader(fh)
         for row in rdr:
             if not row:
@@ -45,7 +44,9 @@ def _parse_csv(path: str) -> List[Tuple[str, str]]:
     return out
 
 
-async def _recover_one(auditor: ExchangeTruthAuditor, ex_client, ss: SharedState, symbol: str, token: str) -> bool:
+async def _recover_one(
+    auditor: ExchangeTruthAuditor, ex_client, ss: SharedState, symbol: str, token: str
+) -> bool:
     """token may be order_id (numeric) or clientOrderId (string)"""
     try:
         # Try numeric order id first
@@ -63,15 +64,23 @@ async def _recover_one(auditor: ExchangeTruthAuditor, ex_client, ss: SharedState
                 order = await ex_client.get_order(symbol, client_order_id=token)
 
         if order is None:
-            logger.warning("Order not found on exchange: symbol=%s token=%s", symbol or "(none)", token)
+            logger.warning(
+                "Order not found on exchange: symbol=%s token=%s", symbol or "(none)", token
+            )
             return False
 
         # Ensure auditor can apply the recovered fill
         applied = await auditor._apply_recovered_fill(order, reason="admin_replay", synthetic=False)
         if applied:
-            logger.info("Recovered and applied order: symbol=%s order_id=%s client_order_id=%s", order.get("symbol"), order.get("orderId") or order.get("clientOrderId"))
+            logger.info(
+                "Recovered and applied order: symbol=%s order_id=%s client_order_id=%s",
+                order.get("symbol"),
+                order.get("orderId") or order.get("clientOrderId"),
+            )
         else:
-            logger.info("Order found but not applied (already recorded?): %s", order.get("orderId") or token)
+            logger.info(
+                "Order found but not applied (already recorded?): %s", order.get("orderId") or token
+            )
         return bool(applied)
     except Exception as e:
         logger.exception("Recovery failed for %s/%s: %s", symbol, token, e)
@@ -89,9 +98,14 @@ async def main_async(args):
 
     ss = SharedState()
     em = ExecutionManager(SimpleNamespace(), ss, ex)
-    auditor = ExchangeTruthAuditor(config=SimpleNamespace(), shared_state=ss, exchange_client=ex, app=SimpleNamespace(execution_manager=em))
+    auditor = ExchangeTruthAuditor(
+        config=SimpleNamespace(),
+        shared_state=ss,
+        exchange_client=ex,
+        app=SimpleNamespace(execution_manager=em),
+    )
 
-    tokens: List[Tuple[str, str]] = []
+    tokens: list[tuple[str, str]] = []
     if args.input:
         tokens.extend(_parse_csv(args.input))
     if args.client_order_id:
@@ -113,9 +127,13 @@ async def main_async(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Recover missing SELL TRADE_EXECUTED events from exchange truth")
+    p = argparse.ArgumentParser(
+        description="Recover missing SELL TRADE_EXECUTED events from exchange truth"
+    )
     p.add_argument("--input", help="CSV file with rows: SYMBOL,ORDER_ID or SYMBOL,CLIENT_ORDER_ID")
-    p.add_argument("--symbol", help="Symbol to use when providing single --order-id/--client-order-id")
+    p.add_argument(
+        "--symbol", help="Symbol to use when providing single --order-id/--client-order-id"
+    )
     p.add_argument("--order-id", help="Order ID (numeric)")
     p.add_argument("--client-order-id", help="clientOrderId string")
     ns = p.parse_args()

@@ -24,8 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from core_engine.implementations import SituationEngineImpl
 
@@ -38,6 +37,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PortfolioSnapshot:
     """Current portfolio state snapshot."""
+
     nav_usdt: float
     available_capital: float
     locked_capital: float
@@ -50,6 +50,7 @@ class PortfolioSnapshot:
 @dataclass
 class SignalScore:
     """Individual signal with edge scoring."""
+
     symbol: str
     signal_type: str  # "BUY", "SELL", "HOLD"
     edge_score: float  # -1.0 to +1.0
@@ -61,6 +62,7 @@ class SignalScore:
 @dataclass
 class RegimeState:
     """Current market regime classification."""
+
     volatility_regime: str  # "LOW", "NORMAL", "HIGH"
     trend_regime: str  # "UPTREND", "DOWNTREND", "RANGING"
     nav_regime: str  # "GROWTH", "DECAY"
@@ -70,7 +72,7 @@ class RegimeState:
 class SituationEngine:
     """
     Façade for understanding portfolio and market situation.
-    
+
     Responsibility: Analyze and synthesize all signals and data.
     - Calculate portfolio metrics (NAV, P&L, exposure)
     - Aggregate signals from all agents
@@ -82,7 +84,7 @@ class SituationEngine:
     def __init__(self, app_ctx: Any):
         """
         Initialize the situation engine.
-        
+
         Args:
             app_ctx: Application context containing all layer components
         """
@@ -97,19 +99,19 @@ class SituationEngine:
     async def get_portfolio_snapshot(self) -> PortfolioSnapshot:
         """
         Get current portfolio state.
-        
+
         Returns:
             PortfolioSnapshot with NAV, capital, positions, P&L
         """
         return await SituationEngineImpl.get_portfolio_snapshot(self.app_ctx)
 
-    async def get_all_signals(self, symbol: Optional[str] = None) -> List[SignalScore]:
+    async def get_all_signals(self, symbol: Optional[str] = None) -> list[SignalScore]:
         """
         Get aggregated signals from all agents.
-        
+
         Args:
             symbol: Optional symbol filter. If None, all signals.
-        
+
         Returns:
             List of SignalScore objects sorted by edge strength
         """
@@ -118,13 +120,13 @@ class SituationEngine:
     async def get_fused_signal(self, symbol: str) -> Optional[SignalScore]:
         """
         Get weighted consensus signal for a symbol.
-        
+
         This applies signal_fusion (L5) to aggregate all agent signals
         into a single composite edge score.
-        
+
         Args:
             symbol: Trading pair (e.g., "BTCUSDT")
-        
+
         Returns:
             Single fused SignalScore, or None if no strong consensus
         """
@@ -133,16 +135,16 @@ class SituationEngine:
     async def get_market_regime(self) -> RegimeState:
         """
         Detect current market regime.
-        
+
         Returns:
             RegimeState with volatility, trend, NAV regime, health
         """
         return await SituationEngineImpl.get_market_regime(self.app_ctx)
 
-    async def detect_anomalies(self) -> Dict[str, Any]:
+    async def detect_anomalies(self) -> dict[str, Any]:
         """
         Detect price spikes, liquidation candles, and other anomalies.
-        
+
         Returns:
             {
                 "price_spikes": [{"symbol": "BTCUSDT", "spike_pct": 5.2, ...}, ...],
@@ -153,31 +155,31 @@ class SituationEngine:
         """
         try:
             anomaly_detection = self.app_ctx.get("anomaly_detection")
-            
+
             anomalies = {
                 "price_spikes": [],
                 "liquidation_candles": [],
                 "volume_anomalies": [],
                 "timestamp": asyncio.get_event_loop().time(),
             }
-            
+
             if anomaly_detection:
                 # Detect anomalies (L2)
                 # anomalies = await anomaly_detection.detect_all()
                 pass
-            
+
             return anomalies
         except Exception as e:
             self.logger.error(f"❌ Error detecting anomalies: {e}")
             raise
 
-    async def get_position_analysis(self, symbol: str) -> Dict[str, Any]:
+    async def get_position_analysis(self, symbol: str) -> dict[str, Any]:
         """
         Analyze a specific position.
-        
+
         Args:
             symbol: Trading pair
-        
+
         Returns:
             {
                 "quantity": float,
@@ -191,7 +193,7 @@ class SituationEngine:
         """
         try:
             position_manager = self.app_ctx.get("position_manager")
-            
+
             analysis = {
                 "quantity": 0.0,
                 "entry_price": 0.0,
@@ -201,21 +203,21 @@ class SituationEngine:
                 "status": "ACTIVE",
                 "risk_level": "LOW",
             }
-            
+
             if position_manager:
                 # Query position_manager (L3)
                 # analysis = await position_manager.analyze_position(symbol)
                 pass
-            
+
             return analysis
         except Exception as e:
             self.logger.error(f"❌ Error analyzing position {symbol}: {e}")
             raise
 
-    async def get_capital_efficiency(self) -> Dict[str, Any]:
+    async def get_capital_efficiency(self) -> dict[str, Any]:
         """
         Analyze capital deployment efficiency.
-        
+
         Returns:
             {
                 "total_capital": float,
@@ -230,7 +232,7 @@ class SituationEngine:
         """
         try:
             portfolio_manager = self.app_ctx.get("portfolio_manager")
-            
+
             efficiency = {
                 "total_capital": 0.0,
                 "active_capital": 0.0,
@@ -241,21 +243,21 @@ class SituationEngine:
                 "avg_position_size": 0.0,
                 "concentration_risk": 0.0,
             }
-            
+
             if portfolio_manager:
                 # Query portfolio_manager (L3)
                 # efficiency = await portfolio_manager.get_capital_efficiency()
                 pass
-            
+
             return efficiency
         except Exception as e:
             self.logger.error(f"❌ Error analyzing capital efficiency: {e}")
             raise
 
-    async def get_risk_assessment(self) -> Dict[str, Any]:
+    async def get_risk_assessment(self) -> dict[str, Any]:
         """
         Get overall risk assessment.
-        
+
         Returns:
             {
                 "overall_risk": "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
@@ -268,7 +270,7 @@ class SituationEngine:
         """
         try:
             risk_manager = self.app_ctx.get("risk_manager")
-            
+
             assessment = {
                 "overall_risk": "LOW",
                 "liquidation_risk": 0.0,
@@ -277,12 +279,12 @@ class SituationEngine:
                 "drawdown_risk": 0.0,
                 "recommendations": [],
             }
-            
+
             if risk_manager:
                 # Query risk_manager (L6)
                 # assessment = await risk_manager.assess_risk()
                 pass
-            
+
             return assessment
         except Exception as e:
             self.logger.error(f"❌ Error assessing risk: {e}")

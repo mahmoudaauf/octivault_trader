@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 
 class PortfolioTargetSizeEnforcer:
@@ -56,7 +56,7 @@ class PortfolioTargetSizeEnforcer:
     # PUBLIC ENTRY POINT
     # ─────────────────────────────────────────────────────────────────
 
-    async def enforce_once(self) -> Dict[str, Any]:
+    async def enforce_once(self) -> dict[str, Any]:
         """
         Run a single trim pass. Returns a structured report:
           {
@@ -95,7 +95,8 @@ class PortfolioTargetSizeEnforcer:
             self.logger.info(
                 "[TargetSizeEnforcer] portfolio already at/below target "
                 "(%d tradable ≤ target=%d) — no action",
-                tradable_count, self.target_count,
+                tradable_count,
+                self.target_count,
             )
             return self._report(
                 candidates_considered=len(snap),
@@ -111,7 +112,9 @@ class PortfolioTargetSizeEnforcer:
 
         self.logger.warning(
             "[TargetSizeEnforcer] trimming %d positions (tradable=%d → target=%d): %s",
-            excess, tradable_count, self.target_count,
+            excess,
+            tradable_count,
+            self.target_count,
             [(c["symbol"], round(c["value_usdt"], 2)) for c in to_liquidate],
         )
 
@@ -127,13 +130,9 @@ class PortfolioTargetSizeEnforcer:
         # Best-effort execution; the executor will log per-symbol outcome.
         ok = False
         try:
-            ok = bool(
-                await self.execution_manager.execute_liquidation_plan(exits)
-            )
+            ok = bool(await self.execution_manager.execute_liquidation_plan(exits))
         except Exception as e:
-            self.logger.error(
-                "[TargetSizeEnforcer] execute_liquidation_plan raised: %s", e
-            )
+            self.logger.error("[TargetSizeEnforcer] execute_liquidation_plan raised: %s", e)
 
         # Re-count after execution to report what actually got out
         post_snap = self._snapshot_positions()
@@ -143,7 +142,11 @@ class PortfolioTargetSizeEnforcer:
 
         self.logger.warning(
             "[TargetSizeEnforcer] done: submitted=%d filled=%d post_tradable=%d target=%d ok=%s",
-            len(exits), exits_filled, post_count, self.target_count, ok,
+            len(exits),
+            exits_filled,
+            post_count,
+            self.target_count,
+            ok,
         )
         return self._report(
             candidates_considered=len(snap),
@@ -157,7 +160,7 @@ class PortfolioTargetSizeEnforcer:
     # INTERNAL HELPERS
     # ─────────────────────────────────────────────────────────────────
 
-    def _snapshot_positions(self) -> Dict[str, Dict[str, Any]]:
+    def _snapshot_positions(self) -> dict[str, dict[str, Any]]:
         try:
             getter = getattr(self.shared_state, "get_positions_snapshot", None)
             if callable(getter):
@@ -172,9 +175,7 @@ class PortfolioTargetSizeEnforcer:
             return {}
         return {}
 
-    def _build_tradable_candidates(
-        self, snap: Dict[str, Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+    def _build_tradable_candidates(self, snap: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
         """Build the list of positions eligible for trim consideration.
 
         Eligibility:
@@ -187,7 +188,7 @@ class PortfolioTargetSizeEnforcer:
         Returns a list of dicts with keys: symbol, quantity, value_usdt, classification.
         """
         min_value = float(os.environ.get("STARTUP_TRIM_MIN_VALUE_USDT", "5") or 5)
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for sym, pos in (snap or {}).items():
             if not isinstance(pos, dict):
                 continue
@@ -201,22 +202,21 @@ class PortfolioTargetSizeEnforcer:
                 # Bot-managed positions are out of scope for startup trim
                 continue
             px = float(
-                pos.get("mark_price")
-                or pos.get("current_price")
-                or pos.get("avg_price")
-                or 0.0
+                pos.get("mark_price") or pos.get("current_price") or pos.get("avg_price") or 0.0
             )
             if px <= 0:
                 continue
             value = float(pos.get("value_usdt") or qty * px)
             if value < min_value:
                 continue
-            out.append({
-                "symbol": sym,
-                "quantity": qty,
-                "value_usdt": value,
-                "classification": classification,
-            })
+            out.append(
+                {
+                    "symbol": sym,
+                    "quantity": qty,
+                    "value_usdt": value,
+                    "classification": classification,
+                }
+            )
         return out
 
     def _report(
@@ -228,7 +228,7 @@ class PortfolioTargetSizeEnforcer:
         exits_submitted: int = 0,
         exits_filled: int = 0,
         skipped_reason: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return {
             "ran": skipped_reason is None,
             "candidates_considered": int(candidates_considered),

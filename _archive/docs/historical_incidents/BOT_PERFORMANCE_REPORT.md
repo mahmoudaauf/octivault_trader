@@ -180,4 +180,3 @@ grep "LOOP_SUMMARY" logs/octivault_master_orchestrator.log | tail -10
 # Check 4th-slot status
 grep "\[4thSlot\]" logs/octivault_master_orchestrator.log
 ```
-

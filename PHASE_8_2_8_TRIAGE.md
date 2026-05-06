@@ -42,7 +42,7 @@ façade engines read 23 keys. The intersection is what actually matters.
 | `health_monitor` | `setup_core_engines` | ❌ not in native | **shim** (TBD) |
 | `performance_monitor` | `operations_engine` | partial — `NativeTelemetry` covers latency | **map** `telemetry` → also accept this key, or drop |
 | `startup_orchestrator` | `setup_core_engines` | n/a — bootstrap *is* the startup | **drop key** |
-| `watchdog` | `operations_engine` ×2 | ❌ not in native | **shim** (TBD) |
+| `watchdog` | `operations_engine` ×2 | ✅ `NativeWatchdog` (8.3.12) | **native** |
 
 ### 1b. Bridge supplies, **nobody reads** — dead weight
 
@@ -121,7 +121,7 @@ For each, we have three options:
 | `safety_order_manager` | `safe_execution_engine` calls `place_safety_orders(order)` | **stub** returning `[]` |
 | `recovery_engine` | `operations_engine` calls `generate_recovery_plan()` and `apply_plan(plan)` | ✅ `NativeRecoveryEngine` (8.3.11) — detects orphan OCO / stale prices / NAV drift / zero entry; applies via dispatcher |
 | `health_monitor` | `setup_core_engines` only references for wiring (not invoked in cycle) | **drop** — wiring path can tolerate `None` |
-| `watchdog` | `operations_engine` calls `heartbeat()` and `check_liveness()` | **stub** returning `True` |
+| `watchdog` | `operations_engine` calls `check_liveness()` and `detect_anomalies()` | ✅ `NativeWatchdog` (8.3.12) — heartbeat-based liveness + 5-detector anomaly sweep (heartbeat / market data / balance sync / exchange client / cycle error rate) |
 
 ### Why stubs over ports
 

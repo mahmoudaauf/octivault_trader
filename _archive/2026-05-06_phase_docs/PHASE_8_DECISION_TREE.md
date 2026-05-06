@@ -1,7 +1,7 @@
 # Phase 8 Decision Tree
 
-**Current State:** Phase 8.2.1 (L0 Native) ✅ Complete  
-**Date:** 2026-05-06  
+**Current State:** Phase 8.2.1 (L0 Native) ✅ Complete
+**Date:** 2026-05-06
 **Next Decision Point:** What to do with L1 Native?
 
 ---
@@ -20,8 +20,8 @@
 - ✅ 53% code reduction (1,600 → 750 lines)
 - ✅ -30MB memory savings
 
-**Timeline:** 2026-05-07 to 2026-06-10  
-**Risk:** Medium (REST API complexity, rate limiting edge cases)  
+**Timeline:** 2026-05-07 to 2026-06-10
+**Risk:** Medium (REST API complexity, rate limiting edge cases)
 **Exit Strategy:** Feature flag `--native-l0` (fallback to bridge)
 
 **Next Steps:**
@@ -45,8 +45,8 @@ echo "CREATE: tests/test_native_l1.py (17+ tests)"
 - ✅ Confidence: L0 production-ready
 - ✅ Decision support: Go/no-go for L1
 
-**Timeline:** 2026-05-06 to 2026-05-07 (1-2 days)  
-**Risk:** Low (validation only, no production changes)  
+**Timeline:** 2026-05-06 to 2026-05-07 (1-2 days)
+**Risk:** Low (validation only, no production changes)
 **Exit Strategy:** Results determine L1 go/no-go
 
 **Procedure:**
@@ -78,8 +78,8 @@ python3 main.py --mode=paper-trade --duration=300s --native-l0
 - ✅ Clear implementation sequence
 - ✅ Integration strategy
 
-**Timeline:** 2026-05-06 to 2026-05-13 (planning week)  
-**Risk:** Low (spec only, no code)  
+**Timeline:** 2026-05-06 to 2026-05-13 (planning week)
+**Risk:** Low (spec only, no code)
 **Dependencies:** Can happen in parallel with L1 implementation
 
 **Next Steps:**
@@ -102,8 +102,8 @@ echo "CREATE: PHASE_8_2_3_L2_NATIVE_SPEC.md"
 - ✅ Test coverage analysis
 - ✅ Risk matrix updated
 
-**Timeline:** 2026-05-06 to 2026-05-08  
-**Risk:** Low (review only)  
+**Timeline:** 2026-05-06 to 2026-05-08
+**Risk:** Low (review only)
 **Deliverables:** Code review notes, documentation gaps
 
 ---

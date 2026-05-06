@@ -1,9 +1,9 @@
 # Phase 8.2.2: L1 Native Implementation Spec
 
-**Layer:** L1 (Exchange Integration)  
-**Scope:** ExchangeClient, BalanceSync, OrderExecution  
-**Timeline:** 2-3 weeks  
-**Target Completion:** 2026-06-10  
+**Layer:** L1 (Exchange Integration)
+**Scope:** ExchangeClient, BalanceSync, OrderExecution
+**Timeline:** 2-3 weeks
+**Target Completion:** 2026-06-10
 **Expected Cycle Time Improvement:** -20ms (280ms → 260ms)
 
 ---
@@ -64,25 +64,25 @@ NativeOrderExecution (stateless)
 ```python
 class NativeExchangeClient:
     """Simple Binance REST API wrapper"""
-    
+
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
         self.base_url = "https://testnet.binance.vision" if testnet else "https://api.binance.com"
-    
+
     async def get_balance(self) -> dict[str, float]:
         """Get account balance"""
         # GET /api/v3/account
         # Returns: {symbol: qty, ...}
         pass
-    
+
     async def get_ticker(self, symbol: str) -> dict:
         """Get current price"""
         # GET /api/v3/ticker/24hr?symbol=ETHUSDT
         # Returns: {price, bid, ask, volume, ...}
         pass
-    
+
     async def place_order(
         self,
         symbol: str,
@@ -94,13 +94,13 @@ class NativeExchangeClient:
         # POST /api/v3/order
         # Returns: {orderId, symbol, side, qty, price, status, ...}
         pass
-    
+
     async def cancel_order(self, symbol: str, order_id: int) -> bool:
         """Cancel order"""
         # DELETE /api/v3/order
         # Returns: {orderId, symbol, status, ...}
         pass
-    
+
     async def get_orders(self, symbol: str, limit: int = 10) -> list[dict]:
         """Get recent orders"""
         # GET /api/v3/allOrders?symbol=ETHUSDT
@@ -132,18 +132,18 @@ class NativeExchangeClient:
 ```python
 class NativeBalanceSync:
     """Real-time balance cache updater"""
-    
+
     def __init__(self, exchange_client: NativeExchangeClient, poll_interval_sec: float = 5.0):
         self.exchange_client = exchange_client
         self.poll_interval_sec = poll_interval_sec
         self.balance_cache: dict[str, float] = {}
         self.last_update_ms: int = 0
         self._update_callback = None
-    
+
     def on_balance_update(self, callback):
         """Register callback for balance updates"""
         self._update_callback = callback
-    
+
     async def start_polling(self):
         """Start background polling task"""
         while True:
@@ -153,25 +153,25 @@ class NativeBalanceSync:
             except Exception as e:
                 logger.warning(f"Balance sync failed: {e}")
                 await asyncio.sleep(self.poll_interval_sec * 2)  # Backoff
-    
+
     async def sync_balance(self):
         """Sync balance from Binance"""
         balance = await self.exchange_client.get_balance()
-        
+
         if balance != self.balance_cache:
             self.balance_cache = balance
             self.last_update_ms = NativeTimeUtils.unix_now_ms()
-            
+
             # Notify listeners
             if self._update_callback:
                 await self._update_callback(balance)
-    
+
     def get_balance(self, symbol: str = None) -> float | dict:
         """Get cached balance"""
         if symbol:
             return self.balance_cache.get(symbol, 0.0)
         return self.balance_cache.copy()
-    
+
     @property
     def total_usdt(self) -> float:
         """Total USDT balance (assuming 'USDT' key)"""
@@ -193,11 +193,11 @@ class NativeBalanceSync:
 ```python
 class NativeOrderExecution:
     """Order execution manager (no state validation)"""
-    
+
     def __init__(self, exchange_client: NativeExchangeClient):
         self.exchange_client = exchange_client
         self.pending_orders: dict[str, dict] = {}  # order_id -> order_info
-    
+
     async def place_order(
         self,
         symbol: str,
@@ -207,14 +207,14 @@ class NativeOrderExecution:
     ) -> tuple[bool, str]:
         """
         Place order
-        
+
         Returns:
             (success: bool, order_id: str)
         """
         try:
             result = await self.exchange_client.place_order(symbol, side, qty, price)
             order_id = str(result["orderId"])
-            
+
             # Track locally
             self.pending_orders[order_id] = {
                 "symbol": symbol,
@@ -224,13 +224,13 @@ class NativeOrderExecution:
                 "status": result.get("status", "NEW"),
                 "timestamp_ms": NativeTimeUtils.unix_now_ms(),
             }
-            
+
             return True, order_id
-        
+
         except Exception as e:
             logger.error(f"Order placement failed: {e}")
             return False, ""
-    
+
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Cancel order"""
         try:
@@ -240,20 +240,20 @@ class NativeOrderExecution:
         except Exception as e:
             logger.error(f"Order cancellation failed: {e}")
             return False
-    
+
     async def sync_orders(self, symbol: str):
         """Sync pending orders with exchange"""
         try:
             orders = await self.exchange_client.get_orders(symbol)
-            
+
             for order in orders:
                 order_id = str(order["orderId"])
                 if order_id in self.pending_orders:
                     self.pending_orders[order_id]["status"] = order["status"]
-        
+
         except Exception as e:
             logger.warning(f"Order sync failed: {e}")
-    
+
     def get_pending_orders(self) -> dict:
         """Get all pending orders"""
         return self.pending_orders.copy()
@@ -268,39 +268,39 @@ class NativeOrderExecution:
 ```python
 async def create_app_context(production: bool = False, native_l0: bool = False, native_l1: bool = False):
     """Build app context with L0/L1 choice"""
-    
+
     if not production:
         return {}
-    
+
     if native_l0 and native_l1:
         # NEW: Use native L0 + L1
         from core_engine.native import NativeSharedState, NativeTimeUtils, ConfigLoader
         from core_engine.native_l1 import NativeExchangeClient, NativeBalanceSync, NativeOrderExecution
-        
+
         config = ConfigLoader()
         exchange = NativeExchangeClient(
             api_key=os.getenv("BINANCE_API_KEY"),
             api_secret=os.getenv("BINANCE_API_SECRET"),
             testnet=config.get("API", "binance_testnet"),
         )
-        
+
         app_ctx = {
             # L0 native
             "shared_state": NativeSharedState(),
             "time_utils": NativeTimeUtils,
             "config": config,
-            
+
             # L1 native
             "exchange_client": exchange,
             "balance_sync": NativeBalanceSync(exchange),
             "order_execution": NativeOrderExecution(exchange),
         }
         return app_ctx
-    
+
     elif native_l0:
         # Use native L0 + legacy L1-L8
         return await build_production_app_ctx(use_native_l0=True)
-    
+
     else:
         # Full legacy bridge
         return await build_production_app_ctx()
@@ -327,13 +327,13 @@ class TestNativeExchangeClient:
         """Test balance retrieval"""
         # Mock aiohttp response
         mocker.patch("aiohttp.ClientSession.get")
-        
+
         client = NativeExchangeClient("key", "secret")
         balance = await client.get_balance()
-        
+
         assert "USDT" in balance
         assert balance["USDT"] > 0
-    
+
     @pytest.mark.asyncio
     async def test_place_order_mock(self, mocker):
         """Test order placement"""
@@ -429,8 +429,8 @@ Once L1 complete:
 
 ---
 
-**Status:** Ready to implement  
-**Owner:** @mauf  
-**Start Date:** 2026-05-07  
-**Target Completion:** 2026-06-10  
+**Status:** Ready to implement
+**Owner:** @mauf
+**Start Date:** 2026-05-07
+**Target Completion:** 2026-06-10
 **Est. Effort:** 80-120 hours

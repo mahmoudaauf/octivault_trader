@@ -34,7 +34,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Optional
 
 logger = logging.getLogger("NavAttributionMonitor")
 
@@ -50,7 +50,7 @@ class NavAttributionMonitor:
         interval_sec: float = 30.0,
         window_sec: float = 300.0,
         flat_epsilon_per_min: float = 0.02,  # $/min (configurable per NAV scale)
-        churn_ratio: float = 0.6,            # |fees| / |ΔNAV| > 0.6 → CHURNING
+        churn_ratio: float = 0.6,  # |fees| / |ΔNAV| > 0.6 → CHURNING
     ) -> None:
         self.ss = shared_state
         self.cfg = config
@@ -70,7 +70,7 @@ class NavAttributionMonitor:
         self.logger = logger
 
         # Rolling snapshots: (ts, nav, realized_total, fees_total, unrealized)
-        self._snapshots: Deque[Tuple[float, float, float, float, float]] = deque()
+        self._snapshots: Deque[tuple[float, float, float, float, float]] = deque()
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -119,7 +119,7 @@ class NavAttributionMonitor:
             return 0.0
 
     # ----------------------------------------------------------------- core
-    def _take_snapshot(self) -> Tuple[float, float, float, float, float]:
+    def _take_snapshot(self) -> tuple[float, float, float, float, float]:
         ts = time.time()
         nav = self._read_nav()
         realized = self._read_realized_total()
@@ -135,7 +135,7 @@ class NavAttributionMonitor:
         return snap
 
     @staticmethod
-    def _slope_per_min(snapshots: Deque[Tuple[float, float, float, float, float]]) -> float:
+    def _slope_per_min(snapshots: Deque[tuple[float, float, float, float, float]]) -> float:
         """Linear slope of NAV vs time, expressed in $/min."""
         if len(snapshots) < 2:
             return 0.0
@@ -148,9 +148,9 @@ class NavAttributionMonitor:
 
     def _attribute(
         self,
-        prev: Tuple[float, float, float, float, float],
-        curr: Tuple[float, float, float, float, float],
-    ) -> Dict[str, float]:
+        prev: tuple[float, float, float, float, float],
+        curr: tuple[float, float, float, float, float],
+    ) -> dict[str, float]:
         d_nav = curr[1] - prev[1]
         d_realized = curr[2] - prev[2]
         d_fees = curr[3] - prev[3]
@@ -166,7 +166,7 @@ class NavAttributionMonitor:
             "d_external": d_external,
         }
 
-    def _classify(self, slope_per_min: float, attr: Dict[str, float]) -> str:
+    def _classify(self, slope_per_min: float, attr: dict[str, float]) -> str:
         eps = self.flat_epsilon_per_min
         d_nav = attr["d_nav"]
         d_fees = attr["d_fees"]
@@ -221,7 +221,7 @@ class NavAttributionMonitor:
                 int(self.window_sec),
                 verdict,
                 attr["d_realized"],
-                -attr["d_fees"],   # negate so log shows fees as cost (negative)
+                -attr["d_fees"],  # negate so log shows fees as cost (negative)
                 attr["d_unrealized"],
                 attr["d_external"],
             )
@@ -253,7 +253,10 @@ class NavAttributionMonitor:
         self._task = asyncio.create_task(self._run_forever(), name="ops.nav_attribution")
         self.logger.info(
             "[NavAttribution] started (interval=%.1fs window=%.0fs eps=%.4f$/min churn=%.2f)",
-            self.interval_sec, self.window_sec, self.flat_epsilon_per_min, self.churn_ratio,
+            self.interval_sec,
+            self.window_sec,
+            self.flat_epsilon_per_min,
+            self.churn_ratio,
         )
 
     async def stop(self) -> None:
@@ -268,7 +271,7 @@ class NavAttributionMonitor:
                 pass
 
     # ----------------------------------------------------------------- public API
-    def latest_verdict(self) -> Dict[str, Any]:
+    def latest_verdict(self) -> dict[str, Any]:
         try:
             return dict((getattr(self.ss, "metrics", {}) or {}).get("nav_attribution_last", {}))
         except Exception:

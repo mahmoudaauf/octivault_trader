@@ -9,10 +9,11 @@ These are pure-logic tests — no live network, no full app boot.
 """
 
 import asyncio
-import pytest
 import re
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -23,14 +24,13 @@ sys.path.insert(0, str(ROOT))
 # exists in execution_manager.py
 # ─────────────────────────────────────────────────────────────────────
 
+
 def test_fix1_capital_downscale_branch_present():
     src = (ROOT / "src/l4_execution/execution_manager.py").read_text()
-    assert "_legitimate_capital_downscale" in src, (
-        "Fix #1 missing: capital-downscale exemption not found in executor"
-    )
-    assert "EM:CAPITAL_DOWNSCALE" in src, (
-        "Fix #1 missing: diagnostic log marker not present"
-    )
+    assert (
+        "_legitimate_capital_downscale" in src
+    ), "Fix #1 missing: capital-downscale exemption not found in executor"
+    assert "EM:CAPITAL_DOWNSCALE" in src, "Fix #1 missing: diagnostic log marker not present"
     # Must guard with min_notional check, otherwise we'd let through dust trades
     pattern = re.compile(
         r"_legitimate_capital_downscale\s*=\s*\(\s*\n\s*reason\s*==\s*\"OK_DOWNSCALED\""
@@ -43,6 +43,7 @@ def test_fix1_capital_downscale_branch_present():
 # ─────────────────────────────────────────────────────────────────────
 # Fix #2/#3 — Real NAV-rebuild test using SharedState
 # ─────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_fix2_nav_includes_mirrored_positions():
@@ -72,7 +73,7 @@ async def test_fix2_nav_includes_mirrored_positions():
             "avg_price": 0.099,
             "entry_price": 0.099,
             "mark_price": 0.10,
-            "_mirrored": False,        # bot-managed
+            "_mirrored": False,  # bot-managed
             "classification": "BOT_POSITION",
         },
         "ETHUSDT": {
@@ -80,7 +81,7 @@ async def test_fix2_nav_includes_mirrored_positions():
             "avg_price": 2295.0,
             "entry_price": 2295.0,
             "mark_price": 2300.0,
-            "_mirrored": True,         # wallet-inherited
+            "_mirrored": True,  # wallet-inherited
             "classification": "EXTERNAL_POSITION",
         },
     }
@@ -93,9 +94,9 @@ async def test_fix2_nav_includes_mirrored_positions():
 
     # ── NAV must include BOTH positions ──
     expected_nav = 14.60 + 25.20 + 78.20
-    assert abs(nav - expected_nav) < 0.01, (
-        f"Fix #2 broken: NAV {nav:.2f} != {expected_nav:.2f} (mirrored ETH not counted)"
-    )
+    assert (
+        abs(nav - expected_nav) < 0.01
+    ), f"Fix #2 broken: NAV {nav:.2f} != {expected_nav:.2f} (mirrored ETH not counted)"
 
     # ── invested_capital must EXCLUDE mirrored ──
     assert abs(invested - 25.20) < 0.01, (
@@ -127,14 +128,16 @@ async def test_fix2_nav_stable_when_mirrored_flag_toggles():
     ss.balances = {"USDT": {"free": 24.60, "locked": 0.0}}
     ss.latest_prices = {"BTCUSDT": 65000.0}
     base_pos = {
-        "quantity": 0.0012,           # value = 78.0
+        "quantity": 0.0012,  # value = 78.0
         "avg_price": 64000.0,
         "entry_price": 64000.0,
         "mark_price": 65000.0,
     }
 
     # State A: _mirrored = True
-    ss.positions = {"BTCUSDT": {**base_pos, "_mirrored": True, "classification": "EXTERNAL_POSITION"}}
+    ss.positions = {
+        "BTCUSDT": {**base_pos, "_mirrored": True, "classification": "EXTERNAL_POSITION"}
+    }
     nav_a = float((await ss.rebuild_nav_from_state(source="toggle_a"))["nav"])
 
     # State B: _mirrored = False (same value, just classification toggled)

@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -173,9 +174,7 @@ def strategy_macd(closes: np.ndarray, *, symbol: str = "") -> Optional[Signal]:
     return Signal(symbol, "HOLD", 0.0, "macd", {"hist": hist})
 
 
-def strategy_ma_crossover(
-    closes: np.ndarray, *, symbol: str = ""
-) -> Optional[Signal]:
+def strategy_ma_crossover(closes: np.ndarray, *, symbol: str = "") -> Optional[Signal]:
     res = ma_crossover(closes)
     if res is None:
         return None
@@ -215,13 +214,9 @@ class NativeSignalEngine:
         enabled: Optional[list[str]] = None,
         cooldown_sec: float = 0.0,
     ) -> None:
-        self._strategies: dict[str, Callable[..., Optional[Signal]]] = dict(
-            BUILTIN_STRATEGIES
-        )
+        self._strategies: dict[str, Callable[..., Optional[Signal]]] = dict(BUILTIN_STRATEGIES)
         self._weights: dict[str, float] = dict(weights or {})
-        self._enabled: set[str] = set(
-            enabled if enabled is not None else self._strategies.keys()
-        )
+        self._enabled: set[str] = set(enabled if enabled is not None else self._strategies.keys())
         self._cooldown_sec = max(0.0, float(cooldown_sec))
         self._last_fired: dict[str, float] = {}  # symbol → ts
 
@@ -258,9 +253,7 @@ class NativeSignalEngine:
     # ──────────────────────────────────────────────────────────────────
     # Evaluation
     # ──────────────────────────────────────────────────────────────────
-    def evaluate(
-        self, symbol: str, klines: list[list[Any]]
-    ) -> Optional[AggregatedSignal]:
+    def evaluate(self, symbol: str, klines: list[list[Any]]) -> Optional[AggregatedSignal]:
         """
         Evaluate all enabled strategies on the given klines.
 

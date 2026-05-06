@@ -277,4 +277,3 @@ The system automatically detects when you've left dust (small remainder) after a
 - Real log examples from DOGE trades
 - How to verify dust status in live system
 - Specific dust configurations for your setup
-

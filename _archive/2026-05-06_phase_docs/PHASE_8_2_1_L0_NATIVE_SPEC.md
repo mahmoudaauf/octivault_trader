@@ -1,9 +1,9 @@
 # Phase 8.2.1: L0 Native Implementation Spec
 
-**Layer:** L0 (Core Utilities)  
-**Scope:** SharedState, TimeUtils, ConfigConstants, RetryManager  
-**Timeline:** 1-2 weeks  
-**Target Completion:** 2026-05-20  
+**Layer:** L0 (Core Utilities)
+**Scope:** SharedState, TimeUtils, ConfigConstants, RetryManager
+**Timeline:** 1-2 weeks
+**Target Completion:** 2026-05-20
 **Expected Cycle Time Improvement:** -20ms (300ms → 280ms)
 
 ---
@@ -58,31 +58,31 @@ core_engine/
 ```python
 class NativeSharedState:
     """Minimal in-memory state (replaces 1,200-line legacy SharedState)"""
-    
+
     def __init__(self):
         # Essential data structures
         self.nav_usdt: float = 0.0
         self.free_balance_usdt: float = 0.0
         self.invested_capital_usdt: float = 0.0
-        
+
         self.positions: dict[str, Position] = {}  # symbol -> Position
         self.open_orders: dict[str, Order] = {}  # order_id -> Order
         self.price_cache: dict[str, float] = {}  # symbol -> latest_price
-        
+
         self.accepted_symbols: set[str] = set()  # actively trading symbols
         self.dust_symbols: set[str] = set()  # below-threshold symbols
-        
+
         # Hydration state
         self._ready_event = asyncio.Event()
-    
+
     async def wait_ready(self):
         """Wait until positions hydrated"""
         await self._ready_event.wait()
-    
+
     def mark_ready(self):
         """Signal positions are ready"""
         self._ready_event.set()
-    
+
     def update_position(self, symbol: str, qty: float, entry: float, current: float):
         """Update position (simple, no invariant checking)"""
         if qty > 0:
@@ -91,11 +91,11 @@ class NativeSharedState:
             )
         else:
             self.positions.pop(symbol, None)
-    
+
     def update_nav(self, nav: float):
         """Update NAV (single source of truth)"""
         self.nav_usdt = nav
-    
+
     def get_nav(self) -> float:
         """Get current NAV"""
         return self.nav_usdt
@@ -126,28 +126,28 @@ from typing import Optional
 
 class NativeTimeUtils:
     """Lightweight time utilities"""
-    
+
     @staticmethod
     def unix_now_ms() -> int:
         """Current Unix timestamp (milliseconds)"""
         return int(time.time() * 1000)
-    
+
     @staticmethod
     def unix_now_s() -> float:
         """Current Unix timestamp (seconds)"""
         return time.time()
-    
+
     @staticmethod
     def iso_now() -> str:
         """ISO8601 timestamp (UTC)"""
         return datetime.now(timezone.utc).isoformat()
-    
+
     @staticmethod
     def align_candle_time(unix_ms: int, interval_sec: int) -> int:
         """Align timestamp to candle boundary"""
         interval_ms = interval_sec * 1000
         return (unix_ms // interval_ms) * interval_ms
-    
+
     @staticmethod
     def seconds_until_next_candle(interval_sec: int) -> float:
         """Seconds until next candle opens"""
@@ -192,11 +192,11 @@ class ConfigGroup:
 
 class ConfigLoader:
     """Load config once at startup"""
-    
+
     def __init__(self):
         self._config: dict[str, ConfigGroup] = {}
         self._load()
-    
+
     def _load(self):
         """Load from .env or defaults"""
         # SYMBOLS
@@ -205,19 +205,19 @@ class ConfigLoader:
             "symbols": symbols.split(","),
             "limit": 10
         })
-        
+
         # CAPITAL
         self._config["CAPITAL"] = ConfigGroup("CAPITAL", {
             "reserve_pct": float(os.getenv("CAPITAL_RESERVE_PCT", "0.10")),
             "min_reserve_usdt": float(os.getenv("MIN_RESERVE_USDT", "10.00"))
         })
-        
+
         # ... etc for other 63 groups
-    
+
     def get(self, group: str, key: str, default: Any = None) -> Any:
         """Get config value"""
         return self._config.get(group, ConfigGroup(group, {})).values.get(key, default)
-    
+
     def get_group(self, group: str) -> dict[str, Any]:
         """Get entire config group"""
         return self._config.get(group, ConfigGroup(group, {})).values
@@ -241,9 +241,9 @@ from typing import Callable, Any
 
 class NativeRetryManager:
     """Simple async retry with exponential backoff"""
-    
+
     def __init__(
-        self, 
+        self,
         max_attempts: int = 3,
         base_delay_sec: float = 0.1,
         max_delay_sec: float = 10.0,
@@ -253,35 +253,35 @@ class NativeRetryManager:
         self.base_delay_sec = base_delay_sec
         self.max_delay_sec = max_delay_sec
         self.jitter = jitter
-    
+
     async def call(
-        self, 
+        self,
         coro_func: Callable,
         *args,
         **kwargs
     ) -> Any:
         """Execute with retries"""
         last_error = None
-        
+
         for attempt in range(1, self.max_attempts + 1):
             try:
                 return await coro_func(*args, **kwargs)
             except Exception as e:
                 last_error = e
-                
+
                 if attempt < self.max_attempts:
                     # Exponential backoff: 0.1s, 0.2s, 0.4s, ...
                     delay = min(
                         self.base_delay_sec * (2 ** (attempt - 1)),
                         self.max_delay_sec
                     )
-                    
+
                     # Add jitter
                     if self.jitter:
                         delay *= (0.5 + random.random())
-                    
+
                     await asyncio.sleep(delay)
-        
+
         raise last_error
 ```
 
@@ -306,15 +306,15 @@ touch core_engine/native/retry_manager.py
 
 async def create_app_context(production: bool = False, native_l0: bool = False):
     """Build app context with L0 choice"""
-    
+
     if not production:
         # Mock mode: always empty dict
         return {}
-    
+
     if native_l0:
         # NEW: Use native L0
         from core_engine.native import NativeSharedState, NativeTimeUtils, ConfigLoader
-        
+
         app_ctx = {
             "shared_state": NativeSharedState(),
             "time_utils": NativeTimeUtils,  # Static class
@@ -380,9 +380,9 @@ Add new test:
 async def test_production_with_native_l0():
     """Test production mode with native L0"""
     from core_engine.integration import create_app_context
-    
+
     app_ctx = await create_app_context(production=True, native_l0=True)
-    
+
     assert "shared_state" in app_ctx
     assert isinstance(app_ctx["shared_state"], NativeSharedState)
     assert app_ctx["shared_state"].get_nav() == 0.0  # Initially empty
@@ -464,8 +464,8 @@ Once L0 native validated:
 
 ---
 
-**Status:** Ready for implementation  
-**Owner:** @mauf  
-**Start Date:** 2026-05-07  
-**Target Completion:** 2026-05-20  
+**Status:** Ready for implementation
+**Owner:** @mauf
+**Start Date:** 2026-05-07
+**Target Completion:** 2026-05-20
 **Est. Effort:** 40-60 hours

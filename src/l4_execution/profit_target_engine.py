@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 
 class ProfitTargetEngine:
@@ -37,9 +37,7 @@ class ProfitTargetEngine:
         self.logger = logger or logging.getLogger(self.component_name)
 
         # --- Config knobs ---
-        self.daily_target_pct = float(
-            getattr(config, "PROFIT_TARGET_DAILY_PCT", 0.02) or 0.02
-        )
+        self.daily_target_pct = float(getattr(config, "PROFIT_TARGET_DAILY_PCT", 0.02) or 0.02)
         self.max_risk_per_cycle = float(
             getattr(config, "PROFIT_TARGET_MAX_RISK_PER_CYCLE", 0.005) or 0.005
         )
@@ -49,9 +47,7 @@ class ProfitTargetEngine:
         self.base_usd_per_hour = float(
             getattr(config, "PROFIT_TARGET_BASE_USD_PER_HOUR", 0.0) or 0.0
         )
-        self.grace_minutes = float(
-            getattr(config, "PROFIT_TARGET_GRACE_MINUTES", 30.0) or 30.0
-        )
+        self.grace_minutes = float(getattr(config, "PROFIT_TARGET_GRACE_MINUTES", 30.0) or 30.0)
 
         # Internal bookkeeping
         self._start_time = time.time()
@@ -75,16 +71,17 @@ class ProfitTargetEngine:
         # Initialize daily tracking if not already done
         if self._day_start_ts == 0.0:
             import datetime as _dt
-            self._day_start_ts = _dt.datetime.utcnow().replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).timestamp()
+
+            self._day_start_ts = (
+                _dt.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            )
         self.logger.info("[PTE] ProfitTargetEngine started successfully")
 
     # ------------------------------------------------------------------
     # Public API — wired as SharedState profit guard
     # ------------------------------------------------------------------
 
-    async def check_global_compliance(self, context: Dict[str, Any]) -> bool:
+    async def check_global_compliance(self, context: dict[str, Any]) -> bool:
         """
         Called by SharedState.profit_target_ok() on every BUY attempt.
 
@@ -179,9 +176,9 @@ class ProfitTargetEngine:
         """Reset daily counters if calendar day changed (UTC)."""
         import datetime as _dt
 
-        today_start = _dt.datetime.utcnow().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).timestamp()
+        today_start = (
+            _dt.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        )
         if self._day_start_ts < today_start:
             self._daily_realized = 0.0
             self._daily_anchor_nav = 0.0

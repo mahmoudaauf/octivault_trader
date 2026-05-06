@@ -13,9 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import types
-
-import pytest
 
 from src.l4_execution.execution_manager import ExecutionManager
 
@@ -40,6 +37,7 @@ def _make_em(monkeypatch) -> ExecutionManager:
     em = ExecutionManager.__new__(ExecutionManager)
     em.shared_state = _StubSharedState()
     import logging
+
     em.logger = logging.getLogger("test_em")
     return em
 

@@ -82,9 +82,7 @@ class NativeExecutor:
         for dec in decisions:
             # Dedup gate
             if dec.decision_id in self._executed_ids:
-                logger.debug(
-                    "decision %s already executed; skipping", dec.decision_id
-                )
+                logger.debug("decision %s already executed; skipping", dec.decision_id)
                 continue
 
             result = await self._execute_one(dec)
@@ -140,9 +138,7 @@ class NativeExecutor:
     # ──────────────────────────────────────────────────────────────────
     # Order placement
     # ──────────────────────────────────────────────────────────────────
-    async def _place_order(
-        self, decision: Decision, result: ExecutionResult
-    ) -> ExecutionResult:
+    async def _place_order(self, decision: Decision, result: ExecutionResult) -> ExecutionResult:
         """Place a new order (BUY)."""
         from core_engine.native.decisions import Action
 
@@ -174,9 +170,7 @@ class NativeExecutor:
 
         return result
 
-    async def _close_position(
-        self, decision: Decision, result: ExecutionResult
-    ) -> ExecutionResult:
+    async def _close_position(self, decision: Decision, result: ExecutionResult) -> ExecutionResult:
         """Close an existing position (SELL at market)."""
         from core_engine.native.decisions import Action
 
@@ -212,9 +206,7 @@ class NativeExecutor:
         """Classify an error as retryable or terminal."""
         error_lower = error_msg.lower()
         # Retryable: rate limit, network, timeout
-        if any(
-            x in error_lower for x in ["429", "timeout", "network", "503", "502"]
-        ):
+        if any(x in error_lower for x in ["429", "timeout", "network", "503", "502"]):
             return ExecutionStatus.RETRYABLE
         # Terminal: invalid request, insufficient balance, etc.
         if any(x in error_lower for x in ["insufficient", "invalid", "rejected"]):

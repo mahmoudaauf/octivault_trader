@@ -11,14 +11,23 @@ def _toy_strategy(ctx: dict, *, seed: int = 42) -> list:
     intents = []
     for sym in ctx.get("symbols", []):
         if rng.random() > 0.5:
-            intents.append({"id": f"{sym}-i", "symbol": sym, "side": "BUY",
-                            "qty": 0.01, "price": ctx["prices"][sym]})
+            intents.append(
+                {
+                    "id": f"{sym}-i",
+                    "symbol": sym,
+                    "side": "BUY",
+                    "qty": 0.01,
+                    "price": ctx["prices"][sym],
+                }
+            )
     return intents
 
 
 def test_l5_is_deterministic_with_fixed_seed():
-    ctx = {"symbols": ["BTC", "ETH", "SOL"],
-           "prices": {"BTC": 40000.0, "ETH": 2500.0, "SOL": 100.0}}
+    ctx = {
+        "symbols": ["BTC", "ETH", "SOL"],
+        "prices": {"BTC": 40000.0, "ETH": 2500.0, "SOL": 100.0},
+    }
     a = _toy_strategy(ctx, seed=42)
     b = _toy_strategy(ctx, seed=42)
     assert a == b

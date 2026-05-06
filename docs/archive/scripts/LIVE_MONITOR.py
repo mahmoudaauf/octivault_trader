@@ -14,32 +14,44 @@ Reads from:
 Refreshes every 10 seconds.
 """
 
-import os, sys, time, json, re, subprocess
-from pathlib import Path
+import os
+import re
+import subprocess
+import sys
+import time
 from datetime import datetime
-from collections import defaultdict
+from pathlib import Path
 
 # ── path setup ────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv
+
 load_dotenv(ROOT / ".env")
 
 # ── colour codes ──────────────────────────────────────────────────────────────
-GRN  = '\033[92m';  YLW  = '\033[93m';  RED  = '\033[91m'
-CYN  = '\033[96m';  BLU  = '\033[94m';  MAG  = '\033[95m'
-BLD  = '\033[1m';   DIM  = '\033[2m';   RST  = '\033[0m'
+GRN = "\033[92m"
+YLW = "\033[93m"
+RED = "\033[91m"
+CYN = "\033[96m"
+BLU = "\033[94m"
+MAG = "\033[95m"
+BLD = "\033[1m"
+DIM = "\033[2m"
+RST = "\033[0m"
 
-LOG_FILE   = ROOT / "logs" / "octivault_master_orchestrator.log"
-REFRESH_S  = 10   # dashboard refresh interval
+LOG_FILE = ROOT / "logs" / "octivault_master_orchestrator.log"
+REFRESH_S = 10  # dashboard refresh interval
+
 
 # ── Binance REST fetch ─────────────────────────────────────────────────────────
 def _fetch_balances():
     """Return {asset: free_float} from Binance via python-binance."""
     try:
         from binance.client import Client
-        api_key    = os.getenv("BINANCE_API_KEY", "")
+
+        api_key = os.getenv("BINANCE_API_KEY", "")
         api_secret = os.getenv("BINANCE_API_SECRET_HMAC", "")
         if not (api_key and api_secret):
             return {}
@@ -58,7 +70,8 @@ def _fetch_prices(symbols):
     """Return {symbol: float_price}."""
     try:
         from binance.client import Client
-        api_key    = os.getenv("BINANCE_API_KEY", "")
+
+        api_key = os.getenv("BINANCE_API_KEY", "")
         api_secret = os.getenv("BINANCE_API_SECRET_HMAC", "")
         c = Client(api_key, api_secret)
         tickers = c.get_all_tickers()
@@ -88,15 +101,15 @@ def _nav_from_balances(balances, prices):
 
 
 # ── log parser ────────────────────────────────────────────────────────────────
-_LOG_TAIL = 500   # lines to scan
+_LOG_TAIL = 500  # lines to scan
+
 
 def _tail_log(n=_LOG_TAIL):
     if not LOG_FILE.exists():
         return []
     try:
         result = subprocess.run(
-            ["tail", "-n", str(n), str(LOG_FILE)],
-            capture_output=True, text=True, timeout=5
+            ["tail", "-n", str(n), str(LOG_FILE)], capture_output=True, text=True, timeout=5
         )
         return result.stdout.splitlines()
     except Exception:
@@ -106,24 +119,27 @@ def _tail_log(n=_LOG_TAIL):
 def _parse_log_events(lines):
     """Extract key events from recent log lines."""
     events = {
-        "trades":        [],  # (ts, side, symbol, quote)
-        "regime":        "unknown",
-        "compounding":   [],  # log lines about compounding
-        "errors":        [],
-        "gate_passed":   0,
-        "gate_dropped":  0,
-        "recovery":      None,
+        "trades": [],  # (ts, side, symbol, quote)
+        "regime": "unknown",
+        "compounding": [],  # log lines about compounding
+        "errors": [],
+        "gate_passed": 0,
+        "gate_dropped": 0,
+        "recovery": None,
         "last_cycle_ts": None,
     }
 
-    trade_re     = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*\[(?:EXEC|BUY|SELL)\].*?(BUY|SELL)\s+(\w+).*?\$?([\d.]+)", re.I)
-    regime_re    = re.compile(r"regime[=:]\s*([A-Z_]+)", re.I)
-    gate_ok_re   = re.compile(r"Filtered intents.*out=(\d+)")
+    trade_re = re.compile(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*\[(?:EXEC|BUY|SELL)\].*?(BUY|SELL)\s+(\w+).*?\$?([\d.]+)",
+        re.I,
+    )
+    regime_re = re.compile(r"regime[=:]\s*([A-Z_]+)", re.I)
+    gate_ok_re = re.compile(r"Filtered intents.*out=(\d+)")
     gate_drop_re = re.compile(r"Filtered intents.*dropped=(\d+)")
-    compound_re  = re.compile(r"compound|reinvest|CompoundingEngine", re.I)
-    error_re     = re.compile(r"\bERROR\b|\bCRITICAL\b", re.I)
-    cycle_re     = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*\[Meta.*cycle\]", re.I)
-    recovery_re  = re.compile(r"StartupOrchestrator complete|positions hydrated", re.I)
+    compound_re = re.compile(r"compound|reinvest|CompoundingEngine", re.I)
+    error_re = re.compile(r"\bERROR\b|\bCRITICAL\b", re.I)
+    cycle_re = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*\[Meta.*cycle\]", re.I)
+    recovery_re = re.compile(r"StartupOrchestrator complete|positions hydrated", re.I)
 
     for line in lines[-_LOG_TAIL:]:
         # trades
@@ -155,7 +171,7 @@ def _parse_log_events(lines):
         if recovery_re.search(line):
             events["recovery"] = line.strip()[-100:]
 
-    events["trades"] = events["trades"][-5:]        # last 5 trades
+    events["trades"] = events["trades"][-5:]  # last 5 trades
     events["compounding"] = events["compounding"][-3:]
     events["errors"] = events["errors"][-5:]
     return events
@@ -166,7 +182,10 @@ def _bot_running():
     try:
         r = subprocess.run(
             "ps aux | grep 'MASTER_SYSTEM_ORCHESTRATOR' | grep -v grep | wc -l",
-            shell=True, capture_output=True, text=True, timeout=3
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
         )
         return int(r.stdout.strip()) > 0
     except Exception:
@@ -174,7 +193,7 @@ def _bot_running():
 
 
 # ── dashboard render ──────────────────────────────────────────────────────────
-def _bar(pct, width=30, filled='█', empty='░'):
+def _bar(pct, width=30, filled="█", empty="░"):
     pct = max(0.0, min(1.0, pct))
     n = int(pct * width)
     return filled * n + empty * (width - n)
@@ -222,22 +241,28 @@ def _render(balances, prices, events, session_start_nav, snapshot_ts):
             pct = val / nav if nav > 0 else 0.0
             bar = _bar(pct, width=20)
             if asset == "USDT":
-                print(f"     {BLD}{asset:<8}{RST}  {val:>10.4f} USDT  {DIM}{bar} {pct*100:.1f}%{RST}")
+                print(
+                    f"     {BLD}{asset:<8}{RST}  {val:>10.4f} USDT  {DIM}{bar} {pct*100:.1f}%{RST}"
+                )
             else:
                 price = prices.get(asset + "USDT", 0.0)
-                print(f"     {BLD}{asset:<8}{RST}  {qty:>12.6f}  @ ${price:,.2f}  = ${val:>9.4f}  {DIM}{bar} {pct*100:.1f}%{RST}")
+                print(
+                    f"     {BLD}{asset:<8}{RST}  {qty:>12.6f}  @ ${price:,.2f}  = ${val:>9.4f}  {DIM}{bar} {pct*100:.1f}%{RST}"
+                )
     print()
 
     # ── Regime & Engine Status ──
     print(f"{BLD}  🧠 Engine Status{RST}")
     print(f"     Market Regime   : {regime_color}{BLD}{regime}{RST}")
     print(f"     Last Cycle      : {DIM}{events['last_cycle_ts'] or 'none yet'}{RST}")
-    passed  = events["gate_passed"]
+    passed = events["gate_passed"]
     dropped = events["gate_dropped"]
-    total   = passed + dropped
+    total = passed + dropped
     gate_pct = (passed / total * 100) if total > 0 else 0
     gate_color = GRN if gate_pct > 50 else (YLW if gate_pct > 0 else RED)
-    print(f"     Signal Gate     : {gate_color}{passed} passed / {dropped} dropped{RST}  (last {_LOG_TAIL} log lines)")
+    print(
+        f"     Signal Gate     : {gate_color}{passed} passed / {dropped} dropped{RST}  (last {_LOG_TAIL} log lines)"
+    )
     print()
 
     # ── Recent Trades ──
@@ -283,7 +308,7 @@ def main():
     print(f"{DIM}Fetching initial portfolio state from Binance...{RST}")
 
     session_start_nav = None
-    snapshot_ts       = None
+    snapshot_ts = None
 
     try:
         while True:
@@ -299,7 +324,7 @@ def main():
 
             # Build price map for assets we hold
             symbols = [a + "USDT" for a in balances if a != "USDT" and not a.startswith("_")]
-            prices  = _fetch_prices(symbols)
+            prices = _fetch_prices(symbols)
 
             nav, _ = _nav_from_balances(balances, prices)
             if session_start_nav is None and nav > 0:
@@ -307,7 +332,7 @@ def main():
                 snapshot_ts = datetime.now().isoformat()
 
             # Parse log
-            lines  = _tail_log()
+            lines = _tail_log()
             events = _parse_log_events(lines)
 
             # Render

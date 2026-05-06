@@ -10,7 +10,7 @@ opportunity-cost pressure.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict
+from typing import Any
 
 from utils.shared_state_tools import fee_bps
 
@@ -32,7 +32,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _infer_liquidity_component(
     symbol: str,
-    position: Dict[str, Any],
+    position: dict[str, Any],
     shared_state: Any = None,
 ) -> float:
     """
@@ -76,7 +76,7 @@ def _infer_liquidity_component(
     return 0.5
 
 
-def _infer_forward_edge_component(position: Dict[str, Any]) -> float:
+def _infer_forward_edge_component(position: dict[str, Any]) -> float:
     pos = position if isinstance(position, dict) else {}
     for key in (
         "continuation_score",
@@ -91,7 +91,9 @@ def _infer_forward_edge_component(position: Dict[str, Any]) -> float:
     return 0.5
 
 
-def _infer_position_value_usdt(symbol: str, position: Dict[str, Any], shared_state: Any = None) -> float:
+def _infer_position_value_usdt(
+    symbol: str, position: dict[str, Any], shared_state: Any = None
+) -> float:
     pos = position if isinstance(position, dict) else {}
     value = _safe_float(pos.get("value_usdt"), 0.0)
     if value > 0:
@@ -102,16 +104,15 @@ def _infer_position_value_usdt(symbol: str, position: Dict[str, Any], shared_sta
         return 0.0
 
     px = _safe_float(
-        pos.get("mark_price")
-        or pos.get("avg_price")
-        or pos.get("entry_price")
-        or pos.get("price"),
+        pos.get("mark_price") or pos.get("avg_price") or pos.get("entry_price") or pos.get("price"),
         0.0,
     )
     if px <= 0 and shared_state is not None:
         try:
             prices = getattr(shared_state, "latest_prices", {}) or {}
-            px = _safe_float((prices.get(_norm_symbol(symbol)) if isinstance(prices, dict) else 0.0), 0.0)
+            px = _safe_float(
+                (prices.get(_norm_symbol(symbol)) if isinstance(prices, dict) else 0.0), 0.0
+            )
         except Exception:
             px = 0.0
     return qty * px if px > 0 else 0.0
@@ -135,13 +136,13 @@ def _round_trip_fee_pct(shared_state: Any = None, config: Any = None) -> float:
 
 def compute_holding_utility(
     symbol: str,
-    position: Dict[str, Any],
+    position: dict[str, Any],
     *,
     best_opp_score: float = 0.0,
     shared_state: Any = None,
     config: Any = None,
     now_ts: float = 0.0,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """
     Compute unified utility and rotation pressure for a held position.
 
@@ -162,7 +163,9 @@ def compute_holding_utility(
     min_significant = 25.0
     if config is not None:
         max_hold_sec = _safe_float(getattr(config, "MAX_HOLD_SEC", max_hold_sec), max_hold_sec)
-        stale_mult = _safe_float(getattr(config, "HOLDING_UTILITY_STALE_MULT", stale_mult), stale_mult)
+        stale_mult = _safe_float(
+            getattr(config, "HOLDING_UTILITY_STALE_MULT", stale_mult), stale_mult
+        )
         target_pnl_pct = _safe_float(
             getattr(config, "HOLDING_UTILITY_TARGET_PNL_PCT", target_pnl_pct),
             target_pnl_pct,

@@ -117,38 +117,38 @@ TestPhase4Summary (1 test)
      • get_account_state() → account balance info
      • get_market_prices(symbols) → current market prices
      • get_wallet_balance() → total wallet value
-   
+
    UNDERSTAND Phase:
      • get_portfolio_snapshot() → portfolio state
      • get_all_signals() → list of active signals
      • get_market_regime() → market conditions
-   
+
    DECIDE Phase:
      • get_current_mode() → current trading mode
      • evaluate_signal(symbol, action, edge) → arbitration result
      • make_buy_decision(symbol, edge) → buy/no-buy decision
-   
+
    EXECUTE Phase:
      • validate_order(symbol, action, qty, price) → validation result
      • place_buy_order(symbol, qty, price) → order result
      • place_sell_order(symbol, qty, price) → order result + FIX #2
-   
+
    RECOVER Phase:
      • get_health_report() → system health status
 
 3. FIX #2 GUARD TESTS (Critical for Safety)
    ─────────────────────────────────────────
    Purpose: Ensure duplicate SELL orders cannot execute on recovery
-   
+
    Test 1 - Caching:
      • Place SELL order → result cached
      • Verify cache key exists
-   
+
    Test 2 - Duplicate Prevention:
      • Simulate first SELL execution → cached
      • Attempt second SELL (on recovery) → blocked by cache
      • Verify cache lookup prevents duplicate
-   
+
    Test 3 - TTL Expiration:
      • Set cache entry with 5-minute TTL
      • Verify entry exists during TTL window
@@ -157,12 +157,12 @@ TestPhase4Summary (1 test)
 4. ERROR HANDLING TESTS
    ────────────────────
    Purpose: Verify system handles errors gracefully
-   
+
    Test 1 - Invalid Orders:
      • Negative price → rejected
      • Zero quantity → rejected
      • Invalid symbol format → rejected
-   
+
    Test 2 - System Recovery:
      • Simulate component error
      • Verify health_monitor catches it
@@ -171,7 +171,7 @@ TestPhase4Summary (1 test)
 5. COMPONENT WIRING TESTS
    ──────────────────────
    Purpose: Verify each engine can access its required components
-   
+
    Wiring Map:
      MarketAccountEngine → exchange_client (L1), market_data_feed (L2)
      SituationEngine → portfolio_manager (L3), signal_manager (L5)

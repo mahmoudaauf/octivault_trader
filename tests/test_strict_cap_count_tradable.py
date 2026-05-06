@@ -14,10 +14,6 @@ on a minimally-stubbed instance, exercising only the lines we changed.
 from __future__ import annotations
 
 import asyncio
-import os
-import types
-
-import pytest
 
 from src.l8_lifecycle.meta_controller import MetaController
 
@@ -42,6 +38,7 @@ def _make_meta_with(positions: dict, classification: dict) -> MetaController:
     mc.shared_state = _StubSharedState(positions, classification)
     # _count_significant_positions only uses self.logger and self.shared_state
     import logging
+
     mc.logger = logging.getLogger("test")
     return mc
 
@@ -60,8 +57,8 @@ def test_strict_cap_disabled_dust_does_not_count(monkeypatch):
 
     positions = {
         "AAA/USDT": _pos(1, 100),  # significant
-        "BBB/USDT": _pos(1, 10),   # tradable-dust ($10)
-        "CCC/USDT": _pos(1, 8),    # tradable-dust ($8)
+        "BBB/USDT": _pos(1, 10),  # tradable-dust ($10)
+        "CCC/USDT": _pos(1, 8),  # tradable-dust ($8)
     }
     classification = {
         "significant": ["AAA/USDT"],
@@ -73,7 +70,7 @@ def test_strict_cap_disabled_dust_does_not_count(monkeypatch):
     total, sig, dust = asyncio.run(mc._count_significant_positions())
 
     assert total == 3
-    assert sig == 1   # ← only the truly significant one
+    assert sig == 1  # ← only the truly significant one
     assert dust == 2
 
 
@@ -84,9 +81,9 @@ def test_strict_cap_enabled_promotes_tradable_dust(monkeypatch):
 
     positions = {
         "AAA/USDT": _pos(1, 100),  # significant — already in sig
-        "BBB/USDT": _pos(1, 10),   # dust $10 — promoted
-        "CCC/USDT": _pos(1, 8),    # dust $8  — promoted
-        "DDD/USDT": _pos(1, 3),    # dust $3  — NOT promoted
+        "BBB/USDT": _pos(1, 10),  # dust $10 — promoted
+        "CCC/USDT": _pos(1, 8),  # dust $8  — promoted
+        "DDD/USDT": _pos(1, 3),  # dust $3  — NOT promoted
     }
     classification = {
         "significant": ["AAA/USDT"],
@@ -98,7 +95,7 @@ def test_strict_cap_enabled_promotes_tradable_dust(monkeypatch):
     total, sig, dust = asyncio.run(mc._count_significant_positions())
 
     assert total == 4
-    assert sig == 3   # AAA + BBB + CCC promoted
+    assert sig == 3  # AAA + BBB + CCC promoted
     assert dust == 1  # only DDD remains dust
 
 
@@ -124,7 +121,7 @@ def test_strict_cap_doge_scenario(monkeypatch):
     total, sig, dust = asyncio.run(mc._count_significant_positions())
 
     assert total == 33
-    assert sig == 33    # all promoted
+    assert sig == 33  # all promoted
     assert dust == 0
     # In _is_portfolio_full(total=33, sig=33, dust=0, max_pos=2),
     # CAPACITY_COUNT_SIGNIFICANT_ONLY mode → sig (33) >= max_pos (2) → FULL ✅
@@ -136,8 +133,8 @@ def test_strict_cap_min_value_floor_excludes_micro_dust(monkeypatch):
     monkeypatch.setenv("STRICT_CAP_MIN_VALUE_USDT", "10")  # higher floor
 
     positions = {
-        "OK/USDT":    _pos(1, 15),  # ≥ $10 → promoted
-        "MICRO/USDT": _pos(1, 5),   # <  $10 → stays dust
+        "OK/USDT": _pos(1, 15),  # ≥ $10 → promoted
+        "MICRO/USDT": _pos(1, 5),  # <  $10 → stays dust
     }
     classification = {
         "significant": [],

@@ -14,16 +14,15 @@ Usage:
     python3 tools/detect_balance_symbols.py --mock    # offline demo data
 """
 
+import argparse
 import asyncio
 import json
-import sys
-import argparse
 import logging
-from pathlib import Path
+import sys
+from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Any
-from decimal import Decimal
-from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Optional
 
 # Ensure project root is on path
 _ROOT = Path(__file__).resolve().parent.parent
@@ -45,6 +44,7 @@ logger = logging.getLogger(__name__)
 # Data models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class SymbolBalance:
     asset: str
@@ -64,7 +64,7 @@ class SymbolBalance:
         stablecoins = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI", "USDE"}
         return self.asset.upper() in stablecoins
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -74,7 +74,7 @@ class SymbolSituation:
     symbol: str
     balance: SymbolBalance
 
-    classification: str           # CLEAN | MICRO_DUST | HARD_DUST | DUST_LOCKED | CASH
+    classification: str  # CLEAN | MICRO_DUST | HARD_DUST | DUST_LOCKED | CASH
     dust_reason: Optional[str] = None
 
     usd_value: float = 0.0
@@ -84,15 +84,15 @@ class SymbolSituation:
     is_locked: bool = False
     can_be_sold: bool = True
 
-    action_recommended: str = "HOLD"   # HOLD | SELL | MONITOR | INVESTIGATE
+    action_recommended: str = "HOLD"  # HOLD | SELL | MONITOR | INVESTIGATE
     healing_eligible: bool = False
-    healing_priority: int = 0          # 0=none 1=low 2=medium 3=high
+    healing_priority: int = 0  # 0=none 1=low 2=medium 3=high
 
     added_at: Optional[float] = None
     age_days: float = 0.0
     notes: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "asset": self.asset,
             "symbol": self.symbol,
@@ -117,8 +117,9 @@ class SymbolSituation:
 # Core analyser
 # ---------------------------------------------------------------------------
 
+
 class BalanceSymbolDetector:
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[dict[str, Any]] = None):
         self.config = config or {}
         self.stablecoins = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI", "USDE"}
         self.min_dust_threshold = self.config.get("min_dust_threshold", 5.0)
@@ -131,8 +132,8 @@ class BalanceSymbolDetector:
         )
 
     def detect_symbols_from_balance(
-        self, balances: Dict[str, Dict[str, float]]
-    ) -> List[SymbolBalance]:
+        self, balances: dict[str, dict[str, float]]
+    ) -> list[SymbolBalance]:
         symbols = []
         logger.info(f"Scanning {len(balances)} assets for non-zero balances...")
 
@@ -156,9 +157,7 @@ class BalanceSymbolDetector:
         logger.info(f"Detected {len(symbols)} non-zero symbols")
         return symbols
 
-    def classify_symbol(
-        self, balance: SymbolBalance, prices: Dict[str, float]
-    ) -> SymbolSituation:
+    def classify_symbol(self, balance: SymbolBalance, prices: dict[str, float]) -> SymbolSituation:
         asset = balance.asset
         symbol = balance.symbol or f"{asset}USDT"
         qty = balance.total
@@ -176,7 +175,9 @@ class BalanceSymbolDetector:
             usd_value = qty * price
             if usd_value < self.min_dust_threshold:
                 classification = "DUST_LOCKED"
-                dust_reason = f"below_dust_threshold (${usd_value:.2f} < ${self.min_dust_threshold})"
+                dust_reason = (
+                    f"below_dust_threshold (${usd_value:.2f} < ${self.min_dust_threshold})"
+                )
             elif usd_value < self.min_productive_threshold:
                 classification = "MICRO_DUST"
                 dust_reason = f"below_productive_threshold (${usd_value:.2f} < ${self.min_productive_threshold})"
@@ -234,16 +235,16 @@ class BalanceSymbolDetector:
 
     def analyze_portfolio(
         self,
-        balances: Dict[str, Dict[str, float]],
-        prices: Dict[str, float],
-    ) -> Dict[str, Any]:
+        balances: dict[str, dict[str, float]],
+        prices: dict[str, float],
+    ) -> dict[str, Any]:
         logger.info("=" * 80)
         logger.info("PORTFOLIO ANALYSIS")
         logger.info("=" * 80)
 
         symbols = self.detect_symbols_from_balance(balances)
 
-        situations: List[SymbolSituation] = []
+        situations: list[SymbolSituation] = []
         total_value = 0.0
 
         logger.info("Classifying symbols...")
@@ -260,7 +261,7 @@ class BalanceSymbolDetector:
             if total_value > 0:
                 situation.percentage_of_portfolio = (situation.usd_value / total_value) * 100
 
-        by_class: Dict[str, list] = {}
+        by_class: dict[str, list] = {}
         for situation in situations:
             by_class.setdefault(situation.classification, []).append(situation)
 
@@ -286,10 +287,10 @@ class BalanceSymbolDetector:
 
     def _generate_summary(
         self,
-        situations: List[SymbolSituation],
+        situations: list[SymbolSituation],
         total_value: float,
-        by_class: Dict[str, list],
-    ) -> Dict[str, Any]:
+        by_class: dict[str, list],
+    ) -> dict[str, Any]:
         cash_value = sum(s.usd_value for s in situations if s.classification == "CASH")
         clean_value = sum(s.usd_value for s in situations if s.classification == "CLEAN")
         dust_value = sum(
@@ -326,7 +327,8 @@ class BalanceSymbolDetector:
 # Live exchange data fetch
 # ---------------------------------------------------------------------------
 
-async def fetch_live_data() -> tuple[Dict[str, Dict[str, float]], Dict[str, float]]:
+
+async def fetch_live_data() -> tuple[dict[str, dict[str, float]], dict[str, float]]:
     """Connect to ExchangeClient and pull real balances + prices."""
     from src.l0_core.config import Config
     from src.l0_core.shared_state import SharedState
@@ -337,7 +339,7 @@ async def fetch_live_data() -> tuple[Dict[str, Dict[str, float]], Dict[str, floa
     exchange = ExchangeClient(config=config, shared_state=shared_state)
 
     logger.info("Fetching balances from exchange...")
-    balances: Dict[str, Dict[str, float]] = await exchange.get_account_balances()
+    balances: dict[str, dict[str, float]] = await exchange.get_account_balances()
 
     # Build a set of symbols we need prices for
     assets_needed = {
@@ -348,7 +350,7 @@ async def fetch_live_data() -> tuple[Dict[str, Dict[str, float]], Dict[str, floa
     }
 
     logger.info(f"Fetching prices for {len(assets_needed)} symbols...")
-    prices: Dict[str, float] = {}
+    prices: dict[str, float] = {}
     try:
         all_tickers = await exchange.get_all_tickers()
         for ticker in all_tickers:
@@ -373,26 +375,27 @@ async def fetch_live_data() -> tuple[Dict[str, Dict[str, float]], Dict[str, floa
 # Mock data (offline demo)
 # ---------------------------------------------------------------------------
 
-def load_mock_balances() -> Dict[str, Dict[str, float]]:
+
+def load_mock_balances() -> dict[str, dict[str, float]]:
     return {
         "USDT": {"free": 250.50, "locked": 0.0},
-        "BTC":  {"free": 0.0015, "locked": 0.0},
-        "ETH":  {"free": 0.045,  "locked": 0.0},
-        "ADA":  {"free": 2156.8, "locked": 0.0},
+        "BTC": {"free": 0.0015, "locked": 0.0},
+        "ETH": {"free": 0.045, "locked": 0.0},
+        "ADA": {"free": 2156.8, "locked": 0.0},
         "SHIB": {"free": 521_000_000, "locked": 0.0},
-        "RAY":  {"free": 5000,   "locked": 0.0},
-        "BNB":  {"free": 0.0003, "locked": 0.0},
+        "RAY": {"free": 5000, "locked": 0.0},
+        "BNB": {"free": 0.0003, "locked": 0.0},
     }
 
 
-def load_mock_prices() -> Dict[str, float]:
+def load_mock_prices() -> dict[str, float]:
     return {
-        "BTCUSDT":  45000.0,
-        "ETHUSDT":  2800.0,
-        "ADAUSDT":  0.42,
+        "BTCUSDT": 45000.0,
+        "ETHUSDT": 2800.0,
+        "ADAUSDT": 0.42,
         "SHIBUSDT": 0.000008,
-        "RAYUSDT":  0.0015,
-        "BNBUSDT":  3000.0,
+        "RAYUSDT": 0.0015,
+        "BNBUSDT": 3000.0,
     }
 
 
@@ -400,18 +403,25 @@ def load_mock_prices() -> Dict[str, float]:
 # Report printer
 # ---------------------------------------------------------------------------
 
-def print_analysis(report: Dict[str, Any]) -> None:
+
+def print_analysis(report: dict[str, Any]) -> None:
     summary = report.get("portfolio_summary", {})
 
     print("\n" + "=" * 100)
     print("BALANCE SYMBOL DETECTION & SITUATION ANALYSIS")
     print("=" * 100)
 
-    print(f"\nPORTFOLIO SNAPSHOT:")
+    print("\nPORTFOLIO SNAPSHOT:")
     print(f"  Total Value:        ${summary.get('total_value_usd', 0):>10.2f}")
-    print(f"  Cash (stablecoins): ${summary.get('cash_value_usd', 0):>10.2f}  ({summary.get('cash_ratio', 0):.1f}%)")
-    print(f"  Clean Positions:    ${summary.get('clean_positions_value_usd', 0):>10.2f}  ({summary.get('clean_ratio', 0):.1f}%)")
-    print(f"  Dust Positions:     ${summary.get('dust_value_usd', 0):>10.2f}  ({summary.get('dust_ratio', 0):.1f}%)")
+    print(
+        f"  Cash (stablecoins): ${summary.get('cash_value_usd', 0):>10.2f}  ({summary.get('cash_ratio', 0):.1f}%)"
+    )
+    print(
+        f"  Clean Positions:    ${summary.get('clean_positions_value_usd', 0):>10.2f}  ({summary.get('clean_ratio', 0):.1f}%)"
+    )
+    print(
+        f"  Dust Positions:     ${summary.get('dust_value_usd', 0):>10.2f}  ({summary.get('dust_ratio', 0):.1f}%)"
+    )
     print(f"  Health Status:      {summary.get('health_status', 'UNKNOWN')}")
 
     print(f"\nSYMBOLS DETECTED: {report.get('total_symbols', 0)}")
@@ -419,13 +429,15 @@ def print_analysis(report: Dict[str, Any]) -> None:
         print(f"    {cls:15s}: {count}")
 
     healing = report.get("healing_analysis", {})
-    print(f"\nHEALING CANDIDATES: {healing.get('healing_eligible_count', 0)}  "
-          f"(${healing.get('healing_eligible_value_usd', 0):.2f} recoverable)")
+    print(
+        f"\nHEALING CANDIDATES: {healing.get('healing_eligible_count', 0)}  "
+        f"(${healing.get('healing_eligible_value_usd', 0):.2f} recoverable)"
+    )
 
-    print(f"\nDETAILED SYMBOL SITUATIONS:")
+    print("\nDETAILED SYMBOL SITUATIONS:")
     print("-" * 100)
 
-    by_class: Dict[str, list] = {}
+    by_class: dict[str, list] = {}
     for sit in report.get("situations", []):
         by_class.setdefault(sit.get("classification", "?"), []).append(sit)
 
@@ -436,13 +448,15 @@ def print_analysis(report: Dict[str, Any]) -> None:
         print(f"\n  {cls} ({len(rows)} symbols):")
         print(f"  {'-' * 96}")
         for sit in rows:
-            asset  = sit.get("asset", "?")
-            qty    = sit.get("balance", {}).get("total", 0)
-            value  = sit.get("usd_value", 0)
-            pct    = sit.get("percentage_of_portfolio", 0)
+            asset = sit.get("asset", "?")
+            qty = sit.get("balance", {}).get("total", 0)
+            value = sit.get("usd_value", 0)
+            pct = sit.get("percentage_of_portfolio", 0)
             action = sit.get("action_recommended", "?")
-            notes  = sit.get("notes", "")
-            print(f"    {asset:8s} | {qty:>18.8f} qty | ${value:>10.2f} ({pct:>5.1f}%) | {action:10s}")
+            notes = sit.get("notes", "")
+            print(
+                f"    {asset:8s} | {qty:>18.8f} qty | ${value:>10.2f} ({pct:>5.1f}%) | {action:10s}"
+            )
             if notes and cls != "CASH":
                 print(f"             -> {notes}")
 
@@ -455,20 +469,23 @@ def print_analysis(report: Dict[str, Any]) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def async_main(use_mock: bool) -> Dict[str, Any]:
+
+async def async_main(use_mock: bool) -> dict[str, Any]:
     if use_mock:
         logger.info("Running in MOCK mode (offline demo data)")
         balances = load_mock_balances()
-        prices   = load_mock_prices()
+        prices = load_mock_prices()
     else:
         logger.info("Connecting to exchange for live data...")
         balances, prices = await fetch_live_data()
 
-    detector = BalanceSymbolDetector(config={
-        "min_dust_threshold":      5.0,
-        "min_productive_threshold": 25.0,
-        "stale_days":              30,
-    })
+    detector = BalanceSymbolDetector(
+        config={
+            "min_dust_threshold": 5.0,
+            "min_productive_threshold": 25.0,
+            "stale_days": 30,
+        }
+    )
 
     report = detector.analyze_portfolio(balances, prices)
 

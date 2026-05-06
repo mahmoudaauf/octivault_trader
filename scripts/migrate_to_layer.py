@@ -18,12 +18,11 @@ This script is idempotent: if the destination already exists or the source
 is already a shim, it bails out without touching anything.
 """
 from __future__ import annotations
-import os
+
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from textwrap import dedent
 
 SHIM_TEMPLATE = '''\
 """Backward-compatibility shim — DEPRECATED.
@@ -69,7 +68,7 @@ def main(argv: list[str]) -> int:
     if not src_path.exists():
         print(f"❌ source not found: {src_path}", file=sys.stderr)
         return 1
-    if not src_path.parts[0] == "core":
+    if src_path.parts[0] != "core":
         print("❌ this script only migrates files out of core/", file=sys.stderr)
         return 1
 
@@ -88,7 +87,8 @@ def main(argv: list[str]) -> int:
     # 1) Move with git
     rc = subprocess.run(
         ["git", "mv", str(src_path), str(dst_path)],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if rc.returncode != 0:
         # fallback to plain mv (untracked file)

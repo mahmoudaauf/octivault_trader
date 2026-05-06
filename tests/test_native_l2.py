@@ -7,7 +7,6 @@ Mocks NativeExchangeClient with a stub. No network.
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any, Optional
 
 import pytest
@@ -28,9 +27,7 @@ class _StubClient:
         self.kline_response: list[list[Any]] = [[1, 2, 3, 4, 5]]
         self.fail_next: int = 0
 
-    async def get_prices(
-        self, symbols: Optional[list[str]] = None
-    ) -> dict[str, float]:
+    async def get_prices(self, symbols: Optional[list[str]] = None) -> dict[str, float]:
         self.price_calls += 1
         self.last_price_filter = list(symbols) if symbols else None
         if self.fail_next > 0:

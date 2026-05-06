@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 balance_sync.py - Real-time Balance Synchronization
 
@@ -20,7 +19,7 @@ Solution:
 import asyncio
 import logging
 import time
-from typing import Optional, Dict, Any
+from typing import Any, Optional
 
 logger = logging.getLogger("BalanceSync")
 
@@ -127,7 +126,7 @@ class BalanceSync:
             self.failures_count += 1
             self.logger.debug("[BalanceSync] Failed to fetch balance: %s", e)
 
-    async def _compute_nav_from_balances(self, balances: Dict[str, Any]) -> float:
+    async def _compute_nav_from_balances(self, balances: dict[str, Any]) -> float:
         """
         Compute NAV from account balances
 
@@ -205,11 +204,11 @@ class BalanceSync:
             delta_pct = (delta / old_nav * 100.0) if old_nav > 0 else 0.0
 
             # Update nav attribute
-            setattr(self.shared_state, "nav", nav)
+            self.shared_state.nav = nav
 
             # Cache timestamps for expiry validation
-            setattr(self.shared_state, "_nav_sync_ts", now)
-            setattr(self.shared_state, "_nav_sync_source", source)
+            self.shared_state._nav_sync_ts = now
+            self.shared_state._nav_sync_source = source
 
             self.last_updated_ts = now
             self.last_nav = nav
@@ -254,7 +253,7 @@ class BalanceSync:
             return await value
         return value
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self) -> dict[str, Any]:
         """Get balance sync status"""
         now = time.time()
         age_sec = now - self.last_updated_ts if self.last_updated_ts > 0 else None

@@ -238,4 +238,3 @@ tail -f logs/trading_run_*.log | grep "pnl="
 **System is now ready to generate trading signals and accumulate profits!** 🎯
 
 ---
-

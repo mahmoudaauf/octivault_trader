@@ -47,4 +47,3 @@ Traceback (most recent call last):
   File "/Users/mauf/Desktop/Octi AI Trading Bot/octivault_trader/🎯_COMPREHENSIVE_DIAGNOSTICS.py", line 127, in run_diagnostics
     polling_config = PollingConfig(interval_seconds=30)
 TypeError: __init__() got an unexpected keyword argument 'interval_seconds'
-

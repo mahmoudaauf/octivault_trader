@@ -13,9 +13,6 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import logging
-
-import pytest
 
 from src.l3_portfolio.portfolio_target_size_enforcer import (
     PortfolioTargetSizeEnforcer,
@@ -33,18 +30,20 @@ class _FakeSharedState:
 
 class _FakeExecutionManager:
     from typing import Optional
+
     def __init__(self, sell_symbols: Optional[set] = None) -> None:
         self.calls: list[list[dict]] = []
         # Symbols that should be considered "sold" after execute_liquidation_plan
         self._sell_symbols = sell_symbols
 
-    async def execute_liquidation_plan(self, exits):  # noqa: ANN001
+    async def execute_liquidation_plan(self, exits):
         self.calls.append(list(exits))
         return True
 
 
-def _pos(qty: float, price: float, *, classification: str = "EXTERNAL_POSITION",
-         is_tradable: bool = True) -> dict:
+def _pos(
+    qty: float, price: float, *, classification: str = "EXTERNAL_POSITION", is_tradable: bool = True
+) -> dict:
     return {
         "quantity": qty,
         "mark_price": price,
@@ -67,11 +66,13 @@ def test_disabled_by_default_is_noop():
 
 
 def test_below_target_is_noop():
-    ss = _FakeSharedState({
-        "AAA/USDT": _pos(10, 10),  # $100
-        "BBB/USDT": _pos(5, 20),   # $100
-        "CCC/USDT": _pos(2, 50),   # $100
-    })
+    ss = _FakeSharedState(
+        {
+            "AAA/USDT": _pos(10, 10),  # $100
+            "BBB/USDT": _pos(5, 20),  # $100
+            "CCC/USDT": _pos(2, 50),  # $100
+        }
+    )
     em = _FakeExecutionManager()
     enf = PortfolioTargetSizeEnforcer(ss, em, target_count=5, enable=True)
 
@@ -85,14 +86,14 @@ def test_below_target_is_noop():
 def test_trim_above_target_sells_lowest_value_first():
     # 8 tradable positions, target=5 → must sell the 3 lowest-value
     positions = {
-        "BIG1/USDT": _pos(1, 1000),    # $1000
-        "BIG2/USDT": _pos(1, 900),     # $900
-        "MID1/USDT": _pos(1, 500),     # $500
-        "MID2/USDT": _pos(1, 300),     # $300
-        "MID3/USDT": _pos(1, 200),     # $200
-        "LOW1/USDT": _pos(1, 50),      # $50  ← cut
-        "LOW2/USDT": _pos(1, 25),      # $25  ← cut
-        "LOW3/USDT": _pos(1, 10),      # $10  ← cut
+        "BIG1/USDT": _pos(1, 1000),  # $1000
+        "BIG2/USDT": _pos(1, 900),  # $900
+        "MID1/USDT": _pos(1, 500),  # $500
+        "MID2/USDT": _pos(1, 300),  # $300
+        "MID3/USDT": _pos(1, 200),  # $200
+        "LOW1/USDT": _pos(1, 50),  # $50  ← cut
+        "LOW2/USDT": _pos(1, 25),  # $25  ← cut
+        "LOW3/USDT": _pos(1, 10),  # $10  ← cut
     }
     ss = _FakeSharedState(positions)
     em = _FakeExecutionManager()
@@ -118,14 +119,14 @@ def test_bot_managed_positions_are_protected():
     # Two BOT_POSITION + 6 EXTERNAL → must only consider the 6 externals,
     # so with target=5 only ONE external gets cut (the cheapest external).
     positions = {
-        "BOT1/USDT": _pos(1, 10, classification="BOT_POSITION"),     # protected
-        "BOT2/USDT": _pos(1, 5, classification="RECOVERY"),          # protected
-        "EXT_BIG/USDT":  _pos(1, 1000),
+        "BOT1/USDT": _pos(1, 10, classification="BOT_POSITION"),  # protected
+        "BOT2/USDT": _pos(1, 5, classification="RECOVERY"),  # protected
+        "EXT_BIG/USDT": _pos(1, 1000),
         "EXT_MID1/USDT": _pos(1, 500),
         "EXT_MID2/USDT": _pos(1, 300),
         "EXT_MID3/USDT": _pos(1, 200),
         "EXT_MID4/USDT": _pos(1, 100),
-        "EXT_LOW/USDT":  _pos(1, 20),  # ← only this one should be cut
+        "EXT_LOW/USDT": _pos(1, 20),  # ← only this one should be cut
     }
     ss = _FakeSharedState(positions)
     em = _FakeExecutionManager()
@@ -140,10 +141,12 @@ def test_bot_managed_positions_are_protected():
 
 
 def test_idempotent_second_call_is_skipped():
-    ss = _FakeSharedState({
-        "AAA/USDT": _pos(1, 100),
-        "BBB/USDT": _pos(1, 50),
-    })
+    ss = _FakeSharedState(
+        {
+            "AAA/USDT": _pos(1, 100),
+            "BBB/USDT": _pos(1, 50),
+        }
+    )
     em = _FakeExecutionManager()
     enf = PortfolioTargetSizeEnforcer(ss, em, target_count=5, enable=True)
 

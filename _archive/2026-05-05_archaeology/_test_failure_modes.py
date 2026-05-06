@@ -14,11 +14,16 @@ Usage:
   python _test_failure_modes.py --mode 3     # only mode N
 """
 from __future__ import annotations
-import os, sys, time, argparse, json
+
+import argparse
+import hashlib
+import hmac
+import sys
+import time
 from pathlib import Path
-from decimal import Decimal
 from urllib.parse import urlencode
-import hmac, hashlib, requests
+
+import requests
 
 # Reuse env loader pattern
 ENV = {}
@@ -55,8 +60,7 @@ def _signed(method, path, params=None):
     params.setdefault("recvWindow", 5000)
     qs = urlencode(params)
     sig = hmac.new(SEC.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    r = _http(method, f"{URL}{path}?{qs}&signature={sig}",
-              headers={"X-MBX-APIKEY": KEY})
+    r = _http(method, f"{URL}{path}?{qs}&signature={sig}", headers={"X-MBX-APIKEY": KEY})
     if r.status_code >= 400:
         raise RuntimeError(f"{method} {path} → HTTP {r.status_code}: {r.text[:300]}")
     return r.json()
@@ -65,17 +69,17 @@ def _signed(method, path, params=None):
 # ─── Test fixtures ─────────────────────────────────────────────────────────
 POSITIONS = [
     {"symbol": "ETHUSDT", "qty": 0.0109, "entry": 2344.91},
-    {"symbol": "SOLUSDT", "qty": 0.296,  "entry": 84.40},
-    {"symbol": "XRPUSDT", "qty": 17.8,   "entry": 1.3986},
+    {"symbol": "SOLUSDT", "qty": 0.296, "entry": 84.40},
+    {"symbol": "XRPUSDT", "qty": 17.8, "entry": 1.3986},
 ]
 
 # Config thresholds (mirrors src/l0_core/config.py)
-STOP_LOSS_PCT       = -0.03   # -3%
-TAKE_PROFIT_PCT     = +0.10   # +10%
-PARTIAL_TP_PCT      = +0.005  # +0.5%
-PARTIAL_TP_AGE_S    = 30
-SIDEWAYS_TP_PCT     = +0.003  # tiny edge after long stagnation
-SIDEWAYS_MAX_AGE_H  = 24      # force-exit after 24h flat
+STOP_LOSS_PCT = -0.03  # -3%
+TAKE_PROFIT_PCT = +0.10  # +10%
+PARTIAL_TP_PCT = +0.005  # +0.5%
+PARTIAL_TP_AGE_S = 30
+SIDEWAYS_TP_PCT = +0.003  # tiny edge after long stagnation
+SIDEWAYS_MAX_AGE_H = 24  # force-exit after 24h flat
 
 
 # ─── Mode #1: Sideways drift simulator ─────────────────────────────────────
@@ -96,23 +100,24 @@ def test_mode_1_sideways():
     print("─" * 72)
     cases = [
         # (label, age_seconds, current_price_factor, expect_exit)
-        ("fresh +0.1% (1h)",        3600,     1.001,  False),
-        ("flat 12h",                12*3600,  1.000,  False),
-        ("flat 24h drift -0.2%",    24*3600,  0.998,  True),
-        ("flat 24h drift +0.4%",    24*3600,  1.004,  True),
-        ("12h tiny-profit +0.4%",   12*3600,  1.004,  True),
-        ("48h drift +0.1%",         48*3600,  1.001,  True),
-        ("48h profit +5%",          48*3600,  1.05,   False),  # let winner run
+        ("fresh +0.1% (1h)", 3600, 1.001, False),
+        ("flat 12h", 12 * 3600, 1.000, False),
+        ("flat 24h drift -0.2%", 24 * 3600, 0.998, True),
+        ("flat 24h drift +0.4%", 24 * 3600, 1.004, True),
+        ("12h tiny-profit +0.4%", 12 * 3600, 1.004, True),
+        ("48h drift +0.1%", 48 * 3600, 1.001, True),
+        ("48h profit +5%", 48 * 3600, 1.05, False),  # let winner run
     ]
     p = 100.0
     pass_n = fail_n = 0
     for label, age, fac, expect in cases:
         cur = p * fac
         ex, why = should_force_exit_sideways(p, cur, age)
-        ok = (ex == expect)
+        ok = ex == expect
         flag = "✅" if ok else "❌"
         print(f"  {flag} {label:<28} → exit={ex}  ({why})")
-        pass_n += ok; fail_n += (not ok)
+        pass_n += ok
+        fail_n += not ok
     print(f"  Result: {pass_n}/{pass_n+fail_n} passed")
     return fail_n == 0
 
@@ -136,14 +141,14 @@ def test_mode_2_drawdown():
     print("\n🧪 MODE #2: DRAWDOWN ─ software stop-loss / take-profit logic")
     print("─" * 72)
     cases = [
-        ("flat",         1.000,  False, False),
-        ("-1% dip",      0.990,  False, False),
-        ("-2.99% edge",  0.9701, False, False),
-        ("-3% trigger",  0.970,  True,  False),
-        ("-5% loss",     0.950,  True,  False),
-        ("+5% partial",  1.050,  False, False),
-        ("+10% TP",      1.100,  False, True),
-        ("+15% jackpot", 1.150,  False, True),
+        ("flat", 1.000, False, False),
+        ("-1% dip", 0.990, False, False),
+        ("-2.99% edge", 0.9701, False, False),
+        ("-3% trigger", 0.970, True, False),
+        ("-5% loss", 0.950, True, False),
+        ("+5% partial", 1.050, False, False),
+        ("+10% TP", 1.100, False, True),
+        ("+15% jackpot", 1.150, False, True),
     ]
     p = 100.0
     pass_n = fail_n = 0
@@ -154,7 +159,8 @@ def test_mode_2_drawdown():
         ok = (sl == exp_sl) and (tp == exp_tp)
         flag = "✅" if ok else "❌"
         print(f"  {flag} {label:<14} SL={sl} TP={tp}  ({why_sl}; {why_tp})")
-        pass_n += ok; fail_n += (not ok)
+        pass_n += ok
+        fail_n += not ok
     print(f"  Result: {pass_n}/{pass_n+fail_n} passed")
     return fail_n == 0
 
@@ -194,13 +200,16 @@ def test_mode_3_exchange_orders():
         flag = "✅" if protected else "❌"
         print(f"  {flag} {sym:<10} orders={len(sym_orders)}  SL={has_sl}  TP={has_tp}")
         for o in sym_orders:
-            print(f"        ↳ {o['type']:<22} {o['side']} qty={o['origQty']} "
-                  f"price={o['price']} stop={o.get('stopPrice','-')}")
-        pass_n += protected; fail_n += (not protected)
+            print(
+                f"        ↳ {o['type']:<22} {o['side']} qty={o['origQty']} "
+                f"price={o['price']} stop={o.get('stopPrice','-')}"
+            )
+        pass_n += protected
+        fail_n += not protected
 
     if fail_n:
         print(f"\n  ⚠️  {fail_n} position(s) UNPROTECTED on exchange.")
-        print(f"      Run: python _arm_safety_orders.py --live")
+        print("      Run: python _arm_safety_orders.py --live")
     print(f"  Result: {pass_n}/{pass_n+fail_n} positions protected")
     return fail_n == 0
 

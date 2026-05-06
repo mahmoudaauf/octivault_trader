@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -136,9 +136,7 @@ class NativeDecisionEngine:
         space_available = max(0, self.max_concurrent_positions - open_count)
 
         # Process BUY signals
-        buy_sigs = [
-            (sym, sig) for sym, sig in signals.items() if sig.get("direction") == "BUY"
-        ]
+        buy_sigs = [(sym, sig) for sym, sig in signals.items() if sig.get("direction") == "BUY"]
         buy_sigs.sort(key=lambda x: -x[1].get("score", 0.0))  # highest conviction first
 
         for sym, sig in buy_sigs:
@@ -157,9 +155,7 @@ class NativeDecisionEngine:
                 )
 
         # Process SELL signals
-        sell_sigs = [
-            (sym, sig) for sym, sig in signals.items() if sig.get("direction") == "SELL"
-        ]
+        sell_sigs = [(sym, sig) for sym, sig in signals.items() if sig.get("direction") == "SELL"]
         sell_sigs.sort(key=lambda x: -x[1].get("score", 0.0))
 
         for sym, sig in sell_sigs:
@@ -186,9 +182,7 @@ class NativeDecisionEngine:
         dd_pct = (1.0 - portfolio.nav / portfolio.nav_peak) * 100.0
         exceeded = dd_pct > self.max_drawdown_pct
         if exceeded:
-            logger.warning(
-                "drawdown %.2f%% exceeds limit %.2f%%", dd_pct, self.max_drawdown_pct
-            )
+            logger.warning("drawdown %.2f%% exceeds limit %.2f%%", dd_pct, self.max_drawdown_pct)
         return exceeded
 
     def _check_daily_loss_exceeded(self, portfolio: PortfolioSnapshot) -> bool:
@@ -223,10 +217,7 @@ class NativeDecisionEngine:
         # Kelly sizing: fraction * confidence-weighted allocation
         conviction = float(signal.get("score", 0.5))  # 0..1
         kelly_allocation = (
-            balance_usdt
-            * self.kelly_fraction
-            * conviction
-            * (self.risk_per_symbol_pct / 100.0)
+            balance_usdt * self.kelly_fraction * conviction * (self.risk_per_symbol_pct / 100.0)
         )
         position_usd = min(kelly_allocation, max_exposure_usd)
 

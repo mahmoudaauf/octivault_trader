@@ -8,6 +8,7 @@ logger.setLevel(logging.INFO)
 
 # ---------- helpers ----------
 
+
 async def _maybe_await(value):
     """Await if coroutine/function, else return value directly."""
     if asyncio.iscoroutine(value):
@@ -18,6 +19,7 @@ async def _maybe_await(value):
             return await result
         return result
     return value
+
 
 def _extract_open_symbols(open_trades):
     """
@@ -52,6 +54,7 @@ def _extract_open_symbols(open_trades):
     except Exception:
         return []
 
+
 async def _get_open_trades(shared_state):
     """
     Try multiple shapes:
@@ -71,9 +74,10 @@ async def _get_open_trades(shared_state):
 
     # 3) raw attr
     if hasattr(shared_state, "open_trades"):
-        return getattr(shared_state, "open_trades")
+        return shared_state.open_trades
 
     return None
+
 
 async def _get_total_equity(shared_state):
     # Prefer method if exists
@@ -85,6 +89,7 @@ async def _get_total_equity(shared_state):
     # Fallback to attribute
     return float(getattr(shared_state, "total_equity", 0.0))
 
+
 async def _get_trade_counts(shared_state):
     v = getattr(shared_state, "trade_counts", None)
     if v is None:
@@ -93,14 +98,16 @@ async def _get_trade_counts(shared_state):
             v = await _maybe_await(getter)
     return v or {}
 
+
 async def _get_total_pnl(shared_state):
     getter = getattr(shared_state, "get_total_pnl", None)
     if getter is not None:
         return await _maybe_await(getter)
     # Could be attribute
     if hasattr(shared_state, "total_pnl"):
-        return getattr(shared_state, "total_pnl")
+        return shared_state.total_pnl
     return "N/A"
+
 
 async def _get_realized_pnl(shared_state):
     """
@@ -114,6 +121,7 @@ async def _get_realized_pnl(shared_state):
             return float(v)
     # Fallback to attribute
     return float(getattr(shared_state, "realized_pnl", 0.0))
+
 
 async def _get_realized_pnl_60m(shared_state):
     """
@@ -130,7 +138,9 @@ async def _get_realized_pnl_60m(shared_state):
     # Fallback: attribute that may be maintained elsewhere
     return float(getattr(shared_state, "pnl_realized_60m", 0.0))
 
+
 # ---------- main task ----------
+
 
 async def system_summary_logger(shared_state, config, interval=60):
     """
@@ -156,7 +166,9 @@ async def system_summary_logger(shared_state, config, interval=60):
             pnl_60m_per_hour = pnl_60m  # 60m window = hourly
 
             trade_counts = await _get_trade_counts(shared_state)
-            sorted_agents = sorted(trade_counts.items(), key=lambda x: -x[1]) if trade_counts else []
+            sorted_agents = (
+                sorted(trade_counts.items(), key=lambda x: -x[1]) if trade_counts else []
+            )
 
             total_pnl = await _get_total_pnl(shared_state)
 
@@ -166,7 +178,9 @@ async def system_summary_logger(shared_state, config, interval=60):
             logger.info("📈 Open Trades (%d): %s", open_trade_count, open_symbols)
             logger.info(
                 "📊 SystemSummary | equity=%.2f | realized=%.2f | 60m_realized=%.2f USDT/h",
-                float(total_equity), float(realized_pnl), float(pnl_60m_per_hour)
+                float(total_equity),
+                float(realized_pnl),
+                float(pnl_60m_per_hour),
             )
             logger.info("💹 Total PnL: %s", total_pnl)
             logger.info("🧠 Agent Trade Counts:")

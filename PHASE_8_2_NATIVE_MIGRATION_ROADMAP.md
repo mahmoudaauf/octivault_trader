@@ -1,7 +1,7 @@
 # Phase 8.2: Native Component Migration Roadmap
 
-**Date:** 2026-05-06  
-**Status:** Planning  
+**Date:** 2026-05-06
+**Status:** Planning
 **Bridge Status:** ✅ Phase 8.1 Complete (validated, 6/6 tests pass)
 
 ---
@@ -259,7 +259,7 @@ After each layer migration:
            self.nav = 0.0
            self.positions = {}
            self.balance = 0.0
-       
+
        def update_nav(self, value: float):
            self.nav = value
    ```
@@ -278,7 +278,7 @@ After each layer migration:
    ```bash
    # Legacy (current)
    python3 main.py --production
-   
+
    # Native L0
    python3 main.py --production --native-l0
    ```
@@ -368,6 +368,6 @@ if args.native_l0:
 
 ---
 
-**Status:** Ready to proceed with Phase 8.2.1 (L0 Native)  
-**Owner:** @mauf  
-**Last Updated:** 2026-05-06 01:47  
+**Status:** Ready to proceed with Phase 8.2.1 (L0 Native)
+**Owner:** @mauf
+**Last Updated:** 2026-05-06 01:47

@@ -6,8 +6,6 @@ Tests risk gates, Kelly sizing, signal aggregation, idempotency.
 
 from __future__ import annotations
 
-import pytest
-
 from core_engine.native import (
     Decision,
     NativeDecisionEngine,

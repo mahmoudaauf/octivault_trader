@@ -1,10 +1,10 @@
 # utils/ohlcv_cache.py
 
-import os
-import pandas as pd
 import logging
-from datetime import datetime
+import os
 from typing import Optional
+
+import pandas as pd
 import requests
 
 logger = logging.getLogger("OHLCVCache")
@@ -36,11 +36,7 @@ def load_ohlcv_from_cache(symbol: str, path: str = DATA_PATH) -> Optional[pd.Dat
 
 
 def fetch_and_cache_ohlcv(symbol: str, interval: str = "1m", limit: int = 500) -> pd.DataFrame:
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
 
     try:
         logger.info(f"📡 Fetching OHLCV from Binance: {symbol}, interval={interval}, limit={limit}")
@@ -48,17 +44,28 @@ def fetch_and_cache_ohlcv(symbol: str, interval: str = "1m", limit: int = 500) -
         response.raise_for_status()
         raw_data = response.json()
 
-        df = pd.DataFrame(raw_data, columns=[
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "quote_asset_volume", "num_trades",
-            "taker_buy_base", "taker_buy_quote", "ignore"
-        ])
+        df = pd.DataFrame(
+            raw_data,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_asset_volume",
+                "num_trades",
+                "taker_buy_base",
+                "taker_buy_quote",
+                "ignore",
+            ],
+        )
         df = df[["timestamp", "open", "high", "low", "close", "volume"]]
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df.astype({
-            "open": "float", "high": "float", "low": "float",
-            "close": "float", "volume": "float"
-        })
+        df = df.astype(
+            {"open": "float", "high": "float", "low": "float", "close": "float", "volume": "float"}
+        )
 
         save_ohlcv_to_csv(symbol, df)
         return df

@@ -1,7 +1,7 @@
 # Phase 8 Production Wiring — Status Dashboard
 
-**Last Updated:** 2026-05-06 01:30 UTC  
-**Branch:** `phase-3/wiring`  
+**Last Updated:** 2026-05-06 01:30 UTC
+**Branch:** `phase-3/wiring`
 **Overall Progress:** Phase 8.1 ✅ COMPLETE | Phase 8.2 🔄 PENDING
 
 ---

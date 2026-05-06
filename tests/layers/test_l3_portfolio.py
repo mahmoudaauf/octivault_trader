@@ -1,5 +1,6 @@
 """L3 — Portfolio: bucket conservation, journaling, EXTERNAL read-only."""
 import pytest
+
 from tests.layers.fakes import FakePortfolio
 
 
@@ -8,7 +9,7 @@ def test_l3_bucket_conservation_after_reserve_and_release():
     initial_total = p.total
     token = p.reserve("BTCUSDT", 1_000.0, "test")
     assert token is not None
-    assert p.total == pytest.approx(initial_total)        # invariant
+    assert p.total == pytest.approx(initial_total)  # invariant
     assert p.release(token)
     assert p.total == pytest.approx(initial_total)
     assert p.buckets()["CASH"] == pytest.approx(10_000.0)

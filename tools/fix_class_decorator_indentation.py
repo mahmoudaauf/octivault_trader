@@ -1,8 +1,9 @@
-import sys
 import re
+import sys
 
 # Usage: python fix_class_decorator_indentation.py <input_file> <output_file>
 # This script will fix misplaced decorators and class definitions to the leftmost column.
+
 
 def fix_class_decorator_indentation(lines):
     output = []
@@ -24,16 +25,18 @@ def fix_class_decorator_indentation(lines):
         i += 1
     return output
 
+
 def main():
     if len(sys.argv) != 3:
         print("Usage: python fix_class_decorator_indentation.py <input_file> <output_file>")
         sys.exit(1)
-    with open(sys.argv[1], 'r') as f:
+    with open(sys.argv[1]) as f:
         lines = f.readlines()
     fixed = fix_class_decorator_indentation(lines)
-    with open(sys.argv[2], 'w') as f:
+    with open(sys.argv[2], "w") as f:
         f.writelines(fixed)
     print(f"Fixed decorator/class indentation written to {sys.argv[2]}")
+
 
 if __name__ == "__main__":
     main()

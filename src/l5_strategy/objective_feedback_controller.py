@@ -22,10 +22,9 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
-
+from typing import Any, Optional
 
 # ------------------------------------------------------------------ #
 #  Tunables (overridable via env)                                    #
@@ -33,31 +32,27 @@ from typing import Any, Dict, Optional
 
 DEFAULTS = {
     # Cadence
-    "CHECKPOINT_HEARTBEAT_S": 900,        # 15 min
-
+    "CHECKPOINT_HEARTBEAT_S": 900,  # 15 min
     # Set-points (derived from objective contract)
-    "OBJ_DAILY_TARGET_PCT": 0.02,         # +2%/day
-    "OBJ_HOURLY_TARGET_PCT": 0.02 / 24,   # ≈0.0833%/h
-    "OBJ_MAX_DRAWDOWN_PCT": 0.05,         # 5% kill-switch
-    "OBJ_MIN_NET_EDGE_BPS": 5.0,          # avg net profit must beat 5 bps
-
+    "OBJ_DAILY_TARGET_PCT": 0.02,  # +2%/day
+    "OBJ_HOURLY_TARGET_PCT": 0.02 / 24,  # ≈0.0833%/h
+    "OBJ_MAX_DRAWDOWN_PCT": 0.05,  # 5% kill-switch
+    "OBJ_MIN_NET_EDGE_BPS": 5.0,  # avg net profit must beat 5 bps
     # Knob ranges  (clamped)
     "OBJ_CONF_FLOOR_MIN": 0.50,
     "OBJ_CONF_FLOOR_MAX": 0.85,
     "OBJ_SIZE_MULT_MIN": 0.25,
     "OBJ_SIZE_MULT_MAX": 1.50,
-    "OBJ_THRU_MIN": 2.0,                  # trades / hour
+    "OBJ_THRU_MIN": 2.0,  # trades / hour
     "OBJ_THRU_MAX": 60.0,
-
     # PI gains (small — we run every 15 min, want gentle motion)
-    "OBJ_KP_CONF": 6.0,                   # Δconf per (%/h) of pace error
+    "OBJ_KP_CONF": 6.0,  # Δconf per (%/h) of pace error
     "OBJ_KI_CONF": 0.5,
     "OBJ_KP_SIZE": 4.0,
     "OBJ_KP_THRU": 50.0,
-    "OBJ_KP_DD_PENALTY": 200.0,           # heavy penalty if dd_error > 0
-
+    "OBJ_KP_DD_PENALTY": 200.0,  # heavy penalty if dd_error > 0
     # Telemetry freshness
-    "OBJ_TELEMETRY_MAX_AGE_S": 1800,      # 2 × heartbeat
+    "OBJ_TELEMETRY_MAX_AGE_S": 1800,  # 2 × heartbeat
 }
 
 
@@ -80,12 +75,13 @@ def _cfg(config: Any, key: str) -> float:
 #  Telemetry snapshot                                                #
 # ------------------------------------------------------------------ #
 
+
 @dataclass
 class Telemetry:
     ok: bool
     age_s: float = 0.0
     nav: float = 0.0
-    nav_anchor: float = 0.0          # NAV at session/day start
+    nav_anchor: float = 0.0  # NAV at session/day start
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
     drawdown_pct: float = 0.0
@@ -102,18 +98,20 @@ class Telemetry:
 #  PI state                                                          #
 # ------------------------------------------------------------------ #
 
+
 @dataclass
 class ControllerState:
     integral_pace: float = 0.0
     last_action_ts: float = 0.0
     consecutive_dd_breaches: int = 0
-    last_knobs: Dict[str, float] = field(default_factory=dict)
+    last_knobs: dict[str, float] = field(default_factory=dict)
     history: list = field(default_factory=list)
 
 
 # ------------------------------------------------------------------ #
 #  Controller                                                        #
 # ------------------------------------------------------------------ #
+
 
 class ObjectiveFeedbackController:
     component_name = "ObjectiveFeedbackController"
@@ -158,7 +156,7 @@ class ObjectiveFeedbackController:
             "Ki_conf": _cfg(config, "OBJ_KI_CONF"),
             "Kp_size": _cfg(config, "OBJ_KP_SIZE"),
             "Kp_thru": _cfg(config, "OBJ_KP_THRU"),
-            "Kp_dd":   _cfg(config, "OBJ_KP_DD_PENALTY"),
+            "Kp_dd": _cfg(config, "OBJ_KP_DD_PENALTY"),
         }
 
         self.state = ControllerState()
@@ -172,14 +170,15 @@ class ObjectiveFeedbackController:
         self._stopping = False
 
         self.artefact_path = Path(
-            artefact_path
-            or os.getenv("OBJ_ARTEFACT_PATH", "objective_controller_state.json")
+            artefact_path or os.getenv("OBJ_ARTEFACT_PATH", "objective_controller_state.json")
         )
 
         self.logger.info(
             "[OFC] Initialised — daily=%.2f%% hourly=%.4f%% dd_max=%.2f%% hb=%ds",
-            self.daily_target * 100, self.hourly_target * 100,
-            self.dd_max * 100, self.heartbeat_s,
+            self.daily_target * 100,
+            self.hourly_target * 100,
+            self.dd_max * 100,
+            self.heartbeat_s,
         )
 
     # ----------------------------------------------------------------
@@ -210,7 +209,7 @@ class ObjectiveFeedbackController:
         while not self._stopping:
             try:
                 await self.step()
-            except Exception as e:                       # pragma: no cover
+            except Exception as e:  # pragma: no cover
                 self.logger.exception("[OFC] step error: %s", e)
             await asyncio.sleep(self.heartbeat_s)
 
@@ -218,7 +217,7 @@ class ObjectiveFeedbackController:
     # One control step (also callable from tests / scripts)
     # ----------------------------------------------------------------
 
-    async def step(self) -> Dict[str, Any]:
+    async def step(self) -> dict[str, Any]:
         """One full measure → decide → act cycle. Returns a record dict."""
         now = time.time()
         tel = await self._measure()
@@ -226,15 +225,16 @@ class ObjectiveFeedbackController:
         if not tel.ok:
             self.logger.warning(
                 "[OFC] STARVED — telemetry missing/stale (age=%.0fs, missing=%s) — no-op",
-                tel.age_s, tel.missing,
+                tel.age_s,
+                tel.missing,
             )
             return {"status": "starved", "missing": tel.missing}
 
         # ---- 1. Errors ------------------------------------------------
         observed_pace_pct_h = self._observed_pace_pct_h(tel)
         pace_error = observed_pace_pct_h - (self.hourly_target * 100)  # % per hour
-        dd_error = max(0.0, tel.drawdown_pct - self.dd_max * 100)       # % over limit
-        edge_error_bps = self.min_edge_bps - tel.avg_net_profit_bps     # >0 = bad
+        dd_error = max(0.0, tel.drawdown_pct - self.dd_max * 100)  # % over limit
+        edge_error_bps = self.min_edge_bps - tel.avg_net_profit_bps  # >0 = bad
 
         # ---- 2. Kill-switch ------------------------------------------
         halted = False
@@ -247,25 +247,22 @@ class ObjectiveFeedbackController:
 
         # ---- 3. PI update --------------------------------------------
         # Anti-windup: only integrate when not at saturation
-        self.state.integral_pace = _clamp(
-            self.state.integral_pace + pace_error, -2.0, 2.0
-        )
+        self.state.integral_pace = _clamp(self.state.integral_pace + pace_error, -2.0, 2.0)
 
         d_conf = (
-            -self.gains["Kp_conf"] * pace_error * 0.01      # %→fraction
+            -self.gains["Kp_conf"] * pace_error * 0.01  # %→fraction
             - self.gains["Ki_conf"] * self.state.integral_pace * 0.01
-            + self.gains["Kp_dd"]   * (dd_error * 0.01)     # raise floor on DD
-            + (edge_error_bps / 1000.0)                     # poor edge → raise floor
+            + self.gains["Kp_dd"] * (dd_error * 0.01)  # raise floor on DD
+            + (edge_error_bps / 1000.0)  # poor edge → raise floor
         )
 
-        d_size = (
-            +self.gains["Kp_size"] * pace_error * 0.01
-            - self.gains["Kp_dd"]  * (dd_error * 0.01)
+        d_size = +self.gains["Kp_size"] * pace_error * 0.01 - self.gains["Kp_dd"] * (
+            dd_error * 0.01
         )
 
         d_thru = (
             +self.gains["Kp_thru"] * pace_error * 0.01
-            - self.gains["Kp_dd"]  * (dd_error * 0.01) * 10.0
+            - self.gains["Kp_dd"] * (dd_error * 0.01) * 10.0
         )
 
         # ---- 4. Apply (clamped) --------------------------------------
@@ -286,7 +283,9 @@ class ObjectiveFeedbackController:
         # If halted, force conservative knobs
         if halted:
             new_knobs["size_multiplier"] = self.knob_ranges["size_multiplier"][0]
-            new_knobs["target_throughput_per_hour"] = self.knob_ranges["target_throughput_per_hour"][0]
+            new_knobs["target_throughput_per_hour"] = self.knob_ranges[
+                "target_throughput_per_hour"
+            ][0]
 
         await self._publish(new_knobs, halted=halted)
 
@@ -313,7 +312,9 @@ class ObjectiveFeedbackController:
         self.logger.info(
             "[OFC] step pace_err=%+.4f%%/h dd_err=%+.2f%% edge_err=%+.1fbps "
             "→ conf=%.3f size=%.2f thru=%.1f%s",
-            pace_error, dd_error, edge_error_bps,
+            pace_error,
+            dd_error,
+            edge_error_bps,
             new_knobs["confidence_floor"],
             new_knobs["size_multiplier"],
             new_knobs["target_throughput_per_hour"],
@@ -373,12 +374,20 @@ class ObjectiveFeedbackController:
 
         ok = (not missing) and nav > 0 and nav_anchor > 0
         return Telemetry(
-            ok=ok, age_s=age, nav=nav, nav_anchor=nav_anchor,
-            realized_pnl=realized, unrealized_pnl=unreal,
-            drawdown_pct=dd_pct, elapsed_h=max(elapsed_h, 1e-3),
-            trades_in_window=trades, win_rate=win_rate,
-            avg_fee_bps=fee_bps, avg_slippage_bps=slip_bps,
-            avg_net_profit_bps=net_bps, missing=missing,
+            ok=ok,
+            age_s=age,
+            nav=nav,
+            nav_anchor=nav_anchor,
+            realized_pnl=realized,
+            unrealized_pnl=unreal,
+            drawdown_pct=dd_pct,
+            elapsed_h=max(elapsed_h, 1e-3),
+            trades_in_window=trades,
+            win_rate=win_rate,
+            avg_fee_bps=fee_bps,
+            avg_slippage_bps=slip_bps,
+            avg_net_profit_bps=net_bps,
+            missing=missing,
         )
 
     @staticmethod
@@ -393,7 +402,7 @@ class ObjectiveFeedbackController:
     # Publish & kill-switch
     # ----------------------------------------------------------------
 
-    async def _publish(self, knobs: Dict[str, float], halted: bool) -> None:
+    async def _publish(self, knobs: dict[str, float], halted: bool) -> None:
         ss = self.ss
         if ss is None:
             return
@@ -403,20 +412,26 @@ class ObjectiveFeedbackController:
                 ss.runtime_overrides = {}
             except Exception:
                 return
-        ss.runtime_overrides.update({
-            "CONFIDENCE_FLOOR": knobs["confidence_floor"],
-            "SIZE_MULTIPLIER": knobs["size_multiplier"],
-            "TARGET_THROUGHPUT_PER_HOUR": knobs["target_throughput_per_hour"],
-            "OBJECTIVE_HALTED": bool(halted),
-            "_objective_fb_updated": time.time(),
-        })
+        ss.runtime_overrides.update(
+            {
+                "CONFIDENCE_FLOOR": knobs["confidence_floor"],
+                "SIZE_MULTIPLIER": knobs["size_multiplier"],
+                "TARGET_THROUGHPUT_PER_HOUR": knobs["target_throughput_per_hour"],
+                "OBJECTIVE_HALTED": bool(halted),
+                "_objective_fb_updated": time.time(),
+            }
+        )
 
         # Best-effort event emission
         if hasattr(ss, "emit_event"):
             try:
-                await ss.emit_event("ObjectiveFeedback", {
-                    "knobs": knobs, "halted": halted,
-                })
+                await ss.emit_event(
+                    "ObjectiveFeedback",
+                    {
+                        "knobs": knobs,
+                        "halted": halted,
+                    },
+                )
             except Exception:
                 pass
 
@@ -424,7 +439,9 @@ class ObjectiveFeedbackController:
         self.logger.error(
             "[OFC] 🚨 KILL-SWITCH — drawdown %.2f%% exceeds limit by %.2f%% "
             "(consecutive=%d). Halting new BUYs.",
-            tel.drawdown_pct, dd_error, self.state.consecutive_dd_breaches,
+            tel.drawdown_pct,
+            dd_error,
+            self.state.consecutive_dd_breaches,
         )
         ss = self.ss
         if ss is not None:
@@ -434,11 +451,14 @@ class ObjectiveFeedbackController:
                 pass
             if hasattr(ss, "emit_event"):
                 try:
-                    await ss.emit_event("ObjectiveKillSwitch", {
-                        "reason": "max_drawdown_breach",
-                        "drawdown_pct": tel.drawdown_pct,
-                        "limit_pct": self.dd_max * 100,
-                    })
+                    await ss.emit_event(
+                        "ObjectiveKillSwitch",
+                        {
+                            "reason": "max_drawdown_breach",
+                            "drawdown_pct": tel.drawdown_pct,
+                            "limit_pct": self.dd_max * 100,
+                        },
+                    )
                 except Exception:
                     pass
         return True
@@ -462,13 +482,14 @@ class ObjectiveFeedbackController:
                 },
             }
             self.artefact_path.write_text(json.dumps(payload, indent=2, default=str))
-        except Exception:                                # pragma: no cover
+        except Exception:  # pragma: no cover
             self.logger.debug("[OFC] persist_state failed", exc_info=True)
 
 
 # ------------------------------------------------------------------ #
 #  Helpers                                                           #
 # ------------------------------------------------------------------ #
+
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     if math.isnan(x) or math.isinf(x):

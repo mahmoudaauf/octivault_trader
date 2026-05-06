@@ -385,9 +385,7 @@ async def wire_engines(app_ctx: dict[str, Any]) -> None:
 
 
 # Convenience function for quick setup
-async def setup_core_engines(
-    *, native: bool = False, compat: bool = False
-) -> dict[str, Any]:
+async def setup_core_engines(*, native: bool = False, compat: bool = False) -> dict[str, Any]:
     """
     Setup: create context → wire engines → return ready app_ctx
 

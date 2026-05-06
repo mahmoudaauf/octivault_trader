@@ -15,7 +15,6 @@ Cases:
 from __future__ import annotations
 
 import asyncio
-import os
 import types
 
 import pytest
@@ -41,7 +40,9 @@ class _StubSharedState:
         self.mark_closed_calls.append(kwargs)
 
 
-def _make_auditor(balances: dict, ss, base: str = "ETH", quote: str = "USDT") -> ExchangeTruthAuditor:
+def _make_auditor(
+    balances: dict, ss, base: str = "ETH", quote: str = "USDT"
+) -> ExchangeTruthAuditor:
     """Build a bare ExchangeTruthAuditor with stubbed helpers."""
     a = ExchangeTruthAuditor.__new__(ExchangeTruthAuditor)
     a.shared_state = ss
@@ -149,5 +150,7 @@ async def test_T6_buy_side_unaffected_by_guard(monkeypatch):
     ss = _StubSharedState(pos_qty=pos_qty)
     a = _make_auditor(ss=ss, balances={"ETH": {"free": pos_qty}})  # wallet full
     await a._apply_recovered_fill(_order(side="BUY", qty=pos_qty), "missed_fill_recovery", False)
-    assert len(ss.record_trade_calls) == 1, "BUY recovery must run record_trade regardless of wallet"
+    assert (
+        len(ss.record_trade_calls) == 1
+    ), "BUY recovery must run record_trade regardless of wallet"
     assert ss.mark_closed_calls == [], "BUY never calls mark_position_closed"

@@ -9,16 +9,16 @@ Pure-mock test (no network). Validates:
  4. dry_run mode does NOT call exchange POST
 """
 from __future__ import annotations
+
 import asyncio
 import sys
-from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 from src.l4_execution.safety_order_manager import (
-    SafetyOrderManager,
     CLIENT_ID_PREFIX,
+    SafetyOrderManager,
 )
 
 
@@ -104,10 +104,12 @@ async def test_arms_unprotected_positions():
         },
         open_orders=[],
     )
-    ss = MockSharedState(positions={
-        "SOLUSDT": {"avg_price": 84.40},
-        "DOGEUSDT": {"avg_price": 0.165},
-    })
+    ss = MockSharedState(
+        positions={
+            "SOLUSDT": {"avg_price": 84.40},
+            "DOGEUSDT": {"avg_price": 0.165},
+        }
+    )
     mgr = SafetyOrderManager(shared_state=ss, config=cfg(), exchange_client=ex)
     armed, skipped = await mgr.arm_all_positions()
     assert armed == 2, f"expected 2 armed, got {armed}"
@@ -125,9 +127,16 @@ async def test_skips_already_protected():
         prices={"SOLUSDT": 84.65},
         symbol_info={"SOLUSDT": _symbol_info("SOLUSDT", tick="0.01", step="0.001")},
         open_orders=[
-            {"symbol": "SOLUSDT", "side": "SELL", "type": "STOP_LOSS_LIMIT",
-             "orderId": 1, "origQty": "0.296", "price": "82",
-             "stopPrice": "82", "clientOrderId": "safety_SOLUSDT_123"},
+            {
+                "symbol": "SOLUSDT",
+                "side": "SELL",
+                "type": "STOP_LOSS_LIMIT",
+                "orderId": 1,
+                "origQty": "0.296",
+                "price": "82",
+                "stopPrice": "82",
+                "clientOrderId": "safety_SOLUSDT_123",
+            },
         ],
     )
     ss = MockSharedState(positions={"SOLUSDT": {"avg_price": 84.40}})
@@ -178,7 +187,7 @@ async def test_cancel_only_safety_orders():
 async def test_filters_min_notional():
     """Position too small (< minNotional) must be skipped."""
     ex = MockExchange(
-        balances={"PEPE": {"free": 100, "locked": 0}},   # value ≈ $1
+        balances={"PEPE": {"free": 100, "locked": 0}},  # value ≈ $1
         prices={"PEPEUSDT": 0.01},
         symbol_info={"PEPEUSDT": _symbol_info("PEPEUSDT", min_notional="5")},
     )
@@ -187,7 +196,7 @@ async def test_filters_min_notional():
     armed, skipped = await mgr.arm_all_positions()
     assert armed == 0
     assert len(ex.posted) == 0
-    print(f"  ✅ min_notional: tiny position correctly skipped")
+    print("  ✅ min_notional: tiny position correctly skipped")
 
 
 async def main():

@@ -110,4 +110,3 @@ The execution_result shows "REJECTED" but doesn't capture WHY. We need to:
 
 **PROPOSED FIX:**
 Modify `core/execution_manager.py` to capture and return detailed rejection reasons.
-

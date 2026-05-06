@@ -1,14 +1,15 @@
-
 import asyncio
 import logging
-import time
-from typing import Any, Optional, Iterable
+from collections.abc import Iterable
+from typing import Any, Optional
+
 
 class VolatilityRegimeDetector:
     """
     P9 Stub: Volatility Regime Detector.
     Analyzes market volatility to classify regimes (Low, Normal, High).
     """
+
     def __init__(self, config: Any, logger: Optional[logging.Logger] = None, **kwargs):
         self.config = config
         self.shared_state = kwargs.get("shared_state")
@@ -42,7 +43,9 @@ class VolatilityRegimeDetector:
         try:
             await self._update_regime_snapshot()
         except Exception as e:
-            self.logger.debug("VolatilityRegimeDetector initial snapshot failed: %s", e, exc_info=True)
+            self.logger.debug(
+                "VolatilityRegimeDetector initial snapshot failed: %s", e, exc_info=True
+            )
         # Run background loop without blocking startup.
         if not self._task or self._task.done():
             self._task = asyncio.create_task(self.run())
@@ -80,7 +83,9 @@ class VolatilityRegimeDetector:
             except Exception:
                 price = 0.0
             if price <= 0:
-                price = float(getattr(self.shared_state, "latest_prices", {}).get(sym_u, 0.0) or 0.0)
+                price = float(
+                    getattr(self.shared_state, "latest_prices", {}).get(sym_u, 0.0) or 0.0
+                )
 
             if not atr or atr <= 0 or price <= 0:
                 continue
@@ -88,7 +93,9 @@ class VolatilityRegimeDetector:
             atrp_values.append(atrp)
             regime = self._classify_regime(atrp)
             try:
-                await self.shared_state.set_volatility_regime(sym_u, self.timeframe, regime, atrp=atrp)
+                await self.shared_state.set_volatility_regime(
+                    sym_u, self.timeframe, regime, atrp=atrp
+                )
             except Exception:
                 pass
 
@@ -99,13 +106,17 @@ class VolatilityRegimeDetector:
                 self._last_regime = provisional
                 self._provisional_emitted = True
                 try:
-                    if hasattr(self.shared_state, "metrics") and isinstance(self.shared_state.metrics, dict):
+                    if hasattr(self.shared_state, "metrics") and isinstance(
+                        self.shared_state.metrics, dict
+                    ):
                         self.shared_state.metrics["volatility_regime"] = provisional
                         self.shared_state.metrics["volatility_regime_atrp"] = 0.0
                 except Exception:
                     pass
                 try:
-                    await self.shared_state.set_volatility_regime("GLOBAL", self.timeframe, provisional, atrp=0.0)
+                    await self.shared_state.set_volatility_regime(
+                        "GLOBAL", self.timeframe, provisional, atrp=0.0
+                    )
                 except Exception:
                     pass
                 self.logger.info(
@@ -116,7 +127,11 @@ class VolatilityRegimeDetector:
 
         atrp_values.sort()
         mid = len(atrp_values) // 2
-        median_atrp = atrp_values[mid] if len(atrp_values) % 2 == 1 else (atrp_values[mid - 1] + atrp_values[mid]) / 2.0
+        median_atrp = (
+            atrp_values[mid]
+            if len(atrp_values) % 2 == 1
+            else (atrp_values[mid - 1] + atrp_values[mid]) / 2.0
+        )
         global_regime = self._classify_regime(median_atrp)
         self.current_regime = global_regime
 
@@ -130,14 +145,18 @@ class VolatilityRegimeDetector:
             self._last_regime = global_regime
 
         try:
-            if hasattr(self.shared_state, "metrics") and isinstance(self.shared_state.metrics, dict):
+            if hasattr(self.shared_state, "metrics") and isinstance(
+                self.shared_state.metrics, dict
+            ):
                 self.shared_state.metrics["volatility_regime"] = global_regime
                 self.shared_state.metrics["volatility_regime_atrp"] = median_atrp
         except Exception:
             pass
 
         try:
-            await self.shared_state.set_volatility_regime("GLOBAL", self.timeframe, global_regime, atrp=median_atrp)
+            await self.shared_state.set_volatility_regime(
+                "GLOBAL", self.timeframe, global_regime, atrp=median_atrp
+            )
         except Exception:
             pass
 

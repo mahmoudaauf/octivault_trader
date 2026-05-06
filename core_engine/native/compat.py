@@ -110,7 +110,7 @@ COMPAT_KEYS: tuple[str, ...] = (
     # "tp_sl_engine",        # Phase 8.3.9  — replaced by NativeTPSLEngine
     # "safety_order_manager",# Phase 8.3.10 — replaced by NativeSafetyOrderManager
     # "recovery_engine",     # Phase 8.3.11 — replaced by NativeRecoveryEngine
-    "watchdog",
+    # "watchdog",            # Phase 8.3.12 — replaced by NativeWatchdog (LAST)
 )
 
 

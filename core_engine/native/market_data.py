@@ -64,7 +64,9 @@ class NativeMarketData:
 
         self._prices: dict[str, float] = {}
         self._price_ts: dict[str, float] = {}
-        self._klines: "OrderedDict[tuple[str, str, int], tuple[float, list[list[Any]]]]" = OrderedDict()
+        self._klines: OrderedDict[
+            tuple[str, str, int], tuple[float, list[list[Any]]]
+        ] = OrderedDict()
 
         self._task: Optional[asyncio.Task[None]] = None
         self._stopped = asyncio.Event()
@@ -133,11 +135,7 @@ class NativeMarketData:
 
     def stale_symbols(self) -> list[str]:
         now = time.time()
-        return [
-            s
-            for s, ts in self._price_ts.items()
-            if (now - ts) > self._stale_threshold
-        ]
+        return [s for s, ts in self._price_ts.items() if (now - ts) > self._stale_threshold]
 
     async def prime(self, symbols: Optional[list[str]] = None) -> None:
         """Force a single price refresh (optionally narrowed to ``symbols``)."""
@@ -184,9 +182,7 @@ class NativeMarketData:
     async def _run(self) -> None:
         while not self._stopped.is_set():
             try:
-                await asyncio.wait_for(
-                    self._stopped.wait(), timeout=self._poll_interval
-                )
+                await asyncio.wait_for(self._stopped.wait(), timeout=self._poll_interval)
                 continue
             except asyncio.TimeoutError:
                 pass

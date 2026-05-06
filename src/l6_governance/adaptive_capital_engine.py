@@ -10,10 +10,10 @@ Computes a bounded adaptive sizing envelope for BUY planning:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
 import logging
 import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 # Sentinel for "no trades on record": guaranteed >= any finite idle_time_sec threshold.
 _IDLE_SEC_NO_TRADES: float = float("inf")
@@ -31,7 +31,7 @@ class AdaptiveSizingDecision:
     win_streak: int
     loss_streak: int
     fee_to_gross_ratio: float
-    reasons: List[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
 
 
 class AdaptiveCapitalEngine:
@@ -71,9 +71,7 @@ class AdaptiveCapitalEngine:
             getattr(config, "ADAPTIVE_WIN_RATE_PENALTY_THRESHOLD", 0.45) or 0.45
         )
         self._win_rate_bonus = float(getattr(config, "ADAPTIVE_WIN_RATE_BONUS", 0.08) or 0.08)
-        self._win_rate_penalty = float(
-            getattr(config, "ADAPTIVE_WIN_RATE_PENALTY", 0.10) or 0.10
-        )
+        self._win_rate_penalty = float(getattr(config, "ADAPTIVE_WIN_RATE_PENALTY", 0.10) or 0.10)
         self._fee_gross_threshold = float(
             getattr(config, "ADAPTIVE_FEE_GROSS_THRESHOLD", 0.35) or 0.35
         )
@@ -91,13 +89,13 @@ class AdaptiveCapitalEngine:
         )
 
         # Per-symbol performance cache: {symbol: snapshot_dict} and {symbol: cache_ts}
-        self._perf_cache: Dict[str, Dict[str, Any]] = {}
-        self._perf_cache_ts: Dict[str, float] = {}
+        self._perf_cache: dict[str, dict[str, Any]] = {}
+        self._perf_cache_ts: dict[str, float] = {}
 
         # Dynamic sizing state
         self.dynamic_min_trade_quote: float = float(getattr(config, "DEFAULT_PLANNED_QUOTE", 10.0))
 
-    def _extract_realized(self, trade: Dict[str, Any]) -> float:
+    def _extract_realized(self, trade: dict[str, Any]) -> float:
         for key in ("realized_delta", "realized_pnl", "net_pnl", "pnl", "profit"):
             try:
                 if key in trade and trade[key] is not None:
@@ -106,7 +104,7 @@ class AdaptiveCapitalEngine:
                 continue
         return 0.0
 
-    def _extract_fee(self, trade: Dict[str, Any]) -> float:
+    def _extract_fee(self, trade: dict[str, Any]) -> float:
         for key in ("fee_quote", "commission", "fee"):
             try:
                 if key in trade and trade[key] is not None:
@@ -115,7 +113,7 @@ class AdaptiveCapitalEngine:
                 continue
         return 0.0
 
-    def _extract_hold_sec(self, trade: Dict[str, Any]) -> float:
+    def _extract_hold_sec(self, trade: dict[str, Any]) -> float:
         for key in ("hold_sec", "hold_time_sec", "holding_time_sec", "duration_sec"):
             try:
                 if key in trade and trade[key] is not None:
@@ -124,7 +122,7 @@ class AdaptiveCapitalEngine:
                 continue
         return 0.0
 
-    def _compute_streaks(self, realized_series: List[float]) -> Dict[str, int]:
+    def _compute_streaks(self, realized_series: list[float]) -> dict[str, int]:
         win_streak = 0
         loss_streak = 0
         for pnl in reversed(realized_series):
@@ -143,7 +141,9 @@ class AdaptiveCapitalEngine:
                 continue
         return {"win_streak": int(win_streak), "loss_streak": int(loss_streak)}
 
-    def _compute_performance_snapshot(self, trade_history: List[Dict[str, Any]], now_ts: float) -> Dict[str, Any]:
+    def _compute_performance_snapshot(
+        self, trade_history: list[dict[str, Any]], now_ts: float
+    ) -> dict[str, Any]:
         if not trade_history:
             return {
                 "win_rate": 0.50,
@@ -155,11 +155,11 @@ class AdaptiveCapitalEngine:
                 "idle_sec": _IDLE_SEC_NO_TRADES,
             }
 
-        realized_vals: List[float] = []
-        fees: List[float] = []
-        holds: List[float] = []
+        realized_vals: list[float] = []
+        fees: list[float] = []
+        holds: list[float] = []
         last_trade_ts = 0.0
-        for t in trade_history[-self._perf_lookback:]:
+        for t in trade_history[-self._perf_lookback :]:
             if not isinstance(t, dict):
                 continue
             pnl = self._extract_realized(t)
@@ -178,7 +178,9 @@ class AdaptiveCapitalEngine:
             except Exception:
                 pass
 
-        idle_sec = float(max(0.0, now_ts - last_trade_ts)) if last_trade_ts > 0 else _IDLE_SEC_NO_TRADES
+        idle_sec = (
+            float(max(0.0, now_ts - last_trade_ts)) if last_trade_ts > 0 else _IDLE_SEC_NO_TRADES
+        )
         avg_hold = float(sum(holds) / len(holds)) if holds else 0.0
 
         # No trades with non-zero PnL yet: return neutral stats rather than a 0.0 win-rate
@@ -207,13 +209,15 @@ class AdaptiveCapitalEngine:
             "win_rate": win_rate,
             "avg_r_multiple": avg_r,
             "avg_hold_sec": avg_hold,
-            "win_streak": streaks["win_streak"],    # int, not float
-            "loss_streak": streaks["loss_streak"],   # int, not float
+            "win_streak": streaks["win_streak"],  # int, not float
+            "loss_streak": streaks["loss_streak"],  # int, not float
             "fee_to_gross_ratio": fee_to_gross,
             "idle_sec": idle_sec,
         }
 
-    def _get_perf_snapshot(self, symbol: str, trade_history: List[Dict[str, Any]], now_ts: float) -> Dict[str, Any]:
+    def _get_perf_snapshot(
+        self, symbol: str, trade_history: list[dict[str, Any]], now_ts: float
+    ) -> dict[str, Any]:
         """Return cached performance snapshot for this symbol, recomputing when stale."""
         cache_ts = self._perf_cache_ts.get(symbol, 0.0)
         if (now_ts - cache_ts) < self._perf_review_sec and symbol in self._perf_cache:
@@ -238,7 +242,7 @@ class AdaptiveCapitalEngine:
         slot_utilization: float,
         throughput_per_hour: float,
         target_throughput_per_hour: float,
-        trade_history: List[Dict[str, Any]],
+        trade_history: list[dict[str, Any]],
         now_ts: Optional[float] = None,
     ) -> AdaptiveSizingDecision:
         now_ts = float(now_ts or time.time())
@@ -275,13 +279,13 @@ class AdaptiveCapitalEngine:
         if idle_sec is None:
             idle_sec = _IDLE_SEC_NO_TRADES
 
-        reasons: List[str] = []
+        reasons: list[str] = []
         risk_mult = 1.0
         cooldown_mult = 1.0
         tp_bias_mult = 1.0
 
         if win_streak >= self._win_streak_trades:
-            risk_mult *= (1.0 + self._win_streak_bonus)
+            risk_mult *= 1.0 + self._win_streak_bonus
             reasons.append("win_streak_up")
         if loss_streak >= self._loss_streak_trades:
             risk_mult *= max(0.25, 1.0 - self._loss_streak_penalty)
@@ -323,7 +327,7 @@ class AdaptiveCapitalEngine:
             reasons.append("slot_tight_down")
 
         if win_rate > self._win_rate_bonus_threshold:
-            risk_mult *= (1.0 + self._win_rate_bonus)
+            risk_mult *= 1.0 + self._win_rate_bonus
             reasons.append("win_rate_up")
         elif win_rate < self._win_rate_penalty_threshold:
             risk_mult *= max(0.25, 1.0 - self._win_rate_penalty)
@@ -334,7 +338,7 @@ class AdaptiveCapitalEngine:
         # The complementary fee_eff_quote below raises the minimum notional floor
         # for the same reason; the two levers are independent and additive.
         if fee_to_gross > self._fee_gross_threshold:
-            risk_mult *= (1.0 + self._fee_gross_bonus)
+            risk_mult *= 1.0 + self._fee_gross_bonus
             reasons.append("fee_efficiency_upsize")
 
         if avg_hold > float(getattr(self.config, "MAX_HOLD_TIME_SEC", 1800.0) or 1800.0):
@@ -345,7 +349,9 @@ class AdaptiveCapitalEngine:
 
         # Economic min quote: fee/slippage-aware and NAV-bounded.
         # fee_bps is assumed to be one-way taker fee; multiply by 2 for round-trip.
-        round_trip_cost_pct = max(0.0, ((float(fee_bps or 0.0) * 2.0) + float(slippage_bps or 0.0)) / 10000.0)
+        round_trip_cost_pct = max(
+            0.0, ((float(fee_bps or 0.0) * 2.0) + float(slippage_bps or 0.0)) / 10000.0
+        )
         target_profit_pct = max(0.0005, float(self._econ_target_profit_pct))
         fee_eff_quote = 0.0
         if round_trip_cost_pct > 0:
@@ -374,7 +380,11 @@ class AdaptiveCapitalEngine:
 
         self.logger.debug(
             "[ACE] %s risk_frac=%.4f min_quote=%.2f cooldown=%.2f reasons=%s",
-            symbol, risk_fraction, min_trade_quote, cooldown_mult, reasons,
+            symbol,
+            risk_fraction,
+            min_trade_quote,
+            cooldown_mult,
+            reasons,
         )
 
         return AdaptiveSizingDecision(

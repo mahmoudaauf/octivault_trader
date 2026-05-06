@@ -1,12 +1,19 @@
-import sys
 import re
+import sys
 
 # Usage: python smart_python_indentation_fixer.py <input_file> <output_file>
 # This script attempts to fix indentation for top-level classes, functions, decorators, and code blocks,
 # while preserving logic as much as possible. It will not insert 'pass' after docstrings, but will warn about them.
 
+
 def is_block_header(line):
-    return bool(re.match(r"^(class |def |async def |if |elif |else:|try:|except|finally:|for |while |with )", line.strip()))
+    return bool(
+        re.match(
+            r"^(class |def |async def |if |elif |else:|try:|except|finally:|for |while |with )",
+            line.strip(),
+        )
+    )
+
 
 def fix_indentation(lines):
     output = []
@@ -17,7 +24,7 @@ def fix_indentation(lines):
         stripped = line.lstrip()
         # Decorators: align with next class/def
         if re.match(r"^@", stripped):
-            output.append(' ' * indent_level + stripped)
+            output.append(" " * indent_level + stripped)
             prev_line = stripped
             continue
         # Top-level class/def/async def
@@ -30,7 +37,7 @@ def fix_indentation(lines):
             continue
         # Block headers (if, elif, else, try, except, finally, for, while, with)
         if re.match(r"^(if |elif |else:|try:|except|finally:|for |while |with )", stripped):
-            output.append(' ' * indent_level + stripped)
+            output.append(" " * indent_level + stripped)
             block_stack.append(indent_level + 4)
             indent_level += 4
             prev_line = stripped
@@ -48,24 +55,26 @@ def fix_indentation(lines):
             continue
         # Dedent for return, break, continue, raise at end of block
         if re.match(r"^(return|break|continue|raise|pass)", stripped):
-            output.append(' ' * indent_level + stripped)
+            output.append(" " * indent_level + stripped)
             prev_line = stripped
             continue
         # Default: indent according to current block
-        output.append(' ' * indent_level + stripped)
+        output.append(" " * indent_level + stripped)
         prev_line = stripped
     return output
+
 
 def main():
     if len(sys.argv) != 3:
         print("Usage: python smart_python_indentation_fixer.py <input_file> <output_file>")
         sys.exit(1)
-    with open(sys.argv[1], 'r') as f:
+    with open(sys.argv[1]) as f:
         lines = f.readlines()
     fixed = fix_indentation(lines)
-    with open(sys.argv[2], 'w') as f:
-        f.writelines(line if line.endswith('\n') else line + '\n' for line in fixed)
+    with open(sys.argv[2], "w") as f:
+        f.writelines(line if line.endswith("\n") else line + "\n" for line in fixed)
     print(f"Smart indentation fix written to {sys.argv[2]}")
+
 
 if __name__ == "__main__":
     main()

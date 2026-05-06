@@ -64,9 +64,9 @@ MIN_BACKTEST_SAMPLES = 30  # Require at least 30 historical trades
 # Fixed: 5-10 trades per day (thoughtful trading)
 # Effect: Fewer opportunities but much better quality
 
-MAX_TRADES_PER_HOUR = 2      # Maximum 2 trades per hour
-MAX_ACTIVE_POSITIONS = 3     # Keep max 3 positions open
-MAX_TRADES_PER_DAY = 20      # Hard limit of 20 trades per day
+MAX_TRADES_PER_HOUR = 2  # Maximum 2 trades per hour
+MAX_ACTIVE_POSITIONS = 3  # Keep max 3 positions open
+MAX_TRADES_PER_DAY = 20  # Hard limit of 20 trades per day
 
 # ============================================================================
 # RESET METRICS & TRACKING
@@ -74,7 +74,7 @@ MAX_TRADES_PER_DAY = 20      # Hard limit of 20 trades per day
 RESET_TIMESTAMP = datetime.now().isoformat()
 RESET_REASON = "Capital decay optimization: tighten filters, increase position size"
 PREVIOUS_STRATEGY_LOSS = -25.93  # Previous NAV loss
-STARTING_CAPITAL_RESET = 99.76   # Starting capital after losses
+STARTING_CAPITAL_RESET = 99.76  # Starting capital after losses
 
 # ============================================================================
 # MONITORING & VERIFICATION
@@ -98,7 +98,8 @@ MAX_ADDITIONAL_DRAWDOWN_PCT = 0.15  # 15% max additional loss
 MONITORING_MODE = True  # Set to False to actually trade after verification
 MONITORING_DURATION_MINUTES = 30  # Monitor for 30 minutes before trading
 
-print(f"""
+print(
+    f"""
 ═══════════════════════════════════════════════════════════
   ⚡ STRATEGY OPTIMIZATION CONFIG LOADED
 ═══════════════════════════════════════════════════════════
@@ -125,4 +126,5 @@ Expected After Fix:
   Estimated Time:        1-7 days to break even
 
 ═══════════════════════════════════════════════════════════
-""")
+"""
+)

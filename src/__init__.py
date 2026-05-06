@@ -22,6 +22,6 @@ Both paths resolve to the **same** module object — no duplication, no
 state divergence. This is verified by `tests/test_layer_namespace.py`.
 """
 
-from src._layer_index import LAYER_MODULES, layer_of  # noqa: F401
+from src._layer_index import LAYER_MODULES, layer_of
 
 __all__ = ["LAYER_MODULES", "layer_of"]

@@ -6,13 +6,11 @@ Mocks NativeOrderExecution. Tests dedup, error classification, per-symbol sequen
 
 from __future__ import annotations
 
-from typing import Any, Optional
-from unittest.mock import AsyncMock
+from typing import Any
 
 import pytest
 
 from core_engine.native import (
-    ExecutionResult,
     ExecutionStatus,
     NativeExecutor,
 )
@@ -33,23 +31,31 @@ class _StubOrderExecution:
 
     async def place_market_buy(self, symbol: str, quantity: float, **kwargs: Any) -> Any:
         self.placed_calls.append({"symbol": symbol, "quantity": quantity, **kwargs})
-        return type("OrderResult", (), {
-            "success": self.next_buy_result["success"],
-            "exchange_order_id": self.next_buy_result.get("orderId"),
-            "quantity": self.next_buy_result.get("quantity", quantity),
-            "raw": self.next_buy_result,
-            "error": self.next_buy_result.get("error"),
-        })()
+        return type(
+            "OrderResult",
+            (),
+            {
+                "success": self.next_buy_result["success"],
+                "exchange_order_id": self.next_buy_result.get("orderId"),
+                "quantity": self.next_buy_result.get("quantity", quantity),
+                "raw": self.next_buy_result,
+                "error": self.next_buy_result.get("error"),
+            },
+        )()
 
     async def place_market_sell(self, symbol: str, quantity: float, **kwargs: Any) -> Any:
         self.sold_calls.append({"symbol": symbol, "quantity": quantity, **kwargs})
-        return type("OrderResult", (), {
-            "success": self.next_sell_result["success"],
-            "exchange_order_id": self.next_sell_result.get("orderId"),
-            "quantity": self.next_sell_result.get("quantity", quantity),
-            "raw": self.next_sell_result,
-            "error": self.next_sell_result.get("error"),
-        })()
+        return type(
+            "OrderResult",
+            (),
+            {
+                "success": self.next_sell_result["success"],
+                "exchange_order_id": self.next_sell_result.get("orderId"),
+                "quantity": self.next_sell_result.get("quantity", quantity),
+                "raw": self.next_sell_result,
+                "error": self.next_sell_result.get("error"),
+            },
+        )()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -158,7 +164,9 @@ class TestNativeExecutor:
     @pytest.mark.asyncio
     async def test_error_classification(self) -> None:
         assert NativeExecutor._classify_error("429 too many requests") == ExecutionStatus.RETRYABLE
-        assert NativeExecutor._classify_error("503 service unavailable") == ExecutionStatus.RETRYABLE
+        assert (
+            NativeExecutor._classify_error("503 service unavailable") == ExecutionStatus.RETRYABLE
+        )
         assert NativeExecutor._classify_error("timeout") == ExecutionStatus.RETRYABLE
         assert NativeExecutor._classify_error("insufficient balance") == ExecutionStatus.TERMINAL
         assert NativeExecutor._classify_error("invalid quantity") == ExecutionStatus.TERMINAL

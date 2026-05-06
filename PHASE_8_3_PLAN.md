@@ -74,7 +74,7 @@ parked behind "land the migration first":
 | **8.3.9** | **Native `tp_sl_engine` (per-symbol target store + crossing detection)** | done — this commit | medium | high |
 | **8.3.10** | **Native `safety_order_manager` (OCO intent store + best-effort TP-leg placement)** | done — this commit | medium | medium |
 | 8.3.11 | **Native `recovery_engine` (in-process self-diagnosis: orphan OCO / stale prices / NAV drift / zero entry — with apply dispatcher)** | done — this commit | medium | medium |
-| 8.3.12 | Native `watchdog` | 1 day | low | medium |
+| 8.3.12 | **Native `watchdog` (heartbeat tracking + 5-detector anomaly sweep) — FINAL compat-stub replacement; G5 unlocked** | done — this commit | low | medium |
 | 8.3.13 | Python 3.9 → 3.11 migration | 1 day | medium | low — DX |
 
 **Recommended sequence**: 8.3.1 → 8.3.4 → 8.3.5 → 8.3.6 → 8.3.2 (when

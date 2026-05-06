@@ -1,29 +1,38 @@
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal
 
 # ========================
 # Structured Exceptions
 # ========================
 
+
 class MinNotionalViolation(Exception):
     """Raised when order notional < exchange MIN_NOTIONAL."""
+
     ...
+
 
 class FeeSafetyViolation(Exception):
     """Raised when order quote value is below fee-safety floor."""
+
     ...
+
 
 class MinEntryViolation(Exception):
     """Raised when order quote value < configured MIN_ENTRY_USDT."""
+
     ...
+
 
 class IntegrityError(Exception):
     """Raised when invalid qty/price/filters passed to hygiene guards."""
+
     ...
 
 
 # ========================
 # Helpers
 # ========================
+
 
 def round_step(qty: Decimal, step: Decimal) -> Decimal:
     """Round quantity DOWN to exchange step (LOT_SIZE.stepSize)."""
@@ -44,6 +53,7 @@ def _get_cfg_val(config, key: str, default):
 # Enforcers
 # ========================
 
+
 def enforce_min_entry_quote(quote_value: float, min_entry_usdt: float):
     if float(quote_value) < float(min_entry_usdt):
         raise MinEntryViolation(f"quote {quote_value} < min-entry {min_entry_usdt}")
@@ -62,6 +72,7 @@ def enforce_fee_safety(quote_value: float, fee_safety_multiplier: float):
 # Unified Guard
 # ========================
 
+
 def compute_tradable_qty(
     *,
     qty: float,
@@ -69,7 +80,7 @@ def compute_tradable_qty(
     step: float = None,
     min_qty: float = None,
     min_notional: float = None,
-    config=None
+    config=None,
 ) -> float:
     """
     Return a safe, rounded quantity or raise a structured violation.
@@ -116,7 +127,10 @@ def compute_tradable_qty(
 # Adapter
 # ========================
 
-def validate_order_request(symbol: str, side: str, quantity: float, price: float, filters: dict, config=None):
+
+def validate_order_request(
+    symbol: str, side: str, quantity: float, price: float, filters: dict, config=None
+):
     """
     Adapter that validates an order using normalized filters, raises on failure.
     Filters dict expected shape:

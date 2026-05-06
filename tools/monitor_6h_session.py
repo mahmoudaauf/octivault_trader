@@ -23,8 +23,7 @@ import traceback
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, List
-
+from typing import Optional
 
 DEFAULT_DURATION_HOURS = 6.0
 DEFAULT_CHECKPOINT_MINUTES = 30.0
@@ -51,7 +50,7 @@ def _latest_trade_journal() -> Optional[Path]:
     return files[-1] if files else None
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Execution-focused orchestrator monitor with periodic checkpoints."
     )
@@ -84,7 +83,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     trade_journal = _latest_trade_journal()
     submit_re = re.compile(r"Submitted\s+(\d+)\s+TradeIntents\s+to\s+Meta")
 
-    counts: Dict[str, int] = {
+    counts: dict[str, int] = {
         "submitted_intents_total": 0,
         "submitted_batches": 0,
         "prepublish_dropped": 0,
@@ -95,7 +94,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "not_submitted_or_blocked": 0,
     }
     blockers: Counter[str] = Counter()
-    checkpoint_counts: Dict[str, int] = counts.copy()
+    checkpoint_counts: dict[str, int] = counts.copy()
     checkpoint_blockers: Counter[str] = Counter()
 
     print("=" * 120, flush=True)
@@ -116,12 +115,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if trade_journal is None:
         print("WARNING: no trade journal found at startup; waiting for file to appear.", flush=True)
 
-    with open(agent_log, "r", encoding="utf-8", errors="ignore") as agent_fp:
+    with open(agent_log, encoding="utf-8", errors="ignore") as agent_fp:
         agent_fp.seek(0, os.SEEK_END)
 
         trade_fp = None
         if trade_journal and trade_journal.exists():
-            trade_fp = open(trade_journal, "r", encoding="utf-8", errors="ignore")
+            trade_fp = open(trade_journal, encoding="utf-8", errors="ignore")
             trade_fp.seek(0, os.SEEK_END)
 
         start_ts = time.time()
@@ -152,7 +151,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     new_journal = _latest_trade_journal()
                     if new_journal and new_journal.exists():
                         trade_journal = new_journal
-                        trade_fp = open(trade_journal, "r", encoding="utf-8", errors="ignore")
+                        trade_fp = open(trade_journal, encoding="utf-8", errors="ignore")
                         trade_fp.seek(0, os.SEEK_END)
                         print(
                             f"[INFO] Attached trade journal: {trade_journal} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -206,10 +205,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 if now >= next_checkpoint:
                     cp_idx = int((now - start_ts) // checkpoint_sec)
-                    delta = {
-                        k: counts[k] - checkpoint_counts.get(k, 0)
-                        for k in counts
-                    }
+                    delta = {k: counts[k] - checkpoint_counts.get(k, 0) for k in counts}
 
                     delta_blockers = Counter(blockers)
                     delta_blockers.subtract(checkpoint_blockers)

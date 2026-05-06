@@ -23,25 +23,26 @@ Modes:
 
 import asyncio
 import logging
-from typing import Dict, Optional, List, Any, Tuple
 from dataclasses import dataclass, field
-from enum import Enum
 from datetime import datetime
-from decimal import Decimal
+from enum import Enum
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class AdoptionMode(Enum):
     """How to handle external positions"""
-    IGNORE = "ignore"           # Do nothing
-    LIQUIDATE = "liquidate"     # Sell immediately
-    ADOPT = "adopt"             # Convert to strategy position
-    HEDGE = "hedge"             # Reduce gradually
+
+    IGNORE = "ignore"  # Do nothing
+    LIQUIDATE = "liquidate"  # Sell immediately
+    ADOPT = "adopt"  # Convert to strategy position
+    HEDGE = "hedge"  # Reduce gradually
 
 
 class AdoptionDecision(Enum):
     """Decision made for external position"""
+
     IGNORED = "ignored"
     LIQUIDATED = "liquidated"
     ADOPTED = "adopted"
@@ -52,6 +53,7 @@ class AdoptionDecision(Enum):
 @dataclass
 class ExternalPosition:
     """Represents pre-existing external position"""
+
     symbol: str
     quantity: float
     entry_price: float
@@ -63,6 +65,7 @@ class ExternalPosition:
 @dataclass
 class AdoptionResult:
     """Result of adoption decision"""
+
     symbol: str
     decision: AdoptionDecision
     mode: AdoptionMode
@@ -113,9 +116,9 @@ class ExternalAdoptionEngine:
         self.hedge_speed_pct_per_day = float(self.config.get("EXTERNAL_HEDGE_SPEED_PCT", 5.0))
 
         # State
-        self._adoption_history: List[AdoptionResult] = []
-        self._adopted_positions: Dict[str, ExternalPosition] = {}
-        self._hedging_positions: Dict[str, Dict[str, Any]] = {}
+        self._adoption_history: list[AdoptionResult] = []
+        self._adopted_positions: dict[str, ExternalPosition] = {}
+        self._hedging_positions: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
     # ═══════════════════════════════════════════════════════════════════
@@ -124,8 +127,8 @@ class ExternalAdoptionEngine:
 
     async def evaluate_external_positions(
         self,
-        external_positions: Dict[str, ExternalPosition],
-    ) -> List[AdoptionResult]:
+        external_positions: dict[str, ExternalPosition],
+    ) -> list[AdoptionResult]:
         """
         Evaluate all external positions and make decisions
 
@@ -202,12 +205,14 @@ class ExternalAdoptionEngine:
                 return result
 
             except Exception as e:
-                self.logger.error(f"[ExternalAdoption] Evaluation error for {symbol}: {e}", exc_info=True)
+                self.logger.error(
+                    f"[ExternalAdoption] Evaluation error for {symbol}: {e}", exc_info=True
+                )
                 return AdoptionResult(
                     symbol=symbol,
                     decision=AdoptionDecision.ERROR,
                     mode=AdoptionMode.IGNORE,
-                    reason=f"Evaluation error: {str(e)}",
+                    reason=f"Evaluation error: {e!s}",
                     value_usdt=position.value_usdt,
                 )
 
@@ -240,21 +245,24 @@ class ExternalAdoptionEngine:
                     # Set TP/SL via TPSLEngine if available
                     try:
                         # Check if execution_manager has TPSLEngine
-                        if hasattr(self.execution_manager, 'tpsl_engine') and self.execution_manager.tpsl_engine:
+                        if (
+                            hasattr(self.execution_manager, "tpsl_engine")
+                            and self.execution_manager.tpsl_engine
+                        ):
                             await self.execution_manager.tpsl_engine.set_take_profit(
-                                symbol=symbol,
-                                tp_price=tp_price,
-                                tp_percent=None
+                                symbol=symbol, tp_price=tp_price, tp_percent=None
                             )
                             if sl_price:
                                 await self.execution_manager.tpsl_engine.set_stop_loss(
-                                    symbol=symbol,
-                                    sl_price=sl_price,
-                                    sl_percent=None
+                                    symbol=symbol, sl_price=sl_price, sl_percent=None
                                 )
-                            self.logger.debug(f"[ExternalAdoption] TP/SL set for {symbol}: TP={tp_price}, SL={sl_price}")
+                            self.logger.debug(
+                                f"[ExternalAdoption] TP/SL set for {symbol}: TP={tp_price}, SL={sl_price}"
+                            )
                     except Exception as e:
-                        self.logger.warning(f"[ExternalAdoption] Could not set TP/SL via TPSLEngine: {e}")
+                        self.logger.warning(
+                            f"[ExternalAdoption] Could not set TP/SL via TPSLEngine: {e}"
+                        )
 
                 return True
             except Exception as e:
@@ -273,7 +281,7 @@ class ExternalAdoptionEngine:
             self.logger.info("[EXTERNAL_ADOPTION] Adoption rejected for %s", symbol)
             return True
 
-    def get_adoption_status(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+    def get_adoption_status(self, symbol: Optional[str] = None) -> dict[str, Any]:
         """Get adoption status"""
         if symbol:
             return {
@@ -286,7 +294,8 @@ class ExternalAdoptionEngine:
                         "reason": r.reason,
                         "timestamp": r.timestamp,
                     }
-                    for r in self._adoption_history if r.symbol == symbol
+                    for r in self._adoption_history
+                    if r.symbol == symbol
                 ],
             }
 
@@ -310,7 +319,7 @@ class ExternalAdoptionEngine:
         exposure_pct: float,
         in_universe: bool,
         unrealized_pnl_pct: float,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Decision tree for adoption
 
@@ -391,9 +400,10 @@ class ExternalAdoptionEngine:
 
             # Build canonical TradeIntent (lazy import to avoid layer cycles)
             try:
-                from src.l0_core.contracts import TradeIntent, OrderSide
+                from src.l0_core.contracts import OrderSide, TradeIntent
             except Exception:
                 from src.l0_core.contracts import TradeIntent  # type: ignore
+
                 OrderSide = None  # type: ignore
 
             qty = float(position.quantity or 0.0)
@@ -426,7 +436,9 @@ class ExternalAdoptionEngine:
             )
             return "liquidation_rejected"
         except Exception as e:
-            self.logger.error(f"[ExternalAdoption] Liquidation error for {symbol}: {e}", exc_info=True)
+            self.logger.error(
+                f"[ExternalAdoption] Liquidation error for {symbol}: {e}", exc_info=True
+            )
         return "liquidation_attempted"
 
     async def _execute_adopt(self, symbol: str, position: ExternalPosition) -> str:
@@ -522,7 +534,7 @@ class ExternalAdoptionEngine:
     # Diagnostic API
     # ═══════════════════════════════════════════════════════════════════
 
-    async def get_status(self) -> Dict[str, Any]:
+    async def get_status(self) -> dict[str, Any]:
         """Get full adoption engine status"""
         return {
             "status": "operational",

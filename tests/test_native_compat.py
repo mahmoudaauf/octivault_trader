@@ -148,11 +148,10 @@ def test_register_compat_stubs_does_not_overwrite_existing():
     app_ctx: dict = {"watchdog": sentinel}
     register_compat_stubs(app_ctx)
     assert app_ctx["watchdog"] is sentinel  # untouched
-    # COMPAT_KEYS shrinks as native impls land (8.3.7-8.3.11 already
-    # graduated). After 8.3.11 only ``watchdog`` remains stubbed; once
-    # 8.3.12 lands COMPAT_KEYS will be empty and this test should be
-    # retired alongside the compat module itself.
-    assert set(COMPAT_KEYS) <= {"watchdog"}
+    # COMPAT_KEYS shrinks as native impls land. After 8.3.12 it is
+    # *empty* — the entire compat module is now a no-op kept solely
+    # for backward import compatibility (G5: scheduled for deletion).
+    assert set(COMPAT_KEYS) == set()
 
 
 def test_compat_keys_excludes_dropped_keys():
@@ -191,12 +190,11 @@ async def test_build_native_app_ctx_compat_true_does_not_break_cycle():
     app_ctx, orch = build_native_app_ctx(_components(), compat=True)
     metrics = await orch.run_cycle()
     assert metrics.cycle_num == 1
-    # Stubs are present but orchestrator never touches them.
-    # Note: portfolio_manager (8.3.7), position_manager (8.3.8),
-    # tp_sl_engine (8.3.9), safety_order_manager (8.3.10) and
-    # recovery_engine (8.3.11) are now real native impls. Only
-    # ``watchdog`` remains stubbed.
-    assert isinstance(app_ctx["watchdog"], _NullStub)
+    # After 8.3.12 the entire COMPAT_KEYS tuple is empty: every
+    # legacy app_ctx key now has a real native implementation. The
+    # compat=True flag is therefore a no-op and only kept so callers
+    # don't need to drop the keyword argument.
+    assert COMPAT_KEYS == ()
 
 
 # ---------------------------------------------------------------------

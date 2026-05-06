@@ -157,10 +157,12 @@ def main():
     # Run monitor
     try:
         monitor_duration = args.duration * 60  # Convert to minutes
-        exit_code = asyncio.run(start_monitor(
-            duration_minutes=monitor_duration,
-            check_interval=args.monitor_interval,
-        ))
+        exit_code = asyncio.run(
+            start_monitor(
+                duration_minutes=monitor_duration,
+                check_interval=args.monitor_interval,
+            )
+        )
     except KeyboardInterrupt:
         print("\n\n🛑 Monitoring interrupted by user")
         exit_code = 0
@@ -174,10 +176,10 @@ def main():
         try:
             orchestrator_proc.terminate()
             orchestrator_proc.wait(timeout=5)
-            print(f"   ✅ Orchestrator terminated gracefully")
+            print("   ✅ Orchestrator terminated gracefully")
         except subprocess.TimeoutExpired:
             orchestrator_proc.kill()
-            print(f"   ⚠️  Orchestrator force-killed")
+            print("   ⚠️  Orchestrator force-killed")
         except Exception as e:
             print(f"   ⚠️  Error terminating orchestrator: {e}")
 

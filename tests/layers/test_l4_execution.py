@@ -1,6 +1,5 @@
 """L4 — Execution: no order without ReservationToken; exactly-once journaling."""
 import asyncio
-import pytest
 
 from src.l0_core.layer_contracts import L4ExecutionContract
 from tests.layers.fakes import FakeExchange, FakePortfolio
@@ -8,20 +7,21 @@ from tests.layers.fakes import FakeExchange, FakePortfolio
 
 def test_l4_contract_validates_required_fields():
     c = L4ExecutionContract()
-    assert c.validate_output({
-        "tickets": [], "fills": [], "cancels": [], "timestamp": 0.0,
-    })
+    assert c.validate_output(
+        {
+            "tickets": [],
+            "fills": [],
+            "cancels": [],
+            "timestamp": 0.0,
+        }
+    )
     assert not c.validate_output({"tickets": []})
 
 
 def test_l4_intent_validator_rejects_no_token():
     c = L4ExecutionContract()
-    assert not c.validate_intent(
-        reservation_token=None, symbol="BTCUSDT", side="BUY", quantity=0.1
-    )
-    assert c.validate_intent(
-        reservation_token="R-abc", symbol="BTCUSDT", side="BUY", quantity=0.1
-    )
+    assert not c.validate_intent(reservation_token=None, symbol="BTCUSDT", side="BUY", quantity=0.1)
+    assert c.validate_intent(reservation_token="R-abc", symbol="BTCUSDT", side="BUY", quantity=0.1)
 
 
 def test_l4_no_token_means_no_order_placed():
@@ -30,12 +30,10 @@ def test_l4_no_token_means_no_order_placed():
     p = FakePortfolio(cash=10_000.0)
     contract = L4ExecutionContract()
 
-    intent = {"id": "i1", "symbol": "BTCUSDT", "side": "BUY",
-              "qty": 0.1, "price": 40_000.0}
+    intent = {"id": "i1", "symbol": "BTCUSDT", "side": "BUY", "qty": 0.1, "price": 40_000.0}
 
     async def submit_with_gate(token):
-        if not contract.validate_intent(token, intent["symbol"],
-                                        intent["side"], intent["qty"]):
+        if not contract.validate_intent(token, intent["symbol"], intent["side"], intent["qty"]):
             return None
         return await ex.place_order({**intent, "quantity": intent["qty"]})
 

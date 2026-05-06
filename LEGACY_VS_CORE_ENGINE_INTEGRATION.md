@@ -1,7 +1,7 @@
 # 🔀 LEGACY vs CORE ENGINE — INTEGRATION ANALYSIS
 
-**Date**: May 6, 2026  
-**Status**: TWO SEPARATE SYSTEMS in gradual migration  
+**Date**: May 6, 2026
+**Status**: TWO SEPARATE SYSTEMS in gradual migration
 **Integration Level**: Minimal (shims only, not merged)
 
 ---
@@ -23,7 +23,7 @@
         ▼                             ▼
    LEGACY SYSTEM                  CORE ENGINE
    (Active/Production)            (Shim Layer)
-   
+
    🎯_MASTER_SYSTEM_              core_engine/
    ORCHESTRATOR.py                ├─ market_account_engine.py
    ├─ L0-L8 (all)                 ├─ situation_engine.py

@@ -3,8 +3,10 @@
 import numpy as np
 import pandas as pd
 
+
 def calculate_ema(series, period):
     return pd.Series(series).ewm(span=period, adjust=False).to_numpy()
+
 
 def calculate_rsi(series, period=14):
     delta = np.diff(series)
@@ -15,6 +17,7 @@ def calculate_rsi(series, period=14):
     rs = avg_gain / (avg_loss + 1e-9)
     rsi = 100 - (100 / (1 + rs))
     return np.append([50] * (period - 1), rsi.fillna(50).to_numpy())
+
 
 def calculate_volume_surge(volumes, threshold_ratio=1.5):
     recent_vol = volumes[-1]

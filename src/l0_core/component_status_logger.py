@@ -11,15 +11,17 @@ __all__ = [
     "clear_statuses",
 ]
 
+import asyncio
+import datetime
+import inspect
 import logging
 import re
-import asyncio
-import time
-import datetime
+import sys  # Used for basic logging fallback if no handlers are configured
 import threading
-import inspect
-import sys # Used for basic logging fallback if no handlers are configured
-from typing import Any, Optional, Callable
+import time
+from collections.abc import Callable
+from typing import Any, Optional
+
 
 class ComponentStatusLogger:
     """
@@ -28,11 +30,12 @@ class ComponentStatusLogger:
     their real-time status and for other monitoring components (like Heartbeat
     and Watchdog) to query current system health.
     """
-    _instance = None # The singleton instance
-    _status_cache = {} # Cache for last reported status of each component.
-    _status_lock = threading.RLock() # Protect cache for cross-thread usage
-    _last_emit = {} # {(comp, status, detail): last_ts} for deduplication
-    _shared_state = None # Optional mirror target for statuses
+
+    _instance = None  # The singleton instance
+    _status_cache = {}  # Cache for last reported status of each component.
+    _status_lock = threading.RLock()  # Protect cache for cross-thread usage
+    _last_emit = {}  # {(comp, status, detail): last_ts} for deduplication
+    _shared_state = None  # Optional mirror target for statuses
 
     # Defaults (configurable at runtime)
     _DEFAULT_TTL_SECONDS = 120
@@ -41,6 +44,7 @@ class ComponentStatusLogger:
     # Effective values (can be changed via configure())
     _ttl_seconds = _DEFAULT_TTL_SECONDS  # Mark status stale after this many seconds
     _dedupe_window_sec = _DEFAULT_DEDUPE_WINDOW_SEC  # Throttle identical logs within this window
+
     @classmethod
     def configure(cls, ttl_seconds: Optional[int] = None, dedupe_window_sec: Optional[int] = None):
         """
@@ -118,12 +122,14 @@ class ComponentStatusLogger:
             "\U0001FA00-\U0001FA6F"  # chess, etc.
             "\U0001FA70-\U0001FAFF"  # pictographs ext-A
             "]+",
-            flags=re.UNICODE
+            flags=re.UNICODE,
         )
-        return emoji_pattern.sub(r'', text)
+        return emoji_pattern.sub(r"", text)
 
     @classmethod
-    def _is_duplicate_emit(cls, component_name: str, status: str, detail: str, now_ts: float) -> bool:
+    def _is_duplicate_emit(
+        cls, component_name: str, status: str, detail: str, now_ts: float
+    ) -> bool:
         """
         Checks if the exact status update for a component has been logged very recently
         to prevent excessive logging of identical messages.
@@ -146,9 +152,9 @@ class ComponentStatusLogger:
 
         target: Optional[Callable[..., Any]] = None
         if hasattr(ss, "set_component_status"):
-            target = getattr(ss, "set_component_status")
+            target = ss.set_component_status
         elif hasattr(ss, "update_component_status"):
-            target = getattr(ss, "update_component_status")
+            target = ss.update_component_status
 
         async def _async_mirror():
             # try component-scoped first
@@ -168,7 +174,9 @@ class ComponentStatusLogger:
                         target(*args, **kwargs)
                     return
                 except Exception as e:
-                    self.logger.debug("Component-status mirror failed; will fallback: %s", e, exc_info=True)
+                    self.logger.debug(
+                        "Component-status mirror failed; will fallback: %s", e, exc_info=True
+                    )
 
             # fallback path
             emit = getattr(ss, "emit_event", None) or getattr(ss, "emit", None)
@@ -186,7 +194,11 @@ class ComponentStatusLogger:
                         emit("HealthStatus", payload)
                     return
                 except Exception as e:
-                    self.logger.debug("HealthStatus emit failed; trying update_system_health: %s", e, exc_info=True)
+                    self.logger.debug(
+                        "HealthStatus emit failed; trying update_system_health: %s",
+                        e,
+                        exc_info=True,
+                    )
 
             ush = getattr(ss, "update_system_health", None)
             if callable(ush):
@@ -210,7 +222,9 @@ class ComponentStatusLogger:
                     target(component, status, detail)
                     return
                 except Exception as e:
-                    self.logger.debug("Sync component-status mirror failed; will fallback: %s", e, exc_info=True)
+                    self.logger.debug(
+                        "Sync component-status mirror failed; will fallback: %s", e, exc_info=True
+                    )
             emit = getattr(ss, "emit_event", None) or getattr(ss, "emit", None)
             payload = {
                 "component": component,
@@ -223,7 +237,11 @@ class ComponentStatusLogger:
                     emit("HealthStatus", payload)
                     return
                 except Exception as e:
-                    self.logger.debug("Sync HealthStatus emit failed; trying update_system_health: %s", e, exc_info=True)
+                    self.logger.debug(
+                        "Sync HealthStatus emit failed; trying update_system_health: %s",
+                        e,
+                        exc_info=True,
+                    )
             ush = getattr(ss, "update_system_health", None)
             if callable(ush) and not asyncio.iscoroutinefunction(ush):
                 try:
@@ -252,8 +270,8 @@ class ComponentStatusLogger:
             payload = {
                 "component": component,
                 "status": "Running",
-                "message": detail,   # P9 canonical
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                "message": detail,  # P9 canonical
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             }
             emit = getattr(ss, "emit_event", None) or getattr(ss, "emit", None)
             if callable(emit):
@@ -280,36 +298,62 @@ class ComponentStatusLogger:
             cls.get().logger.debug("Heartbeat SharedState emit failed: %s", e, exc_info=True)
 
     @classmethod
-    def log_status(cls, component: str = None, status: str = "", detail: str = "", level: int = logging.INFO, **kwargs):
+    def log_status(
+        cls,
+        component: str = None,
+        status: str = "",
+        detail: str = "",
+        level: int = logging.INFO,
+        **kwargs,
+    ):
         """
         Logs the status of a component and updates the internal cache.
         Accepts both modern and legacy keyword names for the component:
         component_name | name | component.
         """
-        comp = component or kwargs.get("component_name") or kwargs.get("name") or kwargs.get("component")
+        comp = (
+            component
+            or kwargs.get("component_name")
+            or kwargs.get("name")
+            or kwargs.get("component")
+        )
         if not comp:
-            cls.get().logger.warning("ComponentStatusLogger.log_status called without a component name.")
+            cls.get().logger.warning(
+                "ComponentStatusLogger.log_status called without a component name."
+            )
             comp = "UnknownComponent"
         return cls.get()._log_status(comp, status, detail, level)
 
     @classmethod
-    def set_component_status(cls, component: str = None, status: str = "", detail: str = "", **kwargs):
+    def set_component_status(
+        cls, component: str = None, status: str = "", detail: str = "", **kwargs
+    ):
         """
         Back-compat alias for log_status. Accepts component_name|component|name.
         """
         # Resolve component name from various possible keyword arguments
-        comp = component or kwargs.get("component_name") or kwargs.get("component") or kwargs.get("name")
+        comp = (
+            component
+            or kwargs.get("component_name")
+            or kwargs.get("component")
+            or kwargs.get("name")
+        )
         if not comp:
             cls.get().logger.warning(
                 "ComponentStatusLogger received status update with no component name."
             )
-            comp = "UnknownComponent" # Default if no component name is provided
+            comp = "UnknownComponent"  # Default if no component name is provided
         return cls.log_status(comp, status, detail)
 
     # Additional back-compat alias: some callers use set_status(...)
     @classmethod
     def set_status(cls, component: str = None, status: str = "", detail: str = "", **kwargs):
-        comp = component or kwargs.get("component_name") or kwargs.get("name") or kwargs.get("component")
+        comp = (
+            component
+            or kwargs.get("component_name")
+            or kwargs.get("name")
+            or kwargs.get("component")
+        )
         if not comp:
             comp = "UnknownComponent"
         return cls.log_status(comp, status, detail)
@@ -328,7 +372,9 @@ class ComponentStatusLogger:
         current_timestamp = time.time()
         detail_stripped = self._strip_emojis(detail)
 
-        is_dup = type(self)._is_duplicate_emit(component, status, detail_stripped, current_timestamp)
+        is_dup = type(self)._is_duplicate_emit(
+            component, status, detail_stripped, current_timestamp
+        )
         msg = f"[{component}] Status: {status} | Detail: {detail_stripped}"
 
         try:
@@ -342,20 +388,20 @@ class ComponentStatusLogger:
                 f"Status log failed for {component}: {type(e).__name__}: {e}; msg={msg}"
             )
 
-        with type(self)._status_lock: # Access class-level lock
-            type(self)._status_cache[component] = { # Access class-level cache
+        with type(self)._status_lock:  # Access class-level lock
+            type(self)._status_cache[component] = {  # Access class-level cache
                 "timestamp": current_timestamp,
                 "status": status,
-                "detail": detail_stripped
+                "detail": detail_stripped,
             }
 
         self._mirror_to_shared_state(component, status, detail_stripped)
         with type(self)._status_lock:
-            return type(self)._status_cache.get(component, {
-                "timestamp": current_timestamp,
-                "status": status,
-                "detail": detail_stripped
-            })
+            return type(self)._status_cache.get(
+                component,
+                {"timestamp": current_timestamp, "status": status, "detail": detail_stripped},
+            )
+
     @classmethod
     def get_stale_components(cls, since_seconds: Optional[int] = None) -> dict:
         """
@@ -388,18 +434,19 @@ class ComponentStatusLogger:
         with cls._status_lock:
             data = cls._status_cache.get(component_name)
         if not data:
-            return {"timestamp": 0, "status": "Unknown", "detail": "No status reported yet.", "stale": True}
+            return {
+                "timestamp": 0,
+                "status": "Unknown",
+                "detail": "No status reported yet.",
+                "stale": True,
+            }
 
         age = max(0.0, time.time() - float(data.get("timestamp", 0)))
         stale = age > cls._ttl_seconds
         if stale:
             # Return a derived view without modifying the cached data
             derived_status = "Unresponsive" if data.get("status") != "Stopped" else "Stopped"
-            return {
-                **data,
-                "stale": True,
-                "status": derived_status
-            }
+            return {**data, "stale": True, "status": derived_status}
         return {**data, "stale": False}
 
     @classmethod
@@ -417,7 +464,9 @@ class ComponentStatusLogger:
             stale = age > cls._ttl_seconds
             vv = {**v, "stale": stale}
             if stale and vv.get("status") != "Stopped":
-                vv["status"] = "Unresponsive" # Indicate unresponsiveness if stale and not explicitly stopped
+                vv[
+                    "status"
+                ] = "Unresponsive"  # Indicate unresponsiveness if stale and not explicitly stopped
             out[k] = vv
         return out
 
@@ -438,16 +487,24 @@ class ComponentStatusLogger:
                     lines = ["\n--- Operational Status Board Summary ---"]
                     for comp, data in statuses.items():
                         ts = float(data.get("timestamp", 0) or 0)
-                        tstr = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts > 0 else "N/A"
+                        tstr = (
+                            datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                            if ts > 0
+                            else "N/A"
+                        )
                         stale_indicator = " (STALE)" if data.get("stale") else ""
-                        lines.append(f"- {comp}: {data.get('status')}{stale_indicator} ({data.get('detail','')}) at {tstr}")
+                        lines.append(
+                            f"- {comp}: {data.get('status')}{stale_indicator} ({data.get('detail','')}) at {tstr}"
+                        )
                     lines.append("--------------------------------------")
                     logger_instance.info("\n".join(lines))
                 else:
-                    logger_instance.info("Operational Status Board: No component statuses to report yet.")
+                    logger_instance.info(
+                        "Operational Status Board: No component statuses to report yet."
+                    )
         except asyncio.CancelledError:
             logger_instance.info("Operational Status Board summary task cancelled (shutdown).")
-            raise # Re-raise to propagate cancellation
+            raise  # Re-raise to propagate cancellation
 
     # ---------- Quality-of-Life Helpers (Class-level) ----------
     @classmethod
@@ -482,9 +539,12 @@ class ComponentStatusLogger:
             cls._status_cache.clear()
             cls._last_emit.clear()
         cls.get().logger.info("Operational Status Board cleared.")
+
     # ---------- Optional: quick helper to bind + announce ----------
     @classmethod
-    def announce_bind(cls, shared_state, detail: str = "ComponentStatusLogger bound to SharedState"):
+    def announce_bind(
+        cls, shared_state, detail: str = "ComponentStatusLogger bound to SharedState"
+    ):
         """
         Convenience: bind_shared_state + optional config read + log Initialized.
         """
@@ -516,13 +576,19 @@ class ComponentStatusLogger:
         except Exception:
             pass
 
+
 # ---------- Functional Facade (Back-Compat & Simplicity) ----------
-def log_component_status(component: str, status: str, detail: str = "", level: int = logging.INFO, **kwargs):
+def log_component_status(
+    component: str, status: str, detail: str = "", level: int = logging.INFO, **kwargs
+):
     """
     Functional facade for agents/components that import a simple function.
     Delegates to ComponentStatusLogger.log_status.
     """
-    return ComponentStatusLogger.log_status(component=component, status=status, detail=detail, level=level, **kwargs)
+    return ComponentStatusLogger.log_status(
+        component=component, status=status, detail=detail, level=level, **kwargs
+    )
+
 
 def bind_shared_state(shared_state):
     """
@@ -530,11 +596,13 @@ def bind_shared_state(shared_state):
     """
     return ComponentStatusLogger.bind_shared_state(shared_state)
 
+
 def get_status(component_name: str) -> dict:
     """
     Functional facade to retrieve a single component status.
     """
     return ComponentStatusLogger.get_status(component_name)
+
 
 def get_all_statuses() -> dict:
     """
@@ -542,11 +610,13 @@ def get_all_statuses() -> dict:
     """
     return ComponentStatusLogger.get_all_statuses()
 
+
 def log_heartbeat(component_name: str, detail: str = "Heartbeat"):
     """
     Functional facade to emit a heartbeat; async scheduling handled internally.
     """
     return ComponentStatusLogger.log_heartbeat(component_name, detail)
+
 
 def clear_statuses():
     """

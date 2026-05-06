@@ -6,8 +6,6 @@ Tests for Phase 8.2.8 (preparation):
 
 from __future__ import annotations
 
-import warnings
-
 import pytest
 
 from core_engine.native.app_context import (

@@ -2,19 +2,22 @@
 """
 Phase 1 Recover Large Positions - Sell positions with sufficient size to meet capital floor
 """
+import os
 import sys
 import time
+
 from dotenv import load_dotenv
-import os
 
 # Load env
 load_dotenv()
 
+
 def main():
     try:
+        from decimal import Decimal
+
         from binance.client import Client
         from binance.exceptions import BinanceAPIException
-        from decimal import Decimal, ROUND_DOWN
 
         api_key = os.getenv("BINANCE_API_KEY")
         api_secret = os.getenv("BINANCE_API_SECRET_HMAC")
@@ -23,9 +26,9 @@ def main():
             print("❌ ERROR: BINANCE_API_KEY or BINANCE_API_SECRET_HMAC not set in .env")
             return False
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("PHASE 1 RECOVER LARGE POSITIONS - Sell Sizeable Assets")
-        print("="*80)
+        print("=" * 80)
 
         # Initialize Binance client
         client = Client(api_key, api_secret)
@@ -34,15 +37,15 @@ def main():
             # Get account info
             print("\n[1] Fetching account and position details...")
             account = client.get_account()
-            balances = account.get('balances', [])
+            balances = account.get("balances", [])
 
             # Find positions with size > $1 (large enough to sell)
             sellable_positions = []
             for bal in balances:
-                symbol = bal['asset']
-                free = float(bal['free'])
+                symbol = bal["asset"]
+                free = float(bal["free"])
 
-                if symbol == 'USDT' or free <= 0:
+                if symbol == "USDT" or free <= 0:
                     continue
 
                 # Get current price and minimum notional
@@ -54,15 +57,19 @@ def main():
 
                     # Get price
                     ticker_data = client.get_symbol_ticker(symbol=f"{symbol}USDT")
-                    price = float(ticker_data['price'])
+                    price = float(ticker_data["price"])
                     value = free * price
 
                     # Find lot size filter
                     lot_size_filter = next(
-                        (f for f in exchange_info.get('filters', []) if f['filterType'] == 'LOT_SIZE'),
-                        None
+                        (
+                            f
+                            for f in exchange_info.get("filters", [])
+                            if f["filterType"] == "LOT_SIZE"
+                        ),
+                        None,
                     )
-                    step_size = float(lot_size_filter['stepSize']) if lot_size_filter else 1e-8
+                    step_size = float(lot_size_filter["stepSize"]) if lot_size_filter else 1e-8
 
                     # Check if we can sell this
                     if value >= 1.0:  # At least $1
@@ -75,24 +82,23 @@ def main():
                         valid_qty = float(steps * decimal_step)
 
                         if valid_qty > 0:
-                            sellable_positions.append({
-                                'asset': symbol,
-                                'qty': free,
-                                'valid_qty': valid_qty,
-                                'price': price,
-                                'value': value,
-                                'step_size': step_size,
-                            })
+                            sellable_positions.append(
+                                {
+                                    "asset": symbol,
+                                    "qty": free,
+                                    "valid_qty": valid_qty,
+                                    "price": price,
+                                    "value": value,
+                                    "step_size": step_size,
+                                }
+                            )
 
-                except Exception as e:
+                except Exception:
                     # Skip this symbol
                     pass
 
             # Get current USDT
-            usdt_balance = next(
-                (float(b['free']) for b in balances if b['asset'] == 'USDT'),
-                0.0
-            )
+            usdt_balance = next((float(b["free"]) for b in balances if b["asset"] == "USDT"), 0.0)
             capital_floor = 10.0
             shortfall = max(0, capital_floor - usdt_balance)
 
@@ -105,12 +111,12 @@ def main():
                 return True
 
             if not sellable_positions:
-                print(f"\n❌ No positions large enough to sell (need > $1)")
+                print("\n❌ No positions large enough to sell (need > $1)")
                 print(f"   Found {len(balances)} total positions, all too small")
                 return False
 
             # Sort by value descending
-            sellable_positions.sort(key=lambda x: x['value'], reverse=True)
+            sellable_positions.sort(key=lambda x: x["value"], reverse=True)
 
             print(f"\n✅ Found {len(sellable_positions)} positions sellable (> $1):")
             needed = shortfall + 2.0  # Get a bit more than floor to be safe
@@ -125,7 +131,7 @@ def main():
                 print(f"       Sellable qty: {pos['valid_qty']:.8f} (step: {pos['step_size']:.8f})")
                 if accumulated < needed:
                     print(f"       → Needed to reach floor: ${needed_for_this:.2f} ✓")
-                    accumulated += pos['value']
+                    accumulated += pos["value"]
 
             # Confirm before proceeding
             print("\n⚠️  ABOUT TO EXECUTE LIVE POSITION SALES")
@@ -137,7 +143,7 @@ def main():
 
             # Execute sales
             print("\n[2] Executing sales...")
-            print("="*80)
+            print("=" * 80)
 
             successful = 0
             failed = 0
@@ -146,12 +152,12 @@ def main():
             for pos in sellable_positions:
                 # Stop if we've recovered enough
                 if usdt_balance + total_recovered >= capital_floor:
-                    print(f"\n✅ Capital floor reached! Stopping sales.")
+                    print("\n✅ Capital floor reached! Stopping sales.")
                     print(f"   Current + recovered: ${usdt_balance + total_recovered:.2f}")
                     break
 
-                symbol = pos['asset']
-                sell_qty = pos['valid_qty']
+                symbol = pos["asset"]
+                sell_qty = pos["valid_qty"]
 
                 print(f"\n[{successful + failed + 1}] Selling {symbol}...")
                 print(f"    Qty: {sell_qty:.8f}")
@@ -165,10 +171,8 @@ def main():
                     )
 
                     # Get actual fills
-                    fills = order.get('fills', [])
-                    actual_value = sum(
-                        float(f['qty']) * float(f['price']) for f in fills
-                    )
+                    fills = order.get("fills", [])
+                    actual_value = sum(float(f["qty"]) * float(f["price"]) for f in fills)
 
                     print(f"    ✅ Sold! (Order ID: {order['orderId']})")
                     print(f"    Actual proceeds: ${actual_value:.2f}")
@@ -188,9 +192,9 @@ def main():
                     failed += 1
 
             # Summary
-            print("\n" + "="*80)
+            print("\n" + "=" * 80)
             print("SALES SUMMARY")
-            print("="*80)
+            print("=" * 80)
             print(f"Successful sales: {successful}")
             print(f"Failed sales:     {failed}")
             print(f"Total recovered:  ${total_recovered:.2f}")
@@ -205,40 +209,46 @@ def main():
                 # Check updated balance
                 print("\n[4] Verifying final balance...")
                 account_updated = client.get_account()
-                balances_updated = account_updated.get('balances', [])
+                balances_updated = account_updated.get("balances", [])
 
                 new_usdt = next(
-                    (float(b['free']) for b in balances_updated if b['asset'] == 'USDT'),
-                    0.0
+                    (float(b["free"]) for b in balances_updated if b["asset"] == "USDT"), 0.0
                 )
 
                 print(f"    Final USDT: ${new_usdt:.2f}")
 
                 if new_usdt >= capital_floor:
-                    print(f"\n✅ SUCCESS: Capital floor met! (${new_usdt:.2f} >= ${capital_floor:.2f})")
+                    print(
+                        f"\n✅ SUCCESS: Capital floor met! (${new_usdt:.2f} >= ${capital_floor:.2f})"
+                    )
                     print("\n   Next steps:")
                     print("   1. Restart the system: python3 🎯_MASTER_SYSTEM_ORCHESTRATOR.py")
                     print("   2. System should resume trading normally")
                     return True
                 else:
-                    print(f"\n⚠️  Capital floor still not met: ${new_usdt:.2f} < ${capital_floor:.2f}")
+                    print(
+                        f"\n⚠️  Capital floor still not met: ${new_usdt:.2f} < ${capital_floor:.2f}"
+                    )
                     print(f"   Still need: ${capital_floor - new_usdt:.2f}")
                     return False
             else:
-                print(f"\n❌ No positions were successfully sold")
+                print("\n❌ No positions were successfully sold")
                 return False
 
         except Exception as e:
             print(f"❌ Error: {e}")
             import traceback
+
             traceback.print_exc()
             return False
 
     except Exception as e:
         print(f"❌ Setup error: {e}")
         import traceback
+
         traceback.print_exc()
         return False
+
 
 if __name__ == "__main__":
     success = main()

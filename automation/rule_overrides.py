@@ -9,9 +9,8 @@ behavior dynamic without restarting the orchestrator.
 import json
 import os
 import time
-from functools import lru_cache
 
-DEFAULT_PATH = os.path.join(os.path.dirname(__file__), 'proposed_rules.json')
+DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "proposed_rules.json")
 _CACHE_TTL = 30.0  # seconds
 _last_load_ts = 0.0
 _last_payload = {}
@@ -20,7 +19,7 @@ _last_payload = {}
 # This allows (a) updating environment variables in-process, and (b)
 # toggling via a simple local control file `automation/.apply_proposed_rules`
 # without restarting the orchestrator.
-_CONTROL_FILE = os.path.join(os.path.dirname(__file__), '.apply_proposed_rules')
+_CONTROL_FILE = os.path.join(os.path.dirname(__file__), ".apply_proposed_rules")
 
 
 def _apply_enabled():
@@ -31,19 +30,19 @@ def _apply_enabled():
     # Control file presence allows operators to toggle without restarting the process.
     try:
         if os.path.exists(_CONTROL_FILE):
-            with open(_CONTROL_FILE, 'r') as f:
+            with open(_CONTROL_FILE) as f:
                 val = f.read().strip().lower()
-            return val in ('1', 'true', 'yes', 'on')
+            return val in ("1", "true", "yes", "on")
     except Exception:
         # ignore and fall back to env var
         pass
-    return os.environ.get('APPLY_PROPOSED_RULES', 'true').lower() in ('1', 'true', 'yes', 'on')
+    return os.environ.get("APPLY_PROPOSED_RULES", "true").lower() in ("1", "true", "yes", "on")
 
 
 def _min_conf_floor():
     """Return configured minimum required_conf floor as a float (default 0.50)."""
     try:
-        return float(os.environ.get('MIN_REQUIRED_CONF_FLOOR', '0.50'))
+        return float(os.environ.get("MIN_REQUIRED_CONF_FLOOR", "0.50"))
     except Exception:
         return 0.50
 
@@ -59,14 +58,14 @@ def _load(path=DEFAULT_PATH):
         _last_load_ts = now
         return {}
     try:
-        with open(path, 'r') as f:
+        with open(path) as f:
             payload = json.load(f)
-        proposals = payload.get('proposals') if isinstance(payload, dict) else None
+        proposals = payload.get("proposals") if isinstance(payload, dict) else None
         if not proposals:
             _last_payload = {}
             _last_load_ts = now
             return {}
-        mapping = {p['symbol']: p for p in proposals if 'symbol' in p}
+        mapping = {p["symbol"]: p for p in proposals if "symbol" in p}
         _last_payload = mapping
         _last_load_ts = now
         return mapping
@@ -85,11 +84,11 @@ def get_required_conf_override(symbol):
         p = proposals.get(symbol)
         if not p:
             return None
-        val = p.get('suggested_required_conf')
+        val = p.get("suggested_required_conf")
         if val is None:
             return None
         # safety cap: do not allow suggested conf below configured floor
-        allow_below = bool(p.get('allow_below_floor', False))
+        allow_below = bool(p.get("allow_below_floor", False))
         try:
             valf = float(val)
         except Exception:

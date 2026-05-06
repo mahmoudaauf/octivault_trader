@@ -18,8 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from statistics import mean
-from typing import Dict, List, Optional, Tuple
-
+from typing import Optional
 
 VOL_RE = re.compile(
     r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+-\s+INFO\s+-\s+🎯 VOL-ADAPTIVE TP/SL\s+"
@@ -73,12 +72,12 @@ def _expected_regime(atr_pct_ratio: float, low: float, high: float) -> str:
     return "trend"
 
 
-def _pearson(xs: List[float], ys: List[float]) -> float:
+def _pearson(xs: list[float], ys: list[float]) -> float:
     if len(xs) != len(ys) or len(xs) < 2:
         return float("nan")
     mx = mean(xs)
     my = mean(ys)
-    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False))
     denx = math.sqrt(sum((x - mx) ** 2 for x in xs))
     deny = math.sqrt(sum((y - my) ** 2 for y in ys))
     if denx == 0 or deny == 0:
@@ -86,10 +85,10 @@ def _pearson(xs: List[float], ys: List[float]) -> float:
     return num / (denx * deny)
 
 
-def parse_log(path: str) -> Tuple[List[VolRow], List[ExecRow]]:
-    vols: List[VolRow] = []
-    execs: List[ExecRow] = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+def parse_log(path: str) -> tuple[list[VolRow], list[ExecRow]]:
+    vols: list[VolRow] = []
+    execs: list[ExecRow] = []
+    with open(path, encoding="utf-8", errors="ignore") as f:
         for line in f:
             mv = VOL_RE.search(line)
             if mv:
@@ -98,12 +97,12 @@ def parse_log(path: str) -> Tuple[List[VolRow], List[ExecRow]]:
                         ts=_parse_ts(mv.group("ts")),
                         symbol=mv.group("symbol"),
                         atr_pct=float(mv.group("atr_pct")),  # percent units (1.00 == 1%)
-                        rv_pct=float(mv.group("rv_pct")),    # percent units
+                        rv_pct=float(mv.group("rv_pct")),  # percent units
                         regime=mv.group("regime"),
                         rr_target=float(mv.group("rr_target")),
                         rr_final=float(mv.group("rr_final")),
-                        sl_pct=float(mv.group("sl_pct")),    # percent units
-                        tp_pct=float(mv.group("tp_pct")),    # percent units
+                        sl_pct=float(mv.group("sl_pct")),  # percent units
+                        tp_pct=float(mv.group("tp_pct")),  # percent units
                         risk_size=float(mv.group("risk_size")),
                     )
                 )
@@ -126,8 +125,8 @@ def parse_log(path: str) -> Tuple[List[VolRow], List[ExecRow]]:
 
 
 def analyze(
-    vols: List[VolRow],
-    execs: List[ExecRow],
+    vols: list[VolRow],
+    execs: list[ExecRow],
     low_atr_ratio: float,
     high_atr_ratio: float,
     sl_noise_floor_mult: float,
@@ -136,7 +135,7 @@ def analyze(
     if not vols:
         return "No VOL-ADAPTIVE TP/SL rows found."
 
-    out: List[str] = []
+    out: list[str] = []
     out.append(f"Rows parsed: vol={len(vols)} exec={len(execs)}")
 
     # 1) SL width optimality
@@ -166,8 +165,8 @@ def analyze(
 
     # 2) Regime accuracy
     correct = 0
-    expected_counts: Dict[str, int] = defaultdict(int)
-    actual_counts: Dict[str, int] = defaultdict(int)
+    expected_counts: dict[str, int] = defaultdict(int)
+    actual_counts: dict[str, int] = defaultdict(int)
     for r in vols:
         exp = _expected_regime(r.atr_pct / 100.0, low_atr_ratio, high_atr_ratio)
         expected_counts[exp] += 1
@@ -207,7 +206,7 @@ def analyze(
 
     # 4) Position sizing efficiency
     # Match nearest BUY execution by symbol/time against VOL risk_size.
-    by_symbol_exec: Dict[str, List[ExecRow]] = defaultdict(list)
+    by_symbol_exec: dict[str, list[ExecRow]] = defaultdict(list)
     for e in execs:
         if e.side == "BUY":
             by_symbol_exec[e.symbol].append(e)
@@ -250,9 +249,15 @@ def analyze(
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--log", default="logs/app.log")
-    p.add_argument("--low-atr", type=float, default=0.0045, help="ATR low threshold ratio (0.0045 = 0.45%)")
-    p.add_argument("--high-atr", type=float, default=0.0150, help="ATR high threshold ratio (0.015 = 1.5%)")
-    p.add_argument("--noise-floor-mult", type=float, default=1.20, help="SL should be >= mult * ATR")
+    p.add_argument(
+        "--low-atr", type=float, default=0.0045, help="ATR low threshold ratio (0.0045 = 0.45%)"
+    )
+    p.add_argument(
+        "--high-atr", type=float, default=0.0150, help="ATR high threshold ratio (0.015 = 1.5%)"
+    )
+    p.add_argument(
+        "--noise-floor-mult", type=float, default=1.20, help="SL should be >= mult * ATR"
+    )
     p.add_argument("--match-window-sec", type=int, default=60)
     args = p.parse_args()
 
@@ -272,4 +277,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

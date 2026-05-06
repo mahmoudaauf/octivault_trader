@@ -1,6 +1,6 @@
-
 import json
 import os
+
 
 def load_tuned_params(agent_name: str) -> dict:
     """
@@ -10,7 +10,7 @@ def load_tuned_params(agent_name: str) -> dict:
     try:
         path = f"tuned_params/{agent_name}.json"
         if os.path.exists(path):
-            with open(path, 'r') as f:
+            with open(path) as f:
                 return json.load(f)
     except Exception:
         pass

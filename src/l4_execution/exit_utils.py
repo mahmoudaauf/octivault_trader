@@ -1,5 +1,5 @@
 import asyncio
-from typing import Optional, Any
+from typing import Any
 
 
 def _maybe_float(value: Any, default: float) -> float:
@@ -9,7 +9,9 @@ def _maybe_float(value: Any, default: float) -> float:
         return float(default)
 
 
-async def post_exit_bookkeeping(shared_state, config, logger, symbol: str, exit_reason: str, source: str) -> None:
+async def post_exit_bookkeeping(
+    shared_state, config, logger, symbol: str, exit_reason: str, source: str
+) -> None:
     """Record exit reason and apply standard post-exit cooldown."""
     try:
         if hasattr(shared_state, "record_exit_reason"):

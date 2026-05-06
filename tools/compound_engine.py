@@ -18,12 +18,12 @@ MetaController reads three values from it every trade:
   • get_pace_status()        → advisory signal (can tighten/loosen filters)
 """
 
+import asyncio
 import logging
 import time
-import asyncio
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Optional
 
 logger = logging.getLogger("CompoundEngine")
 
@@ -32,19 +32,20 @@ logger = logging.getLogger("CompoundEngine")
 # Data types
 # ---------------------------------------------------------------------------
 
+
 class PaceStatus(str, Enum):
-    AHEAD    = "AHEAD"      # Exceeding 2%/day pace → maintain parameters
-    ON_PACE  = "ON_PACE"    # Within ±25% of target → normal operation
-    BEHIND   = "BEHIND"     # Behind pace → can slightly loosen entry filters
-    CRITICAL = "CRITICAL"   # Far behind — kill-switch territory
+    AHEAD = "AHEAD"  # Exceeding 2%/day pace → maintain parameters
+    ON_PACE = "ON_PACE"  # Within ±25% of target → normal operation
+    BEHIND = "BEHIND"  # Behind pace → can slightly loosen entry filters
+    CRITICAL = "CRITICAL"  # Far behind — kill-switch territory
 
 
 @dataclass
 class Checkpoint:
     ts: float
     nav: float
-    target_nav: float           # What NAV should be at this time for +2%/day
-    gap_pct: float              # (nav - target_nav) / target_nav
+    target_nav: float  # What NAV should be at this time for +2%/day
+    gap_pct: float  # (nav - target_nav) / target_nav
     pace_status: PaceStatus
     trades_since_last: int
     realized_pnl_since_last: float
@@ -54,7 +55,7 @@ class Checkpoint:
 class KillSwitch:
     reason: str
     triggered_at: float
-    resume_at: float            # 0 = permanent until manual reset
+    resume_at: float  # 0 = permanent until manual reset
     nav_at_trigger: float
     detail: str = ""
 
@@ -74,10 +75,11 @@ class ReinvestmentLedger:
     Every time a trade closes with profit, 50% goes into the pool.
     The pool is drawn down as position sizes are scaled up.
     """
-    pool_usdt: float = 0.0          # Accumulated reinvestable capital
+
+    pool_usdt: float = 0.0  # Accumulated reinvestable capital
     total_profits_seen: float = 0.0
     total_reinvested: float = 0.0
-    total_withdrawn: float = 0.0    # 50% kept / taken out
+    total_withdrawn: float = 0.0  # 50% kept / taken out
 
     def record_profit(self, profit_usdt: float, reinvest_rate: float = 0.50):
         if profit_usdt <= 0:
@@ -91,8 +93,11 @@ class ReinvestmentLedger:
         logger.info(
             "[Compound:Reinvest] profit=+$%.4f reinvest=+$%.4f pool=$%.4f "
             "total_reinvested=$%.4f total_withdrawn=$%.4f",
-            profit_usdt, reinvest, self.pool_usdt,
-            self.total_reinvested, self.total_withdrawn,
+            profit_usdt,
+            reinvest,
+            self.pool_usdt,
+            self.total_reinvested,
+            self.total_withdrawn,
         )
 
     def draw(self, amount: float) -> float:
@@ -105,6 +110,7 @@ class ReinvestmentLedger:
 # ---------------------------------------------------------------------------
 # Main engine
 # ---------------------------------------------------------------------------
+
 
 class CompoundGrowthEngine:
     """
@@ -123,27 +129,27 @@ class CompoundGrowthEngine:
         self._lock = asyncio.Lock()
 
         # Core target
-        self.daily_target_pct   = float(self._cfg("COMPOUND_DAILY_TARGET_PCT", 0.02))
-        self.reinvest_rate      = float(self._cfg("COMPOUND_REINVEST_RATE", 0.50))
-        self.checkpoint_sec     = float(self._cfg("COMPOUND_CHECKPOINT_SEC", 3600))
+        self.daily_target_pct = float(self._cfg("COMPOUND_DAILY_TARGET_PCT", 0.02))
+        self.reinvest_rate = float(self._cfg("COMPOUND_REINVEST_RATE", 0.50))
+        self.checkpoint_sec = float(self._cfg("COMPOUND_CHECKPOINT_SEC", 3600))
 
         # Risk bounds
         self.max_nav_at_risk_pct = float(self._cfg("COMPOUND_MAX_NAV_AT_RISK_PCT", 0.60))
-        self.min_edge_fee_mult   = float(self._cfg("COMPOUND_MIN_EDGE_FEE_MULT", 2.5))
+        self.min_edge_fee_mult = float(self._cfg("COMPOUND_MIN_EDGE_FEE_MULT", 2.5))
 
         # Kill-switch thresholds
-        self.ks_daily_dd_pct      = float(self._cfg("KILLSWITCH_DAILY_DD_PCT", 0.05))
+        self.ks_daily_dd_pct = float(self._cfg("KILLSWITCH_DAILY_DD_PCT", 0.05))
         self.ks_session_floor_pct = float(self._cfg("KILLSWITCH_SESSION_FLOOR_PCT", 0.10))
-        self.ks_consec_losses     = int(self._cfg("KILLSWITCH_CONSEC_LOSSES", 3))
-        self.ks_fee_drain_pct     = float(self._cfg("KILLSWITCH_FEE_DRAIN_PCT", 0.01))
-        self.ks_pause_sec         = float(self._cfg("KILLSWITCH_PAUSE_SEC", 1800))
+        self.ks_consec_losses = int(self._cfg("KILLSWITCH_CONSEC_LOSSES", 3))
+        self.ks_fee_drain_pct = float(self._cfg("KILLSWITCH_FEE_DRAIN_PCT", 0.01))
+        self.ks_pause_sec = float(self._cfg("KILLSWITCH_PAUSE_SEC", 1800))
 
         # State
         self._session_open_nav: Optional[float] = None
         self._daily_open_nav: Optional[float] = None
         self._last_checkpoint_ts: float = 0.0
-        self._checkpoints: List[Checkpoint] = []
-        self._kill_switches: List[KillSwitch] = []
+        self._checkpoints: list[Checkpoint] = []
+        self._kill_switches: list[KillSwitch] = []
         self._reinvestment = ReinvestmentLedger()
 
         # Loss streak tracking
@@ -157,8 +163,10 @@ class CompoundGrowthEngine:
         logger.info(
             "[Compound:Init] target=+%.1f%%/day reinvest=%.0f%% "
             "max_risk=%.0f%% DD_kill=%.1f%% losses_kill=%d",
-            self.daily_target_pct * 100, self.reinvest_rate * 100,
-            self.max_nav_at_risk_pct * 100, self.ks_daily_dd_pct * 100,
+            self.daily_target_pct * 100,
+            self.reinvest_rate * 100,
+            self.max_nav_at_risk_pct * 100,
+            self.ks_daily_dd_pct * 100,
             self.ks_consec_losses,
         )
 
@@ -175,7 +183,7 @@ class CompoundGrowthEngine:
         """Call once after first NAV read at startup."""
         if self._session_open_nav is None:
             self._session_open_nav = nav
-            self._daily_open_nav   = nav
+            self._daily_open_nav = nav
             self._last_checkpoint_ts = time.time()
             logger.info("[Compound:Init] Session open NAV: $%.2f", nav)
 
@@ -196,10 +204,12 @@ class CompoundGrowthEngine:
             self._consecutive_losses += 1
 
         logger.info(
-            "[Compound:Trade] %s pnl=%+.4f streak_losses=%d "
-            "pnl_today=%+.4f trades_today=%d",
-            symbol, pnl_usdt, self._consecutive_losses,
-            self._pnl_today, self._trades_today,
+            "[Compound:Trade] %s pnl=%+.4f streak_losses=%d " "pnl_today=%+.4f trades_today=%d",
+            symbol,
+            pnl_usdt,
+            self._consecutive_losses,
+            self._pnl_today,
+            self._trades_today,
         )
 
         # Evaluate kill-switches after every trade
@@ -212,7 +222,8 @@ class CompoundGrowthEngine:
         for ks in expired:
             logger.info(
                 "[Compound:KillSwitch:CLEARED] reason=%s was_triggered_at=%.0f",
-                ks.reason, ks.triggered_at,
+                ks.reason,
+                ks.triggered_at,
             )
         self._kill_switches = [ks for ks in self._kill_switches if not ks.is_expired()]
 
@@ -225,7 +236,9 @@ class CompoundGrowthEngine:
             for ks in active:
                 logger.warning(
                     "[Compound:KillSwitch:ACTIVE] %s — %s  resume_in=%.0fs",
-                    ks.reason, ks.detail, ks.time_remaining_sec(),
+                    ks.reason,
+                    ks.detail,
+                    ks.time_remaining_sec(),
                 )
             return True
         return False
@@ -258,7 +271,10 @@ class CompoundGrowthEngine:
         if abs(mult - 1.0) > 0.05:
             logger.debug(
                 "[Compound:Sizing] base=$%.2f mult=%.2f pool=$%.2f nav=$%.2f",
-                base_size_usdt, mult, pool, current_nav,
+                base_size_usdt,
+                mult,
+                pool,
+                current_nav,
             )
         return mult
 
@@ -271,7 +287,7 @@ class CompoundGrowthEngine:
             return PaceStatus.ON_PACE
 
         elapsed_h = (time.time() - self._session_start) / 3600.0
-        if elapsed_h < 0.25:   # first 15 min: no data yet
+        if elapsed_h < 0.25:  # first 15 min: no data yet
             return PaceStatus.ON_PACE
 
         # Pro-rated target: fraction of 24h elapsed × daily target
@@ -291,13 +307,13 @@ class CompoundGrowthEngine:
 
         gap_pct = (nav - target_nav) / self._session_open_nav
 
-        if gap_pct >= 0.005:         # >+0.5% ahead of pace
+        if gap_pct >= 0.005:  # >+0.5% ahead of pace
             return PaceStatus.AHEAD
-        elif gap_pct >= -0.005:      # within ±0.5%
+        elif gap_pct >= -0.005:  # within ±0.5%
             return PaceStatus.ON_PACE
-        elif gap_pct >= -0.015:      # 0.5-1.5% behind
+        elif gap_pct >= -0.015:  # 0.5-1.5% behind
             return PaceStatus.BEHIND
-        else:                        # >1.5% behind
+        else:  # >1.5% behind
             return PaceStatus.CRITICAL
 
     def take_checkpoint(self, current_nav: float) -> Checkpoint:
@@ -331,9 +347,12 @@ class CompoundGrowthEngine:
             "[Compound:Checkpoint] %s elapsed=%.1fh  NAV=$%.2f  target=$%.2f  "
             "gap=%+.2f%%  trades=%d  pnl=%+.4f  pool=$%.4f  losses_streak=%d",
             status_emoji.get(pace.value, ""),
-            elapsed_h, current_nav, target_nav,
+            elapsed_h,
+            current_nav,
+            target_nav,
             gap_pct * 100,
-            self._trades_today, self._pnl_today,
+            self._trades_today,
+            self._pnl_today,
             self._reinvestment.pool_usdt,
             self._consecutive_losses,
         )
@@ -348,12 +367,14 @@ class CompoundGrowthEngine:
         if expected_move_pct < min_required:
             logger.debug(
                 "[Compound:EdgeCheck] REJECT expected=%.3f%% < min=%.3f%% (%.1f× fees)",
-                expected_move_pct * 100, min_required * 100, self.min_edge_fee_mult,
+                expected_move_pct * 100,
+                min_required * 100,
+                self.min_edge_fee_mult,
             )
             return False
         return True
 
-    def get_summary(self) -> Dict[str, Any]:
+    def get_summary(self) -> dict[str, Any]:
         """Return a dict suitable for dashboard / logging."""
         pace = self.get_pace_status()
         open_nav = self._session_open_nav or 0.0
@@ -408,7 +429,7 @@ class CompoundGrowthEngine:
             if floor_pct <= -self.ks_session_floor_pct:
                 self._arm_kill_switch(
                     reason="SESSION_FLOOR",
-                    pause_sec=0,   # permanent
+                    pause_sec=0,  # permanent
                     nav=nav,
                     detail=f"NAV hit session floor {floor_pct*100:.1f}% — manual restart required",
                 )
@@ -429,7 +450,7 @@ class CompoundGrowthEngine:
                 pause_sec=self.ks_pause_sec / 2,  # shorter pause
                 nav=nav or open_nav,
                 detail=f"Fees today ${self._fees_today:.4f} = "
-                       f"{self._fees_today/open_nav*100:.2f}% of NAV — reduce frequency",
+                f"{self._fees_today/open_nav*100:.2f}% of NAV — reduce frequency",
             )
 
     def _arm_kill_switch(self, reason: str, pause_sec: float, nav: float, detail: str):
@@ -448,9 +469,11 @@ class CompoundGrowthEngine:
         self._kill_switches.append(ks)
         emoji = "🛑" if pause_sec == 0 else "⚠️"
         logger.warning(
-            "[Compound:KillSwitch:ARMED] %s %s — %s  "
-            "pause=%.0fs (resume=%s)",
-            emoji, reason, detail, pause_sec,
+            "[Compound:KillSwitch:ARMED] %s %s — %s  " "pause=%.0fs (resume=%s)",
+            emoji,
+            reason,
+            detail,
+            pause_sec,
             "NEVER (manual reset)" if pause_sec == 0 else f"{pause_sec/60:.0f}m",
         )
 
@@ -459,9 +482,7 @@ class CompoundGrowthEngine:
         if self._consecutive_losses > 0:
             self._consecutive_losses = 0
         # Remove LOSS_STREAK kill-switch (will be removed on next check too)
-        self._kill_switches = [
-            ks for ks in self._kill_switches if ks.reason != "LOSS_STREAK"
-        ]
+        self._kill_switches = [ks for ks in self._kill_switches if ks.reason != "LOSS_STREAK"]
 
     def manual_reset(self, reason: str = "ALL"):
         """Manually clear kill-switches (e.g. after reviewing situation)."""
@@ -472,7 +493,8 @@ class CompoundGrowthEngine:
             self._kill_switches = [ks for ks in self._kill_switches if ks.reason != reason]
         logger.warning(
             "[Compound:ManualReset] Cleared %d kill-switch(es) (reason=%s)",
-            before - len(self._kill_switches), reason,
+            before - len(self._kill_switches),
+            reason,
         )
 
     # ------------------------------------------------------------------

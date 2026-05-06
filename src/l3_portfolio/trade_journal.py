@@ -16,7 +16,7 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 LOGGER = logging.getLogger("TradeJournal")
 
@@ -35,7 +35,7 @@ class TradeJournal:
     # Public API
     # ------------------------------------------------------------------
 
-    def record(self, event_type: str, data: Dict[str, Any]) -> None:
+    def record(self, event_type: str, data: dict[str, Any]) -> None:
         """
         Write one JSON line to the journal.
 

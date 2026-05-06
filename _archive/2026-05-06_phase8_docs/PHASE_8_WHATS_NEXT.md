@@ -1,7 +1,7 @@
 # Phase 8 - What's Next? Quick Start (2 minutes)
 
-**Status:** Phase 8.2.1 ✅ Complete (L0 Native 29/29 tests pass)  
-**Current Time:** 2026-05-06  
+**Status:** Phase 8.2.1 ✅ Complete (L0 Native 29/29 tests pass)
+**Current Time:** 2026-05-06
 **You Have:** 4 immediate choices
 
 ---
@@ -9,8 +9,8 @@
 ## 🚨 TL;DR - Choose One (Read in 30 seconds)
 
 ### ⚡ Option 1: Test First (Recommended) ✔️
-**Time:** 1 hour  
-**Risk:** None  
+**Time:** 1 hour
+**Risk:** None
 **Value:** Confirms L0 works, data for next decision
 
 ```bash
@@ -29,8 +29,8 @@ python3 main.py --mode=paper-trade --duration=300 --native-l0
 ---
 
 ### 🚀 Option 2: Build L1 Now
-**Time:** 2-3 weeks  
-**Risk:** Medium  
+**Time:** 2-3 weeks
+**Risk:** Medium
 **Value:** Next native layer (53% code reduction target)
 
 ```bash
@@ -45,8 +45,8 @@ python3 main.py --mode=paper-trade --duration=300 --native-l0
 ---
 
 ### 📋 Option 3: Plan Phases 8.2.3-8
-**Time:** 1-2 days  
-**Risk:** None  
+**Time:** 1-2 days
+**Risk:** None
 **Value:** Roadmap clarity for all future phases
 
 ```bash
@@ -60,8 +60,8 @@ python3 main.py --mode=paper-trade --duration=300 --native-l0
 ---
 
 ### ✅ Option 4: Code Review & Audit
-**Time:** 1 day  
-**Risk:** None  
+**Time:** 1 day
+**Risk:** None
 **Value:** Ensure production readiness
 
 ```bash
@@ -198,7 +198,7 @@ python3 main.py --mode=paper-trade --duration=300 --native-l0 2>&1 | tee test_na
 grep "cycle_time_ms\|nav:" test_bridge.log test_native_l0.log
 ```
 
-**If PASS:** Continue to Option 2 (L1 implementation)  
+**If PASS:** Continue to Option 2 (L1 implementation)
 **If FAIL:** Debug and fix, then restart
 
 ---
@@ -218,7 +218,7 @@ EOF
 # Commit regularly
 ```
 
-**Timeline:** 2026-05-07 to 2026-06-10 (2-3 weeks)  
+**Timeline:** 2026-05-07 to 2026-06-10 (2-3 weeks)
 **Next Checkpoint:** 2026-05-20 (ExchangeClient done)
 
 ---

@@ -1,13 +1,14 @@
 import asyncio
+import inspect
 import logging
 import time
-import inspect
-from typing import Dict, Tuple, Optional, Any, List
+from typing import Any, Optional
 
 logger = logging.getLogger("Watchdog")
 
 # Healthy status values (lowercase)
 _HEALTHY = {"operational", "running", "initialized", "active", "healthy", "ok"}
+
 
 def _is_healthy(s: str) -> bool:
     try:
@@ -45,7 +46,13 @@ class Watchdog:
       • emits a single summary status per cycle
     """
 
-    def __init__(self, check_interval_seconds: Optional[float] = None, config=None, shared_state=None, **kwargs):
+    def __init__(
+        self,
+        check_interval_seconds: Optional[float] = None,
+        config=None,
+        shared_state=None,
+        **kwargs,
+    ):
         """
         P9-compatible constructor with backward-compat support.
         Accepts either the legacy positional form (check_interval_seconds, config, shared_state)
@@ -63,8 +70,10 @@ class Watchdog:
         # interval can come from: interval_sec > check_sec > check_interval_seconds > config > default
         interval_sec = kwargs.pop("interval_sec", None)
         check_sec = kwargs.pop("check_sec", None)
-        interval_candidate = interval_sec if interval_sec is not None else (
-            check_sec if check_sec is not None else check_interval_seconds
+        interval_candidate = (
+            interval_sec
+            if interval_sec is not None
+            else (check_sec if check_sec is not None else check_interval_seconds)
         )
 
         # Interval from arg or config, with sane defaults
@@ -77,8 +86,10 @@ class Watchdog:
 
         # Tolerance: multiplier and optional cap
         tol_mult = float(getattr(config, "WATCHDOG_TOLERANCE_MULTIPLIER", 3.0) or 3.0)
-        tol_cap  = getattr(config, "WATCHDOG_MAX_TOLERANCE_SEC", None)
-        tolerance_time_seconds = max(float(interval_candidate), float(interval_candidate) * tol_mult)
+        tol_cap = getattr(config, "WATCHDOG_MAX_TOLERANCE_SEC", None)
+        tolerance_time_seconds = max(
+            float(interval_candidate), float(interval_candidate) * tol_mult
+        )
         if tol_cap is not None:
             try:
                 tolerance_time_seconds = min(float(tolerance_time_seconds), float(tol_cap))
@@ -95,7 +106,8 @@ class Watchdog:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.info(
             "✅ Watchdog initialized (interval=%.1fs, tolerance=%.1fs).",
-            self.check_interval, self.tolerance_time_seconds
+            self.check_interval,
+            self.tolerance_time_seconds,
         )
 
         self._stop_event = asyncio.Event()
@@ -152,10 +164,12 @@ class Watchdog:
             self.required_components = set(default_required)
 
         # Track last time a component was confirmed healthy
-        self.last_healthy_report: Dict[str, float] = {}
+        self.last_healthy_report: dict[str, float] = {}
 
-        self.warn_cooldown_seconds: float = float(getattr(self.config, "WATCHDOG_WARN_COOLDOWN_SEC", 60.0) or 60.0)
-        self._last_warn_time: Dict[str, float] = {}
+        self.warn_cooldown_seconds: float = float(
+            getattr(self.config, "WATCHDOG_WARN_COOLDOWN_SEC", 60.0) or 60.0
+        )
+        self._last_warn_time: dict[str, float] = {}
 
         # Mark as initialized (best-effort; supports sync or async impls)
         try:
@@ -163,7 +177,9 @@ class Watchdog:
                 "Watchdog", "Initialized", "Ready to monitor components."
             )
         except Exception:
-            logger.debug("Watchdog: initial component status set failed (non-fatal).", exc_info=True)
+            logger.debug(
+                "Watchdog: initial component status set failed (non-fatal).", exc_info=True
+            )
 
     async def start(self):
         """
@@ -191,7 +207,9 @@ class Watchdog:
             try:
                 t.cancel()
                 try:
-                    await asyncio.wait_for(t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0)))
+                    await asyncio.wait_for(
+                        t, timeout=float(getattr(self.config, "STOP_JOIN_TIMEOUT_S", 5.0))
+                    )
                 except asyncio.CancelledError:
                     pass
             except Exception:
@@ -203,12 +221,12 @@ class Watchdog:
 
     # -------- shared_state helpers (sync/async tolerant) --------
 
-    def _safe_status(self, name: str) -> Dict[str, Any]:
+    def _safe_status(self, name: str) -> dict[str, Any]:
         """
         Retrieve a component status snapshot from SharedState safely.
         Expected keys: {'timestamp': epoch_seconds, 'status': str, 'detail': str}
         """
-        si: Optional[Dict[str, Any]] = None
+        si: Optional[dict[str, Any]] = None
 
         # Preferred: component-status snapshot (Phase 9 store: _component_status)
         try:
@@ -231,7 +249,7 @@ class Watchdog:
                 si = None
 
         # Normalize structure to {timestamp, status, detail}
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         if isinstance(si, dict):
             ts = si.get("timestamp", si.get("ts", 0.0)) or 0.0
             status = si.get("status", "Unknown") or "Unknown"
@@ -338,8 +356,9 @@ class Watchdog:
         Also tolerant to newer update_system_health signature (message/detail).
         """
         # Prefer dedicated component API
-        fn = getattr(self.shared_state, "update_component_status", None) or \
-             getattr(self.shared_state, "set_component_status", None)
+        fn = getattr(self.shared_state, "update_component_status", None) or getattr(
+            self.shared_state, "set_component_status", None
+        )
         if callable(fn):
             if _is_coro_fn(fn):
                 await fn(comp, status, detail)
@@ -373,13 +392,15 @@ class Watchdog:
         except Exception:
             pass
         return False
+
     def _safe_update_component_status_sync(self, comp: str, status: str, detail: str):
         """
         Synchronous helper (used at init); no await context required.
         If the target API is async, schedule it on the running loop when available.
         """
-        fn = getattr(self.shared_state, "update_component_status", None) or \
-             getattr(self.shared_state, "set_component_status", None)
+        fn = getattr(self.shared_state, "update_component_status", None) or getattr(
+            self.shared_state, "set_component_status", None
+        )
         if callable(fn):
             try:
                 if _is_coro_fn(fn):
@@ -418,7 +439,7 @@ class Watchdog:
 
     # -------- core check --------
 
-    async def _check_component_health(self, component_name: str) -> Tuple[str, bool, Optional[str]]:
+    async def _check_component_health(self, component_name: str) -> tuple[str, bool, Optional[str]]:
         """
         Check one component and (best-effort) annotate Watchdog status when needed.
         Returns: (component_name, is_healthy, problem_label_or_None)
@@ -427,8 +448,8 @@ class Watchdog:
         now = time.time()
 
         last_ts = float(status_info.get("timestamp", 0.0) or 0.0)
-        status  = str(status_info.get("status", "Unknown") or "Unknown")
-        detail  = str(status_info.get("detail", "") or "")
+        status = str(status_info.get("status", "Unknown") or "Unknown")
+        detail = str(status_info.get("detail", "") or "")
         stale_s = now - last_ts if last_ts > 0 else None
 
         # Case 1: never reported
@@ -445,8 +466,9 @@ class Watchdog:
                         component_name,
                     )
                     await self._safe_update_component_status(
-                        "Watchdog", "Warning",
-                        f"'{component_name}' missing-component (not wired in AppContext)."
+                        "Watchdog",
+                        "Warning",
+                        f"'{component_name}' missing-component (not wired in AppContext).",
                     )
                 if required:
                     return component_name, False, "missing-component"
@@ -460,8 +482,7 @@ class Watchdog:
             if self._should_warn(component_name):
                 logger.warning("🚨 Watchdog: '%s' has not reported any status yet.", component_name)
                 await self._safe_update_component_status(
-                    "Watchdog", "Warning",
-                    f"'{component_name}' status unknown / not yet reported."
+                    "Watchdog", "Warning", f"'{component_name}' status unknown / not yet reported."
                 )
             if required:
                 return component_name, False, "no-report"
@@ -480,11 +501,10 @@ class Watchdog:
             if self._should_warn(component_name):
                 logger.warning(
                     "⚠️ Watchdog: '%s' has timestamp but no status; treating as Degraded until status arrives.",
-                    component_name
+                    component_name,
                 )
                 await self._safe_update_component_status(
-                    "Watchdog", "Warning",
-                    f"'{component_name}' timestamp present but no status."
+                    "Watchdog", "Warning", f"'{component_name}' timestamp present but no status."
                 )
             return component_name, False, "no-status"
 
@@ -501,18 +521,23 @@ class Watchdog:
                     if self._should_warn(component_name):
                         logger.warning(
                             "⚠️ Watchdog: optional '%s' is stale (%.1fs) — not degrading overall health.",
-                            component_name, stale_s
+                            component_name,
+                            stale_s,
                         )
                     return component_name, True, None
 
                 if self._should_warn(component_name):
                     logger.warning(
                         "⚠️ Watchdog: '%s' marked '%s' but last report is %.1fs old (tolerating up to %.1fs).",
-                        component_name, status, stale_s, self.tolerance_time_seconds
+                        component_name,
+                        status,
+                        stale_s,
+                        self.tolerance_time_seconds,
                     )
                     await self._safe_update_component_status(
-                        "Watchdog", "Warning",
-                        f"'{component_name}' potentially unresponsive. Last report {stale_s:.1f}s ago."
+                        "Watchdog",
+                        "Warning",
+                        f"'{component_name}' potentially unresponsive. Last report {stale_s:.1f}s ago.",
                     )
                 return component_name, False, "stale"
             return component_name, True, None
@@ -529,10 +554,14 @@ class Watchdog:
             return component_name, True, None
 
         logger.error("❌ Watchdog: '%s' reported '%s'. Detail: %s", component_name, status, detail)
-        await self._safe_update_component_status("Watchdog", "Error", f"'{component_name}' reported {status}: {detail}")
+        await self._safe_update_component_status(
+            "Watchdog", "Error", f"'{component_name}' reported {status}: {detail}"
+        )
 
         if status in {"Critical", "Critical Failure"}:
-            logger.critical("🛑 Watchdog: Critical failure in '%s'. Requesting SYSTEM_HALT.", component_name)
+            logger.critical(
+                "🛑 Watchdog: Critical failure in '%s'. Requesting SYSTEM_HALT.", component_name
+            )
             await self._emit_system_halt(f"Critical failure in {component_name}")
 
         # Case 4: prolonged absence of healthy reports
@@ -542,11 +571,13 @@ class Watchdog:
             if no_healthy_for > (self.tolerance_time_seconds * 2.0):
                 logger.critical(
                     "💔 Watchdog: '%s' not healthy for %.1fs; may be stuck/crashed.",
-                    component_name, no_healthy_for
+                    component_name,
+                    no_healthy_for,
                 )
                 await self._safe_update_component_status(
-                    "Watchdog", "Critical",
-                    f"'{component_name}' unresponsive/unhealthy for {no_healthy_for:.1f}s."
+                    "Watchdog",
+                    "Critical",
+                    f"'{component_name}' unresponsive/unhealthy for {no_healthy_for:.1f}s.",
                 )
         return component_name, False, status
 
@@ -564,15 +595,17 @@ class Watchdog:
                 # Concurrent per-component checks
                 results = await asyncio.gather(
                     *(self._check_component_health(c) for c in self.monitored_components),
-                    return_exceptions=True
+                    return_exceptions=True,
                 )
 
                 overall = "Operational"
-                problems: List[str] = []
+                problems: list[str] = []
 
-                for comp, res in zip(self.monitored_components, results):
+                for comp, res in zip(self.monitored_components, results, strict=False):
                     if isinstance(res, Exception):
-                        logger.error("Watchdog: exception while checking '%s': %s", comp, res, exc_info=True)
+                        logger.error(
+                            "Watchdog: exception while checking '%s': %s", comp, res, exc_info=True
+                        )
                         overall = "Degraded"
                         problems.append(f"{comp} (check-error)")
                         continue
@@ -583,7 +616,9 @@ class Watchdog:
                         problems.append(f"{_name} ({problem})")
 
                 if overall == "Operational":
-                    await self._safe_update_component_status("Watchdog", "Operational", "All monitored components are healthy.")
+                    await self._safe_update_component_status(
+                        "Watchdog", "Operational", "All monitored components are healthy."
+                    )
                     logger.debug("Watchdog: All monitored components healthy.")
                 else:
                     msg = f"System health issues detected in: {', '.join(problems)}."

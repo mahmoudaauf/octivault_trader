@@ -12,7 +12,7 @@ If DUST > 0%, capital is still getting trapped (raise MIN_ECONOMIC_TRADE_USDT).
 
 import logging
 import time
-from typing import Dict, Optional, List
+from typing import Optional
 
 logger = logging.getLogger("ExitMetrics")
 
@@ -32,10 +32,10 @@ class ExitMetricsTracker:
     PATHWAYS = ("TAKE_PROFIT", "STOP_LOSS", "TIME_BASED", "DUST_ROUTED")
 
     def __init__(self):
-        self._stats: Dict[str, Dict] = {
+        self._stats: dict[str, dict] = {
             "TAKE_PROFIT": {"count": 0, "total_pnl": 0.0, "hold_times": []},
-            "STOP_LOSS":   {"count": 0, "total_pnl": 0.0, "hold_times": []},
-            "TIME_BASED":  {"count": 0, "total_pnl": 0.0, "hold_times": []},
+            "STOP_LOSS": {"count": 0, "total_pnl": 0.0, "hold_times": []},
+            "TIME_BASED": {"count": 0, "total_pnl": 0.0, "hold_times": []},
             "DUST_ROUTED": {"count": 0, "total_pnl": 0.0, "hold_times": []},
         }
         self._session_start = time.time()
@@ -55,7 +55,9 @@ class ExitMetricsTracker:
         """Record one closed position and update running statistics."""
         pathway = str(exit_pathway).upper()
         if pathway not in self._stats:
-            logger.warning("[ExitMetrics] Unknown pathway '%s', falling back to DUST_ROUTED", pathway)
+            logger.warning(
+                "[ExitMetrics] Unknown pathway '%s', falling back to DUST_ROUTED", pathway
+            )
             pathway = "DUST_ROUTED"
 
         pnl = (exit_price - entry_price) * quantity
@@ -65,9 +67,10 @@ class ExitMetricsTracker:
         bucket["hold_times"].append(hold_time_sec)
 
         logger.info(
-            "[ExitMetrics] %s exit recorded: pnl=%.4f hold=%.1fs "
-            "(TP=%d SL=%d TIME=%d DUST=%d)",
-            pathway, pnl, hold_time_sec,
+            "[ExitMetrics] %s exit recorded: pnl=%.4f hold=%.1fs " "(TP=%d SL=%d TIME=%d DUST=%d)",
+            pathway,
+            pnl,
+            hold_time_sec,
             self._stats["TAKE_PROFIT"]["count"],
             self._stats["STOP_LOSS"]["count"],
             self._stats["TIME_BASED"]["count"],
@@ -81,7 +84,7 @@ class ExitMetricsTracker:
     def total_exits(self) -> int:
         return sum(b["count"] for b in self._stats.values())
 
-    def get_distribution(self) -> Dict[str, float]:
+    def get_distribution(self) -> dict[str, float]:
         """Return percentage share of each pathway (0–100)."""
         total = self.total_exits()
         if total == 0:
@@ -124,7 +127,7 @@ class ExitMetricsTracker:
     # Reporting
     # ------------------------------------------------------------------
 
-    def summary_dict(self) -> Dict:
+    def summary_dict(self) -> dict:
         dist = self.get_distribution()
         return {
             "total_exits": self.total_exits(),

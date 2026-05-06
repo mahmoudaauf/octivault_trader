@@ -8,7 +8,7 @@ to fix an L5→L8 leak in src/l5_strategy/signal_manager.py.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 
 class BoundedCache:
@@ -20,7 +20,7 @@ class BoundedCache:
     """
 
     def __init__(self, max_size: int = 1000, default_ttl: float = 300.0):
-        self._cache: Dict[str, Tuple[Any, float]] = {}
+        self._cache: dict[str, tuple[Any, float]] = {}
         self._max_size = max_size
         self._default_ttl = default_ttl
 
@@ -49,11 +49,11 @@ class BoundedCache:
         """Alias for :meth:`set` for compatibility."""
         self.set(key, value, ttl)
 
-    def list_all(self) -> List[Any]:
+    def list_all(self) -> list[Any]:
         """Return all non-expired values."""
         now = time.time()
-        results: List[Any] = []
-        expired_keys: List[str] = []
+        results: list[Any] = []
+        expired_keys: list[str] = []
         for k, (val, exp) in list(self._cache.items()):
             if now <= exp:
                 results.append(val)

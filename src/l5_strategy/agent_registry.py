@@ -1,6 +1,6 @@
 # agent_registry.py
-import logging
 import inspect
+import logging
 import traceback
 
 __all__ = [
@@ -25,8 +25,10 @@ AGENT_IMPORT_ERRORS: dict = {}
 try:
     from agents.ipo_chaser import IPOChaser
 except Exception as _e:
+
     class IPOChaser:  # type: ignore
         """Placeholder — IPOChaser module failed to import."""
+
         agent_type = "discovery"
 
         def __init__(self, *args, **kwargs):
@@ -44,8 +46,10 @@ except Exception as _e:
 try:
     from agents.dip_sniper import DipSniper
 except Exception as _e:
+
     class DipSniper:  # type: ignore
         """Placeholder — DipSniper module failed to import."""
+
         agent_type = "strategy"
 
         def __init__(self, *args, **kwargs):
@@ -63,8 +67,10 @@ except Exception as _e:
 try:
     from agents.trend_hunter import TrendHunter
 except Exception as _e:
+
     class TrendHunter:  # type: ignore
         """Placeholder — TrendHunter module failed to import."""
+
         agent_type = "strategy"
 
         def __init__(self, *args, **kwargs):
@@ -82,8 +88,10 @@ except Exception as _e:
 try:
     from agents.liquidation_agent import LiquidationAgent
 except Exception as _e:
+
     class LiquidationAgent:  # type: ignore
         """Placeholder — LiquidationAgent module failed to import."""
+
         agent_type = "strategy"
 
         def __init__(self, *args, **kwargs):
@@ -101,8 +109,10 @@ except Exception as _e:
 try:
     from agents.wallet_scanner_agent import WalletScannerAgent
 except Exception as _e:
+
     class WalletScannerAgent:  # type: ignore
         """Placeholder — WalletScannerAgent module failed to import."""
+
         agent_type = "discovery"
 
         def __init__(self, *args, **kwargs):
@@ -120,8 +130,10 @@ except Exception as _e:
 try:
     from agents.symbol_screener import SymbolScreener
 except Exception as _e:
+
     class SymbolScreener:  # type: ignore
         """Placeholder — SymbolScreener module failed to import."""
+
         agent_type = "discovery"
 
         def __init__(self, *args, **kwargs):
@@ -140,11 +152,13 @@ except Exception as _e:
 try:
     from agents.ml_forecaster import MLForecaster
 except Exception as _e:
+
     class MLForecaster:  # type: ignore
         """
         Placeholder that preserves registry visibility when MLForecaster import fails.
         AgentManager will attempt registration and emit an explicit failure.
         """
+
         agent_type = "strategy"
 
         def __init__(self, *args, **kwargs):
@@ -170,8 +184,10 @@ except Exception as _e:
 try:
     from agents.swing_trade_hunter import SwingTradeHunter
 except Exception as _e:
+
     class SwingTradeHunter:  # type: ignore
         """Placeholder — SwingTradeHunter module failed to import."""
+
         agent_type = "strategy"
 
         def __init__(self, *args, **kwargs):
@@ -300,8 +316,7 @@ def register_all_discovery_agents(agent_manager, app_context):
                 sig = inspect.signature(cls.__init__)
                 params = set(sig.parameters.keys()) - {"self"}
                 accepts_var_kw = any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD
-                    for p in sig.parameters.values()
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
                 )
                 if not accepts_var_kw:
                     filtered = {k: v for k, v in filtered.items() if k in params}
@@ -318,7 +333,7 @@ def register_all_discovery_agents(agent_manager, app_context):
         if not agent:
             continue
         if not getattr(agent, "agent_type", None):
-            setattr(agent, "agent_type", "discovery")
+            agent.agent_type = "discovery"
         agent_manager.register_discovery_agent(agent)
 
 
@@ -369,8 +384,7 @@ def register_all_strategy_agents(agent_manager, app_context):
                 sig = inspect.signature(cls.__init__)
                 params = set(sig.parameters.keys()) - {"self"}
                 accepts_var_kw = any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD
-                    for p in sig.parameters.values()
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
                 )
                 if not accepts_var_kw:
                     filtered = {k: v for k, v in filtered.items() if k in params}
@@ -386,5 +400,5 @@ def register_all_strategy_agents(agent_manager, app_context):
         if not agent:
             continue
         if not getattr(agent, "agent_type", None):
-            setattr(agent, "agent_type", "strategy")
+            agent.agent_type = "strategy"
         agent_manager.register_agent(agent)

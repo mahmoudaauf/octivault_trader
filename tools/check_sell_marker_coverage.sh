@@ -73,4 +73,3 @@ fi
 echo
 echo "MARKER SAMPLE (tail):"
 rg -an -e "$MARKER_PAT" "${BOT_FILES[@]}" | tail -n 80 || true
-

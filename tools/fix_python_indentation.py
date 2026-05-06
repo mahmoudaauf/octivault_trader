@@ -1,8 +1,9 @@
-import sys
 import re
+import sys
 
 # Usage: python fix_python_indentation.py <input_file> <output_file>
 # This script will attempt to fix global indentation issues for top-level classes, functions, and decorators.
+
 
 def fix_indentation(lines):
     output = []
@@ -31,16 +32,18 @@ def fix_indentation(lines):
         output.append(line)
     return output
 
+
 def main():
     if len(sys.argv) != 3:
         print("Usage: python fix_python_indentation.py <input_file> <output_file>")
         sys.exit(1)
-    with open(sys.argv[1], 'r') as f:
+    with open(sys.argv[1]) as f:
         lines = f.readlines()
     fixed = fix_indentation(lines)
-    with open(sys.argv[2], 'w') as f:
+    with open(sys.argv[2], "w") as f:
         f.writelines(fixed)
     print(f"Fixed global indentation written to {sys.argv[2]}")
+
 
 if __name__ == "__main__":
     main()

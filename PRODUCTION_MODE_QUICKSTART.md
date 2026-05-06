@@ -213,14 +213,15 @@ python3 main.py --mode=paper-trade --duration=15min --production
 4. Check logs for any ERROR lines
 
 ### For Production Deployment
-1. Phase 8.2 is complete — native L0–L8 components are the default boot path
-2. The legacy bridge has been removed; opt out with `--no-native` if needed
-3. No breaking changes to CLI interface (the legacy `--production` flag was a no-op for one release and is now gone)
+1. Phase 8.2 will replace legacy components with native implementations
+2. Expect performance improvement to ~100ms/cycle
+3. Bridge will remain as fallback during migration
+4. No breaking changes to CLI interface
 
 ### For Development
-- See `PHASE_8_3_PLAN.md` for the active Stabilization & Hardening plan
-- See `PHASE_8_2_8_TRIAGE.md` for the compat-stub per-key triage
-- Historical Phase 8.1/8.2 docs live under `_archive/2026-05-06_phase8_docs/`
+- See `PHASE_8_STATUS.md` for Phase 8.2 migration roadmap
+- See `PHASE_8_BRIDGE_VALIDATION.md` for full test results
+- See `PHASE_8_PRODUCTION_WIRING_PLAN.md` for architecture details
 
 ---
 
@@ -238,6 +239,6 @@ python3 main.py --mode=paper-trade --duration=15min --production
 
 ---
 
-**Version:** Phase 8.1 Bridge  
-**Last Updated:** 2026-05-06  
+**Version:** Phase 8.1 Bridge
+**Last Updated:** 2026-05-06
 **Status:** ✅ Production Ready

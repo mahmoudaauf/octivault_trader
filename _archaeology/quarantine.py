@@ -12,6 +12,7 @@ Excludes:
 - anything under docs/, tools/ (build/dev infra)
 """
 from __future__ import annotations
+
 import subprocess
 from pathlib import Path
 
@@ -25,18 +26,33 @@ unreached = (ROOT / "_archaeology" / "unreached_from_entry.txt").read_text().spl
 EXCLUDE_PREFIXES = ("src/", "tests/", "docs/", "tools/", "agents/", "automation/")
 EXCLUDE_NAMES = {"__init__.py"}
 
+
 # Filename screams "junk patch artifact" - root level only
 def is_obvious_junk(rel: str) -> bool:
-    if "/" in rel:                           # only root-level
+    if "/" in rel:  # only root-level
         return False
     if rel in EXCLUDE_NAMES:
         return False
     name = rel.upper()
-    patterns = ("FIX_", "_FIX", "VERIFY_", "DIAGNOSE_", "FORCE_",
-                "PHASE1_", "VALIDATE_", "_TEST_", "CHECK_", "RESTORE_",
-                "LAUNCH_WITH_", "SHOW_DETECTED", "_BACKUP", "BACKUP_",
-                "CAPITAL_ALLOCATOR_FIX")
+    patterns = (
+        "FIX_",
+        "_FIX",
+        "VERIFY_",
+        "DIAGNOSE_",
+        "FORCE_",
+        "PHASE1_",
+        "VALIDATE_",
+        "_TEST_",
+        "CHECK_",
+        "RESTORE_",
+        "LAUNCH_WITH_",
+        "SHOW_DETECTED",
+        "_BACKUP",
+        "BACKUP_",
+        "CAPITAL_ALLOCATOR_FIX",
+    )
     return any(p in name for p in patterns)
+
 
 candidates = [r for r in unreached if is_obvious_junk(r)]
 
@@ -45,10 +61,11 @@ for c in candidates:
     print(f"  {c}")
 
 (ROOT / "_archaeology" / "quarantine_plan.txt").write_text("\n".join(candidates))
-print(f"\nPlan written to _archaeology/quarantine_plan.txt")
+print("\nPlan written to _archaeology/quarantine_plan.txt")
 print("Run with --apply to actually move files.")
 
 import sys
+
 if "--apply" in sys.argv:
     moved = 0
     for c in candidates:

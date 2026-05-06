@@ -14,12 +14,15 @@ __all__ = [
     "scale_features",
 ]
 
-from typing import Iterable, Tuple, Optional, Union
+from collections.abc import Iterable
+from typing import Union
+
 
 def _as_series(x, name: str = "value") -> pd.Series:
     if isinstance(x, pd.Series):
         return x
     return pd.Series(list(x), name=name)
+
 
 def _as_dataframe(df_or_hlc) -> pd.DataFrame:
     if isinstance(df_or_hlc, pd.DataFrame):
@@ -27,22 +30,29 @@ def _as_dataframe(df_or_hlc) -> pd.DataFrame:
     # Expecting a tuple/list of (highs, lows, closes)
     try:
         highs, lows, closes = df_or_hlc
-        return pd.DataFrame({
-            "high": _as_series(highs, "high").astype(float),
-            "low": _as_series(lows, "low").astype(float),
-            "close": _as_series(closes, "close").astype(float),
-        })
+        return pd.DataFrame(
+            {
+                "high": _as_series(highs, "high").astype(float),
+                "low": _as_series(lows, "low").astype(float),
+                "close": _as_series(closes, "close").astype(float),
+            }
+        )
     except Exception:
-        raise TypeError("compute_atr expects a DataFrame with columns ['high','low','close'] "
-                        "or an iterable triple (highs, lows, closes).")
+        raise TypeError(
+            "compute_atr expects a DataFrame with columns ['high','low','close'] "
+            "or an iterable triple (highs, lows, closes)."
+        )
+
 
 def compute_ema(series: Union[Iterable[float], pd.Series], span: int) -> pd.Series:
     """Exponential Moving Average (accepts list/array/Series)."""
     s = _as_series(series, "close").astype(float)
     return s.ewm(span=span, adjust=False).mean()
 
-def compute_bollinger_bands(series: Union[Iterable[float], pd.Series], period: int = 20, std_dev: float = 2
-                            ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+
+def compute_bollinger_bands(
+    series: Union[Iterable[float], pd.Series], period: int = 20, std_dev: float = 2
+) -> tuple[pd.Series, pd.Series, pd.Series]:
     """Calculate Bollinger Bands (accepts list/array/Series). Returns (upper, middle, lower)."""
     s = _as_series(series, "close").astype(float)
     sma = s.rolling(window=period, min_periods=period).mean()
@@ -50,6 +60,7 @@ def compute_bollinger_bands(series: Union[Iterable[float], pd.Series], period: i
     upper_band = sma + std_dev * std
     lower_band = sma - std_dev * std
     return upper_band, sma, lower_band
+
 
 def compute_atr(df_or_hlc, period: int = 14) -> pd.Series:
     """
@@ -64,6 +75,7 @@ def compute_atr(df_or_hlc, period: int = 14) -> pd.Series:
     # Wilder's ATR uses RMA; here we keep simple rolling mean for speed/compat unless min_periods provided.
     return true_range.rolling(window=period, min_periods=period).mean()
 
+
 def compute_rsi(series: Union[Iterable[float], pd.Series], period: int = 14) -> pd.Series:
     """Relative Strength Index (accepts list/array/Series)."""
     s = _as_series(series, "close").astype(float)
@@ -76,8 +88,10 @@ def compute_rsi(series: Union[Iterable[float], pd.Series], period: int = 14) -> 
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def compute_macd(series: Union[Iterable[float], pd.Series], fast: int = 12, slow: int = 26, signal: int = 9
-                 ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+
+def compute_macd(
+    series: Union[Iterable[float], pd.Series], fast: int = 12, slow: int = 26, signal: int = 9
+) -> tuple[pd.Series, pd.Series, pd.Series]:
     """Moving Average Convergence Divergence (accepts list/array/Series). Returns (macd, signal, histogram)."""
     s = _as_series(series, "close").astype(float)
     ema_fast = compute_ema(s, span=fast)
@@ -87,8 +101,10 @@ def compute_macd(series: Union[Iterable[float], pd.Series], fast: int = 12, slow
     hist = macd - signal_line
     return macd, signal_line, hist
 
-def compute_stochastic(df_or_hlc, k_period: int = 14, d_period: int = 3
-                       ) -> Tuple[pd.Series, pd.Series]:
+
+def compute_stochastic(
+    df_or_hlc, k_period: int = 14, d_period: int = 3
+) -> tuple[pd.Series, pd.Series]:
     """Stochastic Oscillator (accepts DataFrame or triple of iterables)."""
     df = _as_dataframe(df_or_hlc)
     low_min = df["low"].rolling(window=k_period, min_periods=k_period).min()
@@ -98,17 +114,20 @@ def compute_stochastic(df_or_hlc, k_period: int = 14, d_period: int = 3
     d_percent = k_percent.rolling(window=d_period, min_periods=d_period).mean()
     return k_percent, d_percent
 
+
 def compute_obv(df: pd.DataFrame) -> pd.Series:
     """On-Balance Volume."""
-    direction = np.sign(df['close'].diff()).fillna(0)
-    obv = (df['volume'] * direction).cumsum()
+    direction = np.sign(df["close"].diff()).fillna(0)
+    obv = (df["volume"] * direction).cumsum()
     return obv
+
 
 def compute_vwap(df: pd.DataFrame) -> pd.Series:
     """Volume Weighted Average Price."""
-    typical_price = (df['high'] + df['low'] + df['close']) / 3
-    vwap = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    vwap = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
     return vwap
+
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Apply common technical indicators to the DataFrame."""
@@ -136,6 +155,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["obv"] = compute_obv(df)
     df["vwap"] = compute_vwap(df)
     return df
+
 
 def scale_features(df: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
     """Normalize feature columns between 0 and 1. Skips missing columns gracefully."""

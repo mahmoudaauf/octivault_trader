@@ -24,8 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from core_engine.implementations import DecisionEngineImpl
 
@@ -38,6 +37,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TradeDecision:
     """Decision output from the decision engine."""
+
     symbol: str
     action: str  # "BUY", "SELL", "HOLD", "FORCE_EXIT"
     quantity: float
@@ -53,16 +53,17 @@ class TradeDecision:
 @dataclass
 class ArbitrationResult:
     """Result of arbitration gates evaluation."""
+
     passed: bool
-    gates_status: Dict[str, bool]  # e.g., {"symbol_format": True, "confidence": True, ...}
-    blocking_gates: List[str]  # Names of gates that blocked the decision
+    gates_status: dict[str, bool]  # e.g., {"symbol_format": True, "confidence": True, ...}
+    blocking_gates: list[str]  # Names of gates that blocked the decision
     reason: str = ""
 
 
 class DecisionEngine:
     """
     Façade for trading decision making.
-    
+
     Responsibility: Synthesize all signals, modes, and policies into trades.
     - Arbitrate signals through multi-layer safety gates
     - Evaluate trading mode constraints
@@ -74,7 +75,7 @@ class DecisionEngine:
     def __init__(self, app_ctx: Any):
         """
         Initialize the decision engine.
-        
+
         Args:
             app_ctx: Application context containing all layer components
         """
@@ -89,7 +90,7 @@ class DecisionEngine:
     async def get_current_mode(self) -> str:
         """
         Get current trading mode.
-        
+
         Returns:
             Mode string: "PAUSED", "PROTECTIVE", "BOOTSTRAP", "GROWTH", etc.
         """
@@ -98,31 +99,33 @@ class DecisionEngine:
     async def set_mode(self, mode: str) -> bool:
         """
         Switch trading mode.
-        
+
         Args:
             mode: Mode to switch to
-        
+
         Returns:
             True if successful
         """
         try:
             mode_manager = self.app_ctx.get("mode_manager")
-            
+
             if mode_manager:
                 # Set mode (L5)
                 self.logger.info(f"🔄 Switching mode to: {mode}")
                 # await mode_manager.set_mode(mode)
                 return True
-            
+
             return False
         except Exception as e:
             self.logger.error(f"❌ Error setting mode: {e}")
             return False
 
-    async def evaluate_signal(self, symbol: str, signal_type: str, edge_score: float) -> ArbitrationResult:
+    async def evaluate_signal(
+        self, symbol: str, signal_type: str, edge_score: float
+    ) -> ArbitrationResult:
         """
         Evaluate a signal through arbitration gates.
-        
+
         Applies 6-layer gate evaluation:
         1. Symbol format validation
         2. Confidence floor (mode-dependent)
@@ -130,64 +133,68 @@ class DecisionEngine:
         4. Position limit check
         5. Capital available check
         6. Risk manager approval
-        
+
         Args:
             symbol: Trading pair
             signal_type: "BUY" or "SELL"
             edge_score: Signal edge score (-1.0 to +1.0)
-        
+
         Returns:
             ArbitrationResult with gate-by-gate status
         """
-        return await DecisionEngineImpl.evaluate_signal(self.app_ctx, symbol, signal_type, edge_score)
+        return await DecisionEngineImpl.evaluate_signal(
+            self.app_ctx, symbol, signal_type, edge_score
+        )
 
     async def make_buy_decision(self, symbol: str, signal_edge: float) -> Optional[TradeDecision]:
         """
         Make a buy decision for a symbol.
-        
+
         Args:
             symbol: Trading pair
             signal_edge: Signal edge score from fusion
-        
+
         Returns:
             TradeDecision if decision made, None if rejected
         """
         return await DecisionEngineImpl.make_buy_decision(self.app_ctx, symbol, signal_edge)
 
-    async def make_sell_decision(self, symbol: str, signal_edge: float, reason: str = "") -> Optional[TradeDecision]:
+    async def make_sell_decision(
+        self, symbol: str, signal_edge: float, reason: str = ""
+    ) -> Optional[TradeDecision]:
         """
         Make a sell decision for a symbol.
-        
+
         Args:
             symbol: Trading pair
             signal_edge: Signal edge score from fusion
             reason: Reason for sell (e.g., "TP_HIT", "SL_HIT", "SIGNAL", "EXIT")
-        
+
         Returns:
             TradeDecision if decision made, None if no position to sell
         """
         try:
             # Step 1: Check if we have a position
             position_manager = self.app_ctx.get("position_manager")
-            
+
             if position_manager:
                 # Get position (L3)
                 # position = await position_manager.get_position(symbol)
                 # if not position or position.quantity <= 0:
                 #     return None
                 pass
-            
+
             # Step 2: Arbitrate sell signal (if signal-based)
             if "SIGNAL" in reason:
                 arb_result = await self.evaluate_signal(symbol, "SELL", signal_edge)
-                
+
                 if not arb_result.passed:
                     self.logger.debug(
                         f"🚫 SELL signal rejected for {symbol}: "
                         f"gates blocked: {arb_result.blocking_gates}"
                     )
                     return None
-            
+
             # Step 3: Create decision
             decision = TradeDecision(
                 symbol=symbol,
@@ -198,7 +205,7 @@ class DecisionEngine:
                 timestamp=asyncio.get_event_loop().time(),
                 mode=await self.get_current_mode(),
             )
-            
+
             self.logger.info(f"✅ SELL decision: {symbol} (reason: {reason})")
             return decision
         except Exception as e:
@@ -208,17 +215,17 @@ class DecisionEngine:
     async def evaluate_exit_signals(self, symbol: str) -> Optional[TradeDecision]:
         """
         Check if a position should be exited based on TP/SL/timeout.
-        
+
         Args:
             symbol: Trading pair
-        
+
         Returns:
             TradeDecision with EXIT action, or None if no exit triggered
         """
         try:
             tp_sl_engine = self.app_ctx.get("tp_sl_engine")
             fourth_slot_tracker = self.app_ctx.get("fourth_slot_tracker")
-            
+
             if tp_sl_engine:
                 # Check TP/SL levels (L4)
                 # exit_reason = await tp_sl_engine.check_exit_levels(symbol)
@@ -230,7 +237,7 @@ class DecisionEngine:
                 #         reason=exit_reason,
                 #     )
                 pass
-            
+
             if fourth_slot_tracker:
                 # Check 4th slot forced exit (L8)
                 # if await fourth_slot_tracker.should_exit(symbol):
@@ -241,7 +248,7 @@ class DecisionEngine:
                 #         reason="4TH_SLOT_TIMEOUT",
                 #     )
                 pass
-            
+
             return None
         except Exception as e:
             self.logger.error(f"❌ Error evaluating exit signals for {symbol}: {e}")
@@ -250,38 +257,38 @@ class DecisionEngine:
     async def apply_policy_constraints(self, decision: TradeDecision) -> bool:
         """
         Check if decision passes all policy constraints.
-        
+
         Args:
             decision: Trade decision to validate
-        
+
         Returns:
             True if passes all policies
         """
         try:
             policy_manager = self.app_ctx.get("policy_manager")
             risk_manager = self.app_ctx.get("risk_manager")
-            
+
             if policy_manager:
                 # Check policies (L6): daily profit targets, dust ratio, etc.
                 # if not await policy_manager.is_allowed(decision):
                 #     return False
                 pass
-            
+
             if risk_manager:
                 # Check risk limits (L6)
                 # if not await risk_manager.is_acceptable(decision):
                 #     return False
                 pass
-            
+
             return True
         except Exception as e:
             self.logger.error(f"❌ Error applying policy constraints: {e}")
             return False
 
-    async def get_mode_constraints(self) -> Dict[str, Any]:
+    async def get_mode_constraints(self) -> dict[str, Any]:
         """
         Get constraints for current trading mode.
-        
+
         Returns:
             {
                 "mode": "PROTECTIVE",
@@ -294,7 +301,7 @@ class DecisionEngine:
         """
         try:
             mode_manager = self.app_ctx.get("mode_manager")
-            
+
             constraints = {
                 "mode": "PROTECTIVE",
                 "allow_new_positions": False,
@@ -303,12 +310,12 @@ class DecisionEngine:
                 "position_size_cap": 0.1,  # 10% of capital per position
                 "leverage_cap": 1.0,  # No margin
             }
-            
+
             if mode_manager:
                 # Get mode constraints (L5)
                 # constraints = await mode_manager.get_constraints()
                 pass
-            
+
             return constraints
         except Exception as e:
             self.logger.error(f"❌ Error getting mode constraints: {e}")

@@ -11,27 +11,19 @@ Tests for all 5 engines working together:
 6. End-to-end trading cycle
 """
 
-import pytest
-import asyncio
 import logging
-from typing import Dict, Any, Optional
-from dataclasses import dataclass
+from typing import Any, Optional
 
-# Import all 5 engines
-from core_engine.market_account_engine import MarketAccountEngine
-from core_engine.situation_engine import SituationEngine
+import pytest
+
 from core_engine.decision_engine import DecisionEngine
-from core_engine.safe_execution_engine import SafeExecutionEngine
-from core_engine.operations_engine import OperationsEngine
 
 # Import implementations
-from core_engine.implementations import (
-    MarketAccountEngineImpl,
-    SituationEngineImpl,
-    DecisionEngineImpl,
-    SafeExecutionEngineImpl,
-    OperationsEngineImpl,
-)
+# Import all 5 engines
+from core_engine.market_account_engine import MarketAccountEngine
+from core_engine.operations_engine import OperationsEngine
+from core_engine.safe_execution_engine import SafeExecutionEngine
+from core_engine.situation_engine import SituationEngine
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +32,9 @@ logger = logging.getLogger(__name__)
 # FIXTURES
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 @pytest.fixture
-def mock_app_ctx() -> Dict[str, Any]:
+def mock_app_ctx() -> dict[str, Any]:
     """Create a minimal mock app context for testing."""
     return {
         "config": {"mode": "paper-trade", "api_key": "test"},
@@ -61,7 +54,7 @@ def mock_app_ctx() -> Dict[str, Any]:
 
 
 @pytest.fixture
-async def all_engines(mock_app_ctx: Dict[str, Any]):
+async def all_engines(mock_app_ctx: dict[str, Any]):
     """Initialize all 5 engines with mock context."""
     market_engine = MarketAccountEngine(mock_app_ctx)
     situation_engine = SituationEngine(mock_app_ctx)
@@ -82,13 +75,14 @@ async def all_engines(mock_app_ctx: Dict[str, Any]):
 # MOCK COMPONENTS
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 class MockExchangeClient:
     """Mock L1 exchange client."""
 
     async def get_balance(self, symbol: str) -> float:
         return 1.0 if symbol == "BTC" else 1000.0
 
-    async def get_prices(self, symbols: list) -> Dict[str, float]:
+    async def get_prices(self, symbols: list) -> dict[str, float]:
         return {sym: 40000.0 if sym == "BTC" else 2500.0 for sym in symbols}
 
     async def get_kline(self, symbol: str, interval: str, limit: int = 100):
@@ -96,26 +90,26 @@ class MockExchangeClient:
 
     async def place_buy_order(
         self, symbol: str, quantity: float, price: float, order_type: str = "LIMIT"
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return {"order_id": "TEST_BUY_001", "status": "FILLED", "filled_qty": quantity}
 
     async def place_sell_order(
         self, symbol: str, quantity: float, price: float, order_type: str = "LIMIT"
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return {"order_id": "TEST_SELL_001", "status": "FILLED", "filled_qty": quantity}
 
 
 class MockMarketDataFeed:
     """Mock L2 market data feed."""
 
-    async def get_prices(self, symbols: list) -> Dict[str, float]:
+    async def get_prices(self, symbols: list) -> dict[str, float]:
         return {sym: 40000.0 if sym == "BTC" else 2500.0 for sym in symbols}
 
     async def get_ohlcv(self, symbol: str, timeframe: str, limit: int = 100):
         return [[1609459200000, 40000, 41000, 39000, 40500, 100]] * limit
 
     @property
-    def prices_cache(self) -> Dict[str, float]:
+    def prices_cache(self) -> dict[str, float]:
         return {"BTCUSDT": 40000.0, "ETHUSDT": 2500.0}
 
 
@@ -125,7 +119,7 @@ class MockPortfolioManager:
     async def get_nav(self) -> float:
         return 10000.0
 
-    async def get_positions(self) -> Dict[str, Any]:
+    async def get_positions(self) -> dict[str, Any]:
         return {"BTCUSDT": {"quantity": 0.1, "entry_price": 40000}}
 
     async def get_capital_allocated(self) -> float:
@@ -147,27 +141,23 @@ class MockSignalManager:
             {"symbol": "ETHUSDT", "action": "SELL", "edge": -0.35, "confidence": 0.65},
         ]
 
-    async def fuse_signal(self, symbol: str) -> Dict[str, Any]:
+    async def fuse_signal(self, symbol: str) -> dict[str, Any]:
         return {"symbol": symbol, "action": "BUY", "edge": 0.45, "confidence": 0.75}
 
 
 class MockExecutionManager:
     """Mock L4 execution manager."""
 
-    async def validate_order(
-        self, symbol: str, action: str, quantity: float, price: float
-    ) -> bool:
+    async def validate_order(self, symbol: str, action: str, quantity: float, price: float) -> bool:
         return price > 0 and quantity > 0
 
     async def place_order(
         self, symbol: str, action: str, quantity: float, price: float
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         order_type = action.upper()
         return {"order_id": f"TEST_{order_type}_001", "status": "FILLED"}
 
-    async def calculate_tp_sl(
-        self, entry_price: float, edge: float
-    ) -> tuple[float, float]:
+    async def calculate_tp_sl(self, entry_price: float, edge: float) -> tuple[float, float]:
         take_profit = entry_price * 1.02  # +2%
         stop_loss = entry_price * 0.98  # -2%
         return take_profit, stop_loss
@@ -176,7 +166,7 @@ class MockExecutionManager:
 class MockHealthMonitor:
     """Mock L7 health monitor."""
 
-    async def get_health(self) -> Dict[str, Any]:
+    async def get_health(self) -> dict[str, Any]:
         return {
             "status": "HEALTHY",
             "components": {
@@ -190,10 +180,10 @@ class MockHealthMonitor:
 class MockStateManager:
     """Mock L3 state manager."""
 
-    async def save_state(self, state: Dict[str, Any]) -> None:
+    async def save_state(self, state: dict[str, Any]) -> None:
         self._state = state
 
-    async def load_state(self) -> Optional[Dict[str, Any]]:
+    async def load_state(self) -> Optional[dict[str, Any]]:
         return getattr(self, "_state", None)
 
 
@@ -216,7 +206,7 @@ class MockBoundedCache:
 class MockErrorHandler:
     """Mock L0 error handler."""
 
-    async def handle(self, error: Exception, context: str) -> Dict[str, Any]:
+    async def handle(self, error: Exception, context: str) -> dict[str, Any]:
         return {"handled": True, "error": str(error), "context": context}
 
 
@@ -233,19 +223,21 @@ class MockModeManager:
 class MockArbitrationEngine:
     """Mock L5 arbitration engine."""
 
-    async def evaluate_signal(
-        self, symbol: str, action: str, edge: float
-    ) -> Dict[str, Any]:
+    async def evaluate_signal(self, symbol: str, action: str, edge: float) -> dict[str, Any]:
         return {
             "passed": True,  # Always pass for testing
-            "gates_status": {"symbol": "✓", "confidence": "✓", "regime": "✓", "capital": "✓", "edge": "✓"},
+            "gates_status": {
+                "symbol": "✓",
+                "confidence": "✓",
+                "regime": "✓",
+                "capital": "✓",
+                "edge": "✓",
+            },
             "blocking_gates": [],
             "reason": "Signal passed all gates",
         }
-    
-    async def evaluate(
-        self, symbol: str, action: str, edge: float
-    ) -> Dict[str, Any]:
+
+    async def evaluate(self, symbol: str, action: str, edge: float) -> dict[str, Any]:
         """Alias for evaluate_signal."""
         return await self.evaluate_signal(symbol, action, edge)
 
@@ -253,7 +245,7 @@ class MockArbitrationEngine:
 class MockCapitalAllocator:
     """Mock L6 capital allocator."""
 
-    async def allocate_capital(self, symbol: str, signal: Dict) -> float:
+    async def allocate_capital(self, symbol: str, signal: dict) -> float:
         return 0.1  # Allocate 0.1 BTC
 
     async def allocate_for_buy(self, symbol: str, edge_score: float) -> float:
@@ -438,9 +430,7 @@ class TestDataFlow:
 
         # Phase 4: EXECUTE
         execution_engine = all_engines["execution"]
-        order_result = await execution_engine.place_buy_order(
-            "BTCUSDT", 0.1, 40000, "LIMIT"
-        )
+        order_result = await execution_engine.place_buy_order("BTCUSDT", 0.1, 40000, "LIMIT")
         assert order_result is not None
         logger.info("✅ [4/5] EXECUTE: Placed order")
 
@@ -468,9 +458,7 @@ class TestFix2Guard:
         bounded_cache = mock_app_ctx["bounded_cache"]
 
         # Place first SELL order
-        result1 = await execution_engine.place_sell_order(
-            "BTCUSDT", 0.1, 42000, "LIMIT"
-        )
+        result1 = await execution_engine.place_sell_order("BTCUSDT", 0.1, 42000, "LIMIT")
         assert result1 is not None
         logger.info(f"✅ First SELL placed: {result1}")
 
@@ -478,7 +466,7 @@ class TestFix2Guard:
         cache_key = "SELL_BTCUSDT_0.1_42000"
         cached = bounded_cache.get(cache_key)
         # Note: Actual caching happens in SafeExecutionEngineImpl
-        logger.info(f"✅ SELL order cached (FIX #2 guard active)")
+        logger.info("✅ SELL order cached (FIX #2 guard active)")
 
     @pytest.mark.asyncio
     async def test_duplicate_sell_prevention(self, all_engines, mock_app_ctx):

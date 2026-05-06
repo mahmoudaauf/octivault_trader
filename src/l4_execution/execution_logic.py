@@ -8,8 +8,8 @@ canonical policy/risk/liquidation routing remains centralized.
 
 import asyncio
 import time
-from collections import deque, defaultdict
-from typing import Any, Dict, Optional, Set
+from collections import defaultdict, deque
+from typing import Any, Optional
 
 
 class ExecutionLogic:
@@ -49,7 +49,9 @@ class ExecutionLogic:
                 "agent": intent.get("agent", "Meta"),
                 "quote": intent.get("quote", intent.get("planned_quote", intent.get("quote_hint"))),
                 "quantity": intent.get("quantity", intent.get("qty", intent.get("qty_hint"))),
-                "planned_quote": intent.get("planned_quote", intent.get("quote", intent.get("quote_hint"))),
+                "planned_quote": intent.get(
+                    "planned_quote", intent.get("quote", intent.get("quote_hint"))
+                ),
                 "tag": intent.get("tag", f"strategy/{intent.get('agent', 'Meta')}"),
                 "bypass_conf": bool(intent.get("bypass_conf", True)),
                 "reason": intent.get("reason", intent.get("rationale", "")),
@@ -93,7 +95,9 @@ class ExecutionLogic:
                 return str(val)
         return None
 
-    async def _execute_decision(self, symbol: str, side: str, signal: dict, accepted_symbols_set: Set[str]):
+    async def _execute_decision(
+        self, symbol: str, side: str, signal: dict, accepted_symbols_set: set[str]
+    ):
         """
         Strict Meta routing:
         this wrapper never calls ExecutionManager.execute_trade/close_position directly.
