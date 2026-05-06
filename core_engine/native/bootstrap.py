@@ -37,6 +37,7 @@ import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .app_context import NativeComponents
@@ -49,6 +50,7 @@ from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
 from .shared_state import NativeSharedState
 from .signals import NativeSignalEngine
+from .telemetry_export import NativeTelemetryExporter
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,8 @@ class BootstrapConfig:
 
     # --- telemetry / runtime ---
     telemetry_capacity: int = 1024
+    telemetry_export_path: str = ""  # empty = disabled
+    telemetry_export_interval_sec: float = 10.0
     duration_sec: float = 3600.0
     request_timeout_sec: float = 10.0
 
@@ -148,6 +152,8 @@ class BootstrapConfig:
             risk_per_symbol_pct=_float(e.get("RISK_PER_SYMBOL_PCT"), 2.0),
             signal_cooldown_sec=_float(e.get("SIGNAL_COOLDOWN_SEC"), 0.0),
             telemetry_capacity=_int(e.get("TELEMETRY_CAPACITY"), 1024),
+            telemetry_export_path=(e.get("TELEMETRY_EXPORT_PATH") or "").strip(),
+            telemetry_export_interval_sec=_float(e.get("TELEMETRY_EXPORT_INTERVAL_SEC"), 10.0),
             duration_sec=_float(e.get("DURATION_SEC"), 3600.0),
             request_timeout_sec=_float(e.get("REQUEST_TIMEOUT_SEC"), 10.0),
         )
@@ -318,6 +324,16 @@ async def build_components(
     # L6
     telemetry = NativeTelemetry(capacity=cfg.telemetry_capacity)
 
+    # L6 exporter (optional — only if TELEMETRY_EXPORT_PATH is configured)
+    telemetry_exporter: NativeTelemetryExporter | None = None
+    if cfg.telemetry_export_path:
+        telemetry_exporter = NativeTelemetryExporter(
+            telemetry=telemetry,
+            output_path=Path(cfg.telemetry_export_path),
+            interval_sec=cfg.telemetry_export_interval_sec,
+        )
+        await telemetry_exporter.start()
+
     # L8 portfolio accessor: minimal snapshot built from L0/L1/L2 state.
     # Returns a duck-typed object with the four attributes
     # NativeDecisionEngine.decide() reads: nav, nav_peak, balance,
@@ -335,6 +351,7 @@ async def build_components(
         telemetry=telemetry,
         exchange_client=exchange_client,
         portfolio_accessor=portfolio_accessor,
+        telemetry_exporter=telemetry_exporter,
     )
 
 
@@ -345,6 +362,15 @@ async def shutdown_components(components: NativeComponents) -> None:
     Stops background pollers and closes the underlying HTTP session if
     one was created. Safe to call multiple times.
     """
+    # telemetry exporter (also a background task) — stop first so its
+    # final snapshot reflects an idle, drained state.
+    exporter = components.telemetry_exporter
+    if exporter is not None:
+        try:
+            await exporter.stop()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("native shutdown: telemetry_exporter.stop() raised: %r", e)
+
     # market data + balance sync own background tasks
     for comp in (components.market_data, components.balance_sync):
         try:

@@ -366,3 +366,66 @@ async def test_portfolio_accessor_extracts_position_qty_from_position_objects():
 
     snap = accessor()
     assert snap.positions == {"BTCUSDT": 0.5}
+
+
+# ---------------------------------------------------------------------
+# telemetry exporter wiring (Phase 8.3.3)
+# ---------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_telemetry_exporter_disabled_when_path_unset():
+    """Default config has empty TELEMETRY_EXPORT_PATH → no exporter."""
+    components = await build_components(_min_cfg(), exchange_client_factory=_stub_factory)
+    assert components.telemetry_exporter is None
+    await shutdown_components(components)
+
+
+@pytest.mark.asyncio
+async def test_telemetry_exporter_enabled_when_path_set(tmp_path):
+    out = tmp_path / "telemetry.json"
+    cfg = _min_cfg(
+        telemetry_export_path=str(out),
+        telemetry_export_interval_sec=0.05,
+    )
+    components = await build_components(cfg, exchange_client_factory=_stub_factory)
+    try:
+        assert components.telemetry_exporter is not None
+        assert components.telemetry_exporter.output_path == out
+        assert components.telemetry_exporter.interval_sec == 0.05
+        # Exporter is already started by build_components.
+        assert components.telemetry_exporter._task is not None
+    finally:
+        await shutdown_components(components)
+    # File exists after shutdown (final snapshot is best-effort).
+    assert out.exists()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_components_stops_telemetry_exporter(tmp_path):
+    out = tmp_path / "telemetry.json"
+    cfg = _min_cfg(
+        telemetry_export_path=str(out),
+        telemetry_export_interval_sec=0.05,
+    )
+    components = await build_components(cfg, exchange_client_factory=_stub_factory)
+    exporter = components.telemetry_exporter
+    assert exporter is not None
+    await shutdown_components(components)
+    assert exporter._task is None  # cleared on stop
+    # Idempotent — second shutdown must not raise.
+    await shutdown_components(components)
+
+
+def test_from_env_parses_telemetry_export_settings(monkeypatch):
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setenv("TELEMETRY_EXPORT_PATH", "/tmp/octi_telemetry.json")
+    monkeypatch.setenv("TELEMETRY_EXPORT_INTERVAL_SEC", "30")
+    cfg = BootstrapConfig.from_env()
+    assert cfg.telemetry_export_path == "/tmp/octi_telemetry.json"
+    assert cfg.telemetry_export_interval_sec == 30.0
+
+
+def test_from_env_telemetry_export_defaults():
+    cfg = BootstrapConfig.from_env({"BINANCE_API_KEY": "k", "BINANCE_API_SECRET": "s"})
+    assert cfg.telemetry_export_path == ""
+    assert cfg.telemetry_export_interval_sec == 10.0

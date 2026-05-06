@@ -99,6 +99,7 @@ class NativeComponents:
     telemetry: NativeTelemetry | None = None
     portfolio_accessor: Any | None = None  # callable | None (kept loose)
     exchange_client: Any | None = None  # NativeExchangeClient | duck-typed stub
+    telemetry_exporter: Any | None = None  # NativeTelemetryExporter | None
 
 
 def build_native_app_ctx(
