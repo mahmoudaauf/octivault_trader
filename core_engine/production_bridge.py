@@ -28,13 +28,36 @@ in `core_engine/integration.py`, layer by layer.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import logging
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Phase 8.2.8: deprecation flag — emit warning at most once per process.
+_DEPRECATION_EMITTED = False
+
+
+def _emit_deprecation_warning() -> None:
+    """Emit a DeprecationWarning at most once per process."""
+    global _DEPRECATION_EMITTED
+    if _DEPRECATION_EMITTED:
+        return
+    _DEPRECATION_EMITTED = True
+    warnings.warn(
+        "core_engine.production_bridge is deprecated (Phase 8.2.8). "
+        "It loads the legacy '🎯_MASTER_SYSTEM_ORCHESTRATOR.py' to populate "
+        "app_ctx and will be removed once the native production bootstrapper "
+        "(core_engine.native.app_context.build_native_app_ctx) covers the "
+        "full L0-L8 surface. See PHASE_8_2_8_PREP.md.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
 
 # Legacy orchestrator filename has emoji + spaces — must import via spec
 _LEGACY_FILE = "🎯_MASTER_SYSTEM_ORCHESTRATOR.py"
@@ -134,7 +157,13 @@ async def build_production_app_ctx() -> tuple[dict[str, Any], Any]:
     ------
     Any exception from the legacy orchestrator's `initialize_components()`.
     Caller should fall back to mock mode if this fails.
+
+    Deprecated
+    ----------
+    Phase 8.2.8: this function will be removed once a native production
+    bootstrapper exists. See ``core_engine.native.app_context.build_native_app_ctx``.
     """
+    _emit_deprecation_warning()
     logger.info("🌉 Phase 8.1 Production Bridge — initializing…")
     legacy_mod = _load_legacy_module()
 
@@ -190,10 +219,8 @@ async def shutdown_production_bridge(legacy_orchestrator: Any) -> None:
             for attr in ("exchange_client", "market_data_feed", "balance_sync"):
                 comp = getattr(legacy_orchestrator, attr, None)
                 if comp and hasattr(comp, "close"):
-                    try:
+                    with contextlib.suppress(Exception):
                         await comp.close()
-                    except Exception:
-                        pass
         logger.info("🌉 Production Bridge shutdown complete")
     except Exception as e:
         logger.warning(f"🌉 Production Bridge shutdown error (non-fatal): {e}")

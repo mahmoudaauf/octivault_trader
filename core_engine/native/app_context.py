@@ -1,0 +1,149 @@
+"""
+Native L0-L8 application context (Phase 8.2.8 preparation)
+
+This is the **seam** that will eventually replace
+``core_engine.production_bridge.build_production_app_ctx``.
+
+Scope (today)
+-------------
+* Pure assembly: takes already-constructed native components and
+  composes them into a single ``app_ctx`` dict + a wired
+  ``NativeOrchestrator``.
+* Does **not** itself construct exchange clients, balance sync, or
+  signal engines. That bootstrap (API keys, env-specific config) is
+  the caller's responsibility — see ``PHASE_8_2_8_PREP.md`` for the
+  remaining work needed before this can fully replace the legacy bridge.
+
+Why no live bootstrap here?
+---------------------------
+The legacy bridge runs ``check_prerequisites() + initialize_components()``
+which performs Binance auth, WS connect, etc. The native equivalent
+needs a dedicated bootstrap module owning credentials and lifecycle.
+Adding that here would conflate assembly with I/O setup. Keeping the
+factory pure makes it trivially testable and reusable across paper /
+live / backtest modes.
+
+Usage::
+
+    from core_engine.native import (
+        NativeBalanceSync, NativeDecisionEngine, NativeExecutor,
+        NativeMarketData, NativeSharedState, NativeSignalEngine,
+        NativeTelemetry,
+    )
+    from core_engine.native.app_context import build_native_app_ctx
+
+    components = NativeComponents(
+        shared_state=NativeSharedState(),
+        market_data=md,
+        signal_engine=sig,
+        decision_engine=dec,
+        executor=exe,
+        balance_sync=bsync,
+        telemetry=NativeTelemetry(),
+    )
+    app_ctx, orch = build_native_app_ctx(components)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from .balance_sync import NativeBalanceSync
+from .decisions import NativeDecisionEngine
+from .executor import NativeExecutor
+from .market_data import NativeMarketData
+from .observability import NativeTelemetry
+from .orchestrator import NativeOrchestrator
+from .shared_state import NativeSharedState
+from .signals import NativeSignalEngine
+
+# ----------------------------------------------------------------------
+# app_ctx key contract
+# ----------------------------------------------------------------------
+# Public, stable keys the 5 facade engines may consume from app_ctx.
+# Mirrors a *subset* of ATTR_TO_CTX_KEY in production_bridge.py — only
+# what the native stack currently provides. Missing keys remain absent;
+# engines must continue to graceful-degrade.
+NATIVE_CTX_KEYS: tuple[str, ...] = (
+    "shared_state",  # L0
+    "balance_manager",  # L1 (NativeBalanceSync; legacy key name preserved)
+    "market_data_feed",  # L2 (NativeMarketData; legacy key name preserved)
+    "signal_manager",  # L3 (NativeSignalEngine; legacy key name preserved)
+    "decision_engine",  # L4 (native-only)
+    "execution_manager",  # L5 (NativeExecutor; legacy key name preserved)
+    "telemetry",  # L6 (native-only)
+    "_native_orchestrator",  # L8 handle
+    "_native_mode",  # marker flag
+)
+
+
+@dataclass(frozen=True)
+class NativeComponents:
+    """
+    Pre-constructed native components, ready to be assembled.
+
+    All required components are instances of the L0-L6 native classes.
+    ``telemetry`` is optional but recommended.
+    """
+
+    shared_state: NativeSharedState
+    market_data: NativeMarketData
+    signal_engine: NativeSignalEngine
+    decision_engine: NativeDecisionEngine
+    executor: NativeExecutor
+    balance_sync: NativeBalanceSync
+    telemetry: NativeTelemetry | None = None
+    portfolio_accessor: Any | None = None  # callable | None (kept loose)
+
+
+def build_native_app_ctx(
+    components: NativeComponents,
+) -> tuple[dict[str, Any], NativeOrchestrator]:
+    """
+    Assemble a native ``app_ctx`` and wire a ``NativeOrchestrator``.
+
+    Parameters
+    ----------
+    components
+        Pre-constructed native L0-L6 instances.
+
+    Returns
+    -------
+    (app_ctx, orchestrator)
+        ``app_ctx`` exposes the keys listed in ``NATIVE_CTX_KEYS``.
+        ``orchestrator`` is a fully-wired ``NativeOrchestrator`` that
+        records into ``components.telemetry`` if provided.
+    """
+    orch = NativeOrchestrator(
+        market_data=components.market_data,
+        signal_engine=components.signal_engine,
+        decision_engine=components.decision_engine,
+        executor=components.executor,
+        balance_sync=components.balance_sync,
+        shared_state=components.shared_state,
+        portfolio_accessor=components.portfolio_accessor,
+        telemetry=components.telemetry,
+    )
+
+    app_ctx: dict[str, Any] = {
+        "shared_state": components.shared_state,
+        "balance_manager": components.balance_sync,
+        "market_data_feed": components.market_data,
+        "signal_manager": components.signal_engine,
+        "decision_engine": components.decision_engine,
+        "execution_manager": components.executor,
+        "_native_orchestrator": orch,
+        "_native_mode": True,
+    }
+    if components.telemetry is not None:
+        app_ctx["telemetry"] = components.telemetry
+
+    return app_ctx, orch
+
+
+__all__ = [
+    "NATIVE_CTX_KEYS",
+    "NativeComponents",
+    "build_native_app_ctx",
+]

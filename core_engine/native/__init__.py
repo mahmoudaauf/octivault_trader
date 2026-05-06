@@ -12,6 +12,8 @@ L8 - Orchestrator: NativeOrchestrator, CycleMetrics
 """
 
 # ── L0 ───────────────────────────────────────────────────────────────
+# ── App context (8.2.8 prep) ─────────────────────────────────────────
+from .app_context import NATIVE_CTX_KEYS, NativeComponents, build_native_app_ctx
 from .balance_sync import NativeBalanceSync
 from .config_loader import ConfigLoader, get_config
 
@@ -84,7 +86,11 @@ __all__ = [
     # L8
     "NativeOrchestrator",
     "CycleMetrics",
+    # App context (8.2.8 prep)
+    "NATIVE_CTX_KEYS",
+    "NativeComponents",
+    "build_native_app_ctx",
 ]
 
-__version__ = "0.8.1"
-__phase__ = "8.2.7"
+__version__ = "0.8.2"
+__phase__ = "8.2.8-prep"
