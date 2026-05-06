@@ -249,19 +249,24 @@ async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
 # Run loop
 # ════════════════════════════════════════════════════════════════════════
 async def run(args: argparse.Namespace) -> int:
+    native = not getattr(args, "no_native", False)
+    compat = native and not getattr(args, "no_compat", False)
+
     log.info("=" * 72)
     log.info("OctiVault Trading Bot — Façade Entry Point (Step 3)")
     log.info(
-        "Mode=%s  duration=%s  capital=%s  cycles=%s",
+        "Mode=%s  duration=%s  capital=%s  cycles=%s  native=%s  compat=%s",
         args.mode,
         args.duration,
         args.capital,
         args.cycles,
+        native,
+        compat,
     )
     log.info("=" * 72)
 
     # Build app_ctx and wire the 5 engines (only call into core_engine)
-    app_ctx = await setup_core_engines()
+    app_ctx = await setup_core_engines(native=native, compat=compat)
     app_ctx["mode"] = args.mode
     app_ctx["initial_capital"] = args.capital
 
@@ -389,6 +394,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1000.0,
         help="Initial capital in USDT (default: 1000).",
+    )
+    p.add_argument(
+        "--no-native",
+        action="store_true",
+        help="Skip native L0-L8 bootstrap; use empty mock app_ctx "
+        "(graceful-degrade everywhere). Default: native is ON.",
+    )
+    p.add_argument(
+        "--no-compat",
+        action="store_true",
+        help="Skip compat null-stubs for the 6 unmigrated façade keys. "
+        "Default: compat is ON when native is ON.",
     )
     return p.parse_args(argv)
 
