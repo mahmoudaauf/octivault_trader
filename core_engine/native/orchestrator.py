@@ -78,6 +78,8 @@ class NativeOrchestrator:
         telemetry: Any | None = None,  # NativeTelemetry (L6, optional)
         watchdog: Any | None = None,  # NativeWatchdog (L7, optional)
         fill_tracker: Any | None = None,  # NativeFillTracker (L3, optional)
+        objective_feedback_controller: Any
+        | None = None,  # ObjectiveFeedbackController (OFC, optional)
     ) -> None:
         self._market_data = market_data
         self._signal_engine = signal_engine
@@ -89,6 +91,7 @@ class NativeOrchestrator:
         self._telemetry = telemetry
         self._watchdog = watchdog
         self._fill_tracker = fill_tracker
+        self._ofc = objective_feedback_controller
 
         self._cycle_count = 0
         self._stopped = True  # Use bool flag instead of asyncio.Event
@@ -99,18 +102,28 @@ class NativeOrchestrator:
     async def start(self) -> None:
         """Prepare orchestrator (e.g., start background tasks)."""
         self._stopped = False
+
+        # Initialize session start time for OFC elapsed calculation
+        if self._shared_state:
+            self._shared_state._session_start_ts = time.time()
+            self._shared_state.session_anchor_nav = 0.0
+
         await self._market_data.start()
         await self._balance_sync.start()
         if self._fill_tracker is not None:
             await self._fill_tracker.start()
+        if self._ofc is not None:
+            await self._ofc.start()
 
     async def stop(self) -> None:
         """Graceful shutdown."""
         self._stopped = True
-        await self._market_data.stop()
-        await self._balance_sync.stop()
+        if self._ofc is not None:
+            await self._ofc.stop()
         if self._fill_tracker is not None:
             await self._fill_tracker.stop()
+        await self._market_data.stop()
+        await self._balance_sync.stop()
 
     async def run_loop(
         self,
@@ -265,7 +278,21 @@ class NativeOrchestrator:
 
         # Update SharedState with current NAV (critical for capital allocator)
         if self._shared_state:
-            self._shared_state.update_nav(balance_usdt)
+            if hasattr(self._shared_state, "update_nav"):
+                self._shared_state.update_nav(balance_usdt)
+
+            # Set session anchor NAV on first cycle with data
+            session_anchor = getattr(self._shared_state, "session_anchor_nav", 0.0)
+            if session_anchor <= 0 and balance_usdt > 0:
+                if hasattr(self._shared_state, "session_anchor_nav"):
+                    self._shared_state.session_anchor_nav = balance_usdt
+
+            # Gate: check if trading is halted by ObjectiveFeedbackController
+            if getattr(self._shared_state, "trading_halted", False):
+                logger.warning(
+                    "trading_halted=True (OFC kill-switch); skipping BUY decisions " "this cycle"
+                )
+                return []
 
         decisions = self._decision_engine.decide(signals, portfolio, balance_usdt)
         return decisions
@@ -277,6 +304,23 @@ class NativeOrchestrator:
 
     async def _phase_recover(self) -> None:
         """Phase 5: Health check and recovery."""
-        # Placeholder: can be expanded with L6 health monitor.
-        # For now, just log cycle completion.
-        pass
+        # Update metrics for ObjectiveFeedbackController
+        if self._shared_state:
+            nav = getattr(self._shared_state, "nav_usdt", getattr(self._shared_state, "nav", 0.0))
+            m = getattr(self._shared_state, "metrics", {})
+
+            # Unrealized P&L: portfolio value - invested cost basis
+            if hasattr(self._shared_state, "get_all_positions"):
+                positions = self._shared_state.get_all_positions()
+                total_position_value = sum(p.qty * p.mark_price for p in positions.values())
+                total_entry_cost = sum(p.qty * p.entry_price for p in positions.values())
+                m["unrealized_pnl"] = (
+                    (total_position_value - total_entry_cost) if positions else 0.0
+                )
+
+            # Peak NAV for drawdown calculation
+            m["peak_nav"] = max(m.get("peak_nav", 0.0), nav)
+
+            # Session elapsed time
+            elapsed_s = time.time() - getattr(self._shared_state, "_session_start_ts", time.time())
+            m["session_elapsed_h"] = elapsed_s / 3600.0

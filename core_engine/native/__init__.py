@@ -13,6 +13,8 @@ L8 - Orchestrator: NativeOrchestrator, CycleMetrics
 
 # ── L0 ───────────────────────────────────────────────────────────────
 # ── App context (8.2.8 prep) ─────────────────────────────────────────
+# ── L6 ───────────────────────────────────────────────────────────────
+from .adaptive_capital_engine import NativeAdaptiveCapitalEngine
 from .app_context import NATIVE_CTX_KEYS, NativeComponents, build_native_app_ctx
 from .balance_sync import NativeBalanceSync
 
@@ -23,8 +25,6 @@ from .bootstrap import (
     build_components,
     shutdown_components,
 )
-
-# ── L6 ───────────────────────────────────────────────────────────────
 from .capital_allocator import NativeCapitalAllocator
 from .config_loader import ConfigLoader, get_config
 
@@ -67,6 +67,9 @@ from .math_utils import (
     volatility,
     win_rate,
 )
+
+# ── L2 (Feedback Control) ────────────────────────────────────────────
+from .objective_feedback_controller import NativeObjectiveFeedbackController
 
 # ── L6 ───────────────────────────────────────────────────────────────
 from .observability import NativeTelemetry
@@ -124,8 +127,11 @@ __all__ = [
     "ExecutionResult",
     "ExecutionStatus",
     # L6
+    "NativeAdaptiveCapitalEngine",
     "NativeCapitalAllocator",
     "NativeTelemetry",
+    # L2 (Feedback Control)
+    "NativeObjectiveFeedbackController",
     # L8
     "NativeOrchestrator",
     "CycleMetrics",

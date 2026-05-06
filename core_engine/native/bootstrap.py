@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .adaptive_capital_engine import NativeAdaptiveCapitalEngine
 from .app_context import NativeComponents
 from .balance_sync import NativeBalanceSync
 from .capital_allocator import NativeCapitalAllocator
@@ -48,6 +49,7 @@ from .exchange_client import NativeExchangeClient
 from .executor import NativeExecutor
 from .fill_tracker import NativeFillTracker
 from .market_data import NativeMarketData
+from .objective_feedback_controller import NativeObjectiveFeedbackController
 from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
 from .portfolio_manager import NativePortfolioManager
@@ -131,6 +133,13 @@ class BootstrapConfig:
     prometheus_export_path: str = ""  # empty = disabled
     prometheus_export_interval_sec: float = 10.0
 
+    # --- feedback loop (adaptive capital engine + objective feedback controller) ---
+    adaptive_capital_engine_enabled: bool = True
+    ofc_enabled: bool = True
+    ofc_heartbeat_sec: float = 900.0  # 15 minutes
+    adaptive_risk_fraction_min: float = 0.05
+    adaptive_risk_fraction_max: float = 0.35
+
     # ------------------------------------------------------------------
     # Loaders
     # ------------------------------------------------------------------
@@ -186,6 +195,13 @@ class BootstrapConfig:
             trade_journal_dir=(e.get("TRADE_JOURNAL_DIR") or "logs").strip(),
             prometheus_export_path=(e.get("PROMETHEUS_EXPORT_PATH") or "").strip(),
             prometheus_export_interval_sec=_float(e.get("PROMETHEUS_EXPORT_INTERVAL_SEC"), 10.0),
+            adaptive_capital_engine_enabled=_bool(
+                e.get("ADAPTIVE_CAPITAL_ENGINE_ENABLED"), default=True
+            ),
+            ofc_enabled=_bool(e.get("OFC_ENABLED"), default=True),
+            ofc_heartbeat_sec=_float(e.get("OFC_HEARTBEAT_SEC"), 900.0),
+            adaptive_risk_fraction_min=_float(e.get("ADAPTIVE_RISK_FRACTION_MIN"), 0.05),
+            adaptive_risk_fraction_max=_float(e.get("ADAPTIVE_RISK_FRACTION_MAX"), 0.35),
         )
 
 
@@ -387,11 +403,25 @@ async def build_components(
         min_order_usdt=cfg.min_order_usdt,
     )
 
+    # L6 adaptive capital engine: dynamic position sizing based on performance
+    ace = NativeAdaptiveCapitalEngine(config=cfg) if cfg.adaptive_capital_engine_enabled else None
+
+    # L2 objective feedback controller: PI control on runtime knobs (confidence_floor,
+    # size_multiplier, target_throughput_per_hour) every 15 minutes to track NAV target
+    ofc = (
+        NativeObjectiveFeedbackController(config=cfg, shared_state=shared_state)
+        if cfg.ofc_enabled
+        else None
+    )
+
     # L6 capital allocator: allocates trading capital per buy signal
+    # Wired with ACE for adaptive sizing + OFC runtime_overrides
     capital_allocator = NativeCapitalAllocator(
         portfolio_manager=portfolio_manager,
         market_data=market_data,
         allocation_pct=cfg.capital_allocation_pct,
+        adaptive_engine=ace,
+        shared_state=shared_state,
     )
 
     # L3 position manager: read-only per-symbol accessor over
@@ -474,6 +504,8 @@ async def build_components(
         trade_journal=trade_journal,
         prometheus_exporter=prometheus_exporter,
         fill_tracker=fill_tracker,
+        adaptive_capital_engine=ace,
+        objective_feedback_controller=ofc,
     )
 
 

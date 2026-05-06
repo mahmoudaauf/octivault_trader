@@ -259,6 +259,26 @@ class NativeFillTracker:
             realized_pnl=realized_pnl,
         )
 
+        # Append trade record for adaptive engine feedback loop
+        record = {
+            "ts": time.time(),
+            "realized_delta": realized_pnl,
+            "fee_quote": fill.commission,
+            "hold_sec": 0.0,  # TODO: track entry_ts in Position for accurate hold time
+        }
+        if hasattr(self._shared_state, "append_trade_record"):
+            self._shared_state.append_trade_record(sym, record)
+
+        # Update metrics for ObjectiveFeedbackController
+        if hasattr(self._shared_state, "metrics"):
+            m = self._shared_state.metrics
+            m["realized_pnl"] = m.get("realized_pnl", 0.0) + realized_pnl
+            m["trades_in_window"] = m.get("trades_in_window", 0) + 1
+            m["last_update_ts"] = time.time()
+            # Rolling win_rate using exponential moving average
+            prev_wr = m.get("win_rate_window", 0.5)
+            m["win_rate_window"] = prev_wr * 0.9 + (1.0 if realized_pnl > 0 else 0.0) * 0.1
+
         logger.info(
             "[SELL_FILLED] %s qty=%.8f price=%.8f commission=%.8f pnl=%.8f",
             sym,

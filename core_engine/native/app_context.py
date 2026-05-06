@@ -119,6 +119,8 @@ class NativeComponents:
     trade_journal: Any | None = None  # NativeTradeJournal | None
     prometheus_exporter: Any | None = None  # NativePrometheusExporter | None
     fill_tracker: Any | None = None  # NativeFillTracker | None
+    adaptive_capital_engine: Any | None = None  # NativeAdaptiveCapitalEngine | None
+    objective_feedback_controller: Any | None = None  # NativeObjectiveFeedbackController | None
 
 
 def build_native_app_ctx(
@@ -162,6 +164,7 @@ def build_native_app_ctx(
         telemetry=components.telemetry,
         watchdog=components.watchdog,
         fill_tracker=components.fill_tracker,
+        objective_feedback_controller=components.objective_feedback_controller,
     )
 
     app_ctx: dict[str, Any] = {

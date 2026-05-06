@@ -86,6 +86,25 @@ class NativeSharedState:
         self._ready_event: Optional[asyncio.Event] = None
         self._hydrated = False
 
+        # Feedback loop state (ObjectiveFeedbackController + AdaptiveCapitalEngine)
+        self.metrics: dict = {
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "session_elapsed_h": 0.0,
+            "peak_nav": 0.0,
+            "trades_in_window": 0,
+            "win_rate_window": 0.5,
+            "avg_fee_bps": 0.0,
+            "avg_slippage_bps": 0.0,
+            "avg_net_profit_bps": 0.0,
+            "last_update_ts": 0.0,
+        }
+        self.session_anchor_nav: float = 0.0  # NAV at session start
+        self.runtime_overrides: dict = {}  # OFC writes: confidence_floor, size_multiplier, etc.
+        self.trading_halted: bool = False  # OFC kill-switch
+        self.trade_history: dict[str, list] = {}  # symbol -> list of closed-trade records
+        self._session_start_ts: float = 0.0  # Session start time for OFC elapsed calc
+
     # ==================== NAV Management ====================
 
     def update_nav(self, nav: float):
@@ -229,3 +248,18 @@ class NativeSharedState:
             "symbols_active": len(self.accepted_symbols),
             "symbols_dust": len(self.dust_symbols),
         }
+
+    # ==================== Feedback Loop ====================
+
+    def append_trade_record(self, symbol: str, record: dict) -> None:
+        """Append a closed-trade record for adaptive engine consumption.
+        Capped at 200 per symbol to prevent unbounded growth."""
+        lst = self.trade_history.setdefault(symbol, [])
+        lst.append(record)
+        if len(lst) > 200:
+            lst.pop(0)
+
+    async def emit_event(self, name: str, payload: dict) -> None:
+        """Emit event for telemetry/journaling.
+        Stub: subclasses can override to add event handling."""
+        pass
