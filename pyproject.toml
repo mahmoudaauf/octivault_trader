@@ -1,6 +1,16 @@
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+# Aligned with actual runtime (Python 3.9.6). Phase 8.3.13 will bump to py311.
+target-version = "py39"
+extend-exclude = [
+  "_archive",
+  "_archaeology",
+  "validation_outputs",
+  "data",
+  "logs",
+  "runs",
+  "artifacts",
+]
 
 [tool.ruff.lint]
 select = [
@@ -20,6 +30,15 @@ ignore = [
   "B008",   # function call in default argument
   "ARG001", # unused first argument (for methods)
   "ARG002", # unused positional argument
+  # Phase 8.3.5 — relaxed for active migration; revisit after 8.3.13 (Py 3.11):
+  "UP007",  # `X | Y` type syntax — requires Py 3.10+ runtime; we still ship 3.9
+  "ARG005", # unused lambda argument — common in callback signatures
+  "F841",   # unused local — often kept for debugging during migration
+  "RUF012", # mutable class attribute — needs ClassVar annotation sweep
+  "RUF003", # ambiguous unicode in comments — too noisy on this codebase
+  "SIM102", # nested if — readability preference, often clearer expanded
+  "SIM105", # contextlib.suppress — minor stylistic
+  "SIM108", # use ternary — readability preference
 ]
 
 [tool.ruff.lint.isort]

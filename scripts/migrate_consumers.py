@@ -14,6 +14,7 @@ Usage:
     python3 scripts/migrate_consumers.py --dry-run FILE1.py
 """
 from __future__ import annotations
+
 import re
 import sys
 from pathlib import Path
@@ -27,7 +28,7 @@ from src._layer_index import LAYER_MODULES  # noqa: E402
 def build_map() -> dict[str, str]:
     """core.X / utils.X short-name → canonical dotted path."""
     out: dict[str, str] = {}
-    for layer, mods in LAYER_MODULES.items():
+    for _layer, mods in LAYER_MODULES.items():
         for short, dotted in mods.items():
             # Only rewrite if the canonical path is in src.lN_*  (not still core.* or utils.*)
             if dotted.startswith("src.l"):

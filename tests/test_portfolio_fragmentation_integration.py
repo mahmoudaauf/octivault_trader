@@ -91,7 +91,7 @@ def simulate_health_check(portfolio: dict[str, dict[str, Any]]) -> dict[str, Any
     active_positions = []
     zero_positions = 0
 
-    for symbol, pos_data in portfolio.items():
+    for _symbol, pos_data in portfolio.items():
         qty = float(pos_data.get("qty", 0.0))
         if qty > 0:
             active_positions.append(qty)
@@ -763,7 +763,7 @@ class TestPerformanceAndScalability:
 
         times = []
 
-        for i in range(10):  # 10 cycles
+        for _ in range(10):  # 10 cycles
             portfolio = create_portfolio_snapshot({f"SYM{j}": 10.0 for j in range(20)})
 
             start = time.time()

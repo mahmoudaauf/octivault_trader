@@ -63,11 +63,11 @@ parked behind "land the migration first":
 
 | # | Title | Effort | Risk | Value |
 |---|---|---|---|---|
-| **8.3.1** | **Native shutdown wiring in `main.py`** | 30 min | low | high — real leak |
+| **8.3.1** | **Native shutdown wiring in `main.py`** | done — `c3fc3a2` | low | high — real leak |
 | 8.3.2 | Live testnet smoke (parked 5b) | 30 min | low | high — first end-to-end signal |
 | 8.3.3 | Telemetry export (`/healthz` JSON or log-rollup task) | 2 h | low | medium |
-| 8.3.4 | Doc graveyard sweep → single `PHASE_8_FINAL.md` | 1 h | none | medium |
-| 8.3.5 | Pre-commit audit (vulture decision, mypy stage) | 30 min | none | low — DX |
+| **8.3.4** | **Doc graveyard sweep → single `PHASE_8_FINAL.md`** | done — `7856404` + `913c543` | none | medium |
+| **8.3.5** | **Pre-commit audit (vulture removed, ruff scoped, 10 lint fixes)** | done — this commit | none | low — DX |
 | 8.3.6 | Real-network performance baseline (avg/p50/p95) | 1 h | low | medium |
 | 8.3.7 | Native `portfolio_manager` (replaces compat stub) | 1-2 days | medium | high — needed for live |
 | 8.3.8 | Native `position_manager` | 1-2 days | medium | high |

@@ -12,11 +12,15 @@ from pathlib import Path
 
 def run_mypy(directories: list[str]) -> str:
     """Run mypy and capture output"""
-    cmd = (
-        ["python3", "-m", "mypy"]
-        + directories
-        + ["--ignore-missing-imports", "--show-error-codes", "--no-error-summary"]
-    )
+    cmd = [
+        "python3",
+        "-m",
+        "mypy",
+        *directories,
+        "--ignore-missing-imports",
+        "--show-error-codes",
+        "--no-error-summary",
+    ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout + result.stderr

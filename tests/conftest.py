@@ -31,7 +31,7 @@ def event_loop():
     yield loop
     try:
         loop.close()
-    except:
+    except Exception:
         pass
 
 

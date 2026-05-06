@@ -1,4 +1,24 @@
 # yaml-language-server: $schema=https://json.schemastore.org/pre-commit-config.json
+#
+# Audited Phase 8.3.5: vulture hook removed (binary unavailable, `|| true`
+# masked it as a no-op anyway); legacy data/archive directories excluded
+# globally; check-yaml allows multi-document streams (see jaeger-deployment.yaml);
+# ruff target-version aligned with actual Python 3.9 runtime via pyproject.toml.
+
+# Top-level exclude: never run any hook on these legacy/data/archive trees.
+exclude: |
+  (?x)^(
+    _archive/.*|
+    _archaeology/.*|
+    validation_outputs/.*|
+    data/.*|
+    logs/.*|
+    runs/.*|
+    artifacts/.*|
+    models/.*\.pkl$|
+    .*\.ipynb_checkpoints/.*
+  )$
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
@@ -6,6 +26,7 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        args: ['--allow-multiple-documents']
       - id: check-added-large-files
         args: ['--maxkb=500']
       - id: check-merge-conflict
@@ -16,7 +37,12 @@ repos:
     hooks:
       - id: ruff
         args: [--fix, --show-fixes]
+        # Phase 8.3.5: scope ruff to actively-maintained code. Legacy `src/`,
+        # `utils/`, `agents/`, root-level orphan scripts are slated for cleanup
+        # alongside the Py 3.9 → 3.11 migration in Phase 8.3.13.
+        files: ^(core_engine/|main\.py$|tests/|scripts/|deployment/.*\.py$)
       - id: ruff-format
+        files: ^(core_engine/|main\.py$|tests/|scripts/|deployment/.*\.py$)
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.7.1
@@ -25,13 +51,3 @@ repos:
         args: [--ignore-missing-imports, --no-error-summary]
         additional_dependencies: ['types-all']
         stages: [manual]  # optional: run only on-demand, not every commit
-
-  - repo: local
-    hooks:
-      - id: vulture-dead-code
-        name: vulture (dead code detection)
-        entry: bash -c 'vulture . --exclude _archive,_archaeology,.claude,build,dist --min-confidence 80 --quiet || true'
-        language: system
-        pass_filenames: false
-        stages: [commit]
-        verbose: true

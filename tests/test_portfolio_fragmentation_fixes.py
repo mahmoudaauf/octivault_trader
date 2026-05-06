@@ -420,7 +420,7 @@ class TestConsolidationExecution:
         }
 
         total_proceeds = 0.0
-        for symbol, pos_data in positions.items():
+        for _symbol, pos_data in positions.items():
             qty = pos_data["qty"]
             entry_price = pos_data["entry_price"]
             position_value = qty * entry_price
