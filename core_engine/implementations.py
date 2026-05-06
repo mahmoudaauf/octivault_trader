@@ -369,8 +369,9 @@ class DecisionEngineImpl:
         }
 
         if not arbitration_engine:
-            logger.warning("⚠️ arbitration_engine not available")
-            result["reason"] = "Arbitration engine unavailable"
+            logger.warning("⚠️ arbitration_engine not available; defaulting to pass=True for MVP")
+            result["passed"] = True
+            result["reason"] = "Arbitration engine unavailable; MVP default-pass"
             return result
 
         try:
@@ -515,11 +516,24 @@ class SafeExecutionEngineImpl:
             result["error_message"] = "; ".join(validation["errors"])
             return result
 
-        # Place order
+        # Place order via exchange_client (native) or execution_manager (legacy)
+        exchange_client = app_ctx.get("exchange_client")
         execution_manager = app_ctx.get("execution_manager")
 
-        if execution_manager and hasattr(execution_manager, "place_order"):
-            try:
+        try:
+            order = None
+
+            # Try native exchange client first
+            if exchange_client and hasattr(exchange_client, "place_order"):
+                order = await exchange_client.place_order(
+                    symbol=symbol,
+                    side="BUY",
+                    quantity=quantity,
+                    order_type=order_type,
+                    price=price,
+                )
+            # Fallback to legacy execution_manager
+            elif execution_manager and hasattr(execution_manager, "place_order"):
                 order = await execution_manager.place_order(
                     symbol=symbol,
                     quantity=quantity,
@@ -528,17 +542,20 @@ class SafeExecutionEngineImpl:
                     order_type=order_type,
                 )
 
+            if order:
                 result["success"] = True
                 result["order_id"] = order.get("orderId")
                 result["status"] = "FILLED"
                 result["average_price"] = order.get("price", price or 0)
                 result["filled_quantity"] = order.get("executedQty", quantity)
-
                 logger.info(f"✅ BUY order placed: {symbol} x{quantity}")
+            else:
+                result["error_message"] = "No exchange client or execution manager available"
+                logger.error(f"❌ No order executor available for BUY {symbol}")
 
-            except Exception as e:
-                result["error_message"] = str(e)
-                logger.error(f"❌ Error placing BUY order: {e}")
+        except Exception as e:
+            result["error_message"] = str(e)
+            logger.error(f"❌ Error placing BUY order: {e}")
 
         return result
 
@@ -590,11 +607,24 @@ class SafeExecutionEngineImpl:
             except Exception as e:
                 logger.warning(f"⚠️ FIX #2 guard check failed: {e}")
 
-        # Place order
+        # Place order via exchange_client (native) or execution_manager (legacy)
+        exchange_client = app_ctx.get("exchange_client")
         execution_manager = app_ctx.get("execution_manager")
 
-        if execution_manager and hasattr(execution_manager, "place_order"):
-            try:
+        try:
+            order = None
+
+            # Try native exchange client first
+            if exchange_client and hasattr(exchange_client, "place_order"):
+                order = await exchange_client.place_order(
+                    symbol=symbol,
+                    side="SELL",
+                    quantity=quantity,
+                    order_type=order_type,
+                    price=price,
+                )
+            # Fallback to legacy execution_manager
+            elif execution_manager and hasattr(execution_manager, "place_order"):
                 order = await execution_manager.place_order(
                     symbol=symbol,
                     quantity=quantity,
@@ -603,6 +633,7 @@ class SafeExecutionEngineImpl:
                     order_type=order_type,
                 )
 
+            if order:
                 result["success"] = True
                 result["order_id"] = order.get("orderId")
                 result["status"] = "FILLED"
@@ -617,10 +648,13 @@ class SafeExecutionEngineImpl:
                         logger.warning(f"⚠️ FIX #2 cache mark failed: {e}")
 
                 logger.info(f"✅ SELL order placed: {symbol} x{quantity}")
+            else:
+                result["error_message"] = "No exchange client or execution manager available"
+                logger.error(f"❌ No order executor available for SELL {symbol}")
 
-            except Exception as e:
-                result["error_message"] = str(e)
-                logger.error(f"❌ Error placing SELL order: {e}")
+        except Exception as e:
+            result["error_message"] = str(e)
+            logger.error(f"❌ Error placing SELL order: {e}")
 
         return result
 

@@ -378,6 +378,7 @@ async def build_components(
     # L6 capital allocator: allocates trading capital per buy signal
     capital_allocator = NativeCapitalAllocator(
         portfolio_manager=portfolio_manager,
+        market_data=market_data,
         allocation_pct=cfg.capital_allocation_pct,
     )
 

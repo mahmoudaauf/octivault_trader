@@ -305,6 +305,81 @@ class SafeExecutionEngine:
         except Exception as e:
             self.logger.error(f"❌ Error marking SELL finalized: {e}")
 
+    async def execute_decision(self, decision: Any) -> ExecutionResult:
+        """
+        Execute a single trading decision (TradeDecision or dict).
+
+        Supports both the native facade TradeDecision objects and plain dicts.
+        Routes to place_buy_order() or place_sell_order() as appropriate.
+
+        Args:
+            decision: TradeDecision object or dict with action/symbol/quantity
+
+        Returns:
+            ExecutionResult with order status and ID
+        """
+        try:
+            # Extract fields from TradeDecision or dict
+            action = (
+                getattr(decision, "action", decision.get("action"))
+                if hasattr(decision, "get")
+                else getattr(decision, "action", None)
+            )
+            symbol = (
+                getattr(decision, "symbol", decision.get("symbol"))
+                if hasattr(decision, "get")
+                else getattr(decision, "symbol", None)
+            )
+            quantity = (
+                getattr(decision, "quantity", decision.get("quantity"))
+                if hasattr(decision, "get")
+                else getattr(decision, "quantity", 0.0)
+            )
+
+            if not symbol or not action or quantity <= 0:
+                return ExecutionResult(
+                    success=False,
+                    symbol=symbol or "?",
+                    action=action or "?",
+                    error_message="invalid decision: missing symbol/action or qty <= 0",
+                )
+
+            # Route to buy or sell (use MARKET orders for MVP — no price needed)
+            if action == "BUY":
+                return await self.place_buy_order(symbol, quantity, order_type="MARKET")
+            elif action == "SELL":
+                return await self.place_sell_order(symbol, quantity, order_type="MARKET")
+            else:
+                return ExecutionResult(
+                    success=False,
+                    symbol=symbol,
+                    action=action,
+                    error_message=f"unknown action: {action}",
+                )
+
+        except Exception as e:
+            self.logger.exception("execute_decision failed: %s", e)
+            return ExecutionResult(
+                success=False,
+                error_message=str(e),
+            )
+
+    async def execute_decisions(self, decisions: list[Any]) -> list[ExecutionResult]:
+        """
+        Execute multiple trading decisions sequentially.
+
+        Args:
+            decisions: List of TradeDecision objects or dicts
+
+        Returns:
+            List of ExecutionResult objects
+        """
+        results: list[ExecutionResult] = []
+        for decision in decisions:
+            result = await self.execute_decision(decision)
+            results.append(result)
+        return results
+
     async def shutdown(self) -> None:
         """Gracefully shut down execution engine."""
         self.logger.info("🛑 SafeExecutionEngine: shutting down...")

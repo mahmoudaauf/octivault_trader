@@ -39,16 +39,19 @@ class NativeCapitalAllocator:
         self,
         *,
         portfolio_manager: Any,
+        market_data: Any | None = None,
         allocation_pct: float = 5.0,
     ) -> None:
         """
         Initialize capital allocator.
 
         Args:
-            portfolio_manager: NativePortfolioManager with get_nav() and get_price() methods
+            portfolio_manager: NativePortfolioManager with get_nav() method
+            market_data: NativeMarketData with get_price() method (optional; if not provided, tries portfolio_manager)
             allocation_pct: Percentage of available USDT to allocate per buy signal (default 5%)
         """
         self._pm = portfolio_manager
+        self._md = market_data
         self._allocation_pct = max(0.1, min(100.0, float(allocation_pct)))
 
     async def allocate_for_buy(self, symbol: str) -> float:
@@ -66,13 +69,17 @@ class NativeCapitalAllocator:
             return 0.0
 
         try:
-            # Get current NAV and price
+            # Get current NAV
             nav = await self._pm.get_nav()
             if not nav or nav <= 0:
                 logger.debug("NAV %s too low to allocate", nav)
                 return 0.0
 
-            price = await self._pm.get_price(symbol)
+            # Get price from market_data if available, otherwise skip allocation
+            price = None
+            if self._md and hasattr(self._md, "get_price"):
+                price = self._md.get_price(symbol)
+
             if not price or price <= 0:
                 logger.debug("Price for %s unavailable or zero", symbol)
                 return 0.0
