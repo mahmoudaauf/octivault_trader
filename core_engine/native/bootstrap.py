@@ -87,11 +87,9 @@ class BootstrapConfig:
     # --- market data ---
     symbols: list[str] = field(
         default_factory=list
-    )  # Auto-populated via discovery; can be overridden via SYMBOLS env
+    )  # Auto-populated via wallet scan; can be overridden via SYMBOLS env
     market_data_poll_sec: float = 2.0
-    symbol_discovery_enabled: bool = True
-    symbol_discovery_min_volume: float = 100000.0
-    symbol_discovery_max_symbols: int = 30
+    symbol_discovery_enabled: bool = True  # Auto-discover from wallet holdings
     klines_cache_size: int = 64
     stale_threshold_sec: float = 30.0
 
@@ -168,10 +166,8 @@ class BootstrapConfig:
             api_key=api_key,
             api_secret=api_secret,
             testnet=_bool(e.get("BINANCE_TESTNET"), default=False),
-            symbols=symbols,  # Empty list → auto-discover during bootstrap
+            symbols=symbols,  # Empty list → auto-scan wallet during bootstrap
             symbol_discovery_enabled=symbol_discovery_enabled,
-            symbol_discovery_min_volume=_float(e.get("SYMBOL_DISCOVERY_MIN_VOLUME"), 100000.0),
-            symbol_discovery_max_symbols=_int(e.get("SYMBOL_DISCOVERY_MAX_SYMBOLS"), 30),
             market_data_poll_sec=_float(e.get("MARKET_DATA_POLL_SEC"), 2.0),
             klines_cache_size=_int(e.get("KLINES_CACHE_SIZE"), 64),
             stale_threshold_sec=_float(e.get("STALE_THRESHOLD_SEC"), 30.0),
@@ -339,14 +335,9 @@ async def build_components(
     if not symbols and cfg.symbol_discovery_enabled:
         from .symbol_discovery import NativeSymbolDiscovery
 
-        discoverer = NativeSymbolDiscovery(
-            exchange_client,
-            base_currency="USDT",
-            min_24h_volume=cfg.symbol_discovery_min_volume,
-            max_symbols=cfg.symbol_discovery_max_symbols,
-        )
+        discoverer = NativeSymbolDiscovery(exchange_client, base_currency="USDT")
         symbols = await discoverer.discover()
-        logger.info("🔍 Auto-discovered %d symbols: %s", len(symbols), symbols)
+        logger.info("📱 Wallet scan: discovered %d symbols: %s", len(symbols), symbols)
     else:
         logger.info(
             "Using %d symbols from config (discovery disabled or explicit override)", len(symbols)
