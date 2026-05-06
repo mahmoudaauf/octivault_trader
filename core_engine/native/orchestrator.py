@@ -262,6 +262,11 @@ class NativeOrchestrator:
             return []
 
         balance_usdt = self._balance_sync.get_balance().get("USDT", 0.0)
+
+        # Update SharedState with current NAV (critical for capital allocator)
+        if self._shared_state:
+            self._shared_state.update_nav(balance_usdt)
+
         decisions = self._decision_engine.decide(signals, portfolio, balance_usdt)
         return decisions
 
