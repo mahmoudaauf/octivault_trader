@@ -360,11 +360,11 @@ class NativeSignalEngine:
         self, market_data: Any, symbols: Optional[list[str]] = None
     ) -> list[dict[str, Any]]:
         """
-        Evaluate signals for all symbols using market_data.market_data_cache.
+        Evaluate signals for all symbols using market_data._klines cache.
 
         Args:
-            market_data: NativeMarketData instance with klines cache
-            symbols: Symbols to evaluate (default: all in cache)
+            market_data: NativeMarketData instance with _klines cache
+            symbols: Symbols to evaluate (default: auto-detect from cache)
 
         Returns:
             List of signal dicts: {symbol, signal_type, edge_score}
@@ -374,25 +374,36 @@ class NativeSignalEngine:
         if not market_data:
             return signals
 
-        # Get cache of klines
-        cache = getattr(market_data, "market_data_cache", {}) or {}
-        if not cache:
+        # Get the internal klines cache (OrderedDict with key=(symbol, interval, limit))
+        klines_cache = getattr(market_data, "_klines", {})
+        if not klines_cache:
             return signals
 
-        # Determine symbols to evaluate
-        eval_symbols = symbols or list(cache.keys())
+        # Collect unique symbols from cache keys
+        cache_symbols: set[str] = set()
+        for key in klines_cache:
+            if isinstance(key, tuple) and len(key) >= 1:
+                cache_symbols.add(key[0])
+
+        eval_symbols = symbols or list(cache_symbols)
+        if not eval_symbols:
+            return signals
 
         for symbol in eval_symbols:
-            # Extract klines for this symbol — cache key is usually (symbol, timeframe)
+            # Find klines for this symbol (prefer the most complete cache entry)
             klines = None
-            for key, klines_data in cache.items():
-                if (isinstance(key, tuple) and key[0] == symbol) or (
-                    isinstance(key, str) and key == symbol
-                ):
-                    klines = klines_data
-                    break
+            best_key = None
+            best_size = 0
 
-            if not klines:
+            for key, (_ts, data) in klines_cache.items():
+                if isinstance(key, tuple) and key[0] == symbol:
+                    data_size = len(data) if isinstance(data, (list, tuple)) else 0
+                    if data_size > best_size:
+                        klines = data
+                        best_key = key
+                        best_size = data_size
+
+            if not klines or len(klines) < 14:  # Need at least 14 bars for RSI
                 continue
 
             # Evaluate this symbol

@@ -194,6 +194,7 @@ class NativeMarketData:
 
             try:
                 await self._refresh_prices()
+                await self._refresh_klines()
             except ExchangeClientError as e:
                 logger.warning("market-data refresh failed (exchange): %s", e)
             except asyncio.CancelledError:
@@ -209,3 +210,21 @@ class NativeMarketData:
         for sym, px in prices.items():
             self._prices[sym] = px
             self._price_ts[sym] = now
+
+    async def _refresh_klines(self) -> None:
+        if not self._symbols:
+            return
+        now = time.time()
+        interval = "1m"
+        limit = 100
+        for sym in self._symbols:
+            try:
+                klines = await self._client.get_klines(sym, interval, limit)
+                if klines:
+                    key = (sym, interval, limit)
+                    self._klines[key] = (now, klines)
+                    # Enforce LRU: remove oldest if cache exceeds size
+                    while len(self._klines) > self._klines_cache_size:
+                        self._klines.popitem(last=False)
+            except ExchangeClientError as e:
+                logger.debug("klines fetch failed for %s: %s", sym, e)
