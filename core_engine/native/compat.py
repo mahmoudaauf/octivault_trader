@@ -106,7 +106,7 @@ class _NullStub:
 # ----------------------------------------------------------------------
 COMPAT_KEYS: tuple[str, ...] = (
     # "portfolio_manager",  # Phase 8.3.7 — replaced by NativePortfolioManager
-    "position_manager",
+    # "position_manager",   # Phase 8.3.8 — replaced by NativePositionManager
     "tp_sl_engine",
     "safety_order_manager",
     "recovery_engine",

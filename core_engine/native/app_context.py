@@ -77,6 +77,7 @@ NATIVE_CTX_KEYS: tuple[str, ...] = (
     "execution_manager",  # L5 (NativeExecutor; legacy key name preserved)
     "telemetry",  # L6 (native-only)
     "portfolio_manager",  # L3 (NativePortfolioManager; replaces compat stub in 8.3.7)
+    "position_manager",  # L3 (NativePositionManager; replaces compat stub in 8.3.8)
     "_native_orchestrator",  # L8 handle
     "_native_mode",  # marker flag
 )
@@ -102,6 +103,7 @@ class NativeComponents:
     exchange_client: Any | None = None  # NativeExchangeClient | duck-typed stub
     telemetry_exporter: Any | None = None  # NativeTelemetryExporter | None
     portfolio_manager: Any | None = None  # NativePortfolioManager | None
+    position_manager: Any | None = None  # NativePositionManager | None
 
 
 def build_native_app_ctx(
@@ -156,6 +158,8 @@ def build_native_app_ctx(
         app_ctx["exchange_client"] = components.exchange_client
     if components.portfolio_manager is not None:
         app_ctx["portfolio_manager"] = components.portfolio_manager
+    if components.position_manager is not None:
+        app_ctx["position_manager"] = components.position_manager
 
     if compat:
         register_compat_stubs(app_ctx)

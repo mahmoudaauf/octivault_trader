@@ -49,6 +49,7 @@ from .market_data import NativeMarketData
 from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
 from .portfolio_manager import NativePortfolioManager
+from .position_manager import NativePositionManager
 from .shared_state import NativeSharedState
 from .signals import NativeSignalEngine
 from .telemetry_export import NativeTelemetryExporter
@@ -351,6 +352,15 @@ async def build_components(
         min_order_usdt=cfg.min_order_usdt,
     )
 
+    # L3 position manager: read-only per-symbol accessor over
+    # shared_state. Replaces the compat null-stub for the
+    # ``position_manager`` app_ctx key consumed by SituationEngine
+    # and DecisionEngine.
+    position_manager = NativePositionManager(
+        shared_state=shared_state,
+        min_order_usdt=cfg.min_order_usdt,
+    )
+
     return NativeComponents(
         shared_state=shared_state,
         market_data=market_data,
@@ -363,6 +373,7 @@ async def build_components(
         portfolio_accessor=portfolio_accessor,
         telemetry_exporter=telemetry_exporter,
         portfolio_manager=portfolio_manager,
+        position_manager=position_manager,
     )
 
 
