@@ -248,24 +248,59 @@ class CoreEngineIntegration:
         logger.info("✅ All engines wired successfully")
 
 
-async def create_app_context(production: bool = False) -> dict[str, Any]:
+async def create_app_context(
+    production: bool = False,
+    *,
+    native: bool = False,
+) -> dict[str, Any]:
     """
     Create application context with all L0-L8 components.
 
     Modes
     -----
-    production=False (default): returns an empty dict — engines run in
-        mock mode via graceful degradation. Used for dry-run / structural
-        smoke tests.
+    native=True (Phase 8.2.8): construct an app_ctx from the native
+        L0-L6 + L8 stack via ``core_engine.native.bootstrap`` +
+        ``core_engine.native.app_context.build_native_app_ctx``.
+        Reads credentials from the environment (``BINANCE_API_KEY`` /
+        ``BINANCE_API_SECRET``). On any failure (missing credentials,
+        construction error) falls back to mock mode (empty dict) and
+        logs the cause. Takes precedence over ``production``.
 
-    production=True: delegates to `core_engine.production_bridge` which
-        reuses the legacy `MasterSystemOrchestrator` to construct all ~50
-        L0–L8 components, then maps them to app_ctx keys. This is the
-        Phase 8.1 path for real telemetry.
+    production=True (Phase 8.1): delegates to
+        ``core_engine.production_bridge`` which reuses the legacy
+        ``MasterSystemOrchestrator`` to construct all ~50 L0-L8
+        components, then maps them to app_ctx keys.
+        **Deprecated** — see ``PHASE_8_2_8_PREP.md``.
+
+    production=False, native=False (default): returns an empty dict —
+        engines run in mock mode via graceful degradation. Used for
+        dry-run / structural smoke tests.
 
     Returns:
         app_ctx: Dict with all components wired (or empty in mock mode)
     """
+    if native:
+        try:
+            from core_engine.native.app_context import build_native_app_ctx
+            from core_engine.native.bootstrap import (
+                BootstrapConfig,
+                build_components,
+            )
+
+            cfg = BootstrapConfig.from_env()
+            components = await build_components(cfg)
+            app_ctx, _orch = build_native_app_ctx(components)
+            logger.info(
+                "✅ Native app_ctx built: %d keys, testnet=%s, symbols=%d",
+                len(app_ctx),
+                cfg.testnet,
+                len(cfg.symbols),
+            )
+            return app_ctx
+        except Exception as e:
+            logger.error("❌ Native bootstrap failed: %r — falling back to mock context", e)
+            # Fall through to empty context (mock mode) on bootstrap failure
+
     if production:
         try:
             from core_engine.production_bridge import build_production_app_ctx
@@ -353,17 +388,19 @@ async def wire_engines(app_ctx: dict[str, Any]) -> None:
 
 
 # Convenience function for quick setup
-async def setup_core_engines(production: bool = False) -> dict[str, Any]:
+async def setup_core_engines(production: bool = False, *, native: bool = False) -> dict[str, Any]:
     """
     Setup: create context → wire engines → return ready app_ctx
 
     Args:
         production: If True, build a production app_ctx via the
-            legacy-orchestrator bridge. Default False = mock mode.
+            legacy-orchestrator bridge (deprecated, see Phase 8.2.8).
+        native: If True, build a native app_ctx via the Phase 8.2.8
+            bootstrap. Takes precedence over ``production``.
 
     Returns:
         app_ctx: Ready-to-use application context
     """
-    app_ctx = await create_app_context(production=production)
+    app_ctx = await create_app_context(production=production, native=native)
     await wire_engines(app_ctx)
     return app_ctx

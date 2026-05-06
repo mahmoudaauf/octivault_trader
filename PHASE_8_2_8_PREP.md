@@ -77,9 +77,11 @@ features the 5 façade engines treat as optional (graceful degradation).
 1. Decide per remaining key: **port to native**, **keep legacy via
    compat shim**, or **drop** (graceful-degrade indefinitely).
 2. ~~Build a dedicated `core_engine/native/bootstrap.py` that:~~ ✅ done.
-3. Update `create_app_context(production=True, native=True)` to call
+3. ~~Update `create_app_context(production=True, native=True)` to call
    `bootstrap.build_components()` then `build_native_app_ctx(...)`,
-   without touching the legacy bridge.
+   without touching the legacy bridge.~~ ✅ done — `create_app_context(native=True)`
+   now exists, takes precedence over `production=True`, and falls back
+   to mock mode on any bootstrap failure.
 4. Run a paper-trading session against the native path end-to-end.
 5. Only then: delete `production_bridge.py`, the
    `🎯_MASTER_SYSTEM_ORCHESTRATOR.py` legacy loader, and the legacy
@@ -92,6 +94,7 @@ After this prep step:
 ```
 pytest tests/test_native_l0..6.py tests/test_native_l8.py \
        tests/test_integration_full_cycle.py \
-       tests/test_native_app_context.py tests/test_native_bootstrap.py -q
-# 190 passed
+       tests/test_native_app_context.py tests/test_native_bootstrap.py \
+       tests/test_integration_native_wiring.py -q
+# 197 passed
 ```
