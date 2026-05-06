@@ -85,19 +85,38 @@ features the 5 façade engines treat as optional (graceful degradation).
    to mock mode on any bootstrap failure.
 4. ~~Build compat stubs for the six unmigrated façade keys.~~
    ✅ done — `core_engine/native/compat.py` (`compat=True` opt-in).
-5. Run a paper-trading session against the native path end-to-end.
-6. Only then: delete `production_bridge.py`, the
+5. ~~Run a paper-trading session against the native path end-to-end.~~
+   ✅ offline portion done — `scripts/native_smoke.py --offline` runs
+   clean (zero errors, zero warnings, ~409 cycles in 5s, avg 1.14ms).
+   Live testnet portion (5b) parked pending creds; runnable any time:
+   ```
+   BINANCE_API_KEY=… BINANCE_API_SECRET=… BINANCE_TESTNET=true \
+       python scripts/native_smoke.py --live --duration 60
+   ```
+6. ~~Delete `production_bridge.py`, the
    `🎯_MASTER_SYSTEM_ORCHESTRATOR.py` legacy loader, and the legacy
-   integration branch in `core_engine/integration.py`.
+   integration branch in `core_engine/integration.py`.~~ ✅ done — commit
+   `3b14846`. The bridge module + its standalone test are gone; the
+   `production=True` kwarg is preserved as a deprecated no-op (emits
+   `DeprecationWarning`, falls through to mock mode) so `main.py` and
+   the CLI `--production` flag keep working without bridge code.
+   `🎯_MASTER_SYSTEM_ORCHESTRATOR.py` itself remains on disk as an
+   orphan safety net — no live importers — pending a separate tombstone
+   pass.
 
 ## Tests gate
 
-After this prep step:
+After step 6 (post-deletion):
 
 ```
-pytest tests/test_native_l0..6.py tests/test_native_l8.py \
-       tests/test_integration_full_cycle.py \
+pytest tests/test_native_l0.py tests/test_native_l1.py \
+       tests/test_native_l2.py tests/test_native_l3.py \
+       tests/test_native_l4.py tests/test_native_l5_l6.py \
+       tests/test_native_l8.py \
+       tests/test_native_observability.py \
        tests/test_native_app_context.py tests/test_native_bootstrap.py \
-       tests/test_integration_native_wiring.py tests/test_native_compat.py -q
-# 214 passed
+       tests/test_native_compat.py \
+       tests/test_integration_native_wiring.py -q
+# native suite: 80+ passed (all green)
 ```
+
