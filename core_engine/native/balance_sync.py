@@ -60,8 +60,7 @@ class NativeBalanceSync:
         self._balances: dict[str, float] = {}
         self._last_update_ts: float = 0.0
         self._task: Optional[asyncio.Task[None]] = None
-        self._stopped = asyncio.Event()
-        self._stopped.set()  # initially stopped
+        self._stopped: Optional[asyncio.Event] = None  # Lazy initialization
 
     # ──────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -70,6 +69,9 @@ class NativeBalanceSync:
         """Start the background poller. Idempotent."""
         if self._task and not self._task.done():
             return
+        # Lazy-create event when we're in async context
+        if self._stopped is None:
+            self._stopped = asyncio.Event()
         self._stopped.clear()
         # Prime the cache once before the loop so callers see data fast.
         try:
@@ -80,6 +82,9 @@ class NativeBalanceSync:
 
     async def stop(self) -> None:
         """Stop the background poller. Idempotent."""
+        # Ensure event is created before setting it
+        if self._stopped is None:
+            self._stopped = asyncio.Event()
         self._stopped.set()
         task = self._task
         self._task = None

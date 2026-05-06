@@ -82,8 +82,8 @@ class NativeSharedState:
         self.accepted_symbols: set[str] = set()
         self.dust_symbols: set[str] = set()
 
-        # Hydration state
-        self._ready_event = asyncio.Event()
+        # Hydration state (lazy initialization to avoid event loop requirement)
+        self._ready_event: Optional[asyncio.Event] = None
         self._hydrated = False
 
     # ==================== NAV Management ====================
@@ -198,12 +198,18 @@ class NativeSharedState:
 
     async def wait_ready(self):
         """Wait until positions hydrated"""
-        await self._ready_event.wait()
+        # Lazy-create event only when needed (ensures we're in async context)
+        if self._ready_event is None:
+            self._ready_event = asyncio.Event()
+        if not self._hydrated:
+            await self._ready_event.wait()
 
     def mark_ready(self):
         """Signal positions are ready"""
         self._hydrated = True
-        self._ready_event.set()
+        # Only set event if it was created
+        if self._ready_event is not None:
+            self._ready_event.set()
 
     def is_ready(self) -> bool:
         """Check if positions hydrated"""

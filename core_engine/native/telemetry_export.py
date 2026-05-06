@@ -60,7 +60,7 @@ class NativeTelemetryExporter:
         self._output_path = Path(output_path)
         self._interval_sec = float(interval_sec)
         self._task: asyncio.Task[None] | None = None
-        self._stopping = asyncio.Event()
+        self._stopping: asyncio.Event | None = None  # Lazy initialization
         self._write_count = 0
 
     # ------------------------------------------------------------------
@@ -70,6 +70,9 @@ class NativeTelemetryExporter:
         """Spawn the background snapshot loop. Idempotent."""
         if self._task is not None and not self._task.done():
             return
+        # Lazy-create the event when we're in async context
+        if self._stopping is None:
+            self._stopping = asyncio.Event()
         self._stopping.clear()
         # Ensure parent directory exists up-front so first export succeeds.
         self._output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,6 +85,9 @@ class NativeTelemetryExporter:
 
     async def stop(self) -> None:
         """Signal the loop to exit and await its completion. Idempotent."""
+        # Ensure event is created before setting it
+        if self._stopping is None:
+            self._stopping = asyncio.Event()
         self._stopping.set()
         task = self._task
         if task is None:

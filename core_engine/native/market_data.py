@@ -69,8 +69,7 @@ class NativeMarketData:
         ] = OrderedDict()
 
         self._task: Optional[asyncio.Task[None]] = None
-        self._stopped = asyncio.Event()
-        self._stopped.set()
+        self._stopped: Optional[asyncio.Event] = None  # Lazy initialization
 
     # ──────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -79,6 +78,9 @@ class NativeMarketData:
         """Start background poller. Idempotent. Primes cache before loop."""
         if self._task and not self._task.done():
             return
+        # Lazy-create event when we're in async context
+        if self._stopped is None:
+            self._stopped = asyncio.Event()
         self._stopped.clear()
         try:
             await self._refresh_prices()
@@ -88,6 +90,9 @@ class NativeMarketData:
 
     async def stop(self) -> None:
         """Stop background poller. Idempotent."""
+        # Ensure event is created before setting it
+        if self._stopped is None:
+            self._stopped = asyncio.Event()
         self._stopped.set()
         task = self._task
         self._task = None
