@@ -67,6 +67,7 @@ from .signals import NativeSignalEngine
 # engines must continue to graceful-degrade.
 NATIVE_CTX_KEYS: tuple[str, ...] = (
     "shared_state",  # L0
+    "exchange_client",  # L1 (NativeExchangeClient; consumed by safe_execution_engine)
     "balance_manager",  # L1 (NativeBalanceSync; legacy key name preserved)
     "market_data_feed",  # L2 (NativeMarketData; legacy key name preserved)
     "signal_manager",  # L3 (NativeSignalEngine; legacy key name preserved)
@@ -95,6 +96,7 @@ class NativeComponents:
     balance_sync: NativeBalanceSync
     telemetry: NativeTelemetry | None = None
     portfolio_accessor: Any | None = None  # callable | None (kept loose)
+    exchange_client: Any | None = None  # NativeExchangeClient | duck-typed stub
 
 
 def build_native_app_ctx(
@@ -138,6 +140,8 @@ def build_native_app_ctx(
     }
     if components.telemetry is not None:
         app_ctx["telemetry"] = components.telemetry
+    if components.exchange_client is not None:
+        app_ctx["exchange_client"] = components.exchange_client
 
     return app_ctx, orch
 

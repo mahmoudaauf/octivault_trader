@@ -251,6 +251,7 @@ async def build_components(
         executor=executor,
         balance_sync=balance_sync,
         telemetry=telemetry,
+        exchange_client=exchange_client,
     )
 
 
@@ -268,8 +269,8 @@ async def shutdown_components(components: NativeComponents) -> None:
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("native shutdown: %s.stop() raised: %r", type(comp).__name__, e)
 
-    # close exchange HTTP session if reachable through balance_sync
-    client = getattr(components.balance_sync, "_client", None)
+    # close exchange HTTP session if reachable
+    client = components.exchange_client or getattr(components.balance_sync, "_client", None)
     if client is not None and hasattr(client, "close"):
         try:
             await client.close()

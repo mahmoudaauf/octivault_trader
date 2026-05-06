@@ -181,6 +181,8 @@ async def test_build_components_returns_wired_native_components():
     assert components.telemetry is not None
     # Telemetry capacity propagated
     assert components.telemetry.capacity == cfg.telemetry_capacity
+    # Exchange client surfaced as first-class field (used by safe_execution_engine)
+    assert components.exchange_client is not None
 
 
 @pytest.mark.asyncio

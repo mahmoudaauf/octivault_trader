@@ -116,6 +116,26 @@ def test_build_native_app_ctx_includes_telemetry_when_provided():
     assert app_ctx["telemetry"] is t
 
 
+def test_build_native_app_ctx_omits_exchange_client_when_none():
+    app_ctx, _ = build_native_app_ctx(_components())
+    assert "exchange_client" not in app_ctx
+
+
+def test_build_native_app_ctx_includes_exchange_client_when_provided():
+    sentinel = object()
+    components = NativeComponents(
+        shared_state=_State(),  # type: ignore[arg-type]
+        market_data=_MD(),  # type: ignore[arg-type]
+        signal_engine=_Sig(),  # type: ignore[arg-type]
+        decision_engine=_Dec(),  # type: ignore[arg-type]
+        executor=_Exe(),  # type: ignore[arg-type]
+        balance_sync=_Bal(),  # type: ignore[arg-type]
+        exchange_client=sentinel,
+    )
+    app_ctx, _ = build_native_app_ctx(components)
+    assert app_ctx["exchange_client"] is sentinel
+
+
 def test_orchestrator_handle_is_same_instance_in_ctx():
     app_ctx, orch = build_native_app_ctx(_components())
     assert app_ctx["_native_orchestrator"] is orch
