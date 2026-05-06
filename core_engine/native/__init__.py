@@ -1,11 +1,12 @@
 """
-Native module: L0 (8.2.1) + L1 (8.2.2) + L2 (8.2.3) + L3 (8.2.4) + L4 (8.2.5)
+Native module: L0 (8.2.1) + L1 (8.2.2) + L2 (8.2.3) + L3 (8.2.4) + L4 (8.2.5) + L5 (8.2.6)
 
 L0 — Utilities: NativeSharedState, NativeTimeUtils, ConfigLoader, NativeRetryManager
 L1 — Exchange: NativeExchangeClient, NativeBalanceSync, NativeOrderExecution
 L2 — Market Data: NativeMarketData
 L3 — Signals: NativeSignalEngine, Signal, AggregatedSignal
 L4 — Decisions: NativeDecisionEngine, Decision, PortfolioSnapshot
+L5 — Execution: NativeExecutor, ExecutionResult, ExecutionStatus
 """
 
 # ── L0 ───────────────────────────────────────────────────────────────
@@ -32,6 +33,9 @@ from .signals import AggregatedSignal, NativeSignalEngine, Signal
 
 # ── L4 ───────────────────────────────────────────────────────────────
 from .decisions import Decision, NativeDecisionEngine, PortfolioSnapshot
+
+# ── L5 ───────────────────────────────────────────────────────────────
+from .executor import ExecutionResult, ExecutionStatus, NativeExecutor
 from .time_utils import NativeTimeUtils
 
 __all__ = [
@@ -63,7 +67,11 @@ __all__ = [
     "NativeDecisionEngine",
     "Decision",
     "PortfolioSnapshot",
+    # L5
+    "NativeExecutor",
+    "ExecutionResult",
+    "ExecutionStatus",
 ]
 
-__version__ = "0.5.0"
-__phase__ = "8.2.5"
+__version__ = "0.6.0"
+__phase__ = "8.2.6"
