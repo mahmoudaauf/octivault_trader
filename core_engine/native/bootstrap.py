@@ -50,6 +50,7 @@ from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
 from .portfolio_manager import NativePortfolioManager
 from .position_manager import NativePositionManager
+from .safety_order_manager import NativeSafetyOrderManager
 from .shared_state import NativeSharedState
 from .signals import NativeSignalEngine
 from .telemetry_export import NativeTelemetryExporter
@@ -377,6 +378,15 @@ async def build_components(
         sl_pct=cfg.sl_pct,
     )
 
+    # L4 safety order manager: per-symbol OCO intent store with
+    # best-effort exchange placement. Replaces the compat null-stub
+    # for the ``safety_order_manager`` app_ctx key consumed by
+    # SafeExecutionEngine.place_safety_order.
+    safety_order_manager = NativeSafetyOrderManager(
+        exchange_client=exchange_client,
+        min_order_usdt=cfg.min_order_usdt,
+    )
+
     return NativeComponents(
         shared_state=shared_state,
         market_data=market_data,
@@ -391,6 +401,7 @@ async def build_components(
         portfolio_manager=portfolio_manager,
         position_manager=position_manager,
         tp_sl_engine=tp_sl_engine_native,
+        safety_order_manager=safety_order_manager,
     )
 
 

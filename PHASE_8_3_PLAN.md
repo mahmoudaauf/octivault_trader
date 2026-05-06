@@ -72,7 +72,7 @@ parked behind "land the migration first":
 | **8.3.7** | **Native `portfolio_manager` (read-only aggregator; replaces compat stub)** | done — this commit | medium | high — needed for live |
 | **8.3.8** | **Native `position_manager` (read-only per-symbol accessor; replaces compat stub)** | done — this commit | medium | high |
 | **8.3.9** | **Native `tp_sl_engine` (per-symbol target store + crossing detection)** | done — this commit | medium | high |
-| 8.3.10 | Native `safety_order_manager` | 2-3 days | medium | medium |
+| **8.3.10** | **Native `safety_order_manager` (OCO intent store + best-effort TP-leg placement)** | done — this commit | medium | medium |
 | 8.3.11 | Native `recovery_engine` | 1 day | medium | medium |
 | 8.3.12 | Native `watchdog` | 1 day | low | medium |
 | 8.3.13 | Python 3.9 → 3.11 migration | 1 day | medium | low — DX |

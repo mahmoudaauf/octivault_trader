@@ -35,7 +35,7 @@ façade engines read 23 keys. The intersection is what actually matters.
 | `position_manager` | `situation_engine`, `decision_engine` | ✅ `NativePositionManager` (8.3.8) | **native** |
 | `risk_manager` | `situation_engine`, `decision_engine` | partial — risk caps live in `NativeDecisionEngine` | **drop key**, behavior already in DE |
 | `tp_sl_engine` | `decision_engine` | ✅ `NativeTPSLEngine` (8.3.9) | **native** |
-| `safety_order_manager` | `safe_execution_engine` | ❌ not in native | **shim** (TBD) |
+| `safety_order_manager` | `safe_execution_engine` | ✅ `NativeSafetyOrderManager` (8.3.10) | **native** |
 | `recovery_engine` | `operations_engine` ×2 | ❌ not in native | **shim** (TBD) |
 | `signal_fusion` | `setup_core_engines` | absorbed | **drop key** — `NativeSignalEngine` is the fusion |
 | `arbitration_engine` | `setup_core_engines` | absorbed | **drop key** — `NativeDecisionEngine` is the gate |

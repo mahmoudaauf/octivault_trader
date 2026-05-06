@@ -105,10 +105,10 @@ class _NullStub:
 # Public registration helper
 # ----------------------------------------------------------------------
 COMPAT_KEYS: tuple[str, ...] = (
-    # "portfolio_manager",  # Phase 8.3.7 — replaced by NativePortfolioManager
-    # "position_manager",   # Phase 8.3.8 — replaced by NativePositionManager
-    # "tp_sl_engine",       # Phase 8.3.9 — replaced by NativeTPSLEngine
-    "safety_order_manager",
+    # "portfolio_manager",   # Phase 8.3.7  — replaced by NativePortfolioManager
+    # "position_manager",    # Phase 8.3.8  — replaced by NativePositionManager
+    # "tp_sl_engine",        # Phase 8.3.9  — replaced by NativeTPSLEngine
+    # "safety_order_manager",# Phase 8.3.10 — replaced by NativeSafetyOrderManager
     "recovery_engine",
     "watchdog",
 )

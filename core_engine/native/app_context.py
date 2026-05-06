@@ -79,6 +79,7 @@ NATIVE_CTX_KEYS: tuple[str, ...] = (
     "portfolio_manager",  # L3 (NativePortfolioManager; replaces compat stub in 8.3.7)
     "position_manager",  # L3 (NativePositionManager; replaces compat stub in 8.3.8)
     "tp_sl_engine",  # L4 (NativeTPSLEngine; replaces compat stub in 8.3.9)
+    "safety_order_manager",  # L4 (NativeSafetyOrderManager; replaces compat stub in 8.3.10)
     "_native_orchestrator",  # L8 handle
     "_native_mode",  # marker flag
 )
@@ -106,6 +107,7 @@ class NativeComponents:
     portfolio_manager: Any | None = None  # NativePortfolioManager | None
     position_manager: Any | None = None  # NativePositionManager | None
     tp_sl_engine: Any | None = None  # NativeTPSLEngine | None
+    safety_order_manager: Any | None = None  # NativeSafetyOrderManager | None
 
 
 def build_native_app_ctx(
@@ -164,6 +166,8 @@ def build_native_app_ctx(
         app_ctx["position_manager"] = components.position_manager
     if components.tp_sl_engine is not None:
         app_ctx["tp_sl_engine"] = components.tp_sl_engine
+    if components.safety_order_manager is not None:
+        app_ctx["safety_order_manager"] = components.safety_order_manager
 
     if compat:
         register_compat_stubs(app_ctx)
