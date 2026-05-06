@@ -50,6 +50,7 @@ from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
 from .portfolio_manager import NativePortfolioManager
 from .position_manager import NativePositionManager
+from .recovery_engine import NativeRecoveryEngine
 from .safety_order_manager import NativeSafetyOrderManager
 from .shared_state import NativeSharedState
 from .signals import NativeSignalEngine
@@ -387,6 +388,15 @@ async def build_components(
         min_order_usdt=cfg.min_order_usdt,
     )
 
+    # L4 recovery engine: in-process self-diagnosis and recovery
+    # planner. Replaces the compat null-stub for the
+    # ``recovery_engine`` app_ctx key consumed by
+    # OperationsEngine.recover_state / apply_recovery.
+    recovery_engine = NativeRecoveryEngine(
+        shared_state=shared_state,
+        safety_order_manager=safety_order_manager,
+    )
+
     return NativeComponents(
         shared_state=shared_state,
         market_data=market_data,
@@ -402,6 +412,7 @@ async def build_components(
         position_manager=position_manager,
         tp_sl_engine=tp_sl_engine_native,
         safety_order_manager=safety_order_manager,
+        recovery_engine=recovery_engine,
     )
 
 

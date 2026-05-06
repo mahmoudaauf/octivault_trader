@@ -36,7 +36,7 @@ façade engines read 23 keys. The intersection is what actually matters.
 | `risk_manager` | `situation_engine`, `decision_engine` | partial — risk caps live in `NativeDecisionEngine` | **drop key**, behavior already in DE |
 | `tp_sl_engine` | `decision_engine` | ✅ `NativeTPSLEngine` (8.3.9) | **native** |
 | `safety_order_manager` | `safe_execution_engine` | ✅ `NativeSafetyOrderManager` (8.3.10) | **native** |
-| `recovery_engine` | `operations_engine` ×2 | ❌ not in native | **shim** (TBD) |
+| `recovery_engine` | `operations_engine` ×2 | ✅ `NativeRecoveryEngine` (8.3.11) | **native** |
 | `signal_fusion` | `setup_core_engines` | absorbed | **drop key** — `NativeSignalEngine` is the fusion |
 | `arbitration_engine` | `setup_core_engines` | absorbed | **drop key** — `NativeDecisionEngine` is the gate |
 | `health_monitor` | `setup_core_engines` | ❌ not in native | **shim** (TBD) |
@@ -119,7 +119,7 @@ For each, we have three options:
 | `position_manager` | `situation_engine` reads list; `decision_engine` checks for existing position before opening | ✅ resolved in **8.3.8** — `NativePositionManager` (read-only per-symbol accessor over `NativeSharedState.positions`; provides `get_position` + `analyze_position`) |
 | `tp_sl_engine` | `decision_engine` consults for protective-order placement decisions | **stub** returning "no action" — decision engine already graceful-degrades |
 | `safety_order_manager` | `safe_execution_engine` calls `place_safety_orders(order)` | **stub** returning `[]` |
-| `recovery_engine` | `operations_engine` calls `check_recovery_needed()` and `recover()` | **stub** returning `False` / no-op |
+| `recovery_engine` | `operations_engine` calls `generate_recovery_plan()` and `apply_plan(plan)` | ✅ `NativeRecoveryEngine` (8.3.11) — detects orphan OCO / stale prices / NAV drift / zero entry; applies via dispatcher |
 | `health_monitor` | `setup_core_engines` only references for wiring (not invoked in cycle) | **drop** — wiring path can tolerate `None` |
 | `watchdog` | `operations_engine` calls `heartbeat()` and `check_liveness()` | **stub** returning `True` |
 

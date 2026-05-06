@@ -148,8 +148,11 @@ def test_register_compat_stubs_does_not_overwrite_existing():
     app_ctx: dict = {"watchdog": sentinel}
     register_compat_stubs(app_ctx)
     assert app_ctx["watchdog"] is sentinel  # untouched
-    # but other compat keys should now be present
-    assert isinstance(app_ctx["recovery_engine"], _NullStub)
+    # COMPAT_KEYS shrinks as native impls land (8.3.7-8.3.11 already
+    # graduated). After 8.3.11 only ``watchdog`` remains stubbed; once
+    # 8.3.12 lands COMPAT_KEYS will be empty and this test should be
+    # retired alongside the compat module itself.
+    assert set(COMPAT_KEYS) <= {"watchdog"}
 
 
 def test_compat_keys_excludes_dropped_keys():
@@ -189,9 +192,11 @@ async def test_build_native_app_ctx_compat_true_does_not_break_cycle():
     metrics = await orch.run_cycle()
     assert metrics.cycle_num == 1
     # Stubs are present but orchestrator never touches them.
-    # Note: portfolio_manager is now a real NativePortfolioManager (8.3.7),
-    # so we probe a still-stubbed key instead.
-    assert isinstance(app_ctx["recovery_engine"], _NullStub)
+    # Note: portfolio_manager (8.3.7), position_manager (8.3.8),
+    # tp_sl_engine (8.3.9), safety_order_manager (8.3.10) and
+    # recovery_engine (8.3.11) are now real native impls. Only
+    # ``watchdog`` remains stubbed.
+    assert isinstance(app_ctx["watchdog"], _NullStub)
 
 
 # ---------------------------------------------------------------------
