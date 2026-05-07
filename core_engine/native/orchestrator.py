@@ -391,11 +391,12 @@ class NativeOrchestrator:
                 klines = await self._market_data.get_klines(symbol, interval="1m", limit=100)
                 agg_sig = self._signal_engine.evaluate(symbol, klines)
                 if agg_sig is not None:
+                    meta = getattr(agg_sig, "meta", {}) or {}
                     signals_by_symbol[symbol] = {
                         "direction": agg_sig.direction,
                         "score": agg_sig.score,
                         "contributions": agg_sig.contributions,
-                        **(agg_sig.meta or {}),
+                        **meta,
                     }
             except Exception as e:  # pragma: no cover
                 logger.debug(f"signal generation failed for {symbol}: {e}")
@@ -506,6 +507,7 @@ class NativeOrchestrator:
         while (time.time() - start) < max_wait_sec:
             has_prices = False
             has_balance = False
+            throttled = False
 
             # Check market_data has prices
             if self._market_data and hasattr(self._market_data, "get_prices"):
@@ -516,14 +518,31 @@ class NativeOrchestrator:
                     logger.debug("initial-data price probe failed: %s", e)
                     prices = {}
 
-            # Check balance_sync or polling_coordinator has balance
-            balance = self._get_balance()
-            has_balance = bool(balance and balance.get("USDT", 0) > 0)
+            # Check throttle state FIRST - if throttled, don't attempt balance fetch
+            throttled = bool(
+                getattr(self._shared_state, "exchange_throttled", False)
+                or (
+                    float(getattr(self._shared_state, "exchange_throttle_until_ts", 0.0) or 0.0)
+                    > time.time()
+                )
+            )
+
+            # Only attempt balance fetch if not throttled (prevents fresh 418 bans)
+            balance = {}
+            has_balance = False
+            if not throttled:
+                balance = self._get_balance()
+                has_balance = bool(balance and balance.get("USDT", 0) > 0)
 
             if has_prices and has_balance:
                 logger.info(
                     f"✅ Initial data ready (prices={len(prices)} symbols, balance=%.2f USDT)",
                     balance.get("USDT", 0.0),
+                )
+                return
+            if throttled:
+                logger.info(
+                    "🟢 Exchange throttled at startup; deferring balance hydration until throttle clears"
                 )
                 return
 
