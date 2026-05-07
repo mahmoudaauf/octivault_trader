@@ -426,6 +426,107 @@ class DecisionEngineImpl:
         logger.info(f"✅ BUY decision: {symbol} x{quantity:.4f}")
         return decision
 
+    @staticmethod
+    async def make_sell_decision(
+        app_ctx: dict[str, Any], symbol: str, edge_score: float, source: str = "signal"
+    ) -> dict[str, Any] | None:
+        """
+        Make sell decision for an open position — only if profitable after fees.
+        Coordinates: arbitration_engine (L5), position_manager (L3), shared_state (L0).
+
+        Args:
+            app_ctx: Application context
+            symbol: Trading pair
+            edge_score: Signal confidence
+            source: Where signal came from ("signal", "tp", "sl", etc.)
+
+        Returns:
+            SELL decision dict if position is profitable after fees, else None
+        """
+        # Step 1: Arbitrate
+        arb_result = await DecisionEngineImpl.evaluate_signal(app_ctx, symbol, "SELL", edge_score)
+
+        if not arb_result.get("passed"):
+            logger.debug(f"🚫 SELL rejected for {symbol}: {arb_result.get('blocking_gates')}")
+            return None
+
+        # Step 2: Get position details
+        position_manager = app_ctx.get("position_manager")
+        quantity = 0.0
+        entry_price = 0.0
+        current_price = 0.0
+
+        if position_manager and hasattr(position_manager, "get_position"):
+            try:
+                pos = await _maybe_await(position_manager.get_position(symbol))
+                if pos is None:
+                    logger.debug(f"⚠️ No open position for {symbol}")
+                    return None
+
+                quantity = float(getattr(pos, "qty", 0.0) or 0.0)
+                entry_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
+                current_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
+            except Exception as e:
+                logger.warning(f"⚠️ Could not get position details: {e}")
+                return None
+
+        if quantity <= 0 or entry_price <= 0 or current_price <= 0:
+            logger.debug(
+                f"⚠️ Invalid position for {symbol}: qty={quantity}, entry={entry_price}, current={current_price}"
+            )
+            return None
+
+        # Step 3: Calculate profit after fees
+        # Binance trading fee: typically 0.1% (0.001) per side
+        # Total round-trip: BUY fee + SELL fee = 0.2% (0.002)
+        fee_pct = 0.002  # 0.2% round-trip fee
+
+        # Unrealized P&L (before fees)
+        pnl_before_fees = (current_price - entry_price) * quantity
+        pnl_before_fees_pct = (
+            ((current_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
+        )
+
+        # P&L after fees
+        # Formula: (current_price * (1 - fee_pct) - entry_price * (1 + fee_pct)) * qty
+        # Simplified: sell_value = qty * current_price * (1 - fee_pct)
+        #            cost_basis = qty * entry_price * (1 + fee_pct)
+        sell_value = quantity * current_price * (1.0 - fee_pct / 2.0)  # 0.1% sell fee
+        cost_basis = quantity * entry_price * (1.0 + fee_pct / 2.0)  # 0.1% buy fee already paid
+        pnl_after_fees = sell_value - cost_basis
+        pnl_after_fees_pct = (pnl_after_fees / cost_basis * 100.0) if cost_basis > 0 else 0.0
+
+        # Gate: Only sell if profitable after fees
+        if pnl_after_fees <= 0:
+            logger.debug(
+                f"🚫 SELL skipped {symbol}: unprofitable after fees. "
+                f"Entry={entry_price:.4f}, Current={current_price:.4f}, "
+                f"P&L before fees: {pnl_before_fees_pct:.2f}%, "
+                f"P&L after fees: {pnl_after_fees_pct:.2f}%"
+            )
+            return None
+
+        # Step 4: Build SELL decision
+        decision = {
+            "symbol": symbol,
+            "action": "SELL",
+            "quantity": quantity,
+            "price_target": current_price,
+            "stop_loss": None,
+            "take_profit": None,
+            "reason": f"SELL {source} @ {current_price:.4f} (entry={entry_price:.4f}, "
+            f"profit={pnl_after_fees:.2f} USDT, {pnl_after_fees_pct:.2f}% after fees)",
+            "confidence": max(0.5, abs(edge_score)),  # At least 50% confidence since profitable
+            "timestamp": asyncio.get_event_loop().time(),
+            "mode": await DecisionEngineImpl.get_current_mode(app_ctx),
+        }
+
+        logger.info(
+            f"✅ SELL decision: {symbol} x{quantity:.4f} @ {current_price:.4f} "
+            f"(profit={pnl_after_fees:.2f} USDT, {pnl_after_fees_pct:.2f}% after fees)"
+        )
+        return decision
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SAFE_EXECUTION_ENGINE IMPLEMENTATIONS

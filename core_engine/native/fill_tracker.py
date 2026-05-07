@@ -204,6 +204,18 @@ class NativeFillTracker:
                 current=fill.price,
             )
 
+        # Track fee in basis points (1 bps = 0.01%)
+        quote_value = fill.quantity * fill.price
+        fee_bps = (fill.commission / quote_value * 10000.0) if quote_value > 0 else 0.0
+
+        # Update metrics
+        if hasattr(self._shared_state, "metrics"):
+            m = self._shared_state.metrics
+            # Rolling average of fee (exponential moving average)
+            prev_avg_fee = m.get("avg_fee_bps", 0.0)
+            m["avg_fee_bps"] = prev_avg_fee * 0.9 + fee_bps * 0.1
+            m["last_update_ts"] = time.time()
+
         # Emit event
         await self._emit_fill_event(
             fill_type="BUY_FILLED",
@@ -214,11 +226,12 @@ class NativeFillTracker:
         )
 
         logger.info(
-            "[BUY_FILLED] %s qty=%.8f price=%.8f commission=%.8f",
+            "[BUY_FILLED] %s qty=%.8f price=%.8f commission=%.8f fee_bps=%.2f",
             sym,
             fill.quantity,
             fill.price,
             fill.commission,
+            fee_bps,
         )
 
     async def _process_sell_fill(self, fill: Fill) -> None:
@@ -269,22 +282,30 @@ class NativeFillTracker:
         if hasattr(self._shared_state, "append_trade_record"):
             self._shared_state.append_trade_record(sym, record)
 
+        # Track fee in basis points
+        quote_value = fill.quantity * fill.price
+        fee_bps = (fill.commission / quote_value * 10000.0) if quote_value > 0 else 0.0
+
         # Update metrics for ObjectiveFeedbackController
         if hasattr(self._shared_state, "metrics"):
             m = self._shared_state.metrics
             m["realized_pnl"] = m.get("realized_pnl", 0.0) + realized_pnl
             m["trades_in_window"] = m.get("trades_in_window", 0) + 1
             m["last_update_ts"] = time.time()
+            # Rolling average of fee (exponential moving average)
+            prev_avg_fee = m.get("avg_fee_bps", 0.0)
+            m["avg_fee_bps"] = prev_avg_fee * 0.9 + fee_bps * 0.1
             # Rolling win_rate using exponential moving average
             prev_wr = m.get("win_rate_window", 0.5)
             m["win_rate_window"] = prev_wr * 0.9 + (1.0 if realized_pnl > 0 else 0.0) * 0.1
 
         logger.info(
-            "[SELL_FILLED] %s qty=%.8f price=%.8f commission=%.8f pnl=%.8f",
+            "[SELL_FILLED] %s qty=%.8f price=%.8f commission=%.8f fee_bps=%.2f pnl=%.8f",
             sym,
             fill.quantity,
             fill.price,
             fill.commission,
+            fee_bps,
             realized_pnl,
         )
 

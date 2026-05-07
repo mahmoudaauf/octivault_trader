@@ -93,10 +93,11 @@ class NativeDecisionEngine:
         kelly_fraction: float = 0.25,
         max_position_size_pct: float = 5.0,
         max_concurrent_positions: int = 10,
-        min_order_usdt: float = 10.0,
+        min_order_usdt: float = 1.0,
         max_drawdown_pct: float = 10.0,
         daily_loss_limit_pct: float = 5.0,
-        risk_per_symbol_pct: float = 2.0,
+        risk_per_symbol_pct: float = 20.0,
+        min_notional_usdt: float = 10.0,
     ) -> None:
         self.kelly_fraction = max(0.0, min(1.0, float(kelly_fraction)))
         self.max_position_size_pct = max(0.1, float(max_position_size_pct))
@@ -105,6 +106,7 @@ class NativeDecisionEngine:
         self.max_drawdown_pct = max(0.0, float(max_drawdown_pct))
         self.daily_loss_limit_pct = max(0.0, float(daily_loss_limit_pct))
         self.risk_per_symbol_pct = max(0.1, float(risk_per_symbol_pct))
+        self.min_notional_usdt = max(0.0, float(min_notional_usdt))
 
     # ──────────────────────────────────────────────────────────────────
     # Main API
@@ -143,6 +145,14 @@ class NativeDecisionEngine:
             if len([d for d in decisions if d.action == Action.OPEN]) >= space_available:
                 break
             qty = self._size_new_position(sym, sig, balance_usdt, portfolio)
+            logger.info(
+                "🎯 Size %s: score=%.2f qty=%.6f (min=%.2f bal=%.2f)",
+                sym,
+                sig.get("score", 0.0),
+                qty,
+                self.min_order_usdt,
+                balance_usdt,
+            )
             if qty > 0:
                 decisions.append(
                     Decision(
@@ -225,11 +235,9 @@ class NativeDecisionEngine:
         if position_usd < self.min_order_usdt:
             return 0.0
 
-        # Convert USD to base-asset quantity (mock: assume 1 USDT per base-unit).
-        # In production, fetch current market price from L2.
-        # For this implementation, we return the USD amount as a placeholder qty.
-        qty = position_usd / max(1.0, portfolio.balance.get("USDT", 1.0))
-        return max(0.0, qty)
+        # Return USD allocation directly (actual price conversion happens in executor)
+        # This allows capital_allocator and executor to use current market prices
+        return max(0.0, position_usd)
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers

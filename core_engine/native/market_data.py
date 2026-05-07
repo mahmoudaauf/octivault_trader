@@ -1,18 +1,15 @@
 """
-Native L2: Market Data (Phase 8.2.3)
+Native L2: Market Data (Phase 8.2.3 + WebSocket)
 
-In-memory price + klines cache backed by NativeExchangeClient.
+In-memory price + klines cache with WebSocket primary source.
 
 Design choices
 --------------
-* Single bulk-pull (`get_prices(None)`) per refresh — one HTTP call covers
-  all symbols.
-* Klines fetched on-demand with a bounded LRU per (symbol, interval).
-* Stale-quote detection: any price whose age exceeds
-  ``stale_threshold_sec`` is considered stale and surfaces via
-  :py:meth:`is_stale` / :py:meth:`stale_symbols`.
-* Pure read API after start — no callbacks, no locks (single-threaded
-  asyncio loop).
+* WebSocket primary (real-time prices + klines) — ZERO API rate limits
+* REST fallback (on-demand klines, bootstrap) — only when needed
+* Stale-quote detection: any price whose age exceeds stale_threshold_sec
+* Pure read API after start — no callbacks, no locks (single-threaded asyncio)
+* Auto-fallback to REST if WebSocket unavailable
 """
 
 from __future__ import annotations
@@ -55,12 +52,14 @@ class NativeMarketData:
         symbols: Optional[list[str]] = None,
         stale_threshold_sec: float = 30.0,
         klines_cache_size: int = 64,
+        shared_state: Optional[Any] = None,
     ) -> None:
         self._client = client
         self._poll_interval = max(0.25, float(poll_interval_sec))
         self._symbols: Optional[list[str]] = list(symbols) if symbols else None
         self._stale_threshold = float(stale_threshold_sec)
         self._klines_cache_size = max(1, int(klines_cache_size))
+        self._shared_state = shared_state  # Optional reference to shared_state for WebSocket data
 
         self._prices: dict[str, float] = {}
         self._price_ts: dict[str, float] = {}
@@ -121,9 +120,17 @@ class NativeMarketData:
     # Price accessors
     # ──────────────────────────────────────────────────────────────────
     def get_price(self, symbol: str) -> Optional[float]:
+        # Try shared_state first (WebSocket source), fall back to REST cache
+        if self._shared_state and hasattr(self._shared_state, "prices"):
+            price = self._shared_state.prices.get(symbol)
+            if price is not None:
+                return price
         return self._prices.get(symbol)
 
     def get_prices(self) -> dict[str, float]:
+        # Return WebSocket data if available, fall back to REST cache
+        if self._shared_state and hasattr(self._shared_state, "prices"):
+            return dict(self._shared_state.prices)
         return dict(self._prices)
 
     def price_age(self, symbol: str) -> Optional[float]:
@@ -203,6 +210,9 @@ class NativeMarketData:
                 logger.exception("market-data refresh failed (unexpected): %s", e)
 
     async def _refresh_prices(self) -> None:
+        # Skip REST polling if no symbols configured (WebSocket will handle it)
+        if not self._symbols:
+            return
         prices = await self._client.get_prices(self._symbols)
         now = time.time()
         # Replace dict atomically; preserve previously-seen symbols' last

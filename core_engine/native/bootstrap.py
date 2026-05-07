@@ -108,6 +108,7 @@ class BootstrapConfig:
     daily_loss_limit_pct: float = 5.0
     risk_per_symbol_pct: float = 20.0  # Increased from 2.0: micro accounts need higher per-symbol allocation to generate trades
     capital_allocation_pct: float = 5.0
+    default_planned_quote: float = 12.0  # Fixed quote per trade for small accounts (like legacy system). Autonomously scales with equity growth.
 
     # --- exit logic (TP/SL) ---
     tp_pct: float = 0.03  # +3% take profit
@@ -181,6 +182,7 @@ class BootstrapConfig:
             daily_loss_limit_pct=_float(e.get("DAILY_LOSS_LIMIT_PCT"), 5.0),
             risk_per_symbol_pct=_float(e.get("RISK_PER_SYMBOL_PCT"), 20.0),
             capital_allocation_pct=_float(e.get("CAPITAL_ALLOCATION_PCT"), 5.0),
+            default_planned_quote=_float(e.get("DEFAULT_PLANNED_QUOTE"), 12.0),
             tp_pct=_float(e.get("TP_PCT"), 0.03),
             sl_pct=_float(e.get("SL_PCT"), 0.02),
             signal_cooldown_sec=_float(e.get("SIGNAL_COOLDOWN_SEC"), 0.0),
@@ -293,6 +295,60 @@ def _make_portfolio_accessor(
     return _accessor
 
 
+async def _fetch_symbol_filters_batch(
+    exchange_client: NativeExchangeClient,
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    """
+    Fetch and cache Binance symbol filters for a batch of symbols.
+    Returns dict[symbol] -> {min_notional, step_size}.
+    Errors are logged but don't block; returns partial results.
+    """
+    filters_cache: dict[str, dict[str, Any]] = {}
+    if not symbols:
+        return filters_cache
+
+    try:
+        exchange_info = await exchange_client.get_exchange_info()
+        symbol_data = {s["symbol"]: s for s in exchange_info.get("symbols", [])}
+
+        for symbol in symbols:
+            try:
+                sym_info = symbol_data.get(symbol, {})
+                filters = sym_info.get("filters", [])
+
+                min_notional = 10.0
+                step_size = 0.00000001
+
+                for f in filters:
+                    if f.get("filterType") == "MIN_NOTIONAL":
+                        min_notional = float(f.get("minNotional", 10.0))
+                    elif f.get("filterType") == "LOT_SIZE":
+                        step_size = float(f.get("stepSize", 0.00000001))
+
+                filters_cache[symbol] = {
+                    "min_notional": min_notional,
+                    "step_size": step_size,
+                }
+                logger.debug(
+                    "📊 %s filters: min_notional=%.2f step_size=%.8f",
+                    symbol,
+                    min_notional,
+                    step_size,
+                )
+            except Exception as e:
+                logger.warning("Failed to fetch filters for %s: %s", symbol, e)
+                # Use defaults
+                filters_cache[symbol] = {
+                    "min_notional": 10.0,
+                    "step_size": 0.00000001,
+                }
+    except Exception as e:
+        logger.warning("Failed to fetch exchange info: %s (will use defaults)", e)
+
+    return filters_cache
+
+
 async def build_components(
     cfg: BootstrapConfig,
     *,
@@ -353,14 +409,51 @@ async def build_components(
         cfg.balance_poll_sec,
     )
 
-    # L2
+    # L2: Market data with WebSocket primary (zero rate limits)
     market_data = NativeMarketData(
         exchange_client,
         poll_interval_sec=cfg.market_data_poll_sec,
         symbols=symbols,  # May be empty; will be updated per-cycle
         stale_threshold_sec=cfg.stale_threshold_sec,
         klines_cache_size=cfg.klines_cache_size,
+        shared_state=shared_state,  # Read prices from WebSocket if available
     )
+
+    # L2: Optional WebSocket for real-time prices + klines (bypasses API rate limits)
+    # When available, WebSocket feeds market_data.prices and market_data.market_data
+    # When unavailable, REST polling serves as fallback
+    market_data_ws = None
+    if cfg.testnet is False:  # Only for live (not testnet)
+        # Start with current symbols, or popular defaults for symbol discovery
+        ws_symbols = (
+            symbols
+            if symbols
+            else [
+                "BTCUSDT",
+                "ETHUSDT",
+                "BNBUSDT",
+                "SOLUSDT",
+                "XRPUSDT",
+                "ADAUSDT",
+                "DOGEUSDT",
+                "AVAXUSDT",
+                "LUNCUSDT",
+                "PEPEUSDT",
+            ]
+        )
+        try:
+            from core_engine.native.market_data_websocket import NativeMarketDataWebSocket
+
+            market_data_ws = NativeMarketDataWebSocket(
+                exchange_client=exchange_client,
+                shared_state=shared_state,
+                symbols=ws_symbols,
+                timeframes=["1m"],
+            )
+            logger.info(f"✅ WebSocket market data initialized ({len(ws_symbols)} symbols)")
+        except Exception as e:
+            logger.warning(f"⚠️ WebSocket initialization failed: {e} (will use REST fallback)")
+            market_data_ws = None
 
     # L3 fill tracker: detect fills and update positions
     fill_tracker = NativeFillTracker(
@@ -429,15 +522,26 @@ async def build_components(
         else None
     )
 
+    # Pre-fetch symbol filters from Binance and inject into capital allocator
+    # This ensures allocator has real step-sizes for each symbol, not just conservative defaults
+    logger.info("📊 Fetching symbol filters from Binance (up to %d symbols)...", len(symbols))
+    symbol_filters = await _fetch_symbol_filters_batch(exchange_client, symbols)
+    logger.info("✅ Fetched filters for %d symbols", len(symbol_filters))
+
     # L6 capital allocator: allocates trading capital per buy signal
-    # Wired with ACE for adaptive sizing + OFC runtime_overrides
+    # Hybrid strategy: fixed quote for small accounts (<$100), % for larger
+    # This matches legacy system's autonomous scaling behavior
     capital_allocator = NativeCapitalAllocator(
         portfolio_manager=portfolio_manager,
         market_data=market_data,
         allocation_pct=cfg.capital_allocation_pct,
         adaptive_engine=ace,
         shared_state=shared_state,
+        exchange_client=exchange_client,
+        default_planned_quote=cfg.default_planned_quote,
     )
+    # Inject pre-fetched filters so allocator can use real step-sizes immediately
+    capital_allocator._symbol_filters_cache = symbol_filters
 
     # L3 position manager: read-only per-symbol accessor over
     # shared_state. Replaces the compat null-stub for the
@@ -522,6 +626,7 @@ async def build_components(
         adaptive_capital_engine=ace,
         objective_feedback_controller=ofc,
         symbol_discovery=symbol_discoverer,
+        market_data_ws=market_data_ws,
     )
 
 
@@ -541,8 +646,13 @@ async def shutdown_components(components: NativeComponents) -> None:
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("native shutdown: telemetry_exporter.stop() raised: %r", e)
 
-    # market data + balance sync + fill tracker own background tasks
-    for comp in (components.market_data, components.balance_sync, components.fill_tracker):
+    # market data + market_data_ws + balance sync + fill tracker own background tasks
+    for comp in (
+        components.market_data,
+        components.market_data_ws,
+        components.balance_sync,
+        components.fill_tracker,
+    ):
         if comp is None:
             continue
         try:

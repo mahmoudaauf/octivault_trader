@@ -91,6 +91,13 @@ class NativePositionManager:
             return None
         return pos
 
+    async def get_position_quantity(self, symbol: str) -> float:
+        """Return the quantity of an open position, or 0.0 if no position exists."""
+        pos = await self.get_position(symbol)
+        if pos is None:
+            return 0.0
+        return float(getattr(pos, "qty", 0.0) or 0.0)
+
     async def analyze_position(self, symbol: str) -> dict[str, Any]:
         """
         Return a stable risk-tagged snapshot for *symbol*.

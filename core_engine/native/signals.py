@@ -372,11 +372,13 @@ class NativeSignalEngine:
         signals = []
 
         if not market_data:
+            logger.debug("❌ evaluate_with_market_data: no market_data provided")
             return signals
 
         # Get the internal klines cache (OrderedDict with key=(symbol, interval, limit))
         klines_cache = getattr(market_data, "_klines", {})
         if not klines_cache:
+            logger.debug("❌ evaluate_with_market_data: _klines cache is empty or missing")
             return signals
 
         # Collect unique symbols from cache keys
@@ -421,4 +423,7 @@ class NativeSignalEngine:
                 }
             )
 
+        logger.info(
+            f"✅ evaluate_with_market_data: found {len(signals)} signals from {len(eval_symbols)} symbols"
+        )
         return signals

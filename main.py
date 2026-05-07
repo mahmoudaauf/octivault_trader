@@ -121,10 +121,13 @@ class Engines:
 # ════════════════════════════════════════════════════════════════════════
 # Trading cycle — the canonical 5-phase pattern via façade engines
 # ════════════════════════════════════════════════════════════════════════
-async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
+async def trading_cycle(
+    engines: Engines, mode: str, app_ctx: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """
     One full trading cycle via the 5 core engines. ONLY calls façade methods.
 
+    PHASE 0: DISCOVER    — Scan wallet and update symbols (optional, per-cycle)
     PHASE 1: READ        — Fetch market data and account state
     PHASE 2: UNDERSTAND  — Analyze portfolio and market regime
     PHASE 3: DECIDE      — Generate trading decisions
@@ -132,6 +135,26 @@ async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
     PHASE 5: RECOVER     — Monitor health and log events
     """
     cycle_start = time.perf_counter()
+
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE 0: DISCOVER (optional symbol discovery per cycle)
+    # ──────────────────────────────────────────────────────────────────
+    if app_ctx:
+        native_orch = app_ctx.get("_native_orchestrator")
+        if native_orch and hasattr(native_orch, "_symbol_discovery"):
+            symbol_discovery = native_orch._symbol_discovery
+            if symbol_discovery:
+                try:
+                    symbols = await symbol_discovery.discover()
+                    if symbols and hasattr(native_orch, "_market_data"):
+                        md = native_orch._market_data
+                        if md and hasattr(md, "_symbols"):
+                            current = md._symbols or []
+                            if sorted(symbols) != sorted(current):
+                                md._symbols = symbols
+                                log.info(f"📱 Symbols discovered: {current} → {symbols}")
+                except Exception as e:
+                    log.debug(f"Phase 0 discovery failed: {e}")
 
     # ──────────────────────────────────────────────────────────────────
     # PHASE 1: READ
@@ -164,16 +187,23 @@ async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
         symbol = get_value(sig, "symbol", "")
         edge_score = get_value(sig, "edge_score", 0.0)
 
-        if sig_type == "BUY":
-            decision = await engines.decision.make_buy_decision(
-                symbol=symbol, edge_score=edge_score
-            )
-        elif sig_type == "SELL":
-            decision = await engines.decision.make_sell_decision(
-                symbol=symbol, edge_score=edge_score, reason="signal"
-            )
-        if decision:
-            trading_decisions.append(decision)
+        try:
+            if sig_type == "BUY" and app_ctx:
+                # Use DecisionEngineImpl static methods via app_ctx
+                from core_engine.implementations import DecisionEngineImpl
+
+                decision = await DecisionEngineImpl.make_buy_decision(app_ctx, symbol, edge_score)
+            elif sig_type == "SELL" and app_ctx:
+                # Use DecisionEngineImpl static methods via app_ctx
+                from core_engine.implementations import DecisionEngineImpl
+
+                decision = await DecisionEngineImpl.make_sell_decision(
+                    app_ctx, symbol, edge_score, "signal"
+                )
+            if decision:
+                trading_decisions.append(decision)
+        except Exception as e:
+            log.debug(f"Decision failed for {symbol}: {e}")
     decide_complete = True
 
     # ──────────────────────────────────────────────────────────────────
@@ -192,13 +222,15 @@ async def trading_cycle(engines: Engines, mode: str) -> dict[str, Any]:
                 order_result = await engines.execution.place_buy_order(
                     symbol=symbol,
                     quantity=quantity,
-                    price=price_target,
+                    price=price_target if (price_target and price_target > 0) else None,
+                    order_type="MARKET",
                 )
             elif action == "SELL":
                 order_result = await engines.execution.place_sell_order(
                     symbol=symbol,
                     quantity=quantity,
-                    price=price_target,
+                    price=price_target if (price_target and price_target > 0) else None,
+                    order_type="MARKET",
                 )
             if order_result:
                 executed_orders.append(order_result)
@@ -316,7 +348,7 @@ async def run(args: argparse.Namespace) -> int:
 
             cycle_no += 1
             try:
-                telem = await trading_cycle(engines, args.mode)
+                telem = await trading_cycle(engines, args.mode, app_ctx)
                 phases = "".join(
                     [
                         "R" if telem["read_phase_ok"] else "✗",

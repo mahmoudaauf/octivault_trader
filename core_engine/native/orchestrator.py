@@ -81,6 +81,8 @@ class NativeOrchestrator:
         objective_feedback_controller: Any
         | None = None,  # ObjectiveFeedbackController (OFC, optional)
         symbol_discovery: Any | None = None,  # NativeSymbolDiscovery (optional)
+        market_data_ws: Any
+        | None = None,  # NativeMarketDataWebSocket (optional, zero API rate limits)
     ) -> None:
         self._market_data = market_data
         self._signal_engine = signal_engine
@@ -94,6 +96,7 @@ class NativeOrchestrator:
         self._fill_tracker = fill_tracker
         self._ofc = objective_feedback_controller
         self._symbol_discovery = symbol_discovery
+        self._market_data_ws = market_data_ws
 
         self._cycle_count = 0
         self._stopped = True  # Use bool flag instead of asyncio.Event
@@ -108,14 +111,20 @@ class NativeOrchestrator:
         # Initialize session start time for OFC elapsed calculation
         if self._shared_state:
             self._shared_state._session_start_ts = time.time()
-            self._shared_state.session_anchor_nav = 0.0
+            # session_anchor_nav will be set on first _phase_read when balance is available
 
         await self._market_data.start()
+        if self._market_data_ws is not None:
+            await self._market_data_ws.start()
         await self._balance_sync.start()
         if self._fill_tracker is not None:
             await self._fill_tracker.start()
         if self._ofc is not None:
             await self._ofc.start()
+
+        # Wait for initial data to be available (up to 5 seconds)
+        # Ensures market_data and balance_sync have fetched at least once
+        await self._wait_for_initial_data(max_wait_sec=5.0)
 
     async def stop(self) -> None:
         """Graceful shutdown."""
@@ -124,6 +133,8 @@ class NativeOrchestrator:
             await self._ofc.stop()
         if self._fill_tracker is not None:
             await self._fill_tracker.stop()
+        if self._market_data_ws is not None:
+            await self._market_data_ws.stop()
         await self._market_data.stop()
         await self._balance_sync.stop()
 
@@ -175,7 +186,12 @@ class NativeOrchestrator:
         try:
             # Phase 0: DISCOVER (optional symbol discovery per cycle)
             if self._symbol_discovery:
+                logger.debug("📍 CYCLE %d: Phase 0 DISCOVER starting", self._cycle_count)
                 await self._phase_discover()
+            else:
+                logger.debug(
+                    "📍 CYCLE %d: Phase 0 DISCOVER skipped (no symbol_discovery)", self._cycle_count
+                )
 
             # Phase 1: READ
             t0 = time.time()
@@ -251,24 +267,42 @@ class NativeOrchestrator:
                 # Update market data symbols if changed
                 current_symbols = self._market_data._symbols
                 if sorted(symbols) != sorted(current_symbols or []):
-                    logger.info("📱 Symbols updated: %s → %s", current_symbols, symbols)
+                    logger.info("📱 Symbols discovered: %s → %s", current_symbols, symbols)
                     self._market_data._symbols = symbols
+                    # Subscribe to new symbols in WebSocket if available
+                    if self._market_data_ws:
+                        await self._market_data_ws.subscribe(symbols)
+            elif not symbols:
+                logger.warning("⚠️ Symbol discovery returned empty list (wallet empty?)")
         except Exception as e:
-            logger.warning("Symbol discovery failed: %s (will retry next cycle)", e)
+            logger.exception("Symbol discovery failed: %s (will retry next cycle)", e)
 
     async def _phase_read(self) -> None:
         """Phase 1: Fetch latest market data. Sync balances."""
         # Market data is background-polled by NativeMarketData.
         # Balance sync is background-polled by NativeBalanceSync.
         # This phase is a no-op in the async model; data is always current.
-        pass
+
+        # Initialize session_anchor_nav on first cycle with real balance
+        if self._shared_state:
+            balance_usdt = self._balance_sync.get_balance().get("USDT", 0.0)
+            if balance_usdt > 0:
+                # Set NAV (used by capital allocator, OFC, ACE)
+                self._shared_state.update_nav(balance_usdt)
+                # Set anchor on first cycle (OFC needs this for pace calculation)
+                if self._shared_state.session_anchor_nav <= 0:
+                    self._shared_state.session_anchor_nav = balance_usdt
+                    logger.info("📊 Session anchor NAV set: %.2f USDT", balance_usdt)
 
     async def _phase_understand(self) -> dict[str, Any]:
         """Phase 2: Generate signals from market data."""
         # Fetch current prices from L2
         prices = self._market_data.get_prices()
         if not prices:
+            logger.debug("⚠️ No prices available from market_data.get_prices()")
             return {}
+
+        logger.debug(f"🔍 Phase 2: Evaluating {len(prices)} symbols for signals")
 
         # For each symbol, fetch klines and evaluate signals
         signals_by_symbol: dict[str, Any] = {}
@@ -283,7 +317,7 @@ class NativeOrchestrator:
                         "contributions": agg_sig.contributions,
                     }
             except Exception as e:  # pragma: no cover
-                logger.warning("signal generation failed for %s: %s", symbol, e)
+                logger.debug(f"signal generation failed for {symbol}: {e}")
 
         return signals_by_symbol
 
@@ -308,17 +342,6 @@ class NativeOrchestrator:
                 len(sell_sigs),
                 balance_usdt,
             )
-
-        # Update SharedState with current NAV (critical for capital allocator)
-        if self._shared_state:
-            if hasattr(self._shared_state, "update_nav"):
-                self._shared_state.update_nav(balance_usdt)
-
-            # Set session anchor NAV on first cycle with data
-            session_anchor = getattr(self._shared_state, "session_anchor_nav", 0.0)
-            if session_anchor <= 0 and balance_usdt > 0:
-                if hasattr(self._shared_state, "session_anchor_nav"):
-                    self._shared_state.session_anchor_nav = balance_usdt
 
             # Gate: check if trading is halted by ObjectiveFeedbackController
             if getattr(self._shared_state, "trading_halted", False):
@@ -357,3 +380,45 @@ class NativeOrchestrator:
             # Session elapsed time
             elapsed_s = time.time() - getattr(self._shared_state, "_session_start_ts", time.time())
             m["session_elapsed_h"] = elapsed_s / 3600.0
+
+    # ──────────────────────────────────────────────────────────────────
+    # Initialization helpers
+    # ──────────────────────────────────────────────────────────────────
+    async def _wait_for_initial_data(self, max_wait_sec: float = 5.0) -> None:
+        """
+        Wait for market_data and balance_sync to fetch initial data.
+
+        Polls both systems and returns once they have data, or after timeout.
+        This ensures the first trading cycle doesn't see zero NAV/prices.
+        """
+        import asyncio as aio
+
+        start = time.time()
+        while (time.time() - start) < max_wait_sec:
+            has_prices = False
+            has_balance = False
+
+            # Check market_data has prices
+            if self._market_data and hasattr(self._market_data, "get_prices"):
+                prices = self._market_data.get_prices()
+                has_prices = len(prices) > 0 if prices else False
+
+            # Check balance_sync has balance
+            if self._balance_sync and hasattr(self._balance_sync, "get_balance"):
+                balance = self._balance_sync.get_balance()
+                has_balance = bool(balance and balance.get("USDT", 0) > 0)
+
+            if has_prices and has_balance:
+                logger.info(
+                    f"✅ Initial data ready (prices={len(prices)} symbols, balance=%.2f USDT)",
+                    balance.get("USDT", 0.0),
+                )
+                return
+
+            # Wait a bit and retry
+            await aio.sleep(0.1)
+
+        logger.warning(
+            f"⚠️  Timeout waiting for initial data (waited {max_wait_sec}s). "
+            f"Trading may start with zero NAV/prices."
+        )

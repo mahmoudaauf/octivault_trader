@@ -122,6 +122,7 @@ class NativeComponents:
     adaptive_capital_engine: Any | None = None  # NativeAdaptiveCapitalEngine | None
     objective_feedback_controller: Any | None = None  # NativeObjectiveFeedbackController | None
     symbol_discovery: Any | None = None  # NativeSymbolDiscovery | None
+    market_data_ws: Any | None = None  # NativeMarketDataWebSocket | None (zero API rate limits)
 
 
 def build_native_app_ctx(
@@ -167,6 +168,7 @@ def build_native_app_ctx(
         fill_tracker=components.fill_tracker,
         objective_feedback_controller=components.objective_feedback_controller,
         symbol_discovery=components.symbol_discovery,
+        market_data_ws=components.market_data_ws,
     )
 
     app_ctx: dict[str, Any] = {
