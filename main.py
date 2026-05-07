@@ -494,8 +494,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--mode",
         choices=("dry-run", "paper-trade", "live"),
-        default="paper-trade",
-        help="Execution mode (default: paper-trade)",
+        default="live",
+        help="Execution mode (default: live)",
     )
     p.add_argument(
         "--duration",

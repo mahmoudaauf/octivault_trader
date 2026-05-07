@@ -57,9 +57,7 @@ class PaperModeSignalGenerator:
             enabled,
         )
 
-    async def generate_signals(
-        self, shared_state: Any | None = None
-    ) -> list[dict[str, Any]]:
+    async def generate_signals(self, shared_state: Any | None = None) -> list[dict[str, Any]]:
         """
         Generate synthetic trading signals.
 
@@ -72,15 +70,16 @@ class PaperModeSignalGenerator:
         signals: list[dict[str, Any]] = []
         now = time.time()
 
-        # Generate signals for 30% of symbols (2-3 per cycle on average)
-        # This gives a realistic signal flow without overwhelming the system
-        num_signals = max(1, random.randint(0, len(self.symbols)) // 3)
+        # Generate signals for 20% of symbols (2 per cycle on average for 10 symbols)
+        # Reduced from 50% to avoid rate-limiting on startup. Binance enforces
+        # strict cooldown on signed requests; multiple orders trigger 15s+ blocking.
+        num_signals = max(1, len(self.symbols) // 5)
         selected_symbols = random.sample(self.symbols, min(num_signals, len(self.symbols)))
 
         for symbol in selected_symbols:
-            # Rate limit: don't generate for the same symbol too frequently
+            # Rate limit: don't generate for the same symbol too frequently (1 sec for paper mode)
             last_ts = self._last_signal_ts.get(symbol, 0.0)
-            if now - last_ts < 5.0:  # At least 5 seconds between signals per symbol
+            if now - last_ts < 1.0:  # At least 1 second between signals per symbol
                 continue
 
             # Random action: 60% BUY, 40% SELL (bias toward buying during growth phase)
@@ -95,7 +94,10 @@ class PaperModeSignalGenerator:
             signal = {
                 "symbol": symbol,
                 "action": action,
+                "signal_type": action,  # BUY or SELL
                 "confidence": confidence,
+                "edge_score": confidence,  # Use confidence as edge_score for decision engine
+                "edge": confidence,  # Legacy field for fallback
                 "quote": quote,
                 "timestamp": now,
                 "source": "PaperModeSignalGenerator",

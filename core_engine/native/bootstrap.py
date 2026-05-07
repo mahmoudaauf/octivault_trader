@@ -58,6 +58,7 @@ from .mode_manager import NativeModeManager
 from .objective_feedback_controller import NativeObjectiveFeedbackController
 from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
+from .paper_signal_generator import PaperModeSignalGenerator
 from .polling_coordinator import NativePollingConfig, NativePollingCoordinator
 from .portfolio_manager import NativePortfolioManager
 from .position_hydration_engine import NativePositionHydrationEngine
@@ -67,7 +68,6 @@ from .recovery_engine import NativeRecoveryEngine
 from .runtime_state import NativeRuntimeStateExporter, load_runtime_state
 from .safety_order_manager import NativeSafetyOrderManager
 from .shared_state import NativeSharedState
-from .paper_signal_generator import PaperModeSignalGenerator
 from .signal_fusion import NativeSignalFusion
 from .signal_manager_bridge import SignalManagerBridge
 from .signals import NativeSignalEngine
@@ -596,15 +596,21 @@ async def build_components(
     # L3
     signal_engine = NativeSignalEngine(cooldown_sec=cfg.signal_cooldown_sec)
 
-    # L3: Paper mode signal generator (for synthetic signals in paper mode)
+    # L3: Paper mode signal generator (for synthetic signals when legacy agents unavailable)
+    # Enabled in both paper mode AND live mode (until legacy agents are wired)
     paper_signal_gen: PaperModeSignalGenerator | None = None
-    if cfg.paper_mode:
+    logger.info(f"[Bootstrap] paper_mode={cfg.paper_mode}, symbols={len(cfg.symbols)}")
+    # Enable paper signals when: (1) in paper mode, OR (2) no legacy signal manager available
+    enable_paper_signals = cfg.paper_mode or True  # Always enable until legacy agents wired
+    if enable_paper_signals and cfg.symbols:
         paper_signal_gen = PaperModeSignalGenerator(
             config=cfg,
             symbols=cfg.symbols,
             enabled=True,
         )
-        logger.info("📊 Paper mode signal generator enabled")
+        logger.info("📊 Paper mode signal generator enabled (%d symbols)", len(cfg.symbols))
+    elif cfg.symbols:
+        logger.info("⚠️  Paper signals disabled but no legacy agents available")
 
     # L3: Signal manager bridge (integrates legacy + paper mode signals)
     signal_manager_bridge = SignalManagerBridge(

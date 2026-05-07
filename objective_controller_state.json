@@ -1,5 +1,5 @@
 {
-  "last_action_ts": 1778172538.7212899,
+  "last_action_ts": 1778174043.521396,
   "integral_pace": -0.08333333333333334,
   "consecutive_dd_breaches": 0,
   "last_knobs": {
@@ -9,12 +9,12 @@
   },
   "history_tail": [
     {
-      "ts": 1778172538.7212899,
+      "ts": 1778174043.521396,
       "telemetry": {
         "ok": true,
         "age_s": 0.0,
-        "nav": 1000.0,
-        "nav_anchor": 1000.0,
+        "nav": 1.0,
+        "nav_anchor": 1.0,
         "realized_pnl": 0.0,
         "unrealized_pnl": 0.0,
         "drawdown_pct": 0.0,

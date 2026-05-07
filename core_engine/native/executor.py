@@ -130,11 +130,9 @@ class NativeExecutor:
             symbol=symbol,
             action=Action.OPEN if str(action).upper() == "BUY" else Action.CLOSE,
             quantity=float(quantity or 0.0),
-            rationale=f"facade_{str(action).lower()}",
+            reason=f"facade_{str(action).lower()}",
+            risk_score=0.5,
         )
-        if price is not None:
-            decision.meta["price_target"] = float(price)
-        decision.meta["order_type"] = order_type
 
         results = await self.execute([decision])
         if not results:
@@ -451,8 +449,8 @@ class NativeExecutor:
     def _classify_error(error_msg: str) -> ExecutionStatus:
         """Classify an error as retryable or terminal."""
         error_lower = error_msg.lower()
-        # Retryable: rate limit, network, timeout
-        if any(x in error_lower for x in ["429", "timeout", "network", "503", "502"]):
+        # Retryable: rate limit, network, timeout, cooldown
+        if any(x in error_lower for x in ["429", "timeout", "network", "503", "502", "cooldown"]):
             return ExecutionStatus.RETRYABLE
         # Terminal: invalid request, insufficient balance, etc.
         if any(x in error_lower for x in ["insufficient", "invalid", "rejected"]):
