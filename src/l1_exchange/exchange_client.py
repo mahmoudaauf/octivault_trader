@@ -3962,8 +3962,9 @@ class ExchangeClient:
         self.logger.debug(f"[EC:Balances] paper_trade={self.paper_trade}, testnet={self.testnet}")
 
         if self.paper_trade and not self.testnet:
-            self.logger.debug("[EC] Paper simulation: returning empty balances")
-            return {}
+            # Paper mode: return simulated $1000 USDT balance
+            self.logger.debug("[EC] Paper simulation: returning $1000 USDT balance")
+            return {"USDT": {"free": 1000.0, "locked": 0.0}}
 
         now = time.time()
         # Shared cache path for full account snapshot.
