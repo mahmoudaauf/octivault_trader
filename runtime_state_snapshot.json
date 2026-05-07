@@ -25,13 +25,13 @@
     "invested_capital_usdt": 0.0,
     "nav_usdt": 1.0,
     "session_anchor_nav": 1.0,
-    "ts": 1778175894.728292
+    "ts": 1778176171.102737
   },
   "metrics": {
     "avg_fee_bps": 0.0,
     "avg_net_profit_bps": 0.0,
     "avg_slippage_bps": 0.0,
-    "last_hydration_time": 0.06475305557250977,
+    "last_hydration_time": 0.7857720851898193,
     "last_update_ts": 0.0,
     "peak_nav": 0.0,
     "portfolio_value": 0,
@@ -46,5 +46,5 @@
   "positions": {},
   "prices": {},
   "session_anchor_nav": 1.0,
-  "ts": 1778175894.728292
+  "ts": 1778176171.102737
 }
