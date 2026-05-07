@@ -58,16 +58,22 @@ class NativeFillTracker:
         exchange_client: Any,  # NativeExchangeClient
         shared_state: Any,  # NativeSharedState
         poll_interval_sec: float = 5.0,
+        tp_sl_engine: Any = None,  # NativeTPSLEngine (optional, for arm_position on fill)
     ):
         self._exchange = exchange_client
         self._shared_state = shared_state
         self._poll_interval = max(1.0, poll_interval_sec)
+        self._tp_sl_engine = tp_sl_engine
 
         self._running = False
         self._poll_task: Optional[asyncio.Task[None]] = None
         self._last_trade_id: dict[str, int] = {}  # symbol → highest seen trade_id
         self._processed_trades: set[int] = set()  # dedup gate
         self._lock = asyncio.Lock()
+
+    def set_tp_sl_engine(self, engine: Any) -> None:
+        """Late-inject TP/SL engine after construction (avoids circular bootstrap order)."""
+        self._tp_sl_engine = engine
 
     # ──────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -204,6 +210,20 @@ class NativeFillTracker:
                 current=fill.price,
             )
 
+        # Arm TP/SL for the new/updated position (records entry_ts for time-based logic)
+        if self._tp_sl_engine is not None:
+            try:
+                tp, sl = self._tp_sl_engine.arm_position(
+                    sym, fill.price, entry_ts=fill.timestamp_ms / 1000.0
+                )
+                pos_obj = self._shared_state.get_position(sym)
+                if pos_obj is not None and isinstance(pos_obj, dict):
+                    pos_obj["tp"] = tp
+                    pos_obj["sl"] = sl
+                    pos_obj["entry_ts"] = fill.timestamp_ms / 1000.0
+            except Exception as _tpsl_e:
+                logger.warning("[FillTracker] arm_position failed for %s: %s", sym, _tpsl_e)
+
         # Track fee in basis points (1 bps = 0.01%)
         quote_value = fill.quantity * fill.price
         fee_bps = (fill.commission / quote_value * 10000.0) if quote_value > 0 else 0.0
@@ -256,8 +276,15 @@ class NativeFillTracker:
                 current=fill.price,
             )
         else:
-            # Full close
+            # Full close — clear TP/SL tracking state
             self._shared_state.close_position(sym)
+            if self._tp_sl_engine is not None:
+                try:
+                    self._tp_sl_engine.close_position_tracking(sym)
+                except Exception as _e:
+                    logger.warning(
+                        "[FillTracker] close_position_tracking failed for %s: %s", sym, _e
+                    )
 
         # Calculate realized P&L
         realized_pnl = (fill.price - current_pos.entry_price) * fill.quantity - fill.commission

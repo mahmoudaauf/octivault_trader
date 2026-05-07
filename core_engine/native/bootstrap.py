@@ -820,6 +820,10 @@ async def build_components(
         config=cfg,
     )
 
+    # Wire TP/SL engine into fill tracker (late injection to avoid bootstrap ordering issue)
+    if fill_tracker is not None and hasattr(fill_tracker, "set_tp_sl_engine"):
+        fill_tracker.set_tp_sl_engine(tp_sl_engine_native)
+
     # L4 safety order manager: per-symbol OCO intent store with
     # best-effort exchange placement. Replaces the compat null-stub
     # for the ``safety_order_manager`` app_ctx key consumed by

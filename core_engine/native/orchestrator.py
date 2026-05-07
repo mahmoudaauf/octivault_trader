@@ -115,6 +115,7 @@ class NativeOrchestrator:
 
         self._cycle_count = 0
         self._stopped = True  # Use bool flag instead of asyncio.Event
+        self._last_tpsl_recalc_ts: float = 0.0  # track aged-position recalc interval
 
     # ──────────────────────────────────────────────────────────────────
     # Private helpers
@@ -468,6 +469,32 @@ class NativeOrchestrator:
             except Exception as e:  # pragma: no cover
                 logger.debug(f"signal generation failed for {symbol}: {e}")
 
+        # TP/SL trigger injection: check armed positions, inject SELL signals
+        if self._tp_sl_engine is not None and self._shared_state is not None:
+            positions = getattr(self._shared_state, "positions", {}) or {}
+            prices_now = getattr(self._shared_state, "prices", {}) or {}
+            for sym, pos in positions.items():
+                if not isinstance(pos, dict):
+                    continue
+                current = float(prices_now.get(sym, 0.0) or 0.0)
+                if current <= 0:
+                    continue
+                trigger = self._tp_sl_engine.check_triggers(sym, pos, current)
+                if trigger is not None:
+                    signals_by_symbol[sym] = {
+                        "direction": "SELL",
+                        "score": 1.0,
+                        "contributions": {},
+                        "reason": trigger,
+                        "tpsl_trigger": trigger,
+                    }
+                    logger.info(
+                        "[Orchestrator] TP/SL trigger %s for %s at %.6f → injecting SELL",
+                        trigger,
+                        sym,
+                        current,
+                    )
+
         return signals_by_symbol
 
     async def _phase_decide(self, signals: dict[str, Any]) -> list[Any]:
@@ -529,6 +556,22 @@ class NativeOrchestrator:
 
     async def _phase_recover(self) -> None:
         """Phase 5: Health check and recovery."""
+        # Layer 2 TP/SL: periodic aged-position recalculation (every 5 min)
+        if self._tp_sl_engine is not None:
+            now = time.time()
+            if now - self._last_tpsl_recalc_ts >= 300.0:
+                self._last_tpsl_recalc_ts = now
+                try:
+                    updates = self._tp_sl_engine.recalculate_aged_positions()
+                    if updates:
+                        logger.info(
+                            "[Orchestrator] TP/SL time-tightening updated %d positions: %s",
+                            len(updates),
+                            list(updates.keys()),
+                        )
+                except Exception as _e:
+                    logger.warning("[Orchestrator] recalculate_aged_positions failed: %s", _e)
+
         # Update metrics for ObjectiveFeedbackController
         if self._shared_state:
             nav = getattr(self._shared_state, "nav_usdt", getattr(self._shared_state, "nav", 0.0))
