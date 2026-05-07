@@ -487,10 +487,17 @@ async def build_components(
         )
     else:
         # Legacy: fall back to aggressive polling (will cause 418 rate limits on real account)
+        def update_shared_state_balance(balances: dict[str, float]) -> None:
+            """Callback: update shared_state.free_balance_usdt when balances change."""
+            usdt_balance = float(balances.get("USDT", 0.0))
+            if usdt_balance > 0:
+                shared_state.free_balance_usdt = usdt_balance
+
         balance_sync = NativeBalanceSync(
             exchange_client,
             poll_interval_sec=cfg.balance_poll_sec,
             min_refresh_interval_sec=cfg.balance_min_refresh_interval_sec,
+            on_update=update_shared_state_balance,
         )
         fill_tracker = NativeFillTracker(
             exchange_client=exchange_client,
