@@ -181,6 +181,65 @@ class NativeDecisionEngine:
                     )
                 )
 
+        # Capital freeing: Liquidate dust holdings when needed & opportunity is good
+        # This allows the system to recycle existing capital instead of waiting for deposits
+        # Only sell when: (1) we need capital for strong BUY signals, (2) asset has weak signal
+        if balance_usdt < self.min_order_usdt and len(buy_sigs) > 0:
+            best_candidate = None
+            best_score = 1.0  # Lower is better (we want weak signals)
+
+            for asset, qty in portfolio.balance.items():
+                if asset == "USDT" or qty <= 0:
+                    continue
+
+                # Check this asset's signal quality
+                asset_symbol = f"{asset}USDT"
+                asset_signal = signals.get(asset_symbol, {})
+                signal_direction = asset_signal.get("direction", "HOLD")
+                signal_score = float(asset_signal.get("score", 0.0))
+
+                # Prioritize SELL signals (best opportunity), then HOLD with low conviction
+                if signal_direction == "SELL":
+                    # Strong exit signal = best time to free capital
+                    priority_score = 0.0 + signal_score
+                elif signal_direction == "HOLD":
+                    # Neutral = safe to exit
+                    priority_score = 0.5 + signal_score
+                else:
+                    # BUY signal = hold, don't sell
+                    priority_score = 2.0
+
+                # Consider asset size (prefer dust over large holdings)
+                is_dust = qty < 0.001 or (portfolio.nav > 0 and (qty * 1.0) < portfolio.nav * 0.02)
+
+                # Only consider selling if:
+                # 1. Not a strong BUY signal
+                # 2. Small holding (dust) OR weak signal
+                if priority_score < 2.0 and (is_dust or signal_score < 0.5):
+                    if priority_score < best_score:
+                        best_candidate = (asset_symbol, asset, qty, signal_direction, signal_score)
+                        best_score = priority_score
+
+            # Execute capital freeing if we found a good candidate
+            if best_candidate:
+                asset_symbol, asset, qty, direction, score = best_candidate
+                logger.info(
+                    "💰 CAPITAL FREEING: %s qty=%.8f (signal=%s score=%.2f) → frees capital for BUY opportunity",
+                    asset_symbol,
+                    qty,
+                    direction,
+                    score,
+                )
+                decisions.append(
+                    Decision(
+                        asset_symbol,
+                        Action.CLOSE,
+                        qty,
+                        f"capital_freeing:{direction.lower()}:{score:.2f}",
+                        risk_score=0.2,  # Very low risk for capital freeing
+                    )
+                )
+
         return decisions
 
     # ──────────────────────────────────────────────────────────────────
