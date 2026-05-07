@@ -25,7 +25,7 @@
     "invested_capital_usdt": 0.0,
     "nav_usdt": 1.0,
     "session_anchor_nav": 0.0,
-    "ts": 1778174095.507644
+    "ts": 1778174995.91908
   },
   "metrics": {
     "avg_fee_bps": 0.0,
@@ -46,5 +46,5 @@
   "positions": {},
   "prices": {},
   "session_anchor_nav": 0.0,
-  "ts": 1778174095.507644
+  "ts": 1778174995.91908
 }

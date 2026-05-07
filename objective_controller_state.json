@@ -1,11 +1,11 @@
 {
-  "last_action_ts": 1778174043.521396,
-  "integral_pace": -0.08333333333333334,
+  "last_action_ts": 1778174943.533579,
+  "integral_pace": -0.16666666666666669,
   "consecutive_dd_breaches": 0,
   "last_knobs": {
-    "confidence_floor": 0.6604166666666667,
-    "size_multiplier": 0.9966666666666667,
-    "target_throughput_per_hour": 11.958333333333334
+    "confidence_floor": 0.67125,
+    "size_multiplier": 0.9933333333333334,
+    "target_throughput_per_hour": 11.916666666666668
   },
   "history_tail": [
     {
@@ -43,6 +43,42 @@
       },
       "halted": false,
       "integral_pace": -0.08333333333333334
+    },
+    {
+      "ts": 1778174943.533579,
+      "telemetry": {
+        "ok": true,
+        "age_s": 0.0,
+        "nav": 1.0,
+        "nav_anchor": 1.0,
+        "realized_pnl": 0.0,
+        "unrealized_pnl": 0.0,
+        "drawdown_pct": 0.0,
+        "elapsed_h": 493935.7638368778,
+        "trades_in_window": 0,
+        "win_rate": 0.5,
+        "avg_fee_bps": 0.0,
+        "avg_slippage_bps": 0.0,
+        "avg_net_profit_bps": 0.0,
+        "missing": []
+      },
+      "errors": {
+        "pace_pct_per_h": -0.08333333333333334,
+        "drawdown_pct_over_limit": 0.0,
+        "net_edge_shortfall_bps": 5.0
+      },
+      "knobs_before": {
+        "confidence_floor": 0.6604166666666667,
+        "size_multiplier": 0.9966666666666667,
+        "target_throughput_per_hour": 11.958333333333334
+      },
+      "knobs_after": {
+        "confidence_floor": 0.67125,
+        "size_multiplier": 0.9933333333333334,
+        "target_throughput_per_hour": 11.916666666666668
+      },
+      "halted": false,
+      "integral_pace": -0.16666666666666669
     }
   ],
   "set_points": {

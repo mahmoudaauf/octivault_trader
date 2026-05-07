@@ -612,12 +612,60 @@ async def build_components(
     elif cfg.symbols:
         logger.info("⚠️  Paper signals disabled but no legacy agents available")
 
+    # L3: Legacy signal agents (MLForecaster, SymbolScreener)
+    ml_forecaster = None
+    symbol_screener = None
+    try:
+        # Try to import legacy agents
+        from agents.ml_forecaster import MLForecaster
+        from agents.symbol_screener import SymbolScreener
+        from core_engine.native.model_manager import ModelManager
+
+        # Initialize ModelManager for MLForecaster
+        model_manager = ModelManager(config=cfg)
+
+        # Instantiate MLForecaster
+        if cfg.symbols:
+            try:
+                ml_forecaster = MLForecaster(
+                    shared_state=shared_state,
+                    execution_manager=None,  # Not used by forecaster
+                    config=cfg,
+                    symbols=cfg.symbols,
+                    timeframe="5m",
+                    market_data_feed=market_data,
+                    exchange_client=exchange_client,
+                    model_manager=model_manager,
+                )
+                logger.info(
+                    "✅ MLForecaster initialized (%d symbols, ModelManager enabled)",
+                    len(cfg.symbols),
+                )
+            except Exception as e:
+                logger.warning("Failed to initialize MLForecaster: %s", e)
+
+        # Instantiate SymbolScreener
+        try:
+            symbol_screener = SymbolScreener(
+                shared_state=shared_state,
+                exchange_client=exchange_client,
+                config=cfg,
+            )
+            logger.info("✅ SymbolScreener initialized")
+        except Exception as e:
+            logger.warning("Failed to initialize SymbolScreener: %s", e)
+
+    except ImportError as e:
+        logger.warning("Legacy agents not available: %s (using paper signals only)", e)
+
     # L3: Signal manager bridge (integrates legacy + paper mode signals)
     signal_manager_bridge = SignalManagerBridge(
         config=cfg,
-        legacy_signal_manager=None,  # TODO: wire legacy signal_manager when available
+        legacy_signal_manager=None,
         paper_generator=paper_signal_gen,
         shared_state=shared_state,
+        ml_forecaster=ml_forecaster,
+        symbol_screener=symbol_screener,
     )
 
     # L4
@@ -863,6 +911,8 @@ async def build_components(
         symbol_discovery=symbol_discoverer,
         market_data_ws=market_data_ws,
         signal_manager_bridge=signal_manager_bridge,
+        ml_forecaster=ml_forecaster,
+        symbol_screener=symbol_screener,
     )
 
 

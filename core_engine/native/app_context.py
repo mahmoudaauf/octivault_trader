@@ -141,7 +141,11 @@ class NativeComponents:
         None  # NativePositionHydrationEngine | None (L0, Phase 8.4)
     )
     startup_state_machine: Any | None = None  # NativeStartupStateMachine | None (L0, Phase 8.4)
-    signal_manager_bridge: Any | None = None  # SignalManagerBridge | None (L3, integrates legacy + paper signals)
+    signal_manager_bridge: Any | None = (
+        None  # SignalManagerBridge | None (L3, integrates legacy + paper signals)
+    )
+    ml_forecaster: Any | None = None  # MLForecaster | None (legacy agent, L3)
+    symbol_screener: Any | None = None  # SymbolScreener | None (legacy agent, L3)
 
 
 def build_native_app_ctx(

@@ -12,7 +12,6 @@ Provides unified interface for getting signals regardless of source.
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -30,6 +29,8 @@ class SignalManagerBridge:
         legacy_signal_manager: Any | None = None,
         paper_generator: Any | None = None,
         shared_state: Any | None = None,
+        ml_forecaster: Any | None = None,
+        symbol_screener: Any | None = None,
     ):
         """
         Initialize the signal manager bridge.
@@ -39,6 +40,8 @@ class SignalManagerBridge:
             legacy_signal_manager: Legacy SignalManager instance (from src/)
             paper_generator: PaperModeSignalGenerator for synthetic signals
             shared_state: NativeSharedState for accessing runtime state
+            ml_forecaster: MLForecaster instance (optional)
+            symbol_screener: SymbolScreener instance (optional)
         """
         self.config = config or {}
         self.legacy_sm = legacy_signal_manager
@@ -48,12 +51,32 @@ class SignalManagerBridge:
         self._sources_active: dict[str, bool] = {
             "legacy": bool(legacy_signal_manager),
             "paper_mode": bool(paper_generator),
+            "ml_forecaster": bool(ml_forecaster),
+            "symbol_screener": bool(symbol_screener),
         }
 
+        # Initialize legacy signal adapter if agents provided
+        self._adapter = None
+        if ml_forecaster or symbol_screener:
+            try:
+                from .legacy_signal_adapter import LegacySignalAdapter
+
+                self._adapter = LegacySignalAdapter(
+                    ml_forecaster=ml_forecaster,
+                    symbol_screener=symbol_screener,
+                    shared_state=shared_state,
+                    timeout_sec=10.0,
+                )
+                self._sources_active["legacy_adapter"] = True
+            except Exception as e:
+                logger.warning("[SignalManagerBridge] Failed to initialize legacy adapter: %s", e)
+
         logger.info(
-            "[SignalManagerBridge] Initialized (legacy=%s, paper_mode=%s)",
+            "[SignalManagerBridge] Initialized (legacy=%s, paper_mode=%s, forecaster=%s, screener=%s)",
             "yes" if self.legacy_sm else "no",
             "yes" if self.paper_gen else "no",
+            "yes" if ml_forecaster else "no",
+            "yes" if symbol_screener else "no",
         )
 
     async def get_all_signals(self) -> list[dict[str, Any]]:
@@ -61,7 +84,7 @@ class SignalManagerBridge:
         Get all signals from all active sources.
 
         Returns:
-            Combined list of signals from legacy manager + paper generator
+            Combined list of signals from all sources (legacy, paper mode, forecaster, etc.)
         """
         signals: list[dict[str, Any]] = []
 
@@ -77,6 +100,19 @@ class SignalManagerBridge:
                     )
             except Exception as e:
                 logger.debug("[SignalManagerBridge] Error getting legacy signals: %s", e)
+
+        # Get signals from legacy signal adapter (MLForecaster, SymbolScreener)
+        if self._adapter:
+            try:
+                adapter_signals = await self._adapter.get_signals()
+                if adapter_signals:
+                    signals.extend(adapter_signals)
+                    logger.debug(
+                        "[SignalManagerBridge] Got %d signals from legacy adapter",
+                        len(adapter_signals),
+                    )
+            except Exception as e:
+                logger.debug("[SignalManagerBridge] Error getting adapter signals: %s", e)
 
         # Get synthetic signals from paper mode generator (if available and enabled)
         if self.paper_gen and hasattr(self.paper_gen, "generate_signals"):
@@ -107,9 +143,7 @@ class SignalManagerBridge:
         all_signals = await self.get_all_signals()
         return [s for s in all_signals if s.get("symbol") == symbol]
 
-    def receive_signal(
-        self, agent_name: str, symbol: str, signal: dict[str, Any]
-    ) -> bool:
+    def receive_signal(self, agent_name: str, symbol: str, signal: dict[str, Any]) -> bool:
         """
         Accept a signal from an agent (for runtime signal injection).
 
@@ -134,9 +168,7 @@ class SignalManagerBridge:
                 self._signal_count += 1
             return result
         except Exception as e:
-            logger.debug(
-                "[SignalManagerBridge] Error receiving signal from %s: %s", agent_name, e
-            )
+            logger.debug("[SignalManagerBridge] Error receiving signal from %s: %s", agent_name, e)
             return False
 
     def cleanup_expired_signals(self) -> int:
