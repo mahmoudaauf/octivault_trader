@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,13 +43,18 @@ from typing import Any
 
 from .adaptive_capital_engine import NativeAdaptiveCapitalEngine
 from .app_context import NativeComponents
+from .arbitration_engine import NativeArbitrationEngine
 from .balance_sync import NativeBalanceSync
+from .balance_validator import NativeBalanceValidator
 from .capital_allocator import NativeCapitalAllocator
 from .decisions import NativeDecisionEngine
 from .exchange_client import NativeExchangeClient
 from .executor import NativeExecutor
 from .fill_tracker import NativeFillTracker
+from .health_monitor import NativeHealthMonitor
 from .market_data import NativeMarketData
+from .market_regime_detector import NativeMarketRegimeDetector
+from .mode_manager import NativeModeManager
 from .objective_feedback_controller import NativeObjectiveFeedbackController
 from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
@@ -57,8 +63,10 @@ from .portfolio_manager import NativePortfolioManager
 from .position_manager import NativePositionManager
 from .prometheus_exporter import NativePrometheusExporter
 from .recovery_engine import NativeRecoveryEngine
+from .runtime_state import NativeRuntimeStateExporter, load_runtime_state
 from .safety_order_manager import NativeSafetyOrderManager
 from .shared_state import NativeSharedState
+from .signal_fusion import NativeSignalFusion
 from .signals import NativeSignalEngine
 from .telemetry_export import NativeTelemetryExporter
 from .tp_sl_engine import NativeTPSLEngine
@@ -91,6 +99,8 @@ class BootstrapConfig:
     )  # Auto-populated via wallet scan; can be overridden via SYMBOLS env
     market_data_poll_sec: float = 2.0
     symbol_discovery_enabled: bool = True  # Auto-discover from wallet holdings
+    symbol_discovery_interval_sec: float = 900.0
+    symbol_discovery_empty_retry_sec: float = 300.0
     klines_cache_size: int = 64
     stale_threshold_sec: float = 30.0
 
@@ -103,6 +113,7 @@ class BootstrapConfig:
 
     # --- legacy: balance_sync & fill_tracker disabled when polling_enabled=True ---
     balance_poll_sec: float = 5.0  # Ignored if polling_enabled=True
+    balance_min_refresh_interval_sec: float = 60.0
     fill_tracker_poll_sec: float = 5.0  # Ignored if polling_enabled=True
 
     # --- decisions / risk ---
@@ -115,6 +126,11 @@ class BootstrapConfig:
     risk_per_symbol_pct: float = 20.0  # Increased from 2.0: micro accounts need higher per-symbol allocation to generate trades
     capital_allocation_pct: float = 5.0
     default_planned_quote: float = 12.0  # Fixed quote per trade for small accounts (like legacy system). Autonomously scales with equity growth.
+    quote_reserve_ratio: float = 0.10
+    quote_min_reserve_usdt: float = 0.0
+    max_total_exposure_pct: float = 60.0
+    confidence_floor: float = 0.50
+    max_cluster_exposure_pct: float = 40.0
 
     # --- exit logic (TP/SL) ---
     tp_pct: float = 0.03  # +3% take profit
@@ -127,6 +143,8 @@ class BootstrapConfig:
     telemetry_capacity: int = 1024
     telemetry_export_path: str = ""  # empty = disabled
     telemetry_export_interval_sec: float = 10.0
+    runtime_state_path: str = "runtime_state_snapshot.json"
+    runtime_state_interval_sec: float = 10.0
     duration_sec: float = 3600.0
     request_timeout_sec: float = 10.0
 
@@ -175,10 +193,17 @@ class BootstrapConfig:
             testnet=_bool(e.get("BINANCE_TESTNET"), default=False),
             symbols=symbols,  # Empty list → auto-scan wallet during bootstrap
             symbol_discovery_enabled=symbol_discovery_enabled,
+            symbol_discovery_interval_sec=_float(e.get("SYMBOL_DISCOVERY_INTERVAL_SEC"), 900.0),
+            symbol_discovery_empty_retry_sec=_float(
+                e.get("SYMBOL_DISCOVERY_EMPTY_RETRY_SEC"), 300.0
+            ),
             market_data_poll_sec=_float(e.get("MARKET_DATA_POLL_SEC"), 2.0),
             klines_cache_size=_int(e.get("KLINES_CACHE_SIZE"), 64),
             stale_threshold_sec=_float(e.get("STALE_THRESHOLD_SEC"), 30.0),
             balance_poll_sec=_float(e.get("BALANCE_POLL_SEC"), 5.0),
+            balance_min_refresh_interval_sec=_float(
+                e.get("BALANCE_MIN_REFRESH_INTERVAL_SEC"), 60.0
+            ),
             fill_tracker_poll_sec=_float(e.get("FILL_TRACKER_POLL_SEC"), 5.0),
             polling_enabled=_bool(e.get("POLLING_ENABLED"), default=True),
             polling_open_orders_interval_sec=_float(
@@ -198,12 +223,21 @@ class BootstrapConfig:
             risk_per_symbol_pct=_float(e.get("RISK_PER_SYMBOL_PCT"), 20.0),
             capital_allocation_pct=_float(e.get("CAPITAL_ALLOCATION_PCT"), 5.0),
             default_planned_quote=_float(e.get("DEFAULT_PLANNED_QUOTE"), 12.0),
+            quote_reserve_ratio=_float(e.get("QUOTE_RESERVE_RATIO"), 0.10),
+            quote_min_reserve_usdt=_float(e.get("QUOTE_MIN_RESERVE_USDT"), 0.0),
+            max_total_exposure_pct=_float(e.get("MAX_TOTAL_EXPOSURE_PCT"), 60.0),
+            confidence_floor=_float(e.get("CONFIDENCE_FLOOR"), 0.50),
+            max_cluster_exposure_pct=_float(e.get("MAX_CLUSTER_EXPOSURE_PCT"), 40.0),
             tp_pct=_float(e.get("TP_PCT"), 0.03),
             sl_pct=_float(e.get("SL_PCT"), 0.02),
             signal_cooldown_sec=_float(e.get("SIGNAL_COOLDOWN_SEC"), 0.0),
             telemetry_capacity=_int(e.get("TELEMETRY_CAPACITY"), 1024),
             telemetry_export_path=(e.get("TELEMETRY_EXPORT_PATH") or "").strip(),
             telemetry_export_interval_sec=_float(e.get("TELEMETRY_EXPORT_INTERVAL_SEC"), 10.0),
+            runtime_state_path=(
+                e.get("RUNTIME_STATE_PATH") or "runtime_state_snapshot.json"
+            ).strip(),
+            runtime_state_interval_sec=_float(e.get("RUNTIME_STATE_INTERVAL_SEC"), 10.0),
             duration_sec=_float(e.get("DURATION_SEC"), 3600.0),
             request_timeout_sec=_float(e.get("REQUEST_TIMEOUT_SEC"), 10.0),
             trade_journal_dir=(e.get("TRADE_JOURNAL_DIR") or "logs").strip(),
@@ -252,11 +286,12 @@ class _PortfolioSnapshot:
     nav_peak: float
     balance: dict[str, float]
     positions: dict[str, float]
+    mode_name: str = ""
 
 
 def _make_portfolio_accessor(
     shared_state: NativeSharedState,
-    balance_sync: NativeBalanceSync,
+    balance_sync: NativeBalanceSync | None,
 ) -> Callable[[], _PortfolioSnapshot]:
     """
     Build a zero-arg callable returning a fresh ``_PortfolioSnapshot``.
@@ -271,7 +306,10 @@ def _make_portfolio_accessor(
 
     def _accessor() -> _PortfolioSnapshot:
         nav = float(getattr(shared_state, "nav_usdt", 0.0))
-        balance = balance_sync.get_balance()
+        if balance_sync is not None and hasattr(balance_sync, "get_balance"):
+            balance = balance_sync.get_balance()
+        else:
+            balance = dict(getattr(shared_state, "balance", {}) or {})
 
         # Positions: shared_state.positions is dict[str, Position]; the
         # decision engine only needs symbol -> qty.
@@ -305,6 +343,7 @@ def _make_portfolio_accessor(
             nav_peak=peak,
             balance=balance,
             positions=positions,
+            mode_name=str(getattr(shared_state, "current_mode", "") or ""),
         )
 
     return _accessor
@@ -392,9 +431,23 @@ async def build_components(
 
     # L0
     shared_state = NativeSharedState()
+    if cfg.runtime_state_path:
+        restored = load_runtime_state(shared_state, Path(cfg.runtime_state_path))
+        if restored:
+            logger.info("✅ Restored runtime state from %s", cfg.runtime_state_path)
+            # Clear expired throttle states (throttle window may have passed since last run)
+            throttle_ts = float(getattr(shared_state, "exchange_throttle_until_ts", 0.0) or 0.0)
+            if throttle_ts > 0 and throttle_ts <= time.time():
+                logger.info("🟢 Throttle window expired; clearing throttle state")
+                shared_state.set_exchange_throttle(False, reason="", until_ts=0.0)
 
     # L1
     exchange_client = factory(cfg)
+    if hasattr(exchange_client, "restore_throttle_state"):
+        exchange_client.restore_throttle_state(
+            until_ts=float(getattr(shared_state, "exchange_throttle_until_ts", 0.0) or 0.0),
+            reason=str(getattr(shared_state, "exchange_throttle_reason", "") or ""),
+        )
     order_execution = NativeOrderExecution(exchange_client)
 
     # L1: Polling coordinator (legacy-style staggered polling with active-trades gate)
@@ -430,6 +483,7 @@ async def build_components(
         balance_sync = NativeBalanceSync(
             exchange_client,
             poll_interval_sec=cfg.balance_poll_sec,
+            min_refresh_interval_sec=cfg.balance_min_refresh_interval_sec,
         )
         fill_tracker = NativeFillTracker(
             exchange_client=exchange_client,
@@ -447,7 +501,13 @@ async def build_components(
         logger.info("📱 Symbol discovery: will scan wallet each cycle (not at bootstrap)")
         from .symbol_discovery import NativeSymbolDiscovery
 
-        symbol_discoverer = NativeSymbolDiscovery(exchange_client, base_currency="USDT")
+        symbol_discoverer = NativeSymbolDiscovery(
+            exchange_client,
+            base_currency="USDT",
+            shared_state=shared_state,
+            min_scan_interval_sec=cfg.symbol_discovery_interval_sec,
+            empty_scan_retry_sec=cfg.symbol_discovery_empty_retry_sec,
+        )
         symbols = []  # Start empty; orchestrator will populate from balance
     else:
         logger.error("No symbols configured and discovery disabled; nothing to trade")
@@ -529,11 +589,25 @@ async def build_components(
         daily_loss_limit_pct=cfg.daily_loss_limit_pct,
         risk_per_symbol_pct=cfg.risk_per_symbol_pct,
         min_notional_usdt=10.0,  # Layer 1: minimum notional filter for Binance LOT_SIZE compliance
+        quote_reserve_ratio=cfg.quote_reserve_ratio,
+        quote_min_reserve_usdt=cfg.quote_min_reserve_usdt,
+        max_total_exposure_pct=cfg.max_total_exposure_pct,
+        confidence_floor=cfg.confidence_floor,
+        max_cluster_exposure_pct=cfg.max_cluster_exposure_pct,
+    )
+    mode_manager = NativeModeManager(
+        bootstrap_trade_usdt=max(cfg.min_order_usdt, 20.0),
+        recovery_trade_usdt=max(cfg.min_order_usdt, 50.0),
+        normal_trade_usdt=max(cfg.min_order_usdt, 150.0),
     )
 
     # L5
     executor = NativeExecutor(
-        order_execution, market_data=market_data, exchange_client=exchange_client
+        order_execution,
+        market_data=market_data,
+        exchange_client=exchange_client,
+        shared_state=shared_state,
+        balance_validator=NativeBalanceValidator(),
     )
 
     # L6
@@ -549,6 +623,15 @@ async def build_components(
         )
         await telemetry_exporter.start()
 
+    runtime_state_exporter: NativeRuntimeStateExporter | None = None
+    if cfg.runtime_state_path:
+        runtime_state_exporter = NativeRuntimeStateExporter(
+            shared_state=shared_state,
+            output_path=Path(cfg.runtime_state_path),
+            interval_sec=cfg.runtime_state_interval_sec,
+        )
+        await runtime_state_exporter.start()
+
     # L8 portfolio accessor: minimal snapshot built from L0/L1/L2 state.
     # Returns a duck-typed object with the four attributes
     # NativeDecisionEngine.decide() reads: nav, nav_peak, balance,
@@ -563,6 +646,8 @@ async def build_components(
         shared_state=shared_state,
         balance_sync=balance_sync,
         min_order_usdt=cfg.min_order_usdt,
+        quote_reserve_ratio=cfg.quote_reserve_ratio,
+        quote_min_reserve_usdt=cfg.quote_min_reserve_usdt,
     )
 
     # L6 adaptive capital engine: dynamic position sizing based on performance
@@ -593,9 +678,30 @@ async def build_components(
         shared_state=shared_state,
         exchange_client=exchange_client,
         default_planned_quote=cfg.default_planned_quote,
+        quote_reserve_ratio=cfg.quote_reserve_ratio,
+        quote_min_reserve_usdt=cfg.quote_min_reserve_usdt,
     )
     # Inject pre-fetched filters so allocator can use real step-sizes immediately
     capital_allocator._symbol_filters_cache = symbol_filters
+
+    signal_fusion = NativeSignalFusion(
+        signal_engine=signal_engine,
+        market_data=market_data,
+        shared_state=shared_state,
+        mode_manager=mode_manager,
+    )
+
+    arbitration_engine = NativeArbitrationEngine(
+        shared_state=shared_state,
+        decision_engine=decision_engine,
+        signal_fusion=signal_fusion,
+        mode_manager=mode_manager,
+    )
+    market_regime_detector = NativeMarketRegimeDetector(
+        market_data=market_data,
+        shared_state=shared_state,
+        signal_engine=signal_engine,
+    )
 
     # L3 position manager: read-only per-symbol accessor over
     # shared_state. Replaces the compat null-stub for the
@@ -644,6 +750,14 @@ async def build_components(
         market_data=market_data,
         exchange_client=exchange_client,
     )
+    health_monitor = NativeHealthMonitor(
+        shared_state=shared_state,
+        exchange_client=exchange_client,
+        market_data=market_data,
+        market_data_ws=market_data_ws,
+        watchdog=watchdog,
+        mode_manager=mode_manager,
+    )
 
     # L0-L7 observability enhancements (legacy features ported)
     # Trade journal: crash-safe, immutable JSONL audit trail
@@ -667,8 +781,13 @@ async def build_components(
         exchange_client=exchange_client,
         portfolio_accessor=portfolio_accessor,
         telemetry_exporter=telemetry_exporter,
+        runtime_state_exporter=runtime_state_exporter,
         portfolio_manager=portfolio_manager,
         capital_allocator=capital_allocator,
+        signal_fusion=signal_fusion,
+        arbitration_engine=arbitration_engine,
+        market_regime_detector=market_regime_detector,
+        health_monitor=health_monitor,
         position_manager=position_manager,
         tp_sl_engine=tp_sl_engine_native,
         safety_order_manager=safety_order_manager,
@@ -680,6 +799,7 @@ async def build_components(
         adaptive_capital_engine=ace,
         polling_coordinator=polling_coordinator,
         objective_feedback_controller=ofc,
+        mode_manager=mode_manager,
         symbol_discovery=symbol_discoverer,
         market_data_ws=market_data_ws,
     )
@@ -700,6 +820,12 @@ async def shutdown_components(components: NativeComponents) -> None:
             await exporter.stop()
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("native shutdown: telemetry_exporter.stop() raised: %r", e)
+    runtime_exporter = components.runtime_state_exporter
+    if runtime_exporter is not None:
+        try:
+            await runtime_exporter.stop()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("native shutdown: runtime_state_exporter.stop() raised: %r", e)
 
     # market data + market_data_ws + balance sync + fill tracker own background tasks
     for comp in (

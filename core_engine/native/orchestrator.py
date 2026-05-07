@@ -81,6 +81,7 @@ class NativeOrchestrator:
         fill_tracker: Any | None = None,  # NativeFillTracker (L3, optional)
         objective_feedback_controller: Any
         | None = None,  # ObjectiveFeedbackController (OFC, optional)
+        mode_manager: Any | None = None,  # NativeModeManager (optional)
         symbol_discovery: Any | None = None,  # NativeSymbolDiscovery (optional)
         market_data_ws: Any
         | None = None,  # NativeMarketDataWebSocket (optional, zero API rate limits)
@@ -98,6 +99,7 @@ class NativeOrchestrator:
         self._watchdog = watchdog
         self._fill_tracker = fill_tracker
         self._ofc = objective_feedback_controller
+        self._mode_manager = mode_manager
         self._symbol_discovery = symbol_discovery
         self._market_data_ws = market_data_ws
         self._polling_coordinator = polling_coordinator
@@ -297,6 +299,16 @@ class NativeOrchestrator:
         """Phase 0: Scan wallet and update symbol list (optional, per-cycle)."""
         if not self._symbol_discovery:
             return
+
+        # Skip wallet scan if exchange is throttled (prevents fresh 418 bans)
+        if self._shared_state:
+            throttle_ts = float(
+                getattr(self._shared_state, "exchange_throttle_until_ts", 0.0) or 0.0
+            )
+            if throttle_ts > time.time():
+                logger.debug("Exchange throttled; skipping symbol discovery this cycle")
+                return
+
         try:
             symbols = await self._symbol_discovery.discover()
             if symbols and self._market_data:
@@ -323,12 +335,44 @@ class NativeOrchestrator:
         if self._shared_state:
             balance_usdt = self._get_balance().get("USDT", 0.0)
             if balance_usdt > 0:
-                # Set NAV (used by capital allocator, OFC, ACE)
-                self._shared_state.update_nav(balance_usdt)
+                current_nav = float(
+                    getattr(self._shared_state, "nav_usdt", getattr(self._shared_state, "nav", 0.0))
+                    or 0.0
+                )
+                if hasattr(self._shared_state, "update_balance_map"):
+                    if current_nav <= 0:
+                        self._shared_state.update_balance_map(self._get_balance())
+                    else:
+                        self._shared_state.balance = dict(self._get_balance())
+                        self._shared_state.free_balance_usdt = float(balance_usdt)
+                if hasattr(self._shared_state, "update_nav") and current_nav <= 0:
+                    self._shared_state.update_nav(balance_usdt)
                 # Set anchor on first cycle (OFC needs this for pace calculation)
-                if self._shared_state.session_anchor_nav <= 0:
+                if getattr(self._shared_state, "session_anchor_nav", 0.0) <= 0:
                     self._shared_state.session_anchor_nav = balance_usdt
                     logger.info("📊 Session anchor NAV set: %.2f USDT", balance_usdt)
+            exchange_client = getattr(self._executor, "_exchange_client", None)
+            if exchange_client is not None and hasattr(self._shared_state, "set_exchange_throttle"):
+                self._shared_state.set_exchange_throttle(
+                    bool(getattr(exchange_client, "is_throttled", lambda: False)()),
+                    reason=str(getattr(exchange_client, "last_error", lambda: "")() or ""),
+                    until_ts=float(
+                        getattr(exchange_client, "throttled_until_ts", lambda: 0.0)() or 0.0
+                    ),
+                )
+            if self._mode_manager is not None:
+                mode = self._mode_manager.evaluate(
+                    nav=float(
+                        getattr(
+                            self._shared_state, "nav_usdt", getattr(self._shared_state, "nav", 0.0)
+                        )
+                        or 0.0
+                    ),
+                    metrics=self._build_mode_metrics(),
+                    state=self._shared_state,
+                )
+                self._shared_state.current_mode = mode.name
+                self._shared_state.current_mode_reason = f"mode_eval:{mode.name.lower()}"
 
     async def _phase_understand(self) -> dict[str, Any]:
         """Phase 2: Generate signals from market data."""
@@ -351,6 +395,7 @@ class NativeOrchestrator:
                         "direction": agg_sig.direction,
                         "score": agg_sig.score,
                         "contributions": agg_sig.contributions,
+                        **(agg_sig.meta or {}),
                     }
             except Exception as e:  # pragma: no cover
                 logger.debug(f"signal generation failed for {symbol}: {e}")
@@ -385,6 +430,11 @@ class NativeOrchestrator:
                     "trading_halted=True (OFC kill-switch); skipping BUY decisions " "this cycle"
                 )
                 return []
+            if getattr(self._shared_state, "exchange_throttled", False):
+                logger.warning("exchange_throttled=True; skipping BUY decisions this cycle")
+                signals = {
+                    sym: sig for sym, sig in signals.items() if str(sig.get("direction")) == "SELL"
+                }
 
         decisions = self._decision_engine.decide(signals, portfolio, balance_usdt)
         return decisions
@@ -417,6 +467,29 @@ class NativeOrchestrator:
             elapsed_s = time.time() - getattr(self._shared_state, "_session_start_ts", time.time())
             m["session_elapsed_h"] = elapsed_s / 3600.0
 
+    def _build_mode_metrics(self) -> dict[str, Any]:
+        metrics = dict(getattr(self._shared_state, "metrics", {}) or {})
+        nav = float(
+            getattr(self._shared_state, "nav_usdt", getattr(self._shared_state, "nav", 0.0)) or 0.0
+        )
+        peak = float(metrics.get("peak_nav", nav) or nav)
+        drawdown_pct = 0.0
+        if peak > 0:
+            drawdown_pct = max(0.0, (1.0 - (nav / peak)) * 100.0)
+        positions = {}
+        if hasattr(self._shared_state, "get_all_positions"):
+            positions = self._shared_state.get_all_positions() or {}
+        metrics.setdefault("drawdown_pct", drawdown_pct)
+        metrics.setdefault("has_positions", bool(positions))
+        metrics.setdefault(
+            "health_ok", not bool(getattr(self._shared_state, "exchange_throttled", False))
+        )
+        metrics.setdefault(
+            "manual_pause", bool(getattr(self._shared_state, "trading_halted", False))
+        )
+        metrics.setdefault("first_trade_executed", int(metrics.get("trades_in_window", 0) or 0) > 0)
+        return metrics
+
     # ──────────────────────────────────────────────────────────────────
     # Initialization helpers
     # ──────────────────────────────────────────────────────────────────
@@ -436,8 +509,12 @@ class NativeOrchestrator:
 
             # Check market_data has prices
             if self._market_data and hasattr(self._market_data, "get_prices"):
-                prices = self._market_data.get_prices()
-                has_prices = len(prices) > 0 if prices else False
+                try:
+                    prices = self._market_data.get_prices()
+                    has_prices = len(prices) > 0 if prices else False
+                except Exception as e:
+                    logger.debug("initial-data price probe failed: %s", e)
+                    prices = {}
 
             # Check balance_sync or polling_coordinator has balance
             balance = self._get_balance()
