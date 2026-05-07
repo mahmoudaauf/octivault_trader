@@ -67,7 +67,9 @@ from .recovery_engine import NativeRecoveryEngine
 from .runtime_state import NativeRuntimeStateExporter, load_runtime_state
 from .safety_order_manager import NativeSafetyOrderManager
 from .shared_state import NativeSharedState
+from .paper_signal_generator import PaperModeSignalGenerator
 from .signal_fusion import NativeSignalFusion
+from .signal_manager_bridge import SignalManagerBridge
 from .signals import NativeSignalEngine
 from .startup_state_machine import NativeStartupStateMachine
 from .telemetry_export import NativeTelemetryExporter
@@ -594,6 +596,24 @@ async def build_components(
     # L3
     signal_engine = NativeSignalEngine(cooldown_sec=cfg.signal_cooldown_sec)
 
+    # L3: Paper mode signal generator (for synthetic signals in paper mode)
+    paper_signal_gen: PaperModeSignalGenerator | None = None
+    if cfg.paper_mode:
+        paper_signal_gen = PaperModeSignalGenerator(
+            config=cfg,
+            symbols=cfg.symbols,
+            enabled=True,
+        )
+        logger.info("📊 Paper mode signal generator enabled")
+
+    # L3: Signal manager bridge (integrates legacy + paper mode signals)
+    signal_manager_bridge = SignalManagerBridge(
+        config=cfg,
+        legacy_signal_manager=None,  # TODO: wire legacy signal_manager when available
+        paper_generator=paper_signal_gen,
+        shared_state=shared_state,
+    )
+
     # L4
     decision_engine = NativeDecisionEngine(
         kelly_fraction=cfg.kelly_fraction,
@@ -836,6 +856,7 @@ async def build_components(
         mode_manager=mode_manager,
         symbol_discovery=symbol_discoverer,
         market_data_ws=market_data_ws,
+        signal_manager_bridge=signal_manager_bridge,
     )
 
 

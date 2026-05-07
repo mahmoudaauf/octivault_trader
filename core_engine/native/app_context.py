@@ -141,6 +141,7 @@ class NativeComponents:
         None  # NativePositionHydrationEngine | None (L0, Phase 8.4)
     )
     startup_state_machine: Any | None = None  # NativeStartupStateMachine | None (L0, Phase 8.4)
+    signal_manager_bridge: Any | None = None  # SignalManagerBridge | None (L3, integrates legacy + paper signals)
 
 
 def build_native_app_ctx(
@@ -238,6 +239,8 @@ def build_native_app_ctx(
         app_ctx["prometheus_exporter"] = components.prometheus_exporter
     if components.fill_tracker is not None:
         app_ctx["fill_tracker"] = components.fill_tracker
+    if components.signal_manager_bridge is not None:
+        app_ctx["signal_manager_bridge"] = components.signal_manager_bridge
 
     return app_ctx, orch
 

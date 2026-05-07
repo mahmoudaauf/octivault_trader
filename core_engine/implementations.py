@@ -394,13 +394,28 @@ class SituationEngineImpl:
 
         For native signal engine (NativeSignalEngine), integrates with
         market_data to evaluate signals on-demand.
+        Also checks signal_manager_bridge (combo of legacy + paper mode).
         """
-        signal_manager = app_ctx.get("signal_manager")
-
         signals = []
 
+        # Try signal_manager_bridge first (integrates legacy + paper signals)
+        signal_bridge = app_ctx.get("signal_manager_bridge")
+        if signal_bridge and hasattr(signal_bridge, "get_all_signals"):
+            try:
+                if symbol:
+                    signals = await _maybe_await(signal_bridge.get_signals_for_symbol(symbol))
+                else:
+                    signals = await _maybe_await(signal_bridge.get_all_signals())
+                if signals:
+                    return signals
+            except Exception as e:
+                logger.debug(f"⚠️ Error getting signals from bridge: {e}")
+
+        # Fallback to legacy signal_manager
+        signal_manager = app_ctx.get("signal_manager")
+
         if not signal_manager:
-            logger.warning("⚠️ signal_manager not available")
+            logger.debug("⚠️ signal_manager not available")
             return signals
 
         try:
