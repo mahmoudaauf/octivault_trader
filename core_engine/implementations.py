@@ -400,16 +400,21 @@ class SituationEngineImpl:
 
         # Try signal_manager_bridge first (integrates legacy + paper signals)
         signal_bridge = app_ctx.get("signal_manager_bridge")
-        if signal_bridge and hasattr(signal_bridge, "get_all_signals"):
-            try:
-                if symbol:
-                    signals = await _maybe_await(signal_bridge.get_signals_for_symbol(symbol))
-                else:
-                    signals = await _maybe_await(signal_bridge.get_all_signals())
-                if signals:
-                    return signals
-            except Exception as e:
-                logger.debug(f"⚠️ Error getting signals from bridge: {e}")
+        if signal_bridge:
+            logger.debug(f"[SignalBridge] Found bridge, has get_all_signals: {hasattr(signal_bridge, 'get_all_signals')}")
+            if hasattr(signal_bridge, "get_all_signals"):
+                try:
+                    if symbol:
+                        signals = await _maybe_await(signal_bridge.get_signals_for_symbol(symbol))
+                    else:
+                        signals = await _maybe_await(signal_bridge.get_all_signals())
+                    logger.debug(f"[SignalBridge] Got {len(signals)} signals from bridge")
+                    if signals:
+                        return signals
+                except Exception as e:
+                    logger.debug(f"⚠️ Error getting signals from bridge: {e}")
+        else:
+            logger.debug(f"[SignalBridge] signal_manager_bridge NOT in app_ctx")
 
         # Fallback to legacy signal_manager
         signal_manager = app_ctx.get("signal_manager")
