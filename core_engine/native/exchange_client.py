@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import re
 import time
 from typing import Any, Optional
 from urllib.parse import urlencode
@@ -80,6 +81,9 @@ class NativeExchangeClient:
         recv_window_ms: int = 5_000,
         request_timeout_sec: float = 10.0,
         retry: Optional[NativeRetryManager] = None,
+        request_budget_window_sec: float = 60.0,
+        request_budget_soft_limit: int = 1200,
+        signed_request_cooldown_sec: float = 15.0,
     ) -> None:
         self.api_key = api_key
         self.api_secret = api_secret.encode() if api_secret else b""
@@ -88,6 +92,13 @@ class NativeExchangeClient:
         self.request_timeout_sec = request_timeout_sec
         self.retry = retry or RETRY_STANDARD
         self._session: Optional[aiohttp.ClientSession] = None  # type: ignore
+        self._throttled_until_ts: float = 0.0
+        self._last_error: str = ""
+        self._request_budget_window_sec = max(1.0, float(request_budget_window_sec))
+        self._request_budget_soft_limit = max(1, int(request_budget_soft_limit))
+        self._signed_request_cooldown_sec = max(0.0, float(signed_request_cooldown_sec))
+        self._request_events: list[tuple[float, int]] = []
+        self._last_signed_request_ts: float = 0.0
 
     # ──────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -149,6 +160,7 @@ class NativeExchangeClient:
         async with session.request(method, url, params=params, headers=headers) as resp:
             text = await resp.text()
             if resp.status >= 400:
+                self._record_error(resp.status, text)
                 raise ExchangeClientError(f"{method} {endpoint} → {resp.status}: {text[:200]}")
             try:
                 return await resp.json(content_type=None)
@@ -164,9 +176,123 @@ class NativeExchangeClient:
         signed: bool = False,
     ) -> Any:
         """Retrying wrapper around :py:meth:`_raw_request`."""
-        return await self.retry.call(
+        if self.is_throttled():
+            raise ExchangeClientError(
+                f"exchange throttled until {self._throttled_until_ts:.0f}: {self._last_error}"
+            )
+        self._enforce_local_budget(endpoint=endpoint, params=params, signed=signed)
+        weight = self._estimate_request_weight(endpoint=endpoint, params=params, signed=signed)
+        out = await self.retry.call(
             self._raw_request, method, endpoint, params=params, signed=signed
         )
+        self._record_request(weight=weight, signed=signed)
+        return out
+
+    def is_throttled(self) -> bool:
+        return self._throttled_until_ts > time.time()
+
+    def throttled_until_ts(self) -> float:
+        return self._throttled_until_ts
+
+    def last_error(self) -> str:
+        return self._last_error
+
+    def restore_throttle_state(self, *, until_ts: float = 0.0, reason: str = "") -> None:
+        """
+        Apply a previously persisted throttle window to this live client.
+
+        This lets startup honor a known ban/cooldown period before any new
+        signed or market-data REST calls are attempted.
+        """
+        until_ts = max(0.0, float(until_ts or 0.0))
+        if until_ts <= time.time():
+            return
+        self._throttled_until_ts = max(self._throttled_until_ts, until_ts)
+        if reason:
+            self._last_error = str(reason)
+
+    def _record_error(self, status: int, text: str) -> None:
+        self._last_error = f"{status}: {text[:200]}"
+        if status not in (418, 429):
+            return
+        until_ts = time.time() + (60.0 if status == 429 else 300.0)
+        match = re.search(r"until\s+(\d{10,13})", text)
+        if match:
+            raw = int(match.group(1))
+            until_ts = raw / 1000.0 if raw > 10_000_000_000 else float(raw)
+        self._throttled_until_ts = max(self._throttled_until_ts, until_ts)
+
+    def request_budget_snapshot(self) -> dict[str, float]:
+        now = time.time()
+        self._prune_request_events(now)
+        used = sum(weight for _ts, weight in self._request_events)
+        return {
+            "window_sec": self._request_budget_window_sec,
+            "soft_limit": float(self._request_budget_soft_limit),
+            "used_weight": float(used),
+            "remaining_weight": float(max(0, self._request_budget_soft_limit - used)),
+            "last_signed_request_ts": float(self._last_signed_request_ts),
+        }
+
+    def _enforce_local_budget(
+        self,
+        *,
+        endpoint: str,
+        params: Optional[dict[str, Any]],
+        signed: bool,
+    ) -> None:
+        now = time.time()
+        self._prune_request_events(now)
+        if signed and self._signed_request_cooldown_sec > 0:
+            since_last_signed = now - self._last_signed_request_ts
+            if 0 < since_last_signed < self._signed_request_cooldown_sec:
+                remaining = self._signed_request_cooldown_sec - since_last_signed
+                self._last_error = f"local signed-request cooldown active for {remaining:.1f}s"
+                raise ExchangeClientError(self._last_error)
+
+        weight = self._estimate_request_weight(endpoint=endpoint, params=params, signed=signed)
+        used = sum(w for _ts, w in self._request_events)
+        if used + weight > self._request_budget_soft_limit:
+            cooldown = min(self._request_budget_window_sec, 60.0)
+            self._throttled_until_ts = max(self._throttled_until_ts, now + cooldown)
+            self._last_error = (
+                f"local request budget exceeded: used={used} next={weight} "
+                f"limit={self._request_budget_soft_limit}"
+            )
+            raise ExchangeClientError(self._last_error)
+
+    def _record_request(self, *, weight: int, signed: bool) -> None:
+        now = time.time()
+        self._request_events.append((now, max(1, int(weight))))
+        self._prune_request_events(now)
+        if signed:
+            self._last_signed_request_ts = now
+
+    def _prune_request_events(self, now: float) -> None:
+        cutoff = now - self._request_budget_window_sec
+        self._request_events = [(ts, w) for ts, w in self._request_events if ts >= cutoff]
+
+    def _estimate_request_weight(
+        self,
+        *,
+        endpoint: str,
+        params: Optional[dict[str, Any]],
+        signed: bool,
+    ) -> int:
+        del signed
+        if endpoint == self.EP_ACCOUNT:
+            return 20
+        if endpoint == self.EP_EXCHANGE_INFO:
+            return 10
+        if endpoint == self.EP_KLINES:
+            return 2
+        if endpoint == self.EP_TICKER_PRICE:
+            return 1 if params and params.get("symbol") else 2
+        if endpoint == self.EP_ORDER:
+            return 4
+        if endpoint == self.EP_TIME:
+            return 1
+        return 1
 
     # ──────────────────────────────────────────────────────────────────
     # Public market data
@@ -219,6 +345,14 @@ class NativeExchangeClient:
     # Signed account / trading
     # ──────────────────────────────────────────────────────────────────
     async def get_account(self) -> dict[str, Any]:
+        # Paper mode: return simulated account
+        if self.api_key == "paper_key" or not self.api_secret:
+            return {
+                "balances": [{"asset": "USDT", "free": "1000.0", "locked": "0.0"}],
+                "canTrade": True,
+                "canDeposit": True,
+                "canWithdraw": True,
+            }
         return await self._request("GET", self.EP_ACCOUNT, signed=True)
 
     async def get_balance(self) -> dict[str, float]:

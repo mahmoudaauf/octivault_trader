@@ -60,6 +60,7 @@ from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
 from .polling_coordinator import NativePollingConfig, NativePollingCoordinator
 from .portfolio_manager import NativePortfolioManager
+from .position_hydration_engine import NativePositionHydrationEngine
 from .position_manager import NativePositionManager
 from .prometheus_exporter import NativePrometheusExporter
 from .recovery_engine import NativeRecoveryEngine
@@ -68,6 +69,7 @@ from .safety_order_manager import NativeSafetyOrderManager
 from .shared_state import NativeSharedState
 from .signal_fusion import NativeSignalFusion
 from .signals import NativeSignalEngine
+from .startup_state_machine import NativeStartupStateMachine
 from .telemetry_export import NativeTelemetryExporter
 from .tp_sl_engine import NativeTPSLEngine
 from .trade_journal import NativeTradeJournal
@@ -92,6 +94,7 @@ class BootstrapConfig:
     api_key: str
     api_secret: str
     testnet: bool = False
+    paper_mode: bool = False  # Paper mode: use simulated $1000 USDT balance
 
     # --- market data ---
     symbols: list[str] = field(
@@ -191,6 +194,7 @@ class BootstrapConfig:
             api_key=api_key,
             api_secret=api_secret,
             testnet=_bool(e.get("BINANCE_TESTNET"), default=False),
+            paper_mode=_bool(e.get("PAPER_MODE"), default=False),
             symbols=symbols,  # Empty list → auto-scan wallet during bootstrap
             symbol_discovery_enabled=symbol_discovery_enabled,
             symbol_discovery_interval_sec=_float(e.get("SYMBOL_DISCOVERY_INTERVAL_SEC"), 900.0),
@@ -261,9 +265,12 @@ ExchangeClientFactory = Callable[[BootstrapConfig], NativeExchangeClient]
 
 
 def _default_exchange_factory(cfg: BootstrapConfig) -> NativeExchangeClient:
+    # In paper mode, use sentinel keys to enable simulated trading
+    api_key = "paper_key" if cfg.paper_mode else cfg.api_key
+    api_secret = "paper_secret" if cfg.paper_mode else cfg.api_secret
     return NativeExchangeClient(
-        api_key=cfg.api_key,
-        api_secret=cfg.api_secret,
+        api_key=api_key,
+        api_secret=api_secret,
         testnet=cfg.testnet,
         request_timeout_sec=cfg.request_timeout_sec,
     )
@@ -530,6 +537,7 @@ async def build_components(
         stale_threshold_sec=cfg.stale_threshold_sec,
         klines_cache_size=cfg.klines_cache_size,
         shared_state=shared_state,  # Read prices from WebSocket if available
+        prime_on_start=cfg.testnet,
     )
 
     # L2: Optional WebSocket for real-time prices + klines (bypasses API rate limits)
@@ -712,13 +720,11 @@ async def build_components(
         min_order_usdt=cfg.min_order_usdt,
     )
 
-    # L4 TP/SL engine: per-symbol exit-target store. Replaces the
-    # compat null-stub for the ``tp_sl_engine`` app_ctx key consumed
-    # by DecisionEngine.evaluate_exit_signals.
+    # L4 TP/SL engine: Volatility-adaptive TP/SL with risk-based sizing
+    # Tier 1 features: ATR-based adaptation, risk-based position sizing, auto-arm
     tp_sl_engine_native = NativeTPSLEngine(
         shared_state=shared_state,
-        tp_pct=cfg.tp_pct,
-        sl_pct=cfg.sl_pct,
+        config=cfg,
     )
 
     # L4 safety order manager: per-symbol OCO intent store with
@@ -770,6 +776,25 @@ async def build_components(
             output_file=cfg.prometheus_export_path,
         )
 
+    # L0 Position hydration engine: Reconstructs portfolio state from trade journal on restart
+    # Reads all fills, calculates entry prices, restores TP/SL, computes realized/unrealized PnL
+    position_hydration_engine = NativePositionHydrationEngine(
+        shared_state=shared_state,
+        trade_journal=trade_journal,
+        exchange_client=exchange_client,
+        journal_dir=cfg.trade_journal_dir,
+        allow_exchange_fallback=True,
+        stale_position_age_sec=3600.0,
+        dust_threshold_usdt=1.0,
+    )
+
+    # L0 Startup state machine: Enforces strict startup progression
+    # BOOTING → HYDRATING → RECONCILING → VALIDATING → READY
+    # Blocks BUY decisions until READY state
+    startup_state_machine = NativeStartupStateMachine(
+        decision_engine=decision_engine,
+    )
+
     return NativeComponents(
         shared_state=shared_state,
         market_data=market_data,
@@ -796,6 +821,8 @@ async def build_components(
         trade_journal=trade_journal,
         prometheus_exporter=prometheus_exporter,
         fill_tracker=fill_tracker,
+        position_hydration_engine=position_hydration_engine,
+        startup_state_machine=startup_state_machine,
         adaptive_capital_engine=ace,
         polling_coordinator=polling_coordinator,
         objective_feedback_controller=ofc,
