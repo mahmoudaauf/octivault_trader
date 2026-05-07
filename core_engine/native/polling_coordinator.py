@@ -257,7 +257,12 @@ class NativePollingCoordinator:
             self.logger.debug("[PollingCoordinator] Open orders loop finished")
 
     async def _poll_balance_loop(self) -> None:
-        """Poll balance at BALANCE_INTERVAL_SEC intervals."""
+        """Poll balance at BALANCE_INTERVAL_SEC intervals.
+
+        Note: Balance polling is NOT gated by active trades (unlike orders/positions).
+        Balance is critical for NAV tracking and capital allocation, so we poll
+        continuously on schedule regardless of whether trades are open.
+        """
         self.logger.info(
             "[PollingCoordinator] Balance loop starting (interval=%.0fs)",
             self.config.balance_interval_sec,
@@ -266,10 +271,7 @@ class NativePollingCoordinator:
         try:
             while self._running:
                 try:
-                    if not await self._should_poll():
-                        await asyncio.sleep(1.0)
-                        continue
-
+                    # Balance polling is always allowed (not gated by active trades)
                     await self._fetch_and_sync_balance()
                     self._last_balance_poll = time.time()
                     self._poll_error_count["balance"] = 0
