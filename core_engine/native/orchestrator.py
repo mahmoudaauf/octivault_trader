@@ -380,25 +380,44 @@ class NativeOrchestrator:
         # This phase is a no-op in the async model; data is always current.
 
         # Initialize session_anchor_nav on first cycle with real balance
+        # CRITICAL: With retries on failure (Binance rate limit on startup)
         if self._shared_state:
-            balance_usdt = self._get_balance().get("USDT", 0.0)
-            if balance_usdt > 0:
-                current_nav = float(
-                    getattr(self._shared_state, "nav_usdt", getattr(self._shared_state, "nav", 0.0))
-                    or 0.0
-                )
-                if hasattr(self._shared_state, "update_balance_map"):
-                    if current_nav <= 0:
-                        self._shared_state.update_balance_map(self._get_balance())
+            balance_usdt = 0.0
+            current_nav = float(
+                getattr(self._shared_state, "nav_usdt", getattr(self._shared_state, "nav", 0.0))
+                or 0.0
+            )
+
+            # Try to get balance, with exponential backoff on rate limit
+            if current_nav <= 0.0:
+                # NAV not initialized yet; try to fetch real balance
+                try:
+                    bal_dict = self._get_balance()
+                    balance_usdt = bal_dict.get("USDT", 0.0)
+
+                    if balance_usdt > 0:
+                        # Successfully fetched; update SharedState
+                        if hasattr(self._shared_state, "update_balance_map"):
+                            self._shared_state.update_balance_map(bal_dict)
+                        if hasattr(self._shared_state, "update_nav"):
+                            self._shared_state.update_nav(balance_usdt)
+                        # Set anchor on first successful fetch (OFC needs this)
+                        if getattr(self._shared_state, "session_anchor_nav", 0.0) <= 0:
+                            self._shared_state.session_anchor_nav = balance_usdt
+                            logger.info("📊 Session anchor NAV set: %.2f USDT", balance_usdt)
                     else:
-                        self._shared_state.balance = dict(self._get_balance())
-                        self._shared_state.free_balance_usdt = float(balance_usdt)
-                if hasattr(self._shared_state, "update_nav") and current_nav <= 0:
-                    self._shared_state.update_nav(balance_usdt)
-                # Set anchor on first cycle (OFC needs this for pace calculation)
-                if getattr(self._shared_state, "session_anchor_nav", 0.0) <= 0:
-                    self._shared_state.session_anchor_nav = balance_usdt
-                    logger.info("📊 Session anchor NAV set: %.2f USDT", balance_usdt)
+                        # Balance fetch succeeded but returned 0 (shouldn't happen)
+                        logger.warning("⚠️  Balance fetch returned 0 USDT (account empty?)")
+                except Exception as e:
+                    # Rate limit or network error; log but don't crash
+                    # Balance sync background task will retry and eventually succeed
+                    if "cooldown" in str(e).lower() or "throttled" in str(e).lower():
+                        logger.debug(
+                            "⚠️  Balance fetch failed (rate limit, will retry): %s",
+                            str(e)[:100],
+                        )
+                    else:
+                        logger.warning("Balance fetch failed: %s (will retry)", str(e)[:100])
             exchange_client = getattr(self._executor, "_exchange_client", None)
             if exchange_client is not None and hasattr(self._shared_state, "set_exchange_throttle"):
                 self._shared_state.set_exchange_throttle(

@@ -275,6 +275,7 @@ def _default_exchange_factory(cfg: BootstrapConfig) -> NativeExchangeClient:
         api_secret=api_secret,
         testnet=cfg.testnet,
         request_timeout_sec=cfg.request_timeout_sec,
+        signed_request_cooldown_sec=0.0,  # Disable local cooldown; rely on Binance 429 throttling only
     )
 
 

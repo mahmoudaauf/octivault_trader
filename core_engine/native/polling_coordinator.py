@@ -365,7 +365,18 @@ class NativePollingCoordinator:
                 usdt_balance = float(balances.get("USDT", 0.0))
                 if usdt_balance > 0 and hasattr(self.shared_state, "free_balance_usdt"):
                     self.shared_state.free_balance_usdt = usdt_balance
-                self.logger.debug("[PollingCoordinator] Synced balance from exchange")
+                    # CRITICAL: Update nav_usdt so orchestrator and decision engine use real balance
+                    if hasattr(self.shared_state, "update_nav"):
+                        self.shared_state.update_nav(usdt_balance)
+                    # Set session anchor on first successful sync (if not already set)
+                    if getattr(self.shared_state, "session_anchor_nav", 0.0) <= 0:
+                        self.shared_state.session_anchor_nav = usdt_balance
+                        self.logger.info(
+                            "[PollingCoordinator] Session anchor NAV set: %.2f USDT", usdt_balance
+                        )
+                self.logger.debug(
+                    "[PollingCoordinator] Synced balance from exchange: %.2f USDT", usdt_balance
+                )
         except Exception as e:
             self._mark_throttle_state(e)
             self.logger.debug("[PollingCoordinator] Failed to fetch balance: %s", e)
