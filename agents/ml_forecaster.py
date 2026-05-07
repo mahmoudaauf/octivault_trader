@@ -81,12 +81,31 @@ if not logger.handlers:
 class MLForecaster:
     async def _get_market_data_safe(self, symbol: str, timeframe: str):
         fn = getattr(self.shared_state, "get_market_data", None)
-        if not callable(fn):
-            return None
-        data = fn(symbol, timeframe)
-        if asyncio.iscoroutine(data):
-            data = await data
-        return data
+        if callable(fn):
+            data = fn(symbol, timeframe)
+            if asyncio.iscoroutine(data):
+                data = await data
+            if data:
+                return data
+
+        market_data_feed = getattr(self, "market_data_feed", None)
+        get_klines = getattr(market_data_feed, "get_klines", None)
+        if callable(get_klines):
+            try:
+                fetch_limit = max(100, int(getattr(self, "_lookback_max", 160)) + 20)
+                data = get_klines(symbol, timeframe, fetch_limit)
+                if asyncio.iscoroutine(data):
+                    data = await data
+                return data
+            except Exception:
+                self.logger.debug(
+                    "[%s] market_data_feed.get_klines fallback failed for %s@%s",
+                    self.name,
+                    symbol,
+                    timeframe,
+                    exc_info=True,
+                )
+        return None
 
     """
     ML-based forecaster that PRODUCES signals and delegates execution to MetaController.
@@ -364,6 +383,20 @@ class MLForecaster:
         self._full_train_min_rows = int(
             self._cfg("ML_FULL_TRAIN_MIN_ROWS", os.getenv("ML_FULL_TRAIN_MIN_ROWS", 3000)) or 3000
         )
+        self._bootstrap_train_target_rows = int(
+            self._cfg(
+                "ML_BOOTSTRAP_TRAIN_TARGET_ROWS",
+                os.getenv("ML_BOOTSTRAP_TRAIN_TARGET_ROWS", 500),
+            )
+            or 500
+        )
+        self._bootstrap_train_min_rows = int(
+            self._cfg(
+                "ML_BOOTSTRAP_TRAIN_MIN_ROWS",
+                os.getenv("ML_BOOTSTRAP_TRAIN_MIN_ROWS", 180),
+            )
+            or 180
+        )
         self._retrain_max_rows = max(500, int(self._retrain_max_rows))
         self._retrain_default_epochs = max(3, min(5, int(self._retrain_default_epochs)))
         self._retrain_cpu_epoch_cap = max(3, int(self._retrain_cpu_epoch_cap))
@@ -377,6 +410,14 @@ class MLForecaster:
         )
         self._full_train_epochs = max(15, min(20, int(self._full_train_epochs)))
         self._full_train_cpu_epoch_cap = max(15, int(self._full_train_cpu_epoch_cap))
+        self._bootstrap_train_min_rows = max(
+            int(self._bootstrap_train_min_rows),
+            int(self._lookback_default) + 50,
+        )
+        self._bootstrap_train_target_rows = max(
+            int(self._bootstrap_train_target_rows),
+            int(self._bootstrap_train_min_rows),
+        )
         self._lookback_default = max(60, int(self._lookback_default))
         self._lookback_min = max(40, min(int(self._lookback_default), int(self._lookback_min)))
         self._lookback_max = max(int(self._lookback_default), int(self._lookback_max))
@@ -1089,8 +1130,16 @@ class MLForecaster:
                         self._load_model_metadata(model_path) if has_existing_model else {}
                     )
                     prior_val_acc = self._model_val_accuracy_from_metadata(prior_metadata)
-                    target_rows = max(int(self._full_train_target_rows), int(lookback) + 50)
-                    min_rows_required = max(int(self._full_train_min_rows), int(lookback) + 50)
+                    if has_existing_model:
+                        target_rows = max(int(self._full_train_target_rows), int(lookback) + 50)
+                        min_rows_required = max(int(self._full_train_min_rows), int(lookback) + 50)
+                    else:
+                        target_rows = max(
+                            int(self._bootstrap_train_target_rows), int(lookback) + 50
+                        )
+                        min_rows_required = max(
+                            int(self._bootstrap_train_min_rows), int(lookback) + 50
+                        )
                     ohlcv = await self._fetch_training_ohlcv(
                         sym,
                         timeframe,

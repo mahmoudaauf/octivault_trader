@@ -235,21 +235,24 @@ class NativeMarketDataWebSocket:
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         """Handle WebSocket message (non-blocking)."""
         try:
-            event_type = msg.get("e")
+            payload = msg.get("data") if isinstance(msg.get("data"), dict) else msg
+            event_type = payload.get("e")
 
             if event_type == "24hrTicker":
                 # Price update
-                symbol = msg.get("s", "").upper()
-                price = float(msg.get("c", 0))
+                symbol = payload.get("s", "").upper()
+                price = float(payload.get("c", 0))
                 if symbol and price > 0:
                     self._shared_state.price_cache[symbol] = price
                     self._shared_state.prices[symbol] = price
+                    if hasattr(self._shared_state, "_last_tick_timestamps"):
+                        self._shared_state._last_tick_timestamps[symbol] = time.time()
                     if hasattr(self._shared_state, "market_data_ready"):
                         self._shared_state.market_data_ready = True
 
             elif event_type == "kline":
                 # Kline update
-                data = msg.get("k", {})
+                data = payload.get("k", {})
                 symbol = data.get("s", "").upper()
                 interval = data.get("i", "1m")
                 is_closed = data.get("x", False)

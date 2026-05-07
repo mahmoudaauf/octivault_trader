@@ -382,7 +382,7 @@ class ModelTrainer:
 
             # Log distribution
             unique, counts = np.unique(labels, return_counts=True)
-            label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist(), strict=False))
+            label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist()))
             self.logger.info(
                 f"[ML DEBUG] Triple Barrier Labels: fee={fee_pct:.4f} "
                 f"slippage={slippage_pct:.4f} buffer={buffer_pct:.4f} "
@@ -652,7 +652,7 @@ class ModelTrainer:
 
         # === DEBUG LABEL DISTRIBUTION ===
         unique, counts = np.unique(y, return_counts=True)
-        label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist(), strict=False))
+        label_dist = dict(zip(unique.astype(int).tolist(), counts.tolist()))
         self.logger.info(f"[ML DEBUG] Label distribution for {self.symbol}: {label_dist}")
         # ================================
 
@@ -673,7 +673,7 @@ class ModelTrainer:
         # DEBUG validation distribution
         if has_validation and y_val is not None:
             unique_val, counts_val = np.unique(y_val, return_counts=True)
-            val_dist = dict(zip(unique_val.astype(int).tolist(), counts_val.tolist(), strict=False))
+            val_dist = dict(zip(unique_val.astype(int).tolist(), counts_val.tolist()))
             self.logger.info(f"[ML DEBUG] Validation distribution for {self.symbol}: {val_dist}")
 
         # Leakage fix: fit feature scalers on training split only, then transform train/val.
@@ -784,13 +784,13 @@ class ModelTrainer:
             weights = compute_class_weight(
                 class_weight="balanced", classes=unique_labels, y=y_train
             )
-            class_weights = dict(zip(unique_labels.astype(int), weights, strict=False))
+            class_weights = dict(zip(unique_labels.astype(int), weights))
         else:
             # Fallback to manual calculation if sklearn is unavailable
             unique_labels, counts = np.unique(y_train, return_counts=True)
             total_samples = len(y_train)
             class_weights = {}
-            for label, count in zip(unique_labels, counts, strict=False):
+            for label, count in zip(unique_labels, counts):
                 class_weights[int(label)] = total_samples / (len(unique_labels) * count)
 
         if len(class_weights) > 1:

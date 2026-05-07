@@ -83,6 +83,15 @@ class TestNativeSharedState:
         expected = 1.0 * 2360 + 0.1 * 630
         assert abs(portfolio_value - expected) < 0.01
 
+    def test_dict_backed_positions_are_counted_in_portfolio_value_and_qty(self):
+        state = NativeSharedState()
+        state.positions = {
+            "BNBUSDT": {"qty": 0.5, "entry_price": 600.0, "mark_price": 650.0},
+        }
+
+        assert state.get_position_qty("BNBUSDT") == 0.5
+        assert abs(state.get_portfolio_value() - 325.0) < 0.01
+
     def test_symbol_management(self):
         """Test symbol tracking"""
         state = NativeSharedState()
@@ -112,6 +121,12 @@ class TestNativeSharedState:
 
         state.mark_order_filled("12345")
         assert state.open_orders["12345"].status == "FILLED"
+
+    def test_price_update_marks_tick_freshness(self):
+        state = NativeSharedState()
+        state.update_price("btcusdt", 65000.0)
+        assert state.get_price("BTCUSDT") == 65000.0
+        assert "BTCUSDT" in state._last_tick_timestamps
 
     @pytest.mark.asyncio
     async def test_hydration_ready_event(self):

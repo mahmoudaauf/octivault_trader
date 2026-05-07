@@ -115,8 +115,17 @@ class Engines:
                 await eng.shutdown()
             except Exception as e:
                 log.warning("shutdown error in %s: %s", eng.__class__.__name__, e)
-        await self.operations.shutdown_system()
         log.info("✅ Clean shutdown complete")
+
+
+def _is_real_execution_result(result: Any) -> bool:
+    """Count only actual placed/filled execution outcomes as executions."""
+    if not result:
+        return False
+    success = getattr(result, "success", None)
+    if success is None and isinstance(result, dict):
+        success = result.get("success")
+    return bool(success)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -260,7 +269,7 @@ async def trading_cycle(
     if mode != "dry-run":
         for decision in trading_decisions:
             order_result = await engines.execution.execute_decision(decision)
-            if order_result:
+            if _is_real_execution_result(order_result):
                 executed_orders.append(order_result)
     execute_complete = True
 

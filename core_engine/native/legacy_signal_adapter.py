@@ -121,8 +121,11 @@ class LegacySignalAdapter:
                 if not symbol:
                     continue
 
-                # Map signal_type to action
-                signal_type = str(sig.get("signal_type", "BUY")).upper()
+                # MLForecaster currently emits ``action``/``side`` in buffered
+                # signals, while some older paths use ``signal_type``.
+                signal_type = str(
+                    sig.get("signal_type", sig.get("action", sig.get("side", "BUY")))
+                ).upper()
                 action = "BUY" if signal_type in ("BUY", "LONG") else "SELL"
 
                 # Confidence

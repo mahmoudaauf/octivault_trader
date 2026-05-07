@@ -195,6 +195,11 @@ def load_runtime_state(shared_state: Any, input_path: Path) -> bool:
             str(k).upper(): float(v or 0.0) for k, v in (payload.get("prices", {}) or {}).items()
         }
         shared_state.price_cache = dict(shared_state.prices)
+        now_ts = time.time()
+        if hasattr(shared_state, "_last_tick_timestamps"):
+            shared_state._last_tick_timestamps = {
+                str(sym).upper(): now_ts for sym in shared_state.prices
+            }
         shared_state.session_anchor_nav = float(
             account_payload.get("session_anchor_nav", 0.0) or 0.0
         )

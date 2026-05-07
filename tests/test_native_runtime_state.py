@@ -30,6 +30,7 @@ def test_runtime_state_export_and_restore(tmp_path: Path) -> None:
     assert restored.nav_usdt == 150.0
     assert restored.balance["USDT"] == 123.45
     assert restored.prices["BTCUSDT"] == 65000.0
+    assert "BTCUSDT" in restored._last_tick_timestamps
     assert restored.exchange_throttled is True
     assert restored.get_position("BTCUSDT") is not None
 

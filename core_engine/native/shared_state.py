@@ -78,6 +78,7 @@ class NativeSharedState:
         self.prices: dict[str, float] = {}
         self.market_data: dict[tuple[str, str], list[dict]] = {}
         self.market_data_ready: bool = False
+        self._last_tick_timestamps: dict[str, float] = {}
 
         # Position tracking
         self.positions: dict[str, Position] = {}  # symbol -> Position
@@ -161,13 +162,38 @@ class NativeSharedState:
         """Get position by symbol"""
         return self.positions.get(symbol)
 
+    def get_position_qty(self, symbol: str) -> float:
+        """Return position quantity for object- or dict-backed positions."""
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return 0.0
+        qty = getattr(pos, "qty", None)
+        if qty is None and isinstance(pos, dict):
+            qty = pos.get("qty", 0.0)
+        return float(qty or 0.0)
+
+    def get_position_quantity(self, symbol: str) -> float:
+        """Compatibility alias for legacy callers."""
+        return self.get_position_qty(symbol)
+
     def get_all_positions(self) -> dict[str, Position]:
         """Get all positions"""
         return self.positions.copy()
 
     def get_portfolio_value(self) -> float:
         """Total value of all positions"""
-        return sum(pos.position_value for pos in self.positions.values())
+        total = 0.0
+        for pos in self.positions.values():
+            if isinstance(pos, dict):
+                qty = float(pos.get("qty", 0.0) or 0.0)
+                mark = float(
+                    pos.get("mark_price", pos.get("current_price", pos.get("avg_price", 0.0)))
+                    or 0.0
+                )
+                total += qty * mark
+            else:
+                total += float(getattr(pos, "position_value", 0.0) or 0.0)
+        return total
 
     # ==================== Order Management ====================
 
@@ -200,8 +226,13 @@ class NativeSharedState:
     def update_price(self, symbol: str, price: float):
         """Update latest price for symbol"""
         if price > 0:
-            self.price_cache[symbol] = price
-            self.prices[symbol] = price
+            import time
+
+            symbol_key = str(symbol or "").upper()
+            now = time.time()
+            self.price_cache[symbol_key] = price
+            self.prices[symbol_key] = price
+            self._last_tick_timestamps[symbol_key] = now
 
     def get_price(self, symbol: str) -> float:
         """Get latest price for symbol"""

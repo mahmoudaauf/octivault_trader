@@ -23,28 +23,60 @@
     },
     "free_balance_usdt": 1.0,
     "invested_capital_usdt": 0.0,
-    "nav_usdt": 1.0,
+    "nav_usdt": 85.2276261957,
     "session_anchor_nav": 1.0,
-    "ts": 1778176171.102737
+    "ts": 1778179824.53432
   },
   "metrics": {
     "avg_fee_bps": 0.0,
     "avg_net_profit_bps": 0.0,
     "avg_slippage_bps": 0.0,
-    "last_hydration_time": 0.7857720851898193,
+    "last_hydration_time": 0.6381151676177979,
     "last_update_ts": 0.0,
     "peak_nav": 0.0,
-    "portfolio_value": 0,
-    "positions_count": 0,
-    "realized_pnl": 0,
+    "portfolio_value": 84.2276261957,
+    "positions_count": 4,
+    "realized_pnl": 0.0,
     "session_elapsed_h": 493935.7638368778,
     "trades_in_window": 0,
-    "unrealized_pnl": 0,
+    "unrealized_pnl": 0.0,
     "win_rate_window": 0.5
   },
-  "nav_usdt": 1.0,
-  "positions": {},
-  "prices": {},
+  "nav_usdt": 85.2276261957,
+  "positions": {
+    "AVAXUSDT": {
+      "entry_price": 0.0,
+      "mark_price": 0.0,
+      "qty": 0.0
+    },
+    "BNBUSDT": {
+      "entry_price": 0.0,
+      "mark_price": 0.0,
+      "qty": 0.0
+    },
+    "DOGEUSDT": {
+      "entry_price": 0.0,
+      "mark_price": 0.0,
+      "qty": 0.0
+    },
+    "PEPEUSDT": {
+      "entry_price": 0.0,
+      "mark_price": 0.0,
+      "qty": 0.0
+    }
+  },
+  "prices": {
+    "ADAUSDT": 0.2624,
+    "AVAXUSDT": 9.47,
+    "BNBUSDT": 642.31,
+    "BTCUSDT": 80028.18,
+    "DOGEUSDT": 0.10788,
+    "ETHUSDT": 2292.47,
+    "LINKUSDT": 9.89,
+    "PEPEUSDT": 4.15e-06,
+    "SOLUSDT": 88.38,
+    "XRPUSDT": 1.3893
+  },
   "session_anchor_nav": 1.0,
-  "ts": 1778176171.102737
+  "ts": 1778179824.53432
 }

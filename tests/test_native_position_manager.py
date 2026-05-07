@@ -103,6 +103,18 @@ async def test_get_position_returns_none_for_zero_qty() -> None:
     assert await pm.get_position("BTCUSDT") is None
 
 
+@pytest.mark.asyncio
+async def test_get_position_supports_dict_backed_hydrated_positions() -> None:
+    state = NativeSharedState()
+    state.positions = {
+        "BNBUSDT": {"qty": 0.25, "entry_price": 600.0, "mark_price": 650.0},
+    }
+    pm = NativePositionManager(state)
+    pos = await pm.get_position("BNBUSDT")
+    assert isinstance(pos, dict)
+    assert pos["qty"] == 0.25
+
+
 # ----------------------------------------------------------------------
 # analyze_position — schema + numerics
 # ----------------------------------------------------------------------
@@ -135,6 +147,21 @@ async def test_analyze_position_computes_pnl_correctly() -> None:
     assert result["current_price"] == 12_000.0
     assert result["p_and_l"] == 2_000.0
     assert result["p_and_l_pct"] == pytest.approx(20.0)
+
+
+@pytest.mark.asyncio
+async def test_analyze_position_supports_dict_backed_hydrated_positions() -> None:
+    state = NativeSharedState()
+    state.positions = {
+        "BNBUSDT": {"qty": 0.5, "entry_price": 600.0, "mark_price": 660.0},
+    }
+    pm = NativePositionManager(state, risk_high_pct=10.0, risk_med_pct=3.0)
+    result = await pm.analyze_position("BNBUSDT")
+    assert result["quantity"] == 0.5
+    assert result["entry_price"] == 600.0
+    assert result["current_price"] == 660.0
+    assert result["p_and_l"] == pytest.approx(30.0)
+    assert result["p_and_l_pct"] == pytest.approx(10.0)
 
 
 # ----------------------------------------------------------------------

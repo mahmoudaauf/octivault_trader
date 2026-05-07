@@ -46,6 +46,7 @@ from .app_context import NativeComponents
 from .arbitration_engine import NativeArbitrationEngine
 from .balance_sync import NativeBalanceSync
 from .balance_validator import NativeBalanceValidator
+from .bounded_cache import NativeBoundedCache
 from .capital_allocator import NativeCapitalAllocator
 from .decisions import NativeDecisionEngine
 from .exchange_client import NativeExchangeClient
@@ -97,6 +98,7 @@ class BootstrapConfig:
     api_secret: str
     testnet: bool = False
     paper_mode: bool = False  # Paper mode: use simulated $1000 USDT balance
+    synthetic_live_signals_enabled: bool = False  # Explicit opt-in for live synthetic signals
 
     # --- market data ---
     symbols: list[str] = field(
@@ -108,6 +110,7 @@ class BootstrapConfig:
     symbol_discovery_empty_retry_sec: float = 300.0
     klines_cache_size: int = 64
     stale_threshold_sec: float = 30.0
+    signal_adapter_timeout_sec: float = 20.0
 
     # --- polling (legacy-style staggered with active-trades gate, not aggressive REST polling) ---
     polling_enabled: bool = True
@@ -197,6 +200,9 @@ class BootstrapConfig:
             api_secret=api_secret,
             testnet=_bool(e.get("BINANCE_TESTNET"), default=False),
             paper_mode=_bool(e.get("PAPER_MODE"), default=False),
+            synthetic_live_signals_enabled=_bool(
+                e.get("SYNTHETIC_LIVE_SIGNALS_ENABLED"), default=False
+            ),
             symbols=symbols,  # Empty list → auto-scan wallet during bootstrap
             symbol_discovery_enabled=symbol_discovery_enabled,
             symbol_discovery_interval_sec=_float(e.get("SYMBOL_DISCOVERY_INTERVAL_SEC"), 900.0),
@@ -206,6 +212,7 @@ class BootstrapConfig:
             market_data_poll_sec=_float(e.get("MARKET_DATA_POLL_SEC"), 2.0),
             klines_cache_size=_int(e.get("KLINES_CACHE_SIZE"), 64),
             stale_threshold_sec=_float(e.get("STALE_THRESHOLD_SEC"), 30.0),
+            signal_adapter_timeout_sec=_float(e.get("SIGNAL_ADAPTER_TIMEOUT_SEC"), 20.0),
             balance_poll_sec=_float(e.get("BALANCE_POLL_SEC"), 5.0),
             balance_min_refresh_interval_sec=_float(
                 e.get("BALANCE_MIN_REFRESH_INTERVAL_SEC"), 60.0
@@ -514,6 +521,7 @@ async def build_components(
     symbol_discoverer = None
     if symbols:
         logger.info("Using %d symbols from config (explicit override)", len(symbols))
+        shared_state.set_accepted_symbols(symbols)
     elif cfg.symbol_discovery_enabled:
         logger.info("📱 Symbol discovery: will scan wallet each cycle (not at bootstrap)")
         from .symbol_discovery import NativeSymbolDiscovery
@@ -597,21 +605,23 @@ async def build_components(
     # L3
     signal_engine = NativeSignalEngine(cooldown_sec=cfg.signal_cooldown_sec)
 
-    # L3: Paper mode signal generator (for synthetic signals when legacy agents unavailable)
-    # Enabled in both paper mode AND live mode (until legacy agents are wired)
+    # L3: Paper mode signal generator (for synthetic signals when explicitly allowed)
     paper_signal_gen: PaperModeSignalGenerator | None = None
     logger.info(f"[Bootstrap] paper_mode={cfg.paper_mode}, symbols={len(cfg.symbols)}")
-    # Enable paper signals when: (1) in paper mode, OR (2) no legacy signal manager available
-    enable_paper_signals = cfg.paper_mode or True  # Always enable until legacy agents wired
+    enable_paper_signals = cfg.paper_mode or cfg.synthetic_live_signals_enabled
     if enable_paper_signals and cfg.symbols:
         paper_signal_gen = PaperModeSignalGenerator(
             config=cfg,
             symbols=cfg.symbols,
             enabled=True,
         )
-        logger.info("📊 Paper mode signal generator enabled (%d symbols)", len(cfg.symbols))
+        logger.info(
+            "📊 Synthetic signal generator enabled (%d symbols, paper_mode=%s)",
+            len(cfg.symbols),
+            cfg.paper_mode,
+        )
     elif cfg.symbols:
-        logger.info("⚠️  Paper signals disabled but no legacy agents available")
+        logger.info("📊 Synthetic signal generator disabled for this run")
 
     # L3: Legacy signal agents (MLForecaster, SymbolScreener)
     ml_forecaster = None
@@ -667,6 +677,7 @@ async def build_components(
         shared_state=shared_state,
         ml_forecaster=ml_forecaster,
         symbol_screener=symbol_screener,
+        timeout_sec=cfg.signal_adapter_timeout_sec,
     )
 
     # L4
@@ -846,6 +857,7 @@ async def build_components(
         watchdog=watchdog,
         mode_manager=mode_manager,
     )
+    bounded_cache = NativeBoundedCache()
 
     # L0-L7 observability enhancements (legacy features ported)
     # Trade journal: crash-safe, immutable JSONL audit trail
@@ -895,6 +907,7 @@ async def build_components(
         arbitration_engine=arbitration_engine,
         market_regime_detector=market_regime_detector,
         health_monitor=health_monitor,
+        bounded_cache=bounded_cache,
         position_manager=position_manager,
         tp_sl_engine=tp_sl_engine_native,
         safety_order_manager=safety_order_manager,

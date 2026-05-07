@@ -44,6 +44,8 @@ def _classify_model_load_error(exc: Exception) -> tuple[bool, str]:
             "error when deserializing class 'inputlayer'",
             "unrecognized keyword arguments: ['batch_shape']",
             "unrecognized keyword arguments: ['batch_input_shape']",
+            "unrecognized keyword arguments passed to gru",
+            "time_major",
         ],
         "legacy_keras_deserialization": [
             "could not deserialize",

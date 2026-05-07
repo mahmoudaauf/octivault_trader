@@ -389,18 +389,19 @@ class NativePollingCoordinator:
             return True
         active_orders = len(getattr(self.shared_state, "open_orders", {}) or {})
         active_positions = len(getattr(self.shared_state, "positions", {}) or {})
-        if active_orders > 0:
+        # Always poll on every cycle if we have active trades
+        if active_orders > 0 or active_positions > 0:
             return False
+        # No active trades: during startup (2 min grace), always poll every 40s
+        if (time.time() - self._startup_ts) < 120.0:
+            return False
+        # After 2 minutes of idle (no trades): sparse polling every 30 minutes
+        # Check if we've ever polled before and how recently
         last_balance_poll = float(self._last_balance_poll or 0.0)
-        if active_positions > 0:
-            return last_balance_poll > 0 and (time.time() - last_balance_poll) < max(
-                self.config.balance_interval_sec,
-                600.0,
-            )
-        return last_balance_poll > 0 and (time.time() - last_balance_poll) < max(
-            self.config.balance_interval_sec,
-            1800.0,
-        )
+        if last_balance_poll <= 0:
+            return False  # Never polled: do it now
+        # Polled before: only skip if within 30-minute window
+        return (time.time() - last_balance_poll) < 1800.0
 
     async def _fetch_and_sync_positions(self) -> None:
         """Sync position marks from shared-state prices.

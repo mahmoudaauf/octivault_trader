@@ -31,6 +31,7 @@ class SignalManagerBridge:
         shared_state: Any | None = None,
         ml_forecaster: Any | None = None,
         symbol_screener: Any | None = None,
+        timeout_sec: float = 10.0,
     ):
         """
         Initialize the signal manager bridge.
@@ -65,7 +66,7 @@ class SignalManagerBridge:
                     ml_forecaster=ml_forecaster,
                     symbol_screener=symbol_screener,
                     shared_state=shared_state,
-                    timeout_sec=10.0,
+                    timeout_sec=timeout_sec,
                 )
                 self._sources_active["legacy_adapter"] = True
             except Exception as e:

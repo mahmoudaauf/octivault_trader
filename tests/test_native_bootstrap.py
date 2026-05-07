@@ -83,6 +83,7 @@ def test_bootstrap_config_defaults():
     assert cfg.testnet is False
     assert cfg.symbols == []
     assert cfg.market_data_poll_sec == 2.0
+    assert cfg.signal_adapter_timeout_sec == 20.0
     assert cfg.balance_poll_sec == 5.0
     assert cfg.telemetry_capacity == 1024
     assert cfg.runtime_state_path == "runtime_state_snapshot.json"
@@ -130,6 +131,7 @@ def test_from_env_parses_full_environment():
         "TELEMETRY_CAPACITY": "256",
         "DURATION_SEC": "1800",
         "REQUEST_TIMEOUT_SEC": "5",
+        "SIGNAL_ADAPTER_TIMEOUT_SEC": "17",
     }
     cfg = BootstrapConfig.from_env(env=env)
     assert cfg.api_key == "key123"
@@ -148,6 +150,7 @@ def test_from_env_parses_full_environment():
     assert cfg.telemetry_capacity == 256
     assert cfg.duration_sec == 1800.0
     assert cfg.request_timeout_sec == 5.0
+    assert cfg.signal_adapter_timeout_sec == 17.0
 
 
 def test_from_env_falls_back_on_malformed_numbers():
@@ -172,6 +175,17 @@ def test_from_env_bool_variants():
     for falsy in ("false", "0", "no", "off", ""):
         cfg = BootstrapConfig.from_env(env={**base, "BINANCE_TESTNET": falsy})
         assert cfg.testnet is False, falsy
+
+
+def test_from_env_parses_synthetic_live_signals_flag():
+    cfg = BootstrapConfig.from_env(
+        env={
+            "BINANCE_API_KEY": "k",
+            "BINANCE_API_SECRET": "s",
+            "SYNTHETIC_LIVE_SIGNALS_ENABLED": "true",
+        }
+    )
+    assert cfg.synthetic_live_signals_enabled is True
 
 
 def test_from_env_handles_empty_symbols_string():
@@ -203,10 +217,36 @@ async def test_build_components_returns_wired_native_components():
     assert components.arbitration_engine is not None
     assert components.market_regime_detector is not None
     assert components.health_monitor is not None
+    assert components.bounded_cache is not None
     # Telemetry capacity propagated
     assert components.telemetry.capacity == cfg.telemetry_capacity
     # Exchange client surfaced as first-class field (used by safe_execution_engine)
     assert components.exchange_client is not None
+
+
+@pytest.mark.asyncio
+async def test_build_native_app_ctx_exposes_bounded_cache():
+    cfg = _min_cfg()
+    components = await build_components(cfg, exchange_client_factory=_stub_factory)
+    app_ctx, _ = build_native_app_ctx(components)
+    assert "bounded_cache" in app_ctx
+    assert app_ctx["bounded_cache"] is components.bounded_cache
+
+
+@pytest.mark.asyncio
+async def test_build_components_disables_synthetic_signals_in_live_mode_by_default():
+    cfg = _min_cfg(paper_mode=False, synthetic_live_signals_enabled=False)
+    components = await build_components(cfg, exchange_client_factory=_stub_factory)
+    bridge = components.signal_manager_bridge
+    assert bridge is not None
+    assert bridge.get_sources_status().get("paper_mode") is False
+
+
+@pytest.mark.asyncio
+async def test_build_components_seeds_accepted_symbols_from_explicit_config():
+    cfg = _min_cfg(symbols=["BTCUSDT", "ETHUSDT"])
+    components = await build_components(cfg, exchange_client_factory=_stub_factory)
+    assert components.shared_state.get_accepted_symbols() == {"BTCUSDT", "ETHUSDT"}
 
 
 @pytest.mark.asyncio

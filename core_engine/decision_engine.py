@@ -21,7 +21,6 @@ This engine abstracts and coordinates:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -181,44 +180,12 @@ class DecisionEngine:
         Returns:
             TradeDecision if decision made, None if no position to sell
         """
-        try:
-            # Step 1: Check if we have a position
-            position_manager = self.app_ctx.get("position_manager")
-
-            if position_manager:
-                # Get position (L3)
-                # position = await position_manager.get_position(symbol)
-                # if not position or position.quantity <= 0:
-                #     return None
-                pass
-
-            # Step 2: Arbitrate sell signal (if signal-based)
-            if "SIGNAL" in reason:
-                arb_result = await self.evaluate_signal(symbol, "SELL", signal_edge)
-
-                if not arb_result.passed:
-                    self.logger.debug(
-                        f"🚫 SELL signal rejected for {symbol}: "
-                        f"gates blocked: {arb_result.blocking_gates}"
-                    )
-                    return None
-
-            # Step 3: Create decision
-            decision = TradeDecision(
-                symbol=symbol,
-                action="SELL",
-                quantity=0.0,  # Sell all
-                reason=reason or f"Signal edge: {signal_edge:.3f}",
-                confidence=abs(signal_edge),
-                timestamp=asyncio.get_event_loop().time(),
-                mode=await self.get_current_mode(),
-            )
-
-            self.logger.info(f"✅ SELL decision: {symbol} (reason: {reason})")
-            return decision
-        except Exception as e:
-            self.logger.error(f"❌ Error making SELL decision for {symbol}: {e}")
-            return None
+        return await DecisionEngineImpl.make_sell_decision(
+            self.app_ctx,
+            symbol,
+            signal_edge,
+            reason or "signal",
+        )
 
     async def evaluate_exit_signals(self, symbol: str) -> Optional[TradeDecision]:
         """

@@ -86,7 +86,10 @@ class NativePositionManager:
         pos = positions.get(symbol)
         if pos is None:
             return None
-        qty = float(getattr(pos, "qty", 0.0) or 0.0)
+        qty = getattr(pos, "qty", None)
+        if qty is None and isinstance(pos, dict):
+            qty = pos.get("qty", 0.0)
+        qty = float(qty or 0.0)
         if qty == 0.0:
             return None
         return pos
@@ -111,9 +114,14 @@ class NativePositionManager:
         if pos is None:
             return empty
 
-        qty = float(getattr(pos, "qty", 0.0) or 0.0)
-        entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
-        mark = float(getattr(pos, "mark_price", 0.0) or 0.0)
+        if isinstance(pos, dict):
+            qty = float(pos.get("qty", 0.0) or 0.0)
+            entry = float(pos.get("entry_price", pos.get("avg_price", 0.0)) or 0.0)
+            mark = float(pos.get("mark_price", pos.get("current_price", 0.0)) or 0.0)
+        else:
+            qty = float(getattr(pos, "qty", 0.0) or 0.0)
+            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            mark = float(getattr(pos, "mark_price", 0.0) or 0.0)
         value = qty * mark
         pnl = (mark - entry) * qty if (entry > 0 and mark > 0) else 0.0
         pnl_pct = ((mark - entry) / entry * 100.0) if entry > 0 else 0.0

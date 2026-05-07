@@ -13,6 +13,7 @@ import pytest
 
 from core_engine.native import NativeMarketData
 from core_engine.native.exchange_client import ExchangeClientError
+from core_engine.native.market_data_websocket import NativeMarketDataWebSocket
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -220,3 +221,55 @@ class TestNativeMarketDataKlines:
         await md.get_klines("BTCUSDT", "1m", 50)
         # 3 distinct (sym, interval, limit) tuples ⇒ 3 client calls
         assert stub.kline_calls == 3
+
+
+class _WsState:
+    def __init__(self) -> None:
+        self.price_cache: dict[str, float] = {}
+        self.prices: dict[str, float] = {}
+        self.market_data: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.market_data_ready = False
+
+
+class TestNativeMarketDataWebSocket:
+    @pytest.mark.asyncio
+    async def test_handle_message_unwraps_multiplex_ticker_payload(self) -> None:
+        state = _WsState()
+        ws = NativeMarketDataWebSocket(exchange_client=object(), shared_state=state, symbols=[])
+        await ws._handle_message(
+            {
+                "stream": "btcusdt@ticker",
+                "data": {"e": "24hrTicker", "s": "BTCUSDT", "c": "65000.12"},
+            }
+        )
+        assert state.prices["BTCUSDT"] == 65000.12
+        assert state.price_cache["BTCUSDT"] == 65000.12
+        assert state.market_data_ready is True
+
+    @pytest.mark.asyncio
+    async def test_handle_message_unwraps_multiplex_kline_payload(self) -> None:
+        state = _WsState()
+        ws = NativeMarketDataWebSocket(exchange_client=object(), shared_state=state, symbols=[])
+        await ws._handle_message(
+            {
+                "stream": "btcusdt@kline_1m",
+                "data": {
+                    "e": "kline",
+                    "k": {
+                        "s": "BTCUSDT",
+                        "i": "1m",
+                        "x": True,
+                        "t": 1_700_000_000_000,
+                        "o": "1.0",
+                        "h": "2.0",
+                        "l": "0.5",
+                        "c": "1.5",
+                        "v": "10.0",
+                    },
+                },
+            }
+        )
+        assert ("BTCUSDT", "1m") in state.market_data
+        candle = state.market_data[("BTCUSDT", "1m")][0]
+        assert candle["close"] == 1.5
+        assert state.market_data_ready is True

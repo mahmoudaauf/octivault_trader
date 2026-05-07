@@ -145,6 +145,43 @@ async def test_hydration_engine_applies_to_shared_state():
     assert ss.positions["AVAXUSDT"]["entry_price"] == 100.0
 
 
+@pytest.mark.asyncio
+async def test_hydration_engine_marks_unattributed_spot_balances_to_market(tmp_path):
+    """Non-USDT spot balances should contribute to NAV even without journal fills."""
+    ss = NativeSharedState()
+    ss.prices = {
+        "AVAXUSDT": 10.0,
+        "DOGEUSDT": 0.1,
+    }
+    engine = NativePositionHydrationEngine(
+        shared_state=ss,
+        trade_journal=None,
+        exchange_client=None,
+        journal_dir=str(tmp_path),
+    )
+
+    engine._exchange = AsyncMock()
+    engine._exchange.get_account = AsyncMock(
+        return_value={
+            "balances": [
+                {"asset": "USDT", "free": "1.0", "locked": "0.0"},
+                {"asset": "AVAX", "free": "4.0", "locked": "0.0"},
+                {"asset": "DOGE", "free": "100.0", "locked": "0.0"},
+            ]
+        }
+    )
+
+    state = await engine.hydrate()
+
+    assert state.success
+    assert "AVAXUSDT" in state.positions
+    assert "DOGEUSDT" in state.positions
+    assert state.positions["AVAXUSDT"].lifecycle_state == "UNATTRIBUTED"
+    assert state.positions["DOGEUSDT"].lifecycle_state == "UNATTRIBUTED"
+    assert state.portfolio_value == pytest.approx(50.0)
+    assert state.total_balance_usdt == pytest.approx(1.0)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Test Startup State Machine
 # ──────────────────────────────────────────────────────────────────────────────

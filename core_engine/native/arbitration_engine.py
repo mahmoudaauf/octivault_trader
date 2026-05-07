@@ -154,9 +154,12 @@ class NativeArbitrationEngine:
         free_usdt = float(getattr(self._shared_state, "free_balance_usdt", 0.0) or 0.0)
         price_cache = dict(getattr(self._shared_state, "price_cache", {}) or {})
         positions_raw = getattr(self._shared_state, "positions", {}) or {}
-        positions = {
-            sym: float(getattr(pos, "qty", pos) or 0.0) for sym, pos in positions_raw.items()
-        }
+        positions: dict[str, float] = {}
+        for sym, pos in positions_raw.items():
+            qty = getattr(pos, "qty", None)
+            if qty is None and isinstance(pos, dict):
+                qty = pos.get("qty", 0.0)
+            positions[sym] = float(qty or 0.0)
         balances = dict(getattr(self._shared_state, "balance", {}) or {})
         if nav <= 0.0:
             nav = free_usdt + sum(

@@ -401,7 +401,9 @@ class SituationEngineImpl:
         # Try signal_manager_bridge first (integrates legacy + paper signals)
         signal_bridge = app_ctx.get("signal_manager_bridge")
         if signal_bridge:
-            logger.debug(f"[SignalBridge] Found bridge, has get_all_signals: {hasattr(signal_bridge, 'get_all_signals')}")
+            logger.debug(
+                f"[SignalBridge] Found bridge, has get_all_signals: {hasattr(signal_bridge, 'get_all_signals')}"
+            )
             if hasattr(signal_bridge, "get_all_signals"):
                 try:
                     if symbol:
@@ -414,7 +416,7 @@ class SituationEngineImpl:
                 except Exception as e:
                     logger.debug(f"⚠️ Error getting signals from bridge: {e}")
         else:
-            logger.debug(f"[SignalBridge] signal_manager_bridge NOT in app_ctx")
+            logger.debug("[SignalBridge] signal_manager_bridge NOT in app_ctx")
 
         # Fallback to legacy signal_manager
         signal_manager = app_ctx.get("signal_manager")
@@ -861,9 +863,17 @@ class DecisionEngineImpl:
                     logger.debug(f"⚠️ No open position for {symbol}")
                     return None
 
-                quantity = float(getattr(pos, "qty", 0.0) or 0.0)
-                entry_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
-                current_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
+                if isinstance(pos, dict):
+                    quantity = float(pos.get("qty", 0.0) or 0.0)
+                    entry_price = float(pos.get("entry_price", pos.get("avg_price", 0.0)) or 0.0)
+                    current_price = float(
+                        pos.get("mark_price", pos.get("current_price", pos.get("avg_price", 0.0)))
+                        or 0.0
+                    )
+                else:
+                    quantity = float(getattr(pos, "qty", 0.0) or 0.0)
+                    entry_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
+                    current_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
             except Exception as e:
                 logger.warning(f"⚠️ Could not get position details: {e}")
                 return None
@@ -896,7 +906,7 @@ class DecisionEngineImpl:
 
         # Gate: Only sell if profitable after fees
         if pnl_after_fees <= 0:
-            logger.debug(
+            logger.info(
                 f"🚫 SELL skipped {symbol}: unprofitable after fees. "
                 f"Entry={entry_price:.4f}, Current={current_price:.4f}, "
                 f"P&L before fees: {pnl_before_fees_pct:.2f}%, "

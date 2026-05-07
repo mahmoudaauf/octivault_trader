@@ -74,6 +74,7 @@ NATIVE_CTX_KEYS: tuple[str, ...] = (
     "signal_manager",  # L3 (NativeSignalEngine; legacy key name preserved)
     "decision_engine",  # L4 (native-only)
     "execution_manager",  # L5 (NativeExecutor; legacy key name preserved)
+    "bounded_cache",  # L0 idempotency guard cache
     "mode_manager",  # L5 strategy state machine (native)
     "signal_fusion",  # L5 native adapter over signal aggregation
     "arbitration_engine",  # L5 native adapter over gating/risk stack
@@ -135,6 +136,7 @@ class NativeComponents:
     arbitration_engine: Any | None = None  # NativeArbitrationEngine | None
     market_regime_detector: Any | None = None  # NativeMarketRegimeDetector | None
     health_monitor: Any | None = None  # NativeHealthMonitor | None
+    bounded_cache: Any | None = None  # NativeBoundedCache | None
     symbol_discovery: Any | None = None  # NativeSymbolDiscovery | None
     market_data_ws: Any | None = None  # NativeMarketDataWebSocket | None (zero API rate limits)
     position_hydration_engine: Any | None = (
@@ -227,6 +229,8 @@ def build_native_app_ctx(
         app_ctx["market_regime_detector"] = components.market_regime_detector
     if components.health_monitor is not None:
         app_ctx["health_monitor"] = components.health_monitor
+    if components.bounded_cache is not None:
+        app_ctx["bounded_cache"] = components.bounded_cache
     if components.position_manager is not None:
         app_ctx["position_manager"] = components.position_manager
     if components.tp_sl_engine is not None:

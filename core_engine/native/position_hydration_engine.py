@@ -228,6 +228,7 @@ class NativePositionHydrationEngine:
             # Step 2: Reconstruct positions from fills
             logger.info("🔄 Position hydration: reconstructing positions from fills...")
             positions = await self._reconstruct_positions_from_fills(balances)
+            self._merge_balance_holdings(positions, balances)
 
             # Step 3: Restore TP/SL from shared_state if available
             logger.info("🔄 Position hydration: restoring TP/SL state...")
@@ -444,6 +445,56 @@ class NativePositionHydrationEngine:
 
             # Fallback: use entry price (conservative, avoids stale data)
             pos.current_price = pos.avg_entry_price
+
+    def _merge_balance_holdings(
+        self, positions: dict[str, HydratedPosition], balances: dict[str, dict[str, float]]
+    ) -> None:
+        """
+        Ensure spot balances contribute to hydrated portfolio value even when
+        no journal-backed position could be reconstructed for them.
+
+        Any non-USDT asset with a positive total balance is converted into a
+        synthetic hydrated holding priced from shared_state.prices when
+        available. If the asset already has a reconstructed position, its
+        quantity is reconciled upward to the exchange balance to avoid
+        undercounting wallet NAV.
+        """
+        price_map = getattr(self._state, "prices", {}) if hasattr(self._state, "prices") else {}
+
+        for asset, bal in (balances or {}).items():
+            asset_key = str(asset or "").upper()
+            if not asset_key or asset_key == "USDT":
+                continue
+
+            total_qty = float((bal or {}).get("total", 0.0) or 0.0)
+            if total_qty <= 0:
+                continue
+
+            symbol = f"{asset_key}USDT"
+            current_price = float(price_map.get(symbol, 0.0) or 0.0)
+            if current_price <= 0:
+                continue
+
+            pos = positions.get(symbol)
+            if pos is None:
+                positions[symbol] = HydratedPosition(
+                    symbol=symbol,
+                    qty=total_qty,
+                    avg_entry_price=current_price,
+                    current_price=current_price,
+                    lifecycle_state="UNATTRIBUTED",
+                    strategy_source="balance_hydration",
+                )
+                continue
+
+            if total_qty > float(pos.qty or 0.0):
+                pos.qty = total_qty
+            if current_price > 0:
+                pos.current_price = current_price
+            if pos.avg_entry_price <= 0:
+                pos.avg_entry_price = current_price
+            if not pos.strategy_source or pos.strategy_source == "unknown":
+                pos.strategy_source = "journal+balance_hydration"
 
     async def _restore_tp_sl_state(self, positions: dict[str, HydratedPosition]) -> None:
         """Restore TP/SL prices from shared_state if available."""

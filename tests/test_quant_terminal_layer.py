@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from core_engine.decision_engine import DecisionEngine, TradeDecision
+from core_engine.native.legacy_signal_adapter import LegacySignalAdapter
 from core_engine.operations_engine import OperationsEngine
 from core_engine.safe_execution_engine import SafeExecutionEngine
 from core_engine.situation_engine import SituationEngine
@@ -272,6 +273,26 @@ async def test_decision_engine_selects_normal_trading() -> None:
 
 
 @pytest.mark.asyncio
+async def test_decision_engine_make_sell_decision_uses_real_position_quantity() -> None:
+    position = _make_position(qty=0.5, entry=100.0, mark=120.0)
+    engine = DecisionEngine(_make_app_ctx(position_for_symbol=position))
+    decision = await engine.make_sell_decision("BTCUSDT", 0.9, "signal")
+    assert decision is not None
+    assert decision.action == "SELL"
+    assert decision.quantity == 0.5
+
+
+@pytest.mark.asyncio
+async def test_decision_engine_make_sell_decision_supports_dict_backed_positions() -> None:
+    position = {"qty": 0.75, "entry_price": 100.0, "mark_price": 125.0}
+    engine = DecisionEngine(_make_app_ctx(position_for_symbol=position))
+    decision = await engine.make_sell_decision("BTCUSDT", 0.9, "signal")
+    assert decision is not None
+    assert decision.action == "SELL"
+    assert decision.quantity == 0.75
+
+
+@pytest.mark.asyncio
 async def test_safe_execution_blocks_buy_in_low_usdt_recovery() -> None:
     engine = SafeExecutionEngine(_make_app_ctx())
     result = await engine.execute_decision(
@@ -352,3 +373,12 @@ async def test_operations_engine_emits_quant_loop_summary(caplog: pytest.LogCapt
     assert "QUANT_LOOP_SUMMARY" in caplog.text
     for key in summary:
         assert key in caplog.text
+
+
+def test_legacy_signal_adapter_uses_action_when_signal_type_missing() -> None:
+    adapter = LegacySignalAdapter()
+    normalized = adapter._normalize_forecaster_signals(
+        [{"symbol": "BNBUSDT", "action": "SELL", "confidence": 0.92, "edge_score": 0.8}]
+    )
+    assert normalized[0]["signal_type"] == "SELL"
+    assert normalized[0]["action"] == "SELL"
