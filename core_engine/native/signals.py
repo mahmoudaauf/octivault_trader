@@ -54,6 +54,7 @@ class AggregatedSignal:
     direction: Direction
     score: float
     contributions: list[Signal] = field(default_factory=list)
+    meta: dict[str, Any] = field(default_factory=dict)
     ts: float = field(default_factory=time.time)
 
 
@@ -151,11 +152,11 @@ def strategy_rsi(closes: np.ndarray, *, symbol: str = "") -> Optional[Signal]:
     if val <= 30:
         # 30 → 0.5, 0 → 1.0
         score = min(1.0, (30.0 - val) / 30.0 + 0.5)
-        return Signal(symbol, "BUY", score, "rsi", {"rsi": val})
+        return Signal(symbol, "BUY", score, "rsi", {"rsi": val, "_closes": closes})
     if val >= 70:
         score = min(1.0, (val - 70.0) / 30.0 + 0.5)
-        return Signal(symbol, "SELL", score, "rsi", {"rsi": val})
-    return Signal(symbol, "HOLD", 0.0, "rsi", {"rsi": val})
+        return Signal(symbol, "SELL", score, "rsi", {"rsi": val, "_closes": closes})
+    return Signal(symbol, "HOLD", 0.0, "rsi", {"rsi": val, "_closes": closes})
 
 
 def strategy_macd(closes: np.ndarray, *, symbol: str = "") -> Optional[Signal]:
@@ -168,10 +169,10 @@ def strategy_macd(closes: np.ndarray, *, symbol: str = "") -> Optional[Signal]:
     norm = abs(hist) / max(px * 0.001, 1e-9)  # 0.1% of price = score 1.0
     score = float(min(1.0, norm))
     if hist > 0 and macd_line > sig_line:
-        return Signal(symbol, "BUY", score, "macd", {"hist": hist})
+        return Signal(symbol, "BUY", score, "macd", {"hist": hist, "_closes": closes})
     if hist < 0 and macd_line < sig_line:
-        return Signal(symbol, "SELL", score, "macd", {"hist": hist})
-    return Signal(symbol, "HOLD", 0.0, "macd", {"hist": hist})
+        return Signal(symbol, "SELL", score, "macd", {"hist": hist, "_closes": closes})
+    return Signal(symbol, "HOLD", 0.0, "macd", {"hist": hist, "_closes": closes})
 
 
 def strategy_ma_crossover(closes: np.ndarray, *, symbol: str = "") -> Optional[Signal]:
@@ -180,10 +181,16 @@ def strategy_ma_crossover(closes: np.ndarray, *, symbol: str = "") -> Optional[S
         return None
     fast_ma, slow_ma, cross = res
     if cross == 1:
-        return Signal(symbol, "BUY", 0.7, "ma_cross", {"fast": fast_ma, "slow": slow_ma})
+        return Signal(
+            symbol, "BUY", 0.7, "ma_cross", {"fast": fast_ma, "slow": slow_ma, "_closes": closes}
+        )
     if cross == -1:
-        return Signal(symbol, "SELL", 0.7, "ma_cross", {"fast": fast_ma, "slow": slow_ma})
-    return Signal(symbol, "HOLD", 0.0, "ma_cross", {"fast": fast_ma, "slow": slow_ma})
+        return Signal(
+            symbol, "SELL", 0.7, "ma_cross", {"fast": fast_ma, "slow": slow_ma, "_closes": closes}
+        )
+    return Signal(
+        symbol, "HOLD", 0.0, "ma_cross", {"fast": fast_ma, "slow": slow_ma, "_closes": closes}
+    )
 
 
 BUILTIN_STRATEGIES: dict[str, Callable[..., Optional[Signal]]] = {
@@ -327,15 +334,66 @@ class NativeSignalEngine:
                 net += w * s.score
             elif s.direction == "SELL":
                 net -= w * s.score
+        meta = self._build_market_context(symbol, sigs)
         if total_w == 0:
-            return AggregatedSignal(symbol, "HOLD", 0.0, sigs)
+            return AggregatedSignal(symbol, "HOLD", 0.0, sigs, meta=meta)
 
         normalized = net / total_w  # in [-1, +1]
         if normalized > 1e-9:
-            return AggregatedSignal(symbol, "BUY", float(min(1.0, normalized)), sigs)
+            return AggregatedSignal(symbol, "BUY", float(min(1.0, normalized)), sigs, meta=meta)
         if normalized < -1e-9:
-            return AggregatedSignal(symbol, "SELL", float(min(1.0, -normalized)), sigs)
-        return AggregatedSignal(symbol, "HOLD", 0.0, sigs)
+            return AggregatedSignal(symbol, "SELL", float(min(1.0, -normalized)), sigs, meta=meta)
+        return AggregatedSignal(symbol, "HOLD", 0.0, sigs, meta=meta)
+
+    def _build_market_context(self, symbol: str, sigs: list[Signal]) -> dict[str, Any]:
+        closes = None
+        for sig in sigs:
+            maybe_closes = sig.meta.get("_closes")
+            if isinstance(maybe_closes, np.ndarray) and maybe_closes.size > 1:
+                closes = maybe_closes
+                break
+        if closes is None:
+            return {}
+
+        latest = float(closes[-1]) if closes.size else 0.0
+        returns = np.diff(closes) / np.clip(closes[:-1], 1e-9, None)
+        volatility = float(np.std(returns[-20:])) if returns.size else 0.0
+        momentum = (
+            float((closes[-1] / closes[-10]) - 1.0)
+            if closes.size >= 10 and closes[-10] != 0
+            else 0.0
+        )
+        trend_gap = 0.0
+        if closes.size >= 20:
+            fast = float(closes[-5:].mean())
+            slow = float(closes[-20:].mean())
+            if slow > 0:
+                trend_gap = (fast / slow) - 1.0
+
+        regime = "normal"
+        if volatility >= 0.03:
+            regime = "volatile"
+        elif abs(trend_gap) >= 0.04:
+            regime = "trend"
+        elif volatility <= 0.003:
+            regime = "range"
+
+        liquidity_score = float(max(0.05, min(1.0, 1.0 - min(volatility * 12.0, 0.9))))
+        volatility_score = float(max(0.0, min(1.0, volatility / 0.03)))
+        market_quality = float(max(0.0, min(1.0, 0.55 + momentum - volatility * 4.0)))
+
+        return {
+            "price": latest,
+            "regime": regime,
+            "volatility_score": volatility_score,
+            "liquidity_score": liquidity_score,
+            "market_quality": market_quality,
+            "momentum": momentum,
+            "trend_gap": trend_gap,
+            "spread_pct": 0.0,
+            "regime_alignment": 0.7 if regime == "trend" and momentum > 0 else 0.5,
+            "agent_confidence": max(float(s.score) for s in sigs) if sigs else 0.0,
+        }
 
     # ──────────────────────────────────────────────────────────────────
     # Facade adapter methods (for compatibility with SituationEngine)

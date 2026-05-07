@@ -52,10 +52,12 @@ class NativeBalanceSync:
         *,
         poll_interval_sec: float = 5.0,
         on_update: Optional[UpdateCallback] = None,
+        min_refresh_interval_sec: float = 60.0,
     ) -> None:
         self._client = client
         self._poll_interval = max(0.5, float(poll_interval_sec))
         self._on_update = on_update
+        self._min_refresh_interval_sec = max(0.0, float(min_refresh_interval_sec))
 
         self._balances: dict[str, float] = {}
         self._last_update_ts: float = 0.0
@@ -138,6 +140,12 @@ class NativeBalanceSync:
 
     async def _refresh_once(self) -> None:
         """Single fetch + cache update + callback."""
+        if (
+            self._last_update_ts > 0
+            and self._min_refresh_interval_sec > 0
+            and (time.time() - self._last_update_ts) < self._min_refresh_interval_sec
+        ):
+            return
         new_balances = await self._client.get_balance()
         self._balances = new_balances
         self._last_update_ts = time.time()

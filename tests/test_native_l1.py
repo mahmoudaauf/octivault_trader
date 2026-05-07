@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import time
 from typing import Any, Optional
 from unittest.mock import AsyncMock
 
@@ -25,6 +26,7 @@ from core_engine.native import (
     NativeRetryManager,
     OrderResult,
 )
+from core_engine.native.symbol_discovery import NativeSymbolDiscovery
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -145,6 +147,60 @@ class TestNativeExchangeClient:
         with pytest.raises(ValueError):
             await c.cancel_order("BTCUSDT")
 
+    def test_record_error_sets_throttle_window(self) -> None:
+        c = self._client()
+        until_ms = int((time.time() + 120.0) * 1000)
+        c._record_error(418, f"Way too much request weight used; IP banned until {until_ms}.")
+        assert c.is_throttled() is True
+        assert c.throttled_until_ts() > 0
+        assert "418" in c.last_error()
+
+    def test_restore_throttle_state_rehydrates_client(self) -> None:
+        c = self._client()
+        until_ts = time.time() + 120.0
+        c.restore_throttle_state(until_ts=until_ts, reason="persisted 418")
+        assert c.is_throttled() is True
+        assert c.throttled_until_ts() >= until_ts - 0.1
+        assert c.last_error() == "persisted 418"
+
+    @pytest.mark.asyncio
+    async def test_request_short_circuits_while_throttled(self) -> None:
+        c = self._client()
+        c._record_error(429, "too many requests")
+        with pytest.raises(ExchangeClientError, match="exchange throttled"):
+            await c._request("GET", c.EP_TIME)
+
+    def test_local_budget_snapshot_updates_after_request_record(self) -> None:
+        c = self._client()
+        c._record_request(weight=5, signed=False)
+        snap = c.request_budget_snapshot()
+        assert snap["used_weight"] >= 5
+        assert snap["remaining_weight"] <= snap["soft_limit"]
+
+    @pytest.mark.asyncio
+    async def test_local_signed_request_cooldown_blocks_repeat_account_call(self) -> None:
+        c = NativeExchangeClient(
+            "KEY",
+            "SECRET",
+            retry=NativeRetryManager(max_attempts=1, base_delay_sec=0.0, jitter=False),
+            signed_request_cooldown_sec=30.0,
+        )
+        c._record_request(weight=20, signed=True)
+        with pytest.raises(ExchangeClientError, match="signed-request cooldown"):
+            await c._request("GET", c.EP_ACCOUNT, signed=True)
+
+    @pytest.mark.asyncio
+    async def test_local_budget_blocks_request_before_network(self) -> None:
+        c = NativeExchangeClient(
+            "KEY",
+            "SECRET",
+            retry=NativeRetryManager(max_attempts=1, base_delay_sec=0.0, jitter=False),
+            request_budget_soft_limit=3,
+        )
+        c._record_request(weight=2, signed=False)
+        with pytest.raises(ExchangeClientError, match="local request budget exceeded"):
+            await c._request("GET", c.EP_TICKER_PRICE)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # NativeBalanceSync
@@ -212,12 +268,88 @@ class TestNativeBalanceSync:
     @pytest.mark.asyncio
     async def test_loop_polls_multiple_times(self) -> None:
         stub = _StubClient({"USDT": 1.0})
-        bs = NativeBalanceSync(stub, poll_interval_sec=0.5)  # type: ignore[arg-type]
+        bs = NativeBalanceSync(stub, poll_interval_sec=0.5, min_refresh_interval_sec=0.0)  # type: ignore[arg-type]
         await bs.start()
         # prime = 1 call. Wait long enough for ≥1 more.
         await asyncio.sleep(0.7)
         await bs.stop()
         assert stub.calls >= 2
+
+    @pytest.mark.asyncio
+    async def test_min_refresh_interval_defers_extra_fetches(self) -> None:
+        stub = _StubClient({"USDT": 1.0})
+        bs = NativeBalanceSync(
+            stub,  # type: ignore[arg-type]
+            poll_interval_sec=0.5,
+            min_refresh_interval_sec=5.0,
+        )
+        await bs.start()
+        await asyncio.sleep(0.7)
+        await bs.stop()
+        assert stub.calls == 1
+
+
+class _DiscoveryClient:
+    def __init__(self, balances: list[dict[str, float]]) -> None:
+        self._balances = list(balances)
+        self.calls = 0
+
+    def is_throttled(self) -> bool:
+        return False
+
+    async def get_balance(self) -> dict[str, float]:
+        self.calls += 1
+        if self._balances:
+            return self._balances.pop(0)
+        return {}
+
+
+class TestNativeSymbolDiscovery:
+    @pytest.mark.asyncio
+    async def test_discovery_uses_cache_between_scans(self) -> None:
+        client = _DiscoveryClient([{"BTC": 0.1, "USDT": 50.0}])
+        discovery = NativeSymbolDiscovery(
+            client,
+            min_scan_interval_sec=600.0,
+            empty_scan_retry_sec=300.0,
+        )
+        first = await discovery.discover()
+        second = await discovery.discover()
+        assert first == ["BTCUSDT"]
+        assert second == ["BTCUSDT"]
+        assert client.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_discovery_defers_retry_after_empty_scan(self) -> None:
+        client = _DiscoveryClient([{}, {"ETH": 1.0}])
+        discovery = NativeSymbolDiscovery(
+            client,
+            min_scan_interval_sec=600.0,
+            empty_scan_retry_sec=600.0,
+        )
+        first = await discovery.discover()
+        second = await discovery.discover()
+        assert first == []
+        assert second == []
+        assert client.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_discovery_uses_shared_state_symbols_when_throttled(self) -> None:
+        client = _DiscoveryClient([{"BTC": 0.1, "USDT": 50.0}])
+        state = type(
+            "State",
+            (),
+            {
+                "exchange_throttle_until_ts": time.time() + 60.0,
+                "accepted_symbols": {"ETHUSDT"},
+                "positions": {"SOLUSDT": object()},
+                "balance": {"XRP": 10.0, "USDT": 1.0},
+            },
+        )()
+        discovery = NativeSymbolDiscovery(client, shared_state=state)
+        symbols = await discovery.discover()
+        assert symbols == ["ETHUSDT", "SOLUSDT", "XRPUSDT"]
+        assert client.calls == 0
 
 
 # ─────────────────────────────────────────────────────────────────────

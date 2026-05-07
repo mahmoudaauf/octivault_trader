@@ -29,7 +29,13 @@ from typing import Any, Optional
 from core_engine.implementations import SituationEngineImpl
 
 # Type hints
-__all__ = ["SituationEngine", "PortfolioSnapshot", "SignalScore", "RegimeState"]
+__all__ = [
+    "SituationEngine",
+    "PortfolioSnapshot",
+    "SignalScore",
+    "RegimeState",
+    "SituationState",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +73,16 @@ class RegimeState:
     trend_regime: str  # "UPTREND", "DOWNTREND", "RANGING"
     nav_regime: str  # "GROWTH", "DECAY"
     overall_health: str  # "OK", "WARN", "CRISIS"
+
+
+@dataclass
+class SituationState:
+    market_regime: str
+    portfolio_state: str
+    capital_state: str
+    risk_state: str
+    system_state: str
+    metrics: dict[str, Any]
 
 
 class SituationEngine:
@@ -140,6 +156,12 @@ class SituationEngine:
             RegimeState with volatility, trend, NAV regime, health
         """
         return await SituationEngineImpl.get_market_regime(self.app_ctx)
+
+    async def get_situation_state(self) -> SituationState:
+        """
+        Get the full scenario/situation state used by quant playbooks.
+        """
+        return await SituationEngineImpl.get_situation_state(self.app_ctx)
 
     async def detect_anomalies(self) -> dict[str, Any]:
         """

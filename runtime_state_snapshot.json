@@ -1,25 +1,36 @@
 {
   "balance": {},
-  "exchange_throttle_reason": "",
+  "exchange_throttle_reason": "local signed-request cooldown active for 11.0s",
   "exchange_throttle_until_ts": 0.0,
   "exchange_throttled": false,
   "free_balance_usdt": 0.0,
   "invested_capital_usdt": 0.0,
+  "last_known_good_account_state": {
+    "balance": {},
+    "free_balance_usdt": 0.0,
+    "invested_capital_usdt": 0.0,
+    "nav_usdt": 1.0,
+    "session_anchor_nav": 0.0,
+    "ts": 1778172259.916032
+  },
   "metrics": {
     "avg_fee_bps": 0.0,
     "avg_net_profit_bps": 0.0,
     "avg_slippage_bps": 0.0,
+    "last_hydration_time": 0.9842119216918945,
     "last_update_ts": 0.0,
     "peak_nav": 0.0,
-    "realized_pnl": 0.0,
-    "session_elapsed_h": 493933.47241139365,
+    "portfolio_value": 0,
+    "positions_count": 0,
+    "realized_pnl": 0,
+    "session_elapsed_h": 493935.7638368778,
     "trades_in_window": 0,
-    "unrealized_pnl": 0.0,
+    "unrealized_pnl": 0,
     "win_rate_window": 0.5
   },
-  "nav_usdt": 0.0,
+  "nav_usdt": 1.0,
   "positions": {},
   "prices": {},
   "session_anchor_nav": 0.0,
-  "ts": 1778161859.2546282
+  "ts": 1778172259.916032
 }

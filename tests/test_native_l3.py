@@ -16,6 +16,7 @@ from core_engine.native import (
     NativeSignalEngine,
     Signal,
 )
+from core_engine.native.signal_fusion import NativeSignalFusion
 from core_engine.native.signals import (
     _ema,
     ma_crossover,
@@ -252,6 +253,19 @@ class TestNativeSignalEngine:
         assert 0.0 <= agg.score <= 1.0
         assert agg.direction in ("BUY", "SELL", "HOLD")
         assert all(isinstance(s, Signal) for s in agg.contributions)
+        assert "regime" in agg.meta
+        assert "liquidity_score" in agg.meta
+        assert "volatility_score" in agg.meta
+        assert "price" in agg.meta
+
+    def test_aggregated_meta_marks_volatile_market(self) -> None:
+        eng = NativeSignalEngine(enabled=["rsi"])
+        closes = [100, 110, 90, 115, 85, 120, 80, 118, 82, 121, 79, 123, 78, 124, 77, 126]
+        closes.extend([125 + ((-1) ** i) * 20 for i in range(50)])
+        agg = eng.evaluate("BTCUSDT", _klines_from_closes(closes))
+        assert agg is not None
+        assert agg.meta["regime"] == "volatile"
+        assert agg.meta["volatility_score"] > 0.5
 
     def test_weights_change_aggregation_outcome(self) -> None:
         # Heavy weight on a strategy that returns BUY should overpower a
@@ -272,3 +286,31 @@ class TestNativeSignalEngine:
         agg = eng.evaluate("BTCUSDT", _klines_from_closes([100.0] * 50))
         assert agg is not None
         assert agg.direction == "BUY"
+
+    @pytest.mark.asyncio
+    async def test_signal_fusion_returns_fused_payload(self) -> None:
+        eng = NativeSignalEngine(enabled=["rsi"])
+        market_data = type(
+            "_MD",
+            (),
+            {
+                "_klines": {
+                    ("BTCUSDT", "1m", 64): (
+                        0.0,
+                        _klines_from_closes(list(np.linspace(100, 200, 60))),
+                    )
+                }
+            },
+        )()
+        shared_state = type("_SS", (), {"current_mode": "NORMAL", "runtime_overrides": {}})()
+        fusion = NativeSignalFusion(
+            signal_engine=eng,
+            market_data=market_data,
+            shared_state=shared_state,
+        )
+        fused = await fusion.fuse_signal("BTCUSDT")
+        assert fused is not None
+        assert fused["symbol"] == "BTCUSDT"
+        assert fused["signal_type"] == "SELL"
+        assert "threshold" in fused
+        assert "regime" in fused

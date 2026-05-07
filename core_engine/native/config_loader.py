@@ -37,11 +37,25 @@ class ConfigLoader:
 
     def _load_symbols(self):
         """Load symbol configuration"""
+        default_symbols = [
+            "BTCUSDT",
+            "ETHUSDT",
+            "BNBUSDT",
+            "SOLUSDT",
+            "XRPUSDT",
+            "ADAUSDT",
+            "LINKUSDT",
+            "DOGEUSDT",
+            "AVAXUSDT",
+            "PEPEUSDT",
+        ]
         symbols_str = os.getenv(
             "SYMBOLS",
-            "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,LINKUSDT,DOGEUSDT,AVAXUSDT,PEPEUSDT",
+            ",".join(default_symbols),
         )
-        symbols = [s.strip() for s in symbols_str.split(",")]
+        symbols = [s.strip().upper() for s in symbols_str.split(",") if s.strip()]
+        if not symbols:
+            symbols = list(default_symbols)
 
         self._config["SYMBOLS"] = ConfigGroup(
             "SYMBOLS",

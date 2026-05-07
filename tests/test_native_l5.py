@@ -12,7 +12,9 @@ import pytest
 
 from core_engine.native import (
     ExecutionStatus,
+    NativeBalanceValidator,
     NativeExecutor,
+    NativeSharedState,
 )
 from core_engine.native.decisions import Action, Decision
 
@@ -225,3 +227,41 @@ class TestNativeExecutor:
         assert len(results) == 1
         assert results[0].status == ExecutionStatus.TERMINAL
         assert "unknown action" in (results[0].error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_balance_validator_blocks_over_allocation(self) -> None:
+        stub = _StubOrderExecution()
+        state = NativeSharedState()
+        state.free_balance_usdt = 50.0
+        state.balance = {"USDT": 50.0}
+        executor = NativeExecutor(
+            stub, shared_state=state, balance_validator=NativeBalanceValidator()
+        )  # type: ignore[arg-type]
+        dec = Decision("BTCUSDT", Action.OPEN, 100.0, "test", 0.7)
+        results = await executor.execute([dec])
+        assert len(results) == 1
+        assert results[0].status == ExecutionStatus.TERMINAL
+        assert "balance validation failed" in (results[0].error or "")
+        assert len(stub.placed_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_successful_buy_commits_allocation_ledger(self) -> None:
+        stub = _StubOrderExecution()
+        state = NativeSharedState()
+        state.free_balance_usdt = 500.0
+        state.balance = {"USDT": 500.0}
+
+        class _MD:
+            def get_price(self, _symbol: str) -> float:
+                return 100.0
+
+        validator = NativeBalanceValidator()
+        executor = NativeExecutor(
+            stub, market_data=_MD(), shared_state=state, balance_validator=validator
+        )  # type: ignore[arg-type]
+        dec = Decision("BTCUSDT", Action.OPEN, 100.0, "test", 0.7)
+        results = await executor.execute([dec])
+        assert results[0].status == ExecutionStatus.SUCCESS
+        assert validator.allocated_balance == 100.0
+        assert validator.recent_entries(1)[0].status == "committed"
+        assert state.reserved_quote_total("USDT") == 100.0

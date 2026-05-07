@@ -14,6 +14,7 @@ Covers the API contract consumed by SituationEngineImpl and meta_controller:
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -120,13 +121,40 @@ async def test_get_capital_available_prefers_shared_state() -> None:
     state = NativeSharedState()
     state.free_balance_usdt = 500.0
     pm = NativePortfolioManager(state, _StubBalanceSync({"USDT": 999.0}))
-    assert await pm.get_capital_available() == 500.0
+    assert await pm.get_capital_available() == 450.0
+
+
+@pytest.mark.asyncio
+async def test_get_capital_available_subtracts_active_reservations() -> None:
+    state = NativeSharedState()
+    state.free_balance_usdt = 500.0
+    state.reserve_quote("USDT", 100.0, ttl_sec=30.0, reservation_id="r1", created_at=time.time())
+    pm = NativePortfolioManager(state, _StubBalanceSync({"USDT": 999.0}))
+    assert await pm.get_capital_available() == 350.0
+
+
+@pytest.mark.asyncio
+async def test_get_capital_available_prunes_expired_reservations() -> None:
+    state = NativeSharedState()
+    state.free_balance_usdt = 500.0
+    state.reserve_quote("USDT", 100.0, ttl_sec=1.0, reservation_id="stale", created_at=1.0)
+    state.prune_quote_reservations("USDT", now_ts=1000.0)
+    pm = NativePortfolioManager(state, _StubBalanceSync({"USDT": 999.0}))
+    assert await pm.get_capital_available() == 450.0
 
 
 @pytest.mark.asyncio
 async def test_get_capital_available_falls_back_to_balance_sync() -> None:
     pm = NativePortfolioManager(NativeSharedState(), _StubBalanceSync({"USDT": 250.0}))
-    assert await pm.get_capital_available() == 250.0
+    assert await pm.get_capital_available() == 225.0
+
+
+@pytest.mark.asyncio
+async def test_get_capital_available_falls_back_to_shared_state_balance_without_sync() -> None:
+    state = NativeSharedState()
+    state.balance = {"USDT": 100.0}
+    pm = NativePortfolioManager(state, None)
+    assert await pm.get_capital_available() == 90.0
 
 
 @pytest.mark.asyncio

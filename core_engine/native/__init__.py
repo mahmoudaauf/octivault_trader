@@ -16,7 +16,9 @@ L8 - Orchestrator: NativeOrchestrator, CycleMetrics
 # ── L6 ───────────────────────────────────────────────────────────────
 from .adaptive_capital_engine import NativeAdaptiveCapitalEngine
 from .app_context import NATIVE_CTX_KEYS, NativeComponents, build_native_app_ctx
+from .arbitration_engine import NativeArbitrationEngine
 from .balance_sync import NativeBalanceSync
+from .balance_validator import AllocationLedgerEntry, AllocationStatus, NativeBalanceValidator
 
 # ── Bootstrap (8.2.8) ────────────────────────────────────────────────
 from .bootstrap import (
@@ -26,6 +28,8 @@ from .bootstrap import (
     shutdown_components,
 )
 from .capital_allocator import NativeCapitalAllocator
+from .capital_policy import compute_spendable_quote, prune_reservations
+from .concentration_guard import ConcentrationCheck, NativeConcentrationGuard
 from .config_loader import ConfigLoader, get_config
 
 # ── L4 ───────────────────────────────────────────────────────────────
@@ -54,9 +58,11 @@ from .executor import ExecutionResult, ExecutionStatus, NativeExecutor
 
 # ── L3 ───────────────────────────────────────────────────────────────
 from .fill_tracker import NativeFillTracker
+from .health_monitor import NativeHealthMonitor
 
 # ── L2 ───────────────────────────────────────────────────────────────
 from .market_data import NativeMarketData
+from .market_regime_detector import NativeMarketRegimeDetector
 from .math_utils import (
     calmar_ratio,
     cumulative_returns,
@@ -67,6 +73,7 @@ from .math_utils import (
     volatility,
     win_rate,
 )
+from .mode_manager import NativeMode, NativeModeManager
 
 # ── L2 (Feedback Control) ────────────────────────────────────────────
 from .objective_feedback_controller import NativeObjectiveFeedbackController
@@ -78,6 +85,7 @@ from .observability import NativeTelemetry
 from .orchestrator import CycleMetrics, NativeOrchestrator
 from .order_execution import NativeOrderExecution, OrderResult
 from .prometheus_exporter import MetricsSnapshot, NativePrometheusExporter
+from .regime_gate import NativeRegimeGate, RegimeDecision
 from .retry_manager import (
     RETRY_AGGRESSIVE,
     RETRY_FAST,
@@ -85,9 +93,11 @@ from .retry_manager import (
     RETRY_STANDARD,
     NativeRetryManager,
 )
+from .runtime_state import NativeRuntimeStateExporter, load_runtime_state
 from .shared_state import NativeSharedState, Order, Position
 
 # ── L3 ───────────────────────────────────────────────────────────────
+from .signal_fusion import NativeSignalFusion
 from .signals import AggregatedSignal, NativeSignalEngine, Signal
 from .symbol_discovery import NativeSymbolDiscovery
 from .time_utils import NativeTimeUtils
@@ -106,15 +116,27 @@ __all__ = [
     "RETRY_STANDARD",
     "RETRY_AGGRESSIVE",
     "RETRY_NO_JITTER",
+    "NativeRuntimeStateExporter",
+    "load_runtime_state",
     # L1
     "NativeExchangeClient",
     "ExchangeClientError",
     "NativeBalanceSync",
+    "NativeBalanceValidator",
+    "AllocationStatus",
+    "AllocationLedgerEntry",
     "NativeOrderExecution",
     "OrderResult",
     # L2
     "NativeMarketData",
+    "NativeMode",
+    "NativeModeManager",
+    "NativeMarketRegimeDetector",
+    "NativeRegimeGate",
+    "RegimeDecision",
     "NativeSymbolDiscovery",
+    "NativeSignalFusion",
+    "NativeArbitrationEngine",
     # L3
     "NativeSignalEngine",
     "Signal",
@@ -131,7 +153,12 @@ __all__ = [
     # L6
     "NativeAdaptiveCapitalEngine",
     "NativeCapitalAllocator",
+    "compute_spendable_quote",
+    "prune_reservations",
+    "NativeConcentrationGuard",
+    "ConcentrationCheck",
     "NativeTelemetry",
+    "NativeHealthMonitor",
     # L2 (Feedback Control)
     "NativeObjectiveFeedbackController",
     # L8

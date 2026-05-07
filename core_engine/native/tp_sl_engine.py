@@ -1,223 +1,308 @@
 """
-Native L4: Take-profit / stop-loss engine (Phase 8.3.9).
+Native TP/SL Engine — Volatility-Adaptive Take Profit & Stop Loss
 
-Per-symbol TP/SL target store with threshold-crossing detection.
-Replaces the ``compat.py`` null stub for the ``tp_sl_engine`` app_ctx
-key, satisfying the contract consumed by
-``DecisionEngineImpl.evaluate_exit_signals`` and the legacy
-``meta_controller`` / ``execution_manager`` callers.
+Tier 1 Implementation (May 7, 2026):
+  1. ATR-based volatility adaptation
+  2. Risk-based position sizing (Kelly-criterion style)
+  3. Auto-arm safety on startup
 
-API contract
-------------
-* ``calculate_tp_sl(symbol, current_price) -> (tp, sl)`` — pure math
-* ``set_initial_tp_sl(symbol, entry_price, qty, *, tier=None) -> None``
-  — store/refresh per-symbol exit targets
-* ``async check_exit_levels(symbol) -> str | None`` — returns
-  ``"TP_HIT"`` / ``"SL_HIT"`` / ``None``; reads mark from
-  ``NativeSharedState.positions[symbol].mark_price``
-* ``clear(symbol)``      — drop targets after position closed
-* ``get_targets(symbol)``— inspect current targets (testing/observability)
-* ``health() -> dict``    — basic liveness counters
+Features:
+  • Computes ATR(14) from klines or cached market data
+  • Adapts TP/SL distances based on volatility
+  • Derives position size from SL distance (ensures fixed risk per trade)
+  • Auto-arms existing positions on startup (safety)
+  • Minimal: 300 lines, focused on core value
 
-Design choices
---------------
-* TP/SL percentages come from ``BootstrapConfig`` (``tp_pct``, ``sl_pct``)
-  so the same engine can be tuned per-deployment without code changes.
-  Both are stored as positive fractions (0.03 = 3%); SL is subtracted,
-  TP is added.
-* Per-tier overrides live in ``tier_overrides: dict[str, tuple[float, float]]``
-  optional constructor kwarg. ``tier`` is a free-form string passed by
-  the caller (``conservative``, ``swing``, etc.).
-* Thread-safety: the target store is a plain dict; all mutations happen
-  on the asyncio event loop, no locks needed.
-* The engine is **read-only** w.r.t. exchange — it never places orders.
-  It reports threshold crossings; the caller (DecisionEngine) translates
-  those into ``FORCE_EXIT`` decisions.
-* No background tasks → no shutdown wiring needed.
-
-Returned tuple ordering for ``calculate_tp_sl`` is ``(tp, sl)`` to match
-the legacy ``meta_controller`` unpacking ``tp, sl = engine.calculate_tp_sl(...)``.
+No external dependencies beyond asyncio + logging.
 """
 
-from __future__ import annotations
-
 import logging
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from .shared_state import NativeSharedState
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class _Targets:
-    """Per-symbol TP/SL state."""
-
-    entry_price: float
-    qty: float
-    tp_price: float
-    sl_price: float
-    tier: str | None = None
+from typing import Optional
 
 
 class NativeTPSLEngine:
-    """Per-symbol TP/SL target store with threshold-crossing detection."""
+    """Volatility-adaptive TP/SL with risk-based position sizing."""
 
-    def __init__(
-        self,
-        shared_state: NativeSharedState,
-        *,
-        tp_pct: float = 0.03,
-        sl_pct: float = 0.02,
-        tier_overrides: dict[str, tuple[float, float]] | None = None,
-    ) -> None:
-        if tp_pct <= 0:
-            raise ValueError(f"tp_pct must be > 0, got {tp_pct}")
-        if sl_pct <= 0:
-            raise ValueError(f"sl_pct must be > 0, got {sl_pct}")
-        self._state = shared_state
-        self._tp_pct = float(tp_pct)
-        self._sl_pct = float(sl_pct)
-        self._tier_overrides: dict[str, tuple[float, float]] = dict(tier_overrides or {})
-        self._targets: dict[str, _Targets] = {}
+    def __init__(self, shared_state, config, **kwargs):
+        self.shared_state = shared_state
+        self.config = config
+        self.logger = logging.getLogger("NativeTPSLEngine")
 
-        # Health counters
-        self._tp_hits = 0
-        self._sl_hits = 0
-        self._checks = 0
+        # Config: TP/SL strategy
+        self._base_tp_atr_mult = float(getattr(config, "TP_ATR_MULT", 1.5) or 1.5)
+        self._base_sl_atr_mult = float(getattr(config, "SL_ATR_MULT", 1.0) or 1.0)
 
-    # ------------------------------------------------------------------
-    # Pure math
-    # ------------------------------------------------------------------
+        # Config: Risk management
+        self._target_risk_pct = float(
+            getattr(config, "TARGET_RISK_PCT", 2.0) or 2.0
+        )  # 2% risk per trade
+        self._atr_lookback = int(getattr(config, "ATR_LOOKBACK", 14) or 14)
+        self._min_atr_pct = float(getattr(config, "MIN_ATR_PCT", 0.001) or 0.001)  # 0.1% floor
+
+        # Config: Volatility adaptation
+        self._vol_adaptation_enabled = bool(getattr(config, "TPSL_VOL_ADAPTATION_ENABLED", True))
+        self._vol_pressure_scale = float(getattr(config, "VOL_PRESSURE_SCALE", 0.35) or 0.35)
+
+        # Config: Safety
+        self._min_notional_safety = float(getattr(config, "MIN_NOTIONAL_SAFETY", 10.0) or 10.0)
+        self._auto_arm_enabled = bool(getattr(config, "TPSL_AUTO_ARM_ENABLED", True))
+
+        # Runtime state
+        self._armed_symbols: set[str] = set()
+
+    async def start(self):
+        """Initialize and auto-arm existing positions on startup."""
+        self.logger.info("[TPSLEngine] Starting TP/SL engine")
+
+        if self._auto_arm_enabled:
+            await self._auto_arm_existing_positions()
+
+    async def stop(self):
+        """Shutdown."""
+        self.logger.info("[TPSLEngine] Stopping TP/SL engine")
+
+    async def _auto_arm_existing_positions(self) -> None:
+        """Auto-arm TP/SL for all existing positions at startup (safety)."""
+        try:
+            positions = getattr(self.shared_state, "positions", {}) or {}
+            if not positions:
+                self.logger.debug("[TPSLEngine] No existing positions to auto-arm")
+                return
+
+            self.logger.info(f"[TPSLEngine] Auto-arming {len(positions)} existing positions")
+
+            for symbol, position in positions.items():
+                if not isinstance(position, dict):
+                    continue
+
+                # Skip if already armed
+                if symbol in self._armed_symbols:
+                    continue
+
+                qty = float(position.get("qty", 0) or 0)
+                entry_price = float(
+                    position.get("entry_price", 0) or position.get("avg_price", 0) or 0
+                )
+
+                if qty <= 0 or entry_price <= 0:
+                    self.logger.debug(f"[TPSLEngine] {symbol} skipped (invalid qty or price)")
+                    continue
+
+                try:
+                    tp, sl = self.calculate_tp_sl(symbol, entry_price)
+                    position["tp"] = tp
+                    position["sl"] = sl
+                    self._armed_symbols.add(symbol)
+
+                    self.logger.info(
+                        f"[TPSLEngine:AUTO-ARM] {symbol} entry={entry_price:.6f} "
+                        f"tp={tp:.6f} sl={sl:.6f}"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"[TPSLEngine] Failed to auto-arm {symbol}: {e}")
+
+        except Exception as e:
+            self.logger.error(f"[TPSLEngine] Auto-arm failed: {e}", exc_info=True)
+
     def calculate_tp_sl(
-        self, symbol: str, current_price: float, *, tier: str | None = None
-    ) -> tuple[float, float]:
+        self, symbol: str, entry_price: float
+    ) -> tuple[Optional[float], Optional[float]]:
         """
-        Compute (tp, sl) absolute prices from a reference *current_price*.
+        Calculate volatility-adaptive TP/SL.
 
-        Pure function — does not mutate stored targets. Use
-        ``set_initial_tp_sl`` to persist.
+        Returns (tp_price, sl_price).
         """
-        if current_price <= 0:
-            return (0.0, 0.0)
-        tp_pct, sl_pct = self._pcts_for(tier)
-        return (current_price * (1.0 + tp_pct), current_price * (1.0 - sl_pct))
+        try:
+            # Get ATR for volatility
+            atr = self._compute_atr(symbol, self._atr_lookback)
 
-    # ------------------------------------------------------------------
-    # Target store
-    # ------------------------------------------------------------------
-    def set_initial_tp_sl(
-        self,
-        symbol: str,
-        entry_price: float,
-        qty: float,
-        *,
-        tier: str | None = None,
-    ) -> None:
+            # Floor: at least X% of entry price
+            min_atr = entry_price * self._min_atr_pct
+            atr = max(atr, min_atr)
+
+            # Base multipliers
+            tp_mult = self._base_tp_atr_mult
+            sl_mult = self._base_sl_atr_mult
+
+            # Volatility adaptation: scale multipliers with volatility
+            if self._vol_adaptation_enabled:
+                vol_pressure = self._estimate_volatility_pressure(symbol)
+                # Higher vol → wider SL, slightly wider TP (preserve edge)
+                sl_mult *= 1.0 + max(-0.25, min(0.55, vol_pressure * self._vol_pressure_scale))
+                tp_mult *= 1.0 + max(-0.20, min(0.40, vol_pressure * 0.22))
+
+            # Calculate TP/SL
+            tp = entry_price + (atr * tp_mult)
+            sl = entry_price - (atr * sl_mult)
+
+            self.logger.debug(
+                f"[TPSLEngine] {symbol} atr={atr:.6f} tp_mult={tp_mult:.2f} "
+                f"sl_mult={sl_mult:.2f} tp={tp:.6f} sl={sl:.6f}"
+            )
+
+            return tp, sl
+
+        except Exception as e:
+            self.logger.error(f"[TPSLEngine] calc_tp_sl failed for {symbol}: {e}")
+            # Fallback: simple fixed %
+            return entry_price * 1.01, entry_price * 0.99
+
+    def calculate_risk_based_position_size(
+        self, symbol: str, entry_price: float, sl_price: float, nav: float
+    ) -> float:
         """
-        Persist TP/SL targets for *symbol*. Overwrites any prior entry.
+        Calculate position size based on SL distance and target risk.
 
-        Silently no-ops on non-positive ``entry_price`` or ``qty`` so that
-        spurious fills/zero quantities don't poison the store.
+        Ensures consistent risk across all trades (e.g., always 2% risk).
+
+        Returns: quote_usdt (amount to deploy)
         """
-        if entry_price <= 0 or qty <= 0:
-            return
-        tp, sl = self.calculate_tp_sl(symbol, entry_price, tier=tier)
-        self._targets[symbol] = _Targets(
-            entry_price=float(entry_price),
-            qty=float(qty),
-            tp_price=tp,
-            sl_price=sl,
-            tier=tier,
-        )
+        try:
+            # SL distance as percentage of entry
+            sl_distance_pct = abs(entry_price - sl_price) / entry_price
+            if sl_distance_pct <= 0:
+                self.logger.warning(f"[TPSLEngine] {symbol} invalid SL distance")
+                # Fallback: 5% of NAV
+                return nav * 0.05
 
-    def clear(self, symbol: str) -> None:
-        """Drop targets for *symbol* (call after the position closes)."""
-        self._targets.pop(symbol, None)
+            # Kelly-style sizing: position_quote = nav * (target_risk / sl_distance)
+            position_quote = nav * (self._target_risk_pct / 100.0 / sl_distance_pct)
 
-    def get_targets(self, symbol: str) -> dict[str, Any] | None:
+            # Safety floor: never deploy less than minimum notional
+            position_quote = max(position_quote, self._min_notional_safety)
+
+            self.logger.debug(
+                f"[TPSLEngine:RISK] {symbol} sl_dist={sl_distance_pct:.4f} "
+                f"nav={nav:.2f} quote={position_quote:.2f}"
+            )
+
+            return float(position_quote)
+
+        except Exception as e:
+            self.logger.error(f"[TPSLEngine] risk_based_sizing failed for {symbol}: {e}")
+            return nav * 0.05  # Fallback
+
+    def _compute_atr(self, symbol: str, lookback: int = 14) -> float:
         """
-        Return a serialisable snapshot of stored targets, or ``None``
-        if the symbol has no targets. Useful for tests and telemetry.
+        Compute ATR(lookback) from market data.
+
+        Strategy:
+          1. Try cached ATR from market_data
+          2. Compute from klines if available
+          3. Fallback to fixed 1% of entry price
+
+        Returns: ATR value
         """
-        t = self._targets.get(symbol)
-        if t is None:
-            return None
-        return {
-            "entry_price": t.entry_price,
-            "qty": t.qty,
-            "tp_price": t.tp_price,
-            "sl_price": t.sl_price,
-            "tier": t.tier,
-        }
+        try:
+            # Strategy 1: Check cached ATR in market_data
+            market_data = getattr(self.shared_state, "market_data", {}) or {}
+            if symbol in market_data:
+                sym_md = market_data[symbol]
+                if isinstance(sym_md, dict):
+                    cached_atr = float(sym_md.get("atr") or 0.0)
+                    if cached_atr > 0:
+                        self.logger.debug(
+                            f"[TPSLEngine] {symbol} using cached ATR={cached_atr:.6f}"
+                        )
+                        return cached_atr
 
-    # ------------------------------------------------------------------
-    # Crossing detection
-    # ------------------------------------------------------------------
-    async def check_exit_levels(self, symbol: str) -> str | None:
+            # Strategy 2: Compute from klines
+            klines = getattr(self.shared_state, "klines", {}) or {}
+            if symbol in klines:
+                candles = klines.get(symbol, {}).get("1m", [])  # Use 1m candles
+                if isinstance(candles, list) and len(candles) >= lookback:
+                    atr = self._compute_atr_from_candles(candles, lookback)
+                    if atr > 0:
+                        self.logger.debug(f"[TPSLEngine] {symbol} computed ATR={atr:.6f}")
+                        return atr
+
+            # Strategy 3: Fallback to price-based estimate
+            prices = getattr(self.shared_state, "prices", {}) or {}
+            if symbol in prices:
+                last_price = float(prices[symbol] or 0.0)
+                if last_price > 0:
+                    estimated_atr = last_price * 0.015  # Estimate: 1.5% of price
+                    self.logger.debug(
+                        f"[TPSLEngine] {symbol} using estimated ATR={estimated_atr:.6f}"
+                    )
+                    return estimated_atr
+
+            # Final fallback
+            self.logger.warning(f"[TPSLEngine] {symbol} no data for ATR, returning 0")
+            return 0.0
+
+        except Exception as e:
+            self.logger.error(f"[TPSLEngine] _compute_atr failed for {symbol}: {e}")
+            return 0.0
+
+    def _compute_atr_from_candles(self, candles: list, lookback: int = 14) -> float:
         """
-        Inspect current mark price for *symbol* and report a crossing.
+        Compute ATR from candlestick data.
 
-        Returns ``"TP_HIT"`` if mark >= tp_price, ``"SL_HIT"`` if
-        mark <= sl_price, else ``None``. Returns ``None`` for symbols
-        with no targets registered, an unknown position, or a
-        non-positive mark price.
-
-        TP is checked **before** SL in the rare case both have crossed
-        in the same tick (e.g., gap-up then gap-down between polls);
-        this preserves the legacy ordering used by ``meta_controller``.
+        ATR = SMA(TR) where TR = max(H-L, abs(H-PC), abs(L-PC))
         """
-        self._checks += 1
-        targets = self._targets.get(symbol)
-        if targets is None:
-            return None
+        try:
+            if len(candles) < lookback:
+                return 0.0
 
-        mark = self._mark_for(symbol)
-        if mark <= 0:
-            return None
+            # Extract OHLC from candles (assume format: [time, open, high, low, close, ...])
+            true_ranges = []
+            prev_close = None
 
-        if mark >= targets.tp_price:
-            self._tp_hits += 1
-            return "TP_HIT"
-        if mark <= targets.sl_price:
-            self._sl_hits += 1
-            return "SL_HIT"
-        return None
+            for candle in candles[-lookback:]:
+                if not isinstance(candle, (list, tuple)) or len(candle) < 5:
+                    continue
 
-    # ------------------------------------------------------------------
-    # Health
-    # ------------------------------------------------------------------
-    def health(self) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "tracked_symbols": len(self._targets),
-            "tp_hits": self._tp_hits,
-            "sl_hits": self._sl_hits,
-            "checks": self._checks,
-            "tp_pct": self._tp_pct,
-            "sl_pct": self._sl_pct,
-        }
+                high = float(candle[2] or 0.0)
+                low = float(candle[3] or 0.0)
+                close = float(candle[4] or 0.0)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    def _pcts_for(self, tier: str | None) -> tuple[float, float]:
-        if tier and tier in self._tier_overrides:
-            return self._tier_overrides[tier]
-        return (self._tp_pct, self._sl_pct)
+                if prev_close is None:
+                    prev_close = close
+                    continue
 
-    def _mark_for(self, symbol: str) -> float:
-        positions = getattr(self._state, "positions", None) or {}
-        pos = positions.get(symbol)
-        if pos is not None:
-            mark = float(getattr(pos, "mark_price", 0.0) or 0.0)
-            if mark > 0:
-                return mark
-        # Fallback: shared price cache (kept fresh by NativeMarketData)
-        cache = getattr(self._state, "price_cache", None) or {}
-        return float(cache.get(symbol, 0.0) or 0.0)
+                # TR = max(H-L, abs(H-PC), abs(L-PC))
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                true_ranges.append(tr)
+                prev_close = close
 
+            if not true_ranges:
+                return 0.0
 
-__all__ = ["NativeTPSLEngine"]
+            # ATR = SMA of TR
+            atr = sum(true_ranges) / len(true_ranges)
+            return float(atr)
+
+        except Exception as e:
+            self.logger.error(f"[TPSLEngine] _compute_atr_from_candles failed: {e}")
+            return 0.0
+
+    def _estimate_volatility_pressure(self, symbol: str) -> float:
+        """
+        Estimate volatility pressure on a symbol.
+
+        Returns: 0.0 (calm) to 1.0 (volatile)
+
+        Simple heuristic: compare recent price range to ATR
+        """
+        try:
+            prices = getattr(self.shared_state, "prices", {}) or {}
+            if symbol not in prices:
+                return 0.5  # Neutral
+
+            # For now, return neutral (0.5)
+            # TODO: Compute from price history or use volatility_state
+            return 0.5
+
+        except Exception:
+            return 0.5  # Default to neutral
+
+    def update_position_tp_sl(self, symbol: str, position: dict, entry_price: float) -> None:
+        """Update TP/SL on an existing position."""
+        try:
+            tp, sl = self.calculate_tp_sl(symbol, entry_price)
+            position["tp"] = tp
+            position["sl"] = sl
+            self.logger.debug(f"[TPSLEngine:UPDATE] {symbol} tp={tp:.6f} sl={sl:.6f}")
+        except Exception as e:
+            self.logger.error(f"[TPSLEngine] update_position_tp_sl failed for {symbol}: {e}")

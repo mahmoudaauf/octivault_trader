@@ -351,14 +351,7 @@ class OperationsEngine:
             details: Event details
         """
         try:
-            event_store = self.app_ctx.get("event_store")
-
-            if event_store:
-                # Log to event store (L3)
-                self.logger.info(f"📝 Event: {event_type}")
-                # await event_store.log_event(event_type, details)
-            else:
-                self.logger.debug(f"Event: {event_type} - {details}")
+            await OperationsEngineImpl.log_event(self.app_ctx, event_type, details)
         except Exception as e:
             self.logger.error(f"❌ Error logging event: {e}")
 

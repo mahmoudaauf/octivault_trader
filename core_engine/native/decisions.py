@@ -23,6 +23,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from .capital_policy import compute_spendable_quote
+from .concentration_guard import NativeConcentrationGuard
+from .regime_gate import NativeRegimeGate
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +71,8 @@ class PortfolioSnapshot:
     balance: dict[str, float]  # free balances per asset
     positions: dict[str, float]  # symbol → quantity held
     open_orders: dict[str, Any]  # symbol → order details (minimal)
+    daily_pnl_pct: float = 0.0  # realized P&L for the current session/day as %
+    mode_name: str = ""
 
 
 class NativeDecisionEngine:
@@ -98,6 +104,12 @@ class NativeDecisionEngine:
         daily_loss_limit_pct: float = 5.0,
         risk_per_symbol_pct: float = 20.0,
         min_notional_usdt: float = 10.0,
+        quote_reserve_ratio: float = 0.10,
+        quote_min_reserve_usdt: float = 0.0,
+        max_total_exposure_pct: float = 60.0,
+        confidence_floor: float = 0.50,
+        max_cluster_exposure_pct: float = 40.0,
+        cluster_map: dict[str, str] | None = None,
     ) -> None:
         self.kelly_fraction = max(0.0, min(1.0, float(kelly_fraction)))
         self.max_position_size_pct = max(0.1, float(max_position_size_pct))
@@ -107,6 +119,16 @@ class NativeDecisionEngine:
         self.daily_loss_limit_pct = max(0.0, float(daily_loss_limit_pct))
         self.risk_per_symbol_pct = max(0.1, float(risk_per_symbol_pct))
         self.min_notional_usdt = max(0.0, float(min_notional_usdt))
+        self.quote_reserve_ratio = max(0.0, float(quote_reserve_ratio))
+        self.quote_min_reserve_usdt = max(0.0, float(quote_min_reserve_usdt))
+        self.max_total_exposure_pct = max(0.0, float(max_total_exposure_pct))
+        self.confidence_floor = max(0.0, min(1.0, float(confidence_floor)))
+        self.max_cluster_exposure_pct = max(0.0, float(max_cluster_exposure_pct))
+        self._concentration_guard = NativeConcentrationGuard(
+            max_cluster_exposure_pct=self.max_cluster_exposure_pct,
+            cluster_map=cluster_map,
+        )
+        self._regime_gate = NativeRegimeGate()
 
     # ──────────────────────────────────────────────────────────────────
     # Main API
@@ -124,6 +146,8 @@ class NativeDecisionEngine:
         All ``HOLD`` actions are omitted.
         """
         decisions: list[Decision] = []
+        spendable_usdt = self._compute_spendable_quote(balance_usdt)
+        mode = self._resolve_mode(portfolio)
 
         # Risk gates
         if self._check_drawdown_exceeded(portfolio):
@@ -132,26 +156,57 @@ class NativeDecisionEngine:
         if self._check_daily_loss_exceeded(portfolio):
             logger.warning("daily loss limit exceeded; returning empty decisions")
             return []
+        exposure_exceeded = self._check_total_exposure_exceeded(portfolio, spendable_usdt)
+        if exposure_exceeded:
+            logger.warning("total exposure exceeded; skipping new OPEN decisions")
 
         # Position limits
         open_count = len(portfolio.positions)
-        space_available = max(0, self.max_concurrent_positions - open_count)
+        mode_max_positions = min(self.max_concurrent_positions, mode["max_positions"])
+        space_available = max(0, mode_max_positions - open_count)
 
         # Process BUY signals
         buy_sigs = [(sym, sig) for sym, sig in signals.items() if sig.get("direction") == "BUY"]
-        buy_sigs.sort(key=lambda x: -x[1].get("score", 0.0))  # highest conviction first
+        ranked_buys = self._rank_buy_signals(buy_sigs, portfolio)
 
-        for sym, sig in buy_sigs:
+        for sym, sig in ranked_buys:
+            if exposure_exceeded:
+                break
             if len([d for d in decisions if d.action == Action.OPEN]) >= space_available:
                 break
-            qty = self._size_new_position(sym, sig, balance_usdt, portfolio)
+            regime_decision = self._regime_gate.evaluate(sig)
+            if not regime_decision.allowed:
+                logger.info("regime gate blocked %s: %s", sym, regime_decision.reason)
+                continue
+            if not self._passes_buy_filters(sig, mode):
+                continue
+            if not self._passes_regime_adjusted_confidence(sig, mode, regime_decision):
+                continue
+            qty = self._size_new_position(sym, sig, spendable_usdt, portfolio, mode)
+            price_map = self._extract_price_map(portfolio, signals)
+            concentration = self._concentration_guard.check_new_position(
+                symbol=sym,
+                proposed_quote=qty,
+                portfolio=portfolio,
+                price_map=price_map,
+            )
+            if not concentration.allowed:
+                logger.info(
+                    "cluster exposure blocked %s: cluster=%s exposure=%.2f%% limit=%.2f%%",
+                    sym,
+                    concentration.cluster,
+                    concentration.cluster_exposure_pct,
+                    self.max_cluster_exposure_pct,
+                )
+                continue
             logger.info(
-                "🎯 Size %s: score=%.2f qty=%.6f (min=%.2f bal=%.2f)",
+                "🎯 Size %s: score=%.2f qty=%.6f (min=%.2f spendable=%.2f mode=%s)",
                 sym,
                 sig.get("score", 0.0),
                 qty,
                 self.min_order_usdt,
-                balance_usdt,
+                spendable_usdt,
+                mode["name"],
             )
             if qty > 0:
                 decisions.append(
@@ -184,7 +239,7 @@ class NativeDecisionEngine:
         # Capital freeing: Liquidate dust holdings when needed & opportunity is good
         # This allows the system to recycle existing capital instead of waiting for deposits
         # Only sell when: (1) we need capital for strong BUY signals, (2) asset has weak signal
-        if balance_usdt < self.min_order_usdt and len(buy_sigs) > 0:
+        if spendable_usdt < self.min_order_usdt and len(ranked_buys) > 0:
             best_candidate = None
             best_score = 1.0  # Lower is better (we want weak signals)
 
@@ -255,11 +310,32 @@ class NativeDecisionEngine:
         return exceeded
 
     def _check_daily_loss_exceeded(self, portfolio: PortfolioSnapshot) -> bool:
-        # Simplified: assume a reference opening NAV can be retrieved from
-        # portfolio metadata (implementation-dependent). For now, return
-        # False unless portfolio signals a loss exceeded condition.
-        # TODO: wire opening-NAV from session metadata when available.
-        return False
+        daily_pnl_pct = abs(float(getattr(portfolio, "daily_pnl_pct", 0.0) or 0.0))
+        exceeded = daily_pnl_pct > self.daily_loss_limit_pct
+        if exceeded:
+            logger.warning(
+                "daily loss %.2f%% exceeds limit %.2f%%",
+                daily_pnl_pct,
+                self.daily_loss_limit_pct,
+            )
+        return exceeded
+
+    def _check_total_exposure_exceeded(
+        self,
+        portfolio: PortfolioSnapshot,
+        spendable_usdt: float,
+    ) -> bool:
+        nav = max(float(portfolio.nav or 0.0), 1.0)
+        invested = max(0.0, nav - max(0.0, spendable_usdt))
+        exposure_pct = (invested / nav) * 100.0
+        exceeded = exposure_pct >= self.max_total_exposure_pct
+        if exceeded:
+            logger.info(
+                "total exposure %.2f%% at/above limit %.2f%%",
+                exposure_pct,
+                self.max_total_exposure_pct,
+            )
+        return exceeded
 
     # ──────────────────────────────────────────────────────────────────
     # Position sizing
@@ -270,6 +346,7 @@ class NativeDecisionEngine:
         signal: dict[str, Any],
         balance_usdt: float,
         portfolio: PortfolioSnapshot,
+        mode: dict[str, Any],
     ) -> float:
         """
         Size a new position using Kelly fraction + exposure limits.
@@ -288,15 +365,155 @@ class NativeDecisionEngine:
         kelly_allocation = (
             balance_usdt * self.kelly_fraction * conviction * (self.risk_per_symbol_pct / 100.0)
         )
-        position_usd = min(kelly_allocation, max_exposure_usd)
+        position_usd = min(kelly_allocation, max_exposure_usd, float(mode["max_trade_usdt"]))
 
         # Sanity check
-        if position_usd < self.min_order_usdt:
+        if position_usd < max(self.min_order_usdt, self.min_notional_usdt):
             return 0.0
 
         # Return USD allocation directly (actual price conversion happens in executor)
         # This allows capital_allocator and executor to use current market prices
         return max(0.0, position_usd)
+
+    def _compute_spendable_quote(self, free_usdt: float) -> float:
+        return compute_spendable_quote(
+            free_usdt,
+            reserve_ratio=self.quote_reserve_ratio,
+            min_reserve=self.quote_min_reserve_usdt,
+        )
+
+    def _resolve_mode(self, portfolio: PortfolioSnapshot) -> dict[str, Any]:
+        nav = float(portfolio.nav or 0.0)
+        mode_name = str(getattr(portfolio, "mode_name", "") or "").upper()
+        if mode_name == "PAUSED":
+            return {
+                "name": "PAUSED",
+                "max_positions": 0,
+                "confidence_floor": 1.0,
+                "max_trade_usdt": 0.0,
+            }
+        if mode_name == "SAFE":
+            return {
+                "name": "SAFE",
+                "max_positions": 1,
+                "confidence_floor": max(0.90, self.confidence_floor),
+                "max_trade_usdt": max(self.min_notional_usdt, 30.0),
+            }
+        if mode_name == "PROTECTIVE":
+            return {
+                "name": "PROTECTIVE",
+                "max_positions": 2,
+                "confidence_floor": max(0.60, self.confidence_floor),
+                "max_trade_usdt": max(self.min_notional_usdt, 50.0),
+            }
+        if mode_name == "RECOVERY":
+            return {
+                "name": "RECOVERY",
+                "max_positions": 2,
+                "confidence_floor": max(0.50, self.confidence_floor),
+                "max_trade_usdt": max(self.min_notional_usdt, 50.0),
+            }
+        if mode_name == "NORMAL":
+            return {
+                "name": "NORMAL",
+                "max_positions": 3,
+                "confidence_floor": max(0.45, self.confidence_floor - 0.05),
+                "max_trade_usdt": max(self.min_notional_usdt, 150.0),
+            }
+        if mode_name == "GROWTH":
+            return {
+                "name": "GROWTH",
+                "max_positions": 5,
+                "confidence_floor": max(0.40, self.confidence_floor - 0.10),
+                "max_trade_usdt": max(self.min_notional_usdt, portfolio_nav_cap(nav=nav)),
+            }
+        if nav < 100.0:
+            return {
+                "name": "BOOTSTRAP",
+                "max_positions": 1,
+                "confidence_floor": max(0.50, self.confidence_floor),
+                "max_trade_usdt": max(self.min_notional_usdt, 20.0),
+            }
+        if nav < 500.0:
+            return {
+                "name": "RECOVERY",
+                "max_positions": 2,
+                "confidence_floor": max(0.50, self.confidence_floor),
+                "max_trade_usdt": max(self.min_notional_usdt, 50.0),
+            }
+        if nav < 2000.0:
+            return {
+                "name": "NORMAL",
+                "max_positions": 3,
+                "confidence_floor": max(0.45, self.confidence_floor - 0.05),
+                "max_trade_usdt": max(self.min_notional_usdt, 150.0),
+            }
+        return {
+            "name": "GROWTH",
+            "max_positions": 5,
+            "confidence_floor": max(0.40, self.confidence_floor - 0.10),
+            "max_trade_usdt": max(self.min_notional_usdt, portfolio_nav_cap(nav=nav)),
+        }
+
+    def _passes_buy_filters(self, signal: dict[str, Any], mode: dict[str, Any]) -> bool:
+        confidence = float(signal.get("confidence", signal.get("score", 0.0)) or 0.0)
+        return confidence >= float(mode["confidence_floor"])
+
+    def _passes_regime_adjusted_confidence(
+        self,
+        signal: dict[str, Any],
+        mode: dict[str, Any],
+        regime_decision: Any,
+    ) -> bool:
+        confidence = float(signal.get("confidence", signal.get("score", 0.0)) or 0.0)
+        floor = float(mode["confidence_floor"]) + float(
+            getattr(regime_decision, "confidence_floor_bump", 0.0) or 0.0
+        )
+        return confidence >= min(1.0, floor)
+
+    def _rank_buy_signals(
+        self,
+        buy_sigs: list[tuple[str, dict[str, Any]]],
+        portfolio: PortfolioSnapshot,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        def _rank_key(item: tuple[str, dict[str, Any]]) -> tuple[float, float, float, str]:
+            sym, sig = item
+            score = float(sig.get("score", 0.0) or 0.0)
+            confidence = float(sig.get("confidence", score) or score)
+            liquidity = float(sig.get("liquidity_score", 0.0) or 0.0)
+            held_penalty = -1.0 if sym in portfolio.positions else 0.0
+            return (
+                score + confidence * 0.5 + liquidity * 0.25 + held_penalty,
+                confidence,
+                score,
+                sym,
+            )
+
+        return sorted(buy_sigs, key=_rank_key, reverse=True)
+
+    def _extract_price_map(
+        self,
+        portfolio: PortfolioSnapshot,
+        signals: dict[str, Any],
+    ) -> dict[str, float]:
+        prices: dict[str, float] = {}
+        maybe_prices = getattr(portfolio, "prices", None)
+        if isinstance(maybe_prices, dict):
+            for sym, px in maybe_prices.items():
+                try:
+                    prices[str(sym).upper()] = float(px or 0.0)
+                except Exception:
+                    continue
+        for sym, sig in signals.items():
+            if not isinstance(sig, dict):
+                continue
+            try:
+                px = float(sig.get("price", 0.0) or 0.0)
+            except Exception:
+                px = 0.0
+            if px > 0:
+                prices[str(sym).upper()] = px
+        return prices
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers
@@ -305,3 +522,7 @@ class NativeDecisionEngine:
     def rank_decisions(decisions: list[Decision]) -> list[Decision]:
         """Sort decisions by risk_score (highest first) then by symbol."""
         return sorted(decisions, key=lambda d: (-d.risk_score, d.symbol))
+
+
+def portfolio_nav_cap(nav: float) -> float:
+    return max(25.0, nav * 0.15)

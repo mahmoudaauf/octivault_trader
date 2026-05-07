@@ -148,7 +148,11 @@ def test_native_ctx_keys_constant_advertises_stable_contract():
         "signal_manager",
         "decision_engine",
         "execution_manager",
+        "signal_fusion",
+        "arbitration_engine",
+        "market_regime_detector",
         "telemetry",
+        "health_monitor",
         "_native_orchestrator",
         "_native_mode",
     }

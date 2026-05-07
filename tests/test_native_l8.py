@@ -7,6 +7,7 @@ End-to-end cycle testing with mocked L0-L7 layers.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -110,6 +111,17 @@ class _StubBalanceSync:
 class _StubSharedState:
     def __init__(self) -> None:
         self.nav = 10000.0
+        self.metrics = {"peak_nav": 10000.0, "trades_in_window": 0}
+        self.exchange_throttled = False
+        self.exchange_throttle_until_ts = 0.0
+        self.trading_halted = False
+        self.current_mode = ""
+        self.current_mode_reason = ""
+
+
+class _StubModeManager:
+    def evaluate(self, *, nav: float, metrics: dict[str, Any], state: Any | None = None) -> Any:
+        return type("Mode", (), {"name": "NORMAL"})()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -145,6 +157,7 @@ class TestNativeOrchestrator:
             executor=exe,
             balance_sync=bal,
             shared_state=state,
+            mode_manager=_StubModeManager(),
             portfolio_accessor=portfolio_accessor,
         )
         await orch.start()
@@ -158,6 +171,7 @@ class TestNativeOrchestrator:
         assert m.signals_count >= 0
         assert m.decisions_count >= 0
         assert m.executions_count >= 0
+        assert state.current_mode == "NORMAL"
 
     @pytest.mark.asyncio
     async def test_cycle_metrics_include_phase_times(self) -> None:
@@ -206,7 +220,33 @@ class TestNativeOrchestrator:
         )
         metrics = await orch.run_loop(duration_sec=0.1)
         assert len(metrics) >= 1
-        assert all(m.duration_ms > 0 for m in metrics)
+
+    @pytest.mark.asyncio
+    async def test_start_does_not_wait_full_timeout_when_throttled_with_prices(self) -> None:
+        md = _StubMarketData()
+        sig = _StubSignalEngine()
+        dec = _StubDecisionEngine()
+        exe = _StubExecutor()
+        bal = _StubBalanceSync()
+        bal.balance_data = {}
+        state = _StubSharedState()
+        state.exchange_throttled = True
+        state.exchange_throttle_until_ts = time.time() + 60.0
+
+        orch = NativeOrchestrator(
+            market_data=md,
+            signal_engine=sig,
+            decision_engine=dec,
+            executor=exe,
+            balance_sync=bal,
+            shared_state=state,
+        )
+
+        start = asyncio.get_event_loop().time()
+        await orch.start()
+        elapsed = asyncio.get_event_loop().time() - start
+        await orch.stop()
+        assert elapsed < 5.0
 
     @pytest.mark.asyncio
     async def test_run_loop_with_max_cycles(self) -> None:

@@ -15,6 +15,13 @@ import inspect
 import logging
 from typing import Any
 
+from core_engine.native.quant_reasoning import (
+    classify_market_regime,
+    compute_probability_score,
+    default_telemetry,
+    select_playbook,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +33,76 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.iscoroutine(value) or inspect.isawaitable(value):
         return await value
     return value
+
+
+def _exchange_throttled(app_ctx: dict[str, Any]) -> bool:
+    shared_state = app_ctx.get("shared_state")
+    if shared_state is not None and bool(getattr(shared_state, "exchange_throttled", False)):
+        return True
+    exchange_client = app_ctx.get("exchange_client")
+    if exchange_client is not None and hasattr(exchange_client, "is_throttled"):
+        try:
+            return bool(exchange_client.is_throttled())
+        except Exception:
+            return False
+    return False
+
+
+def _recent_loss_streak(trade_history: dict[str, list[Any]] | None) -> int:
+    streak = 0
+    if not isinstance(trade_history, dict):
+        return 0
+    flattened: list[Any] = []
+    for trades in trade_history.values():
+        if isinstance(trades, list):
+            flattened.extend(trades)
+    for trade in reversed(flattened):
+        if isinstance(trade, dict):
+            pnl = float(
+                trade.get("realized_pnl_usdt", trade.get("pnl_usdt", trade.get("pnl", 0.0))) or 0.0
+            )
+        else:
+            pnl = float(getattr(trade, "realized_pnl_usdt", getattr(trade, "pnl", 0.0)) or 0.0)
+        if pnl < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _compute_unrealized_pnl_usdt(shared_state: Any) -> float:
+    positions = getattr(shared_state, "positions", {}) or {}
+    pnl = 0.0
+    for pos in positions.values():
+        qty = float(getattr(pos, "qty", 0.0) or 0.0)
+        entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        mark = float(getattr(pos, "mark_price", 0.0) or 0.0)
+        if qty > 0 and entry > 0 and mark > 0:
+            pnl += (mark - entry) * qty
+    return pnl
+
+
+def _compute_dust_ratio(shared_state: Any, nav_usdt: float) -> float:
+    if nav_usdt <= 0:
+        return 0.0
+    dust_value = 0.0
+    positions = getattr(shared_state, "positions", {}) or {}
+    for pos in positions.values():
+        qty = float(getattr(pos, "qty", 0.0) or 0.0)
+        mark = float(getattr(pos, "mark_price", 0.0) or 0.0)
+        value = qty * mark
+        if 0 < value < 10.0:
+            dust_value += value
+    return max(0.0, min(1.0, dust_value / nav_usdt))
+
+
+def _map_system_state(health_status: str) -> str:
+    status = str(health_status or "OK").upper()
+    if status in {"CRITICAL", "ERROR", "UNHEALTHY"}:
+        return "CRITICAL"
+    if status in {"WARN", "DEGRADED"}:
+        return "DEGRADED"
+    return "HEALTHY"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -52,6 +129,18 @@ class MarketAccountEngineImpl:
 
         if not exchange_client:
             logger.warning("⚠️ exchange_client not available")
+            shared_state = app_ctx.get("shared_state")
+            if shared_state is not None:
+                account_data["balances"] = dict(getattr(shared_state, "balance", {}) or {})
+                account_data["positions"] = dict(getattr(shared_state, "positions", {}) or {})
+            return account_data
+
+        if _exchange_throttled(app_ctx):
+            shared_state = app_ctx.get("shared_state")
+            if shared_state is not None:
+                account_data["balances"] = dict(getattr(shared_state, "balance", {}) or {})
+                account_data["positions"] = dict(getattr(shared_state, "positions", {}) or {})
+                account_data["open_orders"] = list(getattr(shared_state, "open_orders", []) or [])
             return account_data
 
         try:
@@ -69,6 +158,18 @@ class MarketAccountEngineImpl:
 
         except Exception as e:
             logger.error(f"❌ Error getting account state: {e}")
+            shared_state = app_ctx.get("shared_state")
+            if shared_state is not None:
+                account_data["balances"] = dict(getattr(shared_state, "balance", {}) or {})
+                account_data["positions"] = dict(getattr(shared_state, "positions", {}) or {})
+                if hasattr(shared_state, "set_exchange_throttle") and exchange_client is not None:
+                    shared_state.set_exchange_throttle(
+                        bool(getattr(exchange_client, "is_throttled", lambda: False)()),
+                        reason=str(getattr(exchange_client, "last_error", lambda: "")() or e),
+                        until_ts=float(
+                            getattr(exchange_client, "throttled_until_ts", lambda: 0.0)() or 0.0
+                        ),
+                    )
 
         return account_data
 
@@ -83,11 +184,28 @@ class MarketAccountEngineImpl:
         exchange_client = app_ctx.get("exchange_client")
 
         prices = {}
+        shared_state = app_ctx.get("shared_state")
+
+        if _exchange_throttled(app_ctx):
+            cached = {}
+            if shared_state is not None and hasattr(shared_state, "prices"):
+                cached = dict(shared_state.prices)
+            elif market_data_feed and hasattr(market_data_feed, "get_prices"):
+                try:
+                    cached = market_data_feed.get_prices()
+                except Exception:
+                    cached = {}
+            if symbols:
+                return {s: cached[s] for s in symbols if s in cached}
+            return cached
 
         # Try market_data_feed first (cached, faster)
         if market_data_feed and hasattr(market_data_feed, "get_prices"):
             try:
-                prices = await market_data_feed.get_prices(symbols)
+                feed_prices = market_data_feed.get_prices()
+                prices = await _maybe_await(feed_prices)
+                if symbols and prices:
+                    return {s: prices[s] for s in symbols if s in prices}
                 return prices
             except Exception as e:
                 logger.debug(f"market_data_feed unavailable: {e}")
@@ -102,6 +220,22 @@ class MarketAccountEngineImpl:
                     prices = {t["symbol"]: float(t["price"]) for t in tickers}
             except Exception as e:
                 logger.error(f"❌ Error getting prices: {e}")
+                if shared_state is not None and hasattr(shared_state, "prices"):
+                    if (
+                        hasattr(shared_state, "set_exchange_throttle")
+                        and exchange_client is not None
+                    ):
+                        shared_state.set_exchange_throttle(
+                            bool(getattr(exchange_client, "is_throttled", lambda: False)()),
+                            reason=str(getattr(exchange_client, "last_error", lambda: "")() or e),
+                            until_ts=float(
+                                getattr(exchange_client, "throttled_until_ts", lambda: 0.0)() or 0.0
+                            ),
+                        )
+                    cached = dict(shared_state.prices)
+                    if symbols:
+                        return {s: cached[s] for s in symbols if s in cached}
+                    return cached
 
         return prices
 
@@ -128,6 +262,15 @@ class MarketAccountEngineImpl:
                 return wallet
             except Exception as e:
                 logger.debug(f"balance_manager unavailable: {e}")
+
+        shared_state = app_ctx.get("shared_state")
+        if _exchange_throttled(app_ctx) and shared_state is not None:
+            balances = dict(getattr(shared_state, "balance", {}) or {})
+            wallet["by_symbol"] = balances
+            free = float(balances.get("USDT", 0.0) or 0.0)
+            wallet["available_usdt"] = free
+            wallet["total_usdt"] = free
+            return wallet
 
         # Fallback: derive from account
         if exchange_client:
@@ -225,9 +368,20 @@ class SituationEngineImpl:
         if snapshot["nav_usdt"] <= 0:
             shared_state = app_ctx.get("shared_state")
             if shared_state is not None:
-                nav_candidate = getattr(shared_state, "nav", 0.0) or 0.0
+                nav_candidate = (
+                    getattr(shared_state, "nav_usdt", 0.0)
+                    or getattr(shared_state, "nav", 0.0)
+                    or 0.0
+                )
                 if nav_candidate > 0:
                     snapshot["nav_usdt"] = float(nav_candidate)
+                snapshot["available_capital"] = float(
+                    getattr(shared_state, "free_balance_usdt", 0.0) or 0.0
+                )
+                snapshot["locked_capital"] = float(
+                    getattr(shared_state, "invested_capital_usdt", 0.0) or 0.0
+                )
+                snapshot["active_positions"] = len(getattr(shared_state, "positions", {}) or {})
 
         return snapshot
 
@@ -320,6 +474,99 @@ class SituationEngineImpl:
 
         return regime
 
+    @staticmethod
+    async def get_situation_state(app_ctx: dict[str, Any]) -> dict[str, Any]:
+        portfolio = await SituationEngineImpl.get_portfolio_snapshot(app_ctx)
+        regime = await SituationEngineImpl.get_market_regime(app_ctx)
+        health_report = await OperationsEngineImpl.get_health_report(app_ctx)
+        shared_state = app_ctx.get("shared_state")
+
+        nav_usdt = float(portfolio.get("nav_usdt", 0.0) or 0.0)
+        free_usdt = float(portfolio.get("available_capital", 0.0) or 0.0)
+        locked_usdt = float(portfolio.get("locked_capital", 0.0) or 0.0)
+        free_ratio = (free_usdt / nav_usdt) if nav_usdt > 0 else 0.0
+        exposure_ratio = (locked_usdt / nav_usdt) if nav_usdt > 0 else 0.0
+        open_position_count = int(portfolio.get("active_positions", 0) or 0)
+        realized_pnl_usdt = 0.0
+        unrealized_pnl_usdt = 0.0
+        dust_ratio = 0.0
+        reserved_quote = 0.0
+        recent_loss_streak = 0
+        api_health = "UNKNOWN"
+
+        if shared_state is not None:
+            realized_pnl_usdt = float(
+                getattr(shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0
+            )
+            unrealized_pnl_usdt = _compute_unrealized_pnl_usdt(shared_state)
+            dust_ratio = _compute_dust_ratio(shared_state, nav_usdt)
+            if hasattr(shared_state, "reserved_quote_total"):
+                reserved_quote = float(shared_state.reserved_quote_total("USDT") or 0.0)
+            recent_loss_streak = _recent_loss_streak(getattr(shared_state, "trade_history", {}))
+
+        health_components = (
+            health_report.get("components", {}) if isinstance(health_report, dict) else {}
+        )
+        api_component = health_components.get("exchange_api", {})
+        api_health = str(api_component.get("status", "UNKNOWN") or "UNKNOWN")
+        system_state = _map_system_state(
+            health_report.get("overall_status", "OK") if isinstance(health_report, dict) else "OK"
+        )
+        market_regime = classify_market_regime(regime, system_state)
+
+        if system_state != "HEALTHY":
+            risk_state = "FROZEN" if system_state == "CRITICAL" else "DEFENSIVE"
+        else:
+            mode_name = (
+                str(getattr(shared_state, "current_mode", "") or "").upper() if shared_state else ""
+            )
+            risk_state = (
+                "DEFENSIVE" if mode_name in {"SAFE", "PROTECTIVE", "RECOVERY"} else "NORMAL"
+            )
+
+        if free_usdt <= 0.01:
+            capital_state = "NO_FREE_USDT"
+        elif reserved_quote > max(5.0, free_usdt * 0.5):
+            capital_state = "RESERVED_HEAVY"
+        elif free_ratio < 0.10:
+            capital_state = "LOW_FREE_USDT"
+        else:
+            capital_state = "HEALTHY"
+
+        if dust_ratio > 0.15:
+            portfolio_state = "DUST_HEAVY"
+        elif free_ratio < 0.10:
+            portfolio_state = "LOW_USDT"
+        elif exposure_ratio >= 0.85:
+            portfolio_state = "OVEREXPOSED"
+        elif free_ratio >= 0.70:
+            portfolio_state = "CASH_HEAVY"
+        else:
+            portfolio_state = "BALANCED"
+
+        metrics = {
+            "nav_usdt": nav_usdt,
+            "free_usdt": free_usdt,
+            "free_ratio": free_ratio,
+            "exposure_ratio": exposure_ratio,
+            "dust_ratio": dust_ratio,
+            "open_position_count": open_position_count,
+            "unrealized_pnl_usdt": unrealized_pnl_usdt,
+            "realized_pnl_usdt": realized_pnl_usdt,
+            "recent_loss_streak": recent_loss_streak,
+            "api_health": api_health,
+            "reserved_quote_usdt": reserved_quote,
+        }
+
+        return {
+            "market_regime": market_regime,
+            "portfolio_state": portfolio_state,
+            "capital_state": capital_state,
+            "risk_state": risk_state,
+            "system_state": system_state,
+            "metrics": metrics,
+        }
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # DECISION_ENGINE IMPLEMENTATIONS
@@ -328,6 +575,44 @@ class SituationEngineImpl:
 
 class DecisionEngineImpl:
     """Real implementations for DecisionEngine methods."""
+
+    @staticmethod
+    def _decision_fits(
+        market_regime: str, portfolio_state: str, signal_type: str
+    ) -> tuple[float, float]:
+        market_fit = 0.5
+        portfolio_fit = 0.5
+        if signal_type == "BUY":
+            if market_regime == "TRENDING":
+                market_fit = 0.9
+            elif market_regime == "VOLATILE":
+                market_fit = 0.4
+            elif market_regime == "CHOPPY":
+                market_fit = 0.55
+
+            if portfolio_state == "CASH_HEAVY":
+                portfolio_fit = 0.9
+            elif portfolio_state == "BALANCED":
+                portfolio_fit = 0.7
+            else:
+                portfolio_fit = 0.2
+        else:
+            if market_regime in {"VOLATILE", "CRISIS"}:
+                market_fit = 0.85
+            elif market_regime == "TRENDING":
+                market_fit = 0.6
+            if portfolio_state in {"LOW_USDT", "OVEREXPOSED", "DUST_HEAVY"}:
+                portfolio_fit = 0.85
+            else:
+                portfolio_fit = 0.65
+        return market_fit, portfolio_fit
+
+    @staticmethod
+    def _playbook_trade_cap(playbook: Any, suggested_quote_usdt: float) -> float:
+        cap = float(getattr(playbook, "max_trade_size_usdt", 0.0) or 0.0)
+        if cap <= 0:
+            return max(0.0, suggested_quote_usdt)
+        return max(0.0, min(float(suggested_quote_usdt or 0.0), cap))
 
     @staticmethod
     async def get_current_mode(app_ctx: dict[str, Any]) -> str:
@@ -385,51 +670,114 @@ class DecisionEngineImpl:
         return result
 
     @staticmethod
-    async def make_buy_decision(
-        app_ctx: dict[str, Any], symbol: str, edge_score: float
-    ) -> dict[str, Any] | None:
+    async def make_buy_decision(app_ctx: dict[str, Any], symbol: str, edge_score: float) -> Any:
         """
         Make buy decision with capital allocation.
         Coordinates: arbitration_engine (L5), capital_allocator (L6).
         """
+        from core_engine.decision_engine import TradeDecision
+
+        situation = await SituationEngineImpl.get_situation_state(app_ctx)
+        playbook = select_playbook(type("Situation", (), situation)())
+        market_fit, portfolio_fit = DecisionEngineImpl._decision_fits(
+            situation["market_regime"], situation["portfolio_state"], "BUY"
+        )
+        telemetry = default_telemetry()
+        telemetry.update(
+            {
+                "market_fit": market_fit,
+                "portfolio_fit": portfolio_fit,
+                "agent_quality": 0.5,
+                "system_state": situation["system_state"],
+                "risk_state": situation["risk_state"],
+            }
+        )
+        probability_score = compute_probability_score(
+            signal_confidence=abs(edge_score),
+            edge_score=edge_score,
+            market_fit=market_fit,
+            portfolio_fit=portfolio_fit,
+            agent_quality=telemetry["agent_quality"],
+            market_regime=situation["market_regime"],
+            risk_state=situation["risk_state"],
+            system_state=situation["system_state"],
+        )
+
         # Step 1: Arbitrate
         arb_result = await DecisionEngineImpl.evaluate_signal(app_ctx, symbol, "BUY", edge_score)
-
-        if not arb_result.get("passed"):
-            logger.debug(f"🚫 BUY rejected for {symbol}: {arb_result.get('blocking_gates')}")
-            return None
+        blocked_reason = ""
+        allowed = bool(arb_result.get("passed"))
+        if not allowed:
+            blocked_reason = ",".join(arb_result.get("blocking_gates", [])) or arb_result.get(
+                "reason", "arbitration_blocked"
+            )
 
         # Step 2: Allocate capital
         capital_allocator = app_ctx.get("capital_allocator")
-        quantity = 0.0
+        suggested_quote_usdt = 0.0
 
-        if capital_allocator and hasattr(capital_allocator, "allocate_for_buy"):
+        if allowed and capital_allocator and hasattr(capital_allocator, "allocate_for_buy"):
             try:
-                quantity = await capital_allocator.allocate_for_buy(symbol)
+                suggested_quote_usdt = await capital_allocator.allocate_for_buy(symbol)
             except Exception as e:
                 logger.warning(f"⚠️ Error allocating capital: {e}")
+                blocked_reason = f"capital_alloc_error:{e}"
+                allowed = False
 
-        # Step 3: Build decision
-        decision = {
-            "symbol": symbol,
-            "action": "BUY",
-            "quantity": quantity,
-            "price_target": None,
-            "stop_loss": None,
-            "take_profit": None,
-            "reason": f"Signal edge: {edge_score:.3f}",
-            "confidence": abs(edge_score),
-            "timestamp": asyncio.get_event_loop().time(),
-            "mode": await DecisionEngineImpl.get_current_mode(app_ctx),
-        }
+        suggested_quote_usdt = DecisionEngineImpl._playbook_trade_cap(
+            playbook, suggested_quote_usdt
+        )
 
-        logger.info(f"✅ BUY decision: {symbol} x{quantity:.4f}")
+        confidence_floor = max(playbook.confidence_floor, 0.0)
+        if situation["risk_state"] == "DEFENSIVE":
+            confidence_floor = max(confidence_floor, 0.70)
+        if not playbook.allow_buy:
+            allowed = False
+            blocked_reason = blocked_reason or "BUY_BLOCKED_BY_PLAYBOOK"
+        if suggested_quote_usdt <= 0:
+            allowed = False
+            blocked_reason = blocked_reason or "NO_EXECUTABLE_CAPITAL"
+        if probability_score < confidence_floor:
+            allowed = False
+            blocked_reason = blocked_reason or "PROBABILITY_BELOW_FLOOR"
+
+        decision = TradeDecision(
+            symbol=symbol,
+            action="BUY",
+            quantity=suggested_quote_usdt if allowed else 0.0,
+            reason=playbook.reason or f"Signal edge: {edge_score:.3f}",
+            confidence=abs(edge_score),
+            timestamp=asyncio.get_event_loop().time(),
+            mode=await DecisionEngineImpl.get_current_mode(app_ctx),
+            edge_score=edge_score,
+            probability_score=probability_score,
+            playbook=playbook.name,
+            blocked_reason=blocked_reason,
+            source_signals=[{"symbol": symbol, "signal_type": "BUY", "edge_score": edge_score}],
+            suggested_quote_usdt=suggested_quote_usdt,
+            telemetry={
+                **telemetry,
+                "confidence_floor": confidence_floor,
+                "situation_state": situation,
+                "arb_passed": bool(arb_result.get("passed")),
+            },
+            allowed=allowed,
+        )
+
+        logger.info(
+            "✅ BUY decision: %s playbook=%s allowed=%s p=%.2f quote=%.2f",
+            symbol,
+            playbook.name,
+            allowed,
+            probability_score,
+            suggested_quote_usdt,
+        )
         return decision
 
     @staticmethod
     async def make_sell_decision(
         app_ctx: dict[str, Any], symbol: str, edge_score: float, source: str = "signal"
-    ) -> dict[str, Any] | None:
+    ) -> Any:
         """
         Make sell decision for an open position — only if profitable after fees.
         Coordinates: arbitration_engine (L5), position_manager (L3), shared_state (L0).
@@ -443,12 +791,42 @@ class DecisionEngineImpl:
         Returns:
             SELL decision dict if position is profitable after fees, else None
         """
+        from core_engine.decision_engine import TradeDecision
+
+        situation = await SituationEngineImpl.get_situation_state(app_ctx)
+        playbook = select_playbook(type("Situation", (), situation)())
+        market_fit, portfolio_fit = DecisionEngineImpl._decision_fits(
+            situation["market_regime"], situation["portfolio_state"], "SELL"
+        )
+        telemetry = default_telemetry()
+        telemetry.update(
+            {
+                "market_fit": market_fit,
+                "portfolio_fit": portfolio_fit,
+                "agent_quality": 0.6,
+                "system_state": situation["system_state"],
+                "risk_state": situation["risk_state"],
+            }
+        )
+        probability_score = compute_probability_score(
+            signal_confidence=abs(edge_score),
+            edge_score=edge_score,
+            market_fit=market_fit,
+            portfolio_fit=portfolio_fit,
+            agent_quality=telemetry["agent_quality"],
+            market_regime=situation["market_regime"],
+            risk_state=situation["risk_state"],
+            system_state=situation["system_state"],
+        )
+
         # Step 1: Arbitrate
         arb_result = await DecisionEngineImpl.evaluate_signal(app_ctx, symbol, "SELL", edge_score)
-
-        if not arb_result.get("passed"):
-            logger.debug(f"🚫 SELL rejected for {symbol}: {arb_result.get('blocking_gates')}")
-            return None
+        blocked_reason = ""
+        allowed = bool(arb_result.get("passed"))
+        if not allowed:
+            blocked_reason = ",".join(arb_result.get("blocking_gates", [])) or arb_result.get(
+                "reason", "arbitration_blocked"
+            )
 
         # Step 2: Get position details
         position_manager = app_ctx.get("position_manager")
@@ -507,23 +885,45 @@ class DecisionEngineImpl:
             return None
 
         # Step 4: Build SELL decision
-        decision = {
-            "symbol": symbol,
-            "action": "SELL",
-            "quantity": quantity,
-            "price_target": current_price,
-            "stop_loss": None,
-            "take_profit": None,
-            "reason": f"SELL {source} @ {current_price:.4f} (entry={entry_price:.4f}, "
-            f"profit={pnl_after_fees:.2f} USDT, {pnl_after_fees_pct:.2f}% after fees)",
-            "confidence": max(0.5, abs(edge_score)),  # At least 50% confidence since profitable
-            "timestamp": asyncio.get_event_loop().time(),
-            "mode": await DecisionEngineImpl.get_current_mode(app_ctx),
-        }
+        if not playbook.allow_sell:
+            allowed = False
+            blocked_reason = blocked_reason or "SELL_BLOCKED_BY_PLAYBOOK"
+
+        decision = TradeDecision(
+            symbol=symbol,
+            action="SELL",
+            quantity=quantity if allowed else 0.0,
+            price_target=current_price,
+            reason=(
+                f"SELL {source} @ {current_price:.4f} (entry={entry_price:.4f}, "
+                f"profit={pnl_after_fees:.2f} USDT, {pnl_after_fees_pct:.2f}% after fees)"
+            ),
+            confidence=max(0.5, abs(edge_score)),
+            timestamp=asyncio.get_event_loop().time(),
+            mode=await DecisionEngineImpl.get_current_mode(app_ctx),
+            edge_score=edge_score,
+            probability_score=probability_score,
+            playbook=playbook.name,
+            blocked_reason=blocked_reason,
+            source_signals=[{"symbol": symbol, "signal_type": "SELL", "edge_score": edge_score}],
+            suggested_quote_usdt=current_price * quantity,
+            telemetry={
+                **telemetry,
+                "pnl_after_fees_usdt": pnl_after_fees,
+                "pnl_after_fees_pct": pnl_after_fees_pct,
+                "situation_state": situation,
+                "arb_passed": bool(arb_result.get("passed")),
+            },
+            allowed=allowed,
+        )
 
         logger.info(
-            f"✅ SELL decision: {symbol} x{quantity:.4f} @ {current_price:.4f} "
-            f"(profit={pnl_after_fees:.2f} USDT, {pnl_after_fees_pct:.2f}% after fees)"
+            "✅ SELL decision: %s playbook=%s allowed=%s p=%.2f qty=%.4f",
+            symbol,
+            playbook.name,
+            allowed,
+            probability_score,
+            quantity,
         )
         return decision
 
@@ -535,6 +935,46 @@ class DecisionEngineImpl:
 
 class SafeExecutionEngineImpl:
     """Real implementations for SafeExecutionEngine methods."""
+
+    @staticmethod
+    def _blocked_execution_result(
+        *, symbol: str, action: str, reason: str, quantity: float = 0.0
+    ) -> dict[str, Any]:
+        return {
+            "success": False,
+            "order_id": None,
+            "symbol": symbol,
+            "action": action,
+            "quantity": quantity,
+            "filled_quantity": 0.0,
+            "average_price": 0.0,
+            "status": "REJECTED",
+            "error_message": reason,
+            "timestamp": asyncio.get_event_loop().time(),
+        }
+
+    @staticmethod
+    def _playbook_allows(decision: Any) -> tuple[bool, str]:
+        action = str(getattr(decision, "action", "") or "").upper()
+        playbook = str(getattr(decision, "playbook", "") or "").upper()
+        allowed = bool(getattr(decision, "allowed", True))
+        blocked_reason = str(getattr(decision, "blocked_reason", "") or "")
+
+        if not allowed:
+            return False, blocked_reason or f"{action}_BLOCKED_BY_DECISION"
+        if playbook == "SYSTEM_PAUSE":
+            return False, "SYSTEM_PAUSE"
+        if action == "BUY" and playbook in {
+            "LOW_USDT_RECOVERY",
+            "OVEREXPOSED_PROTECTION",
+            "DUST_CLEANUP",
+        }:
+            return False, "BUY_BLOCKED_BY_PLAYBOOK"
+        if action == "SELL" and playbook == "SYSTEM_PAUSE":
+            return False, "SELL_BLOCKED_BY_PLAYBOOK"
+        if action not in {"SELL", "REBALANCE", "DUST_CLEANUP"} and playbook == "DUST_CLEANUP":
+            return False, "ACTION_BLOCKED_BY_DUST_CLEANUP"
+        return True, ""
 
     @staticmethod
     async def validate_order(
@@ -617,24 +1057,12 @@ class SafeExecutionEngineImpl:
             result["error_message"] = "; ".join(validation["errors"])
             return result
 
-        # Place order via exchange_client (native) or execution_manager (legacy)
-        exchange_client = app_ctx.get("exchange_client")
         execution_manager = app_ctx.get("execution_manager")
 
         try:
             order = None
 
-            # Try native exchange client first
-            if exchange_client and hasattr(exchange_client, "place_order"):
-                order = await exchange_client.place_order(
-                    symbol=symbol,
-                    side="BUY",
-                    quantity=quantity,
-                    order_type=order_type,
-                    price=price,
-                )
-            # Fallback to legacy execution_manager
-            elif execution_manager and hasattr(execution_manager, "place_order"):
+            if execution_manager and hasattr(execution_manager, "place_order"):
                 order = await execution_manager.place_order(
                     symbol=symbol,
                     quantity=quantity,
@@ -645,14 +1073,14 @@ class SafeExecutionEngineImpl:
 
             if order:
                 result["success"] = True
-                result["order_id"] = order.get("orderId")
-                result["status"] = "FILLED"
+                result["order_id"] = order.get("orderId") or order.get("order_id")
+                result["status"] = order.get("status", "FILLED")
                 result["average_price"] = order.get("price", price or 0)
                 result["filled_quantity"] = order.get("executedQty", quantity)
                 logger.info(f"✅ BUY order placed: {symbol} x{quantity}")
             else:
-                result["error_message"] = "No exchange client or execution manager available"
-                logger.error(f"❌ No order executor available for BUY {symbol}")
+                result["error_message"] = "No execution manager available"
+                logger.error(f"❌ No execution manager available for BUY {symbol}")
 
         except Exception as e:
             result["error_message"] = str(e)
@@ -700,7 +1128,7 @@ class SafeExecutionEngineImpl:
 
         if bounded_cache and hasattr(bounded_cache, "get"):
             try:
-                if await bounded_cache.get(cache_key):
+                if await _maybe_await(bounded_cache.get(cache_key)):
                     logger.warning(f"⚠️ SELL already finalized for {symbol}, skipping")
                     result["status"] = "ALREADY_FINALIZED"
                     result["error_message"] = "Duplicate SELL prevented by FIX #2 guard"
@@ -708,24 +1136,12 @@ class SafeExecutionEngineImpl:
             except Exception as e:
                 logger.warning(f"⚠️ FIX #2 guard check failed: {e}")
 
-        # Place order via exchange_client (native) or execution_manager (legacy)
-        exchange_client = app_ctx.get("exchange_client")
         execution_manager = app_ctx.get("execution_manager")
 
         try:
             order = None
 
-            # Try native exchange client first
-            if exchange_client and hasattr(exchange_client, "place_order"):
-                order = await exchange_client.place_order(
-                    symbol=symbol,
-                    side="SELL",
-                    quantity=quantity,
-                    order_type=order_type,
-                    price=price,
-                )
-            # Fallback to legacy execution_manager
-            elif execution_manager and hasattr(execution_manager, "place_order"):
+            if execution_manager and hasattr(execution_manager, "place_order"):
                 order = await execution_manager.place_order(
                     symbol=symbol,
                     quantity=quantity,
@@ -736,22 +1152,22 @@ class SafeExecutionEngineImpl:
 
             if order:
                 result["success"] = True
-                result["order_id"] = order.get("orderId")
-                result["status"] = "FILLED"
+                result["order_id"] = order.get("orderId") or order.get("order_id")
+                result["status"] = order.get("status", "FILLED")
                 result["average_price"] = order.get("price", price or 0)
                 result["filled_quantity"] = order.get("executedQty", quantity)
 
                 # Mark in FIX #2 cache
                 if bounded_cache and hasattr(bounded_cache, "set"):
                     try:
-                        await bounded_cache.set(cache_key, True, ttl=300)
+                        await _maybe_await(bounded_cache.set(cache_key, True, ttl=300))
                     except Exception as e:
                         logger.warning(f"⚠️ FIX #2 cache mark failed: {e}")
 
                 logger.info(f"✅ SELL order placed: {symbol} x{quantity}")
             else:
-                result["error_message"] = "No exchange client or execution manager available"
-                logger.error(f"❌ No order executor available for SELL {symbol}")
+                result["error_message"] = "No execution manager available"
+                logger.error(f"❌ No execution manager available for SELL {symbol}")
 
         except Exception as e:
             result["error_message"] = str(e)
@@ -830,3 +1246,14 @@ class OperationsEngineImpl:
             logger.error(f"❌ Error getting health report: {e}")
 
         return report
+
+    @staticmethod
+    async def log_event(app_ctx: dict[str, Any], event_type: str, details: dict[str, Any]) -> None:
+        event_store = app_ctx.get("event_store")
+        if event_store:
+            logger.info("📝 Event: %s", event_type)
+            return
+        if event_type == "QUANT_LOOP_SUMMARY":
+            logger.info("QUANT_LOOP_SUMMARY %s", details)
+            return
+        logger.debug("Event: %s - %s", event_type, details)

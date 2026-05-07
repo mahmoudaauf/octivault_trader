@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .capital_policy import compute_spendable_quote
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,6 +53,8 @@ class NativeCapitalAllocator:
         shared_state: Any | None = None,
         exchange_client: Any | None = None,
         default_planned_quote: float = 12.0,
+        quote_reserve_ratio: float = 0.10,
+        quote_min_reserve_usdt: float = 0.0,
     ) -> None:
         """
         Initialize adaptive capital allocator.
@@ -71,6 +75,8 @@ class NativeCapitalAllocator:
         self._ss = shared_state
         self._exchange_client = exchange_client
         self._default_planned_quote = max(1.0, float(default_planned_quote))
+        self._quote_reserve_ratio = max(0.0, float(quote_reserve_ratio))
+        self._quote_min_reserve_usdt = max(0.0, float(quote_min_reserve_usdt))
         self._symbol_filters_cache: dict[str, dict[str, Any]] = {}
 
     async def allocate_for_buy(self, symbol: str) -> float:
@@ -133,6 +139,24 @@ class NativeCapitalAllocator:
                 logger.debug("NAV %s too low to allocate", nav)
                 return 0.0
 
+            free_capital = (
+                float(getattr(self._ss, "free_balance_usdt", 0.0) or 0.0) if self._ss else nav
+            )
+            reserved_quote = (
+                float(getattr(self._ss, "reserved_quote_total", lambda _asset: 0.0)("USDT") or 0.0)
+                if self._ss
+                else 0.0
+            )
+            spendable_capital = compute_spendable_quote(
+                free_capital,
+                reserve_ratio=self._quote_reserve_ratio,
+                min_reserve=self._quote_min_reserve_usdt,
+                reserved_quote=reserved_quote,
+            )
+            if spendable_capital <= 0:
+                logger.debug("Spendable capital %.2f too low to allocate", spendable_capital)
+                return 0.0
+
             # Get price from market_data if available, otherwise skip allocation
             price = None
             if self._md and hasattr(self._md, "get_price"):
@@ -151,7 +175,7 @@ class NativeCapitalAllocator:
             if nav < 100.0:
                 # Small account: use fixed default_planned_quote per trade
                 # This allows compounding growth from small starting capital
-                allocation_usdt = self._default_planned_quote * size_mult
+                allocation_usdt = min(self._default_planned_quote * size_mult, spendable_capital)
                 alloc_reason = f"fixed-quote (nav=${nav:.2f}<$100)"
             else:
                 # Larger account: switch to percentage-based allocation
@@ -161,14 +185,13 @@ class NativeCapitalAllocator:
                     try:
                         trade_history = self._ss.trade_history.get(symbol, []) if self._ss else []
                         positions = self._ss.get_all_positions() if self._ss else {}
-                        free_capital = self._ss.free_balance_usdt if self._ss else nav
                         drawdown_pct = self._compute_drawdown_pct()
                         volatility_pct = self._compute_volatility_pct(symbol)
 
                         decision = self._ace.evaluate(
                             symbol=symbol,
                             nav=nav,
-                            free_capital=free_capital,
+                            free_capital=spendable_capital,
                             base_risk_fraction=self._allocation_pct / 100.0,
                             volatility_pct=volatility_pct,
                             drawdown_pct=drawdown_pct,
@@ -187,7 +210,7 @@ class NativeCapitalAllocator:
                             trade_history=trade_history,
                         )
                         risk_fraction = decision.risk_fraction * size_mult
-                        allocation_usdt = nav * risk_fraction
+                        allocation_usdt = min(nav * risk_fraction, spendable_capital)
                         alloc_reason = f"ACE-adaptive (risk={decision.risk_fraction:.3f})"
 
                         logger.debug(
@@ -200,12 +223,12 @@ class NativeCapitalAllocator:
                     except Exception as e:
                         logger.warning("ACE evaluation failed; falling back to flat: %s", e)
                         risk_fraction = (self._allocation_pct / 100.0) * size_mult
-                        allocation_usdt = nav * risk_fraction
+                        allocation_usdt = min(nav * risk_fraction, spendable_capital)
                         alloc_reason = "flat-pct (%.1f%%)" % self._allocation_pct
                 else:
                     # Flat percentage allocation with OFC multiplier
                     risk_fraction = (self._allocation_pct / 100.0) * size_mult
-                    allocation_usdt = nav * risk_fraction
+                    allocation_usdt = min(nav * risk_fraction, spendable_capital)
                     alloc_reason = "flat-pct (%.1f%%)" % self._allocation_pct
 
             quantity = allocation_usdt / price

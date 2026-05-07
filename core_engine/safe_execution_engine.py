@@ -319,6 +319,21 @@ class SafeExecutionEngine:
             ExecutionResult with order status and ID
         """
         try:
+            allowed = (
+                getattr(decision, "allowed", decision.get("allowed", True))
+                if hasattr(decision, "get")
+                else getattr(decision, "allowed", True)
+            )
+            blocked_reason = (
+                getattr(decision, "blocked_reason", decision.get("blocked_reason", ""))
+                if hasattr(decision, "get")
+                else getattr(decision, "blocked_reason", "")
+            )
+            playbook = (
+                getattr(decision, "playbook", decision.get("playbook", ""))
+                if hasattr(decision, "get")
+                else getattr(decision, "playbook", "")
+            )
             # Extract fields from TradeDecision or dict
             action = (
                 getattr(decision, "action", decision.get("action"))
@@ -342,6 +357,16 @@ class SafeExecutionEngine:
                     symbol=symbol or "?",
                     action=action or "?",
                     error_message="invalid decision: missing symbol/action or qty <= 0",
+                )
+
+            if not allowed or str(playbook).upper() == "SYSTEM_PAUSE":
+                return ExecutionResult(
+                    success=False,
+                    symbol=symbol,
+                    action=action,
+                    quantity=quantity,
+                    status="REJECTED",
+                    error_message=blocked_reason or "PLAYBOOK_BLOCKED",
                 )
 
             # Route to buy or sell (use MARKET orders for MVP — no price needed)

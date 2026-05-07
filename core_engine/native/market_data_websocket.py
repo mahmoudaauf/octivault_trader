@@ -214,7 +214,10 @@ class NativeMarketDataWebSocket:
                 logger.error(f"WebSocket loop error: {e}")
                 reconnect_count += 1
 
-        logger.error("❌ WebSocket disconnected (max reconnects reached)")
+        if self._stopped.is_set() or not self._running:
+            logger.info("WebSocket market data stopped")
+        else:
+            logger.error("❌ WebSocket disconnected (max reconnects reached)")
         self._running = False
 
     def _build_streams(self) -> list[str]:
@@ -241,6 +244,8 @@ class NativeMarketDataWebSocket:
                 if symbol and price > 0:
                     self._shared_state.price_cache[symbol] = price
                     self._shared_state.prices[symbol] = price
+                    if hasattr(self._shared_state, "market_data_ready"):
+                        self._shared_state.market_data_ready = True
 
             elif event_type == "kline":
                 # Kline update
@@ -260,6 +265,8 @@ class NativeMarketDataWebSocket:
                         "volume": float(data.get("v", 0)),
                     }
                     self._shared_state.market_data[(symbol, interval)] = [ohlcv]
+                    if hasattr(self._shared_state, "market_data_ready"):
+                        self._shared_state.market_data_ready = True
 
         except Exception as e:
             logger.debug(f"Error handling message: {e}")

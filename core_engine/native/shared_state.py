@@ -12,6 +12,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
+from .capital_policy import prune_reservations
+
 
 @dataclass
 class Position:
@@ -72,6 +74,10 @@ class NativeSharedState:
         self.nav_usdt: float = 0.0
         self.free_balance_usdt: float = 0.0
         self.invested_capital_usdt: float = 0.0
+        self.balance: dict[str, float] = {}
+        self.prices: dict[str, float] = {}
+        self.market_data: dict[tuple[str, str], list[dict]] = {}
+        self.market_data_ready: bool = False
 
         # Position tracking
         self.positions: dict[str, Position] = {}  # symbol -> Position
@@ -104,6 +110,12 @@ class NativeSharedState:
         self.trading_halted: bool = False  # OFC kill-switch
         self.trade_history: dict[str, list] = {}  # symbol -> list of closed-trade records
         self._session_start_ts: float = 0.0  # Session start time for OFC elapsed calc
+        self.current_mode: str = "BOOTSTRAP"
+        self.current_mode_reason: str = ""
+        self.exchange_throttled: bool = False
+        self.exchange_throttle_reason: str = ""
+        self.exchange_throttle_until_ts: float = 0.0
+        self.quote_reservations: dict[str, list[dict]] = {}
 
     # ==================== NAV Management ====================
 
@@ -121,6 +133,13 @@ class NativeSharedState:
         self.invested_capital_usdt = max(0.0, invested)
         # Auto-update NAV from balance
         self.nav_usdt = self.free_balance_usdt + self.invested_capital_usdt
+
+    def update_balance_map(self, balances: dict[str, float]) -> None:
+        """Store raw exchange/free balances and keep canonical USDT fields aligned."""
+        self.balance = {str(k).upper(): float(v or 0.0) for k, v in (balances or {}).items()}
+        free_usdt = float(self.balance.get("USDT", 0.0) or 0.0)
+        invested = self.get_portfolio_value()
+        self.update_balance(free_usdt, invested)
 
     # ==================== Position Management ====================
 
@@ -182,6 +201,7 @@ class NativeSharedState:
         """Update latest price for symbol"""
         if price > 0:
             self.price_cache[symbol] = price
+            self.prices[symbol] = price
 
     def get_price(self, symbol: str) -> float:
         """Get latest price for symbol"""
@@ -247,7 +267,87 @@ class NativeSharedState:
             "portfolio_value": self.get_portfolio_value(),
             "symbols_active": len(self.accepted_symbols),
             "symbols_dust": len(self.dust_symbols),
+            "exchange_throttled": self.exchange_throttled,
         }
+
+    def set_exchange_throttle(
+        self,
+        throttled: bool,
+        *,
+        reason: str = "",
+        until_ts: float = 0.0,
+    ) -> None:
+        self.exchange_throttled = bool(throttled)
+        self.exchange_throttle_reason = str(reason or "")
+        self.exchange_throttle_until_ts = max(0.0, float(until_ts or 0.0))
+
+    # ==================== Reservations ====================
+
+    def reserve_quote(
+        self,
+        asset: str,
+        amount: float,
+        *,
+        ttl_sec: float = 30.0,
+        reservation_id: str = "",
+        created_at: float = 0.0,
+    ) -> None:
+        asset_key = str(asset or "USDT").upper()
+        amount = max(0.0, float(amount or 0.0))
+        if amount <= 0:
+            return
+        created = float(created_at or 0.0)
+        if created <= 0:
+            import time
+
+            created = time.time()
+        expires = created + max(1.0, float(ttl_sec or 30.0))
+        arr = self.quote_reservations.setdefault(asset_key, [])
+        arr.append(
+            {
+                "reservation_id": str(reservation_id or ""),
+                "amount": amount,
+                "created_at": created,
+                "expires_at": expires,
+            }
+        )
+
+    def release_quote_reservation(self, asset: str, reservation_id: str) -> None:
+        asset_key = str(asset or "USDT").upper()
+        if asset_key not in self.quote_reservations:
+            return
+        rid = str(reservation_id or "")
+        self.quote_reservations[asset_key] = [
+            r
+            for r in self.quote_reservations.get(asset_key, [])
+            if str(r.get("reservation_id", "")) != rid
+        ]
+
+    def prune_quote_reservations(
+        self,
+        asset: str,
+        *,
+        now_ts: float = 0.0,
+        max_age_sec: float = 90.0,
+        default_ttl_sec: float = 30.0,
+    ) -> float:
+        asset_key = str(asset or "USDT").upper()
+        kept, freed = prune_reservations(
+            self.quote_reservations.get(asset_key, []),
+            now_ts=now_ts or None,
+            max_age_sec=max_age_sec,
+            default_ttl_sec=default_ttl_sec,
+        )
+        self.quote_reservations[asset_key] = kept
+        return float(freed)
+
+    def reserved_quote_total(self, asset: str, *, prune: bool = True) -> float:
+        asset_key = str(asset or "USDT").upper()
+        if prune:
+            self.prune_quote_reservations(asset_key)
+        return sum(
+            float(r.get("amount", 0.0) or 0.0) for r in self.quote_reservations.get(asset_key, [])
+        )
 
     # ==================== Feedback Loop ====================
 

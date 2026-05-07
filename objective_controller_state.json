@@ -1,13 +1,50 @@
 {
-  "last_action_ts": 0.0,
-  "integral_pace": 0.0,
+  "last_action_ts": 1778172258.4995909,
+  "integral_pace": -0.08333333333333334,
   "consecutive_dd_breaches": 0,
   "last_knobs": {
-    "confidence_floor": 0.65,
-    "size_multiplier": 1.0,
-    "target_throughput_per_hour": 12.0
+    "confidence_floor": 0.6604166666666667,
+    "size_multiplier": 0.9966666666666667,
+    "target_throughput_per_hour": 11.958333333333334
   },
-  "history_tail": [],
+  "history_tail": [
+    {
+      "ts": 1778172258.4995909,
+      "telemetry": {
+        "ok": true,
+        "age_s": 0.0,
+        "nav": 1000.0,
+        "nav_anchor": 1000.0,
+        "realized_pnl": 0.0,
+        "unrealized_pnl": 0.0,
+        "drawdown_pct": 0.0,
+        "elapsed_h": 493935.7638368778,
+        "trades_in_window": 0,
+        "win_rate": 0.5,
+        "avg_fee_bps": 0.0,
+        "avg_slippage_bps": 0.0,
+        "avg_net_profit_bps": 0.0,
+        "missing": []
+      },
+      "errors": {
+        "pace_pct_per_h": -0.08333333333333334,
+        "drawdown_pct_over_limit": 0.0,
+        "net_edge_shortfall_bps": 5.0
+      },
+      "knobs_before": {
+        "confidence_floor": 0.65,
+        "size_multiplier": 1.0,
+        "target_throughput_per_hour": 12.0
+      },
+      "knobs_after": {
+        "confidence_floor": 0.6604166666666667,
+        "size_multiplier": 0.9966666666666667,
+        "target_throughput_per_hour": 11.958333333333334
+      },
+      "halted": false,
+      "integral_pace": -0.08333333333333334
+    }
+  ],
   "set_points": {
     "daily_target_pct": 0.02,
     "hourly_target_pct": 0.0008333333333333334,

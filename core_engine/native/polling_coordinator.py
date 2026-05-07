@@ -95,6 +95,9 @@ class NativePollingCoordinator:
         self._position_task: Optional[asyncio.Task] = None
 
         # Timing trackers
+        self._startup_ts: float = (
+            time.time()
+        )  # For startup grace period (allow polling without trades)
         self._last_orders_poll: float = 0.0
         self._last_balance_poll: float = 0.0
         self._last_position_poll: float = 0.0
@@ -183,6 +186,10 @@ class NativePollingCoordinator:
             self._mark_throttle_state(RuntimeError("exchange throttled"))
             return False
         if not self.config.enable_active_trades_gate:
+            return True
+
+        # Allow polling during startup grace period (first 60 seconds)
+        if time.time() - self._startup_ts < 60.0:
             return True
 
         try:

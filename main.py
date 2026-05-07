@@ -63,6 +63,7 @@ from core_engine import (
     SituationEngine,
 )
 from core_engine.integration import setup_core_engines
+from core_engine.native.cadence_scheduler import CadenceScheduler
 
 # ────────────────────────────────────────────────────────────────────────
 # Logging
@@ -135,6 +136,10 @@ async def trading_cycle(
     PHASE 5: RECOVER     — Monitor health and log events
     """
     cycle_start = time.perf_counter()
+    cadence = None
+    now_ts = time.time()
+    if app_ctx is not None:
+        cadence = app_ctx.setdefault("_cadence_scheduler", CadenceScheduler())
 
     # ──────────────────────────────────────────────────────────────────
     # PHASE 0: DISCOVER (optional symbol discovery per cycle)
@@ -159,16 +164,61 @@ async def trading_cycle(
     # ──────────────────────────────────────────────────────────────────
     # PHASE 1: READ
     # ──────────────────────────────────────────────────────────────────
-    account_state = await engines.market.get_account_state()
+    cached_account_state = (
+        app_ctx.get("_cached_account_state") if app_ctx is not None else None
+    ) or {
+        "balances": {},
+        "positions": {},
+        "open_orders": [],
+    }
+    if cadence is None or cadence.is_due("account", now=now_ts):
+        account_state = await engines.market.get_account_state()
+        if app_ctx is not None:
+            app_ctx["_cached_account_state"] = account_state
+        if cadence is not None:
+            cadence.mark("account", now=now_ts)
+    else:
+        account_state = cached_account_state
     market_prices = await engines.market.get_market_prices()
     read_complete = True
 
     # ──────────────────────────────────────────────────────────────────
     # PHASE 2: UNDERSTAND
     # ──────────────────────────────────────────────────────────────────
-    portfolio_snapshot = await engines.situation.get_portfolio_snapshot()
-    market_regime = await engines.situation.get_market_regime()
-    all_signals = await engines.situation.get_all_signals()
+    scenario_due = cadence is None or cadence.is_due("scenario", now=now_ts)
+    decision_due = cadence is None or cadence.is_due("decision", now=now_ts)
+    cached_portfolio = (
+        app_ctx.get("_cached_portfolio_snapshot") if app_ctx is not None else None
+    ) or {}
+    cached_regime = (app_ctx.get("_cached_market_regime") if app_ctx is not None else None) or {}
+    cached_situation = (
+        app_ctx.get("_cached_situation_state") if app_ctx is not None else None
+    ) or {}
+    cached_signals = (app_ctx.get("_cached_signals") if app_ctx is not None else None) or []
+
+    if scenario_due or not cached_situation:
+        portfolio_snapshot = await engines.situation.get_portfolio_snapshot()
+        market_regime = await engines.situation.get_market_regime()
+        situation_state = await engines.situation.get_situation_state()
+        if app_ctx is not None:
+            app_ctx["_cached_portfolio_snapshot"] = portfolio_snapshot
+            app_ctx["_cached_market_regime"] = market_regime
+            app_ctx["_cached_situation_state"] = situation_state
+        if cadence is not None:
+            cadence.mark("scenario", now=now_ts)
+    else:
+        portfolio_snapshot = cached_portfolio
+        market_regime = cached_regime
+        situation_state = cached_situation
+
+    if decision_due or not cached_signals:
+        all_signals = await engines.situation.get_all_signals()
+        if app_ctx is not None:
+            app_ctx["_cached_signals"] = all_signals
+        if cadence is not None:
+            cadence.mark("decision", now=now_ts)
+    else:
+        all_signals = cached_signals
     understand_complete = True
 
     # Helper: safely extract value from dict or object
@@ -181,29 +231,26 @@ async def trading_cycle(
     # PHASE 3: DECIDE
     # ──────────────────────────────────────────────────────────────────
     trading_decisions: list[Any] = []
-    for sig in all_signals:
-        decision = None
-        sig_type = get_value(sig, "signal_type", "")
-        symbol = get_value(sig, "symbol", "")
-        edge_score = get_value(sig, "edge_score", 0.0)
+    if decision_due:
+        for sig in all_signals:
+            decision = None
+            sig_type = str(
+                get_value(sig, "signal_type", get_value(sig, "action", "")) or ""
+            ).upper()
+            symbol = get_value(sig, "symbol", "")
+            edge_score = float(get_value(sig, "edge_score", get_value(sig, "edge", 0.0)) or 0.0)
 
-        try:
-            if sig_type == "BUY" and app_ctx:
-                # Use DecisionEngineImpl static methods via app_ctx
-                from core_engine.implementations import DecisionEngineImpl
-
-                decision = await DecisionEngineImpl.make_buy_decision(app_ctx, symbol, edge_score)
-            elif sig_type == "SELL" and app_ctx:
-                # Use DecisionEngineImpl static methods via app_ctx
-                from core_engine.implementations import DecisionEngineImpl
-
-                decision = await DecisionEngineImpl.make_sell_decision(
-                    app_ctx, symbol, edge_score, "signal"
-                )
-            if decision:
-                trading_decisions.append(decision)
-        except Exception as e:
-            log.debug(f"Decision failed for {symbol}: {e}")
+            try:
+                if sig_type == "BUY":
+                    decision = await engines.decision.make_buy_decision(symbol, edge_score)
+                elif sig_type == "SELL":
+                    decision = await engines.decision.make_sell_decision(
+                        symbol, edge_score, "signal"
+                    )
+                if decision:
+                    trading_decisions.append(decision)
+            except Exception as e:
+                log.debug(f"Decision failed for {symbol}: {e}")
     decide_complete = True
 
     # ──────────────────────────────────────────────────────────────────
@@ -212,26 +259,7 @@ async def trading_cycle(
     executed_orders: list[Any] = []
     if mode != "dry-run":
         for decision in trading_decisions:
-            order_result = None
-            action = get_value(decision, "action", "")
-            symbol = get_value(decision, "symbol", "")
-            quantity = get_value(decision, "quantity", 0.0)
-            price_target = get_value(decision, "price_target", 0.0)
-
-            if action == "BUY":
-                order_result = await engines.execution.place_buy_order(
-                    symbol=symbol,
-                    quantity=quantity,
-                    price=price_target if (price_target and price_target > 0) else None,
-                    order_type="MARKET",
-                )
-            elif action == "SELL":
-                order_result = await engines.execution.place_sell_order(
-                    symbol=symbol,
-                    quantity=quantity,
-                    price=price_target if (price_target and price_target > 0) else None,
-                    order_type="MARKET",
-                )
+            order_result = await engines.execution.execute_decision(decision)
             if order_result:
                 executed_orders.append(order_result)
     execute_complete = True
@@ -239,9 +267,55 @@ async def trading_cycle(
     # ──────────────────────────────────────────────────────────────────
     # PHASE 5: RECOVER / OBSERVE
     # ──────────────────────────────────────────────────────────────────
-    health_report = await engines.operations.get_health_report()
+    cached_health = (app_ctx.get("_cached_health_report") if app_ctx is not None else None) or {}
+    if cadence is None or cadence.is_due("health", now=now_ts):
+        health_report = await engines.operations.get_health_report()
+        if app_ctx is not None:
+            app_ctx["_cached_health_report"] = health_report
+        if cadence is not None:
+            cadence.mark("health", now=now_ts)
+    else:
+        health_report = cached_health
     nav_val = get_value(portfolio_snapshot, "nav_usdt", 0.0)
     regime_val = get_value(market_regime, "overall_health", "unknown")
+    primary_decision = trading_decisions[0] if trading_decisions else None
+    primary_execution = executed_orders[0] if executed_orders else None
+    situation_metrics = get_value(situation_state, "metrics", {}) or {}
+    quant_summary = {
+        "timestamp": time.time(),
+        "nav_usdt": float(situation_metrics.get("nav_usdt", nav_val) or 0.0),
+        "free_usdt": float(situation_metrics.get("free_usdt", 0.0) or 0.0),
+        "free_ratio": float(situation_metrics.get("free_ratio", 0.0) or 0.0),
+        "exposure_ratio": float(situation_metrics.get("exposure_ratio", 0.0) or 0.0),
+        "market_regime": get_value(situation_state, "market_regime", "UNKNOWN"),
+        "portfolio_state": get_value(situation_state, "portfolio_state", "BALANCED"),
+        "capital_state": get_value(situation_state, "capital_state", "HEALTHY"),
+        "risk_state": get_value(situation_state, "risk_state", "NORMAL"),
+        "system_state": get_value(situation_state, "system_state", "HEALTHY"),
+        "playbook": get_value(primary_decision, "playbook", ""),
+        "action": get_value(primary_decision, "action", "NONE"),
+        "symbol": get_value(primary_decision, "symbol", ""),
+        "probability_score": float(get_value(primary_decision, "probability_score", 0.0) or 0.0),
+        "confidence": float(get_value(primary_decision, "confidence", 0.0) or 0.0),
+        "edge_score": float(get_value(primary_decision, "edge_score", 0.0) or 0.0),
+        "allowed": bool(get_value(primary_decision, "allowed", False)),
+        "blocked_reason": get_value(primary_decision, "blocked_reason", ""),
+        "execution_result": get_value(primary_execution, "status", "NONE"),
+        "loop_duration_ms": (time.perf_counter() - cycle_start) * 1000,
+    }
+    summary_due = cadence is None or cadence.is_due("summary", now=now_ts)
+    should_emit_summary = summary_due or bool(trading_decisions) or bool(executed_orders)
+    # Extract health status (handle both dict and object)
+    if isinstance(health_report, dict):
+        health_status_val = health_report.get("overall_status", "UNKNOWN")
+    elif hasattr(health_report, "overall_status"):
+        health_status_val = (
+            health_report.overall_status.value
+            if hasattr(health_report.overall_status, "value")
+            else str(health_report.overall_status)
+        )
+    else:
+        health_status_val = "UNKNOWN"
     await engines.operations.log_event(
         "cycle_complete",
         {
@@ -256,19 +330,13 @@ async def trading_cycle(
             "market_regime": regime_val,
         },
     )
+    if should_emit_summary:
+        await engines.operations.log_event("QUANT_LOOP_SUMMARY", quant_summary)
+        if app_ctx is not None:
+            app_ctx["_last_summary_health_status"] = health_status_val
+        if cadence is not None:
+            cadence.mark("summary", now=now_ts)
     recover_complete = True
-
-    # Extract health status (handle both dict and object)
-    if isinstance(health_report, dict):
-        health_status_val = health_report.get("overall_status", "UNKNOWN")
-    elif hasattr(health_report, "overall_status"):
-        health_status_val = (
-            health_report.overall_status.value
-            if hasattr(health_report.overall_status, "value")
-            else str(health_report.overall_status)
-        )
-    else:
-        health_status_val = "UNKNOWN"
 
     # Return cycle telemetry
     return {

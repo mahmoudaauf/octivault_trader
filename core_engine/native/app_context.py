@@ -74,7 +74,12 @@ NATIVE_CTX_KEYS: tuple[str, ...] = (
     "signal_manager",  # L3 (NativeSignalEngine; legacy key name preserved)
     "decision_engine",  # L4 (native-only)
     "execution_manager",  # L5 (NativeExecutor; legacy key name preserved)
+    "mode_manager",  # L5 strategy state machine (native)
+    "signal_fusion",  # L5 native adapter over signal aggregation
+    "arbitration_engine",  # L5 native adapter over gating/risk stack
+    "market_regime_detector",  # L2 native market regime adapter
     "telemetry",  # L6 (native-only)
+    "health_monitor",  # L7 native health monitor
     "portfolio_manager",  # L3 (NativePortfolioManager; replaces compat stub in 8.3.7)
     "capital_allocator",  # L6 (NativeCapitalAllocator; allocates capital for trades)
     "position_manager",  # L3 (NativePositionManager; replaces compat stub in 8.3.8)
@@ -112,6 +117,7 @@ class NativeComponents:
     portfolio_accessor: Any | None = None  # callable | None (kept loose)
     exchange_client: Any | None = None  # NativeExchangeClient | duck-typed stub
     telemetry_exporter: Any | None = None  # NativeTelemetryExporter | None
+    runtime_state_exporter: Any | None = None  # NativeRuntimeStateExporter | None
     portfolio_manager: Any | None = None  # NativePortfolioManager | None
     capital_allocator: Any | None = None  # NativeCapitalAllocator | None
     position_manager: Any | None = None  # NativePositionManager | None
@@ -124,8 +130,17 @@ class NativeComponents:
     fill_tracker: Any | None = None  # NativeFillTracker | None
     adaptive_capital_engine: Any | None = None  # NativeAdaptiveCapitalEngine | None
     objective_feedback_controller: Any | None = None  # NativeObjectiveFeedbackController | None
+    mode_manager: Any | None = None  # NativeModeManager | None
+    signal_fusion: Any | None = None  # NativeSignalFusion | None
+    arbitration_engine: Any | None = None  # NativeArbitrationEngine | None
+    market_regime_detector: Any | None = None  # NativeMarketRegimeDetector | None
+    health_monitor: Any | None = None  # NativeHealthMonitor | None
     symbol_discovery: Any | None = None  # NativeSymbolDiscovery | None
     market_data_ws: Any | None = None  # NativeMarketDataWebSocket | None (zero API rate limits)
+    position_hydration_engine: Any | None = (
+        None  # NativePositionHydrationEngine | None (L0, Phase 8.4)
+    )
+    startup_state_machine: Any | None = None  # NativeStartupStateMachine | None (L0, Phase 8.4)
 
 
 def build_native_app_ctx(
@@ -169,10 +184,14 @@ def build_native_app_ctx(
         telemetry=components.telemetry,
         watchdog=components.watchdog,
         fill_tracker=components.fill_tracker,
+        tp_sl_engine=components.tp_sl_engine,
         objective_feedback_controller=components.objective_feedback_controller,
+        mode_manager=components.mode_manager,
         symbol_discovery=components.symbol_discovery,
         market_data_ws=components.market_data_ws,
         polling_coordinator=components.polling_coordinator,
+        position_hydration_engine=components.position_hydration_engine,
+        startup_state_machine=components.startup_state_machine,
     )
 
     app_ctx: dict[str, Any] = {
@@ -193,6 +212,16 @@ def build_native_app_ctx(
         app_ctx["portfolio_manager"] = components.portfolio_manager
     if components.capital_allocator is not None:
         app_ctx["capital_allocator"] = components.capital_allocator
+    if components.mode_manager is not None:
+        app_ctx["mode_manager"] = components.mode_manager
+    if components.signal_fusion is not None:
+        app_ctx["signal_fusion"] = components.signal_fusion
+    if components.arbitration_engine is not None:
+        app_ctx["arbitration_engine"] = components.arbitration_engine
+    if components.market_regime_detector is not None:
+        app_ctx["market_regime_detector"] = components.market_regime_detector
+    if components.health_monitor is not None:
+        app_ctx["health_monitor"] = components.health_monitor
     if components.position_manager is not None:
         app_ctx["position_manager"] = components.position_manager
     if components.tp_sl_engine is not None:

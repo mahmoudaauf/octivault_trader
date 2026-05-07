@@ -53,6 +53,7 @@ class NativeMarketData:
         stale_threshold_sec: float = 30.0,
         klines_cache_size: int = 64,
         shared_state: Optional[Any] = None,
+        prime_on_start: bool = True,
     ) -> None:
         self._client = client
         self._poll_interval = max(0.25, float(poll_interval_sec))
@@ -60,6 +61,7 @@ class NativeMarketData:
         self._stale_threshold = float(stale_threshold_sec)
         self._klines_cache_size = max(1, int(klines_cache_size))
         self._shared_state = shared_state  # Optional reference to shared_state for WebSocket data
+        self._prime_on_start = bool(prime_on_start)
 
         self._prices: dict[str, float] = {}
         self._price_ts: dict[str, float] = {}
@@ -81,10 +83,11 @@ class NativeMarketData:
         if self._stopped is None:
             self._stopped = asyncio.Event()
         self._stopped.clear()
-        try:
-            await self._refresh_prices()
-        except Exception as e:  # pragma: no cover — best-effort prime
-            logger.warning("initial market-data refresh failed: %r", e)
+        if self._prime_on_start:
+            try:
+                await self._refresh_prices()
+            except Exception as e:  # pragma: no cover — best-effort prime
+                logger.warning("initial market-data refresh failed: %r", e)
         self._task = asyncio.create_task(self._run(), name="native-market-data")
 
     async def stop(self) -> None:
@@ -210,8 +213,7 @@ class NativeMarketData:
                 logger.exception("market-data refresh failed (unexpected): %s", e)
 
     async def _refresh_prices(self) -> None:
-        # Skip REST polling if no symbols configured (WebSocket will handle it)
-        if not self._symbols:
+        if hasattr(self._client, "is_throttled") and self._client.is_throttled():
             return
         prices = await self._client.get_prices(self._symbols)
         now = time.time()
@@ -223,6 +225,8 @@ class NativeMarketData:
 
     async def _refresh_klines(self) -> None:
         if not self._symbols:
+            return
+        if hasattr(self._client, "is_throttled") and self._client.is_throttled():
             return
         now = time.time()
         interval = "1m"

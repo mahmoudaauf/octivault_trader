@@ -12,6 +12,8 @@ Covers:
 
 from __future__ import annotations
 
+import json
+import time
 from typing import Any
 
 import pytest
@@ -33,10 +35,16 @@ class _StubExchangeClient:
     def __init__(self, *_, **__):
         self._closed = False
         self.close_calls = 0
+        self.restored_throttle_until_ts = 0.0
+        self.restored_throttle_reason = ""
 
     async def close(self) -> None:
         self.close_calls += 1
         self._closed = True
+
+    def restore_throttle_state(self, *, until_ts: float = 0.0, reason: str = "") -> None:
+        self.restored_throttle_until_ts = float(until_ts or 0.0)
+        self.restored_throttle_reason = str(reason or "")
 
     # NativeBalanceSync probes these on the prime call; we make them no-ops.
     async def get_account(self) -> dict[str, Any]:
@@ -59,6 +67,7 @@ def _min_cfg(**overrides: Any) -> BootstrapConfig:
         "api_secret": "s",
         "testnet": True,
         "symbols": ["BTCUSDT"],
+        "runtime_state_path": "",
     }
     base.update(overrides)
     return BootstrapConfig(**base)
@@ -72,10 +81,11 @@ def test_bootstrap_config_defaults():
     assert cfg.api_key == "k"
     assert cfg.api_secret == "s"
     assert cfg.testnet is False
-    assert cfg.symbols  # non-empty default list
+    assert cfg.symbols == []
     assert cfg.market_data_poll_sec == 2.0
     assert cfg.balance_poll_sec == 5.0
     assert cfg.telemetry_capacity == 1024
+    assert cfg.runtime_state_path == "runtime_state_snapshot.json"
 
 
 def test_bootstrap_config_is_frozen():
@@ -112,6 +122,10 @@ def test_from_env_parses_full_environment():
         "MAX_DRAWDOWN_PCT": "15",
         "DAILY_LOSS_LIMIT_PCT": "8",
         "RISK_PER_SYMBOL_PCT": "3",
+        "QUOTE_RESERVE_RATIO": "0.2",
+        "QUOTE_MIN_RESERVE_USDT": "5",
+        "MAX_TOTAL_EXPOSURE_PCT": "55",
+        "CONFIDENCE_FLOOR": "0.6",
         "SIGNAL_COOLDOWN_SEC": "60",
         "TELEMETRY_CAPACITY": "256",
         "DURATION_SEC": "1800",
@@ -127,6 +141,10 @@ def test_from_env_parses_full_environment():
     assert cfg.balance_poll_sec == 3.0
     assert cfg.kelly_fraction == 0.5
     assert cfg.max_concurrent_positions == 5
+    assert cfg.quote_reserve_ratio == 0.2
+    assert cfg.quote_min_reserve_usdt == 5.0
+    assert cfg.max_total_exposure_pct == 55.0
+    assert cfg.confidence_floor == 0.6
     assert cfg.telemetry_capacity == 256
     assert cfg.duration_sec == 1800.0
     assert cfg.request_timeout_sec == 5.0
@@ -177,8 +195,14 @@ async def test_build_components_returns_wired_native_components():
     assert components.signal_engine is not None
     assert components.decision_engine is not None
     assert components.executor is not None
-    assert components.balance_sync is not None
+    assert components.balance_sync is None
+    assert components.polling_coordinator is not None
     assert components.telemetry is not None
+    assert components.mode_manager is not None
+    assert components.signal_fusion is not None
+    assert components.arbitration_engine is not None
+    assert components.market_regime_detector is not None
+    assert components.health_monitor is not None
     # Telemetry capacity propagated
     assert components.telemetry.capacity == cfg.telemetry_capacity
     # Exchange client surfaced as first-class field (used by safe_execution_engine)
@@ -220,8 +244,31 @@ async def test_build_components_uses_injected_exchange_client():
     components = await build_components(cfg, exchange_client_factory=factory)
     assert len(seen_cfg) == 1 and seen_cfg[0] is cfg
     # Both balance_sync and market_data should share the same client instance.
-    assert components.balance_sync._client is stub
+    assert components.exchange_client is stub
     assert components.market_data._client is stub
+
+
+@pytest.mark.asyncio
+async def test_build_components_restores_throttle_into_exchange_client(tmp_path):
+    snapshot = tmp_path / "runtime_state.json"
+    until_ts = time.time() + 300.0
+    snapshot.write_text(
+        json.dumps(
+            {
+                "exchange_throttled": True,
+                "exchange_throttle_reason": "persisted 418",
+                "exchange_throttle_until_ts": until_ts,
+            }
+        )
+    )
+    stub = _StubExchangeClient()
+    cfg = _min_cfg(runtime_state_path=str(snapshot))
+
+    components = await build_components(cfg, exchange_client_factory=lambda _c: stub)
+    assert components.shared_state.exchange_throttled is True
+    assert components.shared_state.exchange_throttle_until_ts == until_ts
+    assert stub.restored_throttle_until_ts == until_ts
+    assert stub.restored_throttle_reason == "persisted 418"
 
 
 # ---------------------------------------------------------------------
@@ -263,6 +310,7 @@ async def test_bootstrap_then_app_ctx_then_cycle_runs():
         "signal_manager",
         "decision_engine",
         "execution_manager",
+        "mode_manager",
         "telemetry",
         "_native_orchestrator",
         "_native_mode",
@@ -366,6 +414,16 @@ async def test_portfolio_accessor_extracts_position_qty_from_position_objects():
 
     snap = accessor()
     assert snap.positions == {"BTCUSDT": 0.5}
+
+
+def test_bootstrap_config_parses_balance_min_refresh_interval() -> None:
+    env = {
+        "BINANCE_API_KEY": "k",
+        "BINANCE_API_SECRET": "s",
+        "BALANCE_MIN_REFRESH_INTERVAL_SEC": "120",
+    }
+    cfg = BootstrapConfig.from_env(env=env)
+    assert cfg.balance_min_refresh_interval_sec == 120.0
 
 
 # ---------------------------------------------------------------------

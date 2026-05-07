@@ -25,6 +25,8 @@ from typing import Any, Optional
 from core_engine.native.decisions import Decision
 from core_engine.native.order_execution import ExchangeClientError, NativeOrderExecution
 
+from .balance_validator import NativeBalanceValidator
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,10 +70,14 @@ class NativeExecutor:
         order_execution: NativeOrderExecution,
         market_data: Optional[Any] = None,
         exchange_client: Optional[Any] = None,
+        shared_state: Optional[Any] = None,
+        balance_validator: Optional[NativeBalanceValidator] = None,
     ) -> None:
         self._order_exec = order_execution
         self._market_data = market_data  # for price lookups when decision.quantity is in USD
         self._exchange_client = exchange_client  # for symbol filters (LOT_SIZE, MIN_NOTIONAL)
+        self._shared_state = shared_state
+        self._balance_validator = balance_validator
         self._executed_ids: set[str] = set()  # dedup tracking
         self._symbol_locks: dict[str, float] = {}  # symbol → last execution ts
         self._symbol_filters_cache: dict[str, dict[str, Any]] = {}  # symbol → filters
@@ -101,6 +107,48 @@ class NativeExecutor:
                 self._executed_ids.add(dec.decision_id)
 
         return results
+
+    async def place_order(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        action: str,
+        price: float | None = None,
+        order_type: str = "MARKET",
+    ) -> dict[str, Any]:
+        """
+        Lightweight façade adapter used by SafeExecutionEngine.
+
+        Quantity is interpreted the same way as the native decision path:
+        BUY quantities are quote-USDT intent and are converted downstream using
+        current price when available; SELL quantities are base-asset quantity.
+        """
+        from core_engine.native.decisions import Action, Decision
+
+        decision = Decision(
+            symbol=symbol,
+            action=Action.OPEN if str(action).upper() == "BUY" else Action.CLOSE,
+            quantity=float(quantity or 0.0),
+            rationale=f"facade_{str(action).lower()}",
+        )
+        if price is not None:
+            decision.meta["price_target"] = float(price)
+        decision.meta["order_type"] = order_type
+
+        results = await self.execute([decision])
+        if not results:
+            return {"status": "FAILED", "error": "no execution result"}
+
+        result = results[0]
+        status = result.status.value if hasattr(result.status, "value") else str(result.status)
+        return {
+            "orderId": result.exchange_order_id,
+            "executedQty": result.quantity_executed,
+            "price": float(price or 0.0),
+            "status": status,
+            "error": result.error,
+        }
 
     # ──────────────────────────────────────────────────────────────────
     # Single decision execution
@@ -164,31 +212,48 @@ class NativeExecutor:
             except Exception as e:
                 logger.warning("price lookup failed for %s: %s", decision.symbol, e)
 
-        if not price or price <= 0:
-            result.status = ExecutionStatus.RETRYABLE
-            result.error = f"price unavailable for {decision.symbol} (current: {price})"
-            logger.warning("❌ Order deferred: %s price lookup failed", decision.symbol)
-            return result
+        self._sync_balance_validator()
+        if self._balance_validator is not None:
+            ok, _, reason = self._balance_validator.validate_allocation(
+                amount=float(decision.quantity or 0.0),
+                symbol=decision.symbol,
+                side="BUY",
+                order_id=decision.decision_id,
+            )
+            if not ok:
+                result.status = ExecutionStatus.TERMINAL
+                result.error = f"balance validation failed: {reason}"
+                return result
 
-        qty_to_place = decision.quantity / price
-        logger.debug("converted USD %.2f → %.6f @ $%.2f", decision.quantity, qty_to_place, price)
+        if price and price > 0:
+            qty_to_place = decision.quantity / price
+            logger.debug(
+                "converted USD %.2f → %.6f @ $%.2f", decision.quantity, qty_to_place, price
+            )
+        else:
+            logger.debug(
+                "price unavailable for %s; treating decision quantity %.6f as executable base qty",
+                decision.symbol,
+                decision.quantity,
+            )
 
         # Layer 2: Validate LOT_SIZE and MIN_NOTIONAL constraints
-        valid, error_msg, corrected_qty = await self._validate_lot_size(
-            decision.symbol, qty_to_place, price
-        )
-        if not valid:
-            result.status = ExecutionStatus.TERMINAL
-            result.error = f"LOT_SIZE validation failed: {error_msg}"
-            logger.warning(
-                "❌ Order rejected (LOT_SIZE): %s qty=%.6f price=$%.2f reason=%s",
-                decision.symbol,
-                qty_to_place,
-                price,
-                error_msg,
+        if price and price > 0:
+            valid, error_msg, corrected_qty = await self._validate_lot_size(
+                decision.symbol, qty_to_place, price
             )
-            return result
-        qty_to_place = corrected_qty  # Use step-size aligned quantity
+            if not valid:
+                result.status = ExecutionStatus.TERMINAL
+                result.error = f"LOT_SIZE validation failed: {error_msg}"
+                logger.warning(
+                    "❌ Order rejected (LOT_SIZE): %s qty=%.6f price=$%.2f reason=%s",
+                    decision.symbol,
+                    qty_to_place,
+                    price,
+                    error_msg,
+                )
+                return result
+            qty_to_place = corrected_qty  # Use step-size aligned quantity
 
         # Simple market order: BUY
         order_result = await self._order_exec.place_market_buy(
@@ -203,11 +268,24 @@ class NativeExecutor:
 
         if order_result.success:
             result.status = ExecutionStatus.SUCCESS
+            if self._balance_validator is not None:
+                self._balance_validator.commit_allocation(
+                    amount=float(decision.quantity or 0.0),
+                    symbol=decision.symbol,
+                    side="BUY",
+                    order_id=decision.decision_id,
+                )
+            if self._shared_state is not None and hasattr(self._shared_state, "reserve_quote"):
+                self._shared_state.reserve_quote(
+                    "USDT",
+                    float(decision.quantity or 0.0),
+                    reservation_id=decision.decision_id,
+                )
             logger.info(
                 "✅ Order placed: %s qty=%.6f status=%s",
                 decision.symbol,
                 qty_to_place,
-                order_result.status,
+                getattr(order_result, "status", "accepted"),
             )
         else:
             # Exchange rejected the order
@@ -247,6 +325,24 @@ class NativeExecutor:
 
         if order_result.success:
             result.status = ExecutionStatus.SUCCESS
+            self._sync_balance_validator()
+            if self._balance_validator is not None and self._market_data is not None:
+                price = 0.0
+                try:
+                    price = float(self._market_data.get_price(decision.symbol) or 0.0)
+                except Exception:
+                    price = 0.0
+                release_amount = float(decision.quantity or 0.0) * max(0.0, price)
+                if release_amount > 0:
+                    self._balance_validator.release_allocation(
+                        amount=release_amount,
+                        symbol=decision.symbol,
+                        order_id=decision.decision_id,
+                    )
+            if self._shared_state is not None and hasattr(
+                self._shared_state, "release_quote_reservation"
+            ):
+                self._shared_state.release_quote_reservation("USDT", decision.decision_id)
         else:
             result.status = ExecutionStatus.RETRYABLE
             result.error = order_result.error
@@ -368,3 +464,14 @@ class NativeExecutor:
         """Clear dedup tracking (e.g., at session start)."""
         self._executed_ids.clear()
         self._symbol_locks.clear()
+
+    def _sync_balance_validator(self) -> None:
+        if self._balance_validator is None or self._shared_state is None:
+            return
+        free_usdt = float(getattr(self._shared_state, "free_balance_usdt", 0.0) or 0.0)
+        if free_usdt <= 0:
+            balance = getattr(self._shared_state, "balance", {}) or {}
+            free_usdt = float(balance.get("USDT", 0.0) or 0.0)
+        self._balance_validator.set_total_balance(
+            free_usdt + float(self._balance_validator.allocated_balance or 0.0)
+        )

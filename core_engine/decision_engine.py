@@ -39,7 +39,7 @@ class TradeDecision:
     """Decision output from the decision engine."""
 
     symbol: str
-    action: str  # "BUY", "SELL", "HOLD", "FORCE_EXIT"
+    action: str  # "BUY", "SELL", "REBALANCE", "DUST_CLEANUP", "PROTECT", "NONE"
     quantity: float
     price_target: Optional[float] = None
     stop_loss: Optional[float] = None
@@ -48,6 +48,14 @@ class TradeDecision:
     confidence: float = 0.0  # 0.0 to 1.0
     timestamp: float = 0.0
     mode: str = ""  # Current trading mode
+    edge_score: float = 0.0
+    probability_score: float = 0.0
+    playbook: str = ""
+    blocked_reason: str = ""
+    source_signals: list[dict[str, Any]] | None = None
+    suggested_quote_usdt: float = 0.0
+    telemetry: dict[str, Any] | None = None
+    allowed: bool = True
 
 
 @dataclass

@@ -41,6 +41,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from .capital_policy import compute_spendable_quote
+
 if TYPE_CHECKING:
     from .balance_sync import NativeBalanceSync
     from .shared_state import NativeSharedState
@@ -54,15 +56,19 @@ class NativePortfolioManager:
     def __init__(
         self,
         shared_state: NativeSharedState,
-        balance_sync: NativeBalanceSync,
+        balance_sync: NativeBalanceSync | None,
         *,
         min_order_usdt: float = 10.0,
+        quote_reserve_ratio: float = 0.10,
+        quote_min_reserve_usdt: float = 0.0,
     ) -> None:
         if min_order_usdt <= 0:
             raise ValueError(f"min_order_usdt must be > 0, got {min_order_usdt}")
         self._state = shared_state
         self._balance_sync = balance_sync
         self._min_order_usdt = float(min_order_usdt)
+        self._quote_reserve_ratio = float(quote_reserve_ratio)
+        self._quote_min_reserve_usdt = float(quote_min_reserve_usdt)
 
     # ------------------------------------------------------------------
     # NAV / capital
@@ -81,9 +87,31 @@ class NativePortfolioManager:
         # it; fall back to the L1 balance poller.
         free = float(getattr(self._state, "free_balance_usdt", 0.0) or 0.0)
         if free > 0.0:
-            return free
-        balances = self._balance_sync.get_balance()
-        return float(balances.get("USDT", 0.0))
+            reserved = (
+                float(
+                    getattr(self._state, "reserved_quote_total", lambda _asset: 0.0)("USDT") or 0.0
+                )
+                if self._state is not None
+                else 0.0
+            )
+            return compute_spendable_quote(
+                free,
+                reserve_ratio=self._quote_reserve_ratio,
+                min_reserve=self._quote_min_reserve_usdt,
+                reserved_quote=reserved,
+            )
+        balances = self._get_balance_map()
+        reserved = (
+            float(getattr(self._state, "reserved_quote_total", lambda _asset: 0.0)("USDT") or 0.0)
+            if self._state is not None
+            else 0.0
+        )
+        return compute_spendable_quote(
+            float(balances.get("USDT", 0.0)),
+            reserve_ratio=self._quote_reserve_ratio,
+            min_reserve=self._quote_min_reserve_usdt,
+            reserved_quote=reserved,
+        )
 
     async def get_capital_allocated(self) -> float:
         """Capital currently locked in open positions (USDT-denominated)."""
@@ -192,9 +220,17 @@ class NativePortfolioManager:
 
     def _derived_nav(self) -> float:
         """USDT free balance + Σ position_value (mark-to-market)."""
-        balances = self._balance_sync.get_balance()
+        balances = self._get_balance_map()
         free = float(balances.get("USDT", 0.0))
         return free + self._sum_position_values()
+
+    def _get_balance_map(self) -> dict[str, float]:
+        if self._balance_sync is not None and hasattr(self._balance_sync, "get_balance"):
+            try:
+                return self._balance_sync.get_balance()
+            except Exception:
+                logger.debug("balance_sync unavailable; falling back to shared_state.balance")
+        return dict(getattr(self._state, "balance", {}) or {})
 
 
 __all__ = ["NativePortfolioManager"]

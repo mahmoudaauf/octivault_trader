@@ -79,6 +79,18 @@ class TestNativeMarketDataLifecycle:
         await md.stop()
         assert stub.price_calls >= 2
 
+    @pytest.mark.asyncio
+    async def test_start_can_skip_initial_rest_prime(self) -> None:
+        stub = _StubClient()
+        md = NativeMarketData(
+            stub,
+            poll_interval_sec=10.0,
+            prime_on_start=False,
+        )  # type: ignore[arg-type]
+        await md.start()
+        await md.stop()
+        assert stub.price_calls == 0
+
 
 class TestNativeMarketDataPrices:
     @pytest.mark.asyncio

@@ -22,6 +22,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from .startup_state_machine import StartupState
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +81,7 @@ class NativeOrchestrator:
         telemetry: Any | None = None,  # NativeTelemetry (L6, optional)
         watchdog: Any | None = None,  # NativeWatchdog (L7, optional)
         fill_tracker: Any | None = None,  # NativeFillTracker (L3, optional)
+        tp_sl_engine: Any | None = None,  # NativeTPSLEngine (L4, optional)
         objective_feedback_controller: Any
         | None = None,  # ObjectiveFeedbackController (OFC, optional)
         mode_manager: Any | None = None,  # NativeModeManager (optional)
@@ -87,6 +90,9 @@ class NativeOrchestrator:
         | None = None,  # NativeMarketDataWebSocket (optional, zero API rate limits)
         polling_coordinator: Any
         | None = None,  # NativePollingCoordinator (optional, legacy-style staggered polling)
+        position_hydration_engine: Any
+        | None = None,  # NativePositionHydrationEngine (L0, Phase 8.4)
+        startup_state_machine: Any | None = None,  # NativeStartupStateMachine (L0, Phase 8.4)
     ) -> None:
         self._market_data = market_data
         self._signal_engine = signal_engine
@@ -98,11 +104,14 @@ class NativeOrchestrator:
         self._telemetry = telemetry
         self._watchdog = watchdog
         self._fill_tracker = fill_tracker
+        self._tp_sl_engine = tp_sl_engine
         self._ofc = objective_feedback_controller
         self._mode_manager = mode_manager
         self._symbol_discovery = symbol_discovery
         self._market_data_ws = market_data_ws
         self._polling_coordinator = polling_coordinator
+        self._hydration_engine = position_hydration_engine
+        self._startup_state_machine = startup_state_machine
 
         self._cycle_count = 0
         self._stopped = True  # Use bool flag instead of asyncio.Event
@@ -149,18 +158,57 @@ class NativeOrchestrator:
         if self._fill_tracker is not None and self._polling_coordinator is None:
             await self._fill_tracker.start()
 
+        # Wait for initial data before running startup sequence
+        await self._wait_for_initial_data(max_wait_sec=5.0)
+
+        # NEW: Run startup state machine (Phase 8.4)
+        # This ensures positions are hydrated before trading begins
+        if self._startup_state_machine is not None:
+            logger.info("🚀 Running startup sequence...")
+
+            # Register hydration callback if available
+            if self._hydration_engine is not None:
+
+                async def hydrate_callback():
+                    hydrated = await self._hydration_engine.hydrate()
+                    if hydrated.success:
+                        await self._hydration_engine.apply_to_shared_state(hydrated)
+                        logger.info(
+                            f"✅ Applied {hydrated.positions_count} hydrated positions "
+                            f"(${hydrated.portfolio_value:.2f} value, "
+                            f"{hydrated.profitable_count} profitable)"
+                        )
+                    return hydrated.success
+
+                self._startup_state_machine.set_callback(
+                    StartupState.HYDRATING,
+                    hydrate_callback,
+                )
+
+            success = await self._startup_state_machine.run_startup(timeout_sec=60.0)
+            if not success:
+                logger.critical(
+                    "❌ Startup failed; trading will be blocked. " "Check logs and restart."
+                )
+            else:
+                logger.info("✅ Startup complete; trading ready")
+
+        # Start TP/SL engine (auto-arms existing positions for safety)
+        if self._tp_sl_engine is not None:
+            await self._tp_sl_engine.start()
+
         if self._ofc is not None:
             await self._ofc.start()
-
-        # Wait for initial data to be available (up to 5 seconds)
-        # Ensures market_data and balance_sync have fetched at least once
-        await self._wait_for_initial_data(max_wait_sec=5.0)
 
     async def stop(self) -> None:
         """Graceful shutdown."""
         self._stopped = True
         if self._ofc is not None:
             await self._ofc.stop()
+
+        # Stop TP/SL engine
+        if self._tp_sl_engine is not None:
+            await self._tp_sl_engine.stop()
 
         # Stop polling coordinator or balance_sync (one or the other)
         if self._polling_coordinator is not None:
@@ -424,6 +472,21 @@ class NativeOrchestrator:
                 len(sell_sigs),
                 balance_usdt,
             )
+
+            # Gate: check startup state (Phase 8.4)
+            # BUY decisions blocked until system is READY
+            if (
+                self._startup_state_machine is not None
+                and not self._startup_state_machine.can_buy()
+            ):
+                logger.warning(
+                    f"BUY blocked during startup (state={self._startup_state_machine.current_state().value}); "
+                    f"skipping BUY decisions this cycle"
+                )
+                # Allow SELL signals even during startup
+                signals = {
+                    sym: sig for sym, sig in signals.items() if str(sig.get("direction")) == "SELL"
+                }
 
             # Gate: check if trading is halted by ObjectiveFeedbackController
             if getattr(self._shared_state, "trading_halted", False):
