@@ -52,6 +52,7 @@ from .market_data import NativeMarketData
 from .objective_feedback_controller import NativeObjectiveFeedbackController
 from .observability import NativeTelemetry
 from .order_execution import NativeOrderExecution
+from .polling_coordinator import NativePollingConfig, NativePollingCoordinator
 from .portfolio_manager import NativePortfolioManager
 from .position_manager import NativePositionManager
 from .prometheus_exporter import NativePrometheusExporter
@@ -93,11 +94,16 @@ class BootstrapConfig:
     klines_cache_size: int = 64
     stale_threshold_sec: float = 30.0
 
-    # --- balance sync ---
-    balance_poll_sec: float = 5.0
+    # --- polling (legacy-style staggered with active-trades gate, not aggressive REST polling) ---
+    polling_enabled: bool = True
+    polling_open_orders_interval_sec: float = 25.0  # vs aggressive 5s REST polling
+    polling_balance_interval_sec: float = 40.0  # vs aggressive 5s balance sync
+    polling_position_interval_sec: float = 25.0
+    polling_enable_active_trades_gate: bool = True  # Skip polling when no trades (huge savings)
 
-    # --- fill detection ---
-    fill_tracker_poll_sec: float = 5.0
+    # --- legacy: balance_sync & fill_tracker disabled when polling_enabled=True ---
+    balance_poll_sec: float = 5.0  # Ignored if polling_enabled=True
+    fill_tracker_poll_sec: float = 5.0  # Ignored if polling_enabled=True
 
     # --- decisions / risk ---
     kelly_fraction: float = 0.25
@@ -174,6 +180,15 @@ class BootstrapConfig:
             stale_threshold_sec=_float(e.get("STALE_THRESHOLD_SEC"), 30.0),
             balance_poll_sec=_float(e.get("BALANCE_POLL_SEC"), 5.0),
             fill_tracker_poll_sec=_float(e.get("FILL_TRACKER_POLL_SEC"), 5.0),
+            polling_enabled=_bool(e.get("POLLING_ENABLED"), default=True),
+            polling_open_orders_interval_sec=_float(
+                e.get("POLLING_OPEN_ORDERS_INTERVAL_SEC"), 25.0
+            ),
+            polling_balance_interval_sec=_float(e.get("POLLING_BALANCE_INTERVAL_SEC"), 40.0),
+            polling_position_interval_sec=_float(e.get("POLLING_POSITION_INTERVAL_SEC"), 25.0),
+            polling_enable_active_trades_gate=_bool(
+                e.get("POLLING_ENABLE_ACTIVE_TRADES_GATE"), default=True
+            ),
             kelly_fraction=_float(e.get("KELLY_FRACTION"), 0.25),
             max_position_size_pct=_float(e.get("MAX_POSITION_PCT"), 5.0),
             max_concurrent_positions=_int(e.get("MAX_CONCURRENT_POSITIONS"), 10),
@@ -381,10 +396,47 @@ async def build_components(
     # L1
     exchange_client = factory(cfg)
     order_execution = NativeOrderExecution(exchange_client)
-    balance_sync = NativeBalanceSync(
-        exchange_client,
-        poll_interval_sec=cfg.balance_poll_sec,
-    )
+
+    # L1: Polling coordinator (legacy-style staggered polling with active-trades gate)
+    # Replaces aggressive REST polling (2s market data, 5s balance, 5s fills)
+    # Reduces API weight from ~1800/min to ~200/min via:
+    #   1. Wider intervals (25-40s vs 2-5s)
+    #   2. Active-trades gate (skip polling when no trades)
+    polling_coordinator = None
+    balance_sync = None
+    fill_tracker = None
+
+    if cfg.polling_enabled:
+        polling_config = NativePollingConfig(
+            open_orders_interval_sec=cfg.polling_open_orders_interval_sec,
+            balance_interval_sec=cfg.polling_balance_interval_sec,
+            position_interval_sec=cfg.polling_position_interval_sec,
+            enable_active_trades_gate=cfg.polling_enable_active_trades_gate,
+        )
+        polling_coordinator = NativePollingCoordinator(
+            shared_state=shared_state,
+            exchange_client=exchange_client,
+            config=polling_config,
+        )
+        logger.info(
+            "✅ Polling coordinator enabled (orders=%.0fs, balance=%.0fs, positions=%.0fs, gate=%s)",
+            cfg.polling_open_orders_interval_sec,
+            cfg.polling_balance_interval_sec,
+            cfg.polling_position_interval_sec,
+            "on" if cfg.polling_enable_active_trades_gate else "off",
+        )
+    else:
+        # Legacy: fall back to aggressive polling (will cause 418 rate limits on real account)
+        balance_sync = NativeBalanceSync(
+            exchange_client,
+            poll_interval_sec=cfg.balance_poll_sec,
+        )
+        fill_tracker = NativeFillTracker(
+            exchange_client=exchange_client,
+            shared_state=shared_state,
+            poll_interval_sec=cfg.fill_tracker_poll_sec,
+        )
+        logger.warning("⚠️ Polling coordinator disabled; using legacy aggressive REST polling")
 
     # Symbol discovery: defer to per-cycle scanning unless explicitly overridden
     symbols = list(cfg.symbols) if cfg.symbols else []
@@ -402,17 +454,18 @@ async def build_components(
         symbols = []
 
     logger.info(
-        "native bootstrap: testnet=%s symbols=%d (cycle-dynamic) md_poll=%.1fs balance_poll=%.1fs",
+        "native bootstrap: testnet=%s symbols=%d (cycle-dynamic) polling=%s",
         cfg.testnet,
         len(symbols),
-        cfg.market_data_poll_sec,
-        cfg.balance_poll_sec,
+        "enabled" if cfg.polling_enabled else "disabled",
     )
 
     # L2: Market data with WebSocket primary (zero rate limits)
     market_data = NativeMarketData(
         exchange_client,
-        poll_interval_sec=cfg.market_data_poll_sec,
+        poll_interval_sec=cfg.market_data_poll_sec
+        if not cfg.polling_enabled
+        else 999.0,  # Disabled when polling is on
         symbols=symbols,  # May be empty; will be updated per-cycle
         stale_threshold_sec=cfg.stale_threshold_sec,
         klines_cache_size=cfg.klines_cache_size,
@@ -455,12 +508,13 @@ async def build_components(
             logger.warning(f"⚠️ WebSocket initialization failed: {e} (will use REST fallback)")
             market_data_ws = None
 
-    # L3 fill tracker: detect fills and update positions
-    fill_tracker = NativeFillTracker(
-        exchange_client=exchange_client,
-        shared_state=shared_state,
-        poll_interval_sec=cfg.fill_tracker_poll_sec,
-    )
+    # L3 fill tracker: only created if polling_enabled=False (legacy fallback)
+    if not cfg.polling_enabled and fill_tracker is None:
+        fill_tracker = NativeFillTracker(
+            exchange_client=exchange_client,
+            shared_state=shared_state,
+            poll_interval_sec=cfg.fill_tracker_poll_sec,
+        )
 
     # L3
     signal_engine = NativeSignalEngine(cooldown_sec=cfg.signal_cooldown_sec)
@@ -624,6 +678,7 @@ async def build_components(
         prometheus_exporter=prometheus_exporter,
         fill_tracker=fill_tracker,
         adaptive_capital_engine=ace,
+        polling_coordinator=polling_coordinator,
         objective_feedback_controller=ofc,
         symbol_discovery=symbol_discoverer,
         market_data_ws=market_data_ws,

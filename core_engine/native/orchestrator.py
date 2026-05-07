@@ -72,8 +72,9 @@ class NativeOrchestrator:
         signal_engine: Any,  # NativeSignalEngine
         decision_engine: Any,  # NativeDecisionEngine
         executor: Any,  # NativeExecutor
-        balance_sync: Any,  # NativeBalanceSync
-        shared_state: Any,  # NativeSharedState
+        balance_sync: Any
+        | None = None,  # NativeBalanceSync (optional when polling_coordinator is used)
+        shared_state: Any | None = None,  # NativeSharedState
         portfolio_accessor: callable | None = None,
         telemetry: Any | None = None,  # NativeTelemetry (L6, optional)
         watchdog: Any | None = None,  # NativeWatchdog (L7, optional)
@@ -83,6 +84,8 @@ class NativeOrchestrator:
         symbol_discovery: Any | None = None,  # NativeSymbolDiscovery (optional)
         market_data_ws: Any
         | None = None,  # NativeMarketDataWebSocket (optional, zero API rate limits)
+        polling_coordinator: Any
+        | None = None,  # NativePollingCoordinator (optional, legacy-style staggered polling)
     ) -> None:
         self._market_data = market_data
         self._signal_engine = signal_engine
@@ -97,9 +100,26 @@ class NativeOrchestrator:
         self._ofc = objective_feedback_controller
         self._symbol_discovery = symbol_discovery
         self._market_data_ws = market_data_ws
+        self._polling_coordinator = polling_coordinator
 
         self._cycle_count = 0
         self._stopped = True  # Use bool flag instead of asyncio.Event
+
+    # ──────────────────────────────────────────────────────────────────
+    # Private helpers
+    # ──────────────────────────────────────────────────────────────────
+    def _get_balance(self) -> dict[str, float]:
+        """
+        Get current account balance from either balance_sync or shared_state.
+
+        When polling_coordinator is enabled, balance is synced to shared_state.
+        When polling_coordinator is disabled, use balance_sync directly.
+        """
+        if self._balance_sync is not None and hasattr(self._balance_sync, "get_balance"):
+            return self._balance_sync.get_balance()
+        elif self._shared_state is not None and hasattr(self._shared_state, "balance"):
+            return dict(self._shared_state.balance)  # Copied dict for consistency
+        return {}
 
     # ──────────────────────────────────────────────────────────────────
     # Loop control
@@ -116,9 +136,17 @@ class NativeOrchestrator:
         await self._market_data.start()
         if self._market_data_ws is not None:
             await self._market_data_ws.start()
-        await self._balance_sync.start()
-        if self._fill_tracker is not None:
+
+        # Start either polling coordinator (new, efficient) or balance_sync (legacy, aggressive)
+        if self._polling_coordinator is not None:
+            await self._polling_coordinator.start()
+        elif self._balance_sync is not None:
+            await self._balance_sync.start()
+
+        # Only start fill_tracker if we're NOT using polling coordinator
+        if self._fill_tracker is not None and self._polling_coordinator is None:
             await self._fill_tracker.start()
+
         if self._ofc is not None:
             await self._ofc.start()
 
@@ -131,12 +159,20 @@ class NativeOrchestrator:
         self._stopped = True
         if self._ofc is not None:
             await self._ofc.stop()
-        if self._fill_tracker is not None:
+
+        # Stop polling coordinator or balance_sync (one or the other)
+        if self._polling_coordinator is not None:
+            await self._polling_coordinator.stop()
+        elif self._balance_sync is not None:
+            await self._balance_sync.stop()
+
+        # Only stop fill_tracker if not using polling coordinator
+        if self._fill_tracker is not None and self._polling_coordinator is None:
             await self._fill_tracker.stop()
+
         if self._market_data_ws is not None:
             await self._market_data_ws.stop()
         await self._market_data.stop()
-        await self._balance_sync.stop()
 
     async def run_loop(
         self,
@@ -285,7 +321,7 @@ class NativeOrchestrator:
 
         # Initialize session_anchor_nav on first cycle with real balance
         if self._shared_state:
-            balance_usdt = self._balance_sync.get_balance().get("USDT", 0.0)
+            balance_usdt = self._get_balance().get("USDT", 0.0)
             if balance_usdt > 0:
                 # Set NAV (used by capital allocator, OFC, ACE)
                 self._shared_state.update_nav(balance_usdt)
@@ -329,7 +365,7 @@ class NativeOrchestrator:
             logger.warning("portfolio snapshot unavailable; returning empty decisions")
             return []
 
-        balance_usdt = self._balance_sync.get_balance().get("USDT", 0.0)
+        balance_usdt = self._get_balance().get("USDT", 0.0)
 
         # Debug: log signal details
         if signals:
@@ -403,10 +439,9 @@ class NativeOrchestrator:
                 prices = self._market_data.get_prices()
                 has_prices = len(prices) > 0 if prices else False
 
-            # Check balance_sync has balance
-            if self._balance_sync and hasattr(self._balance_sync, "get_balance"):
-                balance = self._balance_sync.get_balance()
-                has_balance = bool(balance and balance.get("USDT", 0) > 0)
+            # Check balance_sync or polling_coordinator has balance
+            balance = self._get_balance()
+            has_balance = bool(balance and balance.get("USDT", 0) > 0)
 
             if has_prices and has_balance:
                 logger.info(

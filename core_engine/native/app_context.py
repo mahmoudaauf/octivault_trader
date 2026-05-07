@@ -104,8 +104,11 @@ class NativeComponents:
     signal_engine: NativeSignalEngine
     decision_engine: NativeDecisionEngine
     executor: NativeExecutor
-    balance_sync: NativeBalanceSync
+    balance_sync: NativeBalanceSync | None = None
     telemetry: NativeTelemetry | None = None
+    polling_coordinator: Any | None = (
+        None  # NativePollingCoordinator | None (legacy-style staggered polling)
+    )
     portfolio_accessor: Any | None = None  # callable | None (kept loose)
     exchange_client: Any | None = None  # NativeExchangeClient | duck-typed stub
     telemetry_exporter: Any | None = None  # NativeTelemetryExporter | None
@@ -169,6 +172,7 @@ def build_native_app_ctx(
         objective_feedback_controller=components.objective_feedback_controller,
         symbol_discovery=components.symbol_discovery,
         market_data_ws=components.market_data_ws,
+        polling_coordinator=components.polling_coordinator,
     )
 
     app_ctx: dict[str, Any] = {
