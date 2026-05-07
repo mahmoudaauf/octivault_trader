@@ -174,6 +174,14 @@ class NativePollingCoordinator:
 
         Otherwise returns True.
         """
+        throttled_until_ts = float(
+            getattr(self.shared_state, "exchange_throttle_until_ts", 0.0) or 0.0
+        )
+        if throttled_until_ts > time.time():
+            return False
+        if hasattr(self.exchange_client, "is_throttled") and self.exchange_client.is_throttled():
+            self._mark_throttle_state(RuntimeError("exchange throttled"))
+            return False
         if not self.config.enable_active_trades_gate:
             return True
 
@@ -330,40 +338,90 @@ class NativePollingCoordinator:
                 self.shared_state.open_orders = orders
                 self.logger.debug("[PollingCoordinator] Synced %d open orders", len(orders))
         except Exception as e:
+            self._mark_throttle_state(e)
             self.logger.debug("[PollingCoordinator] Failed to fetch open orders: %s", e)
             raise
 
     async def _fetch_and_sync_balance(self) -> None:
         """Fetch balance and sync to SharedState."""
-        if not hasattr(self.exchange_client, "get_balances"):
+        if not hasattr(self.exchange_client, "get_balance"):
             return
 
         try:
-            balances = await self.exchange_client.get_balances()
-            if balances and hasattr(self.shared_state, "update_balances"):
-                res = self.shared_state.update_balances(balances)
-                if asyncio.iscoroutine(res):
-                    await res
+            if self._should_defer_balance_sync():
+                self.logger.debug("[PollingCoordinator] Deferring balance sync this cycle")
+                return
+            balances = await self.exchange_client.get_balance()
+            if balances and hasattr(self.shared_state, "update_balance_map"):
+                self.shared_state.update_balance_map(balances)
+                # Also update free_balance_usdt directly for decision engine
+                usdt_balance = float(balances.get("USDT", 0.0))
+                if usdt_balance > 0 and hasattr(self.shared_state, "free_balance_usdt"):
+                    self.shared_state.free_balance_usdt = usdt_balance
                 self.logger.debug("[PollingCoordinator] Synced balance from exchange")
         except Exception as e:
+            self._mark_throttle_state(e)
             self.logger.debug("[PollingCoordinator] Failed to fetch balance: %s", e)
             raise
 
-    async def _fetch_and_sync_positions(self) -> None:
-        """Fetch positions and sync to SharedState."""
-        if not hasattr(self.exchange_client, "get_positions"):
-            return
+    def _should_defer_balance_sync(self) -> bool:
+        if bool(getattr(self.shared_state, "exchange_throttled", False)):
+            return True
+        active_orders = len(getattr(self.shared_state, "open_orders", {}) or {})
+        active_positions = len(getattr(self.shared_state, "positions", {}) or {})
+        if active_orders > 0:
+            return False
+        last_balance_poll = float(self._last_balance_poll or 0.0)
+        if active_positions > 0:
+            return last_balance_poll > 0 and (time.time() - last_balance_poll) < max(
+                self.config.balance_interval_sec,
+                600.0,
+            )
+        return last_balance_poll > 0 and (time.time() - last_balance_poll) < max(
+            self.config.balance_interval_sec,
+            1800.0,
+        )
 
+    async def _fetch_and_sync_positions(self) -> None:
+        """Sync position marks from shared-state prices.
+
+        Native spot stack tracks fills/positions locally; there is no separate
+        exchange positions endpoint. This loop refreshes mark prices so NAV/PnL
+        stay current even when balance polling is sparse.
+        """
         try:
-            positions = await self.exchange_client.get_positions()
-            if positions and hasattr(self.shared_state, "update_positions"):
-                res = self.shared_state.update_positions(positions)
-                if asyncio.iscoroutine(res):
-                    await res
-                self.logger.debug("[PollingCoordinator] Synced %d positions", len(positions))
+            if not hasattr(self.shared_state, "get_all_positions"):
+                return
+            positions = self.shared_state.get_all_positions()
+            price_cache = getattr(self.shared_state, "price_cache", {}) or {}
+            updated = 0
+            for sym, pos in positions.items():
+                price = float(price_cache.get(sym, 0.0) or 0.0)
+                if price > 0 and hasattr(self.shared_state, "update_position"):
+                    self.shared_state.update_position(
+                        symbol=sym,
+                        qty=float(getattr(pos, "qty", 0.0) or 0.0),
+                        entry=float(getattr(pos, "entry_price", 0.0) or 0.0),
+                        current=price,
+                    )
+                    updated += 1
+            if updated:
+                self.logger.debug("[PollingCoordinator] Refreshed %d position marks", updated)
         except Exception as e:
+            self._mark_throttle_state(e)
             self.logger.debug("[PollingCoordinator] Failed to fetch positions: %s", e)
             raise
+
+    def _mark_throttle_state(self, err: Exception) -> None:
+        if not hasattr(self.shared_state, "set_exchange_throttle"):
+            return
+        self.shared_state.set_exchange_throttle(
+            bool(getattr(self.exchange_client, "is_throttled", lambda: False)()),
+            reason=str(getattr(self.exchange_client, "last_error", lambda: "")() or err),
+            until_ts=float(
+                getattr(self.exchange_client, "throttled_until_ts", lambda: 0.0)() or 0.0
+            ),
+        )
 
     # ====================================================================
     # Public: Query interface
