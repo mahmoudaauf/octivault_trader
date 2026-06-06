@@ -266,8 +266,16 @@ class NativeMarketDataWebSocket:
                         "low": float(data.get("l", 0)),
                         "close": float(data.get("c", 0)),
                         "volume": float(data.get("v", 0)),
+                        "taker_buy_volume": float(data.get("V", 0)),  # taker buy base asset volume
+                        "num_trades": float(data.get("n", 0)),  # number of trades
                     }
-                    self._shared_state.market_data[(symbol, interval)] = [ohlcv]
+                    _key = (symbol, interval)
+                    _buf = self._shared_state.market_data.get(_key) or []
+                    _buf = list(_buf)
+                    _buf.append(ohlcv)
+                    if len(_buf) > 100:
+                        _buf = _buf[-100:]
+                    self._shared_state.market_data[_key] = _buf
                     if hasattr(self._shared_state, "market_data_ready"):
                         self._shared_state.market_data_ready = True
 

@@ -1,0 +1,383 @@
+from __future__ import annotations
+
+import time
+
+from core_engine.native.shared_state import NativeSharedState
+from core_engine.native.tp_sl_engine import NativeTPSLEngine
+
+
+class _Cfg:
+    TP_ATR_MULT = 1.5
+    SL_ATR_MULT = 1.5
+    TARGET_RISK_PCT = 2.0
+    ATR_LOOKBACK = 14
+    MIN_ATR_PCT = 0.001  # very small floor so ATR-based SL tests control the value precisely
+    TPSL_VOL_ADAPTATION_ENABLED = True
+    VOL_PRESSURE_SCALE = 0.35
+    MIN_NOTIONAL_SAFETY = 10.0
+    TPSL_AUTO_ARM_ENABLED = False
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _engine_with_regime(regime: str) -> tuple[NativeTPSLEngine, NativeSharedState]:
+    state = NativeSharedState()
+    state.metrics = {"market_regime": regime}
+    state.prices = {"TESTUSDT": 100.0}
+    engine = NativeTPSLEngine(state, _Cfg())
+    engine._startup_grace_until = 0.0  # disable grace period in all tests
+    return engine, state
+
+
+def _make_position(entry: float, tp: float, sl: float) -> dict:
+    return {"symbol": "TESTUSDT", "qty": 1.0, "entry_price": entry, "tp": tp, "sl": sl}
+
+
+# ---------------------------------------------------------------------------
+# ATR-based SL tests
+# ---------------------------------------------------------------------------
+
+
+def test_calculate_tp_sl_uses_atr_for_slow_mover() -> None:
+    """Low-ATR symbol should produce SL near the 1.0% floor."""
+    state = NativeSharedState()
+    # Inject a small ATR directly into shared_state.market_data
+    state.market_data = {"SLOWUSDT": {"atr": 0.5}}  # 0.5 absolute on a $100 entry = 0.5% ATR
+    state.prices = {"SLOWUSDT": 100.0}
+    engine = NativeTPSLEngine(state, _Cfg())
+
+    tp, sl = engine.calculate_tp_sl("SLOWUSDT", 100.0)
+
+    sl_pct = (100.0 - sl) / 100.0
+    # ATR pct = 0.5/100 = 0.5%, SL_ATR_MULT=1.5 → 0.75% → clamped to floor 1.0%
+    assert abs(sl_pct - 0.010) < 1e-9, f"Expected SL ~1.0%, got {sl_pct*100:.3f}%"
+    # TP = max(sl_pct*2.0, atr*1.5) = max(2.0%, 0.75%) = 2.0%, floored at 1.5% → 2.0%
+    tp_pct = (tp - 100.0) / 100.0
+    assert abs(tp_pct - 0.020) < 1e-9, f"Expected TP ~2.0%, got {tp_pct*100:.3f}%"
+
+
+def test_calculate_tp_sl_uses_atr_for_volatile_mover() -> None:
+    """High-ATR symbol should produce SL near the 2.5% ceiling."""
+    state = NativeSharedState()
+    state.market_data = {"VOLAUSDT": {"atr": 2.0}}  # 2.0 on $100 = 2.0% ATR
+    state.prices = {"VOLAUSDT": 100.0}
+    engine = NativeTPSLEngine(state, _Cfg())
+
+    tp, sl = engine.calculate_tp_sl("VOLAUSDT", 100.0)
+
+    sl_pct = (100.0 - sl) / 100.0
+    # ATR pct = 2.0/100 = 2.0%, SL_ATR_MULT=1.5 → 3.0% → clamped to ceiling 2.5%
+    assert abs(sl_pct - 0.025) < 1e-9, f"Expected SL ~2.5%, got {sl_pct*100:.3f}%"
+
+
+def test_calculate_tp_sl_medium_atr_between_floor_and_ceiling() -> None:
+    """Medium-ATR symbol should produce SL proportional to ATR, unclamped."""
+    state = NativeSharedState()
+    state.market_data = {"MEDUSDT": {"atr": 1.0}}  # 1.0% ATR on $100 entry
+    state.prices = {"MEDUSDT": 100.0}
+    engine = NativeTPSLEngine(state, _Cfg())
+
+    tp, sl = engine.calculate_tp_sl("MEDUSDT", 100.0)
+
+    sl_pct = (100.0 - sl) / 100.0
+    # ATR pct = 1.0%, SL_ATR_MULT=1.5 → 1.5% → within [1.0%, 2.5%] → unclamped
+    assert abs(sl_pct - 0.015) < 1e-9, f"Expected SL ~1.5%, got {sl_pct*100:.3f}%"
+
+
+def test_calculate_tp_sl_fallback_no_data_reasonable_sl() -> None:
+    """When no price/candle data is available, SL should stay within bounds."""
+    state = NativeSharedState()
+    # No market_data, no klines, no prices → _compute_atr returns 0 → min_atr kicks in
+    engine = NativeTPSLEngine(state, _Cfg())
+
+    tp, sl = engine.calculate_tp_sl("NOUSDT", 100.0)
+
+    sl_pct = (100.0 - sl) / 100.0
+    assert (
+        engine._SL_FLOOR_PCT <= sl_pct <= engine._SL_CEILING_PCT
+    ), f"SL {sl_pct*100:.2f}% out of [{engine._SL_FLOOR_PCT*100}%, {engine._SL_CEILING_PCT*100}%]"
+    # TP must be at least 2:1 vs SL and within [1.5%, 6%]
+    tp_pct = (tp - 100.0) / 100.0
+    assert 0.015 <= tp_pct <= 0.06, f"TP {tp_pct*100:.2f}% outside [1.5%, 6%]"
+    assert tp_pct >= sl_pct * 2.0 - 1e-9, f"TP {tp_pct*100:.2f}% < 2x SL {sl_pct*100:.2f}%"
+
+
+def test_calculate_tp_sl_price_fallback_gives_reasonable_sl() -> None:
+    """Price-only fallback (no candles) produces ATR=0.8% → SL=1.2%."""
+    state = NativeSharedState()
+    state.prices = {"PRICEUSDT": 100.0}
+    # no market_data / klines → falls through to price fallback 0.8%
+    engine = NativeTPSLEngine(state, _Cfg())
+
+    tp, sl = engine.calculate_tp_sl("PRICEUSDT", 100.0)
+
+    sl_pct = (100.0 - sl) / 100.0
+    # atr = 100 * 0.008 = 0.8%, SL_ATR_MULT=1.5 → 1.2% → within bounds
+    assert abs(sl_pct - 0.012) < 1e-9, f"Expected SL ~1.2%, got {sl_pct*100:.3f}%"
+
+
+# ---------------------------------------------------------------------------
+# Regime-aware trailing stop tests
+# ---------------------------------------------------------------------------
+
+
+def test_trailing_stop_uptrend_activates_at_2pct() -> None:
+    """In UPTREND, trailing activates at +2.0% and fires 1.0% below peak.
+
+    For trailing to fire: peak * (1 - distance) must stay above activation threshold.
+    Constraint: peak/entry >= (1 + activation) / (1 - distance) = 1.02/0.99 = 1.0303.
+    We use peak=105 (5% above entry) so trail=103.95 is above activation floor 102.0.
+    """
+    engine, state = _engine_with_regime("UPTREND")
+    entry = 100.0
+    engine._entry_prices["TESTUSDT"] = entry
+    engine._entry_timestamps["TESTUSDT"] = time.time() - 60
+
+    pos = _make_position(entry, tp=108.0, sl=97.5)
+
+    # Price at +1.9% — below activation threshold of 2.0% → trailing not yet active
+    result = engine.check_triggers("TESTUSDT", pos, current_price=101.9)
+    assert result is None, f"Should not activate below 2.0%, got {result}"
+
+    # Price rises to +5% (peak=105), then drops to 103.9 (profit=3.9% >= 2.0% activation,
+    # and 103.9 <= 105 * 0.99 = 103.95 → fires)
+    engine._peak_prices["TESTUSDT"] = 105.0
+    result = engine.check_triggers("TESTUSDT", pos, current_price=103.9)
+    assert result == "TRAILING_STOP", f"Expected TRAILING_STOP, got {result}"
+
+
+def test_trailing_stop_choppy_activates_at_0pt8pct() -> None:
+    """In CHOPPY, trailing activates at +0.8% — faster lock-in.
+
+    Constraint: peak/entry >= (1 + 0.008) / (1 - 0.004) = 1.008/0.996 = 1.01205.
+    Peak=102 (2% above entry) → trail=101.592; current=101.5 satisfies both conditions.
+    """
+    engine, state = _engine_with_regime("CHOPPY")
+    entry = 100.0
+    engine._entry_prices["TESTUSDT"] = entry
+    engine._entry_timestamps["TESTUSDT"] = time.time() - 60
+
+    pos = _make_position(entry, tp=108.0, sl=97.5)
+
+    # Price at +0.7% — below CHOPPY activation of 0.8% → no trailing
+    result = engine.check_triggers("TESTUSDT", pos, current_price=100.7)
+    assert result is None
+
+    # Peak=102, current=101.5 (profit=1.5% >= 0.8%; 101.5 <= 102 * 0.996 = 101.592) → fires
+    engine._peak_prices["TESTUSDT"] = 102.0
+    result = engine.check_triggers("TESTUSDT", pos, current_price=101.5)
+    assert result == "TRAILING_STOP", f"Expected TRAILING_STOP in CHOPPY, got {result}"
+
+
+def test_trailing_stop_downtrend_activates_at_0pt6pct() -> None:
+    """In DOWNTREND, trailing activates at +0.6% — survival mode.
+
+    Constraint: peak/entry >= (1 + 0.006) / (1 - 0.003) = 1.006/0.997 = 1.00903.
+    Peak=101.5 (1.5% above entry) → trail=101.196; current=101.0 satisfies both.
+    """
+    engine, state = _engine_with_regime("DOWNTREND")
+    entry = 100.0
+    engine._entry_prices["TESTUSDT"] = entry
+    engine._entry_timestamps["TESTUSDT"] = time.time() - 60
+
+    pos = _make_position(entry, tp=108.0, sl=97.5)
+
+    # Peak=101.5, current=101.0 (profit=1.0% >= 0.6%; 101.0 <= 101.5 * 0.997 = 101.195) → fires
+    engine._peak_prices["TESTUSDT"] = 101.5
+    result = engine.check_triggers("TESTUSDT", pos, current_price=101.0)
+    assert result == "TRAILING_STOP", f"Expected TRAILING_STOP in DOWNTREND, got {result}"
+
+
+def test_trailing_stop_unknown_regime_uses_trending_default() -> None:
+    """Unknown/empty regime falls back to TRENDING behaviour (1.5%, 0.8%).
+
+    Constraint: peak/entry >= (1 + 0.015) / (1 - 0.008) = 1.015/0.992 = 1.02318.
+    Peak=104 (4% above entry) → trail=103.168; current=103.1 satisfies both.
+    """
+    engine, state = _engine_with_regime("")
+    entry = 100.0
+    engine._entry_prices["TESTUSDT"] = entry
+    engine._entry_timestamps["TESTUSDT"] = time.time() - 60
+
+    pos = _make_position(entry, tp=108.0, sl=97.5)
+
+    # +1.4% — below TRENDING activation of 1.5% → no trailing
+    result = engine.check_triggers("TESTUSDT", pos, current_price=101.4)
+    assert result is None
+
+    # Peak=104, current=103.1 (profit=3.1% >= 1.5%; 103.1 <= 104 * 0.992 = 103.168) → fires
+    engine._peak_prices["TESTUSDT"] = 104.0
+    result = engine.check_triggers("TESTUSDT", pos, current_price=103.1)
+    assert result == "TRAILING_STOP", f"Expected TRAILING_STOP for default regime, got {result}"
+
+
+def test_all_regime_params_within_valid_bounds() -> None:
+    """Every regime entry has activation >= distance (can't trail before activating)."""
+    for regime, (activation, distance) in NativeTPSLEngine._REGIME_TRAIL_PARAMS.items():
+        assert (
+            activation > distance
+        ), f"{regime}: activation ({activation}) must exceed distance ({distance})"
+        assert activation >= 0.005, f"{regime}: activation too small ({activation})"
+        assert distance >= 0.002, f"{regime}: distance too small ({distance})"
+
+
+def test_persisted_sl_survives_restart_unchanged() -> None:
+    """Best practice: persisted SL must be restored exactly, not recalculated.
+
+    A position armed at entry with SL=98.0 should still have SL=98.0 after a
+    simulated restart (_load_tpsl_state), even if ATR would produce a different
+    value now.  The symbol must also be in _armed_symbols so auto_arm skips it.
+    """
+    import json
+    import os
+    import tempfile
+
+    entry = 100.0
+    original_sl = 98.0  # 2.0% SL set at entry
+    original_tp = 108.0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_path = os.path.join(tmpdir, "tpsl_state.json")
+
+        # Simulate a saved state from a previous session
+        saved = {
+            "tp_levels": {"TESTUSDT": original_tp},
+            "sl_levels": {"TESTUSDT": original_sl},
+            "entry_timestamps": {"TESTUSDT": time.time() - 3600},
+            "peak_prices": {"TESTUSDT": entry},
+            "entry_prices": {"TESTUSDT": entry},
+            "saved_at": time.time(),
+        }
+        with open(state_path, "w") as f:
+            json.dump(saved, f)
+
+        # Simulate restart: create a fresh engine pointing at the saved state file
+        state = NativeSharedState()
+        state.positions = {"TESTUSDT": {"symbol": "TESTUSDT", "qty": 1.0, "entry_price": entry}}
+        state.prices = {"TESTUSDT": 101.0}
+        # Inject candle data that would produce a DIFFERENT SL if recalculated
+        state.market_data[("TESTUSDT", "1m")] = [
+            {"time": i, "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 1000}
+            for i in range(20)
+        ]  # ATR ~1.0% → would produce SL=98.5 if recalculated (different from 98.0)
+
+        engine = NativeTPSLEngine(state, _Cfg())
+        # Fully reset internal state so production logs/tpsl_state.json (loaded in __init__)
+        # doesn't pollute this test — we want to test only our fixture file.
+        engine._armed_symbols.clear()
+        engine._tp_levels.clear()
+        engine._sl_levels.clear()
+        engine._entry_timestamps.clear()
+        engine._peak_prices.clear()
+        engine._entry_prices.clear()
+        engine._tpsl_state_path = state_path
+        engine._load_tpsl_state()  # restore from saved state
+
+        # After _load_tpsl_state(), TESTUSDT must be in _armed_symbols so that
+        # _auto_arm_existing_positions() skips recalculation for it.
+        assert (
+            "TESTUSDT" in engine._armed_symbols
+        ), "Restored symbol must be in _armed_symbols so auto-arm skips recalculation"
+        assert engine._sl_levels.get("TESTUSDT") == original_sl, (
+            f"SL was modified on load: got {engine._sl_levels.get('TESTUSDT')}, "
+            f"expected persisted {original_sl}"
+        )
+        assert engine._tp_levels.get("TESTUSDT") == original_tp
+        assert engine._entry_prices.get("TESTUSDT") == entry
+
+
+def test_sl_ceiling_never_exceeded_by_atr_formula() -> None:
+    """Even with an extreme ATR, SL must never exceed the 2.5% ceiling."""
+    state = NativeSharedState()
+    state.market_data = {"EXTREMEUSDT": {"atr": 50.0}}  # 50% ATR on $100 entry
+    state.prices = {"EXTREMEUSDT": 100.0}
+    engine = NativeTPSLEngine(state, _Cfg())
+
+    _, sl = engine.calculate_tp_sl("EXTREMEUSDT", 100.0)
+
+    sl_pct = (100.0 - sl) / 100.0
+    assert (
+        sl_pct <= engine._SL_CEILING_PCT + 1e-9
+    ), f"SL ceiling violated: {sl_pct*100:.2f}% > {engine._SL_CEILING_PCT*100}%"
+
+
+def test_recalculate_aged_positions_tightens_quick_winner_under_nav_protection() -> None:
+    state = NativeSharedState()
+    now = time.time()
+    state.positions = {
+        "BTCUSDT": {
+            "symbol": "BTCUSDT",
+            "qty": 1.0,
+            "entry_price": 100.0,
+            "current_price": 101.2,
+            "tp": 102.5,
+            "sl": 98.5,
+        }
+    }
+    state.prices = {"BTCUSDT": 101.2}
+    state.position_setup_context = {
+        "BTCUSDT": {
+            "setup_family": "continuation",
+            "regime": "trend",
+            "confidence": 0.78,
+            "entry_quality": 0.72,
+            "entry_ts": now - (45 * 60),
+        }
+    }
+    state.nav_protection_state = {
+        "allow_tp_sl_adjustment": True,
+        "protection_mode": "FLOATING_GAIN_PROTECTION",
+        "suggested_actions": ["TIGHTEN_TP_SL", "PARTIAL_TAKE_PROFIT"],
+    }
+
+    engine = NativeTPSLEngine(state, _Cfg())
+    engine._entry_timestamps["BTCUSDT"] = now - (45 * 60)
+
+    updates = engine.recalculate_aged_positions()
+
+    assert "BTCUSDT" in updates
+    assert state.positions["BTCUSDT"]["tp"] < 102.5
+    assert state.positions["BTCUSDT"]["sl"] > 100.0
+    assert "protection" in updates["BTCUSDT"]["reason"]
+
+
+def test_recalculate_aged_positions_does_not_tighten_fresh_flat_position() -> None:
+    state = NativeSharedState()
+    now = time.time()
+    state.positions = {
+        "ETHUSDT": {
+            "symbol": "ETHUSDT",
+            "qty": 1.0,
+            "entry_price": 100.0,
+            "current_price": 100.3,
+            "tp": 102.0,
+            "sl": 98.5,
+        }
+    }
+    state.prices = {"ETHUSDT": 100.3}
+    state.position_setup_context = {
+        "ETHUSDT": {
+            "setup_family": "continuation",
+            "regime": "trend",
+            "confidence": 0.75,
+            "entry_quality": 0.70,
+            "entry_ts": now - (10 * 60),
+        }
+    }
+    state.nav_protection_state = {
+        "allow_tp_sl_adjustment": True,
+        "protection_mode": "FLOATING_GAIN_PROTECTION",
+        "suggested_actions": ["TIGHTEN_TP_SL"],
+    }
+
+    engine = NativeTPSLEngine(state, _Cfg())
+    engine._entry_timestamps["ETHUSDT"] = now - (10 * 60)
+
+    updates = engine.recalculate_aged_positions()
+
+    assert updates == {}
+    assert state.positions["ETHUSDT"]["tp"] == 102.0
+    assert state.positions["ETHUSDT"]["sl"] == 98.5

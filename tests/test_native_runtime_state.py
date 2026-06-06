@@ -68,5 +68,7 @@ def test_runtime_state_restore_prefers_last_known_good_when_current_is_zero_and_
     assert restored.nav_usdt == 222.0
     assert restored.free_balance_usdt == 111.0
     assert restored.balance["USDT"] == 111.0
-    assert restored.session_anchor_nav == 200.0
+    # session_anchor_nav is intentionally zeroed on restore — main.py sets it from live NAV
+    # on the first cycle so phantom drawdowns from prior sessions don't lock the OFC floor.
+    assert restored.session_anchor_nav == 0.0
     assert restored.exchange_throttled is True

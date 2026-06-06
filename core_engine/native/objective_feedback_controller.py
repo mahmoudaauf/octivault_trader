@@ -39,9 +39,11 @@ DEFAULTS = {
     "OBJ_MAX_DRAWDOWN_PCT": 0.05,  # 5% kill-switch
     "OBJ_MIN_NET_EDGE_BPS": 5.0,  # avg net profit must beat 5 bps
     # Knob ranges  (clamped)
+    # Floor minimum of 0.65 is the empirical breakeven threshold — signals below this
+    # have shown ~30% win rate which is deeply unprofitable. Never go below 0.65.
     "OBJ_CONF_FLOOR_MIN": 0.50,
-    "OBJ_CONF_FLOOR_MAX": 0.85,
-    "OBJ_SIZE_MULT_MIN": 0.25,
+    "OBJ_CONF_FLOOR_MAX": 0.72,
+    "OBJ_SIZE_MULT_MIN": 0.50,
     "OBJ_SIZE_MULT_MAX": 1.50,
     "OBJ_THRU_MIN": 2.0,  # trades / hour
     "OBJ_THRU_MAX": 60.0,
@@ -168,10 +170,17 @@ class ObjectiveFeedbackController:
 
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
+        self._session_peak_nav: float = 0.0  # intra-session peak; never loaded from metrics
 
         self.artefact_path = Path(
             artefact_path or os.getenv("OBJ_ARTEFACT_PATH", "objective_controller_state.json")
         )
+
+        # Restore only the knobs from the previous session.
+        # consecutive_dd_breaches and integral_pace must NOT carry over — a stale
+        # breach count from a previous crash causes an immediate kill-switch on restart
+        # even when the current session has no drawdown at all.
+        self._restore_knobs_from_artefact()
 
         self.logger.info(
             "[OFC] Initialised — daily=%.2f%% hourly=%.4f%% dd_max=%.2f%% hb=%ds",
@@ -235,6 +244,11 @@ class ObjectiveFeedbackController:
         pace_error = observed_pace_pct_h - (self.hourly_target * 100)  # % per hour
         dd_error = max(0.0, tel.drawdown_pct - self.dd_max * 100)  # % over limit
         edge_error_bps = self.min_edge_bps - tel.avg_net_profit_bps  # >0 = bad
+        # avg_net_profit_bps carries stale EMA data from previous sessions.
+        # Suppress edge penalty until we have fresh trades (at least 3h or 5 fills)
+        # to avoid false tightening from historical bad data.
+        if tel.elapsed_h < 3.0 or tel.trades_in_window < 5:
+            edge_error_bps = min(0.0, edge_error_bps)
 
         # ---- 2. Kill-switch ------------------------------------------
         halted = False
@@ -246,24 +260,68 @@ class ObjectiveFeedbackController:
             self.state.consecutive_dd_breaches = 0
 
         # ---- 3. PI update --------------------------------------------
-        # Anti-windup: only integrate when not at saturation
-        self.state.integral_pace = _clamp(self.state.integral_pace + pace_error, -2.0, 2.0)
+        # When there are zero trades (regime block, cooldown, etc.) and no drawdown,
+        # the system is idle by design — not underperforming. Skip PI update to prevent
+        # integral windup and slowly decay floor back to min so it doesn't ratchet up.
+        # EXCEPTION: if the portfolio is capacity-constrained (many positions or high
+        # exposure), the idle signal is a capacity signal, not a quality signal — do NOT
+        # decay the floor. Decaying the floor when all slots are taken causes low-quality
+        # entries as soon as a slot opens.
+        _ss_cap = self.ss
+        _positions_count = 0
+        _exposure_ratio = 0.0
+        if _ss_cap is not None:
+            try:
+                _positions_count = len(getattr(_ss_cap, "positions", {}) or {})
+                _metrics_cap = getattr(_ss_cap, "metrics", {}) or {}
+                _nav_cap = await _safe_get(_ss_cap, "get_nav", default=1.0) or 1.0
+                _locked_cap = float(_metrics_cap.get("locked_usdt", 0.0) or 0.0)
+                _exposure_ratio = _locked_cap / _nav_cap if _nav_cap > 0 else 0.0
+            except Exception:
+                pass
+        _capacity_constrained = _positions_count >= 10 or _exposure_ratio >= 0.45
 
-        d_conf = (
-            -self.gains["Kp_conf"] * pace_error * 0.01  # %→fraction
-            - self.gains["Ki_conf"] * self.state.integral_pace * 0.01
-            + self.gains["Kp_dd"] * (dd_error * 0.01)  # raise floor on DD
-            + (edge_error_bps / 1000.0)  # poor edge → raise floor
-        )
+        no_trades_idle = tel.trades_in_window == 0 and dd_error == 0.0
+        if no_trades_idle and _capacity_constrained:
+            # Portfolio is full — 0 trades means no slots, not low quality.
+            # Hold floor steady so we don't open slots to mediocre signals.
+            self.logger.debug(
+                "[OFC] idle (0 trades) but capacity-constrained (positions=%d, exposure=%.0f%%) — holding floor steady",
+                _positions_count,
+                _exposure_ratio * 100,
+            )
+            d_conf = 0.0
+            d_size = 0.0
+            d_thru = 0.0
+        elif no_trades_idle:
+            self.logger.debug(
+                "[OFC] idle (0 trades, no DD) — decaying floor toward min, holding other knobs"
+            )
+            conf_min = self.knob_ranges["confidence_floor"][0]
+            current_floor = self.state.last_knobs["confidence_floor"]
+            # Gentle decay: move 10% toward floor_min each OFC step so ratchet reverses
+            d_conf = (conf_min - current_floor) * 0.10
+            d_size = 0.0
+            d_thru = 0.0
+        else:
+            # Anti-windup: only integrate when not at saturation
+            self.state.integral_pace = _clamp(self.state.integral_pace + pace_error, -2.0, 2.0)
 
-        d_size = +self.gains["Kp_size"] * pace_error * 0.01 - self.gains["Kp_dd"] * (
-            dd_error * 0.01
-        )
+            d_conf = (
+                +self.gains["Kp_conf"] * pace_error * 0.01  # behind→lower floor, ahead→raise
+                + self.gains["Ki_conf"] * self.state.integral_pace * 0.01
+                + self.gains["Kp_dd"] * (dd_error * 0.01)  # raise floor on DD
+                + (edge_error_bps / 1000.0)  # poor edge → raise floor
+            )
 
-        d_thru = (
-            +self.gains["Kp_thru"] * pace_error * 0.01
-            - self.gains["Kp_dd"] * (dd_error * 0.01) * 10.0
-        )
+            d_size = -self.gains["Kp_size"] * pace_error * 0.01 - self.gains["Kp_dd"] * (
+                dd_error * 0.01
+            )
+
+            d_thru = (
+                +self.gains["Kp_thru"] * pace_error * 0.01
+                - self.gains["Kp_dd"] * (dd_error * 0.01) * 10.0
+            )
 
         # ---- 4. Apply (clamped) --------------------------------------
         new_knobs = dict(self.state.last_knobs)
@@ -358,7 +416,12 @@ class ObjectiveFeedbackController:
             else:
                 missing.append("elapsed_h")
 
-        peak_nav = float(metrics.get("peak_nav", nav) or nav)
+        # Track peak_nav in-memory so stale all-time highs from prior sessions never
+        # contaminate this session. On first call, seed from session anchor (not metrics).
+        if self._session_peak_nav <= 0:
+            self._session_peak_nav = float(nav_anchor or nav)
+        self._session_peak_nav = max(self._session_peak_nav, nav)
+        peak_nav = self._session_peak_nav
         dd_pct = 0.0 if peak_nav <= 0 else max(0.0, (peak_nav - nav) / peak_nav * 100.0)
 
         trades = int(metrics.get("trades_in_window", 0) or 0)
@@ -446,7 +509,10 @@ class ObjectiveFeedbackController:
         ss = self.ss
         if ss is not None:
             try:
+                import time as _t
+
                 ss.trading_halted = True
+                ss._trading_halted_since = _t.time()  # timestamp for auto-resume
             except Exception:
                 pass
             if hasattr(ss, "emit_event"):
@@ -466,6 +532,24 @@ class ObjectiveFeedbackController:
     # ----------------------------------------------------------------
     # Persistence (so we survive restarts and have an audit trail)
     # ----------------------------------------------------------------
+
+    def _restore_knobs_from_artefact(self) -> None:
+        """Load only last_knobs from the artefact — never restore breach counters or integral state."""
+        try:
+            if self.artefact_path.exists():
+                data = json.loads(self.artefact_path.read_text())
+                knobs = data.get("last_knobs")
+                if isinstance(knobs, dict):
+                    self.state.last_knobs = knobs
+                    self.logger.info(
+                        "[OFC] Restored knobs from artefact: conf_floor=%.2f size_mult=%.2f",
+                        float(knobs.get("confidence_floor", 0.65)),
+                        float(knobs.get("size_multiplier", 1.0)),
+                    )
+                # Deliberately NOT restoring: consecutive_dd_breaches, integral_pace, history_tail
+                # Those are session-scoped — stale values cause false kill-switches on restart.
+        except Exception:
+            self.logger.debug("[OFC] _restore_knobs_from_artefact: no artefact or parse error")
 
     def _persist_state(self) -> None:
         try:

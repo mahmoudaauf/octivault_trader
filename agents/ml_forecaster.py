@@ -187,7 +187,10 @@ class MLForecaster:
         self.max_concurrency = int(getattr(self.config, "MLF_MAX_CONCURRENCY", 6))
         self.symbol_timeout_s = float(getattr(self.config, "MLF_SYMBOL_TIMEOUT_S", 15.0))
         self.predict_timeout_s = float(getattr(self.config, "MLF_PREDICT_TIMEOUT_S", 5.0))
-        self.max_symbols_per_tick = 5
+        self.max_symbols_per_tick = max(
+            len(self.symbols) if self.symbols else 5,
+            int(getattr(self.config, "MLF_MAX_SYMBOLS_PER_TICK", 0)) or 99,
+        )
         self._sem = asyncio.Semaphore(self.max_concurrency)
         self._stop_event = asyncio.Event()
 
@@ -313,6 +316,8 @@ class MLForecaster:
             "trend_flag",
             "sideways_flag",
             "high_vol_flag",
+            "taker_buy_ratio",
+            "taker_buy_vol_zscore",
         ]
         self._feature_force_upgrade = self._cfg_bool("ML_FEATURE_FORCE_UPGRADE", True)
         self._auto_retrain_feature_mismatch = self._cfg_bool(
@@ -336,7 +341,7 @@ class MLForecaster:
         self._retrain_last_end_ts = 0.0
         self._retrain_rr_cursor = 0
         self._retrain_min_gap_s = float(
-            self._cfg("ML_RETRAIN_MIN_GAP_S", os.getenv("ML_RETRAIN_MIN_GAP_S", 900.0)) or 900.0
+            self._cfg("ML_RETRAIN_MIN_GAP_S", os.getenv("ML_RETRAIN_MIN_GAP_S", 14400.0)) or 14400.0
         )
         self._retrain_symbol_timeout_s = float(
             self._cfg(
@@ -349,7 +354,7 @@ class MLForecaster:
             or 240.0
         )
         self._retrain_max_rows = int(
-            self._cfg("ML_RETRAIN_MAX_ROWS", os.getenv("ML_RETRAIN_MAX_ROWS", 500)) or 500
+            self._cfg("ML_RETRAIN_MAX_ROWS", os.getenv("ML_RETRAIN_MAX_ROWS", 1000)) or 1000
         )
         self._retrain_default_epochs = int(
             self._cfg("ML_RETRAIN_EPOCHS", os.getenv("ML_RETRAIN_EPOCHS", 3)) or 3
@@ -480,8 +485,21 @@ class MLForecaster:
 
         # 2. Fallback to static config (env or file)
         if isinstance(self.config, dict):
-            return self.config.get(key, default)
-        return getattr(self.config, key, default)
+            val = self.config.get(key)
+            if val is not None:
+                return val
+        else:
+            _sentinel = object()
+            val = getattr(self.config, key, _sentinel)
+            if val is not _sentinel:
+                return val
+
+        # 3. os.environ (populated by load_dotenv in main.py)
+        env_val = os.getenv(key)
+        if env_val is not None:
+            return env_val
+
+        return default
 
     def _cfg_bool(self, key: str, default: bool = False) -> bool:
         raw = self._cfg(key, default)
@@ -636,17 +654,29 @@ class MLForecaster:
                 return list(res.keys())
             result = list(res or [])
 
-            # ITERATION 2 FIX: If empty, use DEFAULT_SYMBOLS as fallback
+            # If empty, fall back to SYMBOLS env var, then self.symbols, then DEFAULT_SYMBOLS
             if not result:
-                try:
-                    from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
-
-                    result = list(DEFAULT_SYMBOLS.keys())
+                _env_syms = os.getenv("SYMBOLS", "").strip()
+                if _env_syms:
+                    result = [s.strip().upper() for s in _env_syms.split(",") if s.strip()]
                     self.logger.warning(
-                        f"[{self.name}] ⚠️  accepted_symbols empty! Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback"
+                        f"[{self.name}] ⚠️  accepted_symbols empty! Using SYMBOLS env ({len(result)} symbols)"
                     )
-                except Exception as e:
-                    self.logger.debug(f"[{self.name}] DEFAULT_SYMBOLS fallback failed: {e}")
+                elif self.symbols:
+                    result = list(self.symbols)
+                    self.logger.warning(
+                        f"[{self.name}] ⚠️  accepted_symbols empty! Using self.symbols ({len(result)} symbols)"
+                    )
+                else:
+                    try:
+                        from src.l3_portfolio.bootstrap_symbols import DEFAULT_SYMBOLS
+
+                        result = list(DEFAULT_SYMBOLS.keys())
+                        self.logger.warning(
+                            f"[{self.name}] ⚠️  accepted_symbols empty! Using {len(DEFAULT_SYMBOLS)} DEFAULT_SYMBOLS as fallback"
+                        )
+                    except Exception as e:
+                        self.logger.debug(f"[{self.name}] DEFAULT_SYMBOLS fallback failed: {e}")
 
             return result
         except Exception:
@@ -1635,6 +1665,8 @@ class MLForecaster:
         """
         Accept either short-key (o/h/l/c/v) or long-key (open/high/low/close/volume) dicts,
         or a sequence ending with [open, high, low, close, volume].
+        Returns [open, high, low, close, volume, taker_buy_volume, num_trades].
+        taker_buy_volume and num_trades default to 0 if absent (backward compat).
         """
         try:
             if isinstance(r, dict):
@@ -1646,13 +1678,19 @@ class MLForecaster:
                 v = d.get("v", d.get("volume"))
                 if None in (o, h, l, c, v):
                     return None
-                return [float(o), float(h), float(l), float(c), float(v)]
+                tb = d.get("taker_buy_volume", d.get("V", 0)) or 0
+                nt = d.get("num_trades", d.get("n", 0)) or 0
+                return [float(o), float(h), float(l), float(c), float(v), float(tb), float(nt)]
             else:
                 seq = list(r)
-                if len(seq) >= 6:
-                    seq = seq[-5:]  # keep last 5 numbers
-                if len(seq) == 5:
+                if len(seq) >= 7:
+                    # sequence has taker fields: extract last 7
+                    seq = seq[-7:]
                     return [float(x) for x in seq]
+                elif len(seq) >= 6:
+                    seq = seq[-5:]  # keep last 5 numbers (OHLCV only)
+                if len(seq) == 5:
+                    return [float(x) for x in seq] + [0.0, 0.0]
         except Exception:
             return None
         return None
@@ -1671,10 +1709,23 @@ class MLForecaster:
                     "low": float(std[2]),
                     "close": float(std[3]),
                     "volume": float(std[4]),
+                    "taker_buy_volume": float(std[5]) if len(std) > 5 else 0.0,
+                    "num_trades": float(std[6]) if len(std) > 6 else 0.0,
                 }
             )
         if not rows:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "taker_buy_volume",
+                    "num_trades",
+                ]
+            )
 
         df = pd.DataFrame(rows)
         for col in self._legacy_feature_columns:
@@ -1775,6 +1826,18 @@ class MLForecaster:
         vol_base = volume.rolling(20, min_periods=5).mean()
         volume_spike_ratio = volume / vol_base.replace(0.0, np.nan)
 
+        taker_buy_vol = (
+            pd.to_numeric(df.get("taker_buy_volume", pd.Series(dtype=float)), errors="coerce")
+            .fillna(0.0)
+            .clip(lower=0.0)
+        )
+        total_vol = volume.replace(0.0, np.nan)
+        raw_ratio = taker_buy_vol / total_vol  # 0..1
+        taker_buy_ratio = (raw_ratio - 0.5).fillna(
+            0.0
+        )  # center: 0 = balanced, +0.5 = all taker buys
+        taker_buy_vol_zscore = self._rolling_zscore(raw_ratio, window=50)
+
         volatility_zscore = self._rolling_zscore(atr_pct, window=50)
         trend_strength = (close - ema50).abs() / close.replace(0.0, np.nan)
 
@@ -1807,6 +1870,8 @@ class MLForecaster:
             "trend_flag": trend_flag,
             "sideways_flag": sideways_flag,
             "high_vol_flag": high_vol_flag,
+            "taker_buy_ratio": taker_buy_ratio,
+            "taker_buy_vol_zscore": taker_buy_vol_zscore,
         }
         for col, values in feature_map.items():
             df[col] = pd.to_numeric(values, errors="coerce")
@@ -1941,8 +2006,10 @@ class MLForecaster:
                 # Convert unconstrained score/logit to probability.
                 p_buy = 1.0 / (1.0 + np.exp(-val))
             p_buy = float(np.clip(p_buy, 0.0, 1.0))
-            action = "buy" if p_buy >= 0.5 else "hold"
-            conf = float(max(p_buy, 1.0 - p_buy))
+            # 0.65 floor: only emit BUY when model has genuine conviction.
+            # At 0.5 we were trading "slightly better than a coin flip" — 8% win rate.
+            action = "buy" if p_buy >= 0.65 else "hold"
+            conf = float(p_buy) if action == "buy" else float(1.0 - p_buy)
             probs = np.asarray([1.0 - p_buy, p_buy], dtype=np.float64)
             return action, conf, probs, "scalar_hold_buy"
 
@@ -3232,6 +3299,31 @@ class MLForecaster:
                 f"[{self.name}] [DEBUG:CollectSignal:Blocked] {symbol} {action} conf={confidence:.3f} < hard_emit_floor={self._conf_hard_emit_floor:.3f} - EARLY RETURN"
             )
             return
+
+        # Model accuracy gate: block BUY signals from symbols whose effective model accuracy
+        # is below the minimum threshold (default 0.55). Uses retrain summary as source of truth
+        # (metadata files can be stale if a worse model was trained but old model restored).
+        if action.upper() == "BUY":
+            _min_model_acc = float(self._cfg("ML_MIN_MODEL_ACCURACY", 0.55) or 0.55)
+            try:
+                import json as _json
+                from pathlib import Path as _Path
+
+                _summary = _Path("logs/retrain_weekly_last.json")
+                if _summary.exists():
+                    _data = _json.loads(_summary.read_text())
+                    _acc_map = {
+                        r["symbol"]: r["new_acc"] if r.get("swapped") else r["old_acc"]
+                        for r in _data.get("results", [])
+                    }
+                    _model_acc = _acc_map.get(symbol)
+                    if _model_acc is not None and float(_model_acc) < _min_model_acc:
+                        self.logger.warning(
+                            f"[{self.name}] MODEL_ACC_BLOCK {symbol}: effective accuracy {_model_acc:.3f} < min {_min_model_acc:.3f} — BUY suppressed"
+                        )
+                        return
+            except Exception:
+                pass
 
         regime, expected_move_pct = await self._live_regime_and_expected_move(symbol)
 

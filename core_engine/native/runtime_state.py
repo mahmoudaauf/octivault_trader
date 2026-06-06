@@ -125,6 +125,8 @@ class NativeRuntimeStateExporter:
                 getattr(self._state, "exchange_throttle_until_ts", 0.0) or 0.0
             ),
             "metrics": dict(getattr(self._state, "metrics", {}) or {}),
+            "position_recovery": dict(getattr(self._state, "position_recovery", {}) or {}),
+            "recovery_state": dict(getattr(self._state, "recovery_state", {}) or {}),
         }
         payload["last_known_good_account_state"] = _account_payload(
             nav_usdt=payload["nav_usdt"],
@@ -210,7 +212,26 @@ def load_runtime_state(shared_state: Any, input_path: Path) -> bool:
         )
         metrics = payload.get("metrics", {}) or {}
         if isinstance(metrics, dict):
-            shared_state.metrics.update(metrics)
+            # These metrics are session-scoped: restoring them would make the OFC and
+            # dynamic-floor logic evaluate the new session against stale history, producing
+            # phantom drawdowns and frozen floors. They must always start at zero each session.
+            _RESET_ON_RESTART = {
+                "realized_pnl",
+                "win_rate_window",
+                "win_rate_tpsl",
+                "trades_in_window",
+                "avg_fee_bps",
+                "avg_slippage_bps",
+                "avg_net_profit_bps",
+                "session_elapsed_h",
+            }
+            filtered_metrics = {k: v for k, v in metrics.items() if k not in _RESET_ON_RESTART}
+            shared_state.metrics.update(filtered_metrics)
+        # session_anchor_nav must never be restored from disk — the OFC uses it as the
+        # drawdown baseline for the current session. If restored, a previous session's
+        # NAV becomes the anchor, creating a phantom drawdown that locks the floor.
+        # main.py sets it to the real live NAV on the first cycle after balance sync.
+        shared_state.session_anchor_nav = 0.0
         positions = payload.get("positions", {}) or {}
         for sym, pos in positions.items():
             try:
@@ -222,6 +243,8 @@ def load_runtime_state(shared_state: Any, input_path: Path) -> bool:
                 )
             except Exception:
                 continue
+        shared_state.position_recovery = dict(payload.get("position_recovery", {}) or {})
+        shared_state.recovery_state = dict(payload.get("recovery_state", {}) or {})
         return True
     except Exception:
         logger.debug("load_runtime_state failed", exc_info=True)
