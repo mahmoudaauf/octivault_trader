@@ -244,6 +244,10 @@ class MLForecaster:
         self.model_cache: dict[str, Any] = {}
         # gap8: per-symbol closed-trade PnL history for drift-triggered retraining
         self._symbol_trade_results: dict[str, list[float]] = {}
+        # a+: calibration EV lookup — updated every recalibration cycle
+        self._last_calibration_rows: list[dict] = []
+        self._last_min_positive_ev_conf: float | None = None
+        self._last_calibration_samples: int = 0
         self._model_mtime: dict[str, float] = {}
         self._predict_fns: dict[
             tuple[str, int, int], Any
@@ -305,7 +309,7 @@ class MLForecaster:
         )
         self._inst_block_bear_buy = self._cfg_bool("ML_INST_BLOCK_BEAR_BUY", True)
         self._inst_high_vol_min_conf = float(self._cfg("ML_INST_HIGH_VOL_MIN_CONF", 0.72) or 0.72)
-        self._inst_sideways_min_conf = float(self._cfg("ML_INST_SIDEWAYS_MIN_CONF", 0.68) or 0.68)
+        self._inst_sideways_min_conf = float(self._cfg("ML_INST_SIDEWAYS_MIN_CONF", 0.78) or 0.78)
         self._inst_normal_min_conf = float(self._cfg("ML_INST_NORMAL_MIN_CONF", 0.58) or 0.58)
         self._inst_bull_min_conf = float(self._cfg("ML_INST_BULL_MIN_CONF", 0.55) or 0.55)
         self._inst_high_vol_ev_mult = float(self._cfg("ML_INST_HIGH_VOL_EV_MULT", 2.4) or 2.4)
@@ -2859,6 +2863,14 @@ class MLForecaster:
         source: str,
         regime_views: Optional[dict[str, dict[str, Any]]] = None,
     ) -> None:
+        # a+: persist calibration rows so _lookup_bucket_ev() can serve them at signal time
+        # rows are passed via the call site that calls _log_backtest_rows with the same rows
+        # We store them on the parent _maybe_recalibrate_confidence_floor call — extract from derivation context
+        _min_ev = derivation.get("min_positive_ev_conf")
+        if _min_ev is not None:
+            self._last_min_positive_ev_conf = float(_min_ev)
+        else:
+            self._last_min_positive_ev_conf = None
         alpha = max(0.01, min(1.0, float(self._conf_floor_ema_alpha or 0.35)))
         if self._dynamic_required_conf is None:
             smoothed = float(required_conf)
@@ -2931,6 +2943,20 @@ class MLForecaster:
             if derivation.get("min_calibrated_conf") is not None
             else "None",
         )
+
+    def _lookup_bucket_ev(self, confidence: float) -> tuple[float, int]:
+        """Return (avg_net_pnl_pct, n_samples) for the calibration bucket containing confidence.
+        avg_net_pnl_pct is a fraction (e.g. -0.00311 means -0.311%).
+        Returns (0.0, 0) if no calibration data is available."""
+        for row in self._last_calibration_rows:
+            try:
+                lo = float(row.get("bucket_low", 0.0))
+                hi = float(row.get("bucket_high", 1.0))
+                if lo <= confidence < hi:
+                    return float(row.get("avg_net_pnl_pct", 0.0)), int(row.get("samples", 0))
+            except Exception:
+                continue
+        return 0.0, 0
 
     def _write_confidence_report_artifacts(
         self,
@@ -3186,6 +3212,9 @@ class MLForecaster:
             source=source,
             regime_views=regime_views,
         )
+        # a+: keep calibration rows for per-signal EV lookup
+        self._last_calibration_rows = list(rows)
+        self._last_calibration_samples = sum(int(r.get("samples", 0) or 0) for r in rows)
         self._log_backtest_rows(
             rows, records, source=source, derivation=derivation, regime_views=regime_views
         )
@@ -3775,6 +3804,19 @@ class MLForecaster:
                 f"[{self.name}] Signal quote {signal['quote']:.2f} < min_notional {MIN_NOTIONAL_FLOOR:.2f}; filtering out"
             )
             return  # Don't emit sub-minimum signals
+
+        # a+: EV gate — block BUY signals whose calibration bucket shows confirmed negative EV
+        if signal.get("action", "").upper() == "BUY":
+            _bucket_ev, _bucket_n = self._lookup_bucket_ev(float(confidence or 0.0))
+            signal["_bucket_ev"] = _bucket_ev
+            signal["_bucket_n"] = _bucket_n
+            _NEG_EV_MIN_SAMPLES = 30
+            if _bucket_n >= _NEG_EV_MIN_SAMPLES and _bucket_ev < 0.0:
+                self.logger.warning(
+                    "[%s] EV gate: %s conf=%.3f bucket_ev=%.3f%% n=%d — BLOCKED (neg EV bucket)",
+                    self.name, symbol, float(confidence or 0.0), _bucket_ev * 100.0, _bucket_n,
+                )
+                return  # Don't emit this signal
 
         # Add to collection buffer (AgentManager will forward to Meta)
         self.logger.info(
