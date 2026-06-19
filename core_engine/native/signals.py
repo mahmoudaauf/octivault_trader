@@ -193,10 +193,38 @@ def strategy_ma_crossover(closes: np.ndarray, *, symbol: str = "") -> Optional[S
     )
 
 
+def strategy_momentum(closes: np.ndarray, *, symbol: str = "", period: int = 10) -> Optional[Signal]:
+    """
+    Rate-of-change momentum filter.
+
+    Requires at least ``period + 1`` bars. Measures the 10-bar price
+    change to confirm the prevailing direction before entry:
+
+    * ROC >  +1.5%  → BUY  (price is actually moving up — real momentum)
+    * ROC < -1.5%   → SELL (price is actually moving down)
+    * Otherwise     → HOLD (flat / indeterminate — no momentum edge)
+
+    This acts as an agreement gate: it votes HOLD in choppy/ranging
+    markets so the aggregator's net score stays below the threshold.
+    """
+    if closes.size < period + 1:
+        return None
+    roc = float((closes[-1] / closes[-period - 1]) - 1.0) if closes[-period - 1] != 0 else 0.0
+    # Score scales linearly: 1.5% move → 0.5 score, 3% move → 1.0 score
+    if roc > 0.015:
+        score = float(min(1.0, roc / 0.03))
+        return Signal(symbol, "BUY", score, "momentum", {"roc": roc, "_closes": closes})
+    if roc < -0.015:
+        score = float(min(1.0, abs(roc) / 0.03))
+        return Signal(symbol, "SELL", score, "momentum", {"roc": roc, "_closes": closes})
+    return Signal(symbol, "HOLD", 0.0, "momentum", {"roc": roc, "_closes": closes})
+
+
 BUILTIN_STRATEGIES: dict[str, Callable[..., Optional[Signal]]] = {
     "rsi": strategy_rsi,
     "macd": strategy_macd,
     "ma_cross": strategy_ma_crossover,
+    "momentum": strategy_momentum,
 }
 
 

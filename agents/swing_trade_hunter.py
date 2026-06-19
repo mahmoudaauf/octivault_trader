@@ -1052,21 +1052,64 @@ class SwingTradeHunter:
             except Exception:
                 vol_confirmed = False  # fail-closed: no volume data = no signal
 
-        if ema20_val > ema50_val and rsi_val < rsi_buy_thresh and vol_confirmed:
+        # --- Fix 1: Market Regime Gate (block trades in RANGING/CHOPPY markets) ---
+        # Momentum signals are noise in ranging/choppy regimes — only trade TRENDING markets
+        BLOCKED_REGIMES = {"RANGING", "CHOPPY", "crisis", "ranging", "choppy"}
+        symbol_regime = None
+        try:
+            # Try symbol-specific regime first (most precise)
+            vr = getattr(self.shared_state, "volatility_regimes", {}) or {}
+            sym_r = vr.get(symbol, {})
+            if isinstance(sym_r, dict):
+                symbol_regime = (
+                    sym_r.get(self.timeframe)
+                    or sym_r.get("1h")
+                    or sym_r.get("5m")
+                    or next(iter(sym_r.values()), None)
+                )
+            elif isinstance(sym_r, str):
+                symbol_regime = sym_r
+            # Fall back to global market_regime from metrics
+            if not symbol_regime:
+                metrics = getattr(self.shared_state, "metrics", {}) or {}
+                sr = (metrics.get("symbol_regimes") or {}).get(symbol)
+                symbol_regime = sr or metrics.get("market_regime")
+        except Exception:
+            symbol_regime = None
+
+        if symbol_regime and str(symbol_regime).upper() in {r.upper() for r in BLOCKED_REGIMES}:
+            logger.warning(
+                f"[{self.name}] ⛔ HOLD for {symbol}: market regime='{symbol_regime}' "
+                f"— momentum signals unreliable in {symbol_regime} market"
+            )
+            return "hold", 0.0, f"Regime blocked: {symbol_regime}"
+
+        # --- Fix 2: MACD Confirmation (require histogram > 0 for BUY) ---
+        # MACD hist > 0 confirms momentum is accelerating upward, reducing false entries
+        macd_bullish = hist_val > 0
+        macd_bearish = hist_val < 0
+
+        if ema20_val > ema50_val and rsi_val < rsi_buy_thresh and vol_confirmed and macd_bullish:
             conf = base_confidence + (0.05 if vol_confirmed else 0.0)
-            reason = "EMA uptrend + volume surge" if vol_confirmed else "EMA uptrend detected"
+            reason = f"EMA uptrend + MACD bullish + volume surge (hist={hist_val:.6f})"
             logger.debug(
-                f"[{self.name}] ✅ BUY SIGNAL for {symbol}: {reason} (ema20>{ema50_val:.4f} rsi={rsi_val:.2f} vol_ok={vol_confirmed})"
+                f"[{self.name}] ✅ BUY SIGNAL for {symbol}: {reason} "
+                f"(ema20={ema20_val:.4f} > ema50={ema50_val:.4f}, rsi={rsi_val:.2f}, vol_ok={vol_confirmed})"
             )
             return "buy", round(conf, 4), reason
-        if ema20_val < ema50_val and rsi_val > rsi_sell_thresh:
+        if ema20_val < ema50_val and rsi_val > rsi_sell_thresh and macd_bearish:
             logger.debug(
-                f"[{self.name}] ✅ SELL SIGNAL for {symbol}: EMA downtrend + RSI unfavorable (EMA20 < EMA50, RSI > {rsi_sell_thresh})"
+                f"[{self.name}] ✅ SELL SIGNAL for {symbol}: EMA downtrend + MACD bearish "
+                f"(ema20={ema20_val:.4f} < ema50={ema50_val:.4f}, rsi={rsi_val:.2f}, hist={hist_val:.6f})"
             )
-            return "sell", base_confidence, "EMA downtrend detected"
+            return "sell", base_confidence, f"EMA downtrend + MACD bearish (hist={hist_val:.6f})"
 
-        logger.warning(f"[{self.name}] ❌ HOLD for {symbol}: no clear signal")
-        return "hold", 0.0, "No clear signal"
+        logger.warning(
+            f"[{self.name}] ❌ HOLD for {symbol}: no confirmed momentum signal "
+            f"(ema20={ema20_val:.4f}, ema50={ema50_val:.4f}, rsi={rsi_val:.2f}, "
+            f"macd_hist={hist_val:.6f}, vol={vol_confirmed}, regime={symbol_regime})"
+        )
+        return "hold", 0.0, "No confirmed momentum signal"
 
     async def _retrain_async_single(self, symbol: str):
         """
