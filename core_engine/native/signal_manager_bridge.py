@@ -32,6 +32,7 @@ class SignalManagerBridge:
         ml_forecaster: Any | None = None,
         symbol_screener: Any | None = None,
         timeout_sec: float = 10.0,
+        native_signal_engine: Any | None = None,
     ):
         """
         Initialize the signal manager bridge.
@@ -48,6 +49,7 @@ class SignalManagerBridge:
         self.legacy_sm = legacy_signal_manager
         self.paper_gen = paper_generator
         self.shared_state = shared_state
+        self._native_engine = native_signal_engine  # gap2: NativeSignalEngine vote layer
         self._signal_count = 0
         self._sources_active: dict[str, bool] = {
             "legacy": bool(legacy_signal_manager),
@@ -129,6 +131,50 @@ class SignalManagerBridge:
                 logger.debug("[SignalManagerBridge] Error getting paper signals: %s", e)
 
         self._signal_count += len(signals)
+
+        # gap2: NativeSignalEngine vote — adjusts ML signal confidence by ±0.05
+        # Uses RSI/MACD/MA/Momentum strategies as a cross-check on ML BUY signals.
+        # Agreement → +0.05 confidence; disagreement → −0.05 confidence.
+        # Never blocks a signal — only nudges the score so gate_2 decides.
+        if self._native_engine and self.shared_state:
+            md = getattr(self.shared_state, "market_data", {}) or {}
+            for sig in signals:
+                if str(sig.get("direction", "")).upper() != "BUY":
+                    continue
+                symbol = str(sig.get("symbol", ""))
+                if not symbol:
+                    continue
+                try:
+                    raw_bars = (
+                        md.get((symbol, "5m"))
+                        or md.get((symbol, "1m"))
+                        or []
+                    )
+                    if len(raw_bars) < 20:
+                        continue
+                    # Convert dict bars → Binance kline list (index 4 = close)
+                    klines = [
+                        [0, 0, 0, 0, float(b.get("close", 0) if isinstance(b, dict) else (b[4] if len(b) > 4 else 0)), 0]
+                        for b in raw_bars
+                    ]
+                    native_agg = self._native_engine.evaluate(symbol, klines)
+                    if native_agg is not None:
+                        prev_conf = float(sig.get("confidence", sig.get("score", 0.5)) or 0.5)
+                        if native_agg.direction == "BUY":
+                            sig["confidence"] = min(1.0, prev_conf + 0.05)
+                            sig["native_vote"] = f"agree:{native_agg.score:.2f}"
+                        elif native_agg.direction == "SELL":
+                            sig["confidence"] = max(0.0, prev_conf - 0.05)
+                            sig["native_vote"] = f"disagree:{native_agg.score:.2f}"
+                        else:
+                            sig["native_vote"] = f"neutral:{native_agg.score:.2f}"
+                        logger.debug(
+                            "[SignalManagerBridge] native_vote %s %s conf %.2f→%.2f",
+                            symbol, sig["native_vote"], prev_conf, sig.get("confidence", prev_conf),
+                        )
+                except Exception as _e:
+                    logger.debug("[SignalManagerBridge] native vote failed for %s: %s", symbol, _e)
+
         return signals
 
     async def get_signals_for_symbol(self, symbol: str) -> list[dict[str, Any]]:

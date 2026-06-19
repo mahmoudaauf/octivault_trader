@@ -242,6 +242,8 @@ class MLForecaster:
 
         # Caching / performance
         self.model_cache: dict[str, Any] = {}
+        # gap8: per-symbol closed-trade PnL history for drift-triggered retraining
+        self._symbol_trade_results: dict[str, list[float]] = {}
         self._model_mtime: dict[str, float] = {}
         self._predict_fns: dict[
             tuple[str, int, int], Any
@@ -648,6 +650,84 @@ class MLForecaster:
         signals = self._collected_signals
         self._collected_signals = []
         return signals
+
+    def notify_trade_result(self, symbol: str, pnl: float) -> None:
+        """gap8: Called after every closed trade. Triggers model retraining when
+        per-symbol win rate drops below 35% over the last 10 trades (model drift).
+
+        Safe to call from any thread — only schedules a background task,
+        never touches the model directly.
+        """
+        results = self._symbol_trade_results.setdefault(symbol, [])
+        results.append(float(pnl))
+        # Keep rolling window of last 30 trades per symbol
+        if len(results) > 30:
+            self._symbol_trade_results[symbol] = results[-30:]
+            results = self._symbol_trade_results[symbol]
+
+        if len(results) < 10:
+            return  # not enough data yet
+
+        wins = sum(1 for p in results if p > 0)
+        win_rate = wins / len(results)
+        _DRIFT_WIN_RATE_THRESHOLD = 0.35
+
+        if win_rate < _DRIFT_WIN_RATE_THRESHOLD:
+            self.logger.warning(
+                "[%s] 📉 drift detected for %s: win_rate=%.0f%% over last %d trades "
+                "— scheduling retrain",
+                self.name, symbol, win_rate * 100, len(results),
+            )
+            # Clear results so retrain fires once, not every trade until model improves
+            self._symbol_trade_results[symbol] = []
+            # Schedule background retrain if model_manager and trainer are available
+            if self.model_manager is not None:
+                try:
+                    import asyncio as _asyncio
+                    tf = getattr(self, "timeframe", "5m") or "5m"
+                    model_path = self.model_manager.build_model_path(
+                        agent_name=self.name, symbol=symbol, version=tf
+                    )
+                    # Use an asyncio-safe fire-and-forget to get OHLCV then retrain
+                    loop = None
+                    try:
+                        loop = _asyncio.get_running_loop()
+                    except RuntimeError:
+                        pass
+                    if loop is not None:
+                        loop.create_task(self._retrain_on_drift(symbol, tf, model_path))
+                except Exception as _e:
+                    self.logger.debug("[%s] notify_trade_result retrain schedule failed: %s", self.name, _e)
+
+    async def _retrain_on_drift(self, symbol: str, tf: str, model_path: str) -> None:
+        """Fetch market data and schedule background retraining after drift detection."""
+        try:
+            ohlcv = await self._get_market_data_safe(symbol, tf)
+            if not isinstance(ohlcv, list) or len(ohlcv) < 100:
+                self.logger.debug(
+                    "[%s] _retrain_on_drift: insufficient data for %s (%d bars)",
+                    self.name, symbol, len(ohlcv) if isinstance(ohlcv, list) else 0,
+                )
+                return
+            import pandas as pd
+            feature_df = self._build_edge_feature_frame(ohlcv)
+            if feature_df is None or feature_df.empty:
+                return
+            lookback = int(getattr(self, "_retrain_max_rows", 500) // 2) or 60
+            ok, reason = self._schedule_background_training(
+                symbol=symbol,
+                timeframe=tf,
+                lookback=lookback,
+                train_df=feature_df,
+                model_path=model_path,
+                reason="drift",
+            )
+            self.logger.info(
+                "[%s] drift retrain scheduled for %s: ok=%s reason=%s",
+                self.name, symbol, ok, reason,
+            )
+        except Exception as _e:
+            self.logger.debug("[%s] _retrain_on_drift failed for %s: %s", self.name, symbol, _e)
 
     # ---------------- Core pass ----------------
 
@@ -3188,6 +3268,11 @@ class MLForecaster:
                     agent_name=self.name, symbol=sym, version=tf
                 )
                 if not self.model_manager.model_exists(model_path):
+                    logger.debug(  # gap3: model file missing — skip with diagnostic
+                        "[%s] no model for %s/%s at %s — skipping inference "
+                        "(will train on next backtest cycle)",
+                        self.name, sym, tf, model_path,
+                    )
                     continue
                 try:
                     mtime = os.path.getmtime(model_path)

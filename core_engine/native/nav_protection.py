@@ -200,7 +200,7 @@ class NAVProtectionEngine:
         profit_lock_trigger_pct: float = 0.03,
         floating_gain_trigger_pct: float = 0.02,
         drawdown_defensive_pct: float = 0.02,
-        drawdown_freeze_buy_pct: float = 0.05,
+        drawdown_freeze_buy_pct: float = 0.04,  # gap6: staggered — OFC kill-switch fires at 6%
         drawdown_recovery_pct: float = 0.08,
         profit_lock_ratio: float = 0.50,
         minimum_protection_floor_ratio: float = 0.95,

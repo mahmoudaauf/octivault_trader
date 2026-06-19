@@ -700,6 +700,7 @@ async def build_components(
         ml_forecaster=ml_forecaster,
         symbol_screener=symbol_screener,
         timeout_sec=cfg.signal_adapter_timeout_sec,
+        native_signal_engine=signal_engine,  # gap2: NativeSignalEngine vote layer
     )
 
     # L4
@@ -824,6 +825,7 @@ async def build_components(
         decision_engine=decision_engine,
         signal_fusion=signal_fusion,
         mode_manager=mode_manager,
+        ml_forecaster=ml_forecaster,  # gap8: drift-retrain callback
     )
     market_regime_detector = NativeMarketRegimeDetector(
         market_data=market_data,

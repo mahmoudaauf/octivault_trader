@@ -36,7 +36,7 @@ DEFAULTS = {
     # Set-points (derived from objective contract)
     "OBJ_DAILY_TARGET_PCT": 0.02,  # +2%/day
     "OBJ_HOURLY_TARGET_PCT": 0.02 / 24,  # ≈0.0833%/h
-    "OBJ_MAX_DRAWDOWN_PCT": 0.05,  # 5% kill-switch
+    "OBJ_MAX_DRAWDOWN_PCT": 0.06,  # 6% kill-switch — staggered above NAV FREEZE_BUY (4%)
     "OBJ_MIN_NET_EDGE_BPS": 5.0,  # avg net profit must beat 5 bps
     # Knob ranges  (clamped)
     # Floor minimum of 0.65 is the empirical breakeven threshold — signals below this

@@ -247,6 +247,17 @@ class FearGreedFetcher:
                 try:
                     open(_PAUSE_FLAG_PATH, "w").close()
                     logger.warning("🛑 AUTO-PAUSE: F&G=%d (Extreme Fear) — BUYs paused until recovery", curr)
+                    if self._shared_state is not None:
+                        try:
+                            self._shared_state.buy_paused_fear_greed = True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            elif self._shared_state is not None:
+                # Ensure flag matches state on every restart
+                try:
+                    self._shared_state.buy_paused_fear_greed = flag_exists
                 except Exception:
                     pass
             return
@@ -262,6 +273,11 @@ class FearGreedFetcher:
                             "✅ AUTO-RESUME: F&G rose %d→%d (+%d pts) + BTC confirmed 🟢🟢 — BUYs unpaused at HALF SIZE",
                             prev, curr, rise,
                         )
+                        if self._shared_state is not None:
+                            try:
+                                self._shared_state.buy_paused_fear_greed = False
+                            except Exception:
+                                pass
                         # Enter half-size mode for first 5 profitable trades
                         self._set_manual_override(size_multiplier=0.5)
                     except Exception:
@@ -285,5 +301,10 @@ class FearGreedFetcher:
                         "🛑 AUTO-PAUSE: F&G fell %d→%d (%d pts drop) — BUYs paused",
                         prev, curr, rise,
                     )
+                    if self._shared_state is not None:
+                        try:
+                            self._shared_state.buy_paused_fear_greed = True
+                        except Exception:
+                            pass
                 except Exception:
                     pass

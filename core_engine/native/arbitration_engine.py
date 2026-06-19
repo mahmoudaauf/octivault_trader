@@ -35,11 +35,13 @@ class NativeArbitrationEngine:
         decision_engine: Any,
         signal_fusion: Any | None = None,
         mode_manager: Any | None = None,
+        ml_forecaster: Any | None = None,  # gap8: drift-retrain callback
     ) -> None:
         self._shared_state = shared_state
         self._decision_engine = decision_engine
         self._signal_fusion = signal_fusion
         self._mode_manager = mode_manager
+        self._ml_forecaster = ml_forecaster  # gap8
         self._regime_gate = NativeRegimeGate(shared_state=shared_state)
         self._last_buy_ts: dict[str, float] = {}  # symbol → epoch of last BUY
         self._loss_streak: dict[str, int] = {}  # symbol → consecutive loss count
@@ -60,7 +62,7 @@ class NativeArbitrationEngine:
             os.getenv("SYMBOL_DOWNTREND_VETO_ENABLED", "true")
         ).lower() in ("1", "true", "yes", "on")
         self._downtrend_tf = os.getenv("SYMBOL_DOWNTREND_TF", "5m")
-        self._downtrend_ma_bars = max(2, int(os.getenv("DOWNTREND_MA_BARS", "20") or 20))
+        self._downtrend_ma_bars = max(2, int(os.getenv("DOWNTREND_MA_BARS", "50") or 50))
         self._downtrend_margin = float(os.getenv("DOWNTREND_MARGIN", "0.005") or 0.005)
         self._downtrend_slope_lag = max(1, int(os.getenv("DOWNTREND_SLOPE_LAG", "5") or 5))
         self._load_streak_state()
@@ -72,6 +74,12 @@ class NativeArbitrationEngine:
             self.record_loss(symbol)
         else:
             self.record_win(symbol)
+        # gap8: notify MLForecaster for drift-triggered retraining
+        if self._ml_forecaster is not None:
+            try:
+                self._ml_forecaster.notify_trade_result(symbol, pnl)
+            except Exception:
+                pass
 
     def get_symbol_size_mult(self, symbol: str) -> float:
         """Returns gate_8 size multiplier for this symbol (0.0-1.25)."""
@@ -156,7 +164,8 @@ class NativeArbitrationEngine:
 
         # For SELL: skip exposure check in gate_6 — high exposure is exactly when we need to sell
         gates_status["gate_6_risk_manager"] = self.gate_6_risk_manager(
-            check_exposure=(signal_type != "SELL")
+            check_exposure=(signal_type != "SELL"),
+            edge_score=edge_score,
         )
         if not gates_status["gate_6_risk_manager"]:
             blocking_gates.append("gate_6_risk_manager")
@@ -317,10 +326,30 @@ class NativeArbitrationEngine:
         min_notional = float(getattr(self._decision_engine, "min_notional_usdt", 10.0) or 10.0)
         return spendable >= max(0.0, min_order, min_notional)
 
-    def gate_6_risk_manager(self, check_exposure: bool = True) -> bool:
+    def gate_6_risk_manager(self, check_exposure: bool = True, edge_score: float = 0.0) -> bool:
         # trading_halted blocks new BUYs only — SELL/exit signals must always pass
         if check_exposure and bool(getattr(self._shared_state, "trading_halted", False)):
             return False
+        # Fear & Greed pause — buy_paused_fear_greed is set by FearGreedFetcher.
+        # Buffett override: allow high-conviction entries in deep fear when BTC reversal is confirmed.
+        # Rationale: Extreme Fear is historically the best contrarian entry point;
+        # blocking ALL entries in F&G<20 leaves alpha on the table.
+        if check_exposure and bool(getattr(self._shared_state, "buy_paused_fear_greed", False)):
+            fg = int(getattr(self._shared_state, "fear_greed_score", 50) or 50)
+            btc_ok = bool(getattr(self._shared_state, "btc_reversal_confirmed", False))
+            # Override conditions: very deep fear + BTC confirmed 2-green-candle + high conviction
+            if fg < 20 and btc_ok and edge_score >= 0.75:
+                _log.info(
+                    "[gate_6] 🦁 Buffett override: F&G=%d BTC✅ edge=%.2f — buying the fear",
+                    fg, edge_score,
+                )
+            else:
+                _log.info(
+                    "[gate_6] F&G pause active: score=%d btc_reversal=%s edge=%.2f "
+                    "(need F&G<20 + BTC✅ + edge≥0.75 to override) — BUY blocked",
+                    fg, btc_ok, edge_score,
+                )
+                return False
         # NAV protection: FREEZE_BUY / RECOVERY mode blocks new BUYs
         if check_exposure:
             _nav_prot = getattr(self._shared_state, "nav_protection_state", {}) or {}
@@ -476,9 +505,9 @@ class NativeArbitrationEngine:
         # Falls back to blended rate when tpsl metric not yet populated.
         win_rate = float(metrics.get("win_rate_tpsl", metrics.get("win_rate_window", 0.5)) or 0.5)
 
-        # Circuit breaker: 2+ SLs in the last hour → block for 1h after the most recent SL
+        # Circuit breaker: 3+ SLs in the last hour → block for 1h after the most recent SL
         recent_sls_1h = [t for t in self._global_sl_history if now - t < 3600]
-        if len(recent_sls_1h) >= 2:
+        if len(recent_sls_1h) >= 3:
             most_recent_sl = max(recent_sls_1h)
             remaining = int(3600 - (now - most_recent_sl))
             if remaining > 0:
