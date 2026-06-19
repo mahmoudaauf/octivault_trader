@@ -610,6 +610,13 @@ class NativeTPSLEngine:
             if entry_price <= 0:
                 # Fall back to armed entry price (e.g. for externally detected positions)
                 entry_price = float(self._entry_prices.get(symbol, 0.0) or 0.0)
+            # Prefer the entry_price registered by arm_position() over the position object.
+            # The position's entry_price can be inflated by position-hydration re-reads from
+            # the Binance API after a session restart — arm_position always stores the actual
+            # fill price, so it is the authoritative source for break-even SL calculations.
+            armed_fill_price = float(self._entry_prices.get(symbol, 0.0) or 0.0)
+            if armed_fill_price > 0 and symbol in self._armed_symbols:
+                entry_price = armed_fill_price
             if entry_price <= 0:
                 continue
 
