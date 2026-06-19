@@ -141,3 +141,4 @@ models/_incompatible_quarantine/
 
 # Phantom core/ — was migrated to src/lN_*/ in Phase C, never recreate
 /core/
+dashboard/node_modules/
