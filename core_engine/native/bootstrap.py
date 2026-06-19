@@ -77,6 +77,7 @@ from .telemetry_export import NativeTelemetryExporter
 from .tp_sl_engine import NativeTPSLEngine
 from .trade_journal import NativeTradeJournal
 from .watchdog import NativeWatchdog
+from .fear_greed import FearGreedFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -538,6 +539,22 @@ async def build_components(
         logger.error("No symbols configured and discovery disabled; nothing to trade")
         symbols = []
 
+    # Symbol Rotator: scores all trained models by regime/momentum/win_rate every 2h
+    symbol_rotator = None
+    try:
+        from .symbol_rotator import SymbolRotator
+
+        symbol_rotator = SymbolRotator(
+            shared_state=shared_state,
+            regime_detector=None,  # wired below after market_regime_detector is built
+            market_data=None,  # wired below after market_data is built
+            perf_tracker=None,
+            fallback_symbols=symbols or [],
+        )
+        logger.info("✅ SymbolRotator instantiated (TOP_N=%d, interval=2h)", 8)
+    except Exception as _e:
+        logger.warning("SymbolRotator init failed (non-fatal): %r", _e)
+
     logger.info(
         "native bootstrap: testnet=%s symbols=%d (cycle-dynamic) polling=%s",
         cfg.testnet,
@@ -590,6 +607,12 @@ async def build_components(
                 timeframes=["1m"],
             )
             logger.info(f"✅ WebSocket market data initialized ({len(ws_symbols)} symbols)")
+            # Pre-fetch 3000 klines per symbol so ML models can train immediately on startup.
+            # MLForecaster trains on 5m candles (self.timeframe="5m"), so pre-fetch 5m.
+            try:
+                await market_data_ws.prefetch_klines_history(limit=3000, timeframe="5m")
+            except Exception as _pf_err:
+                logger.warning("Kline pre-fetch failed (non-fatal): %s", _pf_err)
         except Exception as e:
             logger.warning(f"⚠️ WebSocket initialization failed: {e} (will use REST fallback)")
             market_data_ws = None
@@ -635,25 +658,24 @@ async def build_components(
         # Initialize ModelManager for MLForecaster
         model_manager = ModelManager(config=cfg)
 
-        # Instantiate MLForecaster
-        if cfg.symbols:
-            try:
-                ml_forecaster = MLForecaster(
-                    shared_state=shared_state,
-                    execution_manager=None,  # Not used by forecaster
-                    config=cfg,
-                    symbols=cfg.symbols,
-                    timeframe="5m",
-                    market_data_feed=market_data,
-                    exchange_client=exchange_client,
-                    model_manager=model_manager,
-                )
-                logger.info(
-                    "✅ MLForecaster initialized (%d symbols, ModelManager enabled)",
-                    len(cfg.symbols),
-                )
-            except Exception as e:
-                logger.warning("Failed to initialize MLForecaster: %s", e)
+        # Instantiate MLForecaster — always initialize; symbols synced dynamically from SharedState
+        try:
+            ml_forecaster = MLForecaster(
+                shared_state=shared_state,
+                execution_manager=None,  # Not used by forecaster
+                config=cfg,
+                symbols=list(cfg.symbols) if cfg.symbols else [],
+                timeframe="5m",
+                market_data_feed=market_data,
+                exchange_client=exchange_client,
+                model_manager=model_manager,
+            )
+            logger.info(
+                "✅ MLForecaster initialized (%d symbols at boot, will sync dynamically)",
+                len(cfg.symbols),
+            )
+        except Exception as e:
+            logger.warning("Failed to initialize MLForecaster: %s", e)
 
         # Instantiate SymbolScreener
         try:
@@ -702,6 +724,9 @@ async def build_components(
         normal_trade_usdt=max(cfg.min_order_usdt, 150.0),
     )
 
+    # Trade journal — created early so executor can write fills immediately
+    trade_journal = NativeTradeJournal(log_dir=cfg.trade_journal_dir)
+
     # L5
     executor = NativeExecutor(
         order_execution,
@@ -709,7 +734,9 @@ async def build_components(
         exchange_client=exchange_client,
         shared_state=shared_state,
         balance_validator=NativeBalanceValidator(),
+        trade_journal=trade_journal,
     )
+    # tp_sl_engine injected below after it is created (line ~843)
 
     # L6
     telemetry = NativeTelemetry(capacity=cfg.telemetry_capacity)
@@ -804,6 +831,11 @@ async def build_components(
         signal_engine=signal_engine,
     )
 
+    # Wire regime_detector and market_data into SymbolRotator now that both are available
+    if symbol_rotator is not None:
+        symbol_rotator._regime_detector = market_regime_detector
+        symbol_rotator._market_data = market_data
+
     # L3 position manager: read-only per-symbol accessor over
     # shared_state. Replaces the compat null-stub for the
     # ``position_manager`` app_ctx key consumed by SituationEngine
@@ -820,9 +852,28 @@ async def build_components(
         config=cfg,
     )
 
-    # Wire TP/SL engine into fill tracker (late injection to avoid bootstrap ordering issue)
+    # Wire TP/SL engine into fill tracker and executor (late injection — created after executor)
     if fill_tracker is not None and hasattr(fill_tracker, "set_tp_sl_engine"):
         fill_tracker.set_tp_sl_engine(tp_sl_engine_native)
+    executor._tp_sl_engine = tp_sl_engine_native
+
+    # Fear & Greed fetcher — fetch once on boot then refresh every hour.
+    # Writes shared_state.fear_greed_score (int 0-100) and fear_greed_label (str).
+    # All downstream consumers (model trainer, inference filter) read from shared_state.
+    fear_greed_fetcher = FearGreedFetcher(
+        shared_state=shared_state, exchange_client=exchange_client
+    )
+    try:
+        await fear_greed_fetcher.start()
+        # Store ref on shared_state so inference filter can call _btc_confirmed_reversal()
+        shared_state._fear_greed_fetcher = fear_greed_fetcher
+        logger.info(
+            "✅ Fear & Greed Index: %d (%s) — refreshes every 1h",
+            fear_greed_fetcher.score or 0,
+            fear_greed_fetcher.classification or "unknown",
+        )
+    except Exception as _fg_err:
+        logger.warning("FearGreedFetcher failed to start (non-fatal): %s", _fg_err)
 
     # L4 safety order manager: per-symbol OCO intent store with
     # best-effort exchange placement. Replaces the compat null-stub
@@ -864,8 +915,7 @@ async def build_components(
     bounded_cache = NativeBoundedCache()
 
     # L0-L7 observability enhancements (legacy features ported)
-    # Trade journal: crash-safe, immutable JSONL audit trail
-    trade_journal = NativeTradeJournal(log_dir=cfg.trade_journal_dir)
+    # (trade_journal already created above, before executor)
 
     # Prometheus exporter: metrics export for Grafana
     prometheus_exporter: NativePrometheusExporter | None = None
@@ -931,6 +981,7 @@ async def build_components(
         signal_manager_bridge=signal_manager_bridge,
         ml_forecaster=ml_forecaster,
         symbol_screener=symbol_screener,
+        symbol_rotator=symbol_rotator,
     )
 
 

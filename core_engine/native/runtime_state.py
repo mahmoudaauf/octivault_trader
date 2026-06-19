@@ -98,14 +98,17 @@ class NativeRuntimeStateExporter:
 
     def _build_payload(self) -> dict[str, Any]:
         positions_raw = getattr(self._state, "positions", {}) or {}
-        positions = {
-            sym: {
-                "qty": float(getattr(pos, "qty", 0.0) or 0.0),
-                "entry_price": float(getattr(pos, "entry_price", 0.0) or 0.0),
-                "mark_price": float(getattr(pos, "mark_price", 0.0) or 0.0),
-            }
-            for sym, pos in positions_raw.items()
-        }
+        positions = {}
+        for sym, pos in positions_raw.items():
+            if isinstance(pos, dict):
+                qty = float(pos.get("qty", 0.0) or 0.0)
+                entry = float(pos.get("entry_price", 0.0) or pos.get("avg_entry_price", 0.0) or 0.0)
+                mark = float(pos.get("mark_price", 0.0) or pos.get("current_price", 0.0) or 0.0)
+            else:
+                qty = float(getattr(pos, "qty", 0.0) or 0.0)
+                entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+                mark = float(getattr(pos, "mark_price", 0.0) or 0.0)
+            positions[sym] = {"qty": qty, "entry_price": entry, "mark_price": mark}
         payload = {
             "ts": time.time(),
             "nav_usdt": float(getattr(self._state, "nav_usdt", 0.0) or 0.0),

@@ -41,6 +41,8 @@ class OrderResult:
     exchange_order_id: Optional[int] = None
     status: str = "PENDING"
     price: Optional[float] = None
+    avg_price: Optional[float] = None  # real volume-weighted fill price (market orders)
+    executed_qty: Optional[float] = None  # actual filled base qty (may be < requested on partial fill)
     error: Optional[str] = None
     raw: dict[str, Any] = field(default_factory=dict)
     ts: float = field(default_factory=time.time)
@@ -181,7 +183,46 @@ class NativeOrderExecution:
         result.raw = raw
         result.exchange_order_id = raw.get("orderId")
         result.status = str(raw.get("status", "PENDING"))
+        # Derive the real volume-weighted fill price from the exchange response.
+        # MARKET orders don't carry a meaningful `price`; the true average is
+        # cummulativeQuoteQty / executedQty (or the weighted `fills` array).
+        result.avg_price = self._extract_avg_fill_price(raw)
+        if result.avg_price and result.avg_price > 0:
+            result.price = result.avg_price
+        # Capture the ACTUAL filled quantity — a partial fill leaves us holding less
+        # than requested; registering the requested qty over-states the position and
+        # causes -2010 on the eventual sell. Fall back to requested only if absent.
+        try:
+            _eq = float(raw.get("executedQty", 0.0) or 0.0)
+            result.executed_qty = _eq if _eq > 0 else None
+        except (TypeError, ValueError):
+            result.executed_qty = None
         # Track only if not already terminal
         if result.status not in ("FILLED", "CANCELED", "EXPIRED", "REJECTED"):
             self._open[coid] = result
         return result
+
+    @staticmethod
+    def _extract_avg_fill_price(raw: dict[str, Any]) -> Optional[float]:
+        """Compute the volume-weighted average fill price from a Binance order response."""
+        try:
+            # Preferred: cummulativeQuoteQty / executedQty (exact, fee-inclusive notional)
+            executed_qty = float(raw.get("executedQty", 0.0) or 0.0)
+            cqq = float(raw.get("cummulativeQuoteQty", 0.0) or 0.0)
+            if executed_qty > 0 and cqq > 0:
+                return cqq / executed_qty
+            # Fallback: weight the individual fills
+            fills = raw.get("fills") or []
+            if fills:
+                tot_qty = 0.0
+                tot_quote = 0.0
+                for f in fills:
+                    fq = float(f.get("qty", 0.0) or 0.0)
+                    fp = float(f.get("price", 0.0) or 0.0)
+                    tot_qty += fq
+                    tot_quote += fq * fp
+                if tot_qty > 0 and tot_quote > 0:
+                    return tot_quote / tot_qty
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        return None

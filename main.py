@@ -160,6 +160,20 @@ async def trading_cycle(
             if symbol_discovery:
                 try:
                     symbols = await symbol_discovery.discover()
+                    # Also run SymbolRotator to expand universe beyond wallet holdings
+                    symbol_rotator = getattr(native_orch, "_symbol_rotator", None)
+                    if symbol_rotator is not None:
+                        try:
+                            symbol_rotator.maybe_rotate()
+                            ss_r = getattr(native_orch, "_shared_state", None)
+                            if ss_r is not None:
+                                rotator_syms = list(getattr(ss_r, "accepted_symbols", set()) or set())
+                                if rotator_syms:
+                                    # Merge: wallet holdings + rotator universe
+                                    merged = sorted(set(symbols) | set(rotator_syms))
+                                    symbols = merged
+                        except Exception as _re:
+                            log.debug(f"SymbolRotator.maybe_rotate failed: {_re}")
                     if symbols and hasattr(native_orch, "_market_data"):
                         md = native_orch._market_data
                         if md and hasattr(md, "_symbols"):
@@ -167,8 +181,37 @@ async def trading_cycle(
                             if sorted(symbols) != sorted(current):
                                 md._symbols = symbols
                                 log.info(f"📱 Symbols discovered: {current} → {symbols}")
+                    if symbols and hasattr(native_orch, "_shared_state"):
+                        ss = native_orch._shared_state
+                        if ss and hasattr(ss, "set_accepted_symbols"):
+                            ss.set_accepted_symbols(symbols)
+                    # Point the real-time WS feed at the actually-traded universe instead
+                    # of its hardcoded bootstrap seeds. Priority order: held positions
+                    # first (need real-time prices for fast SL/TP), then BTC/ETH (regime),
+                    # then the rotator/discovery universe — capped so the stream count stays
+                    # bounded (avoids the python-binance queue overflow).
+                    _ws = getattr(native_orch, "_market_data_ws", None)
+                    if _ws is not None and hasattr(_ws, "set_symbols"):
+                        try:
+                            _ss_ws = getattr(native_orch, "_shared_state", None)
+                            _held = list((getattr(_ss_ws, "positions", {}) or {}).keys()) if _ss_ws else []
+                            _ws_universe = _held + ["BTCUSDT", "ETHUSDT"] + list(symbols)
+                            await _ws.set_symbols(_ws_universe, max_symbols=12)
+                        except Exception as _ws_err:
+                            log.debug(f"WS set_symbols failed: {_ws_err}")
                 except Exception as e:
                     log.debug(f"Phase 0 discovery failed: {e}")
+
+    # Sync live market prices to shared_state.price_cache before portfolio snapshot
+    if app_ctx:
+        native_orch = app_ctx.get("_native_orchestrator")
+        if native_orch:
+            _md = getattr(native_orch, "_market_data", None)
+            _ss = getattr(native_orch, "_shared_state", None)
+            if _md and _ss and hasattr(_md, "get_prices") and hasattr(_ss, "price_cache"):
+                _live = _md.get_prices()
+                if _live:
+                    _ss.price_cache.update(_live)
 
     # ──────────────────────────────────────────────────────────────────
     # PHASE 1: READ
@@ -213,6 +256,11 @@ async def trading_cycle(
             app_ctx["_cached_portfolio_snapshot"] = portfolio_snapshot
             app_ctx["_cached_market_regime"] = market_regime
             app_ctx["_cached_situation_state"] = situation_state
+        # Write trend_regime to shared_state.metrics so arbitration gates can read it
+        _ss = app_ctx.get("shared_state") if app_ctx else None
+        if _ss is not None and hasattr(_ss, "metrics") and isinstance(market_regime, dict):
+            _ss.metrics["trend_regime"] = market_regime.get("trend_regime", "RANGING")
+            _ss.metrics["market_regime"] = str((situation_state or {}).get("market_regime", "UNKNOWN"))
         if cadence is not None:
             cadence.mark("scenario", now=now_ts)
     else:
@@ -228,6 +276,42 @@ async def trading_cycle(
             cadence.mark("decision", now=now_ts)
     else:
         all_signals = cached_signals
+
+    # TP/SL trigger injection — runs every cycle regardless of cadence gate
+    # The native orchestrator's _phase_understand is never called by this loop
+    # so we inject SELL signals here directly from the tp_sl_engine.
+    _native_orch = app_ctx.get("_native_orchestrator") if app_ctx else None
+    _tp_sl_engine = getattr(_native_orch, "_tp_sl_engine", None) if _native_orch else None
+    _ss = getattr(_native_orch, "_shared_state", None) if _native_orch else None
+    if _tp_sl_engine is not None and _ss is not None:
+        _positions = getattr(_ss, "positions", {}) or {}
+        _price_cache = getattr(_ss, "price_cache", {}) or {}
+        _prices_now = getattr(_ss, "prices", {}) or {}
+        _tpsl_signals = []
+        for _sym, _pos in _positions.items():
+            _cur = float(
+                _prices_now.get(_sym)
+                or _price_cache.get(str(_sym).upper())
+                or 0.0
+            )
+            if _cur <= 0:
+                continue
+            _trigger = _tp_sl_engine.check_triggers(_sym, _pos, _cur)
+            if _trigger is not None:
+                _tpsl_signals.append({
+                    "signal_type": "SELL",
+                    "action": "SELL",
+                    "symbol": _sym,
+                    "edge_score": 1.0,
+                    "edge": 1.0,
+                    "reason": _trigger,
+                    "tpsl_trigger": _trigger,
+                })
+                log.info("[main:TPSL] %s trigger=%s price=%.6f → injecting SELL", _sym, _trigger, _cur)
+        if _tpsl_signals:
+            # Prepend TP/SL exits so they take priority in decision phase
+            all_signals = list(_tpsl_signals) + list(all_signals)
+
     understand_complete = True
 
     # Helper: safely extract value from dict or object
@@ -240,42 +324,126 @@ async def trading_cycle(
     # PHASE 3: DECIDE
     # ──────────────────────────────────────────────────────────────────
     trading_decisions: list[Any] = []
-    if decision_due:
-        for sig in all_signals:
-            decision = None
-            sig_type = str(
-                get_value(sig, "signal_type", get_value(sig, "action", "")) or ""
-            ).upper()
-            symbol = get_value(sig, "symbol", "")
-            edge_score = float(get_value(sig, "edge_score", get_value(sig, "edge", 0.0)) or 0.0)
+    for sig in all_signals:
+        decision = None
+        sig_type = str(
+            get_value(sig, "signal_type", get_value(sig, "action", "")) or ""
+        ).upper()
+        symbol = get_value(sig, "symbol", "")
+        edge_score = float(get_value(sig, "edge_score", get_value(sig, "edge", get_value(sig, "confidence", 0.0))) or 0.0)
+        _is_tpsl = bool(get_value(sig, "tpsl_trigger", ""))
 
-            try:
-                if sig_type == "BUY":
-                    decision = await engines.decision.make_buy_decision(symbol, edge_score)
-                elif sig_type == "SELL":
-                    decision = await engines.decision.make_sell_decision(
-                        symbol, edge_score, "signal"
-                    )
-                if decision:
-                    trading_decisions.append(decision)
-            except Exception as e:
-                log.debug(f"Decision failed for {symbol}: {e}")
+        # TP/SL exits always processed; BUY and non-tpsl SELLs only when decision cadence is due
+        if not _is_tpsl and not decision_due:
+            continue
+
+        try:
+            if sig_type == "BUY":
+                decision = await engines.decision.make_buy_decision(symbol, edge_score)
+            elif sig_type == "SELL":
+                _sell_source = str(get_value(sig, "tpsl_trigger", "") or get_value(sig, "reason", "") or "signal")
+                decision = await engines.decision.make_sell_decision(
+                    symbol, edge_score, _sell_source
+                )
+            if decision:
+                trading_decisions.append(decision)
+        except Exception as e:
+            log.debug(f"Decision failed for {symbol}: {e}")
     decide_complete = True
 
     # ──────────────────────────────────────────────────────────────────
     # PHASE 4: EXECUTE (only in non-dry-run modes)
     # ──────────────────────────────────────────────────────────────────
     executed_orders: list[Any] = []
+    _arb_engine = app_ctx.get("arbitration_engine") if app_ctx else None
     if mode != "dry-run":
         for decision in trading_decisions:
             order_result = await engines.execution.execute_decision(decision)
             if _is_real_execution_result(order_result):
                 executed_orders.append(order_result)
+
+            # Feed arbitration gate_7 so re-entry cooldowns and loss streaks work
+            if _arb_engine is None:
+                continue
+            _dec_action = str(getattr(decision, "action", decision.get("action", "") if hasattr(decision, "get") else "")).upper()
+            _dec_symbol = str(getattr(decision, "symbol", decision.get("symbol", "") if hasattr(decision, "get") else ""))
+            _dec_allowed = getattr(decision, "allowed", decision.get("allowed", False) if hasattr(decision, "get") else False)
+            _exec_success = getattr(order_result, "success", order_result.get("success", False) if hasattr(order_result, "get") else False)
+
+            if not _dec_symbol or not _dec_allowed or not _exec_success:
+                continue
+
+            if _dec_action == "BUY":
+                _arb_engine.record_buy(_dec_symbol)
+
+            elif _dec_action == "SELL":
+                # Determine win/loss from decision telemetry
+                _telemetry = getattr(decision, "telemetry", decision.get("telemetry", {}) if hasattr(decision, "get") else {}) or {}
+                _pnl = float(_telemetry.get("pnl_after_fees_usdt", 0.0) or 0.0)
+                _src = str(getattr(decision, "reason", decision.get("reason", "") if hasattr(decision, "get") else "") or "").upper()
+                _is_sl = any(kw in _src for kw in ("SL_HIT", "SL_EXIT", "STOP_LOSS"))
+                _is_tp = any(kw in _src for kw in ("TP_HIT", "TAKE_PROFIT"))
+                if _is_sl:
+                    _arb_engine.record_sl_exit(_dec_symbol)
+                    _arb_engine.record_loss(_dec_symbol)
+                    _arb_engine.record_trade_outcome(_dec_symbol, _pnl if _pnl != 0.0 else -0.01)
+                elif _pnl < 0:
+                    _arb_engine.record_loss(_dec_symbol)
+                    _arb_engine.record_trade_outcome(_dec_symbol, _pnl)
+                else:
+                    _arb_engine.record_win(_dec_symbol)
+                    _arb_engine.record_trade_outcome(_dec_symbol, _pnl if _pnl > 0.0 else 0.01)
+
     execute_complete = True
 
     # ──────────────────────────────────────────────────────────────────
     # PHASE 5: RECOVER / OBSERVE
     # ──────────────────────────────────────────────────────────────────
+    # NAV protection evaluation — every 60s
+    # Computes peak_nav, drawdown tier, protection mode and writes to shared_state.nav_protection_state
+    _nav_prot_due = (
+        app_ctx is not None
+        and (now_ts - app_ctx.get("_last_nav_prot_ts", 0.0)) >= 60.0
+        and _ss is not None
+    )
+    if _nav_prot_due:
+        try:
+            from core_engine.native.nav_protection import evaluate_nav_protection
+            _ss.previous_nav_usdt = float(getattr(_ss, "nav_usdt", 0.0) or 0.0)
+            _, _prot = evaluate_nav_protection(_ss)
+            _mode = _prot.protection_mode
+            _dd = _prot.drawdown_from_peak_pct
+            if _mode != "NORMAL":
+                log.info(
+                    "[main:NAV-PROTECT] mode=%s drawdown=%.2f%% peak=%.2f allow_buy=%s actions=%s",
+                    _mode, _dd, _prot.peak_nav_usdt, _prot.allow_buy, _prot.suggested_actions,
+                )
+            # Persist peak_nav update to metrics
+            _cur_peak = float((_ss.metrics or {}).get("peak_nav", 0.0) or 0.0)
+            if _prot.peak_nav_usdt > _cur_peak:
+                _ss.metrics["peak_nav"] = _prot.peak_nav_usdt
+                _ss.metrics["peak_nav_ts"] = now_ts
+                log.info("[main:NAV-PROTECT] New peak NAV: %.4f USDT", _prot.peak_nav_usdt)
+        except Exception as _e:
+            log.debug("[main:NAV-PROTECT] evaluation failed: %s", _e)
+        if app_ctx is not None:
+            app_ctx["_last_nav_prot_ts"] = now_ts
+
+    # TP/SL time-tightening + dynamic TP widening — every 5 minutes
+    _tpsl_recalc_due = (
+        app_ctx is not None
+        and (now_ts - app_ctx.get("_last_tpsl_recalc_ts", 0.0)) >= 300.0
+    )
+    if _tpsl_recalc_due and _tp_sl_engine is not None:
+        try:
+            _updates = _tp_sl_engine.recalculate_aged_positions()
+            if _updates:
+                log.info("[main:TPSL-RECALC] time-tightening updated %d positions: %s", len(_updates), list(_updates.keys()))
+        except Exception as _e:
+            log.warning("[main:TPSL-RECALC] recalculate_aged_positions failed: %s", _e)
+        if app_ctx is not None:
+            app_ctx["_last_tpsl_recalc_ts"] = now_ts
+
     cached_health = (app_ctx.get("_cached_health_report") if app_ctx is not None else None) or {}
     if cadence is None or cadence.is_due("health", now=now_ts):
         health_report = await engines.operations.get_health_report()
@@ -285,14 +453,24 @@ async def trading_cycle(
             cadence.mark("health", now=now_ts)
     else:
         health_report = cached_health
-    nav_val = get_value(portfolio_snapshot, "nav_usdt", 0.0)
+    # Always read NAV fresh from native shared_state — cached portfolio_snapshot can be stale
+    _native_orch_for_nav = app_ctx.get("_native_orchestrator") if app_ctx else None
+    _ss_for_nav = getattr(_native_orch_for_nav, "_shared_state", None) if _native_orch_for_nav else None
+    if _ss_for_nav is None:
+        _ss_for_nav = app_ctx.get("shared_state") if app_ctx else None
+    if _ss_for_nav is not None and hasattr(_ss_for_nav, "free_balance_usdt"):
+        _free = float(getattr(_ss_for_nav, "free_balance_usdt", 0.0) or 0.0)
+        _pos_val = _ss_for_nav.get_portfolio_value() if hasattr(_ss_for_nav, "get_portfolio_value") else 0.0
+        nav_val = _free + _pos_val if (_free + _pos_val) > 0 else get_value(portfolio_snapshot, "nav_usdt", 0.0)
+    else:
+        nav_val = get_value(portfolio_snapshot, "nav_usdt", 0.0)
     regime_val = get_value(market_regime, "overall_health", "unknown")
     primary_decision = trading_decisions[0] if trading_decisions else None
     primary_execution = executed_orders[0] if executed_orders else None
     situation_metrics = get_value(situation_state, "metrics", {}) or {}
     quant_summary = {
         "timestamp": time.time(),
-        "nav_usdt": float(situation_metrics.get("nav_usdt", nav_val) or 0.0),
+        "nav_usdt": nav_val if nav_val > 0 else float(situation_metrics.get("nav_usdt", 0.0) or 0.0),
         "free_usdt": float(situation_metrics.get("free_usdt", 0.0) or 0.0),
         "free_ratio": float(situation_metrics.get("free_ratio", 0.0) or 0.0),
         "exposure_ratio": float(situation_metrics.get("exposure_ratio", 0.0) or 0.0),
@@ -446,6 +624,32 @@ async def run(args: argparse.Namespace) -> int:
                     phases,
                     telem["health_status"],
                 )
+                # Phase-0 safety net: every 50 cycles, assert the system's core
+                # invariants (NAV identity, TP/SL coverage, no orphans/phantoms,
+                # priced positions). Logs only violations; can never break the loop.
+                if cycle_no % 50 == 0:
+                    try:
+                        from system_invariants import check_live as _check_inv
+
+                        _no = app_ctx.get("_native_orchestrator") if app_ctx else None
+                        _ss_inv = getattr(_no, "_shared_state", None) if _no else None
+                        _tpsl_inv = getattr(_no, "_tp_sl_engine", None) if _no else None
+                        if _ss_inv is not None:
+                            _violations = _check_inv(_ss_inv, _tpsl_inv)
+                            for _name, _status, _detail in _violations:
+                                log.warning("[INVARIANT] %s — %s: %s", _status, _name, _detail)
+                            # Auto-heal: an orphaned holding (held but untracked → no stop,
+                            # missing from NAV) is fixable by forcing a balance reconcile,
+                            # which re-adopts external positions. Cheap and idempotent.
+                            if any("orphan" in str(_n).lower() for _n, _, _ in _violations):
+                                try:
+                                    if hasattr(_ss_inv, "update_balance_map") and _ss_inv.balance:
+                                        _ss_inv.update_balance_map(dict(_ss_inv.balance))
+                                        log.warning("[INVARIANT] auto-heal: forced balance reconcile to re-adopt orphan(s)")
+                                except Exception as _heal_err:
+                                    log.debug("invariant auto-heal failed: %s", _heal_err)
+                    except Exception as _inv_err:
+                        log.debug("invariant check skipped: %s", _inv_err)
             except Exception as e:
                 log.exception("cycle %d failed: %s", cycle_no, e)
                 # Let OperationsEngine decide whether we recover
@@ -520,8 +724,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--interval",
         type=float,
-        default=1.0,
-        help="Seconds between cycles (default: 1.0).",
+        default=5.0,
+        help="Seconds between cycles (default: 5.0).",
     )
     p.add_argument(
         "--capital",
@@ -544,12 +748,75 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+_PID_FILE = "/tmp/octivault_trader.pid"
+
+
+def _acquire_pid_lock() -> bool:
+    """Return True if this process is the sole running instance.
+
+    If a previous instance is still alive, send it SIGTERM so it can shut
+    down gracefully, then wait up to 10 s before forcefully replacing it.
+    """
+    import os
+    import signal
+    import time as _time
+
+    if os.path.exists(_PID_FILE):
+        try:
+            with open(_PID_FILE) as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 0)  # raises ProcessLookupError if dead
+            log.warning(
+                "⚠️  Previous instance found (PID %d) — sending SIGTERM for graceful shutdown.",
+                old_pid,
+            )
+            try:
+                os.kill(old_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            # Wait up to 10 s for it to exit, then SIGKILL
+            for _ in range(20):
+                _time.sleep(0.5)
+                try:
+                    os.kill(old_pid, 0)
+                except ProcessLookupError:
+                    break
+            else:
+                log.warning("⚠️  Forcefully killing stale instance (PID %d).", old_pid)
+                try:
+                    os.kill(old_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _time.sleep(0.5)
+        except (ProcessLookupError, ValueError):
+            pass  # Stale PID file — safe to overwrite
+    with open(_PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def _release_pid_lock() -> None:
+    import os
+    try:
+        if os.path.exists(_PID_FILE):
+            with open(_PID_FILE) as f:
+                if int(f.read().strip()) == os.getpid():
+                    os.remove(_PID_FILE)
+    except Exception:
+        pass
+
+
 def main() -> None:
+    import os
     args = parse_args()
+    if not _acquire_pid_lock():
+        sys.exit(1)
     try:
         rc = asyncio.run(run(args))
     except KeyboardInterrupt:
         rc = 130
+    finally:
+        _release_pid_lock()
     sys.exit(rc)
 
 

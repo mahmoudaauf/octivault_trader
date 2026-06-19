@@ -1,25 +1,25 @@
 {
-  "last_action_ts": 1780741355.868457,
-  "integral_pace": -1.3553537353335738,
+  "last_action_ts": 1781883462.014677,
+  "integral_pace": 0.0,
   "consecutive_dd_breaches": 0,
   "last_knobs": {
-    "confidence_floor": 0.5,
-    "size_multiplier": 1.5,
+    "confidence_floor": 0.5194984638632355,
+    "size_multiplier": 0.5,
     "target_throughput_per_hour": 2.0
   },
   "history_tail": [
     {
-      "ts": 1780741355.868457,
+      "ts": 1781883462.014677,
       "telemetry": {
         "ok": true,
-        "age_s": 0.8720650672912598,
-        "nav": 69.0614833653112,
-        "nav_anchor": 69.0730742290035,
+        "age_s": 14.395578861236572,
+        "nav": 57.869620564824004,
+        "nav_anchor": 57.7982845586146,
         "realized_pnl": 0.0,
         "unrealized_pnl": 0.0,
-        "drawdown_pct": 0.016780581755870442,
-        "elapsed_h": 0.013192069662941827,
-        "trades_in_window": 1,
+        "drawdown_pct": 0.0,
+        "elapsed_h": 0.5176207316584057,
+        "trades_in_window": 0,
         "win_rate": 0.5,
         "avg_fee_bps": 0.0,
         "avg_slippage_bps": 0.0,
@@ -27,22 +27,22 @@
         "missing": []
       },
       "errors": {
-        "pace_pct_per_h": -1.3553537353335738,
+        "pace_pct_per_h": 0.15510835062028616,
         "drawdown_pct_over_limit": 0.0,
         "net_edge_shortfall_bps": 0.0
       },
       "knobs_before": {
-        "confidence_floor": 0.581,
-        "size_multiplier": 1.5,
+        "confidence_floor": 0.5216649598480394,
+        "size_multiplier": 0.5,
         "target_throughput_per_hour": 2.0
       },
       "knobs_after": {
-        "confidence_floor": 0.5,
-        "size_multiplier": 1.5,
+        "confidence_floor": 0.5194984638632355,
+        "size_multiplier": 0.5,
         "target_throughput_per_hour": 2.0
       },
       "halted": false,
-      "integral_pace": -1.3553537353335738
+      "integral_pace": 0.0
     }
   ],
   "set_points": {

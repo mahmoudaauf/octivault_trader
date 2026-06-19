@@ -82,8 +82,10 @@ class TestNativeDecisionEngine:
         portfolio = _portfolio(nav=80.0, nav_peak=80.0, balance={"USDT": 80.0})
         decisions = eng.decide(signals, portfolio, balance_usdt=80.0)
         opens = [d for d in decisions if d.action == Action.OPEN]
-        assert len(opens) == 1
-        assert opens[0].symbol == "ETHUSDT"
+        # BOOTSTRAP now allows up to 3 concurrent positions (raised from 1 for capital efficiency)
+        assert len(opens) == 2
+        symbols = {d.symbol for d in opens}
+        assert "ETHUSDT" in symbols
 
     def test_paused_mode_blocks_open_decisions(self) -> None:
         eng = NativeDecisionEngine()

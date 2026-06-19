@@ -107,7 +107,9 @@ class NativeMarketDataWebSocket:
                 pass
 
     async def subscribe(self, symbols: list[str]) -> None:
-        """Add symbols to subscription."""
+        """Add symbols to subscription (additive). Prefer set_symbols() for the trading
+        universe — additive growth raises the stream/message count unbounded and risks
+        the python-binance queue overflow."""
         new_symbols = {s.upper() for s in symbols} - set(self._symbols)
         if new_symbols:
             self._symbols.extend(new_symbols)
@@ -115,6 +117,44 @@ class NativeMarketDataWebSocket:
             # Force reconnect to pick up new symbols
             if self._ws_task:
                 self._ws_task.cancel()
+
+    async def set_symbols(self, symbols: list[str], *, max_symbols: int = 12) -> None:
+        """REPLACE the subscription set (order-preserving, capped) and reconnect if changed.
+
+        Unlike subscribe() this replaces rather than appends, so the stream count stays
+        bounded (each symbol = 2 streams: @ticker + @kline) and the message queue can't
+        overflow from unbounded growth. Caller passes symbols in priority order — held
+        positions first (real-time prices for fast SL/TP), then regime anchors (BTC/ETH),
+        then the rotator's trading universe.
+        """
+        seen: list[str] = []
+        for s in symbols:
+            su = str(s or "").upper()
+            if su and su.endswith("USDT") and su not in seen:
+                seen.append(su)
+            if len(seen) >= max(1, int(max_symbols)):
+                break
+        if not seen or sorted(seen) == sorted(self._symbols):
+            return  # no change → don't churn the connection
+        self._symbols = seen
+        logger.info("📡 WS universe updated (%d): %s", len(seen), seen)
+        # Cleanly RESTART the feed task with the new symbol set. Cancelling alone just
+        # terminates _ws_loop — and on its way out the loop sets self._running=False — so
+        # we must cancel+await the old task, then re-enable _running before spawning a
+        # fresh task (which resets the reconnect counter and re-subscribes to _symbols).
+        # REST polling covers the brief gap.
+        old = self._ws_task
+        if old is not None and not old.done():
+            self._stopped.set()  # so the old loop logs a clean "stopped", not an ERROR
+            old.cancel()
+            try:
+                await old
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._running = True
+        self._stopped.clear()
+        self._current_backoff = self._initial_backoff_sec
+        self._ws_task = asyncio.create_task(self._ws_loop())
 
     async def _ws_loop(self) -> None:
         """Main WebSocket connection loop with reconnection."""
@@ -221,12 +261,27 @@ class NativeMarketDataWebSocket:
         self._running = False
 
     def _build_streams(self) -> list[str]:
-        """Build Binance stream names."""
+        """Build Binance stream names.
+
+        @bookTicker is the highest-frequency stream (fires on every best bid/ask
+        change). With many symbols it overruns python-binance's internal 100-message
+        queue (BinanceWebsocketQueueOverflow), which storms reconnects and can wedge
+        the trading loop. It only feeds an OBSERVE-ONLY orderbook-imbalance check in
+        regime_gate, so it's off by default to keep the message queue bounded
+        (~2 streams/symbol). Re-enable with WS_ENABLE_BOOKTICKER=true if needed.
+        """
+        import os
+        enable_bookticker = str(
+            os.getenv("WS_ENABLE_BOOKTICKER", "false")
+        ).lower() in ("1", "true", "yes", "on")
         streams = []
         for symbol in self._symbols:
             symbol_lower = symbol.lower()
             # Price stream
             streams.append(f"{symbol_lower}@ticker")
+            # Top-of-book stream — high-frequency firehose; opt-in only.
+            if enable_bookticker:
+                streams.append(f"{symbol_lower}@bookTicker")
             # Kline streams
             for tf in self._timeframes:
                 streams.append(f"{symbol_lower}@kline_{tf}")
@@ -237,6 +292,20 @@ class NativeMarketDataWebSocket:
         try:
             payload = msg.get("data") if isinstance(msg.get("data"), dict) else msg
             event_type = payload.get("e")
+
+            # @bookTicker carries no "e" field — detect by best bid/ask keys.
+            if event_type is None and "b" in payload and "a" in payload:
+                symbol = payload.get("s", "").upper()
+                try:
+                    bid = float(payload.get("b", 0) or 0)
+                    bid_qty = float(payload.get("B", 0) or 0)
+                    ask = float(payload.get("a", 0) or 0)
+                    ask_qty = float(payload.get("A", 0) or 0)
+                except (TypeError, ValueError):
+                    return
+                if symbol and bid > 0 and ask > 0:
+                    self._shared_state.update_book(symbol, bid, bid_qty, ask, ask_qty)
+                return
 
             if event_type == "24hrTicker":
                 # Price update
@@ -273,11 +342,73 @@ class NativeMarketDataWebSocket:
                     _buf = self._shared_state.market_data.get(_key) or []
                     _buf = list(_buf)
                     _buf.append(ohlcv)
-                    if len(_buf) > 100:
-                        _buf = _buf[-100:]
+                    if len(_buf) > 3500:
+                        _buf = _buf[-3500:]
                     self._shared_state.market_data[_key] = _buf
                     if hasattr(self._shared_state, "market_data_ready"):
                         self._shared_state.market_data_ready = True
 
         except Exception as e:
             logger.debug(f"Error handling message: {e}")
+
+    async def prefetch_klines_history(self, limit: int = 3000, timeframe: str = "1m") -> None:
+        """Pre-populate kline buffers via REST on startup so ML models can train immediately.
+        Without this, WS-only accumulation takes ~50 minutes to reach 3,000 rows."""
+        import asyncio as _asyncio
+        symbols = list(self._symbols)
+        logger.info("📥 Pre-fetching %d klines for %d symbols via REST...", limit, len(symbols))
+        fetched, failed = 0, 0
+
+        def _parse_row(row):
+            if isinstance(row, (list, tuple)) and len(row) >= 6:
+                return {
+                    "time": float(row[0]) / 1000,
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                    "taker_buy_volume": float(row[9]) if len(row) > 9 else 0.0,
+                    "num_trades": float(row[8]) if len(row) > 8 else 0.0,
+                }
+            return row if isinstance(row, dict) else None
+
+        async def _fetch_one(sym: str) -> None:
+            nonlocal fetched, failed
+            try:
+                ec = self._exchange_client
+                all_rows = []
+                end_time = None
+                per_call = 1000  # Binance hard limit per request
+                calls_needed = (limit + per_call - 1) // per_call
+
+                for _ in range(calls_needed):
+                    params = {"symbol": sym, "interval": timeframe, "limit": per_call}
+                    if end_time is not None:
+                        params["endTime"] = end_time
+                    raw = await ec._request("GET", ec.EP_KLINES, params=params)
+                    if not raw:
+                        break
+                    parsed = [r for row in raw if (r := _parse_row(row)) is not None]
+                    all_rows = parsed + all_rows  # prepend older pages
+                    if len(raw) < per_call:
+                        break
+                    end_time = int(raw[0][0]) - 1  # step back before earliest row
+                    await _asyncio.sleep(0.1)
+
+                if all_rows:
+                    self._shared_state.market_data[(sym, timeframe)] = all_rows[-limit:]
+                    fetched += 1
+            except Exception as _e:
+                failed += 1
+                logger.debug("prefetch_klines failed for %s: %s", sym, _e)
+
+        # Fetch in small batches to stay within rate limits
+        for i in range(0, len(symbols), 3):
+            batch = symbols[i:i + 3]
+            await _asyncio.gather(*[_fetch_one(s) for s in batch])
+            await _asyncio.sleep(0.3)
+
+        if hasattr(self._shared_state, "market_data_ready"):
+            self._shared_state.market_data_ready = True
+        logger.info("✅ Kline pre-fetch complete: %d fetched, %d failed", fetched, failed)

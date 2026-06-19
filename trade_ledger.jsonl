@@ -1,0 +1,9 @@
+{"ts": "2026-06-12 22:37:20", "symbol": "HBARUSDT", "outcome": "WIN", "entry": 0.07815, "exit": 0.07839, "qty": 128.0, "gross_pnl": 0.0307, "pnl_pct": 0.307}
+{"ts": "2026-06-12 22:37:21", "symbol": "UNIUSDT", "outcome": "WIN", "entry": 2.528, "exit": 2.536, "qty": 2.37, "gross_pnl": 0.019, "pnl_pct": 0.316}
+{"ts": "2026-06-12 23:47:32", "symbol": "ADAUSDT", "outcome": "LOSS", "entry": 0.1715, "exit": 0.17, "qty": 58.1, "gross_pnl": -0.0872, "pnl_pct": -0.875}
+{"ts": "2026-06-12 23:54:19", "symbol": "APTUSDT", "outcome": "LOSS", "entry": 0.648, "exit": 0.642, "qty": 14.23, "gross_pnl": -0.0854, "pnl_pct": -0.926}
+{"ts": "2026-06-13 01:02:43", "symbol": "LUNCUSDT", "outcome": "LOSS", "entry": 7.525e-05, "exit": 7.445e-05, "qty": 79755.41, "gross_pnl": -0.0638, "pnl_pct": -1.063}
+{"ts": "2026-06-13 05:20:52", "symbol": "LUNCUSDT", "outcome": "LOSS", "entry": 7.53e-05, "exit": 7.454e-05, "qty": 79670.69, "gross_pnl": -0.0605, "pnl_pct": -1.009}
+{"ts": "2026-06-13 10:36:23", "symbol": "SEIUSDT", "outcome": "LOSS", "entry": 0.05533, "exit": 0.05485, "qty": 108.2, "gross_pnl": -0.0519, "pnl_pct": -0.868}
+{"ts": "2026-06-13 10:49:31", "symbol": "ARBUSDT", "outcome": "WIN", "entry": 0.0855, "exit": 0.086, "qty": 70.4, "gross_pnl": 0.0352, "pnl_pct": 0.585}
+{"ts": "2026-06-13 12:32:52", "symbol": "BCHUSDT", "outcome": "LOSS", "entry": 208.1, "exit": 207.7, "qty": 0.041, "gross_pnl": -0.0164, "pnl_pct": -0.192}

@@ -29,22 +29,26 @@ class NativeTPSLEngine:
     _MIN_NET_PROFIT_PCT = 0.005  # 0.5% net profit floor
 
     # Time-based tightening thresholds
-    _AGE_TIGHTEN_1_SEC = 2 * 3600  # 2 hours  → tp=+1.5%, sl=break-even
-    _AGE_TIGHTEN_2_SEC = 6 * 3600  # 6 hours  → tp=+0.8%
+    _AGE_TIGHTEN_1_SEC = 2 * 3600   # 2 hours  → tp=+1.5%, sl=break-even
+    _AGE_TIGHTEN_2_SEC = 4 * 3600   # 4 hours  → tp=+0.8%
     _AGE_FORCE_EXIT_SEC = int(
-        1.5 * 3600
-    )  # 1.5 hours → force exit before rotation immunity (2h) expires
+        os.getenv("TPSL_FORCE_EXIT_H", "3")
+    ) * 3600  # 3 hours default → force exit after rotator immunity (2h) expires
     _PROTECTIVE_TIGHTEN_SEC = 30 * 60  # 30 minutes for protection-driven tightening
 
     # Trailing stop — regime-aware profit capture.
     # Faster lock-in during chop (fee drag kills small winners); let trends run further.
     # Each tuple: (activation_pct, distance_pct).  Default row used for UNKNOWN/"".
+    # Trend regimes keep a high activation so real runners reach the +2% TP. Non-trend
+    # regimes (range/chop/down) activate EARLY (+0.5%) so a stalled winner that won't reach
+    # TP gets its modest profit locked instead of round-tripping to breakeven — the +2% TP
+    # rarely hits in chop, so capturing +0.3-0.5% net is the higher-expectancy play there.
     _REGIME_TRAIL_PARAMS: dict[str, tuple[float, float]] = {
         "UPTREND": (0.020, 0.010),  # ride the trend; exit ~+1.0% net
         "TRENDING": (0.015, 0.008),  # solid momentum; exit ~+0.7% net
-        "RANGING": (0.010, 0.005),  # range-bound; lock in at ~+0.5% net
-        "CHOPPY": (0.008, 0.004),  # high noise; exit fast at ~+0.4% net
-        "DOWNTREND": (0.006, 0.003),  # survival mode; any gain locked immediately
+        "RANGING": (0.005, 0.004),  # arm at +0.5%, trail 0.4% — capture stalled winners
+        "CHOPPY": (0.005, 0.003),  # arm at +0.5%, trail 0.3% — lock fast in noise
+        "DOWNTREND": (0.005, 0.003),  # survival mode; any real gain locked immediately
     }
     _REGIME_TRAIL_DEFAULT = (0.015, 0.008)  # fallback = TRENDING behaviour
 
@@ -108,6 +112,24 @@ class NativeTPSLEngine:
         self._tpsl_state_path = os.path.join("logs", "tpsl_state.json")
         self._load_tpsl_state()
 
+    @staticmethod
+    def _fp(price: float) -> str:
+        """Format a price with adaptive decimal places — prevents sub-cent tokens showing as 0."""
+        if price == 0:
+            return "0"
+        abs_p = abs(price)
+        if abs_p < 0.000001:
+            return f"{price:.10f}"
+        if abs_p < 0.0001:
+            return f"{price:.8f}"
+        if abs_p < 0.01:
+            return f"{price:.7f}"
+        if abs_p < 1.0:
+            return f"{price:.6f}"
+        if abs_p < 100.0:
+            return f"{price:.4f}"
+        return f"{price:.2f}"
+
     def _load_tpsl_state(self) -> None:
         try:
             if os.path.exists(self._tpsl_state_path):
@@ -150,17 +172,32 @@ class NativeTPSLEngine:
     def _save_tpsl_state(self) -> None:
         try:
             os.makedirs(os.path.dirname(self._tpsl_state_path) or "logs", exist_ok=True)
+            # P4: MIN_NOTIONAL guard — never persist entries whose notional is below
+            # Binance's minimum. Prevents dust positions from surviving restarts.
+            live_prices = getattr(self.shared_state, "prices", {}) if self.shared_state else {}
+            _min_notional = getattr(self, "_min_notional_safety", 10.0)
+            def _above_min(sym: str) -> bool:
+                ep = self._entry_prices.get(sym, 0.0)
+                if ep <= 0:
+                    return True  # unknown price — keep, don't silently drop
+                price = float((live_prices or {}).get(sym, ep) or ep)
+                # Use whichever is larger to be conservative
+                notional = price * 1.0  # qty unknown here; guard on entry_price alone
+                # Real guard: entry_price itself below minimum unit price is suspect
+                # Practical check: if entry_price is set, symbol was real — keep it
+                return sym in (getattr(self.shared_state, "positions", {}) or {})
+            valid_syms = {s for s in self._tp_levels if _above_min(s)}
             payload = {
-                "tp_levels": dict(self._tp_levels),
-                "sl_levels": dict(self._sl_levels),
-                "entry_timestamps": dict(self._entry_timestamps),
-                "peak_prices": dict(self._peak_prices),
-                "entry_prices": dict(self._entry_prices),
+                "tp_levels": {k: v for k, v in self._tp_levels.items() if k in valid_syms},
+                "sl_levels": {k: v for k, v in self._sl_levels.items() if k in valid_syms},
+                "entry_timestamps": {k: v for k, v in self._entry_timestamps.items() if k in valid_syms},
+                "peak_prices": {k: v for k, v in self._peak_prices.items() if k in valid_syms},
+                "entry_prices": {k: v for k, v in self._entry_prices.items() if k in valid_syms},
                 "saved_at": time.time(),
             }
             tmp = self._tpsl_state_path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(payload, f)
+                json.dump(payload, f, allow_nan=False)
             os.replace(tmp, self._tpsl_state_path)
         except Exception as exc:
             self.logger.debug("[TPSLEngine] _save_tpsl_state failed: %s", exc)
@@ -180,6 +217,25 @@ class NativeTPSLEngine:
         """Auto-arm TP/SL for all existing positions at startup."""
         try:
             positions = getattr(self.shared_state, "positions", {}) or {}
+
+            # Purge stale TP/SL entries for symbols no longer in live positions.
+            # _load_tpsl_state runs before hydration so positions was empty then —
+            # this is the correct place to do the cleanup.
+            stale = [s for s in list(self._tp_levels) if s not in positions]
+            for s in stale:
+                self._tp_levels.pop(s, None)
+                self._sl_levels.pop(s, None)
+                self._entry_timestamps.pop(s, None)
+                self._peak_prices.pop(s, None)
+                self._entry_prices.pop(s, None)
+                self._armed_symbols.discard(s)
+            if stale:
+                self.logger.info(
+                    "[TPSLEngine] Post-hydration purge: removed %d ghost entries: %s", len(stale), stale
+                )
+                # P2: Flush immediately so ghosts don't survive the next disk write
+                self._save_tpsl_state()
+
             if not positions:
                 self.logger.debug("[TPSLEngine] No existing positions to auto-arm")
                 return
@@ -231,8 +287,8 @@ class NativeTPSLEngine:
                     self._peak_prices[symbol] = max(entry_price, current)
 
                     self.logger.info(
-                        f"[TPSLEngine:AUTO-ARM] {symbol} entry={entry_price:.6f} "
-                        f"tp={tp:.6f} sl={sl:.6f}"
+                        f"[TPSLEngine:AUTO-ARM] {symbol} entry={self._fp(entry_price)} "
+                        f"tp={self._fp(tp)} sl={self._fp(sl)}"
                     )
                 except Exception as e:
                     self.logger.warning(f"[TPSLEngine] Failed to auto-arm {symbol}: {e}")
@@ -281,10 +337,19 @@ class NativeTPSLEngine:
             tp_pct = max(tp_pct, 0.015)
             tp_pct = min(tp_pct, 0.06)
             tp = entry_price * (1.0 + tp_pct)
+            sl = entry_price * (1.0 - sl_pct)
+
+            # Guard: for sub-cent tokens, float precision can collapse TP/SL to equal entry.
+            # If they round to the same value, widen by at least 0.5% of entry.
+            _min_sep = entry_price * 0.005
+            if abs(tp - entry_price) < _min_sep:
+                tp = entry_price * (1.0 + max(tp_pct, 0.005))
+            if abs(sl - entry_price) < _min_sep:
+                sl = entry_price * (1.0 - max(sl_pct, 0.005))
 
             self.logger.debug(
                 f"[TPSLEngine] {symbol} atr_pct={atr_pct*100:.2f}% "
-                f"sl={sl:.6f} (-{sl_pct*100:.1f}%) tp={tp:.6f} (+{tp_pct*100:.1f}%)"
+                f"sl={self._fp(sl)} (-{sl_pct*100:.1f}%) tp={self._fp(tp)} (+{tp_pct*100:.1f}%)"
             )
 
             return tp, sl
@@ -330,11 +395,24 @@ class NativeTPSLEngine:
         self._breakeven_activated.discard(symbol)
         self._save_tpsl_state()
 
-    def check_triggers(self, symbol: str, position: dict, current_price: float) -> Optional[str]:
+    @staticmethod
+    def _pos_field(position: object, *keys: str, default: float = 0.0) -> float:
+        """Extract a numeric field from either a dict or a Position-like object."""
+        for k in keys:
+            v = position.get(k, None) if isinstance(position, dict) else getattr(position, k, None)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        return default
+
+    def check_triggers(self, symbol: str, position: object, current_price: float) -> Optional[str]:
         """
         Check all TP/SL triggers for a position.
 
         Returns: "TP_HIT", "SL_HIT", "TRAILING_STOP", "TIME_FORCE_EXIT", or None.
+        Supports both dict-based and Position-object positions.
 
         Layers checked in order:
           3. Trailing TP (overrides static TP once activated)
@@ -349,13 +427,29 @@ class NativeTPSLEngine:
             if time.time() < self._startup_grace_until:
                 return None
 
-            entry_price = float(position.get("entry_price", 0) or position.get("avg_price", 0) or 0)
+            entry_price = self._pos_field(position, "entry_price", "avg_price")
             if entry_price <= 0:
                 return None
 
-            # Use engine's internal registry (authoritative) — fall back to position dict for legacy
-            tp = float(self._tp_levels.get(symbol, 0) or position.get("tp", 0) or 0)
-            sl = float(self._sl_levels.get(symbol, 0) or position.get("sl", 0) or 0)
+            # Use engine's internal registry (authoritative) — fall back to position for legacy
+            tp = float(self._tp_levels.get(symbol, 0) or self._pos_field(position, "tp"))
+            sl = float(self._sl_levels.get(symbol, 0) or self._pos_field(position, "sl"))
+
+            # Auto-arm any managed-but-unarmed position. Positions re-adopted from the
+            # exchange balance (update_balance_map's external-position detection) are
+            # added to the registry with a qty/entry but no TP/SL — leaving them with no
+            # stop-loss. Arm them on first sight so every held position is protected.
+            if tp <= 0 and sl <= 0 and entry_price > 0:
+                try:
+                    self.arm_position(symbol, entry_price)
+                    tp = float(self._tp_levels.get(symbol, 0) or 0.0)
+                    sl = float(self._sl_levels.get(symbol, 0) or 0.0)
+                    self.logger.info(
+                        "[TPSLEngine:AUTO-ARM] %s armed on first sight (entry=%s) → tp=%s sl=%s",
+                        symbol, self._fp(entry_price), self._fp(tp), self._fp(sl),
+                    )
+                except Exception as _arm_err:
+                    self.logger.debug("[TPSLEngine] auto-arm failed for %s: %s", symbol, _arm_err)
 
             now = time.time()
 
@@ -404,16 +498,22 @@ class NativeTPSLEngine:
                 if current_price <= trailing_stop:
                     self.logger.info(
                         f"[TPSLEngine:TRAILING] {symbol} regime={_market_regime} "
-                        f"peak={new_peak:.6f} trail={trailing_stop:.6f} "
-                        f"current={current_price:.6f} → TRAILING_STOP"
+                        f"peak={self._fp(new_peak)} trail={self._fp(trailing_stop)} "
+                        f"current={self._fp(current_price)} → TRAILING_STOP"
                     )
                     return "TRAILING_STOP"
 
                 self.logger.debug(
                     f"[TPSLEngine:TRAILING] {symbol} profit={profit_pct*100:.2f}% "
-                    f"peak={new_peak:.6f} trail={trailing_stop:.6f} (active)"
+                    f"peak={self._fp(new_peak)} trail={self._fp(trailing_stop)} (active)"
                 )
-                return None  # Trailing is active; don't check static TP while trailing
+                # Still fire static TP if price has reached it — don't let trailing block a win
+                if tp > 0 and current_price >= tp:
+                    self.logger.info(
+                        f"[TPSLEngine:TP] {symbol} current={self._fp(current_price)} >= tp={self._fp(tp)}"
+                    )
+                    return "TP_HIT"
+                return None  # Trailing is active; delegate exit to trailing stop
 
             # Breakeven SL: once price reaches 50% of TP distance, move SL to entry price.
             # Guarantees we never lose on a trade that got halfway to target.
@@ -432,23 +532,23 @@ class NativeTPSLEngine:
                         self._sl_levels[symbol] = entry_price
                         sl = entry_price
                         self.logger.info(
-                            "[TPSLEngine:BREAKEVEN] %s at %.0f%% TP → SL moved to entry %.6f",
+                            "[TPSLEngine:BREAKEVEN] %s at %.0f%% TP → SL moved to entry %s",
                             symbol,
                             progress * 100,
-                            entry_price,
+                            self._fp(entry_price),
                         )
                         self._save_tpsl_state()
 
             # Layer 1: Static TP/SL
             if tp > 0 and current_price >= tp:
                 self.logger.info(
-                    f"[TPSLEngine:TP] {symbol} current={current_price:.6f} >= tp={tp:.6f}"
+                    f"[TPSLEngine:TP] {symbol} current={self._fp(current_price)} >= tp={self._fp(tp)}"
                 )
                 return "TP_HIT"
 
             if sl > 0 and current_price <= sl:
                 self.logger.info(
-                    f"[TPSLEngine:SL] {symbol} current={current_price:.6f} <= sl={sl:.6f}"
+                    f"[TPSLEngine:SL] {symbol} current={self._fp(current_price)} <= sl={self._fp(sl)}"
                 )
                 return "SL_HIT"
 
@@ -458,6 +558,26 @@ class NativeTPSLEngine:
             self.logger.error(f"[TPSLEngine] check_triggers failed for {symbol}: {e}")
             return None
 
+    def reconcile_against_positions(self) -> list[str]:
+        """
+        P3: Periodic reconciliation — drop any TP/SL entry whose symbol is no longer
+        in shared_state.positions. Runs every 5 min via recalculate_aged_positions.
+        Returns list of purged symbols.
+        """
+        live = set(getattr(self.shared_state, "positions", {}) or {})
+        ghosts = [s for s in list(self._tp_levels) if s not in live]
+        for s in ghosts:
+            self._tp_levels.pop(s, None)
+            self._sl_levels.pop(s, None)
+            self._entry_timestamps.pop(s, None)
+            self._peak_prices.pop(s, None)
+            self._entry_prices.pop(s, None)
+            self._armed_symbols.discard(s)
+        if ghosts:
+            self.logger.info("[TPSLEngine] Reconciliation purged %d ghosts: %s", len(ghosts), ghosts)
+            self._save_tpsl_state()
+        return ghosts
+
     def recalculate_aged_positions(self) -> dict[str, dict]:
         """
         Layer 2: Time-based TP tightening. Call periodically (e.g., every 5 min).
@@ -465,6 +585,9 @@ class NativeTPSLEngine:
         Returns dict of {symbol: {"tp": new_tp, "sl": new_sl, "reason": str}}
         for positions whose TP/SL changed.
         """
+        # P3: Reconcile first — purge any ghost entries before recalculating
+        self.reconcile_against_positions()
+
         updates: dict[str, dict] = {}
         now = time.time()
         positions = getattr(self.shared_state, "positions", {}) or {}
@@ -478,23 +601,28 @@ class NativeTPSLEngine:
         prices = getattr(self.shared_state, "prices", {}) or {}
         setup_contexts = getattr(self.shared_state, "position_setup_context", {}) or {}
 
-        for symbol, position in positions.items():
-            if not isinstance(position, dict):
-                continue
+        _market_regime = str(
+            (getattr(self.shared_state, "metrics", {}) or {}).get("market_regime", "") or ""
+        ).upper()
 
-            entry_price = float(position.get("entry_price", 0) or position.get("avg_price", 0) or 0)
+        for symbol, position in positions.items():
+            entry_price = self._pos_field(position, "entry_price", "avg_price")
+            if entry_price <= 0:
+                # Fall back to armed entry price (e.g. for externally detected positions)
+                entry_price = float(self._entry_prices.get(symbol, 0.0) or 0.0)
             if entry_price <= 0:
                 continue
 
             entry_ts = self._entry_timestamps.get(symbol, 0)
             if entry_ts <= 0:
-                continue
+                entry_ts = float(self.shared_state.prices.get("_boot_ts", 0.0) or 0.0) or (time.time() - 3600)
+                self._entry_timestamps[symbol] = entry_ts
 
             age_sec = now - entry_ts
             current_price = float(
-                prices.get(
-                    symbol, position.get("current_price", 0) or position.get("mark_price", 0) or 0
-                )
+                prices.get(symbol)
+                or self._pos_field(position, "current_price", "mark_price")
+                or 0.0
             )
             profit_pct = (
                 ((current_price - entry_price) / entry_price)
@@ -502,8 +630,8 @@ class NativeTPSLEngine:
                 else 0.0
             )
 
-            current_tp = float(position.get("tp", 0) or 0)
-            current_sl = float(position.get("sl", 0) or 0)
+            current_tp = float(self._tp_levels.get(symbol) or self._pos_field(position, "tp"))
+            current_sl = float(self._sl_levels.get(symbol) or self._pos_field(position, "sl"))
             changed = False
             reason_parts: list[str] = []
 
@@ -524,66 +652,157 @@ class NativeTPSLEngine:
                 new_tp = float(protective_update["tp"])
                 new_sl = float(protective_update["sl"])
                 if current_tp > 0 and new_tp < current_tp:
-                    position["tp"] = new_tp
-                    self._tp_levels[symbol] = new_tp  # keep engine registry in sync
+                    self._set_pos_field(position, "tp", new_tp)
+                    self._tp_levels[symbol] = new_tp
                     current_tp = new_tp
                     changed = True
                 if current_sl > 0 and new_sl > current_sl:
-                    position["sl"] = new_sl
-                    self._sl_levels[symbol] = new_sl  # keep engine registry in sync
+                    self._set_pos_field(position, "sl", new_sl)
+                    self._sl_levels[symbol] = new_sl
                     current_sl = new_sl
                     changed = True
                 if changed:
                     reason_parts.append(str(protective_update["reason"]))
 
+            # Dynamic TP widening for TRENDING/UPTREND regime on young positions (<2h).
+            # Only widen when not yet profitable — gives more room to reach profit.
+            if age_sec < self._AGE_TIGHTEN_1_SEC and not changed:
+                widened = self._maybe_widen_tp(
+                    symbol, entry_price, current_price, current_tp, current_sl,
+                    age_sec, profit_pct, _market_regime
+                )
+                if widened:
+                    self._set_pos_field(position, "tp", widened["tp"])
+                    self._set_pos_field(position, "sl", widened["sl"])
+                    self._tp_levels[symbol] = widened["tp"]
+                    self._sl_levels[symbol] = widened["sl"]
+                    changed = True
+                    reason_parts.append(widened["reason"])
+
             if age_sec < self._AGE_TIGHTEN_1_SEC:
                 if changed:
                     updates[symbol] = {
-                        "tp": position.get("tp"),
-                        "sl": position.get("sl"),
+                        "tp": self._tp_levels.get(symbol, current_tp),
+                        "sl": self._sl_levels.get(symbol, current_sl),
                         "reason": "; ".join(reason_parts) or "protective_tightening",
                     }
                     self.logger.info(
-                        f"[TPSLEngine:PROTECT] {symbol} {updates[symbol]['reason']} "
-                        f"tp={position.get('tp'):.6f} sl={position.get('sl'):.6f}"
+                        f"[TPSLEngine:ADJUST] {symbol} {updates[symbol]['reason']} "
+                        f"tp={self._fp(updates[symbol]['tp'])} sl={self._fp(updates[symbol]['sl'])}"
                     )
                 continue
 
             if age_sec >= self._AGE_TIGHTEN_2_SEC:
                 # 6h threshold: tighten to +0.8%
                 new_tp = entry_price * 1.008
-                # Move SL to break-even (fee-covered)
                 new_sl = entry_price * (1.0 + self._ROUND_TRIP_FEE_PCT)
-                reason = f"age={age_sec/3600:.1f}h >= 6h → tp=+0.8%"
+                reason = f"age={age_sec/3600:.1f}h >= 4h → tp=+0.8%"
             else:
                 # 2h threshold: tighten to +1.5%, move SL to break-even
                 new_tp = entry_price * 1.015
                 new_sl = entry_price * (1.0 + self._ROUND_TRIP_FEE_PCT)
                 reason = f"age={age_sec/3600:.1f}h >= 2h → tp=+1.5%, sl=break-even"
 
-            # Only update if TP would tighten (never loosen via time logic)
+            # Only tighten TP (never loosen via time logic)
             if current_tp > 0 and new_tp < current_tp:
-                position["tp"] = new_tp
-                self._tp_levels[symbol] = new_tp  # keep engine registry in sync
+                self._set_pos_field(position, "tp", new_tp)
+                self._tp_levels[symbol] = new_tp
                 changed = True
             if current_sl > 0 and new_sl > current_sl:
-                position["sl"] = new_sl
-                self._sl_levels[symbol] = new_sl  # keep engine registry in sync
+                self._set_pos_field(position, "sl", new_sl)
+                self._sl_levels[symbol] = new_sl
                 changed = True
 
             if changed:
                 reason_parts.append(reason)
                 updates[symbol] = {
-                    "tp": position.get("tp"),
-                    "sl": position.get("sl"),
+                    "tp": self._tp_levels.get(symbol, current_tp),
+                    "sl": self._sl_levels.get(symbol, current_sl),
                     "reason": "; ".join(reason_parts),
                 }
                 self.logger.info(
                     f"[TPSLEngine:TIME-TIGHTEN] {symbol} {updates[symbol]['reason']} "
-                    f"tp={position.get('tp'):.6f} sl={position.get('sl'):.6f}"
+                    f"tp={self._fp(updates[symbol]['tp'])} sl={self._fp(updates[symbol]['sl'])}"
                 )
 
         return updates
+
+    @staticmethod
+    def _set_pos_field(position: object, key: str, value: float) -> None:
+        """Write a field to either a dict or a Position-like object."""
+        if isinstance(position, dict):
+            position[key] = value
+        else:
+            try:
+                setattr(position, key, value)
+            except (AttributeError, TypeError):
+                pass
+
+    # Regime → (max_tp_pct, sl_pct) for dynamic widening.
+    # Only applied when position is young (<2h) and not yet profitable.
+    _REGIME_WIDEN_PARAMS: dict[str, tuple[float, float]] = {
+        "UPTREND":  (0.10, 0.025),  # 10% TP, 2.5% SL — ride the trend
+        "TRENDING": (0.06, 0.020),  # 6% TP, 2.0% SL — solid momentum
+        "RANGING":  (0.03, 0.015),  # 3% TP, 1.5% SL — range-bound, keep tight
+        "CHOPPY":   (0.02, 0.012),  # 2% TP, 1.2% SL — noisy, exit fast
+    }
+
+    def _maybe_widen_tp(
+        self,
+        symbol: str,
+        entry_price: float,
+        current_price: float,
+        current_tp: float,
+        current_sl: float,
+        age_sec: float,
+        profit_pct: float,
+        regime: str,
+    ) -> Optional[dict]:
+        """
+        Dynamically widen TP when regime improves and position is underwater or flat.
+
+        Only widens — never tightens. Does not touch profitable positions (trailing
+        stop handles those). Returns dict with new tp/sl/reason or None if no change.
+        """
+        params = self._REGIME_WIDEN_PARAMS.get(regime)
+        if params is None:
+            return None  # DOWNTREND or unknown — don't widen
+
+        max_tp_pct, sl_pct = params
+
+        # Don't widen for positions already comfortably profitable (trailing stop active)
+        if profit_pct > 0.01:
+            return None
+
+        new_tp = entry_price * (1.0 + max_tp_pct)
+        new_sl = entry_price * (1.0 - sl_pct)
+
+        tp_changed = current_tp > 0 and new_tp > current_tp * 1.01  # at least 1% wider
+        sl_changed = current_sl > 0 and new_sl < current_sl * 0.99  # at least 1% wider
+
+        if not tp_changed and not sl_changed:
+            return None
+
+        result = {}
+        if tp_changed:
+            result["tp"] = new_tp
+        else:
+            result["tp"] = current_tp
+        if sl_changed:
+            result["sl"] = new_sl
+        else:
+            result["sl"] = current_sl
+        result["reason"] = (
+            f"regime={regime} dynamic_widen tp={self._fp(result['tp'])} sl={self._fp(result['sl'])}"
+        )
+        self.logger.info(
+            "[TPSLEngine:WIDEN] %s regime=%s age=%.1fh pnl=%.2f%% "
+            "tp: %s→%s sl: %s→%s",
+            symbol, regime, age_sec / 3600, profit_pct * 100,
+            self._fp(current_tp), self._fp(result["tp"]),
+            self._fp(current_sl), self._fp(result["sl"]),
+        )
+        return result
 
     def _compute_protective_tightening(
         self,
@@ -827,6 +1046,6 @@ class NativeTPSLEngine:
             tp, sl = self.calculate_tp_sl(symbol, entry_price)
             position["tp"] = tp
             position["sl"] = sl
-            self.logger.debug(f"[TPSLEngine:UPDATE] {symbol} tp={tp:.6f} sl={sl:.6f}")
+            self.logger.debug(f"[TPSLEngine:UPDATE] {symbol} tp={self._fp(tp)} sl={self._fp(sl)}")
         except Exception as e:
             self.logger.error(f"[TPSLEngine] update_position_tp_sl failed for {symbol}: {e}")

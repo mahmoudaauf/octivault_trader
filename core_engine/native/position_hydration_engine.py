@@ -230,6 +230,19 @@ class NativePositionHydrationEngine:
             positions = await self._reconstruct_positions_from_fills(balances)
             self._merge_balance_holdings(positions, balances)
 
+            # Step 2b: Remove ghost positions — journal says we hold it but
+            # exchange balance is zero. Exchange is always ground truth.
+            ghost_keys = []
+            for sym, pos in positions.items():
+                asset = str(sym).upper().replace("USDT", "")
+                exchange_qty = float((balances.get(asset) or {}).get("total", 0.0) or 0.0)
+                if exchange_qty <= 1e-8:
+                    ghost_keys.append(sym)
+            if ghost_keys:
+                logger.info("🧹 Removed %d ghost positions not on exchange: %s", len(ghost_keys), ghost_keys)
+                for k in ghost_keys:
+                    positions.pop(k, None)
+
             # Step 3: Restore TP/SL from shared_state if available
             logger.info("🔄 Position hydration: restoring TP/SL state...")
             await self._restore_tp_sl_state(positions)
@@ -460,6 +473,8 @@ class NativePositionHydrationEngine:
         undercounting wallet NAV.
         """
         price_map = getattr(self._state, "prices", {}) if hasattr(self._state, "prices") else {}
+        # Also check snapshot positions for last-known prices when live prices unavailable
+        snapshot_positions = getattr(self._state, "positions", {}) if hasattr(self._state, "positions") else {}
 
         for asset, bal in (balances or {}).items():
             asset_key = str(asset or "").upper()
@@ -472,7 +487,27 @@ class NativePositionHydrationEngine:
 
             symbol = f"{asset_key}USDT"
             current_price = float(price_map.get(symbol, 0.0) or 0.0)
+            # When live price unavailable, fall back to last known mark price from snapshot
             if current_price <= 0:
+                snap_pos = snapshot_positions.get(symbol)
+                if snap_pos is not None:
+                    fallback = float(
+                        getattr(snap_pos, "mark_price", 0.0)
+                        if not isinstance(snap_pos, dict)
+                        else snap_pos.get("mark_price", 0.0)
+                    )
+                    if fallback <= 0:
+                        fallback = float(
+                            getattr(snap_pos, "entry_price", 0.0)
+                            if not isinstance(snap_pos, dict)
+                            else snap_pos.get("entry_price", 0.0)
+                        )
+                    current_price = fallback
+            # Skip dust balances below threshold ($5 — below Binance MIN_NOTIONAL of $10)
+            _MIN_NOTIONAL_HYDRATION = 5.0
+            if current_price > 0 and total_qty * current_price < _MIN_NOTIONAL_HYDRATION:
+                continue
+            if current_price <= 0 and total_qty < 1.0:
                 continue
 
             pos = positions.get(symbol)
@@ -487,8 +522,8 @@ class NativePositionHydrationEngine:
                 )
                 continue
 
-            if total_qty > float(pos.qty or 0.0):
-                pos.qty = total_qty
+            # Exchange balance is authoritative — reconcile in both directions
+            pos.qty = total_qty
             if current_price > 0:
                 pos.current_price = current_price
             if pos.avg_entry_price <= 0:
@@ -554,6 +589,7 @@ class NativePositionHydrationEngine:
                     "qty": hydrated.qty,
                     "entry_price": hydrated.avg_entry_price,
                     "current_price": hydrated.current_price,
+                    "mark_price": hydrated.current_price,  # ensure get_portfolio_value finds it
                     "unrealized_pnl": hydrated.unrealized_pnl,
                     "realized_pnl": hydrated.realized_pnl,
                     "tp": hydrated.tp_price,
@@ -562,10 +598,26 @@ class NativePositionHydrationEngine:
                     "entry_time": hydrated.entry_time,
                     "last_update": hydrated.last_update,
                 }
+                # Seed price_cache so NAV calc immediately has correct prices
+                if hydrated.current_price > 0 and hasattr(self._state, "price_cache"):
+                    self._state.price_cache[symbol.upper()] = hydrated.current_price
 
-        # Update balance
+        # Update balance — sync previous_nav so attribution engine has a clean baseline
         if hasattr(self._state, "nav_usdt"):
-            self._state.nav_usdt = state.total_balance_usdt + state.portfolio_value
+            _hydrated_nav = state.total_balance_usdt + state.portfolio_value
+            self._state.nav_usdt = _hydrated_nav
+            if hasattr(self._state, "previous_nav_usdt"):
+                self._state.previous_nav_usdt = _hydrated_nav
+            if hasattr(self._state, "session_anchor_nav") and self._state.session_anchor_nav <= 0:
+                self._state.session_anchor_nav = _hydrated_nav
+            # Seed a baseline attribution so NAVAttributionEngine doesn't see a phantom delta
+            if hasattr(self._state, "last_nav_attribution"):
+                self._state.last_nav_attribution = {
+                    "reason": "STARTUP_HYDRATION_RECONCILIATION",
+                    "realized_pnl_total_usdt": state.total_realized_pnl,
+                    "unrealized_pnl_total_usdt": state.total_unrealized_pnl,
+                    "free_usdt": float(state.free_balance_usdt or 0.0),
+                }
 
         # Update metrics
         if hasattr(self._state, "metrics"):

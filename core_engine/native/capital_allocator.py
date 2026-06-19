@@ -109,28 +109,31 @@ class NativeCapitalAllocator:
 
                     min_notional = 10.0
                     step_size = 0.00000001
+                    min_qty = 0.0
 
                     for f in filters:
-                        if f.get("filterType") == "MIN_NOTIONAL":
-                            min_notional = float(f.get("minNotional", 10.0))
+                        # Binance renamed MIN_NOTIONAL → NOTIONAL; accept both.
+                        if f.get("filterType") in ("MIN_NOTIONAL", "NOTIONAL"):
+                            min_notional = float(f.get("minNotional", min_notional) or min_notional)
                         elif f.get("filterType") == "LOT_SIZE":
                             step_size = float(f.get("stepSize", 0.00000001))
+                            min_qty = float(f.get("minQty", 0.0) or 0.0)
 
                     self._symbol_filters_cache[symbol] = {
                         "min_notional": min_notional,
                         "step_size": step_size,
+                        "min_qty": min_qty,
                     }
                     logger.debug(
-                        "✅ %s filters cached: min_notional=%.2f step_size=%.8f",
-                        symbol,
-                        min_notional,
-                        step_size,
+                        "✅ %s filters cached: min_notional=%.2f step_size=%.8f min_qty=%.8f",
+                        symbol, min_notional, step_size, min_qty,
                     )
                 except Exception as e:
                     logger.warning("Failed to fetch filters for %s: %s (using defaults)", symbol, e)
                     self._symbol_filters_cache[symbol] = {
                         "min_notional": 10.0,
                         "step_size": 0.00000001,
+                        "min_qty": 0.0,
                     }
 
             # Get current NAV
@@ -162,28 +165,41 @@ class NativeCapitalAllocator:
             if self._md and hasattr(self._md, "get_price"):
                 price = self._md.get_price(symbol)
 
-            # Fallback to mock prices for paper mode (when real prices unavailable)
+            # Price missing from market_data. In LIVE mode we must NEVER size off a fake
+            # price (the old mock table is stale by 30-50% — BTC 45k vs 62k, DOGE 0.35 vs
+            # 0.085 — and would badly mis-size real orders). Try a fresh REST quote; if that
+            # also fails, skip the allocation. Mock prices are paper-mode only.
             if not price or price <= 0:
-                # Use mock prices for common symbols (for testing in paper mode)
-                mock_prices = {
-                    "BTCUSDT": 45000.0,
-                    "ETHUSDT": 2500.0,
-                    "BNBUSDT": 600.0,
-                    "SOLUSDT": 180.0,
-                    "XRPUSDT": 2.5,
-                    "ADAUSDT": 0.9,
-                    "LINKUSDT": 25.0,
-                    "DOGEUSDT": 0.35,
-                    "AVAXUSDT": 80.0,
-                    "PEPEUSDT": 0.000015,
-                }
-                price = mock_prices.get(symbol, 10.0)  # default to $10 if symbol not in list
-                if price <= 0:
-                    logger.debug("Price for %s unavailable, skipping allocation", symbol)
-                    return 0.0
-                logger.debug(
-                    "Using mock price for %s: $%.8f (real price unavailable)", symbol, price
-                )
+                # First: a real REST quote (same source as the executor's freshness guard).
+                if self._exchange_client is not None and hasattr(self._exchange_client, "get_prices"):
+                    try:
+                        quotes = await self._exchange_client.get_prices([symbol])
+                        price = float(quotes.get(symbol, 0.0) or 0.0)
+                        if price > 0 and self._ss is not None and hasattr(self._ss, "update_price"):
+                            self._ss.update_price(symbol, price)
+                    except Exception as e:
+                        logger.debug("REST price fetch failed for %s: %s", symbol, e)
+
+                if not price or price <= 0:
+                    _is_paper = (
+                        getattr(self._exchange_client, "api_key", "") == "paper_key"
+                        or not getattr(self._exchange_client, "api_secret", None)
+                    ) if self._exchange_client is not None else True
+                    if _is_paper:
+                        mock_prices = {
+                            "BTCUSDT": 45000.0, "ETHUSDT": 2500.0, "BNBUSDT": 600.0,
+                            "SOLUSDT": 180.0, "XRPUSDT": 2.5, "ADAUSDT": 0.9,
+                            "LINKUSDT": 25.0, "DOGEUSDT": 0.35, "AVAXUSDT": 80.0,
+                            "PEPEUSDT": 0.000015,
+                        }
+                        price = mock_prices.get(symbol, 10.0)
+                        logger.debug("[paper] mock price for %s: $%.8f", symbol, price)
+                    else:
+                        logger.warning(
+                            "⛔ %s real price unavailable (market_data + REST both empty) — "
+                            "skipping allocation rather than sizing off a stale mock", symbol,
+                        )
+                        return 0.0
 
             # Apply runtime_overrides from ObjectiveFeedbackController if present
             overrides = getattr(self._ss, "runtime_overrides", {}) if self._ss else {}
@@ -193,13 +209,30 @@ class NativeCapitalAllocator:
                     "📊 OFC SIZE_MULTIPLIER active: %.2f (from runtime_overrides)", size_mult
                 )
 
-            # Hybrid allocation: fixed quote for small accounts, %-based for larger
-            # This matches legacy system's autonomous scaling behavior
+            # Hybrid allocation: NAV-percentage for all accounts, floored by min_notional
+            # At $58 NAV: 15% = $8.70; floor ensures we always clear Binance minimum.
+            # Auto-compounds: as NAV grows, position size grows proportionally.
             if nav < 100.0:
-                # Small account: use fixed default_planned_quote per trade
-                # This allows compounding growth from small starting capital
-                allocation_usdt = min(self._default_planned_quote * size_mult, spendable_capital)
-                alloc_reason = f"fixed-quote (nav=${nav:.2f}<$100)"
+                sym_filters = self._symbol_filters_cache.get(symbol, {})
+                min_notional = float(sym_filters.get("min_notional", 10.0))
+                # 15% of NAV, floored at min_notional + 20% safety buffer, capped at 20% of NAV
+                nav_pct_usdt = nav * 0.15 * size_mult
+                # Fear-time half-size: in fear (F&G ≤ 25) without confirmed BTC reversal,
+                # halve position size. Reversal is market-wide so this gates globally.
+                fear_factor = 1.0
+                try:
+                    fg = getattr(self._ss, "fear_greed_score", None) if self._ss else None
+                    btc_rev = bool(getattr(self._ss, "btc_reversal_confirmed", False)) if self._ss else False
+                    if fg is not None and float(fg) <= 25 and not btc_rev:
+                        fear_factor = 0.5
+                except Exception:
+                    fear_factor = 1.0
+                nav_pct_usdt *= fear_factor
+                floor_usdt = min_notional * 1.2  # 20% above min_notional to absorb slippage
+                allocation_usdt = min(max(nav_pct_usdt, floor_usdt), nav * 0.20, spendable_capital)
+                alloc_reason = (
+                    f"nav-pct-15% (nav=${nav:.2f}, floor=${floor_usdt:.2f}, fear×{fear_factor:.1f})"
+                )
             else:
                 # Larger account: switch to percentage-based allocation
                 # ACE will further refine this if enabled
@@ -254,24 +287,49 @@ class NativeCapitalAllocator:
                     allocation_usdt = min(nav * risk_fraction, spendable_capital)
                     alloc_reason = "flat-pct (%.1f%%)" % self._allocation_pct
 
+            # ── Exchange-minimum enforcement ───────────────────────────────────
+            # A sub-minimum order (allocation too small for the symbol's min_notional/
+            # min_qty — common on high-priced assets like ETH/BTC, or when spendable
+            # dips) just gets rejected by the exchange and wastes the attempt. If we can
+            # afford the minimum, bump the allocation up to it; otherwise skip cleanly.
+            _sf = self._symbol_filters_cache.get(symbol, {})
+            _min_notional = float(_sf.get("min_notional", 10.0) or 10.0)
+            _min_qty = float(_sf.get("min_qty", 0.0) or 0.0)
+            _min_order_usdt = max(_min_notional, _min_qty * price) * 1.02  # 2% headroom for fees/rounding
+            if allocation_usdt < _min_order_usdt:
+                if _min_order_usdt <= spendable_capital and _min_order_usdt <= nav * 0.25:
+                    logger.info(
+                        "[allocator] %s allocation $%.4f < exchange min $%.2f — bumped to min",
+                        symbol, allocation_usdt, _min_order_usdt,
+                    )
+                    allocation_usdt = _min_order_usdt
+                else:
+                    logger.info(
+                        "[allocator] %s skip: min order $%.2f exceeds budget (spendable $%.2f) — no sub-min order",
+                        symbol, _min_order_usdt, spendable_capital,
+                    )
+                    return 0.0
+
             quantity = allocation_usdt / price
 
             # Round down to step_size to meet Binance LOT_SIZE requirement
             if quantity > 0:
                 quantity = self._round_quantity_for_exchange_sync(symbol, quantity, price)
 
-            logger.debug(
-                "Allocate for %s: nav=%.2f mult=%.2f usdt=%.2f price=%.2f qty=%.6f (%s)",
-                symbol,
-                nav,
-                size_mult,
-                allocation_usdt,
-                price,
-                quantity,
-                alloc_reason,
+            logger.info(
+                "[allocator] %s: nav=%.2f mult=%.3f spendable=%.2f usdt=%.2f price=%.4f qty=%.8f (%s)",
+                symbol, nav, size_mult, spendable_capital, allocation_usdt, price, quantity, alloc_reason,
             )
 
-            return float(max(0.0, quantity))
+            # The executor expects a BUY decision.quantity to be a USD quote intent
+            # (it converts to base qty via current price itself). Returning the base
+            # `quantity` here caused a double division by price downstream, producing
+            # sub-minimum dust orders (e.g. SOL: $6 alloc → $0.09 order → LOT_SIZE
+            # reject). `quantity` above is computed only to validate step-size
+            # feasibility; the USD allocation is the value the executor needs.
+            if quantity <= 0:
+                return 0.0
+            return float(max(0.0, allocation_usdt))
 
         except Exception as e:
             logger.warning("Capital allocation failed for %s: %s", symbol, e)

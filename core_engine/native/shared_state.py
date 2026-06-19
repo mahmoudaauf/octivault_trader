@@ -79,6 +79,11 @@ class NativeSharedState:
         self.market_data: dict[tuple[str, str], list[dict]] = {}
         self.market_data_ready: bool = False
         self._last_tick_timestamps: dict[str, float] = {}
+        # Real-time top-of-book (from @bookTicker): the demand/supply layer that
+        # PRECEDES indicators. symbol -> {bid, bid_qty, ask, ask_qty, spread_pct,
+        # imbalance, ts}. imbalance = bid_qty/(bid_qty+ask_qty): >0.5 demand-heavy,
+        # <0.5 supply-heavy (ask wall). Populated by WebSocketMarketData.
+        self.order_book: dict[str, dict] = {}
 
         # Position tracking
         self.positions: dict[str, Position] = {}  # symbol -> Position
@@ -107,6 +112,12 @@ class NativeSharedState:
             "last_update_ts": 0.0,
         }
         self.session_anchor_nav: float = 0.0  # NAV at session start
+        self.previous_nav_usdt: float = 0.0   # NAV from previous evaluation cycle
+        self.peak_nav_usdt: float = 0.0        # All-time-high NAV (persisted across restarts via metrics)
+        self.protection_floor_usdt: float = 0.0  # Ratchet floor set by NAVProtectionEngine
+        self.nav_protection_state: dict = {}   # Latest NAVProtectionState.to_dict()
+        self.last_nav_attribution: dict = {}    # Last NAVAttribution.to_dict() for delta tracking
+        self.recovery_state: dict = {}          # Portfolio recovery mode flags
         self.runtime_overrides: dict = {}  # OFC writes: confidence_floor, size_multiplier, etc.
         self.trading_halted: bool = False  # OFC kill-switch
         self.trade_history: dict[str, list] = {}  # symbol -> list of closed-trade records
@@ -120,8 +131,22 @@ class NativeSharedState:
 
     # ==================== NAV Management ====================
 
+    def update_nav_protection(self, attribution: dict, protection_state: dict) -> None:
+        """Called by NAVProtectionEngine after each evaluation."""
+        self.nav_protection_state = dict(protection_state or {})
+        peak = float((protection_state or {}).get("peak_nav_usdt", 0.0) or 0.0)
+        if peak > self.peak_nav_usdt:
+            self.peak_nav_usdt = peak
+            self.metrics["peak_nav"] = peak
+            self.metrics["peak_nav_ts"] = __import__("time").time()
+        floor = float((protection_state or {}).get("protection_floor_usdt", 0.0) or 0.0)
+        if floor > self.protection_floor_usdt:
+            self.protection_floor_usdt = floor
+
     def update_nav(self, nav: float):
-        """Update NAV (single source of truth)"""
+        """Update NAV (single source of truth). Captures previous value for attribution."""
+        if self.nav_usdt > 0:
+            self.previous_nav_usdt = self.nav_usdt
         self.nav_usdt = max(0.0, nav)
 
     def get_nav(self) -> float:
@@ -136,10 +161,69 @@ class NativeSharedState:
         self.nav_usdt = self.free_balance_usdt + self.invested_capital_usdt
 
     def update_balance_map(self, balances: dict[str, float]) -> None:
-        """Store raw exchange/free balances and keep canonical USDT fields aligned."""
+        """Store raw exchange/free balances, reconcile position quantities, and align NAV."""
         self.balance = {str(k).upper(): float(v or 0.0) for k, v in (balances or {}).items()}
         free_usdt = float(self.balance.get("USDT", 0.0) or 0.0)
+
+        _NON_TRADE_ASSETS = {"USDT", "BNB", "BTC"}
+        _MIN_NOTIONAL_FOR_POSITION = 5.0  # ignore confirmed dust (below $5 means truly worthless)
+
+        # Reconcile position quantities against exchange balances.
+        # This corrects partial fills and removes sold positions automatically.
+        for sym in list(self.positions.keys()):
+            asset = str(sym).upper().replace("USDT", "")
+            exchange_qty = float(self.balance.get(asset, 0.0) or 0.0)
+            pos = self.positions[sym]
+            held_qty = float(getattr(pos, "qty", 0.0) if not isinstance(pos, dict) else pos.get("qty", 0.0))
+            price = float((getattr(self, "prices", {}) or {}).get(sym, 0.0) or 0.0)
+            if exchange_qty <= 1e-8 or (price > 0 and exchange_qty * price < _MIN_NOTIONAL_FOR_POSITION):
+                # Exchange has none, or notional dropped below MIN_NOTIONAL — treat as dust/closed
+                self.positions.pop(sym, None)
+            elif abs(exchange_qty - held_qty) / max(held_qty, 1e-8) > 0.01:
+                # Quantity differs by >1% — update to real exchange amount
+                entry = float(getattr(pos, "entry_price", 0.0) if not isinstance(pos, dict) else pos.get("entry_price", 0.0))
+                mark = float(getattr(pos, "mark_price", entry) if not isinstance(pos, dict) else pos.get("mark_price", entry))
+                self.update_position(sym, exchange_qty, entry, mark)
+
+        # Surface positions that exist on exchange but are unknown to the bot.
+        # Covers manual buys, external transfers, and fills the bot missed.
+        live_prices = getattr(self, "prices", {}) or {}
+        for asset, qty in self.balance.items():
+            sym = asset.upper() + "USDT"
+            if asset in _NON_TRADE_ASSETS or sym in self.positions or qty <= 1e-8:
+                continue
+            price = float(live_prices.get(sym, 0.0) or 0.0)
+            if price == 0:
+                # Try price_cache as fallback (populated by REST price refresh)
+                price = float((getattr(self, "price_cache", {}) or {}).get(sym, 0.0) or 0.0)
+            if price > 0 and qty * price < _MIN_NOTIONAL_FOR_POSITION:
+                continue  # confirmed dust by notional
+            if price == 0 and qty < 1.0:
+                continue  # likely dust (can't verify notional without price)
+            # Register with available price (entry = current price; 0 if price not yet loaded)
+            import logging as _logging
+            _logging.getLogger("SharedState").info(
+                "[SharedState] External position detected: %s qty=%.6f (~$%.2f) — adding to registry",
+                sym, qty, qty * price,
+            )
+            self.update_position(sym, qty, price, price)
+
         invested = self.get_portfolio_value()
+        # Also count any non-USDT balances not tracked as positions (dust / excluded holdings)
+        # so NAV reflects true account value even when positions are filtered out.
+        live_prices = getattr(self, "prices", {}) or {}
+        for asset, qty in self.balance.items():
+            if asset in _NON_TRADE_ASSETS:
+                continue
+            sym = asset.upper() + "USDT"
+            if sym in self.positions:
+                continue  # already counted in get_portfolio_value()
+            price = float(live_prices.get(sym, 0.0) or 0.0)
+            if price > 0 and float(qty or 0) > 1e-8:
+                invested += float(qty) * price
+        # Don't zero out invested_capital when positions exist but prices aren't loaded yet.
+        if invested <= 0 and self.positions and self.invested_capital_usdt > 0:
+            invested = self.invested_capital_usdt
         self.update_balance(free_usdt, invested)
 
     # ==================== Position Management ====================
@@ -181,18 +265,33 @@ class NativeSharedState:
         return self.positions.copy()
 
     def get_portfolio_value(self) -> float:
-        """Total value of all positions"""
+        """Total value of all positions, using live prices where available."""
         total = 0.0
-        for pos in self.positions.values():
+        live_prices = getattr(self, "price_cache", {}) or {}
+        for symbol, pos in self.positions.items():
+            sym_upper = str(symbol or "").upper()
             if isinstance(pos, dict):
                 qty = float(pos.get("qty", 0.0) or 0.0)
                 mark = float(
-                    pos.get("mark_price", pos.get("current_price", pos.get("avg_price", 0.0)))
+                    live_prices.get(sym_upper)
+                    or live_prices.get(symbol)
+                    or pos.get("mark_price")
+                    or pos.get("current_price")
+                    or pos.get("avg_price")
+                    or pos.get("entry_price")  # fallback: use cost basis
                     or 0.0
                 )
                 total += qty * mark
             else:
-                total += float(getattr(pos, "position_value", 0.0) or 0.0)
+                qty = float(getattr(pos, "qty", 0.0) or 0.0)
+                mark = float(
+                    live_prices.get(sym_upper)
+                    or live_prices.get(symbol)
+                    or getattr(pos, "mark_price", 0.0)
+                    or getattr(pos, "entry_price", 0.0)  # fallback: use cost basis
+                    or 0.0
+                )
+                total += qty * mark if mark > 0 else float(getattr(pos, "position_value", 0.0) or 0.0)
         return total
 
     # ==================== Order Management ====================
@@ -237,6 +336,58 @@ class NativeSharedState:
     def get_price(self, symbol: str) -> float:
         """Get latest price for symbol"""
         return self.price_cache.get(symbol, 0.0)
+
+    def get_price_age(self, symbol: str) -> float:
+        """Seconds since the last price tick for symbol. inf if never seen."""
+        import time
+
+        symbol_key = str(symbol or "").upper()
+        ts = self._last_tick_timestamps.get(symbol_key)
+        if not ts:
+            return float("inf")
+        return max(0.0, time.time() - float(ts))
+
+    # ==================== Order Book / Flow ====================
+
+    def update_book(self, symbol: str, bid: float, bid_qty: float,
+                    ask: float, ask_qty: float) -> None:
+        """Store real-time top-of-book from @bookTicker. Computes spread_pct and
+        imbalance (bid-vs-ask resting size) — the supply/demand state that leads price."""
+        import time
+
+        symbol_key = str(symbol or "").upper()
+        if bid <= 0 or ask <= 0:
+            return
+        mid = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid if mid > 0 else 0.0
+        total_qty = bid_qty + ask_qty
+        imbalance = (bid_qty / total_qty) if total_qty > 0 else 0.5
+        self.order_book[symbol_key] = {
+            "bid": bid, "bid_qty": bid_qty, "ask": ask, "ask_qty": ask_qty,
+            "spread_pct": spread_pct, "imbalance": imbalance, "ts": time.time(),
+        }
+
+    def get_book(self, symbol: str) -> dict:
+        """Latest top-of-book snapshot for symbol (empty dict if unseen)."""
+        return self.order_book.get(str(symbol or "").upper(), {})
+
+    def get_spread_pct(self, symbol: str) -> float:
+        """Real-time bid/ask spread fraction (e.g. 0.001 = 0.1%). 0.0 if unseen."""
+        return float(self.get_book(symbol).get("spread_pct", 0.0) or 0.0)
+
+    def get_book_imbalance(self, symbol: str) -> float:
+        """Top-of-book size imbalance: bid_qty/(bid_qty+ask_qty). >0.5 demand-heavy
+        (buyers resting), <0.5 supply-heavy (ask wall). 0.5 (neutral) if unseen."""
+        return float(self.get_book(symbol).get("imbalance", 0.5) or 0.5)
+
+    def get_book_age(self, symbol: str) -> float:
+        """Seconds since the last book update. inf if never seen."""
+        import time
+
+        ts = self.get_book(symbol).get("ts")
+        if not ts:
+            return float("inf")
+        return max(0.0, time.time() - float(ts))
 
     # ==================== Symbol Management ====================
 
@@ -389,6 +540,18 @@ class NativeSharedState:
         lst.append(record)
         if len(lst) > 200:
             lst.pop(0)
+
+    def get_market_data(self, symbol: str, timeframe: str = "1m") -> list:
+        """Return kline buffer for a symbol/timeframe. Pre-fetch populates this with 3000 rows."""
+        return self.market_data.get((symbol, timeframe)) or []
+
+    async def get_sentiment(self, symbol: str = None) -> float:
+        """Return normalized Fear & Greed score as sentiment.
+        -1.0 = extreme fear, 0.0 = neutral, +1.0 = extreme greed."""
+        fg = getattr(self, "fear_greed_score", None)
+        if fg is None:
+            return 0.0
+        return (float(fg) - 50.0) / 50.0
 
     async def emit_event(self, name: str, payload: dict) -> None:
         """Emit event for telemetry/journaling.

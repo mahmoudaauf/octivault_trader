@@ -104,15 +104,32 @@ class NativeSymbolDiscovery:
                 return self._fallback_symbols_from_state()
 
             # Find all non-zero holdings and build USDT pairs
+            # Use live prices to filter out dust (< $1 notional) that causes phantom signal loops
+            prices: dict = {}
+            if self._shared_state is not None:
+                prices = dict(getattr(self._shared_state, "prices", {}) or {})
+                price_cache = dict(getattr(self._shared_state, "price_cache", {}) or {})
+                prices = {**price_cache, **prices}  # live prices take precedence
+            _MIN_NOTIONAL_USD = 1.0  # ignore dust below $1
+
             symbols: list[str] = []
             for asset, qty in sorted(balance.items()):
                 # Skip USDT itself (quote asset, not tradable)
                 if asset.upper() == self._base:
                     continue
                 # Skip zero balances and dust
-                if float(qty) <= 0:
+                qty_f = float(qty)
+                if qty_f <= 0:
                     continue
-                symbols.append(f"{asset.upper()}{self._base}")
+                sym = f"{asset.upper()}{self._base}"
+                price = float(prices.get(sym, 0.0) or 0.0)
+                if price > 0 and qty_f * price < _MIN_NOTIONAL_USD:
+                    logger.debug(
+                        "[SymbolDiscovery] Skipping dust %s qty=%.8f notional=$%.4f",
+                        sym, qty_f, qty_f * price,
+                    )
+                    continue
+                symbols.append(sym)
 
             logger.info(
                 "🔍 Wallet scan: discovered %d symbols from your holdings: %s",

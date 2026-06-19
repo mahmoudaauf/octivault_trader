@@ -4,11 +4,14 @@ Native market regime detector.
 Per-symbol regime classification. Each symbol gets its own trend score
 so a flat BTC doesn't block a trending SOL.
 
-Thresholds:
-  gap >= +0.30%  → UPTREND
-  gap <= -0.30%  → DOWNTREND
-  0.10% < |gap| < 0.30% → CHOPPY (momentum bursts possible)
-  |gap| <= 0.10% → RANGING (no directional edge)
+Thresholds (MA5 vs MA20 gap):
+  gap >= +1.00%  → UPTREND   (raised from 0.30% — requires real sustained move)
+  gap <= -1.00%  → DOWNTREND
+  0.30% < |gap| < 1.00% → CHOPPY
+  |gap| <= 0.30% → RANGING
+
+Aggregation: requires ≥3 symbols UPTREND (not 1) and zero DOWNTREND symbols
+to declare global UPTREND. One bad apple poisons the portfolio.
 """
 
 from __future__ import annotations
@@ -156,10 +159,10 @@ class NativeMarketRegimeDetector:
     def _classify_trend(closes: list[float]) -> str:
         """
         MA5 vs MA20 gap classification.
-          gap >= +0.30%  → UPTREND
-          gap <= -0.30%  → DOWNTREND
-          |gap| 0.10-0.30% → CHOPPY
-          |gap| <= 0.10% → RANGING
+          gap >= +1.00%  → UPTREND   (requires real sustained move, not noise)
+          gap <= -1.00%  → DOWNTREND
+          |gap| 0.30-1.00% → CHOPPY
+          |gap| <= 0.30% → RANGING
         """
         n = len(closes)
         fast = sum(closes[-5:]) / min(5, n)
@@ -167,30 +170,41 @@ class NativeMarketRegimeDetector:
         if slow <= 0:
             return "RANGING"
         gap = (fast / slow) - 1.0
-        if gap >= 0.003:  # +0.30%
+        if gap >= 0.010:   # +1.00%
             return "UPTREND"
-        if gap <= -0.003:  # -0.30%
+        if gap <= -0.010:  # -1.00%
             return "DOWNTREND"
-        if abs(gap) >= 0.001:  # 0.10-0.30%
+        if abs(gap) >= 0.003:  # 0.30-1.00%
             return "CHOPPY"
         return "RANGING"
 
     @staticmethod
     def _aggregate_regime(symbol_regimes: dict[str, str]) -> str:
-        """Pick the most favourable regime across all symbols."""
+        """
+        Aggregate per-symbol regimes conservatively.
+
+        UPTREND  : ≥3 symbols trending up AND zero symbols in DOWNTREND
+                   (one bad apple poisons the portfolio — avoids buying into
+                   a coordinated altcoin drawdown disguised as a single winner)
+        CHOPPY   : majority in CHOPPY range (0.30-1.00% MA gap)
+        DOWNTREND: any symbol showing confirmed downtrend
+        RANGING  : default when no clear signal
+        """
         if not symbol_regimes:
             return "RANGING"
         counts = {"UPTREND": 0, "CHOPPY": 0, "DOWNTREND": 0, "RANGING": 0}
         for r in symbol_regimes.values():
             counts[r] = counts.get(r, 0) + 1
-        # If any symbol is trending up → trade it
-        if counts["UPTREND"] >= 1:
+        n = len(symbol_regimes)
+        # Require ≥3 symbols cleanly uptrending AND no symbol downtrending
+        if counts["UPTREND"] >= 3 and counts["DOWNTREND"] == 0:
             return "UPTREND"
-        # If majority are choppy → CHOPPY (tradeable with floor bump)
-        if counts["CHOPPY"] >= max(1, len(symbol_regimes) // 3):
-            return "CHOPPY"
+        # Any confirmed downtrend poisons the portfolio
         if counts["DOWNTREND"] >= 1:
             return "DOWNTREND"
+        # Majority choppy → tradeable but with tighter sizing
+        if counts["CHOPPY"] >= max(2, n // 3):
+            return "CHOPPY"
         return "RANGING"
 
     def _nav_regime(self) -> str:

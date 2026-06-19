@@ -334,6 +334,10 @@ def test_recalculate_aged_positions_tightens_quick_winner_under_nav_protection()
     }
 
     engine = NativeTPSLEngine(state, _Cfg())
+    engine._tpsl_state_path = "/tmp/test_tpsl_isolated.json"  # isolate from live state file
+    engine._tp_levels.clear()
+    engine._sl_levels.clear()
+    engine._entry_timestamps.clear()
     engine._entry_timestamps["BTCUSDT"] = now - (45 * 60)
 
     updates = engine.recalculate_aged_positions()
@@ -381,3 +385,153 @@ def test_recalculate_aged_positions_does_not_tighten_fresh_flat_position() -> No
     assert updates == {}
     assert state.positions["ETHUSDT"]["tp"] == 102.0
     assert state.positions["ETHUSDT"]["sl"] == 98.5
+
+
+# ---------------------------------------------------------------------------
+# Dynamic TP/SL — Position object support + regime-aware widening
+# ---------------------------------------------------------------------------
+
+from core_engine.native.shared_state import Position
+
+
+def test_check_triggers_supports_position_objects():
+    """check_triggers works with Position objects, not just dicts."""
+    engine, state = _engine_with_regime("TRENDING")
+    entry = 1.00
+    tp = 1.025
+    sl = 0.975
+    engine._tp_levels["POSOBJ"] = tp
+    engine._sl_levels["POSOBJ"] = sl
+    engine._entry_timestamps["POSOBJ"] = time.time() - 100
+
+    pos_obj = Position(symbol="POSOBJ", qty=10.0, entry_price=entry, mark_price=tp + 0.001)
+
+    result = engine.check_triggers("POSOBJ", pos_obj, tp + 0.001)
+    assert result == "TP_HIT", f"Expected TP_HIT, got {result}"
+
+
+def test_check_triggers_position_object_sl():
+    """SL triggers correctly on Position objects."""
+    engine, state = _engine_with_regime("TRENDING")
+    entry = 1.00
+    tp = 1.025
+    sl = 0.975
+    engine._tp_levels["POSOBJ"] = tp
+    engine._sl_levels["POSOBJ"] = sl
+    engine._entry_timestamps["POSOBJ"] = time.time() - 100
+
+    pos_obj = Position(symbol="POSOBJ", qty=10.0, entry_price=entry, mark_price=sl - 0.001)
+
+    result = engine.check_triggers("POSOBJ", pos_obj, sl - 0.001)
+    assert result == "SL_HIT", f"Expected SL_HIT, got {result}"
+
+
+def test_recalculate_aged_positions_handles_position_objects():
+    """recalculate_aged_positions doesn't skip Position objects."""
+    state = NativeSharedState()
+    state.metrics = {"market_regime": "TRENDING"}
+    state.prices = {"BIOOBJ": 0.028}
+    state.nav_protection_state = {}
+
+    # Simulate a 3-hour old position as a Position object (after polling refresh)
+    entry = 0.030
+    pos_obj = Position(symbol="BIOOBJ", qty=660.0, entry_price=entry, mark_price=0.028)
+    state.positions["BIOOBJ"] = pos_obj
+
+    engine = NativeTPSLEngine(state, _Cfg())
+    engine._startup_grace_until = 0.0
+    engine._entry_timestamps["BIOOBJ"] = time.time() - (3 * 3600)
+    original_tp = entry * 1.024
+    engine._tp_levels["BIOOBJ"] = original_tp
+    engine._sl_levels["BIOOBJ"] = entry * 0.961
+
+    updates = engine.recalculate_aged_positions()
+
+    # Should have processed and tightened (3h >= 2h threshold → tp=+1.5%)
+    assert "BIOOBJ" in updates, f"Expected BIOOBJ in updates, got {updates}"
+    assert updates["BIOOBJ"]["tp"] < original_tp, \
+        f"TP should have tightened: {updates['BIOOBJ']['tp']:.6f} < {original_tp:.6f}"
+
+
+def test_maybe_widen_tp_trending_regime():
+    """Dynamic TP widening triggers for TRENDING regime on underwater position."""
+    engine, state = _engine_with_regime("TRENDING")
+    result = engine._maybe_widen_tp(
+        symbol="BIOUSDT",
+        entry_price=0.030,
+        current_price=0.029,   # underwater
+        current_tp=0.030 * 1.024,   # tight 2.4% TP
+        current_sl=0.030 * 0.961,
+        age_sec=3600,           # 1 hour old
+        profit_pct=-0.033,
+        regime="TRENDING",
+    )
+    assert result is not None, "Expected TP widening for TRENDING + underwater position"
+    assert result["tp"] > 0.030 * 1.024, "New TP should be wider than original"
+    assert "TRENDING" in result["reason"]
+
+
+def test_maybe_widen_tp_no_widen_for_profitable():
+    """Dynamic TP widening does NOT apply to profitable positions (trailing handles those)."""
+    engine, state = _engine_with_regime("TRENDING")
+    result = engine._maybe_widen_tp(
+        symbol="BIOUSDT",
+        entry_price=0.030,
+        current_price=0.032,   # +6.7% profitable
+        current_tp=0.030 * 1.06,
+        current_sl=0.030 * 0.98,
+        age_sec=3600,
+        profit_pct=0.067,
+        regime="TRENDING",
+    )
+    assert result is None, "Should not widen TP for profitable position"
+
+
+def test_maybe_widen_tp_no_widen_for_downtrend():
+    """Dynamic TP widening is suppressed in DOWNTREND."""
+    engine, state = _engine_with_regime("DOWNTREND")
+    result = engine._maybe_widen_tp(
+        symbol="BIOUSDT",
+        entry_price=0.030,
+        current_price=0.028,
+        current_tp=0.030 * 1.024,
+        current_sl=0.030 * 0.975,
+        age_sec=3600,
+        profit_pct=-0.067,
+        regime="DOWNTREND",
+    )
+    assert result is None, "Should not widen TP in DOWNTREND"
+
+
+def test_maybe_widen_tp_uptrend_sets_10pct():
+    """UPTREND regime sets TP to 10% above entry."""
+    engine, state = _engine_with_regime("UPTREND")
+    entry = 0.056
+    result = engine._maybe_widen_tp(
+        symbol="WLFIUSDT",
+        entry_price=entry,
+        current_price=entry * 0.99,
+        current_tp=entry * 1.024,
+        current_sl=entry * 0.975,
+        age_sec=1800,
+        profit_pct=-0.01,
+        regime="UPTREND",
+    )
+    assert result is not None
+    assert abs(result["tp"] - entry * 1.10) < 1e-8, \
+        f"UPTREND TP should be +10%, got {result['tp']:.6f}"
+
+
+def test_force_exit_triggers_on_aged_position_object():
+    """TIME_FORCE_EXIT fires on Position objects after 1.5h when unprofitable."""
+    engine, state = _engine_with_regime("CHOPPY")
+    entry = 0.030
+    current = 0.028  # -6.7% unprofitable
+
+    pos_obj = Position(symbol="STALE", qty=660.0, entry_price=entry, mark_price=current)
+    engine._tp_levels["STALE"] = entry * 1.024
+    engine._sl_levels["STALE"] = entry * 0.975
+    engine._entry_timestamps["STALE"] = time.time() - (2 * 3600)  # 2h old
+
+    result = engine.check_triggers("STALE", pos_obj, current)
+    assert result == "TIME_FORCE_EXIT", f"Expected TIME_FORCE_EXIT, got {result}"

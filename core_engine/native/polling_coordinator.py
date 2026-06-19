@@ -32,6 +32,7 @@ class NativePollingConfig:
         position_interval_sec: float = 25.0,
         enable_active_trades_gate: bool = True,
         health_cadence_sec: float = 5.0,
+        position_price_refresh_interval_sec: float = 60.0,
     ):
         """
         Initialize polling configuration.
@@ -42,12 +43,15 @@ class NativePollingConfig:
             position_interval_sec: How often to poll positions (default 25s)
             enable_active_trades_gate: Skip polling if no active trades (default True)
             health_cadence_sec: How often to emit health/status (default 5s)
+            position_price_refresh_interval_sec: Batch REST price fetch for all held symbols (default 60s)
         """
+        self.fills_reconcile_interval_sec: float = 60.0  # cross-check fill prices vs Binance
         self.open_orders_interval_sec = float(open_orders_interval_sec)
         self.balance_interval_sec = float(balance_interval_sec)
         self.position_interval_sec = float(position_interval_sec)
         self.enable_active_trades_gate = bool(enable_active_trades_gate)
         self.health_cadence_sec = float(health_cadence_sec)
+        self.position_price_refresh_interval_sec = float(position_price_refresh_interval_sec)
 
 
 class NativePollingCoordinator:
@@ -93,6 +97,8 @@ class NativePollingCoordinator:
         self._open_orders_task: Optional[asyncio.Task] = None
         self._balance_task: Optional[asyncio.Task] = None
         self._position_task: Optional[asyncio.Task] = None
+        self._position_price_refresh_task: Optional[asyncio.Task] = None
+        self._fills_task: Optional[asyncio.Task] = None
 
         # Timing trackers
         self._startup_ts: float = (
@@ -101,17 +107,23 @@ class NativePollingCoordinator:
         self._last_orders_poll: float = 0.0
         self._last_balance_poll: float = 0.0
         self._last_position_poll: float = 0.0
+        self._last_price_refresh_poll: float = 0.0
+        self._fills_processed: set[int] = set()  # dedup by Binance trade ID (int)
+        self._last_fills_poll: float = 0.0
         self._poll_error_count: dict[str, int] = {
             "orders": 0,
             "balance": 0,
             "positions": 0,
+            "price_refresh": 0,
+            "fills": 0,
         }
 
         self.logger.info(
-            "[PollingCoordinator] Initialized (orders=%.0fs, balance=%.0fs, positions=%.0fs, gate=%s)",
+            "[PollingCoordinator] Initialized (orders=%.0fs, balance=%.0fs, positions=%.0fs, price_refresh=%.0fs, gate=%s)",
             self.config.open_orders_interval_sec,
             self.config.balance_interval_sec,
             self.config.position_interval_sec,
+            self.config.position_price_refresh_interval_sec,
             "enabled" if self.config.enable_active_trades_gate else "disabled",
         )
 
@@ -134,6 +146,8 @@ class NativePollingCoordinator:
             self._open_orders_task = asyncio.create_task(self._poll_open_orders_loop())
             self._balance_task = asyncio.create_task(self._poll_balance_loop())
             self._position_task = asyncio.create_task(self._poll_positions_loop())
+            self._position_price_refresh_task = asyncio.create_task(self._poll_position_prices_loop())
+            self._fills_task = asyncio.create_task(self._poll_fills_loop())
 
             self.logger.info("[PollingCoordinator] All polling loops started")
         except Exception as e:
@@ -150,7 +164,7 @@ class NativePollingCoordinator:
         self._running = False
         self._stop_event.set()
 
-        tasks = [t for t in [self._open_orders_task, self._balance_task, self._position_task] if t]
+        tasks = [t for t in [self._open_orders_task, self._balance_task, self._position_task, self._position_price_refresh_task, self._fills_task] if t]
 
         if tasks:
             try:
@@ -366,16 +380,19 @@ class NativePollingCoordinator:
                 # Also update free_balance_usdt directly for decision engine
                 usdt_balance = float(balances.get("USDT", 0.0))
                 if usdt_balance > 0 and hasattr(self.shared_state, "free_balance_usdt"):
-                    self.shared_state.free_balance_usdt = usdt_balance
-                    # CRITICAL: Update nav_usdt so orchestrator and decision engine use real balance
-                    if hasattr(self.shared_state, "update_nav"):
-                        self.shared_state.update_nav(usdt_balance)
-                    # Set session anchor on first successful sync (if not already set)
-                    if getattr(self.shared_state, "session_anchor_nav", 0.0) <= 0:
-                        self.shared_state.session_anchor_nav = usdt_balance
-                        self.logger.info(
-                            "[PollingCoordinator] Session anchor NAV set: %.2f USDT", usdt_balance
-                        )
+                    # update_balance_map above already sets free_balance_usdt + NAV correctly
+                    # Always reset session anchor on first balance sync of this process.
+                    # This ensures drawdown is measured from today's starting NAV,
+                    # not a stale value persisted from a previous session.
+                    if not getattr(self, "_session_anchor_set", False):
+                        self._session_anchor_set = True
+                        # Anchor is set by orchestrator after startup completes — skip here
+                # Keep OFC telemetry alive — it gates on last_update_ts and elapsed_h freshness
+                if hasattr(self.shared_state, "metrics") and isinstance(self.shared_state.metrics, dict):
+                    _now = time.time()
+                    self.shared_state.metrics["last_update_ts"] = _now
+                    _start = float(getattr(self.shared_state, "_session_start_ts", _now) or _now)
+                    self.shared_state.metrics["session_elapsed_h"] = (_now - _start) / 3600.0
                 self.logger.debug(
                     "[PollingCoordinator] Synced balance from exchange: %.2f USDT", usdt_balance
                 )
@@ -417,14 +434,18 @@ class NativePollingCoordinator:
             price_cache = getattr(self.shared_state, "price_cache", {}) or {}
             updated = 0
             for sym, pos in positions.items():
-                price = float(price_cache.get(sym, 0.0) or 0.0)
-                if price > 0 and hasattr(self.shared_state, "update_position"):
-                    self.shared_state.update_position(
-                        symbol=sym,
-                        qty=float(getattr(pos, "qty", 0.0) or 0.0),
-                        entry=float(getattr(pos, "entry_price", 0.0) or 0.0),
-                        current=price,
-                    )
+                price = float(
+                    price_cache.get(str(sym).upper())
+                    or price_cache.get(sym)
+                    or 0.0
+                )
+                if price > 0:
+                    # Only update mark price — never re-write qty from stale state.
+                    # qty is authoritative from exchange balance reconciliation.
+                    if isinstance(pos, dict):
+                        pos["mark_price"] = price
+                    elif hasattr(pos, "mark_price"):
+                        pos.mark_price = price
                     updated += 1
             if updated:
                 self.logger.debug("[PollingCoordinator] Refreshed %d position marks", updated)
@@ -432,6 +453,204 @@ class NativePollingCoordinator:
             self._mark_throttle_state(e)
             self.logger.debug("[PollingCoordinator] Failed to fetch positions: %s", e)
             raise
+
+    async def _poll_position_prices_loop(self) -> None:
+        """Batch-fetch live prices for all held position symbols every 60s via REST.
+
+        Fills the gap for symbols not covered by WebSocket subscriptions so NAV
+        stays accurate for the full wallet (not just the 10 actively traded symbols).
+        One REST call fetches all symbols at once — minimal API weight.
+        """
+        self.logger.info(
+            "[PollingCoordinator] Position price refresh loop starting (interval=%.0fs)",
+            self.config.position_price_refresh_interval_sec,
+        )
+        try:
+            while self._running:
+                try:
+                    await self._fetch_and_refresh_position_prices()
+                    self._last_price_refresh_poll = time.time()
+                    self._poll_error_count["price_refresh"] = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.logger.debug("[PollingCoordinator] Position price refresh error: %s", e)
+                    self._poll_error_count["price_refresh"] += 1
+
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=self.config.position_price_refresh_interval_sec,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.logger.debug("[PollingCoordinator] Position price refresh loop finished")
+
+    async def _fetch_and_refresh_position_prices(self) -> None:
+        """Fetch live prices for all held positions in one batch REST call."""
+        if not hasattr(self.exchange_client, "get_prices"):
+            return
+        positions = getattr(self.shared_state, "positions", {}) or {}
+        if not positions:
+            return
+
+        symbols = [str(sym).upper() for sym in positions.keys()]
+        try:
+            prices = await self.exchange_client.get_prices(symbols=symbols)
+        except Exception as e:
+            self._mark_throttle_state(e)
+            self.logger.debug("[PollingCoordinator] Batch price fetch failed: %s", e)
+            raise
+
+        if not prices:
+            return
+
+        # Update price_cache with fresh prices
+        price_cache = getattr(self.shared_state, "price_cache", None)
+        if price_cache is not None:
+            price_cache.update(prices)
+
+        # Also call update_price if available (updates prices + price_timestamps)
+        if hasattr(self.shared_state, "update_price"):
+            for sym, price in prices.items():
+                self.shared_state.update_price(sym, price)
+
+        self.logger.info(
+            "[PollingCoordinator] Refreshed live prices for %d position symbols (nav accuracy)",
+            len(prices),
+        )
+
+    async def _poll_fills_loop(self) -> None:
+        """Cross-check fill prices against Binance trade history every 60s.
+
+        Authoritative source: Binance get_my_trades() returns the actual
+        cummulativeQuoteQty/executedQty for each fill — the only reliable avg
+        fill price for market orders (order response price field is "0").
+
+        Only updates entry_price when:
+          - Position entry_price is 0 (never recorded), OR
+          - New fills detected since last poll (trade ID not in dedup set)
+        Never overwrites a valid entry with a worse estimate.
+        """
+        self.logger.info("[PollingCoordinator] Fills reconciliation loop starting (interval=60s)")
+        try:
+            while self._running:
+                try:
+                    if not await self._should_poll():
+                        await asyncio.sleep(1.0)
+                        continue
+                    await self._fetch_and_reconcile_fills()
+                    self._last_fills_poll = time.time()
+                    self._poll_error_count["fills"] = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.logger.debug("[PollingCoordinator] Fills reconciliation error: %s", e)
+                    self._poll_error_count["fills"] += 1
+
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=self.config.fills_reconcile_interval_sec,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.logger.debug("[PollingCoordinator] Fills reconciliation loop finished")
+
+    async def _fetch_and_reconcile_fills(self) -> None:
+        """Fetch recent trades from Binance and reconcile entry prices in shared_state."""
+        if not hasattr(self.exchange_client, "get_account_trades"):
+            return
+        positions = getattr(self.shared_state, "positions", {}) or {}
+        if not positions:
+            return
+
+        for sym in list(positions.keys()):
+            pos = positions.get(sym)
+            if pos is None:
+                continue
+            current_entry = float(
+                pos.get("entry_price", 0.0) if isinstance(pos, dict)
+                else getattr(pos, "entry_price", 0.0)
+            )
+            try:
+                trades = await self.exchange_client.get_account_trades(symbol=str(sym).upper(), limit=20)
+            except Exception as e:
+                self.logger.debug("[PollingCoordinator] get_account_trades(%s) failed: %s", sym, e)
+                continue
+
+            if not trades:
+                continue
+
+            # Find new BUY fills not yet processed
+            new_buys = [
+                t for t in trades
+                if int(t.get("id") or 0) not in self._fills_processed
+                and str(t.get("isBuyer") or t.get("side") or "").upper() in ("TRUE", "BUY", "1")
+            ]
+
+            if not new_buys and current_entry > 0:
+                # Mark all as seen, nothing to update
+                for t in trades:
+                    self._fills_processed.add(int(t.get("id") or 0))
+                continue
+
+            # Compute weighted average fill price from ALL buy trades for this symbol
+            all_buys = [
+                t for t in trades
+                if str(t.get("isBuyer") or t.get("side") or "").upper() in ("TRUE", "BUY", "1")
+            ]
+            if not all_buys:
+                continue
+
+            total_qty = sum(float(t.get("qty") or 0) for t in all_buys)
+            total_cost = sum(float(t.get("qty") or 0) * float(t.get("price") or 0) for t in all_buys)
+            avg_fill_price = total_cost / total_qty if total_qty > 0 else 0.0
+
+            if avg_fill_price <= 0:
+                continue
+
+            # Only update if entry is missing OR a new fill changed the average materially (>0.1%)
+            needs_update = current_entry <= 0 or (
+                new_buys and abs(avg_fill_price - current_entry) / current_entry > 0.001
+            )
+
+            if needs_update:
+                current_qty = float(
+                    pos.get("qty", 0.0) if isinstance(pos, dict)
+                    else getattr(pos, "qty", 0.0)
+                )
+                current_mark = float(
+                    pos.get("mark_price", avg_fill_price) if isinstance(pos, dict)
+                    else getattr(pos, "mark_price", avg_fill_price)
+                )
+                if hasattr(self.shared_state, "update_position"):
+                    self.shared_state.update_position(
+                        symbol=str(sym).upper(),
+                        qty=current_qty,
+                        entry=avg_fill_price,
+                        current=current_mark,
+                    )
+                    self.logger.info(
+                        "[PollingCoordinator:FILLS] %s entry reconciled: %.6f → %.6f (Binance avg fill, %d trades)",
+                        sym, current_entry, avg_fill_price, len(all_buys),
+                    )
+
+            # Mark all fetched trades as processed
+            for t in trades:
+                self._fills_processed.add(int(t.get("id") or 0))
+
+        # Trim dedup set to avoid unbounded growth (keep last 10k IDs)
+        if len(self._fills_processed) > 10000:
+            self._fills_processed = set(sorted(self._fills_processed)[-5000:])
 
     def _mark_throttle_state(self, err: Exception) -> None:
         if not hasattr(self.shared_state, "set_exchange_throttle"):
@@ -454,6 +673,8 @@ class NativePollingCoordinator:
             "open_orders": self._last_orders_poll,
             "balance": self._last_balance_poll,
             "positions": self._last_position_poll,
+            "price_refresh": self._last_price_refresh_poll,
+            "fills": self._last_fills_poll,
         }
 
     def get_error_counts(self) -> dict[str, int]:

@@ -382,6 +382,25 @@ class NativeDecisionEngine:
             min_reserve=self.quote_min_reserve_usdt,
         )
 
+    def _count_active_tradable_positions(self, snapshot: Any) -> int:
+        """Count positions with non-zero qty, excluding BNB dust."""
+        positions = getattr(snapshot, "positions", {}) or {}
+        count = 0
+        for sym, pos in positions.items():
+            qty = float(getattr(pos, "qty", 0) or 0)
+            if qty > 0 and not (sym == "BNBUSDT" and qty * float(getattr(pos, "entry_price", 0) or 0) < 1.0):
+                count += 1
+        return count
+
+    def _is_slot_blocking_position(self, symbol: str, snapshot: Any) -> bool:
+        """Return True if an existing position should block a new BUY slot for this symbol."""
+        positions = getattr(snapshot, "positions", {}) or {}
+        pos = positions.get(symbol)
+        if pos is None:
+            return False
+        qty = float(getattr(pos, "qty", 0) or 0)
+        return qty > 0
+
     def _resolve_mode(self, portfolio: PortfolioSnapshot) -> dict[str, Any]:
         nav = float(portfolio.nav or 0.0)
         mode_name = str(getattr(portfolio, "mode_name", "") or "").upper()
@@ -409,7 +428,7 @@ class NativeDecisionEngine:
         if mode_name == "RECOVERY":
             return {
                 "name": "RECOVERY",
-                "max_positions": 2,
+                "max_positions": 5,
                 "confidence_floor": max(0.50, self.confidence_floor),
                 "max_trade_usdt": max(self.min_notional_usdt, 50.0),
             }
@@ -430,21 +449,21 @@ class NativeDecisionEngine:
         if nav < 100.0:
             return {
                 "name": "BOOTSTRAP",
-                "max_positions": 1,
+                "max_positions": 3,
                 "confidence_floor": max(0.50, self.confidence_floor),
                 "max_trade_usdt": max(self.min_notional_usdt, 20.0),
             }
         if nav < 500.0:
             return {
                 "name": "RECOVERY",
-                "max_positions": 2,
+                "max_positions": 5,
                 "confidence_floor": max(0.50, self.confidence_floor),
                 "max_trade_usdt": max(self.min_notional_usdt, 50.0),
             }
         if nav < 2000.0:
             return {
                 "name": "NORMAL",
-                "max_positions": 3,
+                "max_positions": 5,
                 "confidence_floor": max(0.45, self.confidence_floor - 0.05),
                 "max_trade_usdt": max(self.min_notional_usdt, 150.0),
             }

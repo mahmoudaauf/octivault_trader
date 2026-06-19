@@ -85,14 +85,23 @@ class MLForecaster:
             data = fn(symbol, timeframe)
             if asyncio.iscoroutine(data):
                 data = await data
-            if data:
+            if data and len(data) >= self._atr_min_rows_for_live():
                 return data
+
+        # Lazy REST-fill: the WS prefetch only covers ~10 symbols, so most symbols
+        # have an empty/short 5m buffer. Fetch via REST (TTL-cached) and write it back
+        # into shared_state.market_data so expected-move AND the TP/SL ATR (which reads
+        # the same buffer) become data-driven instead of falling back to defaults.
+        filled = await self._rest_fill_kline_buffer(symbol, timeframe)
+        if filled:
+            return filled
 
         market_data_feed = getattr(self, "market_data_feed", None)
         get_klines = getattr(market_data_feed, "get_klines", None)
         if callable(get_klines):
             try:
-                fetch_limit = max(100, int(getattr(self, "_lookback_max", 160)) + 20)
+                # Use 3000 rows for training; inference uses a smaller slice internally
+                fetch_limit = max(3000, int(getattr(self, "_full_train_target_rows", 3000)) + 50)
                 data = get_klines(symbol, timeframe, fetch_limit)
                 if asyncio.iscoroutine(data):
                     data = await data
@@ -106,6 +115,55 @@ class MLForecaster:
                     exc_info=True,
                 )
         return None
+
+    def _atr_min_rows_for_live(self) -> int:
+        """Minimum rows needed for a trustworthy live expected-move / ATR estimate."""
+        return 20
+
+    async def _rest_fill_kline_buffer(self, symbol: str, timeframe: str):
+        """Fetch klines via REST and cache them into shared_state.market_data.
+
+        Self-heals the candle-data gap: only ~10 symbols get a WS prefetch, so the
+        rest fall back to default expected-move (0.65%) and ATR (0.8%). TTL-cached so
+        we hit REST at most once per TTL per symbol. Returns the buffer or None.
+        """
+        ec = self.exchange_client or getattr(self.market_data_feed, "exchange_client", None)
+        if ec is None or not hasattr(ec, "get_klines"):
+            return None
+        key = (symbol, timeframe)
+        now = time.time()
+        last = self._rest_kline_fetch_ts.get(key, 0.0)
+        ss_md = getattr(self.shared_state, "market_data", None)
+        # Serve the cached buffer while it's still fresh.
+        if (now - last) < self._rest_kline_ttl_s and isinstance(ss_md, dict):
+            cached = ss_md.get(key)
+            if cached and len(cached) >= self._atr_min_rows_for_live():
+                return cached
+        try:
+            raw = await ec.get_klines(symbol, interval=timeframe, limit=self._rest_kline_rows)
+        except Exception as e:
+            self.logger.debug("[%s] REST kline fill failed for %s@%s: %s", self.name, symbol, timeframe, e)
+            return None
+        if not raw or not isinstance(raw, list):
+            return None
+        # Normalize Binance rows [ts,o,h,l,c,v,...] → OHLCV dicts (matches WS buffer format
+        # and what _compute_atr_from_candles / _std_row both accept).
+        candles = []
+        for r in raw:
+            if isinstance(r, (list, tuple)) and len(r) >= 5:
+                candles.append({
+                    "open": float(r[1]), "high": float(r[2]),
+                    "low": float(r[3]), "close": float(r[4]),
+                    "volume": float(r[5]) if len(r) > 5 else 0.0,
+                    "ts": r[0],
+                })
+        if len(candles) < self._atr_min_rows_for_live():
+            return None
+        if isinstance(ss_md, dict):
+            ss_md[key] = candles
+        self._rest_kline_fetch_ts[key] = now
+        self.logger.debug("[%s] REST-filled %d %s candles for %s", self.name, len(candles), timeframe, symbol)
+        return candles
 
     """
     ML-based forecaster that PRODUCES signals and delegates execution to MetaController.
@@ -140,6 +198,13 @@ class MLForecaster:
         self.exchange_client = kwargs.get("exchange_client")
         self.database_manager = kwargs.get("database_manager")
         self.agent_schedule = kwargs.get("agent_schedule")
+        # Lazy REST-fill cache for the live 5m candle buffer. The WS prefetch only
+        # covers ~10 hardcoded symbols on 1m, so the other evaluated symbols have no
+        # 5m buffer and expected-move/ATR silently fall back to defaults. We fill the
+        # buffer on demand via REST and refresh per TTL so both stay data-driven.
+        self._rest_kline_fetch_ts: dict[tuple, float] = {}
+        self._rest_kline_ttl_s: float = float(getattr(config, "ML_REST_KLINE_TTL_S", 150.0) or 150.0)
+        self._rest_kline_rows: int = int(getattr(config, "ML_REST_KLINE_ROWS", 300) or 300)
 
         # Log initialization state
         self.logger.info(
@@ -264,6 +329,23 @@ class MLForecaster:
         self._expected_move_calib_global = 1.0
         self._expected_move_calib_by_regime: dict[str, float] = {}
         self._expected_move_calib_counts: dict[str, int] = {}
+        # ── BUY conviction-persistence gate ────────────────────────────────
+        # Model conviction is spiky: a symbol can read a strong BUY for a single
+        # 5m bar then revert to HOLD next bar (see entries that flipped to
+        # HOLD/SELL minutes after fill). Require a BUY to persist across at least
+        # N evaluations spaced >= min_gap apart (i.e. survive a bar transition)
+        # before emitting, so single-bar spikes don't trigger trades. Data is
+        # cached within a bar, so spacing — not raw cycle count — is what makes
+        # consecutive reads independent. SELLs are never gated (exits stay prompt).
+        self._buy_persist_enabled = self._cfg_bool("ML_BUY_PERSIST_ENABLED", True)
+        self._buy_persist_bars = max(1, int(self._cfg("ML_BUY_PERSIST_BARS", 2) or 2))
+        self._buy_persist_min_gap_s = float(
+            self._cfg("ML_BUY_PERSIST_MIN_GAP_S", 120.0) or 120.0
+        )
+        self._buy_persist_reset_s = float(
+            self._cfg("ML_BUY_PERSIST_RESET_S", 360.0) or 360.0
+        )
+        self._buy_persist: dict[str, dict[str, float]] = {}
         self._sideways_conf_compression_enabled = self._cfg_bool(
             "ML_SIDEWAYS_CONF_COMPRESSION_ENABLED", True
         )
@@ -759,9 +841,13 @@ class MLForecaster:
                         model_manager=self.model_manager,
                     )
                     loop = asyncio.get_running_loop()
+                    _fg_for_train = int(getattr(self.shared_state, "fear_greed_score", None) or 50)
                     ok = bool(
                         await asyncio.wait_for(
-                            loop.run_in_executor(None, trainer.train_model, train_df_copy),
+                            loop.run_in_executor(
+                                None,
+                                lambda: trainer.train_model(train_df_copy, fear_greed_score=_fg_for_train)
+                            ),
                             timeout=max(1.0, float(self.train_timeout_s)),
                         )
                     )
@@ -1210,6 +1296,7 @@ class MLForecaster:
                         model_manager=self.model_manager,
                     )
                     loop = asyncio.get_running_loop()
+                    _fg_for_train2 = int(getattr(self.shared_state, "fear_greed_score", None) or 50)
                     result = await asyncio.wait_for(
                         loop.run_in_executor(
                             None,
@@ -1220,6 +1307,7 @@ class MLForecaster:
                                 max_rows=int(self._full_train_max_rows),
                                 save_model_artifact=False,
                                 return_metrics=True,
+                                fear_greed_score=_fg_for_train2,
                             ),
                         ),
                         timeout=max(1.0, float(self.train_timeout_s)),
@@ -1535,6 +1623,7 @@ class MLForecaster:
                             agent_name=self.name,
                             model_manager=self.model_manager,
                         )
+                        _fg_for_train3 = int(getattr(self.shared_state, "fear_greed_score", None) or 50)
                         result = await asyncio.wait_for(
                             loop.run_in_executor(
                                 None,
@@ -1545,6 +1634,7 @@ class MLForecaster:
                                     max_rows=int(tier_max_rows),
                                     save_model_artifact=False,
                                     return_metrics=True,
+                                    fear_greed_score=_fg_for_train3,
                                 ),
                             ),
                             timeout=timeout_s,
@@ -2045,53 +2135,53 @@ class MLForecaster:
         self, base_confidence: float, expected_move_pct: float
     ) -> float:
         """
-        PHASE 2: Magnitude-aware confidence scoring.
+        Magnitude-aware confidence — NON-SATURATING (calibration-preserving).
 
-        Boosts confidence based on magnitude of expected move relative to threshold.
-        Model learns magnitude implicitly through this feedback mechanism.
+        The previous multiplicative form (base × min(1.5, 1+factor)) drove every
+        signal whose expected move exceeded 0.15% to clip at 1.0, collapsing the
+        model's real conviction spread (0.65…0.83 all → 1.00). That broke:
+          • ranking (all edge_scores equal), and
+          • position-sizing tiers (everything got the top 1.5× tier).
 
-        Formula: adjusted_conf = base_conf * min(1.0 + magnitude_factor, MAX_BOOST)
-        Where magnitude_factor = (expected_move_pct - threshold) / threshold
+        New form tilts confidence within its *remaining headroom* so it stays
+        strictly monotonic in base_confidence and can never saturate to 1.0:
 
-        Example:
-        - threshold=0.15%, expected_move=0.15% → magnitude_factor=0.0 → adjusted=base_conf
-        - threshold=0.15%, expected_move=0.30% → magnitude_factor=1.0 → adjusted=base_conf*1.5
-        - threshold=0.15%, expected_move=0.45% → magnitude_factor=2.0 → capped at base_conf*2.0
+            bonus    = max_bonus · clip((move − thr) / (sat_move − thr), 0, 1)
+            adjusted = base + bonus · (1 − base)
+
+        Properties:
+          • d(adjusted)/d(base) = 1 − bonus > 0  → preserves the model's ordering
+          • higher expected move ⇒ larger bonus  → magnitude tilt retained
+          • adjusted < 1 always                   → no saturation, spread preserved
+          • strong signals stay high (≈0.85–0.90) so downstream gate_2 still clears
         """
         if not self._cfg("ML_MAGNITUDE_CONFIDENCE_ENABLED", True):
             return float(base_confidence)
 
         try:
-            base_threshold = float(self._cfg("ML_MAGNITUDE_BASE_THRESHOLD", 0.0015) or 0.0015)
-            multiplier = float(self._cfg("ML_MAGNITUDE_MULTIPLIER", 1.5) or 1.5)
+            base = max(0.0, min(1.0, float(base_confidence)))
+            thr = float(self._cfg("ML_MAGNITUDE_BASE_THRESHOLD", 0.0015) or 0.0015)
+            # Move at which the magnitude tilt is fully applied (default 2%).
+            sat_move = float(self._cfg("ML_MAGNITUDE_SATURATION_MOVE", 0.02) or 0.02)
+            # Maximum headroom fraction the tilt can consume (default 0.35).
+            max_bonus = float(self._cfg("ML_MAGNITUDE_MAX_BONUS", 0.35) or 0.35)
 
-            # Ensure we have positive expected move
             move = float(expected_move_pct or 0.0)
-            if move <= base_threshold:
-                return float(base_confidence)  # No boost if below threshold
+            if move <= thr or sat_move <= thr:
+                return base  # no magnitude information to add
 
-            # Calculate magnitude factor (how much move exceeds threshold)
-            magnitude_factor = (move - base_threshold) / max(base_threshold, 1e-9)
-
-            # Boost confidence (capped at 2.0x multiplier to avoid extreme confidence)
-            boost = min(multiplier, 1.0 + magnitude_factor)
-            adjusted_conf = float(base_confidence) * float(boost)
-
-            # Clip to valid range [0, 1]
-            adjusted_conf = max(0.0, min(1.0, adjusted_conf))
+            frac = (move - thr) / (sat_move - thr)
+            frac = max(0.0, min(1.0, frac))
+            bonus = max_bonus * frac
+            adjusted = base + bonus * (1.0 - base)
+            # Hard cap just below 1.0 so confidence is never reported as saturated.
+            adjusted = max(0.0, min(0.99, adjusted))
 
             self.logger.debug(
-                "[%s] magnitude_aware_conf: base=%.3f move=%.5f threshold=%.5f factor=%.2f boost=%.2f adjusted=%.3f",
-                self.name,
-                base_confidence,
-                move,
-                base_threshold,
-                magnitude_factor,
-                boost,
-                adjusted_conf,
+                "[%s] magnitude_aware_conf(headroom): base=%.3f move=%.5f frac=%.2f bonus=%.3f adjusted=%.3f",
+                self.name, base, move, frac, bonus, adjusted,
             )
-
-            return float(adjusted_conf)
+            return float(adjusted)
         except Exception as e:
             self.logger.debug("[%s] magnitude_aware_confidence failed: %s", self.name, e)
             return float(base_confidence)
@@ -3300,28 +3390,72 @@ class MLForecaster:
             )
             return
 
-        # Model accuracy gate: block BUY signals from symbols whose effective model accuracy
-        # is below the minimum threshold (default 0.55). Uses retrain summary as source of truth
-        # (metadata files can be stale if a worse model was trained but old model restored).
+        # Conviction-persistence gate (BUY only): require the BUY to recur across
+        # >= _buy_persist_bars evaluations spaced >= _buy_persist_min_gap_s apart, so
+        # a single-bar conviction spike (which tends to revert next bar) does not fire
+        # a trade. A lapse longer than _buy_persist_reset_s restarts the streak.
+        if action.upper() == "BUY" and self._buy_persist_enabled:
+            now_ts = time.time()
+            st = self._buy_persist.get(symbol)
+            if st is None or (now_ts - st["last_ts"]) > self._buy_persist_reset_s:
+                streak, last_ts = 1, now_ts
+            elif (now_ts - st["last_ts"]) >= self._buy_persist_min_gap_s:
+                streak, last_ts = int(st["streak"]) + 1, now_ts
+            else:
+                # Same bar window — no independent confirmation; hold streak/timestamp.
+                streak, last_ts = int(st["streak"]), st["last_ts"]
+            self._buy_persist[symbol] = {"streak": float(streak), "last_ts": last_ts}
+            if streak < self._buy_persist_bars:
+                self.logger.info(
+                    "[%s] PERSIST_GATE %s BUY held: streak=%d/%d (conf=%.3f) — "
+                    "awaiting confirmation across bars",
+                    self.name, symbol, streak, self._buy_persist_bars, float(confidence),
+                )
+                return
+
+        # Model accuracy gate: block BUY signals from symbols whose model val_accuracy
+        # is below the minimum threshold (default 0.55). Reads pkl metadata as primary source;
+        # falls back to retrain summary if pkl unavailable.
         if action.upper() == "BUY":
             _min_model_acc = float(self._cfg("ML_MIN_MODEL_ACCURACY", 0.55) or 0.55)
             try:
+                import pickle as _pickle
                 import json as _json
                 from pathlib import Path as _Path
 
-                _summary = _Path("logs/retrain_weekly_last.json")
-                if _summary.exists():
-                    _data = _json.loads(_summary.read_text())
-                    _acc_map = {
-                        r["symbol"]: r["new_acc"] if r.get("swapped") else r["old_acc"]
-                        for r in _data.get("results", [])
-                    }
-                    _model_acc = _acc_map.get(symbol)
-                    if _model_acc is not None and float(_model_acc) < _min_model_acc:
-                        self.logger.warning(
-                            f"[{self.name}] MODEL_ACC_BLOCK {symbol}: effective accuracy {_model_acc:.3f} < min {_min_model_acc:.3f} — BUY suppressed"
+                _model_acc = None
+                # Primary: read val_accuracy from pkl metadata (authoritative)
+                _meta_path = _Path("models") / f"mlforecaster_{symbol}_5m_metadata.pkl"
+                if _meta_path.exists():
+                    try:
+                        with open(_meta_path, "rb") as _f:
+                            _meta = _pickle.load(_f)
+                        _model_acc = float(
+                            _meta.get("model_val_accuracy")
+                            or (_meta.get("training_metrics") or {}).get("val_accuracy")
+                            or 0.0
                         )
-                        return
+                    except Exception:
+                        _model_acc = None
+
+                # Fallback: retrain summary
+                if _model_acc is None:
+                    _summary = _Path("logs/retrain_weekly_last.json")
+                    if _summary.exists():
+                        _data = _json.loads(_summary.read_text())
+                        _acc_map = {
+                            r["symbol"]: r["new_acc"] if r.get("swapped") else r["old_acc"]
+                            for r in _data.get("results", [])
+                        }
+                        _v = _acc_map.get(symbol)
+                        if _v is not None:
+                            _model_acc = float(_v)
+
+                if _model_acc is not None and _model_acc < _min_model_acc:
+                    self.logger.warning(
+                        f"[{self.name}] MODEL_ACC_BLOCK {symbol}: val_accuracy {_model_acc:.3f} < min {_min_model_acc:.3f} — BUY suppressed"
+                    )
+                    return
             except Exception:
                 pass
 
@@ -3414,14 +3548,36 @@ class MLForecaster:
                 )
             required_conf = compressed_floor
 
-        inst_ok, inst_required_conf, inst_reason = self._institutional_regime_gate(
-            action=action,
-            regime=regime,
-            confidence=float(confidence),
-            required_conf=float(required_conf),
-            expected_move_pct=float(expected_move_pct),
-            round_trip_cost_ev_pct=float(round_trip_cost_ev_pct),
-        )
+        # Buffett-approved signals (fear + high-conviction) relax the institutional
+        # *confidence* floor — the Buffett filter already applied a stricter conf
+        # threshold (≥0.65). BUT they must still clear a minimum expected-move floor:
+        # a high-conviction signal whose expected move can't cover the round-trip cost
+        # books gross "wins" that are net losses after fees. So we keep the conf
+        # relaxation but enforce a (lighter than institutional) move floor even here.
+        _buffett_bypass = bool((extras or {}).get("_buffett_approved", False))
+        if _buffett_bypass:
+            _buffett_ev_mult = float(self._cfg("ML_BUFFETT_MIN_EV_MULT", 1.8) or 1.8)
+            _buffett_min_move = max(0.0, float(round_trip_cost_ev_pct) * _buffett_ev_mult)
+            if float(expected_move_pct or 0.0) < _buffett_min_move:
+                inst_ok = False
+                inst_required_conf = float(required_conf)
+                inst_reason = (
+                    f"buffett_move_floor:{float(expected_move_pct or 0.0):.5f}"
+                    f"<{_buffett_min_move:.5f}"
+                )
+            else:
+                inst_ok, inst_required_conf, inst_reason = (
+                    True, float(required_conf), "buffett_bypass",
+                )
+        else:
+            inst_ok, inst_required_conf, inst_reason = self._institutional_regime_gate(
+                action=action,
+                regime=regime,
+                confidence=float(confidence),
+                required_conf=float(required_conf),
+                expected_move_pct=float(expected_move_pct),
+                round_trip_cost_ev_pct=float(round_trip_cost_ev_pct),
+            )
         required_conf = max(float(required_conf), float(inst_required_conf))
         if not inst_ok:
             self.logger.info(
@@ -4139,11 +4295,60 @@ class MLForecaster:
             f"[{self.name}] Filters: Sentiment={sentiment:.2f}, VolatilityRegime={regime}, CoT='{cot_txt}', CoT_Numeric={cot_num}"
         )
 
-        if (sentiment < -0.5) or (regime in {"high_vol", "bear"}) or (cot_num < 0):
+        # Buffett contrarian hybrid: in fear, size down rather than block outright.
+        #   confirmed BTC reversal → buy the dip at lower floor (0.38), full size
+        #   no reversal, conf ≥ 0.65 → buy strongest signals only, HALF size (allocator halves)
+        #   else → hold (protect capital)
+        # Fear-time position sizing is applied globally by the capital allocator using
+        # shared_state.btc_reversal_confirmed (BTC reversal is a market-wide signal).
+        _buffett_override = False
+        if sentiment <= -0.5:  # F&G ≤ 25 (fear or extreme fear)
+            _btc_rev = False
+            try:
+                _fg_fetcher = getattr(self.shared_state, "_fear_greed_fetcher", None)
+                if _fg_fetcher is not None and hasattr(_fg_fetcher, "_btc_confirmed_reversal"):
+                    _btc_rev = await _fg_fetcher._btc_confirmed_reversal()
+            except Exception:
+                _btc_rev = bool(getattr(self.shared_state, "btc_reversal_confirmed", False))
+            _fg_disp = getattr(self.shared_state, "fear_greed_score", "?")
+            if _btc_rev:
+                # Reversal confirmed → buy the dip at reduced floor, full size
+                if action == "buy" and confidence >= 0.38:
+                    _buffett_override = True
+                    self.logger.info(
+                        f"[{self.name}] 🦁 Buffett contrarian: F&G={_fg_disp} + BTC reversal 🟢🟢 "
+                        f"→ BUY full size (conf={confidence:.2f} ≥ 0.38)"
+                    )
+                else:
+                    action = "hold"
+                    self.logger.info(
+                        f"[{self.name}] Fear + reversal but conf {confidence:.2f} < 0.38 — hold"
+                    )
+            else:
+                # No reversal → only highest-conviction signals, half size (allocator halves)
+                if action == "buy" and confidence >= 0.65:
+                    self.logger.info(
+                        f"[{self.name}] Fear (F&G={_fg_disp}), no BTC reversal — high-conviction "
+                        f"BUY at HALF size (conf={confidence:.2f} ≥ 0.65)"
+                    )
+                elif action == "buy":
+                    action = "hold"
+                    self.logger.info(
+                        f"[{self.name}] Fear (F&G={_fg_disp}), no reversal, conf {confidence:.2f} < 0.65 "
+                        f"— hold (protect capital)"
+                    )
+                else:
+                    # model itself said hold/sell — leave as-is
+                    self.logger.info(
+                        f"[{self.name}] Fear (F&G={_fg_disp}) — model action={action} (conf={confidence:.2f}), no buy"
+                    )
+        elif (sentiment > 0.8) or (regime in {"high_vol", "bear"}) or (cot_num < 0):
+            # Extreme greed is also risky; high-vol/bear regimes block entry
             action = "hold"
 
         self.logger.info(
             f"[{self.name}] Final decision for {cur_sym} => Action: {action.upper()}, Confidence: {confidence:.2f}"
+            + (" [BUFFETT_CONTRARIAN]" if _buffett_override else "")
         )
 
         # Store a brief CoT/debug explanation for UI/debuggers
@@ -4200,6 +4405,10 @@ class MLForecaster:
                 "_feature_mode": str(feature_mode),
                 "_feature_dim": int(feature_dim),
                 "_model_schema": str(schema),
+                "_buffett_approved": _buffett_override or (
+                    action == "buy" and sentiment <= -0.5
+                    and confidence >= 0.65
+                ),
             },
         )
 

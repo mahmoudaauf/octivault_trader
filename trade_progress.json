@@ -1,0 +1,17 @@
+{
+  "updated": "2026-06-15 00:39:48",
+  "target_trades": 50,
+  "total_trades": 9,
+  "round_trip_fee_pct": 0.38,
+  "wins": 3,
+  "losses": 6,
+  "flat": 0,
+  "win_rate": 0.3333,
+  "net_wins": 1,
+  "net_losses": 8,
+  "net_win_rate": 0.1111,
+  "cum_gross_pnl_usdt": -0.2803,
+  "cum_net_pnl_usdt": -0.5377,
+  "remaining_to_target": 41,
+  "target_reached": false
+}

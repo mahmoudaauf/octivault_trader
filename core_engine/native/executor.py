@@ -16,7 +16,9 @@ Design choices
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -72,15 +74,27 @@ class NativeExecutor:
         exchange_client: Optional[Any] = None,
         shared_state: Optional[Any] = None,
         balance_validator: Optional[NativeBalanceValidator] = None,
+        trade_journal: Optional[Any] = None,
+        tp_sl_engine: Optional[Any] = None,
     ) -> None:
         self._order_exec = order_execution
         self._market_data = market_data  # for price lookups when decision.quantity is in USD
         self._exchange_client = exchange_client  # for symbol filters (LOT_SIZE, MIN_NOTIONAL)
         self._shared_state = shared_state
         self._balance_validator = balance_validator
+        self._trade_journal = trade_journal
+        self._tp_sl_engine = tp_sl_engine
         self._executed_ids: set[str] = set()  # dedup tracking
         self._symbol_locks: dict[str, float] = {}  # symbol → last execution ts
         self._symbol_filters_cache: dict[str, dict[str, Any]] = {}  # symbol → filters
+        # Reject a BUY when the cached price is older than this (seconds). A stale
+        # price corrupts both order sizing and the SL anchor → instant phantom stop-outs.
+        import os as _os
+
+        self._price_max_age_s: float = float(_os.getenv("PRICE_MAX_AGE_S") or 30.0)
+        # If the cached price deviates from a fresh REST quote by more than this
+        # fraction, treat it as stale and use the REST price for sizing/entry.
+        self._price_max_deviation: float = float(_os.getenv("PRICE_MAX_DEVIATION") or 0.015)
 
     # ──────────────────────────────────────────────────────────────────
     # Main API
@@ -192,6 +206,87 @@ class NativeExecutor:
     # ──────────────────────────────────────────────────────────────────
     # Order placement
     # ──────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _raw_executed_qty(order: Any) -> float:
+        """Authoritative filled base qty. refresh_status updates `raw` but not
+        `executed_qty`, so read the fresh raw first, then fall back to the field."""
+        try:
+            rq = float((getattr(order, "raw", {}) or {}).get("executedQty", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            rq = 0.0
+        eq = float(getattr(order, "executed_qty", None) or 0.0)
+        return max(rq, eq)
+
+    async def _maker_first_buy(
+        self, symbol: str, qty: float, ref_price: float, coid: str
+    ) -> Any:
+        """Try a maker (LIMIT) BUY just below ``ref_price`` for a short grace window to
+        save the taker fee, then fall back to MARKET for fill certainty.
+
+        Safety: never double-buys. On a *partial* maker fill we keep the partial (the
+        downstream registers the real executed qty); only on a *zero* fill do we
+        market-buy the full qty. A cancel/fill race is resolved by re-reading the
+        executed qty after cancel. Returns an OrderResult-compatible object.
+        """
+        enabled = str(os.getenv("MAKER_ENTRY_ENABLED", "true")).lower() in (
+            "1", "true", "yes", "on",
+        )
+        grace_s = float(os.getenv("MAKER_GRACE_S", "2.0") or 2.0)
+        offset_bps = float(os.getenv("MAKER_OFFSET_BPS", "1.0") or 1.0)
+        # Disabled / no usable price → plain market order (today's behaviour).
+        if not enabled or grace_s <= 0 or ref_price <= 0 or qty <= 0:
+            return await self._order_exec.place_market_buy(symbol, qty, client_order_id=coid)
+
+        mk_coid = (coid + "-mk")[:36]
+        limit_px = ref_price * (1.0 - offset_bps / 10000.0)
+        lr = await self._order_exec.place_limit_buy(symbol, qty, limit_px, client_order_id=coid)
+        if not lr.success:
+            logger.info("[Executor] maker limit place failed for %s — market fallback", symbol)
+            return await self._order_exec.place_market_buy(symbol, qty, client_order_id=mk_coid)
+
+        # Give the resting limit a brief window to fill as maker.
+        await asyncio.sleep(grace_s)
+        try:
+            st = await self._order_exec.refresh_status(symbol, lr.client_order_id)
+        except Exception as e:
+            logger.debug("[Executor] maker refresh_status failed for %s: %s", symbol, e)
+            st = lr
+        executed = self._raw_executed_qty(st)
+        if executed >= qty * 0.999 or str(getattr(st, "status", "")).upper() == "FILLED":
+            logger.info(
+                "[Executor] ✅ maker fill %s qty=%.6f @ ~%.6f (saved taker fee)",
+                symbol, executed or qty, limit_px,
+            )
+            return st
+
+        # Not fully filled within grace → cancel the resting order, then resolve the
+        # final executed qty (cancel may race a fill).
+        try:
+            await self._order_exec.cancel(symbol, lr.client_order_id)
+        except Exception as e:
+            logger.debug("[Executor] maker cancel failed for %s: %s", symbol, e)
+        final_exec = executed
+        try:
+            fs = await self._order_exec.refresh_status(symbol, lr.client_order_id)
+            final_exec = max(final_exec, self._raw_executed_qty(fs))
+        except Exception:
+            fs = st
+        if final_exec >= qty * 0.999:
+            logger.info("[Executor] maker filled during cancel race %s qty=%.6f", symbol, final_exec)
+            return fs
+        if final_exec > 0:
+            # Partial maker fill — keep it; do NOT market the remainder (avoids double-buy).
+            logger.info(
+                "[Executor] partial maker fill %s: kept %.6f of %.6f (no taker remainder)",
+                symbol, final_exec, qty,
+            )
+            return fs
+        # Zero fill → market-buy the full qty (taker fallback).
+        logger.info(
+            "[Executor] maker unfilled %s after %.1fs — market fallback (taker)", symbol, grace_s
+        )
+        return await self._order_exec.place_market_buy(symbol, qty, client_order_id=mk_coid)
+
     async def _place_order(self, decision: Decision, result: ExecutionResult) -> ExecutionResult:
         """Place a new order (BUY)."""
         from core_engine.native.decisions import Action
@@ -209,6 +304,15 @@ class NativeExecutor:
                 price = self._market_data.get_price(decision.symbol)
             except Exception as e:
                 logger.warning("price lookup failed for %s: %s", decision.symbol, e)
+
+        # ── Price-freshness guard ──────────────────────────────────────────
+        # A stale cached price corrupts order sizing AND the SL anchor, causing
+        # instant phantom stop-outs against the real market. If the cached price
+        # is too old, refresh it via REST; reject the BUY if we still can't get a
+        # fresh, agreeing price.
+        price = await self._ensure_fresh_price(decision.symbol, price, result)
+        if result.status == ExecutionStatus.TERMINAL:
+            return result
 
         self._sync_balance_validator()
         if self._balance_validator is not None:
@@ -229,11 +333,18 @@ class NativeExecutor:
                 "converted USD %.2f → %.6f @ $%.2f", decision.quantity, qty_to_place, price
             )
         else:
-            logger.debug(
-                "price unavailable for %s; treating decision quantity %.6f as executable base qty",
+            # decision.quantity is a USD quote intent; without a price we cannot
+            # convert it to a base quantity safely. Treating the USD figure as base
+            # qty would place a wildly mis-sized order (e.g. $6 → 6 base units), so
+            # reject and let the next cycle retry once a price is available.
+            result.status = ExecutionStatus.TERMINAL
+            result.error = f"BUY rejected: price unavailable for {decision.symbol}, cannot size order"
+            logger.warning(
+                "❌ BUY rejected (no price): %s quote=$%.2f — cannot convert to base qty",
                 decision.symbol,
-                decision.quantity,
+                float(decision.quantity or 0.0),
             )
+            return result
 
         # Layer 2: Validate LOT_SIZE and MIN_NOTIONAL constraints
         if price and price > 0:
@@ -253,11 +364,14 @@ class NativeExecutor:
                 return result
             qty_to_place = corrected_qty  # Use step-size aligned quantity
 
-        # Simple market order: BUY
-        order_result = await self._order_exec.place_market_buy(
+        # Maker-first BUY: try a resting LIMIT at/just-below price to save the taker
+        # fee, with a MARKET fallback for fill certainty. Falls back to market if maker
+        # is disabled or unavailable.
+        order_result = await self._maker_first_buy(
             decision.symbol,
             qty_to_place,
-            client_order_id=decision.decision_id,  # idempotency key
+            float(price or 0.0),
+            decision.decision_id,  # idempotency key for the limit leg
         )
 
         result.raw = order_result.raw
@@ -285,6 +399,58 @@ class NativeExecutor:
                 qty_to_place,
                 getattr(order_result, "status", "accepted"),
             )
+            # Real volume-weighted fill price from the exchange response — never the
+            # pre-trade cached price (which may be stale and misanchor the SL).
+            fill_price = float(
+                getattr(order_result, "avg_price", None)
+                or getattr(order_result, "price", None)
+                or price
+                or 0.0
+            )
+            if fill_price <= 0:
+                fill_price = float(price or 0.0)
+            # Use the ACTUAL executed quantity (partial fills leave us holding less than
+            # requested). Registering the requested qty over-states the position and
+            # triggers -2010 on the eventual sell. Fall back to requested if unavailable.
+            filled_qty = float(getattr(order_result, "executed_qty", None) or qty_to_place)
+            if abs(filled_qty - qty_to_place) > qty_to_place * 0.001:
+                logger.info(
+                    "[Executor] %s partial/adjusted fill: requested %.6f, executed %.6f",
+                    decision.symbol, qty_to_place, filled_qty,
+                )
+            # Register position immediately — fill_tracker is None in polling mode,
+            # so executor is the only place that can write this synchronously.
+            if self._shared_state is not None and hasattr(self._shared_state, "update_position"):
+                current_pos = self._shared_state.get_position(decision.symbol) if hasattr(self._shared_state, "get_position") else None
+                if current_pos is not None:
+                    old_qty = float(getattr(current_pos, "qty", 0.0) or 0.0)
+                    old_entry = float(getattr(current_pos, "entry_price", 0.0) or 0.0)
+                    new_qty = old_qty + filled_qty
+                    avg_entry = ((old_qty * old_entry) + (filled_qty * fill_price)) / new_qty if new_qty > 0 else fill_price
+                    self._shared_state.update_position(decision.symbol, new_qty, avg_entry, fill_price)
+                else:
+                    self._shared_state.update_position(decision.symbol, filled_qty, fill_price, fill_price)
+                logger.info(
+                    "[Executor] Position registered: %s qty=%.2f entry=%.8f",
+                    decision.symbol, filled_qty, fill_price,
+                )
+                # Arm TP/SL immediately so time-based and trailing logic starts from fill
+                if self._tp_sl_engine is not None and hasattr(self._tp_sl_engine, "arm_position"):
+                    try:
+                        import time as _time
+                        self._tp_sl_engine.arm_position(decision.symbol, fill_price, entry_ts=_time.time())
+                    except Exception as _tpsl_err:
+                        logger.debug("[Executor] TP/SL arm failed (non-fatal): %s", _tpsl_err)
+            if self._trade_journal is not None:
+                import asyncio as _asyncio
+                _asyncio.ensure_future(self._trade_journal.record("BUY_FILLED", {
+                    "symbol": decision.symbol,
+                    "qty": filled_qty,
+                    "price": fill_price or price or 0.0,
+                    "quote_qty": decision.quantity,
+                    "order_id": result.exchange_order_id,
+                    "reason": getattr(decision, "reason", ""),
+                }))
         else:
             # Exchange rejected the order
             logger.warning(
@@ -310,10 +476,62 @@ class NativeExecutor:
             result.error = "expected CLOSE action"
             return result
 
+        # Round quantity to step size before sending to exchange
+        qty_to_sell = decision.quantity
+        # Full-balance sell: prefer the REAL exchange-held base balance over the tracked
+        # decision.quantity so we don't orphan a dust remainder from tracked-vs-real drift
+        # (e.g. ADA sold 58.1 of a tracked 58.2, leaving 0.1 dust). Only override when the
+        # real balance is positive and within 5% of the tracked qty — a larger gap means a
+        # stale balance poll, so we trust the tracked qty instead of selling a wrong amount.
+        try:
+            _real_bal = self._real_base_balance(decision.symbol)
+            if _real_bal > 0 and qty_to_sell > 0:
+                _drift = abs(_real_bal - qty_to_sell) / qty_to_sell
+                if _drift <= 0.05:
+                    if _real_bal != qty_to_sell:
+                        logger.info(
+                            "[Executor] full-balance sell %s: tracked=%.8f → real=%.8f (drift=%.2f%%)",
+                            decision.symbol, qty_to_sell, _real_bal, _drift * 100.0,
+                        )
+                    qty_to_sell = _real_bal
+        except Exception as _e:
+            logger.debug("[Executor] full-balance sell lookup failed for %s: %s", decision.symbol, _e)
+        sell_price = 0.0
+        if self._market_data is not None:
+            try:
+                sell_price = float(self._market_data.get_price(decision.symbol) or 0.0)
+            except Exception:
+                pass
+        if sell_price <= 0 and self._shared_state is not None:
+            try:
+                sell_price = float(
+                    getattr(self._shared_state, "price_cache", {}).get(decision.symbol, 0.0) or 0.0
+                )
+            except Exception:
+                pass
+        if sell_price <= 0:
+            result.status = ExecutionStatus.TERMINAL
+            result.error = f"SELL rejected: price unavailable for {decision.symbol}, cannot verify MIN_NOTIONAL"
+            logger.warning("❌ SELL rejected (no price): %s qty=%.8f", decision.symbol, qty_to_sell)
+            return result
+        valid, error_msg, corrected_qty = await self._validate_lot_size(
+            decision.symbol, qty_to_sell, price=sell_price
+        )
+        if not valid:
+            result.status = ExecutionStatus.TERMINAL
+            result.error = f"LOT_SIZE validation failed (SELL): {error_msg}"
+            logger.warning(
+                "❌ SELL rejected (LOT_SIZE): %s qty=%.8f reason=%s",
+                decision.symbol, decision.quantity, error_msg,
+            )
+            return result
+        if corrected_qty > 0:
+            qty_to_sell = corrected_qty
+
         # Market sell
         order_result = await self._order_exec.place_market_sell(
             decision.symbol,
-            decision.quantity,
+            qty_to_sell,
             client_order_id=decision.decision_id,
         )
 
@@ -337,13 +555,109 @@ class NativeExecutor:
                         symbol=decision.symbol,
                         order_id=decision.decision_id,
                     )
-            if self._shared_state is not None and hasattr(
-                self._shared_state, "release_quote_reservation"
-            ):
-                self._shared_state.release_quote_reservation("USDT", decision.decision_id)
+            if self._shared_state is not None:
+                if hasattr(self._shared_state, "release_quote_reservation"):
+                    self._shared_state.release_quote_reservation("USDT", decision.decision_id)
+                # Clear position from state — balance polling will re-hydrate if any remainder
+                if hasattr(self._shared_state, "close_position"):
+                    # Capture entry price BEFORE clearing so we can log realized P&L.
+                    _entry_px = 0.0
+                    try:
+                        _cur_pos = (
+                            self._shared_state.get_position(decision.symbol)
+                            if hasattr(self._shared_state, "get_position")
+                            else None
+                        )
+                        _entry_px = float(
+                            getattr(_cur_pos, "entry_price", None)
+                            or (_cur_pos.get("entry_price", 0) if isinstance(_cur_pos, dict) else 0)
+                            or 0.0
+                        )
+                    except Exception:
+                        _entry_px = 0.0
+                    self._shared_state.close_position(decision.symbol)
+                    if _entry_px > 0 and sell_price > 0:
+                        _qty = float(qty_to_sell or 0.0)
+                        _gross_pnl = (sell_price - _entry_px) * _qty
+                        _pnl_pct = (sell_price / _entry_px - 1.0) * 100.0
+                        _outcome = "WIN" if _gross_pnl > 0 else ("LOSS" if _gross_pnl < 0 else "FLAT")
+                        logger.info(
+                            "[Executor] TRADE_CLOSED %s %s entry=%.8f exit=%.8f qty=%.8f "
+                            "gross_pnl=%.4f USDT pnl_pct=%.3f%% reason=%s",
+                            decision.symbol, _outcome, _entry_px, sell_price, _qty,
+                            _gross_pnl, _pnl_pct, getattr(decision, "reason", ""),
+                        )
+                    else:
+                        logger.info(
+                            "[Executor] SELL %s filled — position cleared from state "
+                            "(realized P&L unavailable: entry=%.8f exit=%.8f)",
+                            decision.symbol, _entry_px, sell_price,
+                        )
+            # P1: Atomic TP/SL cleanup — clear registries immediately on SELL fill,
+            # don't wait for fill_tracker (5s lag can allow ghost to be written to disk).
+            if self._tp_sl_engine is not None:
+                try:
+                    self._tp_sl_engine.close_position_tracking(decision.symbol)
+                except Exception as _e:
+                    logger.debug("[Executor] close_position_tracking failed for %s: %s", decision.symbol, _e)
+            if self._trade_journal is not None:
+                import asyncio as _asyncio
+                _asyncio.ensure_future(self._trade_journal.record("SELL_FILLED", {
+                    "symbol": decision.symbol,
+                    "qty": qty_to_sell,
+                    "price": sell_price,
+                    "order_id": result.exchange_order_id,
+                    "reason": getattr(decision, "reason", ""),
+                }))
         else:
-            result.status = ExecutionStatus.RETRYABLE
-            result.error = order_result.error
+            error_str = str(order_result.error or "")
+            # -2010 = insufficient balance. This does NOT always mean the position is
+            # gone — it also fires when our tracked qty is slightly stale (rounding,
+            # locked balance, dust). Blindly removing the position orphans a real
+            # holding: it then has no TP/SL and vanishes from NAV. So re-check the
+            # actual exchange balance before deciding.
+            if "-2010" in error_str or "insufficient balance" in error_str.lower():
+                result.status = ExecutionStatus.TERMINAL
+                real_qty = self._real_base_balance(decision.symbol)
+                sell_px = 0.0
+                if self._market_data is not None:
+                    try:
+                        sell_px = float(self._market_data.get_price(decision.symbol) or 0.0)
+                    except Exception:
+                        sell_px = 0.0
+                real_notional = real_qty * sell_px if sell_px > 0 else real_qty
+                # Treat as truly closed only if the asset is effectively gone (dust).
+                gone = (real_qty <= 1e-8) or (sell_px > 0 and real_notional < 1.0)
+                if gone:
+                    if self._shared_state is not None and hasattr(self._shared_state, "close_position"):
+                        self._shared_state.close_position(decision.symbol)
+                        logger.warning(
+                            "[Executor] SELL %s -2010 and balance≈0 (qty=%.8f) — confirmed cleared, removing",
+                            decision.symbol, real_qty,
+                        )
+                elif self._shared_state is not None and hasattr(self._shared_state, "update_position"):
+                    # Still held — correct the tracked qty to the real balance and KEEP it
+                    # managed so TP/SL keeps watching it (preserve the original entry price).
+                    cur = self._shared_state.get_position(decision.symbol) if hasattr(self._shared_state, "get_position") else None
+                    entry = float(getattr(cur, "entry_price", None) or (cur.get("entry_price", 0) if isinstance(cur, dict) else 0) or sell_px or 0.0)
+                    self._shared_state.update_position(decision.symbol, real_qty, entry or sell_px, sell_px or entry)
+                    if self._tp_sl_engine is not None and hasattr(self._tp_sl_engine, "arm_position") and (entry or sell_px) > 0:
+                        try:
+                            import time as _time
+                            self._tp_sl_engine.arm_position(decision.symbol, entry or sell_px, entry_ts=_time.time())
+                        except Exception:
+                            pass
+                    logger.warning(
+                        "[Executor] SELL %s -2010 but still held (qty=%.8f ~$%.2f) — qty re-synced, kept managed",
+                        decision.symbol, real_qty, real_notional,
+                    )
+            else:
+                result.status = ExecutionStatus.RETRYABLE
+            result.error = error_str
+            logger.warning(
+                "[Executor] SELL failed for %s qty=%.6f: %s",
+                decision.symbol, decision.quantity, error_str,
+            )
 
         return result
 
@@ -462,6 +776,80 @@ class NativeExecutor:
         """Clear dedup tracking (e.g., at session start)."""
         self._executed_ids.clear()
         self._symbol_locks.clear()
+
+    async def _ensure_fresh_price(
+        self, symbol: str, cached_price: Optional[float], result: ExecutionResult
+    ) -> Optional[float]:
+        """Return a trustworthy price for sizing/entry, or mark result TERMINAL.
+
+        Refreshes via REST when the cached tick is stale or missing. If a fresh
+        REST quote disagrees with the cached price beyond the deviation tolerance,
+        the REST price wins (it reflects the market the order will actually fill at).
+        """
+        age = float("inf")
+        if self._shared_state is not None and hasattr(self._shared_state, "get_price_age"):
+            try:
+                age = self._shared_state.get_price_age(symbol)
+            except Exception:
+                age = float("inf")
+
+        stale = (not cached_price or cached_price <= 0) or (age > self._price_max_age_s)
+
+        # Always cross-check against a fresh REST quote when cached looks stale.
+        if stale and self._exchange_client is not None:
+            try:
+                quotes = await self._exchange_client.get_prices([symbol])
+                rest_price = float(quotes.get(symbol, 0.0) or 0.0)
+            except Exception as e:
+                rest_price = 0.0
+                logger.warning("[Executor] REST price refresh failed for %s: %s", symbol, e)
+
+            if rest_price > 0:
+                # Push the fresh price back into shared_state so the SL anchor and
+                # downstream consumers use it too.
+                if self._shared_state is not None and hasattr(self._shared_state, "update_price"):
+                    try:
+                        self._shared_state.update_price(symbol, rest_price)
+                    except Exception:
+                        pass
+                if cached_price and cached_price > 0:
+                    dev = abs(rest_price - cached_price) / cached_price
+                    if dev > self._price_max_deviation:
+                        logger.warning(
+                            "[Executor] %s cached price %.8f stale (age=%.0fs, dev=%.2f%% vs REST %.8f) — using REST",
+                            symbol, cached_price, age, dev * 100.0, rest_price,
+                        )
+                return rest_price
+
+            # No fresh price available and cached is stale → refuse to trade blind.
+            if stale and (not cached_price or cached_price <= 0 or age > self._price_max_age_s):
+                result.status = ExecutionStatus.TERMINAL
+                result.error = (
+                    f"stale_price: {symbol} age={age:.0f}s > {self._price_max_age_s:.0f}s "
+                    f"and REST refresh unavailable"
+                )
+                logger.warning(
+                    "❌ BUY rejected (stale price): %s age=%.0fs cached=%s — no fresh quote",
+                    symbol, age, cached_price,
+                )
+                return cached_price
+
+        return cached_price
+
+    def _real_base_balance(self, symbol: str) -> float:
+        """Actual exchange-held quantity of the base asset (e.g. STRK for STRKUSDT).
+
+        Reads the live balance map (populated by the balance poller, same source
+        gate_4 uses). Used to decide whether a -2010 sell failure means the
+        position is truly gone vs merely a stale tracked quantity.
+        """
+        if self._shared_state is None:
+            return 0.0
+        base = str(symbol or "").upper()
+        if base.endswith("USDT"):
+            base = base[:-4]
+        bal = getattr(self._shared_state, "balance", {}) or {}
+        return float(bal.get(base, 0.0) or 0.0)
 
     def _sync_balance_validator(self) -> None:
         if self._balance_validator is None or self._shared_state is None:

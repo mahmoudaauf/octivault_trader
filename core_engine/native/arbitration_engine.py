@@ -49,6 +49,20 @@ class NativeArbitrationEngine:
         self._global_sl_history: list[float] = []  # epoch of every SL exit (pruned to 1h)
         self._arb_state_path = os.path.join("logs", "arb_state.json")
         self._perf_tracker = SymbolPerformanceTracker()
+        # gate_10: regimes in which adding to an underwater position is forbidden.
+        _raw_regimes = os.getenv("NO_AVGDOWN_REGIMES", "DOWNTREND")
+        self._no_avgdown_regimes = {r.strip().upper() for r in _raw_regimes.split(",") if r.strip()}
+        # gate_11: per-symbol downtrend veto on INITIAL buys. gate_10 only blocks
+        # averaging-down and keys off the GLOBAL regime; a falling name in a globally
+        # RANGING market (e.g. LUNC) slips through. This blocks buying a falling knife
+        # using the symbol's own price vs a short MA.
+        self._downtrend_veto_enabled = str(
+            os.getenv("SYMBOL_DOWNTREND_VETO_ENABLED", "true")
+        ).lower() in ("1", "true", "yes", "on")
+        self._downtrend_tf = os.getenv("SYMBOL_DOWNTREND_TF", "5m")
+        self._downtrend_ma_bars = max(2, int(os.getenv("DOWNTREND_MA_BARS", "20") or 20))
+        self._downtrend_margin = float(os.getenv("DOWNTREND_MARGIN", "0.005") or 0.005)
+        self._downtrend_slope_lag = max(1, int(os.getenv("DOWNTREND_SLOPE_LAG", "5") or 5))
         self._load_streak_state()
 
     def record_trade_outcome(self, symbol: str, pnl: float) -> None:
@@ -63,6 +77,11 @@ class NativeArbitrationEngine:
         """Returns gate_8 size multiplier for this symbol (0.0-1.25)."""
         return self._perf_tracker.get_size_multiplier(symbol)
 
+    def get_symbol_quality(self, symbol: str) -> float:
+        """0..1 performance-based quality (win-rate) for the probability score.
+        Neutral 0.5 until the symbol has enough closed trades to judge."""
+        return self._perf_tracker.quality_score(symbol)
+
     def get_perf_summary(self) -> dict:
         return self._perf_tracker.summary()
 
@@ -72,6 +91,9 @@ class NativeArbitrationEngine:
         self._last_buy_ts[symbol] = now
         self._global_buy_history.append(now)
         _log.info(f"[gate_7] {symbol} reentry cooldown started ({_SYMBOL_REENTRY_COOLDOWN_SECS}s)")
+        # Persist immediately so a crash/restart right after the fill can't forget the
+        # cooldown and double-buy into the same symbol (concentration bug).
+        self._save_streak_state()
 
     def record_loss(self, symbol: str) -> None:
         """Call after a closed trade that resulted in a net loss."""
@@ -156,6 +178,14 @@ class NativeArbitrationEngine:
             if not gates_status["gate_9_global_pace"]:
                 blocking_gates.append("gate_9_global_pace")
 
+            gates_status["gate_10_no_average_down"] = self.gate_10_no_average_down(symbol)
+            if not gates_status["gate_10_no_average_down"]:
+                blocking_gates.append("gate_10_no_average_down")
+
+            gates_status["gate_11_symbol_downtrend"] = self.gate_11_symbol_downtrend(symbol)
+            if not gates_status["gate_11_symbol_downtrend"]:
+                blocking_gates.append("gate_11_symbol_downtrend")
+
         passed = all(gates_status.values())
         if signal_type == "SELL":
             passed = gates_status["gate_1_symbol_format"] and gates_status["gate_6_risk_manager"]
@@ -194,10 +224,14 @@ class NativeArbitrationEngine:
         positions = dict(getattr(self._shared_state, "positions", {}) or {})
         balance = dict(getattr(self._shared_state, "balance", {}) or {})
         prices = dict(getattr(self._shared_state, "prices", {}) or {})
-        # Use min_notional ($10) for both the per-symbol re-buy block and the slot counter so
-        # they are consistent: a dust position below $10 neither blocks re-entry nor counts as a slot.
+        # Slot counter uses min_notional ($10): a dust position below $10 doesn't claim a slot.
         count_threshold = float(getattr(self._decision_engine, "min_notional_usdt", 10.0) or 10.0)
-        rebuy_threshold = count_threshold  # was $1; raised to $10 to match decision engine logic
+        # Re-buy block uses a MUCH lower threshold so ANY real held position blocks adding more —
+        # enforcing one lot per symbol. Tying it to min_notional ($10) created a loophole: right
+        # after a ~$10 buy the position sits at/just-below $10, so a 2nd buy slipped through and
+        # the system stacked $20 into one name (the WLFI/DOGE concentration). $2 = only genuine
+        # dust can be topped up; a real position always blocks.
+        rebuy_threshold = float(os.getenv("REBUY_BLOCK_NOTIONAL", "2.0") or 2.0)
 
         def _pos_qty(pos: object) -> float:
             return float(
@@ -287,6 +321,17 @@ class NativeArbitrationEngine:
         # trading_halted blocks new BUYs only — SELL/exit signals must always pass
         if check_exposure and bool(getattr(self._shared_state, "trading_halted", False)):
             return False
+        # NAV protection: FREEZE_BUY / RECOVERY mode blocks new BUYs
+        if check_exposure:
+            _nav_prot = getattr(self._shared_state, "nav_protection_state", {}) or {}
+            _prot_mode = str(_nav_prot.get("protection_mode", "NORMAL") or "NORMAL").upper()
+            if _prot_mode in ("FREEZE_BUY", "RECOVERY") and not _nav_prot.get("allow_buy", True):
+                _log.info(
+                    "[gate_6] NAV protection mode=%s — new BUYs blocked (drawdown=%.2f%%)",
+                    _prot_mode,
+                    float(_nav_prot.get("drawdown_from_peak_pct", 0.0) or 0.0),
+                )
+                return False
         snapshot = self._portfolio_snapshot()
         if self._decision_engine._check_drawdown_exceeded(snapshot):
             return False
@@ -362,25 +407,35 @@ class NativeArbitrationEngine:
         }
 
     def _portfolio_snapshot(self) -> PortfolioSnapshot:
-        nav = float(getattr(self._shared_state, "nav_usdt", 0.0) or 0.0)
         free_usdt = float(getattr(self._shared_state, "free_balance_usdt", 0.0) or 0.0)
+        live_prices = dict(getattr(self._shared_state, "prices", {}) or {})
         price_cache = dict(getattr(self._shared_state, "price_cache", {}) or {})
         positions_raw = getattr(self._shared_state, "positions", {}) or {}
         positions: dict[str, float] = {}
+        position_value = 0.0
         for sym, pos in positions_raw.items():
             qty = getattr(pos, "qty", None)
             if qty is None and isinstance(pos, dict):
                 qty = pos.get("qty", 0.0)
-            positions[sym] = float(qty or 0.0)
-        balances = dict(getattr(self._shared_state, "balance", {}) or {})
+            qty = float(qty or 0.0)
+            positions[sym] = qty
+            price = (live_prices.get(sym) or price_cache.get(sym)
+                     or (pos.get("current_price") if isinstance(pos, dict) else getattr(pos, "mark_price", 0.0))
+                     or 0.0)
+            position_value += qty * float(price)
+        # Always recompute NAV from live data — never trust the stale stored nav_usdt
+        nav = free_usdt + position_value
         if nav <= 0.0:
-            nav = free_usdt + sum(
-                qty * float(price_cache.get(sym, 0.0) or 0.0) for sym, qty in positions.items()
-            )
-        nav_peak = float(getattr(self._shared_state, "metrics", {}).get("peak_nav", 0.0) or 0.0)
-        if nav_peak <= 0.0:
-            nav_peak = max(nav, 1.0)
+            nav = float(getattr(self._shared_state, "nav_usdt", 0.0) or 1.0)
+        balances = dict(getattr(self._shared_state, "balance", {}) or {})
+        # Use session_anchor_nav as the drawdown baseline (session-relative protection).
+        # This prevents prior sessions' all-time peaks from permanently blocking a new session.
+        # If session_anchor not yet set (early startup), use current nav — 0% drawdown until
+        # the first balance poll fires and sets the real anchor.
         session_anchor = float(getattr(self._shared_state, "session_anchor_nav", 0.0) or 0.0)
+        nav_peak = session_anchor if session_anchor > 0 else nav
+        if nav_peak <= 0.0 or nav_peak < nav:
+            nav_peak = max(nav, 1.0)
         realized_pnl = float(
             getattr(self._shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0
         )
@@ -513,6 +568,105 @@ class NativeArbitrationEngine:
 
         return max(-0.05, min(0.18, delta))
 
+    def gate_10_no_average_down(self, symbol: str) -> bool:
+        """Block averaging-down into a losing position during a downtrend.
+
+        gate_4 uses a min-notional ($10) threshold for its re-buy block, so a
+        position that loses value and drops below that notional stops counting as
+        'held' and becomes re-buyable — the system then averages down into a
+        falling name (e.g. the 2nd DOGE lot). This gate closes that hole: if we
+        already hold the symbol (any quantity), the mark is below our average
+        entry, and the regime is hostile (DOWNTREND by default), refuse to add.
+        Pyramiding into a *winning* position (mark >= entry) is still allowed.
+
+        Fail-open: any uncertainty (no position, no price, error) returns True.
+        """
+        try:
+            positions = dict(getattr(self._shared_state, "positions", {}) or {})
+            pos = positions.get(symbol)
+            if not pos:
+                return True  # not held → not an average-down
+            qty = float(
+                getattr(pos, "qty", None)
+                or (pos.get("qty", 0) if isinstance(pos, dict) else 0)
+                or 0.0
+            )
+            entry = float(
+                getattr(pos, "entry_price", None)
+                or (pos.get("entry_price", 0) if isinstance(pos, dict) else 0)
+                or 0.0
+            )
+            if qty <= 1e-9 or entry <= 0:
+                return True
+            prices = dict(getattr(self._shared_state, "prices", {}) or {})
+            price = float(prices.get(symbol, 0.0) or 0.0)
+            if price <= 0:
+                return True  # no fresh price → let other gates decide
+            regime = str(
+                (getattr(self._shared_state, "metrics", {}) or {}).get("market_regime", "") or ""
+            ).upper()
+            if price < entry and regime in self._no_avgdown_regimes:
+                _log.info(
+                    "[gate_10] %s BLOCK avg-down: mark %.8f < avg entry %.8f in %s",
+                    symbol, price, entry, regime,
+                )
+                return False
+            return True
+        except Exception:
+            return True  # fail-open — never block a trade on an internal error
+
+    def _recent_closes(self, symbol: str) -> list[float]:
+        """Recent close prices for a symbol from the shared candle buffer (newest last)."""
+        try:
+            getter = getattr(self._shared_state, "get_market_data", None)
+            rows = getter(symbol, self._downtrend_tf) if callable(getter) else None
+            if not rows:
+                return []
+            closes: list[float] = []
+            for r in rows:
+                c = (
+                    r.get("close") if isinstance(r, dict)
+                    else getattr(r, "close", None)
+                )
+                if c is not None:
+                    closes.append(float(c))
+            return closes
+        except Exception:
+            return []
+
+    def gate_11_symbol_downtrend(self, symbol: str) -> bool:
+        """Block an INITIAL buy when the symbol itself is in a confirmed downtrend.
+
+        Closes the gap left by gate_10 (which only blocks averaging-down and keys off
+        the GLOBAL regime): a falling name like LUNC in a globally-RANGING market is
+        otherwise freely buyable. Downtrend = latest price below its short MA by a
+        margin AND that MA is falling. Fail-open: insufficient data → True.
+        """
+        try:
+            if not self._downtrend_veto_enabled:
+                return True
+            closes = self._recent_closes(symbol)
+            need = self._downtrend_ma_bars + self._downtrend_slope_lag
+            if len(closes) < need:
+                return True  # not enough history → let other gates decide
+            n = self._downtrend_ma_bars
+            ma_now = sum(closes[-n:]) / n
+            ma_prev = sum(closes[-n - self._downtrend_slope_lag:-self._downtrend_slope_lag]) / n
+            price = closes[-1]
+            if ma_now <= 0 or ma_prev <= 0:
+                return True
+            below = price < ma_now * (1.0 - self._downtrend_margin)
+            falling = ma_now < ma_prev
+            if below and falling:
+                _log.info(
+                    "[gate_11] %s BLOCK buy: downtrend — price %.8f < MA%d %.8f (margin %.2f%%), MA falling",
+                    symbol, price, n, ma_now, self._downtrend_margin * 100.0,
+                )
+                return False
+            return True
+        except Exception:
+            return True  # fail-open
+
     def _confidence_floor(self, mode_name: str) -> float:
         # Get base floor — from mode_manager if available, else from decision engine
         if self._mode_manager and hasattr(self._mode_manager, "get_constraints"):
@@ -533,8 +687,9 @@ class NativeArbitrationEngine:
             (getattr(self._shared_state, "metrics", {}) or {}).get("market_regime", "") or ""
         ).upper()
         if regime in {"CHOPPY", "RANGING"}:
-            # Fee drag consumes the entire typical move — require high conviction only.
-            base_floor = min(0.90, base_floor + 0.25)
+            # Mild bump: blocks low-quality native signals (~0.16–0.35) but allows
+            # high-conviction ML signals (≥0.65) that passed the Buffett fear filter.
+            base_floor = min(0.75, base_floor + 0.10)
         elif regime == "UNKNOWN":
             # No regime data — apply mild guard; don't over-restrict
             base_floor = min(0.75, base_floor + 0.05)
@@ -556,8 +711,17 @@ class NativeArbitrationEngine:
                     k: float(v) for k, v in data.get("last_trade_ts", {}).items()
                 }
                 self._last_sl_ts = {k: float(v) for k, v in data.get("last_sl_ts", {}).items()}
+                # Restore post-buy reentry cooldowns so restarts can't double-buy into a
+                # symbol just purchased (concentration bug). Pruned to the cooldown window below.
+                self._last_buy_ts = {
+                    k: float(v) for k, v in data.get("last_buy_ts", {}).items()
+                }
                 # Restore global SL history (only keep last 2h)
                 now = time.time()
+                stale_buy = [s for s, ts in self._last_buy_ts.items()
+                             if now - ts > _SYMBOL_REENTRY_COOLDOWN_SECS]
+                for s in stale_buy:
+                    self._last_buy_ts.pop(s, None)
                 self._global_sl_history = [
                     float(t) for t in data.get("global_sl_history", []) if now - float(t) < 7200
                 ]
@@ -591,6 +755,13 @@ class NativeArbitrationEngine:
                 "loss_streak": dict(self._loss_streak),
                 "last_trade_ts": dict(self._last_trade_ts),
                 "last_sl_ts": dict(self._last_sl_ts),
+                # Persist post-buy reentry timestamps so a restart can't forget a symbol
+                # was just bought and double-buy into it (the WLFI/DOGE concentration bug).
+                # Only keep entries still inside the cooldown window.
+                "last_buy_ts": {
+                    s: t for s, t in self._last_buy_ts.items()
+                    if now - t < _SYMBOL_REENTRY_COOLDOWN_SECS
+                },
                 "global_sl_history": [t for t in self._global_sl_history if now - t < 7200],
                 "saved_at": now,
             }

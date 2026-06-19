@@ -341,6 +341,24 @@ class NativeExchangeClient:
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         return await self._request("GET", self.EP_KLINES, params=params)
 
+    async def get_ohlcv(
+        self,
+        symbol: str,
+        interval: str = "5m",
+        timeframe: str = None,
+        tf: str = None,
+        limit: int = 1000,
+        end_time: int = None,
+        endTime: int = None,
+    ) -> list[list[Any]]:
+        """Alias for get_klines — supports kwargs used by MLForecaster._fetch_exchange_ohlcv_batch."""
+        tf_resolved = interval or timeframe or tf or "5m"
+        end_ms = end_time or endTime
+        params: dict[str, Any] = {"symbol": symbol, "interval": tf_resolved, "limit": min(limit, 1000)}
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+        return await self._request("GET", self.EP_KLINES, params=params)
+
     # ──────────────────────────────────────────────────────────────────
     # Signed account / trading
     # ──────────────────────────────────────────────────────────────────
@@ -366,10 +384,12 @@ class NativeExchangeClient:
         for entry in account.get("balances", []):
             try:
                 free = float(entry.get("free", 0.0))
+                locked = float(entry.get("locked", 0.0))
             except (TypeError, ValueError):
-                free = 0.0
-            if free > 0:
-                balances[entry["asset"]] = free
+                free = locked = 0.0
+            total = free + locked
+            if total > 0:
+                balances[entry["asset"]] = total
         return balances
 
     async def place_order(

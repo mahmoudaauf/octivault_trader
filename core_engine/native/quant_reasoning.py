@@ -33,10 +33,14 @@ def classify_market_regime(regime: dict[str, Any], system_state: str) -> str:
         return "CRISIS"
     if vol == "HIGH":
         return "VOLATILE"
-    if trend in {"UPTREND", "DOWNTREND"}:
+    if trend == "UPTREND":
         return "TRENDING"
-    if trend == "RANGING":
+    if trend == "DOWNTREND":
+        return "DOWNTREND"
+    if trend == "CHOPPY":
         return "CHOPPY"
+    if trend == "RANGING":
+        return "RANGING"
     return "UNKNOWN"
 
 

@@ -291,10 +291,16 @@ class NativeRecoveryEngine:
 
     def _derive_nav(self, positions: dict[str, Any]) -> float:
         free = float(getattr(self._state, "free_balance_usdt", 0.0) or 0.0)
+        price_cache = getattr(self._state, "price_cache", {}) or {}
         total = free
-        for pos in positions.values():
+        for sym, pos in positions.items():
             qty = self._qty_of(pos)
-            mark = float(getattr(pos, "mark_price", 0.0) or 0.0)
+            mark = float(
+                price_cache.get(str(sym).upper())
+                or (pos.get("current_price") if isinstance(pos, dict) else None)
+                or getattr(pos, "mark_price", 0.0)
+                or 0.0
+            )
             total += qty * mark
         return total
 

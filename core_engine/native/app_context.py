@@ -148,6 +148,7 @@ class NativeComponents:
     )
     ml_forecaster: Any | None = None  # MLForecaster | None (legacy agent, L3)
     symbol_screener: Any | None = None  # SymbolScreener | None (legacy agent, L3)
+    symbol_rotator: Any | None = None  # SymbolRotator | None
 
 
 def build_native_app_ctx(
@@ -199,6 +200,7 @@ def build_native_app_ctx(
         polling_coordinator=components.polling_coordinator,
         position_hydration_engine=components.position_hydration_engine,
         startup_state_machine=components.startup_state_machine,
+        symbol_rotator=components.symbol_rotator,
     )
 
     app_ctx: dict[str, Any] = {

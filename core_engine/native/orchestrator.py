@@ -93,6 +93,7 @@ class NativeOrchestrator:
         position_hydration_engine: Any
         | None = None,  # NativePositionHydrationEngine (L0, Phase 8.4)
         startup_state_machine: Any | None = None,  # NativeStartupStateMachine (L0, Phase 8.4)
+        symbol_rotator: Any | None = None,  # SymbolRotator (optional)
     ) -> None:
         self._market_data = market_data
         self._signal_engine = signal_engine
@@ -112,6 +113,7 @@ class NativeOrchestrator:
         self._polling_coordinator = polling_coordinator
         self._hydration_engine = position_hydration_engine
         self._startup_state_machine = startup_state_machine
+        self._symbol_rotator = symbol_rotator
 
         self._cycle_count = 0
         self._stopped = True  # Use bool flag instead of asyncio.Event
@@ -193,6 +195,30 @@ class NativeOrchestrator:
                 )
             else:
                 logger.info("✅ Startup complete; trading ready")
+                # Set session anchor here — single authoritative source.
+                # Hydration is done, positions are loaded, NAV is accurate.
+                # Always overwrite stale snapshot values.
+                if self._shared_state is not None:
+                    # Wait for WS prices to load and first balance poll to run
+                    await asyncio.sleep(15.0)
+                    # Force a fresh price fetch for all tracked positions before anchoring
+                    if self._polling_coordinator is not None and hasattr(self._polling_coordinator, "_fetch_and_refresh_position_prices"):
+                        try:
+                            await self._polling_coordinator._fetch_and_refresh_position_prices()
+                        except Exception:
+                            pass
+                    # Also trigger a balance map update with fresh prices
+                    if hasattr(self._shared_state, "update_balance_map") and self._shared_state.balance:
+                        self._shared_state.update_balance_map(self._shared_state.balance)
+                    await asyncio.sleep(2.0)
+                    nav = float(getattr(self._shared_state, "nav_usdt", 0.0) or 0.0)
+                    if nav > 0:
+                        self._shared_state.session_anchor_nav = nav
+                        # Also reset peak so drawdown is session-relative
+                        self._shared_state.peak_nav_usdt = nav
+                        self._shared_state.metrics["peak_nav"] = nav
+                        self._shared_state.metrics["peak_nav_ts"] = 0.0
+                        logger.info("📊 Session anchor NAV = %.2f USDT (peak reset)", nav)
 
         # Start TP/SL engine (auto-arms existing positions for safety)
         if self._tp_sl_engine is not None:
@@ -271,13 +297,13 @@ class NativeOrchestrator:
         )
 
         try:
-            # Phase 0: DISCOVER (optional symbol discovery per cycle)
-            if self._symbol_discovery:
+            # Phase 0: DISCOVER (optional symbol discovery + symbol rotation per cycle)
+            if self._symbol_discovery or self._symbol_rotator:
                 logger.debug("📍 CYCLE %d: Phase 0 DISCOVER starting", self._cycle_count)
                 await self._phase_discover()
             else:
                 logger.debug(
-                    "📍 CYCLE %d: Phase 0 DISCOVER skipped (no symbol_discovery)", self._cycle_count
+                    "📍 CYCLE %d: Phase 0 DISCOVER skipped (no symbol_discovery/rotator)", self._cycle_count
                 )
 
             # Phase 1: READ
@@ -345,8 +371,14 @@ class NativeOrchestrator:
     # 6-phase implementation (Phase 0 optional: symbol discovery)
     # ──────────────────────────────────────────────────────────────────
     async def _phase_discover(self) -> None:
-        """Phase 0: Scan wallet and update symbol list (optional, per-cycle)."""
+        """Phase 0: Scan wallet and update symbol list; run symbol rotator."""
         if not self._symbol_discovery:
+            # Still run rotator even without wallet discovery
+            if self._symbol_rotator is not None:
+                try:
+                    self._symbol_rotator.maybe_rotate()
+                except Exception as _e:
+                    logger.warning("SymbolRotator.maybe_rotate() failed: %r", _e)
             return
 
         # Skip wallet scan if exchange is throttled (prevents fresh 418 bans)
@@ -369,10 +401,20 @@ class NativeOrchestrator:
                     # Subscribe to new symbols in WebSocket if available
                     if self._market_data_ws:
                         await self._market_data_ws.subscribe(symbols)
+                # Bridge wallet discovery into ML accepted_symbols watchlist
+                if self._shared_state and hasattr(self._shared_state, "set_accepted_symbols"):
+                    self._shared_state.set_accepted_symbols(symbols)
             elif not symbols:
                 logger.warning("⚠️ Symbol discovery returned empty list (wallet empty?)")
         except Exception as e:
             logger.exception("Symbol discovery failed: %s (will retry next cycle)", e)
+
+        # Run symbol rotator (scores all trained models, picks top N by regime/momentum/win_rate)
+        if self._symbol_rotator is not None:
+            try:
+                self._symbol_rotator.maybe_rotate()
+            except Exception as _e:
+                logger.warning("SymbolRotator.maybe_rotate() failed: %r", _e)
 
     async def _phase_read(self) -> None:
         """Phase 1: Fetch latest market data. Sync balances."""
@@ -400,12 +442,9 @@ class NativeOrchestrator:
                         # Successfully fetched; update SharedState
                         if hasattr(self._shared_state, "update_balance_map"):
                             self._shared_state.update_balance_map(bal_dict)
-                        if hasattr(self._shared_state, "update_nav"):
-                            self._shared_state.update_nav(balance_usdt)
+                        # update_balance_map already set NAV correctly via get_portfolio_value()
                         # Set anchor on first successful fetch (OFC needs this)
-                        if getattr(self._shared_state, "session_anchor_nav", 0.0) <= 0:
-                            self._shared_state.session_anchor_nav = balance_usdt
-                            logger.info("📊 Session anchor NAV set: %.2f USDT", balance_usdt)
+                        pass  # anchor is set after startup completes in run()
                     else:
                         # Balance fetch succeeded but returned 0 (shouldn't happen)
                         logger.warning("⚠️  Balance fetch returned 0 USDT (account empty?)")
@@ -450,6 +489,10 @@ class NativeOrchestrator:
             logger.debug("⚠️ No prices available from market_data.get_prices()")
             return {}
 
+        # Sync all market prices to shared_state.price_cache so NAV/PnL stay accurate
+        if self._shared_state and hasattr(self._shared_state, "price_cache"):
+            self._shared_state.price_cache.update(prices)
+
         logger.debug(f"🔍 Phase 2: Evaluating {len(prices)} symbols for signals")
 
         # For each symbol, fetch klines and evaluate signals
@@ -470,13 +513,19 @@ class NativeOrchestrator:
                 logger.debug(f"signal generation failed for {symbol}: {e}")
 
         # TP/SL trigger injection: check armed positions, inject SELL signals
+        # NOTE: This path is not reached by the main trading_cycle in main.py
+        # (which uses the facade engines pattern). TP/SL injection happens in main.py directly.
+        # This block remains for completeness if run_cycle() is ever called directly.
         if self._tp_sl_engine is not None and self._shared_state is not None:
             positions = getattr(self._shared_state, "positions", {}) or {}
             prices_now = getattr(self._shared_state, "prices", {}) or {}
+            price_cache = getattr(self._shared_state, "price_cache", {}) or {}
             for sym, pos in positions.items():
-                if not isinstance(pos, dict):
-                    continue
-                current = float(prices_now.get(sym, 0.0) or 0.0)
+                current = float(
+                    prices_now.get(sym)
+                    or price_cache.get(str(sym).upper())
+                    or 0.0
+                )
                 if current <= 0:
                     continue
                 trigger = self._tp_sl_engine.check_triggers(sym, pos, current)

@@ -240,6 +240,15 @@ class ObjectiveFeedbackController:
             return {"status": "starved", "missing": tel.missing}
 
         # ---- 1. Errors ------------------------------------------------
+        # Suppress all control actions for first 30 min — pace estimate is
+        # meaningless over a tiny elapsed window and causes wild swings.
+        if tel.elapsed_h < 0.5:
+            self.logger.info(
+                "[OFC] warm-up (elapsed=%.1fmin < 30min) — no-op this step",
+                tel.elapsed_h * 60,
+            )
+            return {"status": "warmup", "elapsed_h": tel.elapsed_h}
+
         observed_pace_pct_h = self._observed_pace_pct_h(tel)
         pace_error = observed_pace_pct_h - (self.hourly_target * 100)  # % per hour
         dd_error = max(0.0, tel.drawdown_pct - self.dd_max * 100)  # % over limit
