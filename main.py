@@ -64,15 +64,12 @@ from core_engine import (
 )
 from core_engine.integration import setup_core_engines
 from core_engine.native.cadence_scheduler import CadenceScheduler
+from utils.logging_setup import setup_logging
 
 # ────────────────────────────────────────────────────────────────────────
-# Logging
+# Logging  — RotatingFileHandler (50 MB × 3) + console WARNING+
 # ────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)-7s] %(name)s — %(message)s",
-)
-log = logging.getLogger("octivault.main")
+log = setup_logging()
 
 load_dotenv()
 

@@ -300,11 +300,17 @@ class NativeArbitrationEngine:
         )
         tradable_count = self._decision_engine._count_active_tradable_positions(snapshot)
         active_count = max(tradable_count, pos_count, bal_count)
+        if active_count < max_positions:
+            _log.debug(
+                "[gate_4] %s counts: tradable=%d pos=%d bal=%d active=%d max=%d → PASS",
+                symbol, tradable_count, pos_count, bal_count, active_count, max_positions,
+            )
+            return True
         _log.info(
-            f"[gate_4] {symbol} counts: tradable={tradable_count} pos={pos_count} bal={bal_count} "
-            f"active={active_count} max={max_positions} → {'PASS' if active_count < max_positions else 'BLOCK'}"
+            "[gate_4] %s counts: tradable=%d pos=%d bal=%d active=%d max=%d → BLOCK",
+            symbol, tradable_count, pos_count, bal_count, active_count, max_positions,
         )
-        return active_count < max_positions
+        return False
 
     def gate_5_capital(self, symbol: str) -> bool:
         del symbol

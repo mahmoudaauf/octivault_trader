@@ -15,9 +15,12 @@ cd "$(dirname "$0")" || exit 1
 RUN_LOG="logs/run_latest.log"
 SUP_LOG="logs/supervisor.log"
 STOP_FLAG="logs/supervisor.stop"
-MAX_LOG_MB=100            # rotate run log past this size
-KEEP_ARCHIVES=5          # gzipped tails to retain
-RESTART_BACKOFF=10       # seconds between normal restarts
+# NOTE: run_latest.log rotation is now handled IN-PROCESS via RotatingFileHandler
+# (50 MB × 3 backups = 200 MB max). The variables below are kept as a fallback
+# safety net only — the rotator loop still runs but will rarely trigger.
+MAX_LOG_MB=150            # safety-net threshold (in-process rotates at 50 MB)
+KEEP_ARCHIVES=3           # supervisor gz archives to keep as emergency backup
+RESTART_BACKOFF=10        # seconds between normal restarts
 FAST_WINDOW=300          # crash-loop detection window (s)
 MAX_FAST_RESTARTS=5      # this many restarts inside the window → long back-off
 LONG_BACKOFF=300         # cool-off when a crash loop is detected
@@ -88,7 +91,10 @@ while true; do
   [ -f "$STOP_FLAG" ] && { log_sup "stop flag present — exiting"; cleanup; }
   rotate_log
   log_sup "launching main.py"
-  python3 main.py >> "$RUN_LOG" 2>&1
+  # main.py owns its own RotatingFileHandler → logs/run_latest.log (INFO+).
+  # We redirect stderr here as a safety net for uncaught exceptions that bypass
+  # the logging system (e.g. segfaults, early-boot errors before loggers init).
+  python3 main.py 2>>"$RUN_LOG"
   ec=$?
   log_sup "main.py exited (code $ec)"
   [ -f "$STOP_FLAG" ] && { log_sup "stop flag present — not restarting"; cleanup; }

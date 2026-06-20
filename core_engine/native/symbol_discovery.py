@@ -91,7 +91,7 @@ class NativeSymbolDiscovery:
                 and self._last_empty_scan_ts > 0
                 and (now - self._last_empty_scan_ts) < self._empty_scan_retry_sec
             ):
-                logger.info(
+                logger.debug(
                     "Recent empty wallet scan; deferring retry for %.0fs",
                     self._empty_scan_retry_sec - (now - self._last_empty_scan_ts),
                 )
