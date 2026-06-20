@@ -46,8 +46,8 @@ class NativeTPSLEngine:
     _REGIME_TRAIL_PARAMS: dict[str, tuple[float, float]] = {
         "UPTREND": (0.020, 0.010),  # ride the trend; exit ~+1.0% net
         "TRENDING": (0.015, 0.008),  # solid momentum; exit ~+0.7% net
-        "RANGING": (0.005, 0.004),  # arm at +0.5%, trail 0.4% — capture stalled winners
-        "CHOPPY": (0.005, 0.003),  # arm at +0.5%, trail 0.3% — lock fast in noise
+        "RANGING": (0.008, 0.005),  # arm at +0.8%, trail 0.5% — min capture +0.3% gross → ~+0.1% net
+        "CHOPPY": (0.005, 0.003),   # arm at +0.5%, trail 0.3% — lock fast in noise
         "DOWNTREND": (0.005, 0.003),  # survival mode; any real gain locked immediately
     }
     _REGIME_TRAIL_DEFAULT = (0.015, 0.008)  # fallback = TRENDING behaviour

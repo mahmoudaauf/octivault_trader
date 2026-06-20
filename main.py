@@ -327,7 +327,13 @@ async def trading_cycle(
             get_value(sig, "signal_type", get_value(sig, "action", "")) or ""
         ).upper()
         symbol = get_value(sig, "symbol", "")
-        edge_score = float(get_value(sig, "edge_score", get_value(sig, "edge", get_value(sig, "confidence", 0.0))) or 0.0)
+        edge_score = float(
+            get_value(sig, "confidence",                           # NativeSignalEngine-adjusted
+                get_value(sig, "edge_score",                       # adapter-normalised fallback
+                    get_value(sig, "edge", 0.0)                    # legacy field
+                )
+            ) or 0.0
+        )
         _is_tpsl = bool(get_value(sig, "tpsl_trigger", ""))
 
         # TP/SL exits always processed; BUY and non-tpsl SELLs only when decision cadence is due

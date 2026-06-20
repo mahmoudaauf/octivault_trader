@@ -343,16 +343,24 @@ class NativeArbitrationEngine:
         if check_exposure and bool(getattr(self._shared_state, "buy_paused_fear_greed", False)):
             fg = int(getattr(self._shared_state, "fear_greed_score", 50) or 50)
             btc_ok = bool(getattr(self._shared_state, "btc_reversal_confirmed", False))
-            # Override conditions: very deep fear + BTC confirmed 2-green-candle + high conviction
+            # Buffett full: extreme fear + BTC 2-green-candle reversal + high conviction → full size
             if fg < 20 and btc_ok and edge_score >= 0.75:
                 _log.info(
                     "[gate_6] 🦁 Buffett override: F&G=%d BTC✅ edge=%.2f — buying the fear",
                     fg, edge_score,
                 )
+            # Fear half-size: fear zone (20-25) + high conviction → allow, capital allocator
+            # already applies fear_factor=0.5 when F&G≤25 without BTC reversal confirmed.
+            # No BTC confirmation required — half-size limits the downside.
+            elif fg <= 25 and edge_score >= 0.65:
+                _log.info(
+                    "[gate_6] 🦁 Fear half-size: F&G=%d edge=%.2f ≥ 0.65 — BUY at HALF size",
+                    fg, edge_score,
+                )
             else:
                 _log.info(
                     "[gate_6] F&G pause active: score=%d btc_reversal=%s edge=%.2f "
-                    "(need F&G<20 + BTC✅ + edge≥0.75 to override) — BUY blocked",
+                    "(need F&G≤25+edge≥0.65 or F&G<20+BTC✅+edge≥0.75) — BUY blocked",
                     fg, btc_ok, edge_score,
                 )
                 return False
