@@ -29,7 +29,7 @@ from typing import Any
 _log = logging.getLogger("SymbolRotator")
 
 ROTATION_INTERVAL_SEC = float(os.getenv("SYMBOL_ROTATION_INTERVAL_SEC", "7200"))  # 2 hours — matches immunity window
-TOP_N = int(os.getenv("SYMBOL_ROTATION_TOP_N", "8"))
+TOP_N = int(os.getenv("SYMBOL_ROTATION_TOP_N", "13"))  # 13 = same coverage as persisted state; wide enough to hold majors + best alts
 MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 MIN_SELLABLE_NOTIONAL = 5.0  # Binance min notional — below this we can't sell
 # Confirmed liquidity score below this is too thin to trade cleanly → excluded from rotation.
