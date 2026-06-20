@@ -1,15 +1,19 @@
 """
 Symbol Universe Rotator
 
-Every ROTATION_INTERVAL_SEC (default 30 min), scores all symbols that have
+Every ROTATION_INTERVAL_SEC (default 2h), scores all symbols that have
 a trained MLForecaster model and picks the top TOP_N by:
-  1. Regime gate  — TRENDING/RANGING only (CHOPPY/DOWNTREND excluded)
-  2. Momentum     — 20-bar price change % from klines cache
-  3. Volume proxy — last-bar volume (higher = more liquid)
-  4. Symbol perf  — win_rate from SymbolPerformanceTracker (soft-blocked symbols penalised)
+  1. Regime gate    — TRENDING/RANGING only (CHOPPY/DOWNTREND excluded)
+  2. ATR floor veto — ATR% < 0.4% excluded (can't cover round-trip fees)
+  3. Liquidity veto — score < 0.10 excluded (too thin to trade cleanly)
+  4. Momentum       — 20-bar price change % from klines cache
+  5. Win-rate       — from SymbolPerformanceTracker (soft-blocked symbols penalised)
+  6. PnL history    — last 10 trades avg PnL
+  7. Liquidity      — log-scale quote volume score
+  8. Preferred bonus — +0.05 for large-cap pairs (BTC/ETH/SOL/XRP etc.)
 
 Applies the result by calling shared_state.set_accepted_symbols(top_n).
-MLForecaster reads accepted_symbols on every run_once() call, so the
+MLForecaster reads accepted_symbols on every run_once() call so the
 watchlist updates automatically without a restart.
 """
 
@@ -30,6 +34,15 @@ MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 MIN_SELLABLE_NOTIONAL = 5.0  # Binance min notional — below this we can't sell
 # Confirmed liquidity score below this is too thin to trade cleanly → excluded from rotation.
 _LIQUIDITY_MIN_SCORE = float(os.getenv("SYMBOL_ROTATION_MIN_LIQUIDITY", "0.10"))
+# ATR% floor: symbols whose 14-bar ATR is below this fraction of price are excluded.
+# 0.4% is roughly 2× the round-trip fee (0.2%) — can't generate net-positive trades below it.
+_ATR_MIN_PCT = float(os.getenv("SYMBOL_ROTATION_MIN_ATR_PCT", "0.004"))
+# Preferred high-quality symbols get a bonus in scoring to break ties in flat markets.
+# These are the most liquid, most data-rich pairs — models train/calibrate better on them.
+_PREFERRED_SYMBOLS = {
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TRXUSDT",
+}
 
 # Regimes that qualify for entry
 _ALLOWED_REGIMES = {"UPTREND", "RANGING"}
@@ -64,6 +77,36 @@ def _get_momentum(symbol: str, market_data: Any) -> float:
             except Exception:
                 pass
     return 0.0
+
+
+def _get_atr_pct(symbol: str, market_data: Any, period: int = 14) -> float:
+    """ATR as a fraction of price (True Range based). Returns -1.0 if unavailable.
+
+    A return of -1.0 means 'unknown — don't veto', so symbols with no klines data
+    are not excluded. Only explicitly low ATR triggers the filter.
+    """
+    if market_data is None:
+        return -1.0
+    klines_cache = getattr(market_data, "_klines", {})
+    for key, (_ts, data) in klines_cache.items():
+        if isinstance(key, tuple) and key[0] == symbol and data and len(data) >= period + 1:
+            try:
+                rows = data[-(period + 1):]
+                trs: list[float] = []
+                for i in range(1, len(rows)):
+                    h = float(rows[i][2])
+                    l = float(rows[i][3])
+                    pc = float(rows[i - 1][4])
+                    tr = max(h - l, abs(h - pc), abs(l - pc))
+                    trs.append(tr)
+                if not trs:
+                    return -1.0
+                atr = sum(trs) / len(trs)
+                close = float(rows[-1][4])
+                return atr / close if close > 0 else -1.0
+            except Exception:
+                pass
+    return -1.0
 
 
 # Deep, always-liquid pairs. Used as a fair-liquidity floor so blue-chips aren't
@@ -262,16 +305,27 @@ class SymbolRotator:
             win_rate = _get_win_rate(sym, self._perf_tracker)
             liq_raw = _get_liquidity_score(sym, self._market_data)
 
-            # Confirmed-thin gate: never rotate into a name too illiquid to trade cleanly
-            # (wide spreads + slippage destroy edge). liq_raw < 0 means "unknown" → don't gate.
+            # Fix A — ATR floor veto: exclude symbols whose volatility can't cover round-trip fees.
+            # -1.0 = no klines data yet → don't gate (give benefit of the doubt on startup).
+            atr_pct = _get_atr_pct(sym, self._market_data)
+            if atr_pct >= 0.0 and atr_pct < _ATR_MIN_PCT:
+                _log.debug(
+                    "[SymbolRotator] %s excluded: ATR%.4f%% < min %.4f%%",
+                    sym, atr_pct * 100, _ATR_MIN_PCT * 100,
+                )
+                continue
+
+            # Fix B — Liquidity hard veto (unchanged logic, now also logs vetoed symbol).
+            # liq_raw < 0 means "unknown" → don't gate.
             if 0.0 <= liq_raw < _LIQUIDITY_MIN_SCORE:
+                _log.debug(
+                    "[SymbolRotator] %s excluded: liquidity_score=%.2f < min %.2f",
+                    sym, liq_raw, _LIQUIDITY_MIN_SCORE,
+                )
                 continue
             liquidity = 0.5 if liq_raw < 0.0 else liq_raw  # unknown → neutral
 
             # Normalize EVERY component to 0..1 so the intended weights actually apply.
-            # The old formula did momentum*40 + win_rate*30 + tiny bonuses: win_rate defaults
-            # to 0.5 (a constant 15 offset with no differentiation) and raw momentum dominated,
-            # collapsing the blend into pure momentum-chasing. Now each term is 0..1.
             mom_norm = max(0.0, min(1.0, 0.5 + momentum * 5.0))     # ±10% move spans 0..1
             regime_score = 1.0 if regime == "UPTREND" else 0.5      # RANGING neutral, UPTREND best
 
@@ -288,6 +342,12 @@ class SymbolRotator:
             if regime != "UPTREND":
                 mom_norm = 0.5 + (mom_norm - 0.5) * 0.4
 
+            # Fix B — Preferred-symbol quality bonus: large-cap pairs have deeper order books,
+            # better model calibration, and more historical data.  +0.05 bonus (≈ a 10pp
+            # liquidity advantage) breaks ties in flat markets in favour of quality names
+            # over micro-caps like LUNC/PEPE whose micro-price makes spread cost proportionally huge.
+            preferred_bonus = 0.05 if sym in _PREFERRED_SYMBOLS else 0.0
+
             # Weighted blend (weights sum to 1.0; all terms 0..1 → real influence).
             score = (
                 0.30 * mom_norm
@@ -295,6 +355,7 @@ class SymbolRotator:
                 + 0.15 * regime_score
                 + 0.10 * pnl_score
                 + 0.15 * liquidity
+                + preferred_bonus
             )
 
             scores.append((score, sym))
