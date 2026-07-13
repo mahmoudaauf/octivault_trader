@@ -391,24 +391,40 @@ class NativePositionHydrationEngine:
         if not symbols:
             return []
 
+        _MAX_PAGES = 20  # safety cap: 20 * 500 = 10,000 trades/symbol, well beyond any real account
+
         fills: list[dict[str, Any]] = []
         for symbol in symbols:
             try:
-                trades = await asyncio.wait_for(
-                    self._exchange.get_my_trades(symbol, limit=500),
-                    timeout=15.0,
-                )
-                for t in trades or []:
-                    fills.append(
-                        {
-                            "symbol": t.get("symbol", symbol),
-                            "side": "BUY" if t.get("isBuyer") else "SELL",
-                            "qty": t.get("qty"),
-                            "price": t.get("price"),
-                            "fee": t.get("commission"),
-                            "epoch": float(t.get("time", 0) or 0) / 1000.0,
-                        }
+                from_id: Optional[int] = None
+                for _page in range(_MAX_PAGES):
+                    trades = await asyncio.wait_for(
+                        self._exchange.get_my_trades(symbol, limit=500, from_id=from_id),
+                        timeout=15.0,
                     )
+                    if not trades:
+                        break
+                    for t in trades:
+                        fills.append(
+                            {
+                                "symbol": t.get("symbol", symbol),
+                                "side": "BUY" if t.get("isBuyer") else "SELL",
+                                "qty": t.get("qty"),
+                                "price": t.get("price"),
+                                "fee": t.get("commission"),
+                                "epoch": float(t.get("time", 0) or 0) / 1000.0,
+                            }
+                        )
+                    if len(trades) < 500:
+                        # Short page — this was the last (most recent) page of history.
+                        break
+                    # Binance /myTrades is ordered oldest-first by trade id; page
+                    # forward from the last id seen to avoid missing older fills
+                    # that would otherwise be truncated by the single-page limit.
+                    last_id = trades[-1].get("id")
+                    if last_id is None:
+                        break
+                    from_id = int(last_id) + 1
             except Exception as e:
                 logger.error(f"Failed to fetch exchange fills for {symbol}: {e}")
 

@@ -467,12 +467,19 @@ class NativeExchangeClient:
         symbol: str,
         *,
         limit: int = 500,
+        from_id: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         """Fetch this account's executed trades for ``symbol`` (GET /api/v3/myTrades).
 
         Binance requires a single ``symbol`` per call — there is no
-        all-symbols trade-history endpoint.
+        all-symbols trade-history endpoint. Results are ordered oldest-first
+        by trade id. Pass ``from_id`` (a trade id, exclusive lower bound minus
+        one — i.e. pass ``last_seen_id + 1``) to page through accounts with
+        more than ``limit`` historical trades; see position_hydration_engine's
+        pagination loop.
         """
         params: dict[str, Any] = {"symbol": symbol, "limit": limit}
+        if from_id is not None:
+            params["fromId"] = int(from_id)
         result = await self._request("GET", self.EP_MY_TRADES, params=params, signed=True)
         return result if isinstance(result, list) else []
