@@ -12,7 +12,7 @@ Design choices
 * All retries delegated to NativeRetryManager (L0).
 * Pure data in / pure data out — no internal cache, no callbacks.
 
-Public surface (8 methods)
+Public surface (9 methods)
 --------------------------
 * get_server_time()         → int (ms)
 * get_exchange_info()       → dict
@@ -22,6 +22,7 @@ Public surface (8 methods)
 * get_klines(sym, iv, lim)  → list[list]
 * place_order(...)          → dict
 * cancel_order(sym, oid)    → dict
+* get_my_trades(sym, limit) → list[dict] (executed trades for one symbol)
 """
 
 from __future__ import annotations
@@ -70,6 +71,7 @@ class NativeExchangeClient:
     # Signed endpoints (HMAC required)
     EP_ACCOUNT = "/api/v3/account"
     EP_ORDER = "/api/v3/order"
+    EP_MY_TRADES = "/api/v3/myTrades"
 
     def __init__(
         self,
@@ -459,3 +461,18 @@ class NativeExchangeClient:
         if client_order_id is not None:
             params["origClientOrderId"] = client_order_id
         return await self._request("GET", self.EP_ORDER, params=params, signed=True)
+
+    async def get_my_trades(
+        self,
+        symbol: str,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Fetch this account's executed trades for ``symbol`` (GET /api/v3/myTrades).
+
+        Binance requires a single ``symbol`` per call — there is no
+        all-symbols trade-history endpoint.
+        """
+        params: dict[str, Any] = {"symbol": symbol, "limit": limit}
+        result = await self._request("GET", self.EP_MY_TRADES, params=params, signed=True)
+        return result if isinstance(result, list) else []

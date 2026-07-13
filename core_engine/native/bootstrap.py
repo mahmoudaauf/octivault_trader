@@ -1041,6 +1041,16 @@ async def shutdown_components(components: NativeComponents) -> None:
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("native shutdown: %s.stop() raised: %r", type(comp).__name__, e)
 
+    # ml_forecaster owns background model-training tasks (asyncio.create_task,
+    # tracked in its own _train_tasks dict) that otherwise outlive shutdown —
+    # cancel them here so the process doesn't hang waiting for training to finish.
+    ml_forecaster = components.ml_forecaster
+    if ml_forecaster is not None and hasattr(ml_forecaster, "stop"):
+        try:
+            await ml_forecaster.stop()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("native shutdown: ml_forecaster.stop() raised: %r", e)
+
     # close exchange HTTP session if reachable
     client = components.exchange_client or getattr(components.balance_sync, "_client", None)
     if client is not None and hasattr(client, "close"):

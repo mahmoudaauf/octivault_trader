@@ -337,7 +337,7 @@ class NativePositionHydrationEngine:
         # Fallback to exchange if allowed
         if self._allow_fallback and self._exchange:
             logger.info("  Attempting exchange trade history recovery...")
-            exchange_fills = await self._fetch_exchange_fills()
+            exchange_fills = await self._fetch_exchange_fills(balances)
             if exchange_fills:
                 logger.info(f"    Found {len(exchange_fills)} fills from exchange")
                 positions = self._build_positions_from_fills(exchange_fills)
@@ -370,22 +370,49 @@ class NativePositionHydrationEngine:
             logger.warning(f"Error reading journal files: {e}")
             return []
 
-    async def _fetch_exchange_fills(self) -> list[dict[str, Any]]:
-        """Fetch trade history from exchange."""
+    async def _fetch_exchange_fills(
+        self, balances: dict[str, dict[str, float]]
+    ) -> list[dict[str, Any]]:
+        """Fetch trade history from exchange via GET /myTrades.
+
+        Binance has no all-symbols trade-history endpoint, so this queries
+        per-symbol for every non-USDT asset with a nonzero balance (the same
+        asset-to-symbol convention used by :meth:`_merge_balance_holdings`).
+        """
         if not self._exchange:
             return []
 
-        try:
-            # Typically: GET /myTrades with limit=500
-            # Returns list of executed trades
-            trades = await asyncio.wait_for(
-                self._exchange.get_all_orders(),  # or similar endpoint
-                timeout=15.0,
-            )
-            return trades if trades else []
-        except Exception as e:
-            logger.error(f"Failed to fetch exchange fills: {e}")
+        symbols = [
+            f"{asset}USDT"
+            for asset, bal in (balances or {}).items()
+            if str(asset or "").upper() != "USDT"
+            and float((bal or {}).get("total", 0.0) or 0.0) > 0
+        ]
+        if not symbols:
             return []
+
+        fills: list[dict[str, Any]] = []
+        for symbol in symbols:
+            try:
+                trades = await asyncio.wait_for(
+                    self._exchange.get_my_trades(symbol, limit=500),
+                    timeout=15.0,
+                )
+                for t in trades or []:
+                    fills.append(
+                        {
+                            "symbol": t.get("symbol", symbol),
+                            "side": "BUY" if t.get("isBuyer") else "SELL",
+                            "qty": t.get("qty"),
+                            "price": t.get("price"),
+                            "fee": t.get("commission"),
+                            "epoch": float(t.get("time", 0) or 0) / 1000.0,
+                        }
+                    )
+            except Exception as e:
+                logger.error(f"Failed to fetch exchange fills for {symbol}: {e}")
+
+        return fills
 
     def _build_positions_from_fills(
         self, fills: list[dict[str, Any]]
