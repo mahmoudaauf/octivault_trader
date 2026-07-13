@@ -101,7 +101,7 @@ class NativeDecisionEngine:
         max_concurrent_positions: int = 10,
         min_order_usdt: float = 1.0,
         max_drawdown_pct: float = 10.0,
-        daily_loss_limit_pct: float = 5.0,
+        daily_loss_limit_pct: float = 2.0,
         risk_per_symbol_pct: float = 20.0,
         min_notional_usdt: float = 10.0,
         quote_reserve_ratio: float = 0.10,
@@ -310,12 +310,16 @@ class NativeDecisionEngine:
         return exceeded
 
     def _check_daily_loss_exceeded(self, portfolio: PortfolioSnapshot) -> bool:
-        daily_pnl_pct = abs(float(getattr(portfolio, "daily_pnl_pct", 0.0) or 0.0))
-        exceeded = daily_pnl_pct > self.daily_loss_limit_pct
+        daily_pnl_pct = float(getattr(portfolio, "daily_pnl_pct", 0.0) or 0.0)
+        # ``daily_pnl_pct`` is signed: losses are negative and gains are positive.
+        # Using abs() here incorrectly halted trading after a sufficiently profitable
+        # day.  Compare only the loss magnitude so the cap cannot become a profit cap.
+        daily_loss_pct = max(0.0, -daily_pnl_pct)
+        exceeded = daily_loss_pct > self.daily_loss_limit_pct
         if exceeded:
             logger.warning(
                 "daily loss %.2f%% exceeds limit %.2f%%",
-                daily_pnl_pct,
+                daily_loss_pct,
                 self.daily_loss_limit_pct,
             )
         return exceeded

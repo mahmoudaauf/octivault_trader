@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 from typing import Any
 
 from core_engine.native.quant_reasoning import (
@@ -924,11 +925,11 @@ class DecisionEngineImpl:
 
         # Step 3: Calculate profit after fees
         # The round-trip cost MUST match the entry-side gate (the forecaster's
-        # round_trip_cost = taker_bps*2 + slippage ≈ 0.0038). Previously hardcoded to
+        # round_trip_cost = taker_bps*2 + configured slippage). Previously hardcoded to
         # 0.002 (fee-only, ignoring spread/slippage), which let the gate approve exits
         # at a gross gain that covered only the fee — booking net-losing "wins"
         # (e.g. HBAR/UNI sold at +0.31% gross = −0.07% net). Reuse the same fee source.
-        fee_pct = 0.0038  # realistic round-trip (fee + spread); overridden below if available
+        fee_pct = 0.0030  # 10bps/side fee + 10bps configured exit slippage fallback
         try:
             from utils.shared_state_tools import fee_bps as _fee_bps
 
@@ -938,12 +939,18 @@ class DecisionEngineImpl:
                 _ss_fee = getattr(_orch_fee, "_shared_state", None) if _orch_fee else None
             _taker_bps = float(_fee_bps(_ss_fee, "taker") or 10.0)
             _cfg_obj = app_ctx.get("config")
-            _slip_bps = float(getattr(_cfg_obj, "EXIT_SLIPPAGE_BPS", 0.0) or 0.0) if _cfg_obj else 0.0
+            _slip_bps = float(
+                getattr(
+                    _cfg_obj,
+                    "exit_slippage_bps",
+                    getattr(_cfg_obj, "EXIT_SLIPPAGE_BPS", os.getenv("EXIT_SLIPPAGE_BPS", 10.0)),
+                )
+                or 0.0
+            )
             _derived = (_taker_bps * 2.0 + _slip_bps) / 10000.0
-            # Never under-charge below the realistic round-trip floor.
-            fee_pct = max(_derived, 0.0038)
+            fee_pct = max(_derived, 0.0020)
         except Exception:
-            fee_pct = 0.0038
+            fee_pct = 0.0030
 
         # Unrealized P&L (before fees)
         pnl_before_fees = (current_price - entry_price) * quantity
@@ -952,17 +959,17 @@ class DecisionEngineImpl:
         )
 
         # P&L after fees
-        # Formula: (current_price * (1 - fee_pct) - entry_price * (1 + fee_pct)) * qty
-        # Simplified: sell_value = qty * current_price * (1 - fee_pct)
-        #            cost_basis = qty * entry_price * (1 + fee_pct)
-        sell_value = quantity * current_price * (1.0 - fee_pct / 2.0)  # 0.1% sell fee
-        cost_basis = quantity * entry_price * (1.0 + fee_pct / 2.0)  # 0.1% buy fee already paid
+        # Allocate the total configured round-trip estimate across the two legs. This
+        # preserves the full fee+slippage hurdle without double-counting it.
+        sell_value = quantity * current_price * (1.0 - fee_pct / 2.0)
+        cost_basis = quantity * entry_price * (1.0 + fee_pct / 2.0)
         pnl_after_fees = sell_value - cost_basis
         pnl_after_fees_pct = (pnl_after_fees / cost_basis * 100.0) if cost_basis > 0 else 0.0
 
         # Gate: Only sell if profitable after fees.
         # Exception: TIME_FORCE_EXIT bypasses this gate to prevent capital deadlock —
-        # a stale position held 12h+ costs more in opportunity cost than a small exit loss.
+        # a stale position held past its configured timeout can cost more in opportunity
+        # cost than a controlled exit loss.
         # Hard floor: never accept worse than -0.5% net loss even on forced exits.
         _src_upper = str(source).upper()
         # SL_HIT is a pre-approved stop level — must always execute, deep floor -10%

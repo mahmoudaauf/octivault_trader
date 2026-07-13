@@ -108,6 +108,12 @@ class NativeSharedState:
             "win_rate_window": 0.5,
             "avg_fee_bps": 0.0,
             "avg_slippage_bps": 0.0,
+            "fee_samples": 0,
+            "execution_quality_samples": 0,
+            "avg_price_improvement_bps": 0.0,
+            "maker_fills": 0,
+            "taker_fills": 0,
+            "maker_fill_rate": 0.0,
             "avg_net_profit_bps": 0.0,
             "last_update_ts": 0.0,
         }

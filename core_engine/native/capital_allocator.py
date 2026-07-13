@@ -19,6 +19,7 @@ import logging
 from typing import Any
 
 from .capital_policy import compute_spendable_quote
+from .daily_compounding import DailyCompoundingPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,8 @@ class NativeCapitalAllocator:
         default_planned_quote: float = 12.0,
         quote_reserve_ratio: float = 0.10,
         quote_min_reserve_usdt: float = 0.0,
+        daily_compounding_enabled: bool = True,
+        daily_compounding_state_path: str | None = None,
     ) -> None:
         """
         Initialize adaptive capital allocator.
@@ -77,6 +80,10 @@ class NativeCapitalAllocator:
         self._default_planned_quote = max(1.0, float(default_planned_quote))
         self._quote_reserve_ratio = max(0.0, float(quote_reserve_ratio))
         self._quote_min_reserve_usdt = max(0.0, float(quote_min_reserve_usdt))
+        self._daily_compounding = DailyCompoundingPolicy(
+            enabled=daily_compounding_enabled,
+            state_path=daily_compounding_state_path,
+        )
         self._symbol_filters_cache: dict[str, dict[str, Any]] = {}
 
     async def allocate_for_buy(self, symbol: str) -> float:
@@ -137,10 +144,20 @@ class NativeCapitalAllocator:
                     }
 
             # Get current NAV
-            nav = await self._pm.get_nav()
-            if not nav or nav <= 0:
-                logger.debug("NAV %s too low to allocate", nav)
+            live_nav = await self._pm.get_nav()
+            if not live_nav or live_nav <= 0:
+                logger.debug("NAV %s too low to allocate", live_nav)
                 return 0.0
+            nav = self._daily_compounding.sizing_nav(
+                float(live_nav),
+                has_open_positions=self._has_open_positions(),
+            )
+            if nav < float(live_nav):
+                logger.info(
+                    "[compounding] sizing from committed NAV $%.2f (live NAV $%.2f)",
+                    nav,
+                    float(live_nav),
+                )
 
             free_capital = (
                 float(getattr(self._ss, "free_balance_usdt", 0.0) or 0.0) if self._ss else nav
@@ -357,6 +374,23 @@ class NativeCapitalAllocator:
         if not peak or peak <= 0:
             return 0.0
         return float(max(0.0, (peak - self._ss.nav_usdt) / peak * 100.0))
+
+    def _has_open_positions(self) -> bool:
+        """Return whether any non-zero position prevents a realized-NAV rollover."""
+        if self._ss is None:
+            return False
+        positions = getattr(self._ss, "positions", {}) or {}
+        for position in positions.values():
+            if isinstance(position, dict):
+                qty = position.get("qty", position.get("quantity", 0.0))
+            else:
+                qty = getattr(position, "qty", getattr(position, "quantity", 0.0))
+            try:
+                if abs(float(qty or 0.0)) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def _compute_volatility_pct(self, symbol: str) -> float:
         """Compute volatility percentage for symbol.

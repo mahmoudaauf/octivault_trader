@@ -12,7 +12,9 @@ a trained MLForecaster model and picks the top TOP_N by:
   7. Liquidity      — log-scale quote volume score
   8. Preferred bonus — +0.05 for large-cap pairs (BTC/ETH/SOL/XRP etc.)
 
-Applies the result by calling shared_state.set_accepted_symbols(top_n).
+Applies the result by calling shared_state.set_accepted_symbols(top_n), while
+pinning any held symbols for price/TP/SL monitoring. Rotation never closes a
+position; exits remain the responsibility of the strategy and TP/SL engines.
 MLForecaster reads accepted_symbols on every run_once() call so the
 watchlist updates automatically without a restart.
 """
@@ -201,7 +203,8 @@ class SymbolRotator:
         self._last_rotation: float = 0.0
         self._startup_rotate_after: float = time.monotonic() + 120.0  # re-run after 2 min (klines ready)
         self._current_universe: list[str] = list(self._fallback)
-        # Pending exits: symbols rotated out with sellable positions — emitted to main loop
+        # Compatibility-only queue. Rotation controls ENTRY eligibility and must never
+        # create an exit merely because a symbol's relative rank changed.
         self._pending_exits: dict[str, float] = {}  # symbol -> qty to sell
         # Known un-sellable dust (notional < MIN_SELLABLE_NOTIONAL) we've already
         # acknowledged. Tracked so we log each crumb ONCE rather than warning every
@@ -272,10 +275,8 @@ class SymbolRotator:
 
     def pop_pending_exits(self) -> dict[str, float]:
         """
-        Return and clear the dict of symbols that were rotated out while
-        holding a sellable position (notional >= MIN_SELLABLE_NOTIONAL).
-        Main loop should issue a SELL for each.
-        Returns {symbol: qty}.
+        Compatibility API. Symbol rotation no longer generates exits; held symbols
+        stay monitored until a strategy or TP/SL decision closes them.
         """
         exits = dict(self._pending_exits)
         self._pending_exits.clear()
@@ -386,11 +387,9 @@ class SymbolRotator:
         # A symbol back in the active set is no longer "stranded dust" — clear its tag
         # so it re-logs if it strands again after a future rotation.
         self._stranded_dust.difference_update(set(top))
-        if self._ss is not None:
-            self._ss.set_accepted_symbols(top)
-
-        # Check removed symbols for sellable positions — queue exits
-        exits_queued = []
+        # Pin removed holdings for market-data and TP/SL monitoring. Falling out of
+        # the entry ranking is not evidence that a market sell has positive edge.
+        positions_pinned = []
         dust_stranded = []
         if removed and self._ss is not None:
             positions = dict(getattr(self._ss, "positions", {}) or {})
@@ -415,37 +414,12 @@ class SymbolRotator:
                 notional = qty * price if price > 0 else 0.0
 
                 if notional >= MIN_SELLABLE_NOTIONAL:
-                    # Post-buy immunity: never rotation-exit a position entered within 2 hours.
-                    # Gives signal exit the chance to fire and generate profit before rotation takes over.
-                    # Use _buy_ts registry first (set at fill time), fall back to position entry_time.
-                    _now = time.time()
-                    _buy_ts = self._buy_ts.get(sym, 0.0)
-                    if _buy_ts == 0.0 and pos is not None:
-                        _buy_ts = float(getattr(pos, "entry_time", None)
-                                        or (pos.get("entry_time", 0) if isinstance(pos, dict) else 0) or 0.0)
-                    if _buy_ts == 0.0:
-                        # No timestamp available — entry time unknown, assume position is fresh and
-                        # grant immunity to prevent rotating out a just-entered position we can't date.
-                        _log.info(
-                            "[SymbolRotator] EXIT deferred: %s has no entry timestamp — granting immunity to avoid rotating fresh position",
-                            sym,
-                        )
+                    if sym not in self._current_universe:
                         self._current_universe.append(sym)
-                        continue
-                    _pos_age = _now - _buy_ts
-                    if _pos_age < 7200.0:  # 2-hour immunity window
-                        _log.info(
-                            "[SymbolRotator] EXIT deferred: %s rotated out but only %.0fm old — "
-                            "holding for signal exit (immunity window=2h)",
-                            sym, _pos_age / 60,
-                        )
-                        # Keep in universe temporarily so it isn't re-rotated immediately
-                        self._current_universe.append(sym)
-                        continue
-                    self._pending_exits[sym] = qty
-                    exits_queued.append(f"{sym}(qty={qty:.6f} ~${notional:.2f})")
+                    positions_pinned.append(f"{sym}(qty={qty:.6f} ~${notional:.2f})")
                     _log.info(
-                        "[SymbolRotator] EXIT queued: %s rotated out with sellable position qty=%.6f notional=$%.2f",
+                        "[SymbolRotator] POSITION pinned: %s rotated out of entry ranking "
+                        "with qty=%.6f notional=$%.2f — TP/SL retains exit authority",
                         sym, qty, notional,
                     )
                 else:
@@ -464,9 +438,13 @@ class SymbolRotator:
                             sym, notional, MIN_SELLABLE_NOTIONAL,
                         )
 
+        if self._ss is not None:
+            self._ss.set_accepted_symbols(self._current_universe)
+
         _log.info(
-            "[SymbolRotator] Universe updated → %s | +%s -%s | exits_queued=%s dust_stranded=%s | trending=%d ranging=%d total_candidates=%d",
+            "[SymbolRotator] Universe updated → %s | +%s -%s | positions_pinned=%s "
+            "dust_stranded=%s | trending=%d ranging=%d total_candidates=%d",
             top, list(added), list(removed),
-            exits_queued or "none", dust_stranded or "none",
+            positions_pinned or "none", dust_stranded or "none",
             len(trending), len(ranging), len(candidates),
         )

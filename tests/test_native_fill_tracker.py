@@ -50,6 +50,35 @@ class TestNativeFillTracker:
         assert fill.price == 65000.0
         assert fill.commission == 32.5
 
+    def test_fee_metric_converts_assets_and_uses_true_average(self):
+        exchange = AsyncMock()
+        shared_state = NativeSharedState()
+        shared_state.price_cache["BNBUSDT"] = 500.0
+        tracker = NativeFillTracker(exchange_client=exchange, shared_state=shared_state)
+
+        base_fee = Fill(
+            exchange_trade_id=1, symbol="BTCUSDT", side="BUY", quantity=1.0,
+            price=100.0, fee_qty=0.001, fee_asset="BTC",
+            timestamp_ms=1609459200000, commission=0.001,
+        )
+        bnb_fee = Fill(
+            exchange_trade_id=2, symbol="BTCUSDT", side="BUY", quantity=1.0,
+            price=100.0, fee_qty=0.004, fee_asset="BNB",
+            timestamp_ms=1609459200001, commission=0.004,
+        )
+
+        first = tracker._record_fee_metric(
+            quote_value=100.0, commission_quote=tracker._commission_quote(base_fee)
+        )
+        second = tracker._record_fee_metric(
+            quote_value=100.0, commission_quote=tracker._commission_quote(bnb_fee)
+        )
+
+        assert first == pytest.approx(10.0)
+        assert second == pytest.approx(200.0)
+        assert shared_state.metrics["fee_samples"] == 2
+        assert shared_state.metrics["avg_fee_bps"] == pytest.approx(105.0)
+
     @pytest.mark.asyncio
     async def test_process_buy_fill_creates_new_position(self):
         """Test BUY fill creates a new position."""

@@ -5,7 +5,7 @@ runtime knobs to keep the bot tracking the +2%/day NAV objective.
 Design contract (see OBJECTIVE_FEEDBACK_PLAN.md):
   • Runs every CHECKPOINT_HEARTBEAT_S seconds (default 900 = 15 min).
   • Reads observed pace / drawdown / throughput / economics from SharedState.
-  • Bounded PI control on three knobs:
+  • Bounded quality/risk control on three knobs:
         confidence_floor, size_multiplier, target_throughput_per_hour
   • Writes to shared_state.runtime_overrides (hot-reload dict).
   • Hard kill-switch on drawdown breach (≥5%).
@@ -41,7 +41,7 @@ DEFAULTS = {
     # Knob ranges  (clamped)
     # Floor minimum of 0.65 is the empirical breakeven threshold — signals below this
     # have shown ~30% win rate which is deeply unprofitable. Never go below 0.65.
-    "OBJ_CONF_FLOOR_MIN": 0.50,
+    "OBJ_CONF_FLOOR_MIN": 0.65,
     "OBJ_CONF_FLOOR_MAX": 0.72,
     "OBJ_SIZE_MULT_MIN": 0.50,
     "OBJ_SIZE_MULT_MAX": 1.50,
@@ -269,68 +269,28 @@ class ObjectiveFeedbackController:
             self.state.consecutive_dd_breaches = 0
 
         # ---- 3. PI update --------------------------------------------
-        # When there are zero trades (regime block, cooldown, etc.) and no drawdown,
-        # the system is idle by design — not underperforming. Skip PI update to prevent
-        # integral windup and slowly decay floor back to min so it doesn't ratchet up.
-        # EXCEPTION: if the portfolio is capacity-constrained (many positions or high
-        # exposure), the idle signal is a capacity signal, not a quality signal — do NOT
-        # decay the floor. Decaying the floor when all slots are taken causes low-quality
-        # entries as soon as a slot opens.
-        _ss_cap = self.ss
-        _positions_count = 0
-        _exposure_ratio = 0.0
-        if _ss_cap is not None:
-            try:
-                _positions_count = len(getattr(_ss_cap, "positions", {}) or {})
-                _metrics_cap = getattr(_ss_cap, "metrics", {}) or {}
-                _nav_cap = await _safe_get(_ss_cap, "get_nav", default=1.0) or 1.0
-                _locked_cap = float(_metrics_cap.get("locked_usdt", 0.0) or 0.0)
-                _exposure_ratio = _locked_cap / _nav_cap if _nav_cap > 0 else 0.0
-            except Exception:
-                pass
-        _capacity_constrained = _positions_count >= 10 or _exposure_ratio >= 0.45
-
+        # Frequency is an evaluation target, never an entry quota.  Zero trades can
+        # legitimately mean that no setup cleared the quality gates, so idle periods
+        # must not lower confidence, increase size, or shorten cooldowns.
         no_trades_idle = tel.trades_in_window == 0 and dd_error == 0.0
-        if no_trades_idle and _capacity_constrained:
-            # Portfolio is full — 0 trades means no slots, not low quality.
-            # Hold floor steady so we don't open slots to mediocre signals.
-            self.logger.debug(
-                "[OFC] idle (0 trades) but capacity-constrained (positions=%d, exposure=%.0f%%) — holding floor steady",
-                _positions_count,
-                _exposure_ratio * 100,
-            )
+        if no_trades_idle:
+            self.logger.debug("[OFC] idle (0 trades, no DD) — holding quality/risk knobs")
+            self.state.integral_pace = 0.0
             d_conf = 0.0
             d_size = 0.0
             d_thru = 0.0
-        elif no_trades_idle:
-            self.logger.debug(
-                "[OFC] idle (0 trades, no DD) — decaying floor toward min, holding other knobs"
-            )
-            conf_min = self.knob_ranges["confidence_floor"][0]
-            current_floor = self.state.last_knobs["confidence_floor"]
-            # Gentle decay: move 10% toward floor_min each OFC step so ratchet reverses
-            d_conf = (conf_min - current_floor) * 0.10
-            d_size = 0.0
-            d_thru = 0.0
         else:
-            # Anti-windup: only integrate when not at saturation
-            self.state.integral_pace = _clamp(self.state.integral_pace + pace_error, -2.0, 2.0)
-
+            # Pace remains telemetry only.  Confidence may relax slightly only when
+            # observed NET edge is already above its floor; it may never be lowered
+            # merely because the system is behind a P&L or throughput target.
+            self.state.integral_pace = 0.0
             d_conf = (
-                +self.gains["Kp_conf"] * pace_error * 0.01  # behind→lower floor, ahead→raise
-                + self.gains["Ki_conf"] * self.state.integral_pace * 0.01
-                + self.gains["Kp_dd"] * (dd_error * 0.01)  # raise floor on DD
+                self.gains["Kp_dd"] * (dd_error * 0.01)  # raise floor on DD
                 + (edge_error_bps / 1000.0)  # poor edge → raise floor
             )
-
-            d_size = -self.gains["Kp_size"] * pace_error * 0.01 - self.gains["Kp_dd"] * (
-                dd_error * 0.01
-            )
-
-            d_thru = (
-                +self.gains["Kp_thru"] * pace_error * 0.01
-                - self.gains["Kp_dd"] * (dd_error * 0.01) * 10.0
-            )
+            # The controller can de-risk, but never sizes up to chase a target.
+            d_size = -self.gains["Kp_dd"] * (dd_error * 0.01)
+            d_thru = 0.0
 
         # ---- 4. Apply (clamped) --------------------------------------
         new_knobs = dict(self.state.last_knobs)

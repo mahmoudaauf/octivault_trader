@@ -87,6 +87,9 @@ def test_bootstrap_config_defaults():
     assert cfg.balance_poll_sec == 5.0
     assert cfg.telemetry_capacity == 1024
     assert cfg.runtime_state_path == "runtime_state_snapshot.json"
+    assert cfg.taker_fee_bps == 10.0
+    assert cfg.maker_fee_bps == 10.0
+    assert cfg.exit_slippage_bps == 10.0
 
 
 def test_bootstrap_config_is_frozen():
@@ -132,6 +135,9 @@ def test_from_env_parses_full_environment():
         "DURATION_SEC": "1800",
         "REQUEST_TIMEOUT_SEC": "5",
         "SIGNAL_ADAPTER_TIMEOUT_SEC": "17",
+        "TAKER_FEE_BPS": "8.5",
+        "MAKER_FEE_BPS": "7.5",
+        "EXIT_SLIPPAGE_BPS": "6",
     }
     cfg = BootstrapConfig.from_env(env=env)
     assert cfg.api_key == "key123"
@@ -151,6 +157,9 @@ def test_from_env_parses_full_environment():
     assert cfg.duration_sec == 1800.0
     assert cfg.request_timeout_sec == 5.0
     assert cfg.signal_adapter_timeout_sec == 17.0
+    assert cfg.taker_fee_bps == 8.5
+    assert cfg.maker_fee_bps == 7.5
+    assert cfg.exit_slippage_bps == 6.0
 
 
 def test_from_env_falls_back_on_malformed_numbers():

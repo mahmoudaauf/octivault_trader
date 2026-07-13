@@ -2204,7 +2204,13 @@ class MLForecaster:
     def _round_trip_cost_pct(self) -> float:
         taker_bps = float(fee_bps(self.shared_state, "taker") or 10.0)
         slippage_bps = float(
-            self._cfg("EXIT_SLIPPAGE_BPS", self._cfg("CR_PRICE_SLIPPAGE_BPS", 0.0)) or 0.0
+            self._cfg(
+                "EXIT_SLIPPAGE_BPS",
+                self._cfg(
+                    "exit_slippage_bps", self._cfg("CR_PRICE_SLIPPAGE_BPS", 10.0)
+                ),
+            )
+            or 0.0
         )
         return ((taker_bps * 2.0) + slippage_bps) / 10000.0
 
@@ -3263,6 +3269,7 @@ class MLForecaster:
         max_samples_per_symbol: Optional[int] = None,
         bucket_size: Optional[float] = None,
         source: str = "manual",
+        include_records: bool = False,
     ) -> dict[str, Any]:
         """
         Historical confidence backtest:
@@ -3421,6 +3428,7 @@ class MLForecaster:
                     records.append(
                         {
                             "symbol": sym,
+                            "entry_ts": self._extract_row_timestamp(ohlcv[i - 1]),
                             "action": action.upper(),
                             "confidence": confidence,
                             "entry_price": entry_price,
@@ -3466,7 +3474,7 @@ class MLForecaster:
         for rec in records[-self._conf_max_completed :]:
             self._completed_conf_samples.append(rec)
 
-        return {
+        result = {
             "ok": True,
             "records": len(records),
             "rows": rows,
@@ -3474,6 +3482,9 @@ class MLForecaster:
             "horizon_min": hz_min,
             "source": source,
         }
+        if include_records:
+            result["samples"] = records
+        return result
 
     async def _collect_signal(
         self,

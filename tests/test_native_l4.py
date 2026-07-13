@@ -248,6 +248,20 @@ class TestNativeDecisionEngine:
         decisions = eng.decide(signals, portfolio, balance_usdt=1000.0)
         assert decisions == []
 
+    def test_daily_loss_gate_does_not_block_profitable_day(self) -> None:
+        eng = NativeDecisionEngine(daily_loss_limit_pct=2.0)
+        signals = {"BTCUSDT": _signal_buy("BTCUSDT", 0.9)}
+        portfolio = PortfolioSnapshot(
+            nav=1030.0,
+            nav_peak=1030.0,
+            balance={"USDT": 1030.0},
+            positions={},
+            open_orders={},
+            daily_pnl_pct=3.0,
+        )
+        decisions = eng.decide(signals, portfolio, balance_usdt=1030.0)
+        assert len(decisions) == 1
+
     def test_exposure_gate_blocks_new_buys(self) -> None:
         eng = NativeDecisionEngine(max_total_exposure_pct=60.0)
         signals = {"BTCUSDT": _signal_buy("BTCUSDT", 0.9)}

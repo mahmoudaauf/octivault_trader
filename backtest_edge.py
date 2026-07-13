@@ -19,6 +19,8 @@ import asyncio
 import glob
 import os
 import sys
+from collections import defaultdict
+from datetime import datetime, timezone
 
 
 async def main() -> None:
@@ -60,9 +62,19 @@ async def main() -> None:
         model_manager=model_manager,
     )
 
-    res = await fc.backtest_confidence_buckets(
-        symbols=syms, max_samples_per_symbol=max_per_sym, source="edge_proof"
-    )
+    try:
+        res = await fc.backtest_confidence_buckets(
+            symbols=syms,
+            max_samples_per_symbol=max_per_sym,
+            source="edge_proof",
+            include_records=True,
+        )
+    finally:
+        close = getattr(exchange_client, "close_connection", None) or getattr(
+            exchange_client, "close", None
+        )
+        if callable(close):
+            await close()
 
     buckets = res.get("rows") or []
     total_n = int(res.get("records", 0) or 0)
@@ -115,6 +127,63 @@ async def main() -> None:
     q4_exp = sum(b["net"] * b["n"] for b in high) / max(1, sum(b["n"] for b in high))
     discriminates = q4_exp > q1_exp
     print(f"\n  low-conf half: {q1_exp:+.4f}%   high-conf half: {q4_exp:+.4f}%")
+
+    samples = res.get("samples") or []
+    by_symbol = defaultdict(list)
+    by_regime = defaultdict(list)
+    daily_wins = defaultdict(int)
+    sample_days = []
+    for sample in samples:
+        net_pct = float(sample.get("net_pnl_pct", 0.0) or 0.0) * 100.0
+        by_symbol[str(sample.get("symbol", "UNKNOWN"))].append(net_pct)
+        by_regime[str(sample.get("regime", "unknown"))].append(net_pct)
+        ts = float(sample.get("entry_ts", 0.0) or 0.0)
+        if ts > 0:
+            day = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+            sample_days.append(day)
+            if net_pct > 0:
+                daily_wins[day] += 1
+
+    if by_symbol:
+        ranked = []
+        for symbol, pnl_values in by_symbol.items():
+            wins = sum(value > 0 for value in pnl_values)
+            ranked.append(
+                (sum(pnl_values) / len(pnl_values), wins / len(pnl_values), len(pnl_values), symbol)
+            )
+        ranked.sort(reverse=True)
+        print("\nPer-symbol net edge (minimum 20 samples):")
+        eligible = [row for row in ranked if row[2] >= 20]
+        for expectancy, win_rate, count, symbol in eligible[:10]:
+            print(
+                f"  {symbol:12} n={count:>4} win={win_rate*100:>5.1f}% "
+                f"net={expectancy:>+8.4f}%"
+            )
+        positive = [row for row in eligible if row[0] > 0]
+        print(f"  positive symbols: {len(positive)}/{len(eligible)} with >=20 samples")
+
+    if by_regime:
+        print("\nPer-regime net edge:")
+        for regime, pnl_values in sorted(by_regime.items()):
+            wins = sum(value > 0 for value in pnl_values)
+            print(
+                f"  {regime:12} n={len(pnl_values):>4} "
+                f"win={wins/len(pnl_values)*100:>5.1f}% "
+                f"net={sum(pnl_values)/len(pnl_values):>+8.4f}%"
+            )
+
+    if sample_days:
+        start_day, end_day = min(sample_days), max(sample_days)
+        calendar_days = (end_day - start_day).days + 1
+        raw_winners_per_day = sum(daily_wins.values()) / calendar_days
+        print(
+            "\nRaw opportunity diagnostic (overlapping samples; NOT executable portfolio proof):"
+        )
+        print(
+            f"  {start_day}..{end_day} ({calendar_days} UTC days): "
+            f"{sum(daily_wins.values())} net-positive samples = "
+            f"{raw_winners_per_day:.2f}/day"
+        )
     print("\n" + "-" * 64)
     if overall_exp > 0 and discriminates:
         print(f"VERDICT: ✅ EDGE SIGNAL — net+ ({overall_exp:+.4f}%) and high-conf "

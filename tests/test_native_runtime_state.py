@@ -14,6 +14,13 @@ def test_runtime_state_export_and_restore(tmp_path: Path) -> None:
     state.update_price("BTCUSDT", 65000.0)
     state.update_position("BTCUSDT", qty=0.01, entry=60000.0, current=65000.0)
     state.set_exchange_throttle(True, reason="418 ban", until_ts=9999999999.0)
+    state.metrics.update({
+        "avg_fee_bps": 10.0,
+        "fee_samples": 12,
+        "avg_slippage_bps": 2.5,
+        "execution_quality_samples": 8,
+        "maker_fill_rate": 0.75,
+    })
 
     out = tmp_path / "runtime_state.json"
     exp = NativeRuntimeStateExporter(state, out, interval_sec=1.0)
@@ -33,6 +40,11 @@ def test_runtime_state_export_and_restore(tmp_path: Path) -> None:
     assert "BTCUSDT" in restored._last_tick_timestamps
     assert restored.exchange_throttled is True
     assert restored.get_position("BTCUSDT") is not None
+    assert restored.metrics["avg_fee_bps"] == 10.0
+    assert restored.metrics["fee_samples"] == 12
+    assert restored.metrics["avg_slippage_bps"] == 2.5
+    assert restored.metrics["execution_quality_samples"] == 8
+    assert restored.metrics["maker_fill_rate"] == 0.75
 
 
 def test_runtime_state_restore_prefers_last_known_good_when_current_is_zero_and_throttled(

@@ -7,8 +7,8 @@ Tier 1 Implementation (May 7, 2026):
   3. Auto-arm safety on startup
 
 Tier 2 Enhancements (May 7, 2026):
-  4. Fee-aware minimum TP floor (0.2% round-trip + 0.5% net profit)
-  5. Time-based TP tightening (2hr/6hr/12hr thresholds)
+  4. Cost-aware minimum TP floor (configured fees + slippage + net profit)
+  5. Time-based TP tightening and configurable stale-position exit
   6. Trailing TP after +1.5% profit (0.8% trail below peak)
 
 No external dependencies beyond asyncio + logging + time.
@@ -24,8 +24,8 @@ from typing import Optional, Union
 class NativeTPSLEngine:
     """Volatility-adaptive TP/SL with fee-awareness, time decay, and trailing stops."""
 
-    # Minimum net profit required above fees (0.2% round-trip Binance fee)
-    _ROUND_TRIP_FEE_PCT = 0.002
+    # Minimum net profit required above fees and configured execution slippage.
+    _ROUND_TRIP_FEE_PCT = 0.003
     _MIN_NET_PROFIT_PCT = 0.005  # 0.5% net profit floor
 
     # Time-based tightening thresholds
@@ -83,6 +83,18 @@ class NativeTPSLEngine:
         # Config: Safety
         self._min_notional_safety = float(getattr(config, "MIN_NOTIONAL_SAFETY", 10.0) or 10.0)
         self._auto_arm_enabled = bool(getattr(config, "TPSL_AUTO_ARM_ENABLED", True))
+        taker_fee_bps = float(getattr(config, "taker_fee_bps", 10.0) or 10.0)
+        exit_slippage_bps = float(
+            getattr(
+                config,
+                "exit_slippage_bps",
+                os.getenv("EXIT_SLIPPAGE_BPS", os.getenv("CR_PRICE_SLIPPAGE_BPS", "10")),
+            )
+            or 0.0
+        )
+        self._round_trip_cost_pct = max(
+            0.002, ((taker_fee_bps * 2.0) + exit_slippage_bps) / 10_000.0
+        )
 
         # Runtime state
         self._armed_symbols: set[str] = set()
@@ -306,7 +318,7 @@ class NativeTPSLEngine:
         """
         Calculate volatility-adaptive TP/SL with fee-aware minimum floor.
 
-        Layer 1: fee-aware minimum TP = entry * (1 + 0.2% fee + 0.5% net profit)
+        Layer 1: cost-aware minimum TP using the canonical round-trip estimate.
         """
         try:
             atr_raw = self._compute_atr(symbol, self._atr_lookback)
@@ -416,7 +428,7 @@ class NativeTPSLEngine:
 
         Layers checked in order:
           3. Trailing TP (overrides static TP once activated)
-          2. Time-based force exit (12h)
+          2. Time-based force exit (configured, 3h default)
           1. Static TP/SL
         """
         try:
@@ -453,14 +465,14 @@ class NativeTPSLEngine:
 
             now = time.time()
 
-            # Layer 2: Force exit at 12h — but only if the position is NOT profitable.
+            # Layer 2: Force exit at the configured age — only when not profitable.
             # Profitable positions are allowed to run; the trailing stop will exit them.
             # Only unprofitable or stagnant positions (< +0.3% after fees) are force-exited.
             entry_ts = self._entry_timestamps.get(symbol, 0)
             if entry_ts > 0:
                 age_sec = now - entry_ts
                 if age_sec >= self._AGE_FORCE_EXIT_SEC:
-                    _fee_cost_pct = 0.002  # round-trip fee
+                    _fee_cost_pct = self._round_trip_cost_pct
                     _net_profit_pct = (current_price - entry_price) / entry_price - _fee_cost_pct
                     if _net_profit_pct > 0.003:
                         # Position is profitable — let trailing stop manage the exit
@@ -700,14 +712,14 @@ class NativeTPSLEngine:
                 continue
 
             if age_sec >= self._AGE_TIGHTEN_2_SEC:
-                # 6h threshold: tighten to +0.8%
+                # 4h threshold: tighten to +0.8%
                 new_tp = entry_price * 1.008
-                new_sl = entry_price * (1.0 + self._ROUND_TRIP_FEE_PCT)
+                new_sl = entry_price * (1.0 + self._round_trip_cost_pct)
                 reason = f"age={age_sec/3600:.1f}h >= 4h → tp=+0.8%"
             else:
                 # 2h threshold: tighten to +1.5%, move SL to break-even
                 new_tp = entry_price * 1.015
-                new_sl = entry_price * (1.0 + self._ROUND_TRIP_FEE_PCT)
+                new_sl = entry_price * (1.0 + self._round_trip_cost_pct)
                 reason = f"age={age_sec/3600:.1f}h >= 2h → tp=+1.5%, sl=break-even"
 
             # Only tighten TP (never loosen via time logic)
@@ -837,7 +849,7 @@ class NativeTPSLEngine:
         confidence = float(setup_context.get("confidence", 0.0) or 0.0)
 
         tighten_tp_pct = 0.012
-        break_even_buffer = self._ROUND_TRIP_FEE_PCT
+        break_even_buffer = self._round_trip_cost_pct
         reason = "protect_quick_winner"
 
         if (
@@ -845,24 +857,24 @@ class NativeTPSLEngine:
             or "TIGHTEN_TP_SL" in suggested_actions
         ):
             tighten_tp_pct = 0.010
-            break_even_buffer = self._ROUND_TRIP_FEE_PCT + 0.002
+            break_even_buffer = self._round_trip_cost_pct + 0.002
             reason = "nav_profit_protection"
 
         if "PARTIAL_TAKE_PROFIT" in suggested_actions:
             tighten_tp_pct = min(tighten_tp_pct, 0.009)
-            break_even_buffer = max(break_even_buffer, self._ROUND_TRIP_FEE_PCT + 0.003)
+            break_even_buffer = max(break_even_buffer, self._round_trip_cost_pct + 0.003)
             reason = "partial_take_profit_protection"
 
         if confidence >= 0.70 and entry_quality >= 0.65:
             tighten_tp_pct = max(0.009, tighten_tp_pct - 0.001)
-            break_even_buffer = max(break_even_buffer, self._ROUND_TRIP_FEE_PCT + 0.003)
+            break_even_buffer = max(break_even_buffer, self._round_trip_cost_pct + 0.003)
 
         new_tp = entry_price * (1.0 + tighten_tp_pct)
         new_sl = entry_price * (1.0 + break_even_buffer)
 
         # Never loosen TP below already-secured price structure if the market is still below new TP.
         new_tp = min(
-            current_tp, max(new_tp, entry_price * (1.0 + self._ROUND_TRIP_FEE_PCT + 0.003))
+            current_tp, max(new_tp, entry_price * (1.0 + self._round_trip_cost_pct + 0.003))
         )
         new_sl = max(current_sl, min(new_sl, current_price * 0.9975))
 
@@ -876,7 +888,7 @@ class NativeTPSLEngine:
         }
 
     def get_force_exit_symbols(self) -> set[str]:
-        """Return symbols that need forced exit due to 12h timeout."""
+        """Return symbols that need forced exit due to the configured timeout."""
         return self._force_exit_symbols.copy()
 
     def calculate_risk_based_position_size(

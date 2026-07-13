@@ -32,7 +32,7 @@ POLL_SECONDS = float(os.getenv("TRADE_MONITOR_POLL_S", "30"))
 # Round-trip fee + spread (%). The executor logs GROSS pnl_pct; a "WIN" there can
 # still be a NET loss once round-trip costs are paid. We reclassify on net so the
 # win-rate reflects money, not gross ticks. Matches round_trip_cost in the logs.
-ROUND_TRIP_FEE_PCT = float(os.getenv("ROUND_TRIP_FEE_PCT", "0.38"))
+ROUND_TRIP_FEE_PCT = float(os.getenv("ROUND_TRIP_FEE_PCT", "0.30"))
 
 # Matches the executor's TRADE_CLOSED line. Leading group captures the log
 # timestamp so each close has a stable dedup signature.

@@ -34,7 +34,7 @@ class Fill:
     fee_qty: float
     fee_asset: str
     timestamp_ms: int
-    commission: float = 0.0  # In quote currency
+    commission: float = 0.0  # Denominated in ``fee_asset`` (not necessarily quote)
 
 
 class NativeFillTracker:
@@ -180,6 +180,39 @@ class NativeFillTracker:
         except Exception as e:
             logger.error("Failed to process fill: %s", e, exc_info=True)
 
+    def _commission_quote(self, fill: Fill) -> float:
+        """Convert Binance's commission asset to quote currency when possible."""
+        commission = max(0.0, float(fill.commission or 0.0))
+        if commission <= 0:
+            return 0.0
+        symbol = fill.symbol.upper()
+        fee_asset = fill.fee_asset.upper()
+        quote_asset = "USDT" if symbol.endswith("USDT") else ""
+        base_asset = symbol[: -len(quote_asset)] if quote_asset else ""
+        if fee_asset == quote_asset:
+            return commission
+        if fee_asset == base_asset:
+            return commission * float(fill.price or 0.0)
+        price_cache = getattr(self._shared_state, "price_cache", {}) or {}
+        conversion = float(price_cache.get(f"{fee_asset}{quote_asset}", 0.0) or 0.0)
+        return commission * conversion if conversion > 0 else 0.0
+
+    def _record_fee_metric(self, *, quote_value: float, commission_quote: float) -> float:
+        fee_bps = (
+            commission_quote / quote_value * 10_000.0
+            if quote_value > 0 and commission_quote > 0
+            else 0.0
+        )
+        metrics = getattr(self._shared_state, "metrics", None)
+        if not isinstance(metrics, dict) or fee_bps <= 0:
+            return fee_bps
+        samples = int(metrics.get("fee_samples", 0) or 0)
+        previous = float(metrics.get("avg_fee_bps", 0.0) or 0.0)
+        metrics["avg_fee_bps"] = ((previous * samples) + fee_bps) / (samples + 1)
+        metrics["fee_samples"] = samples + 1
+        metrics["last_update_ts"] = time.time()
+        return fee_bps
+
     async def _process_buy_fill(self, fill: Fill) -> None:
         """Update position after BUY fill."""
         sym = fill.symbol.upper()
@@ -226,15 +259,10 @@ class NativeFillTracker:
 
         # Track fee in basis points (1 bps = 0.01%)
         quote_value = fill.quantity * fill.price
-        fee_bps = (fill.commission / quote_value * 10000.0) if quote_value > 0 else 0.0
-
-        # Update metrics
-        if hasattr(self._shared_state, "metrics"):
-            m = self._shared_state.metrics
-            # Rolling average of fee (exponential moving average)
-            prev_avg_fee = m.get("avg_fee_bps", 0.0)
-            m["avg_fee_bps"] = prev_avg_fee * 0.9 + fee_bps * 0.1
-            m["last_update_ts"] = time.time()
+        commission_quote = self._commission_quote(fill)
+        fee_bps = self._record_fee_metric(
+            quote_value=quote_value, commission_quote=commission_quote
+        )
 
         # Emit event
         await self._emit_fill_event(
@@ -287,7 +315,10 @@ class NativeFillTracker:
                     )
 
         # Calculate realized P&L
-        realized_pnl = (fill.price - current_pos.entry_price) * fill.quantity - fill.commission
+        commission_quote = self._commission_quote(fill)
+        realized_pnl = (
+            (fill.price - current_pos.entry_price) * fill.quantity - commission_quote
+        )
 
         # Emit event
         await self._emit_fill_event(
@@ -303,7 +334,7 @@ class NativeFillTracker:
         record = {
             "ts": time.time(),
             "realized_delta": realized_pnl,
-            "fee_quote": fill.commission,
+            "fee_quote": commission_quote,
             "hold_sec": 0.0,  # TODO: track entry_ts in Position for accurate hold time
         }
         if hasattr(self._shared_state, "append_trade_record"):
@@ -311,7 +342,9 @@ class NativeFillTracker:
 
         # Track fee in basis points
         quote_value = fill.quantity * fill.price
-        fee_bps = (fill.commission / quote_value * 10000.0) if quote_value > 0 else 0.0
+        fee_bps = self._record_fee_metric(
+            quote_value=quote_value, commission_quote=commission_quote
+        )
 
         # Update metrics for ObjectiveFeedbackController
         if hasattr(self._shared_state, "metrics"):
@@ -319,9 +352,6 @@ class NativeFillTracker:
             m["realized_pnl"] = m.get("realized_pnl", 0.0) + realized_pnl
             m["trades_in_window"] = m.get("trades_in_window", 0) + 1
             m["last_update_ts"] = time.time()
-            # Rolling average of fee (exponential moving average)
-            prev_avg_fee = m.get("avg_fee_bps", 0.0)
-            m["avg_fee_bps"] = prev_avg_fee * 0.9 + fee_bps * 0.1
             # Rolling win_rate using exponential moving average
             prev_wr = m.get("win_rate_window", 0.5)
             m["win_rate_window"] = prev_wr * 0.9 + (1.0 if realized_pnl > 0 else 0.0) * 0.1

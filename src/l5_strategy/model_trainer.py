@@ -135,6 +135,7 @@ class ModelTrainer:
 
         # Feature scaling persistence
         self.feature_scalers = {}  # Will store sklearn scalers
+        self.feature_columns: list[str] = []
 
         # Probability calibration
         self.calibration_method = os.getenv(
@@ -175,7 +176,13 @@ class ModelTrainer:
             self.logger.info(
                 "Using legacy Adam optimizer for improved Apple Silicon training performance."
             )
-            return LegacyAdam(learning_rate=self.learning_rate, clipnorm=1.0)
+            try:
+                return LegacyAdam(learning_rate=self.learning_rate, clipnorm=1.0)
+            except Exception as exc:
+                self.logger.warning(
+                    "Legacy Adam unavailable at runtime (%s); falling back to standard Adam.",
+                    exc,
+                )
         return Adam(learning_rate=self.learning_rate, clipnorm=1.0)
 
     def _build_model(self, state_shape):
@@ -253,6 +260,7 @@ class ModelTrainer:
         try:
             metadata = {
                 "feature_scalers": self.feature_scalers,
+                "feature_columns": list(self.feature_columns),
                 "label_threshold_pct": self.label_threshold_pct,
                 "input_lookback": self.input_lookback,
                 "model_version": self.timeframe,
@@ -477,6 +485,157 @@ class ModelTrainer:
             self.logger.warning("Failed to persist model for %s: %s", self.symbol, e)
             return False
 
+    def evaluate_holdout(
+        self,
+        df,
+        *,
+        probability_threshold: float = 0.55,
+        round_trip_cost_pct: float = 0.0030,
+        horizon_bars: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Evaluate the trained model without fitting on held-out observations.
+
+        A signal is entered at the prediction bar's close and exited at the
+        configured horizon close. Net returns include the complete round-trip
+        fee/slippage assumption. Existing training scalers are transformed only;
+        they are never refit on holdout data.
+        """
+        result: dict[str, Any] = {
+            "ok": False,
+            "reason": "unknown",
+            "samples": 0,
+            "signals": 0,
+            "wins": 0,
+            "accuracy": 0.0,
+            "win_rate": 0.0,
+            "expectancy_pct": 0.0,
+            "profit_factor": 0.0,
+            "winners_per_day": 0.0,
+            "round_trip_cost_pct": float(round_trip_cost_pct),
+        }
+        if pd is None:
+            result["reason"] = "pandas_missing"
+            return result
+        if self.model is None:
+            result["reason"] = "model_missing"
+            return result
+        if not isinstance(df, pd.DataFrame):
+            try:
+                df = pd.DataFrame(df)
+            except Exception:
+                result["reason"] = "invalid_dataframe"
+                return result
+
+        feature_cols = list(self.feature_columns or self.feature_scalers.keys())
+        if not feature_cols:
+            result["reason"] = "feature_schema_missing"
+            return result
+        missing = [col for col in feature_cols if col not in df.columns]
+        if missing:
+            result["reason"] = f"missing_features:{','.join(missing[:5])}"
+            return result
+        if "close" not in df.columns:
+            result["reason"] = "missing_close_column"
+            return result
+
+        horizon = max(1, int(horizon_bars or self.triple_barrier_lookforward))
+        if len(df) < self.input_lookback + horizon:
+            result["reason"] = "insufficient_rows"
+            return result
+
+        raw = (
+            df[feature_cols]
+            .replace([np.inf, -np.inf], np.nan)
+            .ffill()
+            .bfill()
+            .fillna(0.0)
+            .to_numpy(dtype=np.float32)
+        )
+        scaled = np.empty_like(raw, dtype=np.float32)
+        for feat_idx, col in enumerate(feature_cols):
+            scaler = self.feature_scalers.get(col)
+            if scaler is None:
+                result["reason"] = f"scaler_missing:{col}"
+                return result
+            values = raw[:, feat_idx].reshape(-1, 1)
+            if hasattr(scaler, "transform"):
+                transformed = scaler.transform(values).reshape(-1)
+            elif isinstance(scaler, dict) and "mean" in scaler and "std" in scaler:
+                transformed = (values.reshape(-1) - float(scaler["mean"])) / max(
+                    float(scaler["std"]), 1e-8
+                )
+            else:
+                result["reason"] = f"invalid_scaler:{col}"
+                return result
+            scaled[:, feat_idx] = transformed
+        scaled = np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
+
+        end_indices = list(range(self.input_lookback - 1, len(df) - horizon))
+        windows = np.asarray(
+            [scaled[i - self.input_lookback + 1 : i + 1] for i in end_indices],
+            dtype=np.float32,
+        )
+        try:
+            predictions = self.model.predict(windows, verbose=0)
+        except TypeError:
+            predictions = self.model.predict(windows)
+        probabilities = np.asarray(predictions, dtype=np.float64).reshape(-1)
+        if len(probabilities) != len(end_indices):
+            result["reason"] = "prediction_shape_mismatch"
+            return result
+
+        labels = self._create_labels_triple_barrier(
+            df,
+            fee_pct=self.triple_barrier_fee_pct,
+            slippage_pct=self.triple_barrier_slippage_pct,
+            buffer_pct=self.triple_barrier_buffer_pct,
+            lookforward_bars=horizon,
+        )
+        if labels is None:
+            result["reason"] = "label_generation_failed"
+            return result
+
+        closes = df["close"].to_numpy(dtype=np.float64)
+        predicted_buy = probabilities >= float(probability_threshold)
+        y_true = np.asarray([labels[i] for i in end_indices], dtype=np.int8)
+        accuracy = float(np.mean(predicted_buy.astype(np.int8) == y_true))
+        net_returns = np.asarray(
+            [
+                (closes[i + horizon] / closes[i]) - 1.0 - float(round_trip_cost_pct)
+                for i, buy in zip(end_indices, predicted_buy)
+                if buy and closes[i] > 0.0
+            ],
+            dtype=np.float64,
+        )
+        wins = net_returns[net_returns > 0.0]
+        losses = net_returns[net_returns < 0.0]
+        gross_profit = float(wins.sum())
+        gross_loss = abs(float(losses.sum()))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0.0 else (
+            float("inf") if gross_profit > 0.0 else 0.0
+        )
+
+        if isinstance(df.index, pd.DatetimeIndex) and len(df.index):
+            span_days = max(1, int((df.index[-1].normalize() - df.index[0].normalize()).days) + 1)
+        else:
+            span_days = max(1, int(np.ceil(len(df) / 288.0)))
+        result.update(
+            ok=True,
+            reason="evaluated",
+            samples=int(len(end_indices)),
+            signals=int(len(net_returns)),
+            wins=int(len(wins)),
+            accuracy=accuracy,
+            win_rate=float(len(wins) / len(net_returns)) if len(net_returns) else 0.0,
+            expectancy_pct=float(net_returns.mean() * 100.0) if len(net_returns) else 0.0,
+            profit_factor=float(profit_factor),
+            winners_per_day=float(len(wins) / span_days),
+            probability_threshold=float(probability_threshold),
+            horizon_bars=int(horizon),
+            calendar_days=int(span_days),
+        )
+        return result
+
     def train_model(
         self,
         df,
@@ -602,6 +761,7 @@ class ModelTrainer:
         core_cols = [c for c in ("open", "high", "low", "close", "volume") if c in numeric_cols]
         extra_cols = [c for c in numeric_cols if c not in core_cols]
         feature_cols = core_cols + extra_cols if core_cols else list(numeric_cols)
+        self.feature_columns = list(feature_cols)
 
         raw_model_df = df[feature_cols].copy()
         raw_model_df = raw_model_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
@@ -736,8 +896,31 @@ class ModelTrainer:
             self.logger.warning("No training samples generated for %s.", self.symbol)
             return _ret(False, "no_training_samples")
         if np.unique(y).size < 2:
-            self.logger.warning("Label set is degenerate for %s; skipping retrain.", self.symbol)
-            return _ret(False, "degenerate_labels")
+            # Bootstrap a balanced target from forward-return ordering. This keeps
+            # training numerically possible when a fixed threshold produces only
+            # one class. The untouched cost-adjusted holdout gate still prevents a
+            # model trained on weak/flat moves from being deployed.
+            sample_returns = (
+                df_copy["future_return"]
+                .iloc[self.input_lookback - 1 : total_bars]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+                .to_numpy(dtype=np.float64)
+            )
+            median_return = float(np.median(sample_returns))
+            fallback_y = (sample_returns > median_return).astype(np.float32)
+            method = "median"
+            if np.unique(fallback_y).size < 2:
+                order = np.argsort(sample_returns, kind="stable")
+                fallback_y = np.zeros(len(sample_returns), dtype=np.float32)
+                fallback_y[order[len(order) // 2 :]] = 1.0
+                method = "rank"
+            y = fallback_y
+            self.logger.warning(
+                "Degenerate labels for %s; using %s forward-return split for training only.",
+                self.symbol,
+                method,
+            )
 
         # === DEBUG LABEL DISTRIBUTION ===
         unique, counts = np.unique(y, return_counts=True)

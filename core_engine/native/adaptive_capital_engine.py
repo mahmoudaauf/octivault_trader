@@ -248,8 +248,6 @@ class AdaptiveCapitalEngine:
         now_ts = float(now_ts or time.time())
         base_risk = max(0.0, float(base_risk_fraction or 0.0))
         nav_val = max(0.0, float(nav or 0.0))
-        free_cap = max(0.0, float(free_capital or 0.0))
-        free_ratio = (free_cap / nav_val) if nav_val > 0 else 0.0
         slot_use = min(1.0, max(0.0, float(slot_utilization or 0.0)))
         min_notional_val = max(0.0, float(min_notional or 0.0))
 
@@ -275,10 +273,6 @@ class AdaptiveCapitalEngine:
         win_streak = int(perf.get("win_streak", 0) or 0)
         loss_streak = int(perf.get("loss_streak", 0) or 0)
         fee_to_gross = float(perf.get("fee_to_gross_ratio", 0.0) or 0.0)
-        idle_sec = perf.get("idle_sec", _IDLE_SEC_NO_TRADES)
-        if idle_sec is None:
-            idle_sec = _IDLE_SEC_NO_TRADES
-
         reasons: list[str] = []
         risk_mult = 1.0
         cooldown_mult = 1.0
@@ -308,19 +302,9 @@ class AdaptiveCapitalEngine:
             risk_mult *= 1.05
             reasons.append("low_vol_up")
 
-        target_throughput = max(0.0, float(target_throughput_per_hour or 0.0))
-        throughput = max(0.0, float(throughput_per_hour or 0.0))
-        if target_throughput > 0:
-            throughput_ratio = throughput / target_throughput
-            if throughput_ratio < self._throughput_low_ratio:
-                risk_mult *= 1.08
-                cooldown_mult *= 0.92
-                reasons.append("throughput_low_up")
-
-        if free_ratio > self._idle_free_capital_pct and idle_sec >= self._idle_time_sec:
-            risk_mult *= 1.15
-            cooldown_mult *= 0.90
-            reasons.append("idle_capital_boost")
+        # Throughput and idle capital are diagnostics, not reasons to increase risk or
+        # shorten cooldowns.  Doing so turns a frequency target into a forced-trade
+        # quota precisely when the market has supplied no qualifying setup.
 
         if slot_use >= 0.90:
             risk_mult *= 0.90

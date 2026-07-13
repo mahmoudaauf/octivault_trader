@@ -217,6 +217,72 @@ class NativeExecutor:
         eq = float(getattr(order, "executed_qty", None) or 0.0)
         return max(rq, eq)
 
+    def _record_execution_quality(
+        self,
+        *,
+        side: str,
+        reference_price: float,
+        fill_price: float,
+        is_maker: bool,
+    ) -> dict[str, Any]:
+        """Persist observed fill quality for cost calibration.
+
+        ``avg_slippage_bps`` is deliberately an adverse-cost measure because it is
+        consumed by entry and sizing gates. Favorable fills are retained separately
+        as price improvement instead of being allowed to hide adverse fills.
+        """
+        side_upper = str(side).upper()
+        if reference_price <= 0 or fill_price <= 0 or side_upper not in {"BUY", "SELL"}:
+            return {}
+        signed_adverse_bps = (
+            (fill_price / reference_price - 1.0) * 10_000.0
+            if side_upper == "BUY"
+            else (reference_price / fill_price - 1.0) * 10_000.0
+        )
+        adverse_bps = max(0.0, signed_adverse_bps)
+        improvement_bps = max(0.0, -signed_adverse_bps)
+        quality = {
+            "side": side_upper,
+            "reference_price": float(reference_price),
+            "fill_price": float(fill_price),
+            "adverse_slippage_bps": float(adverse_bps),
+            "price_improvement_bps": float(improvement_bps),
+            "liquidity_role": "maker" if is_maker else "taker",
+        }
+        metrics = getattr(self._shared_state, "metrics", None)
+        if isinstance(metrics, dict):
+            count = int(metrics.get("execution_quality_samples", 0) or 0)
+            next_count = count + 1
+            for key, value in (
+                ("avg_slippage_bps", adverse_bps),
+                ("avg_price_improvement_bps", improvement_bps),
+            ):
+                previous = float(metrics.get(key, 0.0) or 0.0)
+                metrics[key] = ((previous * count) + float(value)) / next_count
+            side_key = f"avg_{side_upper.lower()}_slippage_bps"
+            side_count_key = f"{side_upper.lower()}_execution_samples"
+            side_count = int(metrics.get(side_count_key, 0) or 0)
+            previous_side = float(metrics.get(side_key, 0.0) or 0.0)
+            metrics[side_key] = ((previous_side * side_count) + adverse_bps) / (side_count + 1)
+            metrics[side_count_key] = side_count + 1
+            metrics["execution_quality_samples"] = next_count
+            maker_fills = int(metrics.get("maker_fills", 0) or 0) + (1 if is_maker else 0)
+            metrics["maker_fills"] = maker_fills
+            metrics["taker_fills"] = next_count - maker_fills
+            metrics["maker_fill_rate"] = maker_fills / next_count
+            metrics["last_execution_quality"] = quality
+            metrics["last_update_ts"] = time.time()
+        logger.info(
+            "[Executor:Quality] %s %s ref=%.8f fill=%.8f slip=%.2fbps improve=%.2fbps",
+            side_upper,
+            quality["liquidity_role"],
+            reference_price,
+            fill_price,
+            adverse_bps,
+            improvement_bps,
+        )
+        return quality
+
     async def _maker_first_buy(
         self, symbol: str, qty: float, ref_price: float, coid: str
     ) -> Any:
@@ -374,9 +440,11 @@ class NativeExecutor:
             decision.decision_id,  # idempotency key for the limit leg
         )
 
-        result.raw = order_result.raw
+        result.raw = dict(order_result.raw or {})
         result.exchange_order_id = order_result.exchange_order_id
-        result.quantity_executed = order_result.quantity
+        result.quantity_executed = float(
+            getattr(order_result, "executed_qty", None) or order_result.quantity
+        )
 
         if order_result.success:
             result.status = ExecutionStatus.SUCCESS
@@ -409,6 +477,14 @@ class NativeExecutor:
             )
             if fill_price <= 0:
                 fill_price = float(price or 0.0)
+            quality = self._record_execution_quality(
+                side="BUY",
+                reference_price=float(price or 0.0),
+                fill_price=fill_price,
+                is_maker=str(getattr(order_result, "order_type", "")).upper() == "LIMIT",
+            )
+            if quality:
+                result.raw["_execution_quality"] = quality
             # Use the ACTUAL executed quantity (partial fills leave us holding less than
             # requested). Registering the requested qty over-states the position and
             # triggers -2010 on the eventual sell. Fall back to requested if unavailable.
@@ -450,6 +526,7 @@ class NativeExecutor:
                     "quote_qty": decision.quantity,
                     "order_id": result.exchange_order_id,
                     "reason": getattr(decision, "reason", ""),
+                    "execution_quality": quality,
                 }))
         else:
             # Exchange rejected the order
@@ -535,12 +612,28 @@ class NativeExecutor:
             client_order_id=decision.decision_id,
         )
 
-        result.raw = order_result.raw
+        result.raw = dict(order_result.raw or {})
         result.exchange_order_id = order_result.exchange_order_id
-        result.quantity_executed = order_result.quantity
+        result.quantity_executed = float(
+            getattr(order_result, "executed_qty", None) or order_result.quantity
+        )
 
         if order_result.success:
             result.status = ExecutionStatus.SUCCESS
+            fill_price = float(
+                getattr(order_result, "avg_price", None)
+                or getattr(order_result, "price", None)
+                or sell_price
+                or 0.0
+            )
+            quality = self._record_execution_quality(
+                side="SELL",
+                reference_price=sell_price,
+                fill_price=fill_price,
+                is_maker=str(getattr(order_result, "order_type", "")).upper() == "LIMIT",
+            )
+            if quality:
+                result.raw["_execution_quality"] = quality
             self._sync_balance_validator()
             if self._balance_validator is not None and self._market_data is not None:
                 price = 0.0
@@ -576,22 +669,22 @@ class NativeExecutor:
                     except Exception:
                         _entry_px = 0.0
                     self._shared_state.close_position(decision.symbol)
-                    if _entry_px > 0 and sell_price > 0:
+                    if _entry_px > 0 and fill_price > 0:
                         _qty = float(qty_to_sell or 0.0)
-                        _gross_pnl = (sell_price - _entry_px) * _qty
-                        _pnl_pct = (sell_price / _entry_px - 1.0) * 100.0
+                        _gross_pnl = (fill_price - _entry_px) * _qty
+                        _pnl_pct = (fill_price / _entry_px - 1.0) * 100.0
                         _outcome = "WIN" if _gross_pnl > 0 else ("LOSS" if _gross_pnl < 0 else "FLAT")
                         logger.info(
                             "[Executor] TRADE_CLOSED %s %s entry=%.8f exit=%.8f qty=%.8f "
                             "gross_pnl=%.4f USDT pnl_pct=%.3f%% reason=%s",
-                            decision.symbol, _outcome, _entry_px, sell_price, _qty,
+                            decision.symbol, _outcome, _entry_px, fill_price, _qty,
                             _gross_pnl, _pnl_pct, getattr(decision, "reason", ""),
                         )
                     else:
                         logger.info(
                             "[Executor] SELL %s filled — position cleared from state "
                             "(realized P&L unavailable: entry=%.8f exit=%.8f)",
-                            decision.symbol, _entry_px, sell_price,
+                            decision.symbol, _entry_px, fill_price,
                         )
             # P1: Atomic TP/SL cleanup — clear registries immediately on SELL fill,
             # don't wait for fill_tracker (5s lag can allow ghost to be written to disk).
@@ -605,9 +698,11 @@ class NativeExecutor:
                 _asyncio.ensure_future(self._trade_journal.record("SELL_FILLED", {
                     "symbol": decision.symbol,
                     "qty": qty_to_sell,
-                    "price": sell_price,
+                    "price": fill_price,
+                    "reference_price": sell_price,
                     "order_id": result.exchange_order_id,
                     "reason": getattr(decision, "reason", ""),
+                    "execution_quality": quality,
                 }))
         else:
             error_str = str(order_result.error or "")

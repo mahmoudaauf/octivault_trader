@@ -40,6 +40,10 @@ class _StubOrderExecution:
                 "success": self.next_buy_result["success"],
                 "exchange_order_id": self.next_buy_result.get("orderId"),
                 "quantity": self.next_buy_result.get("quantity", quantity),
+                "executed_qty": self.next_buy_result.get("executed_qty"),
+                "avg_price": self.next_buy_result.get("avg_price"),
+                "price": self.next_buy_result.get("price"),
+                "order_type": self.next_buy_result.get("order_type", "MARKET"),
                 "raw": self.next_buy_result,
                 "error": self.next_buy_result.get("error"),
             },
@@ -54,6 +58,10 @@ class _StubOrderExecution:
                 "success": self.next_sell_result["success"],
                 "exchange_order_id": self.next_sell_result.get("orderId"),
                 "quantity": self.next_sell_result.get("quantity", quantity),
+                "executed_qty": self.next_sell_result.get("executed_qty"),
+                "avg_price": self.next_sell_result.get("avg_price"),
+                "price": self.next_sell_result.get("price"),
+                "order_type": self.next_sell_result.get("order_type", "MARKET"),
                 "raw": self.next_sell_result,
                 "error": self.next_sell_result.get("error"),
             },
@@ -64,6 +72,50 @@ class _StubOrderExecution:
 # Tests
 # ─────────────────────────────────────────────────────────────────────
 class TestNativeExecutor:
+    def test_execution_quality_tracks_adverse_cost_and_maker_rate(self) -> None:
+        state = NativeSharedState()
+        executor = NativeExecutor(_StubOrderExecution(), shared_state=state)  # type: ignore[arg-type]
+
+        buy = executor._record_execution_quality(
+            side="BUY", reference_price=100.0, fill_price=99.99, is_maker=True
+        )
+        sell = executor._record_execution_quality(
+            side="SELL", reference_price=100.0, fill_price=99.90, is_maker=False
+        )
+
+        assert buy["adverse_slippage_bps"] == 0.0
+        assert buy["price_improvement_bps"] == pytest.approx(1.0)
+        assert sell["adverse_slippage_bps"] == pytest.approx(10.01001)
+        assert state.metrics["execution_quality_samples"] == 2
+        assert state.metrics["avg_slippage_bps"] == pytest.approx(5.005005)
+        assert state.metrics["maker_fill_rate"] == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_sell_uses_exchange_fill_price_for_slippage_and_pnl(self) -> None:
+        stub = _StubOrderExecution()
+        stub.next_sell_result.update(
+            {"quantity": 1.0, "executed_qty": 1.0, "avg_price": 100.5}
+        )
+        state = NativeSharedState()
+        state.update_position("BTCUSDT", 1.0, 100.0, 101.0)
+
+        class _MD:
+            def get_price(self, _symbol: str) -> float:
+                return 101.0
+
+        executor = NativeExecutor(stub, market_data=_MD(), shared_state=state)  # type: ignore[arg-type]
+        result = (await executor.execute([
+            Decision("BTCUSDT", Action.CLOSE, 1.0, "test", 0.7)
+        ]))[0]
+
+        quality = result.raw["_execution_quality"]
+        assert quality["fill_price"] == 100.5
+        assert quality["reference_price"] == 101.0
+        assert quality["adverse_slippage_bps"] == pytest.approx(
+            (101.0 / 100.5 - 1.0) * 10_000.0
+        )
+        assert state.get_position("BTCUSDT") is None
+
     @pytest.mark.asyncio
     async def test_execute_open_decision(self) -> None:
         stub = _StubOrderExecution()

@@ -6,7 +6,8 @@ For each active symbol:
   1. Fetches last 90 days of OHLCV from Binance
   2. Trains a new GRU model using triple-barrier labels
   3. Validates on the held-out last 14 days
-  4. Swaps the model only if new val_accuracy >= old model's accuracy
+  4. Swaps only if prediction-only validation has positive net expectancy
+     and profit factor after conservative spot trading costs
   5. Keeps old model as backup (.backup extension)
 
 Designed to run independently from the live bot — safe to run while bot is active.
@@ -52,11 +53,16 @@ AGENT_NAME = "MLForecaster"
 TIMEFRAME = os.getenv("RETRAIN_TIMEFRAME", "5m")
 KLINES_INTERVAL = TIMEFRAME
 LOOKBACK_DAYS = int(os.getenv("RETRAIN_LOOKBACK_DAYS", "180"))  # training window
-VALIDATION_DAYS = 14        # held-out validation window (last N days of training data)
-MIN_TRAINING_ROWS = 500     # skip symbol if not enough data
-MAX_TRAINING_ROWS = 8000    # cap for training speed
-EPOCHS = 30                 # more epochs for larger dataset
+VALIDATION_DAYS = max(1, int(os.getenv("RETRAIN_VALIDATION_DAYS", "14") or 14))
+MIN_TRAINING_ROWS = max(100, int(os.getenv("RETRAIN_MIN_TRAINING_ROWS", "500") or 500))
+MAX_TRAINING_ROWS = max(256, int(os.getenv("RETRAIN_MAX_TRAINING_ROWS", "8000") or 8000))
+EPOCHS = max(1, int(os.getenv("RETRAIN_EPOCHS", "30") or 30))
 KLINES_LIMIT = 1000         # Binance max per request
+EVAL_ROUND_TRIP_COST_PCT = float(os.getenv("RETRAIN_EVAL_ROUND_TRIP_COST_PCT", "0.0030") or 0.0030)
+EVAL_MIN_SIGNALS = max(1, int(os.getenv("RETRAIN_EVAL_MIN_SIGNALS", "20") or 20))
+EVAL_MIN_PROFIT_FACTOR = float(os.getenv("RETRAIN_EVAL_MIN_PROFIT_FACTOR", "1.20") or 1.20)
+EVAL_MIN_EXPECTANCY_PCT = float(os.getenv("RETRAIN_EVAL_MIN_EXPECTANCY_PCT", "0.0") or 0.0)
+EVAL_PROBABILITY_THRESHOLD = float(os.getenv("RETRAIN_EVAL_PROBABILITY_THRESHOLD", "0.55") or 0.55)
 
 
 def _bars_per_day(tf: str) -> int:
@@ -321,13 +327,14 @@ async def retrain_symbol(symbol: str) -> dict:
             agent_name=AGENT_NAME,
         )
 
-        # Train — ModelTrainer saves directly to build_model_path(agent_name, symbol, timeframe)
+        # Train in memory. Persistence is deferred until untouched holdout data
+        # clears the cost-adjusted economic gate.
         train_result = trainer.train_model(
             df=train_df,
             task="supervised_learning",
             epochs=EPOCHS,
             max_rows=MAX_TRAINING_ROWS,
-            save_model_artifact=True,
+            save_model_artifact=False,
             return_metrics=True,
         )
 
@@ -345,47 +352,55 @@ async def retrain_symbol(symbol: str) -> dict:
         result["new_acc"] = new_acc
         log.info("%s: train complete — old_acc=%.3f new_acc=%.3f", symbol, old_acc, new_acc)
 
-        # Validate on held-out data (no save)
-        val_result = trainer.train_model(
-            df=val_df,
-            task="supervised_learning",
-            epochs=1,
-            max_rows=len(val_df),
-            save_model_artifact=False,
-            return_metrics=True,
+        # Prediction-only validation: this must never call fit or refit scalers.
+        val_result = trainer.evaluate_holdout(
+            val_df,
+            probability_threshold=EVAL_PROBABILITY_THRESHOLD,
+            round_trip_cost_pct=EVAL_ROUND_TRIP_COST_PCT,
         )
-        val_acc = float((val_result or {}).get("val_accuracy") or (val_result or {}).get("accuracy") or new_acc)
-        log.info("%s: held-out validation accuracy=%.3f", symbol, val_acc)
+        val_acc = float(val_result.get("accuracy") or 0.0)
+        signals = int(val_result.get("signals") or 0)
+        expectancy_pct = float(val_result.get("expectancy_pct") or 0.0)
+        profit_factor = float(val_result.get("profit_factor") or 0.0)
+        result["holdout"] = val_result
+        log.info(
+            "%s: untouched holdout samples=%d signals=%d accuracy=%.3f expectancy=%+.4f%% PF=%.3f",
+            symbol,
+            int(val_result.get("samples") or 0),
+            signals,
+            val_acc,
+            expectancy_pct,
+            profit_factor,
+        )
 
-        # Adoption criterion. Normally the new model must roughly match the old model's
-        # validation accuracy. BUT when the labelling methodology changes (Tier-2
-        # path-dependent/trend-aware barriers), `old_acc` was computed on the OLD labels
-        # and is NOT comparable to the new model's accuracy — and the old buy-happy model
-        # is often overfit (val_acc ~0.99). In that migration (opt-in via
-        # ML_RELABEL_FORCE_ADOPT) we adopt on an ABSOLUTE quality floor instead.
-        _relabel_adopt = os.getenv("ML_RELABEL_FORCE_ADOPT", "false").lower() == "true"
-        _abs_floor = float(os.getenv("ML_RELABEL_MIN_VAL_ACC", "0.55") or 0.55)
-        if _relabel_adopt:
-            _accept = val_acc >= _abs_floor
-            _baseline = f"abs_floor={_abs_floor:.2f} (relabel migration)"
-        else:
-            _accept = val_acc >= max(old_acc - 0.02, 0.50)
-            _baseline = f"old={old_acc:.3f}"
+        _accept = bool(
+            val_result.get("ok")
+            and signals >= EVAL_MIN_SIGNALS
+            and expectancy_pct > EVAL_MIN_EXPECTANCY_PCT
+            and profit_factor >= EVAL_MIN_PROFIT_FACTOR
+        )
+        _baseline = (
+            f"signals>={EVAL_MIN_SIGNALS}, expectancy>{EVAL_MIN_EXPECTANCY_PCT:.4f}%, "
+            f"PF>={EVAL_MIN_PROFIT_FACTOR:.2f}, cost={EVAL_ROUND_TRIP_COST_PCT:.2%}"
+        )
 
         if _accept:
-            result["swapped"] = True
-            result["ok"] = True
-            result["reason"] = "swapped"
-            log.info("✅ %s: new model deployed (val_acc=%.3f, %s)", symbol, val_acc, _baseline)
+            trainer._last_train_metrics["holdout"] = dict(val_result)
+            trainer._last_train_metrics["val_accuracy"] = val_acc
+            if not trainer.persist_model(model_path=model_path):
+                backup = model_path.with_suffix(".backup.keras")
+                if backup.exists():
+                    shutil.copy2(backup, model_path)
+                    log.info("%s: restored backup after persistence failure", symbol)
+                result["reason"] = "persist_failed"
+                log.warning("%s: holdout passed but persistence failed", symbol)
+                return result
+            result.update(swapped=True, ok=True, reason="swapped")
+            log.info("✅ %s: new model deployed (%s)", symbol, _baseline)
         else:
-            # New model worse — restore backup
-            backup = model_path.with_suffix(".backup.keras")
-            if backup.exists():
-                shutil.copy2(backup, model_path)
-                log.info("%s: new model underperformed — restored backup", symbol)
             result["ok"] = True
             result["reason"] = "kept_old_model"
-            log.info("⚠️  %s: kept old model (new val_acc=%.3f < %s)", symbol, val_acc, _baseline)
+            log.info("⚠️  %s: kept old model; holdout failed gate (%s)", symbol, _baseline)
 
     except Exception as e:
         log.exception("%s: unexpected error during retrain: %s", symbol, e)

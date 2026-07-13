@@ -91,10 +91,11 @@ while true; do
   [ -f "$STOP_FLAG" ] && { log_sup "stop flag present — exiting"; cleanup; }
   rotate_log
   log_sup "launching main.py"
+  # Use venv python so all dependencies are available.
   # main.py owns its own RotatingFileHandler → logs/run_latest.log (INFO+).
   # We redirect stderr here as a safety net for uncaught exceptions that bypass
   # the logging system (e.g. segfaults, early-boot errors before loggers init).
-  python3 main.py 2>>"$RUN_LOG"
+  .venv/bin/python3 main.py 2>>"$RUN_LOG"
   ec=$?
   log_sup "main.py exited (code $ec)"
   [ -f "$STOP_FLAG" ] && { log_sup "stop flag present — not restarting"; cleanup; }

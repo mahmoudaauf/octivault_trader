@@ -131,15 +131,20 @@ class BootstrapConfig:
     max_concurrent_positions: int = 10
     min_order_usdt: float = 1.0  # Lowered from 10.0 to allow micro trades on small account
     max_drawdown_pct: float = 10.0
-    daily_loss_limit_pct: float = 5.0
+    daily_loss_limit_pct: float = 2.0
     risk_per_symbol_pct: float = 20.0  # Increased from 2.0: micro accounts need higher per-symbol allocation to generate trades
     capital_allocation_pct: float = 5.0
     default_planned_quote: float = 12.0  # Fixed quote per trade for small accounts (like legacy system). Autonomously scales with equity growth.
+    daily_compounding_enabled: bool = True
+    daily_compounding_state_path: str = "logs/daily_compounding_state.json"
     quote_reserve_ratio: float = 0.10
     quote_min_reserve_usdt: float = 0.0
     max_total_exposure_pct: float = 60.0
     confidence_floor: float = 0.50
     max_cluster_exposure_pct: float = 40.0
+    taker_fee_bps: float = 10.0
+    maker_fee_bps: float = 10.0
+    exit_slippage_bps: float = 10.0
 
     # --- exit logic (TP/SL) ---
     tp_pct: float = 0.03  # +3% take profit
@@ -233,15 +238,24 @@ class BootstrapConfig:
             max_concurrent_positions=_int(e.get("MAX_CONCURRENT_POSITIONS"), 10),
             min_order_usdt=_float(e.get("MIN_ORDER_USDT"), 1.0),
             max_drawdown_pct=_float(e.get("MAX_DRAWDOWN_PCT"), 10.0),
-            daily_loss_limit_pct=_float(e.get("DAILY_LOSS_LIMIT_PCT"), 5.0),
+            daily_loss_limit_pct=_float(e.get("DAILY_LOSS_LIMIT_PCT"), 2.0),
             risk_per_symbol_pct=_float(e.get("RISK_PER_SYMBOL_PCT"), 20.0),
             capital_allocation_pct=_float(e.get("CAPITAL_ALLOCATION_PCT"), 5.0),
             default_planned_quote=_float(e.get("DEFAULT_PLANNED_QUOTE"), 12.0),
+            daily_compounding_enabled=_bool(e.get("DAILY_COMPOUNDING_ENABLED"), default=True),
+            daily_compounding_state_path=(
+                e.get("DAILY_COMPOUNDING_STATE_PATH") or "logs/daily_compounding_state.json"
+            ).strip(),
             quote_reserve_ratio=_float(e.get("QUOTE_RESERVE_RATIO"), 0.10),
             quote_min_reserve_usdt=_float(e.get("QUOTE_MIN_RESERVE_USDT"), 0.0),
             max_total_exposure_pct=_float(e.get("MAX_TOTAL_EXPOSURE_PCT"), 60.0),
             confidence_floor=_float(e.get("CONFIDENCE_FLOOR"), 0.50),
             max_cluster_exposure_pct=_float(e.get("MAX_CLUSTER_EXPOSURE_PCT"), 40.0),
+            taker_fee_bps=_float(e.get("TAKER_FEE_BPS"), 10.0),
+            maker_fee_bps=_float(e.get("MAKER_FEE_BPS"), 10.0),
+            exit_slippage_bps=_float(
+                e.get("EXIT_SLIPPAGE_BPS", e.get("CR_PRICE_SLIPPAGE_BPS")), 10.0
+            ),
             tp_pct=_float(e.get("TP_PCT"), 0.03),
             sl_pct=_float(e.get("SL_PCT"), 0.02),
             signal_cooldown_sec=_float(e.get("SIGNAL_COOLDOWN_SEC"), 0.0),
@@ -449,6 +463,8 @@ async def build_components(
 
     # L0
     shared_state = NativeSharedState()
+    # Canonical cost source used by signal, sizing, TP/SL, and exit gates.
+    shared_state.config = cfg
     if cfg.runtime_state_path:
         restored = load_runtime_state(shared_state, Path(cfg.runtime_state_path))
         if restored:
@@ -809,6 +825,8 @@ async def build_components(
         default_planned_quote=cfg.default_planned_quote,
         quote_reserve_ratio=cfg.quote_reserve_ratio,
         quote_min_reserve_usdt=cfg.quote_min_reserve_usdt,
+        daily_compounding_enabled=cfg.daily_compounding_enabled,
+        daily_compounding_state_path=cfg.daily_compounding_state_path,
     )
     # Inject pre-fetched filters so allocator can use real step-sizes immediately
     capital_allocator._symbol_filters_cache = symbol_filters

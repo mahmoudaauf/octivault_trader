@@ -43,7 +43,7 @@ class CanonicalEVConfig:
     ROUND_TRIP_TAKER_FEES_PCT = TAKER_FEE_PCT * 2.0  # 0.2% both ways
 
     # Slippage on exit (when market absorbs our full position)
-    EXIT_SLIPPAGE_BPS = 15.0  # 0.15% average slippage on exit
+    EXIT_SLIPPAGE_BPS = 10.0  # aligned with live spot configuration
     EXIT_SLIPPAGE_PCT = EXIT_SLIPPAGE_BPS / 10000.0
 
     # Safety buffer for TP/SL precision
@@ -60,8 +60,8 @@ class CanonicalEVConfig:
           round_trip_cost = (2 × taker_fee) + slippage + buffer
 
         Example for SPOT trading:
-          = (2 × 0.1%) + 0.15% + 0%
-          = 0.35%
+          = (2 × 0.1%) + 0.10% + 0%
+          = 0.30%
         """
         return float(cls.ROUND_TRIP_TAKER_FEES_PCT + cls.EXIT_SLIPPAGE_PCT + cls.TP_MIN_BUFFER_PCT)
 

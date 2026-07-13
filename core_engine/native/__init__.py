@@ -34,6 +34,7 @@ from .config_loader import ConfigLoader, get_config
 
 # ── L4 ───────────────────────────────────────────────────────────────
 from .decisions import Decision, NativeDecisionEngine, PortfolioSnapshot
+from .daily_compounding import DailyCompoundingPolicy, DailyCompoundingState
 
 # ── Observability (Legacy features ported) ──────────────────────────
 from .error_types import (
@@ -106,6 +107,8 @@ from .trade_journal import NativeTradeJournal
 __all__ = [
     # L0
     "NativeSharedState",
+    "DailyCompoundingPolicy",
+    "DailyCompoundingState",
     "Position",
     "Order",
     "NativeTimeUtils",
