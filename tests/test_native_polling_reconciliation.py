@@ -41,8 +41,13 @@ async def test_balance_sync_reconciles_wallet_holdings_into_positions() -> None:
 
     assert state.free_balance_usdt == 20.0
     assert "XRPUSDT" in state.positions
-    assert state.positions["XRPUSDT"]["qty"] == 100.0
-    assert state.positions["XRPUSDT"]["_mirrored"] is True
+    # NativeSharedState.update_position() (called by update_balance_map() for
+    # externally-detected holdings) always constructs a Position dataclass, not
+    # a dict — and the old "_mirrored" flag no longer exists anywhere in the
+    # reconciliation code (see update_balance_map()'s "External position
+    # detected" path in shared_state.py), so there's no equivalent to assert.
+    assert isinstance(state.positions["XRPUSDT"], Position)
+    assert state.positions["XRPUSDT"].qty == 100.0
 
 
 @pytest.mark.asyncio

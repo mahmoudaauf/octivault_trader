@@ -68,10 +68,32 @@ class _StubOrderExecution:
         )()
 
 
+class _MD:
+    """Minimal market_data stub — executor.py needs a price to convert a
+    decision's USD quantity into a base-asset order size (see executor.py
+    "BUY rejected: price unavailable ... cannot size order")."""
+
+    def get_price(self, _symbol: str) -> float:
+        return 100.0
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Tests
 # ─────────────────────────────────────────────────────────────────────
 class TestNativeExecutor:
+    @pytest.fixture(autouse=True)
+    def _disable_maker_first_buy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """executor.py's maker-first BUY path (MAKER_ENTRY_ENABLED, default on)
+        places a LIMIT order via place_limit_buy()/refresh_status()/cancel() and
+        waits MAKER_GRACE_S (2s default) before falling back to a market order.
+        These tests exercise dedup/error-classification/basic execution, not the
+        maker-entry feature itself, and _StubOrderExecution doesn't implement the
+        limit-order interface — force the "no usable maker window" branch so
+        execute() takes the plain market-buy path these tests were written
+        against (see executor.py::_maker_first_buy, `grace_s <= 0` branch).
+        """
+        monkeypatch.setenv("MAKER_GRACE_S", "0")
+
     def test_execution_quality_tracks_adverse_cost_and_maker_rate(self) -> None:
         state = NativeSharedState()
         executor = NativeExecutor(_StubOrderExecution(), shared_state=state)  # type: ignore[arg-type]
@@ -119,8 +141,8 @@ class TestNativeExecutor:
     @pytest.mark.asyncio
     async def test_execute_open_decision(self) -> None:
         stub = _StubOrderExecution()
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
-        dec = Decision("BTCUSDT", Action.OPEN, 0.1, "test", 0.7)
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
+        dec = Decision("BTCUSDT", Action.OPEN, 20.0, "test", 0.7)
         results = await executor.execute([dec])
         assert len(results) == 1
         assert results[0].status == ExecutionStatus.SUCCESS
@@ -131,7 +153,7 @@ class TestNativeExecutor:
     @pytest.mark.asyncio
     async def test_execute_close_decision(self) -> None:
         stub = _StubOrderExecution()
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
         dec = Decision("BTCUSDT", Action.CLOSE, 0.1, "test", 0.7)
         results = await executor.execute([dec])
         assert len(results) == 1
@@ -142,8 +164,8 @@ class TestNativeExecutor:
     @pytest.mark.asyncio
     async def test_dedup_prevents_reexecution(self) -> None:
         stub = _StubOrderExecution()
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
-        dec = Decision("BTCUSDT", Action.OPEN, 0.1, "test", 0.7, decision_id="id-1")
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
+        dec = Decision("BTCUSDT", Action.OPEN, 20.0, "test", 0.7, decision_id="id-1")
         # First execution
         results1 = await executor.execute([dec])
         assert len(results1) == 1
@@ -156,10 +178,10 @@ class TestNativeExecutor:
     @pytest.mark.asyncio
     async def test_multiple_decisions_sequential(self) -> None:
         stub = _StubOrderExecution()
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
         decs = [
-            Decision("BTCUSDT", Action.OPEN, 0.1, "test", 0.7),
-            Decision("ETHUSDT", Action.OPEN, 0.5, "test", 0.8),
+            Decision("BTCUSDT", Action.OPEN, 20.0, "test", 0.7),
+            Decision("ETHUSDT", Action.OPEN, 20.0, "test", 0.8),
         ]
         results = await executor.execute(decs)
         assert len(results) == 2
@@ -171,8 +193,8 @@ class TestNativeExecutor:
     async def test_exchange_order_id_captured(self) -> None:
         stub = _StubOrderExecution()
         stub.next_buy_result["orderId"] = 999
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
-        dec = Decision("BTCUSDT", Action.OPEN, 0.1, "test", 0.7)
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
+        dec = Decision("BTCUSDT", Action.OPEN, 20.0, "test", 0.7)
         results = await executor.execute([dec])
         assert results[0].exchange_order_id == 999
 
@@ -184,8 +206,8 @@ class TestNativeExecutor:
             "error": "429 rate limited",
             "orderId": None,
         }
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
-        dec = Decision("BTCUSDT", Action.OPEN, 0.1, "test", 0.7)
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
+        dec = Decision("BTCUSDT", Action.OPEN, 20.0, "test", 0.7)
         results = await executor.execute([dec])
         assert len(results) == 1
         assert results[0].status == ExecutionStatus.RETRYABLE
@@ -199,8 +221,8 @@ class TestNativeExecutor:
             "error": "insufficient balance",
             "orderId": None,
         }
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
-        dec = Decision("BTCUSDT", Action.OPEN, 0.1, "test", 0.7)
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
+        dec = Decision("BTCUSDT", Action.OPEN, 20.0, "test", 0.7)
         results = await executor.execute([dec])
         assert len(results) == 1
         assert results[0].status == ExecutionStatus.TERMINAL
@@ -209,8 +231,8 @@ class TestNativeExecutor:
     @pytest.mark.asyncio
     async def test_decision_id_used_as_client_order_id(self) -> None:
         stub = _StubOrderExecution()
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
-        dec = Decision("BTCUSDT", Action.OPEN, 0.1, "test", 0.7, decision_id="my-id-42")
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
+        dec = Decision("BTCUSDT", Action.OPEN, 20.0, "test", 0.7, decision_id="my-id-42")
         await executor.execute([dec])
         # Verify client_order_id was passed through
         assert stub.placed_calls[0]["client_order_id"] == "my-id-42"
@@ -230,8 +252,8 @@ class TestNativeExecutor:
     @pytest.mark.asyncio
     async def test_reset_dedup_state(self) -> None:
         stub = _StubOrderExecution()
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
-        dec = Decision("BTCUSDT", Action.OPEN, 0.1, "test", 0.7, decision_id="id-1")
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
+        dec = Decision("BTCUSDT", Action.OPEN, 20.0, "test", 0.7, decision_id="id-1")
         # Execute once
         await executor.execute([dec])
         assert len(stub.placed_calls) == 1
@@ -258,9 +280,9 @@ class TestNativeExecutor:
     @pytest.mark.asyncio
     async def test_mixed_buy_sell(self) -> None:
         stub = _StubOrderExecution()
-        executor = NativeExecutor(stub)  # type: ignore[arg-type]
+        executor = NativeExecutor(stub, market_data=_MD())  # type: ignore[arg-type]
         decs = [
-            Decision("BTCUSDT", Action.OPEN, 0.1, "buy", 0.8),
+            Decision("BTCUSDT", Action.OPEN, 20.0, "buy", 0.8),
             Decision("ETHUSDT", Action.CLOSE, 0.5, "sell", 0.7),
         ]
         results = await executor.execute(decs)
