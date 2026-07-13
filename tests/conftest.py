@@ -9,6 +9,34 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 # ============================================================================
+# QUARANTINED: stale legacy-namespace tests
+#
+# These modules fail to import (ModuleNotFoundError) because they target a
+# layer structure (src.l1_exchange, src.l4_execution, src.l6_governance,
+# src.l7_observability, src.l8_lifecycle) that no longer exists anywhere in
+# the repo — superseded first by src/{l0_core,l3_portfolio,l5_strategy}, then
+# by core_engine/native/. Confirmed via docs/audit/baseline_test_report.md
+# (2026-07-14 native-solution audit) that this is 100% test drift, not a
+# reflection of any currently-live code path. Ignored (not deleted) so the
+# baseline test suite reflects current architecture; each entry here was
+# individually confirmed to fail at collection (whole-file ImportError), not
+# a partial/parametrized failure that could be hiding a real passing test.
+collect_ignore = [
+    "layers/test_l1_exchange.py",
+    "layers/test_l2_wallet.py",
+    "layers/test_l4_execution.py",
+    "layers/test_l6_governance.py",
+    "layers/test_l7_observability.py",
+    "test_dust_exit_candidate_selection.py",
+    "test_insuff_bal_circuit_breaker.py",
+    "test_live_order_recovery_guards.py",
+    "test_portfolio_target_size_enforcer.py",
+    "test_sell_finalize_idempotency.py",
+    "test_strict_cap_count_tradable.py",
+    "test_truth_audit_wallet_guard.py",
+]
+
+# ============================================================================
 # PYTEST CONFIGURATION
 # ============================================================================
 

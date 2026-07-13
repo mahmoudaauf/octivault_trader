@@ -523,7 +523,12 @@ def test_maybe_widen_tp_uptrend_sets_10pct():
 
 
 def test_force_exit_triggers_on_aged_position_object():
-    """TIME_FORCE_EXIT fires on Position objects after 1.5h when unprofitable."""
+    """TIME_FORCE_EXIT fires on Position objects after _AGE_FORCE_EXIT_SEC (3h
+    default, TPSL_FORCE_EXIT_H) when unprofitable. Layer 2 (time-based force
+    exit) is checked before Layer 1 (static TP/SL) in check_triggers(), so once
+    the age threshold is crossed this fires ahead of SL_HIT even though the
+    price here has also breached the static SL level.
+    """
     engine, state = _engine_with_regime("CHOPPY")
     entry = 0.030
     current = 0.028  # -6.7% unprofitable
@@ -531,7 +536,7 @@ def test_force_exit_triggers_on_aged_position_object():
     pos_obj = Position(symbol="STALE", qty=660.0, entry_price=entry, mark_price=current)
     engine._tp_levels["STALE"] = entry * 1.024
     engine._sl_levels["STALE"] = entry * 0.975
-    engine._entry_timestamps["STALE"] = time.time() - (2 * 3600)  # 2h old
+    engine._entry_timestamps["STALE"] = time.time() - (3.5 * 3600)  # past the 3h default
 
     result = engine.check_triggers("STALE", pos_obj, current)
     assert result == "TIME_FORCE_EXIT", f"Expected TIME_FORCE_EXIT, got {result}"

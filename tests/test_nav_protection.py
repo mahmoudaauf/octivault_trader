@@ -123,12 +123,17 @@ def test_freeze_buy_blocks_new_entries() -> None:
     state.session_anchor_nav = 97.0
     state.peak_nav_usdt = 100.0
     state.nav_usdt = 97.0
-    state.update_nav(94.0)
-    state.metrics["unrealized_pnl"] = -3.0
+    # drawdown_freeze_buy_pct is 4% (see nav_protection.py "gap6" threshold,
+    # deliberately lowered from 5%->4% in commit 66fd382c); 97 -> 93 is a
+    # ~4.12% drawdown from the session anchor, comfortably past the FREEZE_BUY
+    # threshold. The original 97 -> 94 scenario here was only a ~3.09% drawdown
+    # and never actually crossed either the old or current threshold.
+    state.update_nav(93.0)
+    state.metrics["unrealized_pnl"] = -4.0
     state.last_nav_attribution = {
         "realized_pnl_total_usdt": 0.0,
         "unrealized_pnl_total_usdt": 0.0,
-        "free_usdt": 94.0,
+        "free_usdt": 93.0,
     }
     _, protection = evaluate_nav_protection(state)
     assert protection.protection_mode == "FREEZE_BUY"
