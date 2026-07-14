@@ -515,7 +515,7 @@ class PortfolioRecoveryEngine:
                 pos.reason = f"stale_flat_holding(age={age/3600:.1f}h pnl={_pnl_pct:.1f}%)"
             return
         # Minimum hold before any recovery/profit sell.
-        # Raised to 45 min to stop the TONUSDT-style churn (buy → immediate loss → sell → repeat).
+        # Raised to 2h to stop the TONUSDT-style churn (buy → immediate loss → sell → repeat).
         # Emergency override: allow early exit at 15 min if PnL is already ≤ −3% — that is
         # a real signal the entry was wrong, not just noise. This is tighter than the post-hold
         # WEAK threshold (−2%) so normal volatility never triggers the emergency path.

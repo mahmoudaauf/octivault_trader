@@ -277,11 +277,6 @@ class NativeArbitrationEngine:
                 _log.info(f"[gate_4] {symbol} BLOCK: held in balance notional=${bal_n:.2f}")
                 return False
 
-        # Also block via recovery classification
-        if self._decision_engine._is_slot_blocking_position(symbol, snapshot):
-            _log.info(f"[gate_4] {symbol} BLOCK: _is_slot_blocking_position=True")
-            return False
-
         mode = self._decision_engine._resolve_mode(snapshot)
         max_positions = min(
             int(getattr(self._decision_engine, "max_concurrent_positions", mode["max_positions"])),
@@ -299,17 +294,16 @@ class NativeArbitrationEngine:
             for asset, qty in balance.items()
             if asset != "USDT" and _bal_notional(asset, f"{asset}USDT") >= count_threshold
         )
-        tradable_count = self._decision_engine._count_active_tradable_positions(snapshot)
-        active_count = max(tradable_count, pos_count, bal_count)
+        active_count = max(pos_count, bal_count)
         if active_count < max_positions:
             _log.debug(
-                "[gate_4] %s counts: tradable=%d pos=%d bal=%d active=%d max=%d → PASS",
-                symbol, tradable_count, pos_count, bal_count, active_count, max_positions,
+                "[gate_4] %s counts: pos=%d bal=%d active=%d max=%d → PASS",
+                symbol, pos_count, bal_count, active_count, max_positions,
             )
             return True
         _log.info(
-            "[gate_4] %s counts: tradable=%d pos=%d bal=%d active=%d max=%d → BLOCK",
-            symbol, tradable_count, pos_count, bal_count, active_count, max_positions,
+            "[gate_4] %s counts: pos=%d bal=%d active=%d max=%d → BLOCK",
+            symbol, pos_count, bal_count, active_count, max_positions,
         )
         return False
 

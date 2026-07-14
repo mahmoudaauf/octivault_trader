@@ -22,8 +22,14 @@ class _State:
 
 class _MarketData:
     def __init__(self, closes: list[float]) -> None:
+        # _aggregate_regime requires >=3 UPTREND symbols (and zero DOWNTREND)
+        # to declare a global UPTREND -- one bad apple poisons the portfolio.
+        # Give the same uptrending closes to 3 symbols so tests exercise the
+        # actual aggregation policy rather than a single-symbol shortcut.
         self._klines = {
             ("BTCUSDT", "1m", 64): (0.0, [[0, 0, 0, 0, c, 0] for c in closes]),
+            ("ETHUSDT", "1m", 64): (0.0, [[0, 0, 0, 0, c, 0] for c in closes]),
+            ("SOLUSDT", "1m", 64): (0.0, [[0, 0, 0, 0, c, 0] for c in closes]),
         }
 
 

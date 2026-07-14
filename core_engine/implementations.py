@@ -86,6 +86,7 @@ def _compute_unrealized_pnl_usdt(shared_state: Any) -> float:
 def _compute_dust_ratio(shared_state: Any, nav_usdt: float) -> float:
     if nav_usdt <= 0:
         return 0.0
+    min_tradeable_usdt = float(os.getenv("MIN_NOTIONAL_USDT", "5.0") or 5.0)
     dust_value = 0.0
     price_cache = getattr(shared_state, "price_cache", {}) or {}
     positions = getattr(shared_state, "positions", {}) or {}
@@ -97,9 +98,40 @@ def _compute_dust_ratio(shared_state: Any, nav_usdt: float) -> float:
             qty = float(getattr(pos, "qty", 0.0) or 0.0)
             mark = float(price_cache.get(str(sym).upper(), 0.0) or getattr(pos, "mark_price", 0.0) or 0.0)
         value = qty * mark
-        if 0 < value < 2.0:  # only count as dust if below minimum tradeable size
+        if 0 < value < min_tradeable_usdt:  # below minimum tradeable size (MIN_NOTIONAL_USDT)
             dust_value += value
     return max(0.0, min(1.0, dust_value / nav_usdt))
+
+
+def _check_price_overextension(shared_state: Any, symbol: str) -> str:
+    """Block BUYs that chase a local spike top or a falling/flat candle.
+
+    Root cause of all <20min SL hits on Jun 3 2026 (SEI, BIO, GIGGLE, DASH,
+    AVAX all bought at local spike tops). Fails open (returns "") when fewer
+    than 10 candles are available -- never blocks trading on missing data.
+    """
+    market_data = getattr(shared_state, "market_data", {}) or {}
+    klines = market_data.get((symbol, "1m")) or []
+    if len(klines) < 10:
+        return ""
+
+    closes = [float(k.get("close", 0.0) or 0.0) for k in klines[-10:]]
+    if any(c <= 0 for c in closes):
+        return ""
+
+    sma = sum(closes) / len(closes)
+    last_close = closes[-1]
+    prev_close = closes[-2]
+
+    if sma > 0 and last_close > sma * 1.008:
+        return "PRICE_EXTENDED"
+    if last_close < prev_close:
+        drop_pct = (prev_close - last_close) / prev_close if prev_close > 0 else 0.0
+        if drop_pct >= 0.003:
+            return "MOMENTUM_FALLING"
+        if last_close < sma:
+            return "MOMENTUM_FLAT"
+    return ""
 
 
 def _map_system_state(health_status: str) -> str:
@@ -819,6 +851,13 @@ class DecisionEngineImpl:
         if probability_score < confidence_floor:
             allowed = False
             blocked_reason = blocked_reason or "PROBABILITY_BELOW_FLOOR"
+
+        overextension_reason = _check_price_overextension(
+            app_ctx.get("shared_state"), symbol
+        )
+        if overextension_reason:
+            allowed = False
+            blocked_reason = blocked_reason or overextension_reason
 
         decision = TradeDecision(
             symbol=symbol,

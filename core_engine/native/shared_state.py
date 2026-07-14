@@ -160,6 +160,9 @@ class NativeSharedState:
         self.exchange_throttle_reason: str = ""
         self.exchange_throttle_until_ts: float = 0.0
         self.quote_reservations: dict[str, list[dict]] = {}
+        # Set externally by PortfolioRecoveryEngine.refresh(); defaulted here
+        # so consumers can rely on the attribute existing before first refresh.
+        self.position_recovery: dict = {}
 
     # ==================== NAV Management ====================
 

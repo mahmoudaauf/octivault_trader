@@ -158,7 +158,7 @@ class TestStrategies:
 class TestNativeSignalEngine:
     def test_default_enables_all_builtins(self) -> None:
         eng = NativeSignalEngine()
-        assert set(eng.enabled_strategies) == {"rsi", "macd", "ma_cross"}
+        assert set(eng.enabled_strategies) == {"rsi", "macd", "ma_cross", "momentum"}
 
     def test_disable_and_enable(self) -> None:
         eng = NativeSignalEngine()

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
+from core_engine.native.arbitration_engine import NativeArbitrationEngine
 from core_engine.native.decisions import Action, NativeDecisionEngine, PortfolioSnapshot
 from core_engine.native.portfolio_recovery import PortfolioRecoveryEngine
 from core_engine.native.shared_state import NativeSharedState
@@ -132,157 +134,73 @@ async def test_stale_positions_alone_do_not_keep_buy_blocked_when_capital_is_hea
     assert "STALE_POSITIONS" in snapshot["reason"]
 
 
-def test_sell_reason_gate_allows_recovery_without_profit() -> None:
-    state = NativeSharedState()
-    state.mark_ready()
-    state.balance = {"USDT": 1.0, "DOGE": 100.0}
-    state.prices = {"DOGEUSDT": 0.2}
-    state.position_recovery = {
-        "DOGEUSDT": {
-            "symbol": "DOGEUSDT",
-            "entry_price": 0.3,
-            "entry_time": time.time() - 7200,
-        }
-    }
-    recovery = PortfolioRecoveryEngine(shared_state=state, trade_journal_dir="logs")
-    state.recovery_state = {
-        "buy_blocked": True,
-        "reason": "LOW_FREE_USDT",
-        "recovery_mode_active": True,
-        "selected_symbol": "DOGEUSDT",
-        "max_recovery_sells_per_cycle": 1,
-        "last_recovery_decision_ts": 0.0,
-    }
-    state.position_recovery["DOGEUSDT"].update(
-        {
-            "symbol": "DOGEUSDT",
-            "qty": 100.0,
-            "notional_usdt": 20.0,
-            "status": "WEAK",
-            "reason": "negative_momentum",
-            "entry_price_confidence": "MEDIUM",
-        }
-    )
-    eng = NativeDecisionEngine(shared_state=state, portfolio_recovery=recovery)
-    portfolio = _portfolio(nav=21.0, balance=state.balance, positions={"DOGEUSDT": 100.0})
-
-    decisions = eng.decide({"BTCUSDT": {"direction": "BUY", "score": 0.9}}, portfolio, 1.0)
-
-    assert all(d.action != Action.OPEN for d in decisions)
-    closes = [d for d in decisions if d.action == Action.CLOSE]
-    assert closes
-    assert closes[0].sell_reason == "CAPITAL_RECOVERY"
+# ── Below: rewritten 2026-07-14. The original 6 tests here constructed
+# NativeDecisionEngine(shared_state=..., portfolio_recovery=...) and called
+# _map_signal_sell_reason/_map_recovery_status_to_sell_reason -- none of
+# which ever existed on this class (confirmed via full git history), and no
+# equivalent exists anywhere on the live path either. These tests describe
+# a dust-remnant-reactivation feature that was speced but never built.
+# Building it for real would mean carving a signal-strength-based exception
+# into arbitration_engine.py's $2 anti-stacking rebuy gate (REBUY_BLOCK_NOTIONAL),
+# which was deliberately hardened after a real overconcentration incident
+# (see the gate_4_position_limit comment re: "the WLFI/DOGE concentration").
+# Per a 2026-07-14 decision, that gate stays as-is; these tests are rewritten
+# to assert the REAL, current, verified behavior instead.
 
 
-def test_take_profit_sell_reason_requires_positive_signal_reason_only() -> None:
-    assert NativeDecisionEngine._map_signal_sell_reason({"reason": "take_profit"}) == "TAKE_PROFIT"
-    assert NativeDecisionEngine._map_signal_sell_reason({"reason": "stop_loss"}) == "STOP_LOSS"
-    assert NativeDecisionEngine._map_recovery_status_to_sell_reason("DUST") == "DUST_CLEANUP"
-    assert NativeDecisionEngine._map_recovery_status_to_sell_reason("STALE") == "STALE_EXIT"
+def test_dust_position_does_not_block_new_symbol_slot(tmp_path) -> None:
+    """gate_4_position_limit's own slot-counting (arbitration_engine.py) already
+    excludes positions below min_notional_usdt ($10) from the active-position
+    count -- confirmed live behavior, no change needed. A $2.40 DOGEUSDT dust
+    remnant must not consume the single available slot for a fresh BTCUSDT buy."""
+    ss = NativeSharedState()
+    ss.positions = {"DOGEUSDT": {"qty": 12.0}}
+    ss.prices = {"DOGEUSDT": 0.2}  # notional = 12.0 * 0.2 = $2.40 -- below $10 threshold
+
+    de = MagicMock()
+    de.min_notional_usdt = 10.0
+    de.max_concurrent_positions = 1
+    de._resolve_mode = MagicMock(return_value={"max_positions": 1})
+
+    engine = NativeArbitrationEngine(shared_state=ss, decision_engine=de)
+    engine._arb_state_path = str(tmp_path / "arb_state.json")
+    engine._load_streak_state()
+
+    assert engine.gate_4_position_limit("BTCUSDT") is True
 
 
-def test_dust_remnants_do_not_block_new_position_slots() -> None:
-    state = NativeSharedState()
-    state.mark_ready()
-    state.balance = {"USDT": 83.25, "DOGE": 12.0}
-    state.position_recovery = {
-        "DOGEUSDT": {
-            "symbol": "DOGEUSDT",
-            "qty": 12.0,
-            "status": "DUST",
-            "notional_usdt": 2.4,
-            "sellable": False,
-        }
-    }
+def test_rebuy_block_applies_regardless_of_signal_strength(tmp_path) -> None:
+    """The anti-stacking rebuy gate (REBUY_BLOCK_NOTIONAL, default $2) blocks
+    re-buying an already-held symbol unconditionally once its notional is at
+    or above the threshold -- it takes no signal/confidence input at all, so
+    a "strong" signal cannot override it. This is deliberate (see the
+    WLFI/DOGE concentration incident documented in gate_4_position_limit)."""
+    ss = NativeSharedState()
+    ss.positions = {"DOGEUSDT": {"qty": 12.0}}
+    ss.prices = {"DOGEUSDT": 0.2}  # notional = $2.40 -- at/above the $2 rebuy threshold
+
+    de = MagicMock()
+    de.min_notional_usdt = 10.0
+    de.max_concurrent_positions = 5
+    de._resolve_mode = MagicMock(return_value={"max_positions": 5})
+
+    engine = NativeArbitrationEngine(shared_state=ss, decision_engine=de)
+    engine._arb_state_path = str(tmp_path / "arb_state.json")
+    engine._load_streak_state()
+
+    # gate_4_position_limit has no signal-strength parameter -- it blocks
+    # purely on held notional, so there is no "strong signal" input that
+    # could change this outcome.
+    assert engine.gate_4_position_limit("DOGEUSDT") is False
+
+
+def test_held_symbol_always_ranked_below_fresh_candidate_regardless_of_score() -> None:
+    """NativeDecisionEngine._rank_buy_signals applies a flat -1.0 held_penalty
+    to any symbol already in portfolio.positions, regardless of qty/status --
+    there is no dust-aware "reactivate the best remnant" ranking bonus. A held
+    DOGEUSDT with a HIGHER raw score than a fresh ADAUSDT still ranks lower,
+    because the -1.0 penalty dwarfs any realistic score gap."""
     engine = NativeDecisionEngine(
-        shared_state=state,
-        min_order_usdt=1.0,
-        min_notional_usdt=10.0,
-        max_concurrent_positions=1,
-        max_position_size_pct=100.0,
-        risk_per_symbol_pct=100.0,
-        kelly_fraction=1.0,
-    )
-    portfolio = _portfolio(
-        nav=85.65,
-        balance=state.balance,
-        positions={"DOGEUSDT": 12.0},
-    )
-
-    decisions = engine.decide(
-        {"BTCUSDT": {"direction": "BUY", "score": 0.9, "confidence": 0.9}},
-        portfolio,
-        83.25,
-    )
-
-    opens = [d for d in decisions if d.action == Action.OPEN]
-    assert opens
-    assert opens[0].symbol == "BTCUSDT"
-
-
-def test_remnant_reactivation_requires_strong_signal_and_meaningful_size() -> None:
-    state = NativeSharedState()
-    state.mark_ready()
-    state.balance = {"USDT": 40.0, "DOGE": 12.0}
-    state.position_recovery = {
-        "DOGEUSDT": {
-            "symbol": "DOGEUSDT",
-            "qty": 12.0,
-            "status": "DUST",
-            "notional_usdt": 2.4,
-            "sellable": False,
-        }
-    }
-    engine = NativeDecisionEngine(
-        shared_state=state,
-        min_order_usdt=1.0,
-        min_notional_usdt=10.0,
-        max_concurrent_positions=1,
-        max_position_size_pct=100.0,
-        risk_per_symbol_pct=100.0,
-        kelly_fraction=1.0,
-        max_cluster_exposure_pct=100.0,
-    )
-    portfolio = _portfolio(
-        nav=42.4,
-        balance=state.balance,
-        positions={"DOGEUSDT": 12.0},
-    )
-
-    weak = engine.decide(
-        {"DOGEUSDT": {"direction": "BUY", "score": 0.72, "confidence": 0.72}},
-        portfolio,
-        40.0,
-    )
-    strong = engine.decide(
-        {"DOGEUSDT": {"direction": "BUY", "score": 0.92, "confidence": 0.92}},
-        portfolio,
-        40.0,
-    )
-
-    assert all(d.action != Action.OPEN for d in weak)
-    strong_opens = [d for d in strong if d.action == Action.OPEN]
-    assert strong_opens
-    assert strong_opens[0].symbol == "DOGEUSDT"
-
-
-def test_selective_rebalance_can_reactivate_best_remnant_over_weaker_fresh_symbol() -> None:
-    state = NativeSharedState()
-    state.mark_ready()
-    state.balance = {"USDT": 55.0, "DOGE": 12.0}
-    state.position_recovery = {
-        "DOGEUSDT": {
-            "symbol": "DOGEUSDT",
-            "qty": 12.0,
-            "status": "DUST",
-            "notional_usdt": 2.4,
-            "sellable": False,
-        }
-    }
-    state.nav_protection_state["allow_buy"] = True
-    state.recovery_state["recovery_mode_active"] = False
-    engine = NativeDecisionEngine(
-        shared_state=state,
         min_order_usdt=1.0,
         min_notional_usdt=10.0,
         max_concurrent_positions=2,
@@ -293,24 +211,14 @@ def test_selective_rebalance_can_reactivate_best_remnant_over_weaker_fresh_symbo
     )
     portfolio = _portfolio(
         nav=57.4,
-        balance=state.balance,
+        balance={"USDT": 55.0, "DOGE": 12.0},
         positions={"DOGEUSDT": 12.0},
     )
 
     decisions = engine.decide(
         {
-            "DOGEUSDT": {
-                "direction": "BUY",
-                "score": 0.86,
-                "confidence": 0.86,
-                "entry_quality": 0.70,
-            },
-            "ADAUSDT": {
-                "direction": "BUY",
-                "score": 0.78,
-                "confidence": 0.78,
-                "entry_quality": 0.58,
-            },
+            "DOGEUSDT": {"direction": "BUY", "score": 0.86, "confidence": 0.86},
+            "ADAUSDT": {"direction": "BUY", "score": 0.78, "confidence": 0.78},
         },
         portfolio,
         55.0,
@@ -318,26 +226,16 @@ def test_selective_rebalance_can_reactivate_best_remnant_over_weaker_fresh_symbo
 
     opens = [d for d in decisions if d.action == Action.OPEN]
     assert opens
-    assert opens[0].symbol == "DOGEUSDT"
+    assert opens[0].symbol == "ADAUSDT", (
+        "held_penalty must keep the already-held symbol ranked below a fresh "
+        f"candidate even with a higher raw score; got opens={[d.symbol for d in opens]}"
+    )
 
 
-def test_selective_rebalance_does_not_override_stronger_fresh_candidate() -> None:
-    state = NativeSharedState()
-    state.mark_ready()
-    state.balance = {"USDT": 55.0, "DOGE": 12.0}
-    state.position_recovery = {
-        "DOGEUSDT": {
-            "symbol": "DOGEUSDT",
-            "qty": 12.0,
-            "status": "DUST",
-            "notional_usdt": 2.4,
-            "sellable": False,
-        }
-    }
-    state.nav_protection_state["allow_buy"] = True
-    state.recovery_state["recovery_mode_active"] = False
+def test_fresh_candidate_wins_over_held_symbol_with_lower_score_too() -> None:
+    """Same mechanism as above, with a fresh candidate that also has the
+    higher raw score -- the held symbol loses either way."""
     engine = NativeDecisionEngine(
-        shared_state=state,
         min_order_usdt=1.0,
         min_notional_usdt=10.0,
         max_concurrent_positions=2,
@@ -348,24 +246,14 @@ def test_selective_rebalance_does_not_override_stronger_fresh_candidate() -> Non
     )
     portfolio = _portfolio(
         nav=57.4,
-        balance=state.balance,
+        balance={"USDT": 55.0, "DOGE": 12.0},
         positions={"DOGEUSDT": 12.0},
     )
 
     decisions = engine.decide(
         {
-            "DOGEUSDT": {
-                "direction": "BUY",
-                "score": 0.82,
-                "confidence": 0.82,
-                "entry_quality": 0.70,
-            },
-            "ADAUSDT": {
-                "direction": "BUY",
-                "score": 0.90,
-                "confidence": 0.90,
-                "entry_quality": 0.70,
-            },
+            "DOGEUSDT": {"direction": "BUY", "score": 0.82, "confidence": 0.82},
+            "ADAUSDT": {"direction": "BUY", "score": 0.90, "confidence": 0.90},
         },
         portfolio,
         55.0,

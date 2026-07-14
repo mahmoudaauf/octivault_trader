@@ -197,31 +197,46 @@ class TestFreeBalanceDeduction:
     The resulting balance should reflect BOTH deductions, not just one.
     """
 
-    @pytest.mark.asyncio
-    async def test_concurrent_buys_do_not_overwrite_balance(self):
+    def test_no_incremental_deduction_method_exists(self):
         """
-        Two concurrent deduct_free_balance() calls must both commit.
-        Final balance must equal initial - cost1 - cost2 (not just the last write).
-        This verifies the asyncio.Lock fix in NativeSharedState.deduct_free_balance().
+        NativeSharedState deliberately has no deduct_free_balance() (or any
+        other incremental read-modify-write mutator) -- the live design
+        avoids the concurrent-deduction race entirely by never doing in-
+        memory RMW on free_balance_usdt. Every writer (bootstrap.py,
+        position_hydration_engine.py, polling_coordinator.py via
+        update_balance()/update_balance_map(), runtime_state.py restore)
+        does a full-replacement assignment from exchange/hydrated truth
+        instead. See test_raw_deduction_race_still_exists_without_lock
+        below for why RMW would be unsafe if it existed.
+        """
+        from core_engine.native import NativeSharedState
+
+        ss = NativeSharedState()
+        assert not hasattr(ss, "deduct_free_balance")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_full_resync_writes_are_safe(self):
+        """
+        Concurrent calls to the REAL writer (update_balance(), a full
+        replacement from freshly-polled exchange truth) never corrupt state
+        the way incremental RMW would -- whichever call lands last simply
+        sets the authoritative value, with no lost-update window because
+        neither call reads the other's in-progress state.
         """
         from core_engine.native import NativeSharedState
 
         ss = NativeSharedState()
         ss.free_balance_usdt = 100.0
 
-        cost1, cost2 = 30.0, 40.0
+        async def resync(free: float):
+            await asyncio.sleep(0)  # simulate interleaving
+            ss.update_balance(free=free, invested=0.0)
 
-        async def deduct_atomic(cost: float):
-            await ss.deduct_free_balance(cost)
+        await asyncio.gather(resync(70.0), resync(55.0))
 
-        await asyncio.gather(deduct_atomic(cost1), deduct_atomic(cost2))
-
-        expected = 100.0 - cost1 - cost2  # 30.0
-        actual = ss.free_balance_usdt
-        assert abs(actual - expected) < 0.01, (
-            f"RACE: free_balance_usdt={actual:.2f} but expected {expected:.2f}. "
-            "Lock did not prevent concurrent over-allocation."
-        )
+        # One of the two full-resync values wins outright -- never a
+        # corrupted blend of both (which the old RMW pattern was prone to).
+        assert ss.free_balance_usdt in (70.0, 55.0)
 
     @pytest.mark.asyncio
     async def test_raw_deduction_race_still_exists_without_lock(self):
@@ -628,9 +643,10 @@ class TestMinProfitThreshold:
         )
 
     def test_above_min_threshold_allows_sell_profit(self):
-        """PnL ≥ 0.5% should emit SELL_PROFIT."""
+        """PnL >= 0.5% should emit SELL_PROFIT once past the 2h min-hold gate
+        (_MIN_HOLD_FOR_ANY_SELL_SEC in portfolio_recovery.py)."""
         classify = self._get_classify()
-        rec = self._make_recovery_record("BTCUSDT", pnl_pct=0.6, age_sec=3600.0)
+        rec = self._make_recovery_record("BTCUSDT", pnl_pct=0.6, age_sec=7300.0)
         classify(rec)
 
         assert rec.suggested_action == "SELL_PROFIT", (

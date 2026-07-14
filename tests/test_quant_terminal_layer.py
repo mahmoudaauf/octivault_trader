@@ -216,10 +216,13 @@ async def test_situation_state_classifies_overexposed() -> None:
 
 @pytest.mark.asyncio
 async def test_situation_state_classifies_dust_heavy() -> None:
+    # Dust cutoff is MIN_NOTIONAL_USDT (default 5.0, exclusive) -- all four
+    # positions below it, "B" (5.0, notional) does not count.
     positions = {
         "A": SimpleNamespace(qty=1.0, mark_price=4.0, entry_price=3.0),
-        "B": SimpleNamespace(qty=1.0, mark_price=5.0, entry_price=4.0),
-        "C": SimpleNamespace(qty=1.0, mark_price=7.0, entry_price=6.0),
+        "B": SimpleNamespace(qty=1.0, mark_price=4.5, entry_price=4.0),
+        "C": SimpleNamespace(qty=1.0, mark_price=4.9, entry_price=4.0),
+        "D": SimpleNamespace(qty=1.0, mark_price=4.99, entry_price=4.0),
     }
     engine = SituationEngine(_make_app_ctx(nav=100.0, free=40.0, locked=60.0, positions=positions))
     situation = await engine.get_situation_state()

@@ -401,13 +401,25 @@ class NativeDecisionEngine:
             min_reserve=self.quote_min_reserve_usdt,
         )
 
+    @staticmethod
+    def _position_qty(pos: Any) -> float:
+        """Extract qty from a position value of any shape PortfolioSnapshot.positions
+        may hold: a plain float (the live shape -- symbol -> qty), a dict, or an
+        object with a .qty attribute."""
+        if isinstance(pos, (int, float)):
+            return float(pos or 0.0)
+        if isinstance(pos, dict):
+            return float(pos.get("qty", 0.0) or 0.0)
+        return float(getattr(pos, "qty", 0.0) or 0.0)
+
     def _count_active_tradable_positions(self, snapshot: Any) -> int:
         """Count positions with non-zero qty, excluding BNB dust."""
         positions = getattr(snapshot, "positions", {}) or {}
         count = 0
         for sym, pos in positions.items():
-            qty = float(getattr(pos, "qty", 0) or 0)
-            if qty > 0 and not (sym == "BNBUSDT" and qty * float(getattr(pos, "entry_price", 0) or 0) < 1.0):
+            qty = self._position_qty(pos)
+            entry_price = pos.get("entry_price", 0.0) if isinstance(pos, dict) else float(getattr(pos, "entry_price", 0.0) or 0.0)
+            if qty > 0 and not (sym == "BNBUSDT" and qty * float(entry_price or 0.0) < 1.0):
                 count += 1
         return count
 
@@ -417,8 +429,7 @@ class NativeDecisionEngine:
         pos = positions.get(symbol)
         if pos is None:
             return False
-        qty = float(getattr(pos, "qty", 0) or 0)
-        return qty > 0
+        return self._position_qty(pos) > 0
 
     def _resolve_mode(self, portfolio: PortfolioSnapshot) -> dict[str, Any]:
         nav = float(portfolio.nav or 0.0)
