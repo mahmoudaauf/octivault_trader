@@ -10,6 +10,7 @@ Performance: ~75% less code than legacy, instant initialization (no Binance I/O)
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from .capital_policy import prune_reservations
@@ -101,6 +102,8 @@ class NativeSharedState:
         # Feedback loop state (ObjectiveFeedbackController + AdaptiveCapitalEngine)
         self.metrics: dict = {
             "realized_pnl": 0.0,
+            "realized_pnl_today": 0.0,  # UTC-day-scoped -- see record_realized_pnl_event()
+            "realized_pnl_today_date": "",  # ISO date the above bucket belongs to
             "unrealized_pnl": 0.0,
             "session_elapsed_h": 0.0,
             "peak_nav": 0.0,
@@ -247,6 +250,27 @@ class NativeSharedState:
     def close_position(self, symbol: str):
         """Mark position as closed"""
         self.positions.pop(symbol, None)
+
+    def record_realized_pnl_event(self, net_pnl: float) -> None:
+        """Record a closed trade's net-of-fee PnL into BOTH the lifetime
+        cumulative bucket (``metrics["realized_pnl"]``) and a UTC-day-scoped
+        bucket (``metrics["realized_pnl_today"]``).
+
+        Fixes a real bug found 2026-07-14: arbitration_engine.py's
+        gate_6_risk_manager daily-loss check was reading the lifetime
+        cumulative ``realized_pnl`` as if it were "today's" PnL, permanently
+        tripping the 2% daily-loss circuit breaker once enough historical
+        loss had accumulated -- regardless of what actually happened that day.
+        Call this instead of mutating ``metrics["realized_pnl"]`` directly
+        wherever a trade closes, so both figures stay correct and in sync.
+        """
+        net_pnl = float(net_pnl or 0.0)
+        today = datetime.now(timezone.utc).date().isoformat()
+        if self.metrics.get("realized_pnl_today_date") != today:
+            self.metrics["realized_pnl_today"] = 0.0
+            self.metrics["realized_pnl_today_date"] = today
+        self.metrics["realized_pnl"] = self.metrics.get("realized_pnl", 0.0) + net_pnl
+        self.metrics["realized_pnl_today"] = self.metrics.get("realized_pnl_today", 0.0) + net_pnl
 
     def get_position(self, symbol: str) -> Optional[Position]:
         """Get position by symbol"""

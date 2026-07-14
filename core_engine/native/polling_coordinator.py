@@ -614,7 +614,10 @@ class NativePollingCoordinator:
                 sym, price, float(t.get("commission") or 0.0), str(t.get("commissionAsset") or "")
             )
             realized_pnl = (price - entry_price) * qty - commission_quote
-            metrics["realized_pnl"] = metrics.get("realized_pnl", 0.0) + realized_pnl
+            if hasattr(self.shared_state, "record_realized_pnl_event"):
+                self.shared_state.record_realized_pnl_event(realized_pnl)
+            else:
+                metrics["realized_pnl"] = metrics.get("realized_pnl", 0.0) + realized_pnl
             metrics["trades_in_window"] = metrics.get("trades_in_window", 0) + 1
             metrics["last_update_ts"] = time.time()
             prev_wr = metrics.get("win_rate_window", 0.5)

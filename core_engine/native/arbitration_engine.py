@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from .capital_policy import compute_spendable_quote
@@ -479,12 +480,23 @@ class NativeArbitrationEngine:
         nav_peak = session_anchor if session_anchor > 0 else nav
         if nav_peak <= 0.0 or nav_peak < nav:
             nav_peak = max(nav, 1.0)
-        realized_pnl = float(
-            getattr(self._shared_state, "metrics", {}).get("realized_pnl", 0.0) or 0.0
+        # Daily loss must be scoped to TODAY, not lifetime cumulative --
+        # metrics["realized_pnl"] is a lifetime running total (2026-07-14 fix:
+        # using it here previously meant any sufficiently large historical
+        # loss would permanently trip the 2% daily-loss circuit breaker,
+        # regardless of what happened today). Use the UTC-day-scoped bucket,
+        # and treat it as 0.0 if no trade has closed yet today (the bucket is
+        # only rolled over lazily, on the next realized-PnL event).
+        _metrics = getattr(self._shared_state, "metrics", {}) or {}
+        _today = datetime.now(timezone.utc).date().isoformat()
+        realized_pnl_today = (
+            float(_metrics.get("realized_pnl_today", 0.0) or 0.0)
+            if _metrics.get("realized_pnl_today_date") == _today
+            else 0.0
         )
         daily_pnl_pct = 0.0
         if session_anchor > 0.0:
-            daily_pnl_pct = (realized_pnl / session_anchor) * 100.0
+            daily_pnl_pct = (realized_pnl_today / session_anchor) * 100.0
         return PortfolioSnapshot(
             nav=nav,
             nav_peak=nav_peak,

@@ -780,7 +780,10 @@ class NativeExecutor:
                         )
                         metrics = getattr(self._shared_state, "metrics", None)
                         if isinstance(metrics, dict):
-                            metrics["realized_pnl"] = metrics.get("realized_pnl", 0.0) + _net_pnl
+                            if hasattr(self._shared_state, "record_realized_pnl_event"):
+                                self._shared_state.record_realized_pnl_event(_net_pnl)
+                            else:
+                                metrics["realized_pnl"] = metrics.get("realized_pnl", 0.0) + _net_pnl
                             metrics["trades_in_window"] = metrics.get("trades_in_window", 0) + 1
                             metrics["last_update_ts"] = time.time()
                             prev_wr = metrics.get("win_rate_window", 0.5)
