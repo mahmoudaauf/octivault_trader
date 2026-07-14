@@ -273,3 +273,189 @@ class TestNativeMarketDataWebSocket:
         candle = state.market_data[("BTCUSDT", "1m")][0]
         assert candle["close"] == 1.5
         assert state.market_data_ready is True
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-07-14: bookTicker queue-overflow storm fix regression tests.
+# @bookTicker previously shared one multiplexed connection with @ticker/
+# @kline, so a bookTicker-side queue overflow tore down price/candle
+# delivery too. Fixed by: (1) routing @bookTicker to its own isolated
+# connection, (2) a configurable BinanceSocketManager queue size (was an
+# unconfigured, too-small library default of 100), (3) only resetting the
+# reconnect/backoff counters once a message is actually received, not on
+# bare connect (previously let a connect->instant-overflow->disconnect loop
+# report "attempt 1/N" forever and never honor max_reconnect_attempts).
+# ─────────────────────────────────────────────────────────────────────
+class TestBookTickerConnectionIsolation:
+    def test_primary_streams_never_include_bookticker(self, monkeypatch) -> None:
+        monkeypatch.setenv("WS_ENABLE_BOOKTICKER", "true")
+        state = _WsState()
+        ws = NativeMarketDataWebSocket(
+            exchange_client=object(), shared_state=state, symbols=["BTCUSDT", "ETHUSDT"]
+        )
+        streams = ws._build_primary_streams()
+        assert not any("bookTicker" in s for s in streams)
+        assert "btcusdt@ticker" in streams
+        assert "btcusdt@kline_1m" in streams
+
+    def test_bookticker_streams_empty_when_disabled(self, monkeypatch) -> None:
+        monkeypatch.setenv("WS_ENABLE_BOOKTICKER", "false")
+        state = _WsState()
+        ws = NativeMarketDataWebSocket(
+            exchange_client=object(), shared_state=state, symbols=["BTCUSDT"]
+        )
+        assert ws._build_bookticker_streams() == []
+
+    def test_bookticker_streams_populated_when_enabled(self, monkeypatch) -> None:
+        monkeypatch.setenv("WS_ENABLE_BOOKTICKER", "true")
+        state = _WsState()
+        ws = NativeMarketDataWebSocket(
+            exchange_client=object(), shared_state=state, symbols=["BTCUSDT", "ETHUSDT"]
+        )
+        streams = ws._build_bookticker_streams()
+        assert streams == ["btcusdt@bookTicker", "ethusdt@bookTicker"]
+
+    def test_queue_max_size_defaults_and_env_override(self, monkeypatch) -> None:
+        state = _WsState()
+        default_ws = NativeMarketDataWebSocket(exchange_client=object(), shared_state=state)
+        assert default_ws._queue_max_size == 2000
+
+        monkeypatch.setenv("WS_QUEUE_MAX_SIZE", "5000")
+        env_ws = NativeMarketDataWebSocket(exchange_client=object(), shared_state=state)
+        assert env_ws._queue_max_size == 5000
+
+        explicit_ws = NativeMarketDataWebSocket(
+            exchange_client=object(), shared_state=state, queue_max_size=42
+        )
+        assert explicit_ws._queue_max_size == 42
+
+    @pytest.mark.asyncio
+    async def test_start_launches_two_independent_connection_tasks(self) -> None:
+        state = _WsState()
+        ws = NativeMarketDataWebSocket(exchange_client=object(), shared_state=state, symbols=[])
+        started = []
+
+        async def _fake_run_connection(streams_fn, conn_label, *, critical):
+            started.append((conn_label, critical))
+            await asyncio.sleep(3600)  # stay "running" until cancelled
+
+        ws._run_connection = _fake_run_connection
+        await ws.start()
+        try:
+            await asyncio.sleep(0)  # let both tasks start
+            assert ("primary", True) in started
+            assert ("bookTicker", False) in started
+            assert ws._ws_task is not None and ws._bookticker_task is not None
+        finally:
+            await ws.stop()
+            assert ws._ws_task.cancelled() or ws._ws_task.done()
+            assert ws._bookticker_task.cancelled() or ws._bookticker_task.done()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_counter_does_not_reset_until_a_message_is_received(
+        self, monkeypatch
+    ) -> None:
+        """The exact bug scenario: every connect immediately overflows before any
+        message arrives. Must count toward max_reconnect_attempts and give up --
+        not loop forever reporting 'attempt 1/N'."""
+        import binance
+
+        connect_attempts = {"n": 0}
+
+        class _FakeStreamCtx:
+            async def __aenter__(self):
+                connect_attempts["n"] += 1
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+            async def recv(self):
+                raise RuntimeError("simulated BinanceWebsocketQueueOverflow before any message")
+
+        class _FakeSocketManager:
+            def __init__(self, client, max_queue_size=100):
+                self.max_queue_size = max_queue_size
+
+            def multiplex_socket(self, streams):
+                return _FakeStreamCtx()
+
+        class _FakeAsyncClient:
+            def __init__(self, *_a, **_kw):
+                pass
+
+            async def close_connection(self):
+                pass
+
+        monkeypatch.setattr(binance, "AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr(binance, "BinanceSocketManager", _FakeSocketManager)
+
+        state = _WsState()
+        ws = NativeMarketDataWebSocket(
+            exchange_client=type("_EC", (), {"api_key": "k", "api_secret": "s"})(),
+            shared_state=state,
+            symbols=["BTCUSDT"],
+            max_reconnect_attempts=3,
+            initial_backoff_sec=0.0,
+            max_backoff_sec=0.0,
+        )
+        ws._running = True
+
+        await ws._run_connection(ws._build_primary_streams, "primary", critical=True)
+
+        assert connect_attempts["n"] == 3, (
+            "each overflow-before-any-message cycle must count toward the "
+            f"reconnect cap; got {connect_attempts['n']} attempts"
+        )
+        assert ws._running is False, "critical connection exhausting reconnects must stop the feed"
+
+    @pytest.mark.asyncio
+    async def test_noncritical_connection_exhausting_reconnects_does_not_stop_feed(
+        self, monkeypatch
+    ) -> None:
+        """bookTicker (critical=False) permanently failing must NOT flip
+        self._running -- @ticker/@kline delivery must be unaffected."""
+        import binance
+
+        class _FakeStreamCtx:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+            async def recv(self):
+                raise RuntimeError("simulated overflow")
+
+        class _FakeSocketManager:
+            def __init__(self, client, max_queue_size=100):
+                pass
+
+            def multiplex_socket(self, streams):
+                return _FakeStreamCtx()
+
+        class _FakeAsyncClient:
+            def __init__(self, *_a, **_kw):
+                pass
+
+            async def close_connection(self):
+                pass
+
+        monkeypatch.setattr(binance, "AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr(binance, "BinanceSocketManager", _FakeSocketManager)
+        monkeypatch.setenv("WS_ENABLE_BOOKTICKER", "true")
+
+        state = _WsState()
+        ws = NativeMarketDataWebSocket(
+            exchange_client=type("_EC", (), {"api_key": "k", "api_secret": "s"})(),
+            shared_state=state,
+            symbols=["BTCUSDT"],
+            max_reconnect_attempts=2,
+            initial_backoff_sec=0.0,
+            max_backoff_sec=0.0,
+        )
+        ws._running = True
+
+        await ws._run_connection(ws._build_bookticker_streams, "bookTicker", critical=False)
+
+        assert ws._running is True

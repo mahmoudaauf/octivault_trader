@@ -12,6 +12,9 @@ Architecture:
   • Non-blocking message handlers
   • Exponential backoff reconnection
   • Fallback to REST only for bootstrap
+  • @bookTicker (optional, opt-in) runs on its own isolated connection so an
+    overflow/disconnect there can never take down @ticker/@kline delivery —
+    see _run_connection().
 
 Design choices:
   * WebSocket primary data source (live prices/klines)
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Optional
 
@@ -48,6 +52,7 @@ class NativeMarketDataWebSocket:
         initial_backoff_sec: float = 1.0,
         max_backoff_sec: float = 30.0,
         message_timeout_sec: float = 60.0,
+        queue_max_size: Optional[int] = None,
     ):
         """
         Initialize WebSocket market data.
@@ -61,6 +66,9 @@ class NativeMarketDataWebSocket:
             initial_backoff_sec: Initial backoff for exponential retry
             max_backoff_sec: Max backoff interval
             message_timeout_sec: Timeout for receiving messages
+            queue_max_size: python-binance BinanceSocketManager's internal
+                message queue size (default: library default of 100 is too
+                small for the startup contention window — see WS_QUEUE_MAX_SIZE).
         """
         self._exchange_client = exchange_client
         self._shared_state = shared_state
@@ -71,13 +79,17 @@ class NativeMarketDataWebSocket:
         self._initial_backoff_sec = initial_backoff_sec
         self._max_backoff_sec = max_backoff_sec
         self._message_timeout_sec = message_timeout_sec
+        self._queue_max_size = int(
+            queue_max_size
+            if queue_max_size is not None
+            else (os.getenv("WS_QUEUE_MAX_SIZE", "2000") or 2000)
+        )
 
         # State
         self._running = False
         self._stopped = asyncio.Event()
-        self._ws_task: Optional[asyncio.Task] = None
-        self._reconnect_count = 0
-        self._current_backoff = initial_backoff_sec
+        self._ws_task: Optional[asyncio.Task] = None  # @ticker + @kline (critical)
+        self._bookticker_task: Optional[asyncio.Task] = None  # @bookTicker (isolated, non-critical)
         self._last_msg_ts = time.time()
 
     async def start(self) -> None:
@@ -91,7 +103,12 @@ class NativeMarketDataWebSocket:
         )
         self._running = True
         self._stopped.clear()
-        self._ws_task = asyncio.create_task(self._ws_loop())
+        self._ws_task = asyncio.create_task(
+            self._run_connection(self._build_primary_streams, "primary", critical=True)
+        )
+        self._bookticker_task = asyncio.create_task(
+            self._run_connection(self._build_bookticker_streams, "bookTicker", critical=False)
+        )
 
     async def stop(self) -> None:
         """Stop WebSocket market data feed."""
@@ -99,12 +116,13 @@ class NativeMarketDataWebSocket:
         self._running = False
         self._stopped.set()
 
-        if self._ws_task:
-            self._ws_task.cancel()
-            try:
-                await self._ws_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._ws_task, self._bookticker_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     async def subscribe(self, symbols: list[str]) -> None:
         """Add symbols to subscription (additive). Prefer set_symbols() for the trading
@@ -115,8 +133,9 @@ class NativeMarketDataWebSocket:
             self._symbols.extend(new_symbols)
             logger.info(f"📡 Added {len(new_symbols)} symbols (total: {len(self._symbols)})")
             # Force reconnect to pick up new symbols
-            if self._ws_task:
-                self._ws_task.cancel()
+            for task in (self._ws_task, self._bookticker_task):
+                if task:
+                    task.cancel()
 
     async def set_symbols(self, symbols: list[str], *, max_symbols: int = 12) -> None:
         """REPLACE the subscription set (order-preserving, capped) and reconnect if changed.
@@ -138,37 +157,61 @@ class NativeMarketDataWebSocket:
             return  # no change → don't churn the connection
         self._symbols = seen
         logger.info("📡 WS universe updated (%d): %s", len(seen), seen)
-        # Cleanly RESTART the feed task with the new symbol set. Cancelling alone just
-        # terminates _ws_loop — and on its way out the loop sets self._running=False — so
-        # we must cancel+await the old task, then re-enable _running before spawning a
-        # fresh task (which resets the reconnect counter and re-subscribes to _symbols).
-        # REST polling covers the brief gap.
-        old = self._ws_task
-        if old is not None and not old.done():
-            self._stopped.set()  # so the old loop logs a clean "stopped", not an ERROR
-            old.cancel()
-            try:
-                await old
-            except (asyncio.CancelledError, Exception):
-                pass
+        # Cleanly RESTART both connections with the new symbol set. Cancelling alone just
+        # terminates _run_connection — and on its way out the loop sets self._running=False
+        # (primary only) — so we must cancel+await the old tasks, then re-enable _running
+        # before spawning fresh tasks (which reset each connection's own reconnect counter
+        # and re-subscribe to _symbols). REST polling covers the brief gap.
+        for task in (self._ws_task, self._bookticker_task):
+            if task is not None and not task.done():
+                self._stopped.set()  # so the old loop logs a clean "stopped", not an ERROR
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
         self._running = True
         self._stopped.clear()
-        self._current_backoff = self._initial_backoff_sec
-        self._ws_task = asyncio.create_task(self._ws_loop())
+        self._ws_task = asyncio.create_task(
+            self._run_connection(self._build_primary_streams, "primary", critical=True)
+        )
+        self._bookticker_task = asyncio.create_task(
+            self._run_connection(self._build_bookticker_streams, "bookTicker", critical=False)
+        )
 
-    async def _ws_loop(self) -> None:
-        """Main WebSocket connection loop with reconnection."""
+    async def _run_connection(self, streams_fn, conn_label: str, *, critical: bool) -> None:
+        """Run one independently-managed WebSocket connection (its own AsyncClient,
+        BinanceSocketManager, and reconnect/backoff state) for whatever streams_fn()
+        returns.
+
+        Isolated from any other connection this instance runs — an overflow or
+        disconnect here cannot take down another connection's stream delivery,
+        since each has its own multiplexed socket and message queue. This is why
+        @bookTicker (a high-frequency, opt-in, observe-only stream) runs on its
+        own connection separate from @ticker/@kline (which real trading decisions
+        depend on): a bookTicker-side overflow should never cost the trading loop
+        its price/candle feed.
+
+        critical=True means this connection permanently failing (reconnect
+        attempts exhausted) marks the whole feed as not-running; critical=False
+        (bookTicker) just leaves that one connection stopped.
+        """
         reconnect_count = 0
+        current_backoff = self._initial_backoff_sec
 
         while self._running and reconnect_count < self._max_reconnect_attempts:
             try:
-                if not self._symbols:
-                    logger.debug("No symbols to subscribe, waiting...")
+                streams = streams_fn()
+                if not streams:
+                    logger.debug("[%s] No streams to subscribe, waiting...", conn_label)
                     await asyncio.sleep(5)
                     continue
 
                 logger.info(
-                    f"🔌 Connecting WebSocket (attempt {reconnect_count + 1}/{self._max_reconnect_attempts})"
+                    "🔌 [%s] Connecting WebSocket (attempt %d/%d)",
+                    conn_label,
+                    reconnect_count + 1,
+                    self._max_reconnect_attempts,
                 )
 
                 # Create Binance AsyncClient for WebSocket
@@ -180,35 +223,34 @@ class NativeMarketDataWebSocket:
                     api_secret = getattr(self._exchange_client, "api_secret", None)
 
                     if not api_key or not api_secret:
-                        logger.error("No API credentials available for WebSocket")
+                        logger.error("[%s] No API credentials available for WebSocket", conn_label)
                         reconnect_count += 1
-                        await asyncio.sleep(self._current_backoff)
+                        await asyncio.sleep(current_backoff)
                         continue
 
                     # Create AsyncClient (public key, secret for authentication)
                     binance_client = AsyncClient(api_key, api_secret)
 
                 except ImportError as e:
-                    logger.error(f"Failed to import Binance client: {e}")
+                    logger.error("[%s] Failed to import Binance client: %s", conn_label, e)
                     reconnect_count += 1
-                    await asyncio.sleep(self._current_backoff)
+                    await asyncio.sleep(current_backoff)
                     continue
 
-                # Build streams list
-                streams = self._build_streams()
-                logger.info(f"📡 Subscribing to {len(streams)} streams: {streams[:5]}...")
+                logger.info(
+                    "📡 [%s] Subscribing to %d streams: %s...", conn_label, len(streams), streams[:5]
+                )
 
                 # Connect WebSocket
                 try:
-                    sm = BinanceSocketManager(binance_client)
+                    sm = BinanceSocketManager(binance_client, max_queue_size=self._queue_max_size)
+                    got_message = False
 
                     try:
                         async with sm.multiplex_socket(streams) as stream:
                             self._last_msg_ts = time.time()
-                            reconnect_count = 0
-                            self._current_backoff = self._initial_backoff_sec
 
-                            logger.info("✅ WebSocket connected, receiving messages...")
+                            logger.info("✅ [%s] WebSocket connected, receiving messages...", conn_label)
 
                             # Message loop
                             while self._running:
@@ -219,73 +261,101 @@ class NativeMarketDataWebSocket:
                                     )
                                     self._last_msg_ts = time.time()
 
+                                    if not got_message:
+                                        # Only declare this connection healthy -- and reset
+                                        # the reconnect/backoff counters -- once a message
+                                        # actually arrives. Resetting immediately on connect
+                                        # let a connect -> instant-overflow -> disconnect
+                                        # loop report "attempt 1/N" forever, never honoring
+                                        # max_reconnect_attempts (a real storm observed live
+                                        # 2026-07-14).
+                                        got_message = True
+                                        reconnect_count = 0
+                                        current_backoff = self._initial_backoff_sec
+
                                     if msg:
                                         await self._handle_message(msg)
 
                                 except asyncio.TimeoutError:
                                     logger.warning(
-                                        f"⚠️ No message for {self._message_timeout_sec}s, reconnecting..."
+                                        "⚠️ [%s] No message for %ss, reconnecting...",
+                                        conn_label,
+                                        self._message_timeout_sec,
                                     )
                                     break
                                 except asyncio.CancelledError:
                                     raise
                                 except Exception as e:
-                                    logger.warning(f"⚠️ WebSocket error: {e}")
+                                    logger.warning("⚠️ [%s] WebSocket error: %s", conn_label, e)
                                     break
                     finally:
                         # Always close the Binance client
                         await binance_client.close_connection()
 
+                    if not got_message:
+                        # This connection attempt never became healthy -- the exact
+                        # 2026-07-14 storm mechanism: connect -> instant overflow
+                        # (BinanceWebsocketQueueOverflow -> ReadLoopClosed) -> the
+                        # message loop's own generic "except Exception: break" catches
+                        # this without ever reaching the outer except block below, so
+                        # it previously never counted toward reconnect_count and never
+                        # applied backoff -- an unbounded, zero-backoff reconnect storm.
+                        # Count and back off here explicitly instead.
+                        reconnect_count += 1
+                        if reconnect_count < self._max_reconnect_attempts:
+                            wait_time = min(current_backoff, self._max_backoff_sec)
+                            logger.info("⏳ [%s] Reconnecting in %ss...", conn_label, wait_time)
+                            await asyncio.sleep(wait_time)
+                            current_backoff *= 2
+
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning(f"❌ WebSocket connection failed: {e}")
+                    logger.warning("❌ [%s] WebSocket connection failed: %s", conn_label, e)
                     reconnect_count += 1
                     if reconnect_count < self._max_reconnect_attempts:
-                        wait_time = min(self._current_backoff, self._max_backoff_sec)
-                        logger.info(f"⏳ Reconnecting in {wait_time}s...")
+                        wait_time = min(current_backoff, self._max_backoff_sec)
+                        logger.info("⏳ [%s] Reconnecting in %ss...", conn_label, wait_time)
                         await asyncio.sleep(wait_time)
-                        self._current_backoff *= 2
+                        current_backoff *= 2
 
             except asyncio.CancelledError:
-                logger.info("WebSocket loop cancelled")
+                logger.info("[%s] WebSocket loop cancelled", conn_label)
                 break
             except Exception as e:
-                logger.error(f"WebSocket loop error: {e}")
+                logger.error("[%s] WebSocket loop error: %s", conn_label, e)
                 reconnect_count += 1
 
         if self._stopped.is_set() or not self._running:
-            logger.info("WebSocket market data stopped")
+            logger.info("[%s] WebSocket market data stopped", conn_label)
         else:
-            logger.error("❌ WebSocket disconnected (max reconnects reached)")
-        self._running = False
+            logger.error("❌ [%s] WebSocket disconnected (max reconnects reached)", conn_label)
+            if critical:
+                self._running = False
 
-    def _build_streams(self) -> list[str]:
-        """Build Binance stream names.
+    def _bookticker_enabled(self) -> bool:
+        return str(os.getenv("WS_ENABLE_BOOKTICKER", "false")).lower() in ("1", "true", "yes", "on")
 
-        @bookTicker is the highest-frequency stream (fires on every best bid/ask
-        change). With many symbols it overruns python-binance's internal 100-message
-        queue (BinanceWebsocketQueueOverflow), which storms reconnects and can wedge
-        the trading loop. It only feeds an OBSERVE-ONLY orderbook-imbalance check in
-        regime_gate, so it's off by default to keep the message queue bounded
-        (~2 streams/symbol). Re-enable with WS_ENABLE_BOOKTICKER=true if needed.
-        """
-        import os
-        enable_bookticker = str(
-            os.getenv("WS_ENABLE_BOOKTICKER", "false")
-        ).lower() in ("1", "true", "yes", "on")
+    def _build_primary_streams(self) -> list[str]:
+        """@ticker + @kline for every symbol -- the data live trading decisions
+        depend on. Always subscribed; never shares a connection with @bookTicker."""
         streams = []
         for symbol in self._symbols:
             symbol_lower = symbol.lower()
-            # Price stream
             streams.append(f"{symbol_lower}@ticker")
-            # Top-of-book stream — high-frequency firehose; opt-in only.
-            if enable_bookticker:
-                streams.append(f"{symbol_lower}@bookTicker")
-            # Kline streams
             for tf in self._timeframes:
                 streams.append(f"{symbol_lower}@kline_{tf}")
         return streams
+
+    def _build_bookticker_streams(self) -> list[str]:
+        """@bookTicker for every symbol -- the highest-frequency stream (fires on
+        every best bid/ask change). Opt-in via WS_ENABLE_BOOKTICKER (checked fresh
+        on every reconnect attempt, so toggling it takes effect without a restart).
+        Runs on its own isolated connection (see _run_connection) so a queue
+        overflow here can't take down @ticker/@kline delivery."""
+        if not self._bookticker_enabled():
+            return []
+        return [f"{symbol.lower()}@bookTicker" for symbol in self._symbols]
 
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         """Handle WebSocket message (non-blocking)."""
