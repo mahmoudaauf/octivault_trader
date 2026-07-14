@@ -55,6 +55,11 @@ DEFAULTS = {
     "OBJ_KP_DD_PENALTY": 200.0,  # heavy penalty if dd_error > 0
     # Telemetry freshness
     "OBJ_TELEMETRY_MAX_AGE_S": 1800,  # 2 × heartbeat
+    # Kill-switch auto-resume: minimum time the halt must hold once drawdown
+    # has recovered below the limit, before BUYs are allowed again. Prevents
+    # rapid flip-flopping right at the threshold; does NOT bypass the
+    # requirement that drawdown actually recover first (see step()).
+    "OBJ_KILL_SWITCH_RESUME_COOLDOWN_S": 1800,  # 30 min
 }
 
 
@@ -137,6 +142,7 @@ class ObjectiveFeedbackController:
         self.dd_max = _cfg(config, "OBJ_MAX_DRAWDOWN_PCT")
         self.min_edge_bps = _cfg(config, "OBJ_MIN_NET_EDGE_BPS")
         self.telemetry_max_age = _cfg(config, "OBJ_TELEMETRY_MAX_AGE_S")
+        self.kill_switch_resume_cooldown_s = _cfg(config, "OBJ_KILL_SWITCH_RESUME_COOLDOWN_S")
 
         self.knob_ranges = {
             "confidence_floor": (
@@ -260,13 +266,26 @@ class ObjectiveFeedbackController:
             edge_error_bps = min(0.0, edge_error_bps)
 
         # ---- 2. Kill-switch ------------------------------------------
-        halted = False
+        # `halted` must always reflect the CURRENT shared_state.trading_halted
+        # (ground truth), not just "did this exact step freshly trip it" --
+        # otherwise a still-breached-but-not-yet-2-consecutive step, or a step
+        # that neither trips nor resumes, would under-report an already-active
+        # halt and skip the "force conservative knobs" branch below.
         if dd_error > 0:
             self.state.consecutive_dd_breaches += 1
             if self.state.consecutive_dd_breaches >= 2:
-                halted = await self._trip_kill_switch(tel, dd_error)
+                await self._trip_kill_switch(tel, dd_error)
         else:
             self.state.consecutive_dd_breaches = 0
+            # Auto-resume (2026-07-14 fix): _trip_kill_switch previously set
+            # trading_halted=True with no code anywhere ever reading it back
+            # to False -- a tripped kill-switch blocked every BUY permanently
+            # until a manual process restart, no matter how much drawdown
+            # recovered. Resume only once drawdown is back under the limit
+            # (dd_error <= 0, this branch) AND a minimum cooldown has held
+            # since the trip, to avoid flip-flopping right at the threshold.
+            await self._maybe_resume_kill_switch()
+        halted = bool(getattr(self.ss, "trading_halted", False)) if self.ss is not None else False
 
         # ---- 3. PI update --------------------------------------------
         # Frequency is an evaluation target, never an entry quota.  Zero trades can
@@ -393,7 +412,18 @@ class ObjectiveFeedbackController:
         peak_nav = self._session_peak_nav
         dd_pct = 0.0 if peak_nav <= 0 else max(0.0, (peak_nav - nav) / peak_nav * 100.0)
 
-        trades = int(metrics.get("trades_in_window", 0) or 0)
+        # 2026-07-14 fix: trades_in_window is a forever-incrementing counter
+        # (only reset on process restart) despite its name -- reading it here
+        # meant the "fresh trades" edge-error suppression and the "genuinely
+        # idle" detection below both permanently stopped working after the
+        # first ~5 trades of a session, regardless of how idle the bot
+        # actually was afterward. trades_since_ofc_check is a twin counter
+        # incremented at the same write sites, but consumed (reset to 0) by
+        # this method every call, giving true "since we last checked" window
+        # semantics without changing trades_in_window's meaning for its other
+        # reader (orchestrator.py's first_trade_executed flag).
+        trades = int(metrics.get("trades_since_ofc_check", 0) or 0)
+        metrics["trades_since_ofc_check"] = 0
         win_rate = float(metrics.get("win_rate_window", 0.0) or 0.0)
         fee_bps = float(metrics.get("avg_fee_bps", 0.0) or 0.0)
         slip_bps = float(metrics.get("avg_slippage_bps", 0.0) or 0.0)
@@ -497,6 +527,45 @@ class ObjectiveFeedbackController:
                 except Exception:
                     pass
         return True
+
+    async def _maybe_resume_kill_switch(self) -> bool:
+        """Auto-resume the kill-switch once drawdown has recovered and a
+        cooldown has held. Returns True if still halted (either not yet
+        eligible to resume, or resume itself failed), False if resumed or
+        never halted. Only called from the dd_error<=0 branch of step() --
+        i.e. drawdown recovery is already a precondition by construction;
+        this method only adds the cooldown gate on top."""
+        ss = self.ss
+        if ss is None or not bool(getattr(ss, "trading_halted", False)):
+            return False
+        halted_since = float(getattr(ss, "_trading_halted_since", 0.0) or 0.0)
+        if halted_since <= 0.0:
+            # Halted with no recorded trip time (e.g. set by something other
+            # than _trip_kill_switch) -- do not auto-resume state we don't
+            # understand the origin of; require manual intervention.
+            return True
+        elapsed = time.time() - halted_since
+        if elapsed < self.kill_switch_resume_cooldown_s:
+            return True
+        try:
+            ss.trading_halted = False
+            ss._trading_halted_since = 0.0
+        except Exception:
+            return True
+        self.logger.warning(
+            "[OFC] ✅ KILL-SWITCH auto-resumed — drawdown recovered and held "
+            "for %.0fs (cooldown %.0fs). New BUYs allowed again.",
+            elapsed, self.kill_switch_resume_cooldown_s,
+        )
+        if hasattr(ss, "emit_event"):
+            try:
+                await ss.emit_event(
+                    "ObjectiveKillSwitchResumed",
+                    {"reason": "drawdown_recovered", "halted_for_s": elapsed},
+                )
+            except Exception:
+                pass
+        return False
 
     # ----------------------------------------------------------------
     # Persistence (so we survive restarts and have an audit trail)

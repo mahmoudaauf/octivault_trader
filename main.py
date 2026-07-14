@@ -90,7 +90,18 @@ class Engines:
     async def initialize(self) -> None:
         """Boot all engines (operations starts the underlying system)."""
         log.info("🚀 Initializing 5 core engines…")
-        await self.operations.startup_system()
+        # 2026-07-14 fix: this return value was previously discarded, so a
+        # failed native-orchestrator startup (state machine timeout/hydration
+        # failure) let the process fall straight into the trading loop with
+        # session_anchor_nav stuck at 0 (or a stale persisted value) --
+        # bypassing every NAV-protection session-scoped safety check. Refuse
+        # to proceed rather than trade on an unknown/unhydrated foundation;
+        # supervisor.sh's existing crash-loop-protected restart handles retry.
+        if not await self.operations.startup_system():
+            raise RuntimeError(
+                "startup_system() failed — refusing to enter the trading loop. "
+                "Check logs for the underlying native-orchestrator startup error."
+            )
         await self.market.initialize()
         await self.situation.initialize()
         await self.decision.initialize()
@@ -412,7 +423,14 @@ async def trading_cycle(
     if _nav_prot_due:
         try:
             from core_engine.native.nav_protection import evaluate_nav_protection
-            _ss.previous_nav_usdt = float(getattr(_ss, "nav_usdt", 0.0) or 0.0)
+            # 2026-07-14 fix: this used to stomp previous_nav_usdt with the
+            # CURRENT nav_usdt immediately before evaluate_nav_protection()
+            # read it, collapsing nav_delta to ~0 on every single evaluation
+            # and silently disabling the PROFIT_LOCK/FLOATING_GAIN_PROTECTION
+            # branches (which key off nav_delta_pct). previous_nav_usdt is
+            # already correctly maintained by shared_state.update_nav(),
+            # called every trading cycle from get_portfolio_snapshot() -- it
+            # does not need (and must not get) a second, destructive writer.
             _, _prot = evaluate_nav_protection(_ss)
             _mode = _prot.protection_mode
             _dd = _prot.drawdown_from_peak_pct

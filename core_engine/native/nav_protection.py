@@ -241,14 +241,31 @@ class NAVProtectionEngine:
             attribution.peak_nav_usdt,
             current_nav,
         )
+        _peak_ts = float((getattr(shared_state, "metrics", {}) or {}).get("peak_nav_ts", 0.0) or 0.0)
+        _now = time.time()
+        # 2026-07-14 fix: the two "cap peak to session_anchor" guards below exist
+        # to stop a STALE peak from a PRIOR session dominating this one -- but
+        # they previously fired unconditionally on magnitude alone, so a
+        # genuine, freshly-set peak from real intra-session growth (e.g. NAV
+        # climbed to $1500 this session, then pulled back to $1400) was
+        # silently collapsed down to current_nav every cycle after the pullback,
+        # discarding the true peak. Only apply the caps when the peak predates
+        # this session's start (or session-start info is unavailable, in which
+        # case fall back to the original conservative behavior).
+        _session_start_ts = float(getattr(shared_state, "_session_start_ts", 0.0) or 0.0)
+        _peak_is_fresh_this_session = (
+            _session_start_ts > 0 and _peak_ts > 0 and _peak_ts >= _session_start_ts
+        )
         # Cap stale snapshot peak: if it exceeds the session anchor by >10%, treat session anchor
         # as the effective starting peak so a cross-session spike doesn't dominate.
-        if session_anchor > 0 and _snapshot_peak > session_anchor * 1.10:
+        if (
+            not _peak_is_fresh_this_session
+            and session_anchor > 0
+            and _snapshot_peak > session_anchor * 1.10
+        ):
             _snapshot_peak = max(session_anchor, current_nav)
 
         _raw_peak = _snapshot_peak
-        _peak_ts = float((getattr(shared_state, "metrics", {}) or {}).get("peak_nav_ts", 0.0) or 0.0)
-        _now = time.time()
 
         if _peak_ts > 0:
             _age_sec = _now - _peak_ts
@@ -264,8 +281,10 @@ class NAVProtectionEngine:
                 _raw_peak = current_nav + (_raw_peak - current_nav) * _drift_factor
 
         # Cap peak_nav to session_anchor — prevents prior session highs from dominating.
-        # When session_anchor is set, the effective peak cannot exceed it.
-        if session_anchor > 0 and _raw_peak > session_anchor:
+        # When session_anchor is set, the effective peak cannot exceed it. Skipped
+        # when the peak is fresh (set this session) -- see _peak_is_fresh_this_session
+        # above; a genuine intra-session peak above the anchor must be preserved.
+        if not _peak_is_fresh_this_session and session_anchor > 0 and _raw_peak > session_anchor:
             _raw_peak = session_anchor
         peak_nav = max(_raw_peak, current_nav)
         prev_floor = float(getattr(shared_state, "protection_floor_usdt", 0.0) or 0.0)

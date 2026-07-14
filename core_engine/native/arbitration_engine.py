@@ -780,6 +780,14 @@ class NativeArbitrationEngine:
                 self._global_sl_history = [
                     float(t) for t in data.get("global_sl_history", []) if now - float(t) < 7200
                 ]
+                # Restore gate_9's global buy-pace history (2026-07-14 fix): this was
+                # never persisted, so it silently reset to empty on every restart,
+                # letting a fresh burst of up to max_buys_in_window BUYs through
+                # immediately post-restart on top of whatever already happened
+                # just before the restart -- too permissive right after a restart.
+                self._global_buy_history = [
+                    float(t) for t in data.get("global_buy_history", []) if now - float(t) < 7200
+                ]
                 # Prune entries older than the reset window — no point keeping them
                 stale = [
                     s
@@ -818,6 +826,7 @@ class NativeArbitrationEngine:
                     if now - t < _SYMBOL_REENTRY_COOLDOWN_SECS
                 },
                 "global_sl_history": [t for t in self._global_sl_history if now - t < 7200],
+                "global_buy_history": [t for t in self._global_buy_history if now - t < 7200],
                 "saved_at": now,
             }
             tmp = self._arb_state_path + ".tmp"

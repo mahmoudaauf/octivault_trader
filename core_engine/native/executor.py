@@ -785,6 +785,9 @@ class NativeExecutor:
                             else:
                                 metrics["realized_pnl"] = metrics.get("realized_pnl", 0.0) + _net_pnl
                             metrics["trades_in_window"] = metrics.get("trades_in_window", 0) + 1
+                            metrics["trades_since_ofc_check"] = (
+                                metrics.get("trades_since_ofc_check", 0) + 1
+                            )
                             metrics["last_update_ts"] = time.time()
                             prev_wr = metrics.get("win_rate_window", 0.5)
                             metrics["win_rate_window"] = prev_wr * 0.9 + (1.0 if _net_pnl > 0 else 0.0) * 0.1

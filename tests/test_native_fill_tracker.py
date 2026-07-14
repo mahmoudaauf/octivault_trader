@@ -179,6 +179,31 @@ class TestNativeFillTracker:
         assert pos is None
 
     @pytest.mark.asyncio
+    async def test_process_sell_fill_updates_realized_pnl_today_not_just_lifetime(self):
+        """Regression (2026-07-14): _process_sell_fill must go through
+        shared_state.record_realized_pnl_event() so realized_pnl_today stays
+        in sync -- the arbitration_engine daily-loss gate reads that bucket,
+        not the lifetime realized_pnl total, and this path was found bypassing
+        it (dormant only because polling_enabled=True is the default)."""
+        exchange = AsyncMock()
+        shared_state = NativeSharedState()
+        tracker = NativeFillTracker(
+            exchange_client=exchange, shared_state=shared_state, poll_interval_sec=5.0,
+        )
+        shared_state.update_position("BTCUSDT", 1.0, 65000.0, 66000.0)
+        fill = Fill(
+            exchange_trade_id=4, symbol="BTCUSDT", side="SELL", quantity=1.0,
+            price=66000.0, fee_qty=0.0, fee_asset="USDT", timestamp_ms=1609459200000,
+            commission=0.0,
+        )
+
+        await tracker._process_sell_fill(fill)
+
+        assert shared_state.metrics["realized_pnl"] == pytest.approx(1000.0)
+        assert shared_state.metrics["realized_pnl_today"] == pytest.approx(1000.0)
+        assert shared_state.metrics["realized_pnl_today_date"] != ""
+
+    @pytest.mark.asyncio
     async def test_process_sell_fill_partial_close(self):
         """Test SELL fill reduces position when qty < position."""
         exchange = AsyncMock()

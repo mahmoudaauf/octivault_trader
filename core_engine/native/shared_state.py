@@ -108,6 +108,13 @@ class NativeSharedState:
             "session_elapsed_h": 0.0,
             "peak_nav": 0.0,
             "trades_in_window": 0,
+            # Consumed and reset to 0 by ObjectiveFeedbackController._measure()
+            # every step -- true "since we last checked" semantics, unlike
+            # trades_in_window above (which, despite its name, is a
+            # forever-incrementing "trades ever this process" counter read
+            # elsewhere; kept separate so fixing OFC's window bug doesn't
+            # change that other reader's meaning).
+            "trades_since_ofc_check": 0,
             "win_rate_window": 0.5,
             "avg_fee_bps": 0.0,
             "avg_slippage_bps": 0.0,
@@ -141,7 +148,16 @@ class NativeSharedState:
     # ==================== NAV Management ====================
 
     def update_nav_protection(self, attribution: dict, protection_state: dict) -> None:
-        """Called by NAVProtectionEngine after each evaluation."""
+        """Called by NAVProtectionEngine after each evaluation.
+
+        2026-07-14 fix: this previously never stored ``attribution``, so
+        ``last_nav_attribution`` stayed frozen at whatever position_hydration_engine
+        set it to at startup -- NAVAttributionEngine.evaluate()'s realized/
+        unrealized-delta baseline (prev_realized/prev_free) never advanced,
+        making its delta grow unboundedly instead of reflecting "change since
+        last cycle."
+        """
+        self.last_nav_attribution = dict(attribution or {})
         self.nav_protection_state = dict(protection_state or {})
         peak = float((protection_state or {}).get("peak_nav_usdt", 0.0) or 0.0)
         if peak > self.peak_nav_usdt:

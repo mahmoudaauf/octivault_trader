@@ -353,8 +353,12 @@ class NativeFillTracker:
         # Update metrics for ObjectiveFeedbackController
         if hasattr(self._shared_state, "metrics"):
             m = self._shared_state.metrics
-            m["realized_pnl"] = m.get("realized_pnl", 0.0) + realized_pnl
+            if hasattr(self._shared_state, "record_realized_pnl_event"):
+                self._shared_state.record_realized_pnl_event(realized_pnl)
+            else:
+                m["realized_pnl"] = m.get("realized_pnl", 0.0) + realized_pnl
             m["trades_in_window"] = m.get("trades_in_window", 0) + 1
+            m["trades_since_ofc_check"] = m.get("trades_since_ofc_check", 0) + 1
             m["last_update_ts"] = time.time()
             # Rolling win_rate using exponential moving average
             prev_wr = m.get("win_rate_window", 0.5)

@@ -190,8 +190,20 @@ class NativeOrchestrator:
 
             success = await self._startup_state_machine.run_startup(timeout_sec=60.0)
             if not success:
-                logger.critical(
-                    "❌ Startup failed; trading will be blocked. " "Check logs and restart."
+                # 2026-07-14 fix: this used to only log critical and fall through --
+                # nothing downstream actually blocked trading despite the log message
+                # claiming it would. session_anchor_nav stayed stuck at whatever it
+                # was (often 0 or a stale persisted value), which bypasses every
+                # session_anchor>0 guard in nav_protection.py (drawdown capped to
+                # ~0, peak-capping disabled) and can silently zero out position
+                # sizing for the rest of the process if a stale high peak survived
+                # from disk. Raise instead, so OperationsEngineImpl.startup_system()
+                # correctly returns False and main.py's Engines.initialize() (which
+                # now checks that return value) refuses to enter the trading loop
+                # rather than run on an unknown/unhydrated foundation.
+                raise RuntimeError(
+                    "Native startup state machine failed (timeout or hydration "
+                    "failure) — refusing to proceed. Check logs and restart."
                 )
             else:
                 logger.info("✅ Startup complete; trading ready")

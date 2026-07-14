@@ -270,3 +270,135 @@ async def test_hydration_resets_nav_attribution_baseline() -> None:
     assert state.previous_nav_usdt == pytest.approx(state.nav_usdt)
     assert state.session_anchor_nav == pytest.approx(state.nav_usdt)
     assert state.last_nav_attribution["reason"] == "STARTUP_HYDRATION_RECONCILIATION"
+
+
+# ── Regression tests: 2026-07-14 main.py previous_nav_usdt ordering bug ────
+# and shared_state.update_nav_protection() dropping the attribution arg.
+
+def test_update_nav_protection_stores_attribution() -> None:
+    """update_nav_protection() must actually store the attribution dict it's
+    given -- it previously silently dropped it, freezing last_nav_attribution
+    at whatever position_hydration_engine set at startup forever, so
+    NAVAttributionEngine's realized/unrealized delta baseline never advanced."""
+    state = NativeSharedState()
+    attribution = {
+        "realized_pnl_total_usdt": 12.5,
+        "unrealized_pnl_total_usdt": 3.0,
+        "free_usdt": 50.0,
+        "evaluated_at": 123456.0,
+    }
+    state.update_nav_protection(attribution=attribution, protection_state={"peak_nav_usdt": 0.0})
+    assert state.last_nav_attribution == attribution
+
+
+def test_evaluate_nav_protection_advances_attribution_baseline_across_calls() -> None:
+    """Two consecutive evaluate_nav_protection() calls (simulating two 60s
+    cycles) must see the SECOND call's prev_realized reflect the FIRST call's
+    realized total, not a value frozen at whatever it was before either call."""
+    state = NativeSharedState()
+    state.session_anchor_nav = 100.0
+    state.nav_usdt = 100.0
+    state.metrics["realized_pnl"] = 5.0
+
+    attr1, _ = evaluate_nav_protection(state)
+    # First-ever call has no prior snapshot: NAVAttributionEngine defensively
+    # defaults prev_realized to current_realized to avoid a false first-call
+    # spike, so delta is 0 here -- this is correct, existing behavior.
+    assert attr1.realized_pnl_delta_usdt == pytest.approx(0.0)
+
+    # Simulate more realized profit accruing between cycles.
+    state.metrics["realized_pnl"] = 8.0
+    attr2, _ = evaluate_nav_protection(state)
+    # Must reflect the delta since the LAST call's snapshot (8 - 5 = 3), not
+    # since some frozen startup baseline (which would wrongly show 8 - 0 = 8).
+    assert attr2.realized_pnl_delta_usdt == pytest.approx(3.0)
+
+
+def test_nav_delta_reflects_real_change_when_previous_nav_maintained_correctly() -> None:
+    """Simulates the FIXED main.py flow: previous_nav_usdt is maintained by
+    shared_state.update_nav() (called every trading cycle via
+    get_portfolio_snapshot), NOT stomped by the NAV-protection block itself
+    right before evaluate_nav_protection() reads it. nav_delta must reflect
+    the real change, not collapse to ~0."""
+    state = NativeSharedState()
+    state.session_anchor_nav = 100.0
+    state.update_nav(100.0)  # first cycle: previous_nav_usdt stays 0 (guard: nav_usdt was 0)
+    state.update_nav(110.0)  # a later cycle: previous_nav_usdt correctly becomes 100.0
+
+    attribution, _ = evaluate_nav_protection(state)
+
+    assert state.previous_nav_usdt == pytest.approx(100.0)
+    assert attribution.nav_delta_usdt == pytest.approx(10.0)
+    assert attribution.nav_delta_pct == pytest.approx(0.10)
+
+
+# ── Regression test: 2026-07-14 NAV peak-capping discarded genuine peaks ────
+
+def test_genuine_intra_session_peak_above_anchor_is_preserved_on_pullback() -> None:
+    """The exact scenario found by the audit: anchor=$1000, NAV climbs to a
+    genuine session peak of $1500 (set THIS session, so peak_ts >=
+    _session_start_ts), then retraces to $1400. The next evaluation must NOT
+    collapse the tracked peak down to current_nav -- the true $1500 peak,
+    since it's fresh this session, must be preserved.
+
+    Uses realistic time.time()-relative timestamps throughout -- using small
+    fixed epoch values (e.g. 1_000_000.0) would make _age_sec (real now minus
+    that value) enormous, spuriously triggering the unrelated 7-day peak-decay
+    logic and masking whether THIS fix actually works.
+    """
+    import time as _time
+    now = _time.time()
+    state = NativeSharedState()
+    state._session_start_ts = now - 3600  # session started 1h ago
+    state.session_anchor_nav = 1000.0
+    state.nav_usdt = 1500.0
+    state.peak_nav_usdt = 1500.0
+    state.metrics["peak_nav"] = 1500.0
+    state.metrics["peak_nav_ts"] = now - 600  # peak set 10min ago -- fresh this session
+
+    # Now NAV retraces to $1400.
+    state.update_nav(1400.0)
+
+    _, protection = evaluate_nav_protection(state)
+
+    assert protection.peak_nav_usdt == pytest.approx(1500.0)
+
+
+def test_stale_pre_session_peak_is_still_capped_to_anchor() -> None:
+    """A peak recorded BEFORE this session started (e.g. restored from a
+    prior session's disk state) must still be capped -- this fix narrows the
+    guard, it does not remove the original cross-session protection."""
+    import time as _time
+    now = _time.time()
+    state = NativeSharedState()
+    state._session_start_ts = now - 60  # session started 1min ago
+    state.session_anchor_nav = 100.0
+    state.nav_usdt = 100.0
+    state.peak_nav_usdt = 500.0  # a stale, much-larger prior-session peak
+    state.metrics["peak_nav"] = 500.0
+    state.metrics["peak_nav_ts"] = now - 120  # set 2min ago -- BEFORE session start, stale
+
+    _, protection = evaluate_nav_protection(state)
+
+    # Capped to session_anchor (or current_nav, whichever is larger) -- the
+    # stale $500 prior-session peak must not dominate this session.
+    assert protection.peak_nav_usdt == pytest.approx(100.0)
+
+
+def test_missing_session_start_ts_falls_back_to_conservative_capping() -> None:
+    """If _session_start_ts is unavailable (e.g. some test harness or an
+    unusual startup path), the fix must fall back to the original
+    conservative behavior (apply the cap) rather than silently disabling
+    cross-session protection."""
+    import time as _time
+    now = _time.time()
+    state = NativeSharedState()
+    state.session_anchor_nav = 100.0
+    state.nav_usdt = 100.0
+    state.peak_nav_usdt = 500.0
+    state.metrics["peak_nav"] = 500.0
+    state.metrics["peak_nav_ts"] = now - 10  # fresh, but no _session_start_ts to compare against
+
+    _, protection = evaluate_nav_protection(state)
+
+    assert protection.peak_nav_usdt == pytest.approx(100.0)

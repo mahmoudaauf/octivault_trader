@@ -223,6 +223,7 @@ def load_runtime_state(shared_state: Any, input_path: Path) -> bool:
                 "win_rate_window",
                 "win_rate_tpsl",
                 "trades_in_window",
+                "trades_since_ofc_check",
                 "avg_net_profit_bps",
                 "session_elapsed_h",
             }
