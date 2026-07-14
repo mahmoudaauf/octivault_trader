@@ -138,6 +138,90 @@ class TestNativeSharedState:
         assert state.is_ready()
 
 
+# ==================== Order-Book History Persistence Tests ====================
+# 2026-07-14: update_book() previously only kept the latest in-memory snapshot,
+# so no order-book history was ever available for backtesting. These tests
+# cover the new throttled JSONL persistence hook.
+
+
+class TestOrderBookHistoryPersistence:
+    def _make_state(self, tmp_path, **overrides):
+        state = NativeSharedState()
+        state._orderbook_history_dir = str(tmp_path)
+        state._orderbook_history_min_interval_s = overrides.get("min_interval_s", 60.0)
+        state._orderbook_history_enabled = overrides.get("enabled", True)
+        return state
+
+    def _read_jsonl(self, path):
+        import json
+
+        with open(path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_update_book_writes_one_record_on_first_tick(self, tmp_path):
+        state = self._make_state(tmp_path)
+        state.update_book("btcusdt", bid=100.0, bid_qty=1.0, ask=100.2, ask_qty=2.0)
+
+        files = list(tmp_path.glob("orderbook_history_*.jsonl"))
+        assert len(files) == 1
+        records = self._read_jsonl(files[0])
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["symbol"] == "BTCUSDT"
+        assert rec["bid"] == 100.0
+        assert rec["ask"] == 100.2
+        assert "spread_pct" in rec and "imbalance" in rec and "ts" in rec
+
+    def test_rapid_ticks_within_min_interval_are_throttled(self, tmp_path):
+        state = self._make_state(tmp_path, min_interval_s=60.0)
+        for _ in range(5):
+            state.update_book("BTCUSDT", bid=100.0, bid_qty=1.0, ask=100.2, ask_qty=2.0)
+
+        files = list(tmp_path.glob("orderbook_history_*.jsonl"))
+        records = self._read_jsonl(files[0])
+        # Only the first tick should have been persisted -- the rest fall
+        # inside the same throttle window (all calls happen well under 60s apart).
+        assert len(records) == 1
+
+    def test_throttle_is_independent_per_symbol(self, tmp_path):
+        state = self._make_state(tmp_path, min_interval_s=60.0)
+        state.update_book("BTCUSDT", bid=100.0, bid_qty=1.0, ask=100.2, ask_qty=2.0)
+        state.update_book("ETHUSDT", bid=50.0, bid_qty=1.0, ask=50.1, ask_qty=2.0)
+
+        files = list(tmp_path.glob("orderbook_history_*.jsonl"))
+        records = self._read_jsonl(files[0])
+        symbols = {r["symbol"] for r in records}
+        assert symbols == {"BTCUSDT", "ETHUSDT"}
+
+    def test_disabled_flag_skips_persistence_entirely(self, tmp_path):
+        state = self._make_state(tmp_path, enabled=False)
+        state.update_book("BTCUSDT", bid=100.0, bid_qty=1.0, ask=100.2, ask_qty=2.0)
+
+        assert list(tmp_path.glob("orderbook_history_*.jsonl")) == []
+        # In-memory snapshot must still work regardless of persistence toggle.
+        assert state.get_book("BTCUSDT")["bid"] == 100.0
+
+    def test_invalid_book_tick_is_never_persisted(self, tmp_path):
+        state = self._make_state(tmp_path)
+        state.update_book("BTCUSDT", bid=0.0, bid_qty=1.0, ask=100.2, ask_qty=2.0)
+
+        assert list(tmp_path.glob("orderbook_history_*.jsonl")) == []
+
+    def test_persist_failure_does_not_raise_or_break_in_memory_update(
+        self, tmp_path, monkeypatch
+    ):
+        state = self._make_state(tmp_path)
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("core_engine.native.shared_state.os.makedirs", _boom)
+
+        # Must not raise despite the persistence path failing internally.
+        state.update_book("BTCUSDT", bid=100.0, bid_qty=1.0, ask=100.2, ask_qty=2.0)
+        assert state.get_book("BTCUSDT")["bid"] == 100.0
+
+
 # ==================== NativeTimeUtils Tests ====================
 
 

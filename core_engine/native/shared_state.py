@@ -9,11 +9,16 @@ Performance: ~75% less code than legacy, instant initialization (no Binance I/O)
 """
 
 import asyncio
+import json
+import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from .capital_policy import prune_reservations
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -85,6 +90,17 @@ class NativeSharedState:
         # imbalance, ts}. imbalance = bid_qty/(bid_qty+ask_qty): >0.5 demand-heavy,
         # <0.5 supply-heavy (ask wall). Populated by WebSocketMarketData.
         self.order_book: dict[str, dict] = {}
+        # Order-book history persistence (2026-07-14): update_book() is called
+        # on every live WebSocket bookTicker tick (multiple times/sec/symbol),
+        # so writes are throttled per-symbol rather than persisting every tick.
+        self._orderbook_history_enabled: bool = (
+            os.getenv("ORDERBOOK_HISTORY_ENABLED", "true").lower() == "true"
+        )
+        self._orderbook_history_dir: str = os.getenv("ORDERBOOK_HISTORY_DIR", "logs")
+        self._orderbook_history_min_interval_s: float = float(
+            os.getenv("ORDERBOOK_HISTORY_MIN_INTERVAL_S", "60") or 60
+        )
+        self._orderbook_history_last_write: dict[str, float] = {}
 
         # Position tracking
         self.positions: dict[str, Position] = {}  # symbol -> Position
@@ -408,10 +424,35 @@ class NativeSharedState:
         spread_pct = (ask - bid) / mid if mid > 0 else 0.0
         total_qty = bid_qty + ask_qty
         imbalance = (bid_qty / total_qty) if total_qty > 0 else 0.5
-        self.order_book[symbol_key] = {
+        now = time.time()
+        snapshot = {
             "bid": bid, "bid_qty": bid_qty, "ask": ask, "ask_qty": ask_qty,
-            "spread_pct": spread_pct, "imbalance": imbalance, "ts": time.time(),
+            "spread_pct": spread_pct, "imbalance": imbalance, "ts": now,
         }
+        self.order_book[symbol_key] = snapshot
+        if self._orderbook_history_enabled:
+            self._persist_orderbook_snapshot(symbol_key, snapshot, now)
+
+    def _persist_orderbook_snapshot(self, symbol_key: str, snapshot: dict, now: float) -> None:
+        """Append a throttled (per-symbol, min-interval-gated) order-book snapshot
+        to a UTC-day-rotated JSONL file, so real book history accumulates for
+        future backtesting/research. Never allowed to break the live book-update
+        hot path -- any failure here is caught and logged, not raised."""
+        last = self._orderbook_history_last_write.get(symbol_key, 0.0)
+        if now - last < self._orderbook_history_min_interval_s:
+            return
+        self._orderbook_history_last_write[symbol_key] = now
+        try:
+            date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+            os.makedirs(self._orderbook_history_dir, exist_ok=True)
+            path = os.path.join(
+                self._orderbook_history_dir, f"orderbook_history_{date_str}.jsonl"
+            )
+            record = {"symbol": symbol_key, **snapshot}
+            with open(path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception:
+            logger.exception("Failed to persist order-book snapshot for %s", symbol_key)
 
     def get_book(self, symbol: str) -> dict:
         """Latest top-of-book snapshot for symbol (empty dict if unseen)."""
