@@ -15,7 +15,7 @@ while true; do
   # Rotate the carry log if it grows past 50MB.
   sz=$(du -m "$LOG" 2>/dev/null | cut -f1); [ "${sz:-0}" -ge 50 ] && : > "$LOG"
   log "launching carry_paper_trader.py"
-  python3 -u carry_paper_trader.py >> "$LOG" 2>&1
+  .venv/bin/python3 -u carry_paper_trader.py >> "$LOG" 2>&1
   log "carry_paper_trader.py exited (code $?)"
   [ -f "$STOP" ] && { log "stop flag present — not restarting"; exit 0; }
   sleep 15
