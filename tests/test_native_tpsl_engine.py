@@ -540,3 +540,28 @@ def test_force_exit_triggers_on_aged_position_object():
 
     result = engine.check_triggers("STALE", pos_obj, current)
     assert result == "TIME_FORCE_EXIT", f"Expected TIME_FORCE_EXIT, got {result}"
+
+
+def test_hydrated_position_with_no_tp_sl_gets_auto_armed_on_first_check(): # noqa: E501
+    """Remediation item #12: position_hydration_engine.py's apply_to_shared_state()
+    writes tp=None/sl=None for any restart-recovered position it couldn't restore
+    a prior TP/SL for (the common real-restart case, since shared_state.positions
+    is empty before hydration runs). This must not leave the position permanently
+    unprotected — check_triggers()'s auto-arm branch (this file's "AUTO-ARM" log
+    line) must arm it on the very first call once the startup grace period ends.
+    """
+    engine, state = _engine_with_regime("CHOPPY")
+    state.positions["BTCUSDT"] = {
+        "symbol": "BTCUSDT", "qty": 1.0, "entry_price": 100.0,
+        "current_price": 100.0, "mark_price": 100.0,
+        "tp": None, "sl": None, "lifecycle": "ACTIVE",
+    }
+    pos = state.positions["BTCUSDT"]
+
+    assert engine._tp_levels.get("BTCUSDT", 0) == 0  # not armed yet
+    engine.check_triggers("BTCUSDT", pos, current_price=100.0)
+
+    assert engine._tp_levels.get("BTCUSDT", 0) > 0, "hydrated position was not auto-armed"
+    assert engine._sl_levels.get("BTCUSDT", 0) > 0, "hydrated position was not auto-armed"
+    assert engine._tp_levels["BTCUSDT"] > 100.0
+    assert engine._sl_levels["BTCUSDT"] < 100.0

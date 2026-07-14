@@ -3,11 +3,28 @@ Native L0: Configuration loader (replaces 300-line legacy ConfigConstants)
 
 Loads config from environment variables or defaults.
 Single initialization at startup.
+
+.. deprecated::
+    NOT used by the supervised production runtime. ``main.py`` / ``bootstrap.py``
+    read configuration exclusively through ``BootstrapConfig``
+    (core_engine/native/bootstrap.py), which is the only config system with real
+    production call sites. This module has zero callers outside its own file and
+    tests/test_native_l0.py — confirmed via ``grep -rn "get_config()\\|ConfigLoader("``
+    across the whole repo (docs/audit/remediation_plan.md item #8). Several of its
+    env var names collide with different-but-similarly-named ``BootstrapConfig``
+    keys (e.g. this module's ``EXIT_FEE_BPS``/``TAKE_PROFIT_PCT``/``STOP_LOSS_PCT``/
+    ``COMPOUNDING_ENABLED`` vs. ``BootstrapConfig``'s ``EXIT_SLIPPAGE_BPS``/``TP_PCT``/
+    ``SL_PCT``/``DAILY_COMPOUNDING_ENABLED``) — setting this module's env vars has NO
+    effect on live trading behavior. Kept only for the one test file that exercises
+    it; do not wire new code to this module.
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,10 +36,22 @@ class ConfigGroup:
 
 
 class ConfigLoader:
-    """Load and provide access to configuration"""
+    """Load and provide access to configuration.
+
+    Deprecated / dead in production — see module docstring. BootstrapConfig
+    (core_engine/native/bootstrap.py) is the only config system the live
+    runtime actually reads.
+    """
 
     def __init__(self):
         """Initialize config from environment and defaults"""
+        logger.warning(
+            "ConfigLoader instantiated — this config system has ZERO production call "
+            "sites (main.py/bootstrap.py use BootstrapConfig exclusively) and several "
+            "of its env var names collide with different BootstrapConfig keys with no "
+            "effect on live behavior. See core_engine/native/config_loader.py's module "
+            "docstring and docs/audit/remediation_plan.md item #8 before relying on this."
+        )
         self._config: dict[str, ConfigGroup] = {}
         self._load_all()
 

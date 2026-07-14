@@ -565,9 +565,69 @@ class NativePollingCoordinator:
         finally:
             self.logger.debug("[PollingCoordinator] Fills reconciliation loop finished")
 
+    def _is_buy_trade(self, t: dict) -> bool:
+        return str(t.get("isBuyer") if "isBuyer" in t else t.get("side") or "").upper() in (
+            "TRUE", "BUY", "1",
+        )
+
+    def _commission_quote(self, symbol: str, price: float, commission: float, commission_asset: str) -> float:
+        """Convert a trade's commission into quote-currency terms.
+
+        Mirrors NativeFillTracker._commission_quote — kept as a separate copy
+        (not a shared import) since this class has no dependency on
+        fill_tracker.py today; duplicating a ~10 line pure function is safer
+        than introducing a new cross-module coupling for this fix.
+        """
+        commission = max(0.0, float(commission or 0.0))
+        if commission <= 0:
+            return 0.0
+        symbol_u = symbol.upper()
+        fee_asset = (commission_asset or "").upper()
+        quote_asset = "USDT" if symbol_u.endswith("USDT") else ""
+        base_asset = symbol_u[: -len(quote_asset)] if quote_asset else ""
+        if fee_asset == quote_asset:
+            return commission
+        if fee_asset == base_asset:
+            return commission * float(price or 0.0)
+        price_cache = getattr(self.shared_state, "price_cache", {}) or {}
+        conversion = float(price_cache.get(f"{fee_asset}{quote_asset}", 0.0) or 0.0)
+        return commission * conversion if conversion > 0 else 0.0
+
+    def _record_realized_pnl(self, sym: str, entry_price: float, sell_trades: list[dict]) -> None:
+        """Compute and persist net-of-fee realized P&L for new SELL fills.
+
+        This is the only place in the default (polling_enabled=True) runtime
+        path that computes realized P&L — without it, shared_state.metrics
+        ["realized_pnl"] stays permanently 0.0 and every downstream reader
+        (NAVAttributionEngine, ObjectiveFeedbackController, AdaptiveCapitalEngine)
+        operates on a dead signal (docs/audit/profit_and_compounding_assessment.md).
+        """
+        metrics = getattr(self.shared_state, "metrics", None)
+        if not isinstance(metrics, dict) or entry_price <= 0:
+            return
+        for t in sell_trades:
+            qty = float(t.get("qty") or 0.0)
+            price = float(t.get("price") or 0.0)
+            if qty <= 0 or price <= 0:
+                continue
+            commission_quote = self._commission_quote(
+                sym, price, float(t.get("commission") or 0.0), str(t.get("commissionAsset") or "")
+            )
+            realized_pnl = (price - entry_price) * qty - commission_quote
+            metrics["realized_pnl"] = metrics.get("realized_pnl", 0.0) + realized_pnl
+            metrics["trades_in_window"] = metrics.get("trades_in_window", 0) + 1
+            metrics["last_update_ts"] = time.time()
+            prev_wr = metrics.get("win_rate_window", 0.5)
+            metrics["win_rate_window"] = prev_wr * 0.9 + (1.0 if realized_pnl > 0 else 0.0) * 0.1
+            self.logger.info(
+                "[PollingCoordinator:FILLS] %s SELL realized_pnl=%.8f (qty=%.8f price=%.8f entry=%.8f fee_quote=%.8f)",
+                sym, realized_pnl, qty, price, entry_price, commission_quote,
+            )
+
     async def _fetch_and_reconcile_fills(self) -> None:
-        """Fetch recent trades from Binance and reconcile entry prices in shared_state."""
-        if not hasattr(self.exchange_client, "get_account_trades"):
+        """Fetch recent trades from Binance, reconcile entry prices, and record
+        net-of-fee realized P&L for SELL fills into shared_state.metrics."""
+        if not hasattr(self.exchange_client, "get_my_trades"):
             return
         positions = getattr(self.shared_state, "positions", {}) or {}
         if not positions:
@@ -582,19 +642,29 @@ class NativePollingCoordinator:
                 else getattr(pos, "entry_price", 0.0)
             )
             try:
-                trades = await self.exchange_client.get_account_trades(symbol=str(sym).upper(), limit=20)
+                trades = await self.exchange_client.get_my_trades(str(sym).upper(), limit=20)
             except Exception as e:
-                self.logger.debug("[PollingCoordinator] get_account_trades(%s) failed: %s", sym, e)
+                self.logger.debug("[PollingCoordinator] get_my_trades(%s) failed: %s", sym, e)
                 continue
 
             if not trades:
                 continue
 
+            # Realized P&L for new SELL fills, using entry_price as recorded
+            # *before* this cycle's BUY reconciliation below (best available
+            # cost-basis estimate — this loop is periodic, not per-fill, so it
+            # cannot do point-in-time cost-basis matching any more precisely).
+            new_sells = [
+                t for t in trades
+                if int(t.get("id") or 0) not in self._fills_processed and not self._is_buy_trade(t)
+            ]
+            if new_sells:
+                self._record_realized_pnl(str(sym).upper(), current_entry, new_sells)
+
             # Find new BUY fills not yet processed
             new_buys = [
                 t for t in trades
-                if int(t.get("id") or 0) not in self._fills_processed
-                and str(t.get("isBuyer") or t.get("side") or "").upper() in ("TRUE", "BUY", "1")
+                if int(t.get("id") or 0) not in self._fills_processed and self._is_buy_trade(t)
             ]
 
             if not new_buys and current_entry > 0:
@@ -604,10 +674,7 @@ class NativePollingCoordinator:
                 continue
 
             # Compute weighted average fill price from ALL buy trades for this symbol
-            all_buys = [
-                t for t in trades
-                if str(t.get("isBuyer") or t.get("side") or "").upper() in ("TRUE", "BUY", "1")
-            ]
+            all_buys = [t for t in trades if self._is_buy_trade(t)]
             if not all_buys:
                 continue
 

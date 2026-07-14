@@ -412,6 +412,7 @@ class NativePositionHydrationEngine:
                                 "qty": t.get("qty"),
                                 "price": t.get("price"),
                                 "fee": t.get("commission"),
+                                "fee_asset": t.get("commissionAsset"),
                                 "epoch": float(t.get("time", 0) or 0) / 1000.0,
                             }
                         )
@@ -430,6 +431,33 @@ class NativePositionHydrationEngine:
 
         return fills
 
+    def _fee_quote(self, symbol: str, price: float, fee: float, fee_asset: str) -> float:
+        """Convert a fill's commission into quote-currency terms.
+
+        Binance commission is denominated in ``fee_asset`` — not necessarily
+        the quote asset (e.g. a BNB fee discount, or the base asset itself).
+        Summing raw ``commission`` values regardless of currency silently
+        corrupts fees_paid/unrealized_pnl for any position with a
+        non-quote-denominated historical fee. Mirrors the equivalent
+        conversion already used in fill_tracker.py/polling_coordinator.py.
+        """
+        fee = max(0.0, float(fee or 0.0))
+        if fee <= 0:
+            return 0.0
+        symbol_u = symbol.upper()
+        fee_asset_u = (fee_asset or "").upper()
+        quote_asset = "USDT" if symbol_u.endswith("USDT") else ""
+        base_asset = symbol_u[: -len(quote_asset)] if quote_asset else ""
+        if not fee_asset_u or fee_asset_u == quote_asset:
+            # No asset recorded (legacy journal fills) — assume already quote-denominated,
+            # matching this method's pre-fix behavior for the common case.
+            return fee
+        if fee_asset_u == base_asset:
+            return fee * float(price or 0.0)
+        price_map = getattr(self._state, "prices", {}) if hasattr(self._state, "prices") else {}
+        conversion = float((price_map or {}).get(f"{fee_asset_u}{quote_asset}", 0.0) or 0.0)
+        return fee * conversion if conversion > 0 else 0.0
+
     def _build_positions_from_fills(
         self, fills: list[dict[str, Any]]
     ) -> dict[str, HydratedPosition]:
@@ -445,7 +473,11 @@ class NativePositionHydrationEngine:
             side = str(fill.get("side", "BUY")).upper()
             qty = float(fill.get("qty", 0) or fill.get("quantity", 0) or 0)
             price = float(fill.get("price", 0) or 0)
-            fee = float(fill.get("fee", 0) or fill.get("commission", 0) or 0)
+            fee = self._fee_quote(
+                symbol, price,
+                fill.get("fee", 0) or fill.get("commission", 0) or 0,
+                fill.get("fee_asset") or fill.get("commissionAsset") or "",
+            )
             ts = float(fill.get("epoch", fill.get("ts", time.time())))
 
             if qty == 0 or price == 0:

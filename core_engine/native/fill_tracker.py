@@ -133,13 +133,14 @@ class NativeFillTracker:
 
     async def _fetch_recent_trades(self, symbol: str) -> list[Fill]:
         """Query exchange for recent trades on symbol."""
-        if not hasattr(self._exchange, "get_account_trades"):
+        if not hasattr(self._exchange, "get_my_trades"):
             return []
 
         try:
-            # Get last 10 trades (or recent since last_trade_id)
-            raw_trades = await self._exchange.get_account_trades(
-                symbol=symbol,
+            # Binance side field is isBuyer (bool), not a "side" string — resolve
+            # it into the "BUY"/"SELL" shape this class works in before parsing.
+            raw_trades = await self._exchange.get_my_trades(
+                symbol,
                 limit=10,
             )
             if not raw_trades:
@@ -149,10 +150,13 @@ class NativeFillTracker:
             for trade in raw_trades:
                 # Parse exchange response
                 try:
+                    side = trade.get("side")
+                    if side is None:
+                        side = "BUY" if trade.get("isBuyer") else "SELL"
                     fill = Fill(
                         exchange_trade_id=int(trade.get("id") or 0),
                         symbol=str(trade.get("symbol") or symbol).upper(),
-                        side=str(trade.get("side") or "BUY").upper(),
+                        side=str(side or "BUY").upper(),
                         quantity=float(trade.get("qty") or trade.get("quantity") or 0.0),
                         price=float(trade.get("price") or 0.0),
                         fee_qty=float(trade.get("commissionQty") or 0.0),
@@ -167,7 +171,7 @@ class NativeFillTracker:
 
             return fills
         except Exception as e:
-            logger.warning("get_account_trades failed: %s", e)
+            logger.warning("get_my_trades failed: %s", e)
             return []
 
     async def _process_fill(self, fill: Fill) -> None:

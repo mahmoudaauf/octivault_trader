@@ -259,6 +259,24 @@ async def test_build_components_seeds_accepted_symbols_from_explicit_config():
 
 
 @pytest.mark.asyncio
+async def test_build_components_wires_daily_target_monitor(tmp_path):
+    """Remediation item #18: daily_target_monitor must be constructed, injected
+    into the executor, and exposed in NativeComponents/app_ctx."""
+    cfg = _min_cfg(
+        daily_target_trades=5,
+        daily_target_state_path=str(tmp_path / "daily_target_state.json"),
+        daily_target_history_path=str(tmp_path / "daily_target_history.jsonl"),
+    )
+    components = await build_components(cfg, exchange_client_factory=_stub_factory)
+    assert components.daily_target_monitor is not None
+    assert components.daily_target_monitor.target_trades == 5
+    assert components.executor._daily_target_monitor is components.daily_target_monitor
+
+    app_ctx, _ = build_native_app_ctx(components)
+    assert app_ctx["daily_target_monitor"] is components.daily_target_monitor
+
+
+@pytest.mark.asyncio
 async def test_build_components_propagates_decision_config():
     cfg = _min_cfg(
         kelly_fraction=0.4,

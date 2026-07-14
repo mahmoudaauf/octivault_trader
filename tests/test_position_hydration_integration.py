@@ -104,6 +104,53 @@ async def test_hydration_engine_reconstructs_positions_from_fills(tmp_path):
     assert state.total_balance_usdt == pytest.approx(99.0)
 
 
+class TestFeeCurrencyConversion:
+    """Priority 2 item #5: commission must be converted via commissionAsset,
+    not summed as if it were always quote-denominated."""
+
+    def test_fee_quote_asset_passthrough(self):
+        ss = NativeSharedState()
+        engine = NativePositionHydrationEngine(shared_state=ss, trade_journal=None, exchange_client=None)
+        assert engine._fee_quote("BTCUSDT", 100.0, 0.1, "USDT") == pytest.approx(0.1)
+
+    def test_fee_base_asset_converted_via_fill_price(self):
+        ss = NativeSharedState()
+        engine = NativePositionHydrationEngine(shared_state=ss, trade_journal=None, exchange_client=None)
+        # 0.001 BTC commission on a $100 fill = 0.1 USDT
+        assert engine._fee_quote("BTCUSDT", 100.0, 0.001, "BTC") == pytest.approx(0.1)
+
+    def test_fee_bnb_asset_converted_via_price_cache(self):
+        ss = NativeSharedState()
+        ss.prices = {"BNBUSDT": 600.0}
+        engine = NativePositionHydrationEngine(shared_state=ss, trade_journal=None, exchange_client=None)
+        assert engine._fee_quote("BTCUSDT", 100.0, 1.0, "BNB") == pytest.approx(600.0)
+
+    def test_fee_bnb_asset_unconvertible_contributes_zero(self):
+        ss = NativeSharedState()
+        ss.prices = {}
+        engine = NativePositionHydrationEngine(shared_state=ss, trade_journal=None, exchange_client=None)
+        assert engine._fee_quote("BTCUSDT", 100.0, 1.0, "BNB") == 0.0
+
+    def test_fee_no_asset_recorded_assumed_quote_for_legacy_journal_fills(self):
+        ss = NativeSharedState()
+        engine = NativePositionHydrationEngine(shared_state=ss, trade_journal=None, exchange_client=None)
+        assert engine._fee_quote("BTCUSDT", 100.0, 0.05, "") == pytest.approx(0.05)
+
+    def test_build_positions_sums_bnb_fee_correctly_not_as_raw_quote(self):
+        ss = NativeSharedState()
+        ss.prices = {"BNBUSDT": 600.0}
+        engine = NativePositionHydrationEngine(shared_state=ss, trade_journal=None, exchange_client=None)
+        fills = [
+            {
+                "symbol": "BTCUSDT", "side": "BUY", "qty": 1.0, "price": 100.0,
+                "fee": 0.001, "fee_asset": "BNB", "epoch": 1620000000.0,
+            },
+        ]
+        positions = engine._build_positions_from_fills(fills)
+        # 0.001 BNB * 600.0 = 0.6 USDT — NOT 0.001 (the pre-fix bug would have summed raw 0.001)
+        assert positions["BTCUSDT"].fees_paid == pytest.approx(0.6)
+
+
 @pytest.mark.asyncio
 async def test_hydration_engine_applies_to_shared_state():
     """Test applying hydrated positions to shared state."""

@@ -79,6 +79,21 @@ class NativeDecisionEngine:
     """
     Position-sizing and risk-gated decision maker.
 
+    .. important::
+        NOT the production decision path. Confirmed by
+        docs/audit/current_state_assessment.md (2026-07-14 audit,
+        remediation_plan.md item #20): the live system's actual decision path
+        is ``main.py`` -> facade ``DecisionEngine`` ->
+        ``core_engine/implementations.py::DecisionEngineImpl.make_buy_decision``/
+        ``make_sell_decision`` -> ``NativeArbitrationEngine.evaluate()`` — a
+        completely separate implementation. This class's ``decide()`` is only
+        reachable via ``NativeOrchestrator.run_loop()``, which ``main.py``
+        does not call in production (it drives its own ``trading_cycle()`` via
+        ``CadenceScheduler`` instead). Kept as test-only / alternate-path
+        infrastructure with real test coverage (tests/test_native_l4.py and
+        others) — not dead code to delete, but do not assume changes here
+        affect live trading behavior.
+
     Usage::
 
         eng = NativeDecisionEngine(

@@ -305,7 +305,7 @@ class TestNativeFillTracker:
         )
 
         # Remove the method
-        delattr(exchange, "get_account_trades")
+        delattr(exchange, "get_my_trades")
 
         fills = await tracker._fetch_recent_trades("BTCUSDT")
         assert fills == []

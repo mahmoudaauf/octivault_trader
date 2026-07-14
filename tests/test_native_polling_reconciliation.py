@@ -7,9 +7,15 @@ from core_engine.native.shared_state import NativeSharedState, Position
 
 
 class _StubExchange:
-    def __init__(self, balances: dict[str, float], prices: dict[str, float] | None = None) -> None:
+    def __init__(
+        self,
+        balances: dict[str, float],
+        prices: dict[str, float] | None = None,
+        trades: dict[str, list[dict]] | None = None,
+    ) -> None:
         self._balances = dict(balances)
         self._prices = prices or {}
+        self._trades = trades or {}
 
     async def get_balance(self) -> dict[str, float]:
         return dict(self._balances)
@@ -18,6 +24,9 @@ class _StubExchange:
         if symbols is None:
             return dict(self._prices)
         return {s: self._prices[s] for s in symbols if s in self._prices}
+
+    async def get_my_trades(self, symbol: str, *, limit: int = 20, from_id=None) -> list[dict]:
+        return list(self._trades.get(symbol, []))
 
     def is_throttled(self) -> bool:
         return False
@@ -163,3 +172,89 @@ async def test_position_price_refresh_dict_positions_not_wiped() -> None:
         assert qty["qty"] > 0
     else:
         assert qty.qty > 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_reconcile_fills_records_realized_pnl_on_sell() -> None:
+    """A new SELL trade against a held position must update metrics['realized_pnl']
+    net of quote-denominated commission — this is the fix for the default
+    (polling_enabled=True) path having zero realized-PnL computation."""
+    state = NativeSharedState()
+    state.positions["BTCUSDT"] = Position(symbol="BTCUSDT", qty=0.5, entry_price=100.0, mark_price=110.0)
+
+    exchange = _StubExchange(
+        balances={"USDT": 100.0},
+        trades={
+            "BTCUSDT": [
+                {
+                    "id": 1001, "isBuyer": False, "qty": "0.5", "price": "110.0",
+                    "commission": "0.05", "commissionAsset": "USDT",
+                },
+            ],
+        },
+    )
+    pc = NativePollingCoordinator(
+        shared_state=state,
+        exchange_client=exchange,
+        config=NativePollingConfig(enable_active_trades_gate=False),
+    )
+
+    await pc._fetch_and_reconcile_fills()
+
+    # (110 - 100) * 0.5 - 0.05 commission (already quote-denominated) = 4.95
+    assert state.metrics["realized_pnl"] == pytest.approx(4.95)
+    assert state.metrics["trades_in_window"] == 1
+    assert 1001 in pc._fills_processed
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_reconcile_fills_sell_dedup_no_double_count() -> None:
+    """A SELL trade already in _fills_processed must not be recorded twice."""
+    state = NativeSharedState()
+    state.positions["BTCUSDT"] = Position(symbol="BTCUSDT", qty=0.5, entry_price=100.0, mark_price=110.0)
+    exchange = _StubExchange(
+        balances={"USDT": 100.0},
+        trades={
+            "BTCUSDT": [
+                {"id": 2002, "isBuyer": False, "qty": "0.5", "price": "110.0", "commission": "0.0", "commissionAsset": "USDT"},
+            ],
+        },
+    )
+    pc = NativePollingCoordinator(
+        shared_state=state,
+        exchange_client=exchange,
+        config=NativePollingConfig(enable_active_trades_gate=False),
+    )
+
+    await pc._fetch_and_reconcile_fills()
+    first_pnl = state.metrics["realized_pnl"]
+    await pc._fetch_and_reconcile_fills()
+    assert state.metrics["realized_pnl"] == first_pnl  # unchanged — already processed
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_reconcile_fills_commission_in_base_asset_converted() -> None:
+    """Commission denominated in the base asset (e.g. BTC) must be converted to
+    quote terms using the trade price — the exact currency-unit bug flagged in
+    position_hydration_engine.py must not exist here."""
+    state = NativeSharedState()
+    state.positions["BTCUSDT"] = Position(symbol="BTCUSDT", qty=1.0, entry_price=100.0, mark_price=110.0)
+    exchange = _StubExchange(
+        balances={"USDT": 100.0},
+        trades={
+            "BTCUSDT": [
+                {"id": 3003, "isBuyer": False, "qty": "1.0", "price": "110.0", "commission": "0.001", "commissionAsset": "BTC"},
+            ],
+        },
+    )
+    pc = NativePollingCoordinator(
+        shared_state=state,
+        exchange_client=exchange,
+        config=NativePollingConfig(enable_active_trades_gate=False),
+    )
+
+    await pc._fetch_and_reconcile_fills()
+
+    # commission_quote = 0.001 BTC * 110.0 price = 0.11 USDT
+    # realized_pnl = (110 - 100) * 1.0 - 0.11 = 9.89
+    assert state.metrics["realized_pnl"] == pytest.approx(9.89)

@@ -101,6 +101,12 @@ class NativeExchangeClient:
         self._signed_request_cooldown_sec = max(0.0, float(signed_request_cooldown_sec))
         self._request_events: list[tuple[float, int]] = []
         self._last_signed_request_ts: float = 0.0
+        # Paper-mode order ledger: place_order() results, keyed both ways so
+        # get_order()/cancel_order() can return the REAL simulated fill instead
+        # of a data-less generic stub (a data-less stub previously corrupted
+        # maker-first-buy's refresh_status() poll — see _simulate_place_order).
+        self._paper_orders_by_id: dict[str, dict[str, Any]] = {}
+        self._paper_orders_by_coid: dict[str, dict[str, Any]] = {}
 
     # ──────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -364,9 +370,19 @@ class NativeExchangeClient:
     # ──────────────────────────────────────────────────────────────────
     # Signed account / trading
     # ──────────────────────────────────────────────────────────────────
+    def _is_paper(self) -> bool:
+        """True when this client is running with sentinel/absent credentials.
+
+        Every signed endpoint that can mutate exchange state or read real trade
+        history MUST check this before touching the network — sentinel keys are
+        not valid Binance credentials, so without this guard a paper-mode run
+        would still fire a real signed HTTP request at the production API.
+        """
+        return self.api_key == "paper_key" or not self.api_secret
+
     async def get_account(self) -> dict[str, Any]:
         # Paper mode: return simulated account
-        if self.api_key == "paper_key" or not self.api_secret:
+        if self._is_paper():
             return {
                 "balances": [{"asset": "USDT", "free": "1000.0", "locked": "0.0"}],
                 "canTrade": True,
@@ -414,6 +430,12 @@ class NativeExchangeClient:
             raise ValueError(f"invalid side: {side!r}")
         type_u = order_type.upper()
 
+        if self._is_paper():
+            return await self._simulate_place_order(
+                symbol, side_u, quantity, order_type=type_u, price=price,
+                client_order_id=client_order_id,
+            )
+
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": side_u,
@@ -430,6 +452,61 @@ class NativeExchangeClient:
 
         return await self._request("POST", self.EP_ORDER, params=params, signed=True)
 
+    async def _simulate_place_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        *,
+        order_type: str,
+        price: Optional[float],
+        client_order_id: Optional[str],
+    ) -> dict[str, Any]:
+        """Fabricate an instantly-filled order response for paper mode.
+
+        Never touches the network for the order itself — ``get_prices`` is a
+        public, unsigned, read-only endpoint so it's safe to call for a
+        realistic fill price. Response shape matches what order_execution.py /
+        executor.py / safety_order_manager.py already read off a real Binance
+        place_order response (orderId, status, executedQty, cummulativeQuoteQty,
+        price, fills[].{price,qty,commission,commissionAsset}).
+        """
+        fill_price = price
+        if fill_price is None:
+            prices = await self.get_prices([symbol])
+            fill_price = prices.get(symbol, 0.0)
+        quote_qty = quantity * fill_price
+        order_id = int(time.time() * 1000)
+        qty_s = f"{quantity:.8f}"
+        price_s = f"{fill_price:.8f}"
+        coid = client_order_id or f"paper-{order_id}"
+        resp = {
+            "symbol": symbol,
+            "orderId": order_id,
+            "clientOrderId": coid,
+            "transactTime": int(time.time() * 1000),
+            "price": price_s,
+            "origQty": qty_s,
+            "executedQty": qty_s,
+            "cummulativeQuoteQty": f"{quote_qty:.8f}",
+            "status": "FILLED",
+            "timeInForce": "GTC",
+            "type": order_type,
+            "side": side,
+            "fills": [
+                {"price": price_s, "qty": qty_s, "commission": "0.0", "commissionAsset": "USDT"}
+            ],
+        }
+        # Register so a later get_order()/cancel_order() poll (e.g. executor.py's
+        # maker-first-buy refresh_status() after its grace window) returns this
+        # exact fill instead of a data-less guess — this order is instantly
+        # FILLED, so order_execution.py's _open cache never holds it (only
+        # non-terminal orders are cached there), making this ledger the only
+        # place a later status poll can find real data.
+        self._paper_orders_by_id[str(order_id)] = resp
+        self._paper_orders_by_coid[coid] = resp
+        return resp
+
     async def cancel_order(
         self,
         symbol: str,
@@ -439,6 +516,22 @@ class NativeExchangeClient:
     ) -> dict[str, Any]:
         if order_id is None and client_order_id is None:
             raise ValueError("order_id or client_order_id is required")
+        if self._is_paper():
+            stored = (
+                self._paper_orders_by_id.get(str(order_id)) if order_id is not None else None
+            ) or (
+                self._paper_orders_by_coid.get(client_order_id) if client_order_id is not None else None
+            )
+            if stored is not None:
+                stored = dict(stored)
+                stored["status"] = "CANCELED"
+                return stored
+            return {
+                "symbol": symbol,
+                "orderId": order_id,
+                "clientOrderId": client_order_id,
+                "status": "CANCELED",
+            }
         params: dict[str, Any] = {"symbol": symbol}
         if order_id is not None:
             params["orderId"] = order_id
@@ -455,6 +548,29 @@ class NativeExchangeClient:
     ) -> dict[str, Any]:
         if order_id is None and client_order_id is None:
             raise ValueError("order_id or client_order_id is required")
+        if self._is_paper():
+            stored = (
+                self._paper_orders_by_id.get(str(order_id)) if order_id is not None else None
+            ) or (
+                self._paper_orders_by_coid.get(client_order_id) if client_order_id is not None else None
+            )
+            if stored is not None:
+                return dict(stored)
+            # Genuinely unknown order (e.g. a lookup for an id never placed this
+            # process) — report a terminal-but-NOT-filled status. Claiming FILLED
+            # here for an order we have zero data on is exactly the bug this
+            # ledger fixes: it silently fed data-less zero qty/price into
+            # executor.py's maker-first-buy fill-price extraction as if a real
+            # fill had occurred.
+            return {
+                "symbol": symbol,
+                "orderId": order_id,
+                "clientOrderId": client_order_id,
+                "side": "BUY",
+                "origQty": "0.0",
+                "price": "0.0",
+                "status": "REJECTED",
+            }
         params: dict[str, Any] = {"symbol": symbol}
         if order_id is not None:
             params["orderId"] = order_id
@@ -478,6 +594,11 @@ class NativeExchangeClient:
         more than ``limit`` historical trades; see position_hydration_engine's
         pagination loop.
         """
+        if self._is_paper():
+            # Sentinel keys have no real trade history — always report empty
+            # rather than guessing, consistent with position_hydration_engine's
+            # existing "assume fresh account" fallback.
+            return []
         params: dict[str, Any] = {"symbol": symbol, "limit": limit}
         if from_id is not None:
             params["fromId"] = int(from_id)

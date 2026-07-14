@@ -20,6 +20,8 @@ import os
 import time
 from typing import Optional, Union
 
+from . import math_utils
+
 
 class NativeTPSLEngine:
     """Volatility-adaptive TP/SL with fee-awareness, time decay, and trailing stops."""
@@ -920,102 +922,16 @@ class NativeTPSLEngine:
             return nav * 0.05
 
     def _compute_atr(self, symbol: str, lookback: int = 14) -> float:
-        """
-        Compute ATR(lookback) from market data.
-
-        Strategy:
-          1. Try live candles from WebSocket: market_data[(symbol, tf)] (tuple key, dict format)
-          2. Try cached ATR scalar: market_data[symbol]["atr"] (legacy format)
-          3. Try klines attribute: klines[symbol]["1m"] (legacy format)
-          4. Fallback to 0.8% of last price
-        """
-        try:
-            market_data = getattr(self.shared_state, "market_data", {}) or {}
-
-            # Primary: WebSocket stores candles as market_data[(symbol, tf)] — list of OHLCV dicts
-            for tf in ("1m", "5m", "15m"):
-                candles = market_data.get((symbol, tf))
-                if isinstance(candles, list) and len(candles) >= max(lookback, 3):
-                    atr = self._compute_atr_from_candles(candles, min(lookback, len(candles)))
-                    if atr > 0:
-                        return atr
-
-            # Legacy: cached ATR scalar stored as market_data[symbol]["atr"]
-            sym_md = market_data.get(symbol)
-            if isinstance(sym_md, dict):
-                cached_atr = float(sym_md.get("atr") or 0.0)
-                if cached_atr > 0:
-                    return cached_atr
-
-            # Legacy: klines attribute
-            klines = getattr(self.shared_state, "klines", {}) or {}
-            if symbol in klines:
-                candles = klines.get(symbol, {}).get("1m", [])
-                if isinstance(candles, list) and len(candles) >= 3:
-                    atr = self._compute_atr_from_candles(candles, min(lookback, len(candles)))
-                    if atr > 0:
-                        return atr
-
-            # Fallback: 0.8% of last price → SL ~1.2% when no candle data available
-            prices = getattr(self.shared_state, "prices", {}) or {}
-            if symbol in prices:
-                last_price = float(prices[symbol] or 0.0)
-                if last_price > 0:
-                    return last_price * 0.008
-
-            self.logger.warning(f"[TPSLEngine] {symbol} no data for ATR, returning 0")
-            return 0.0
-
-        except Exception as e:
-            self.logger.error(f"[TPSLEngine] _compute_atr failed for {symbol}: {e}")
-            return 0.0
+        """Compute ATR(lookback) from market data — delegates to math_utils.compute_atr
+        (shared with NativeCapitalAllocator's volatility sizing input; moved there
+        2026-07-14 so both callers stay in sync). See that function's docstring
+        for the fallback strategy."""
+        return math_utils.compute_atr(self.shared_state, symbol, lookback)
 
     def _compute_atr_from_candles(self, candles: list, lookback: int = 14) -> float:
-        """
-        Compute ATR from candlestick data. Handles both formats:
-          - Dict:  {"high": h, "low": l, "close": c}  (WebSocket live candles)
-          - List:  [ts, open, high, low, close, ...]    (legacy kline format)
-
-        ATR = SMA(TR) where TR = max(H-L, abs(H-PC), abs(L-PC))
-        """
-        try:
-            if len(candles) < 2:
-                return 0.0
-
-            true_ranges = []
-            prev_close = None
-
-            for candle in candles[-lookback:]:
-                if isinstance(candle, dict):
-                    high = float(candle.get("high") or candle.get("h") or 0.0)
-                    low = float(candle.get("low") or candle.get("l") or 0.0)
-                    close = float(candle.get("close") or candle.get("c") or 0.0)
-                elif isinstance(candle, (list, tuple)) and len(candle) >= 5:
-                    high = float(candle[2] or 0.0)
-                    low = float(candle[3] or 0.0)
-                    close = float(candle[4] or 0.0)
-                else:
-                    continue
-
-                if high <= 0 or low <= 0 or close <= 0:
-                    continue
-
-                if prev_close is None:
-                    prev_close = close
-                    continue
-
-                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-                true_ranges.append(tr)
-                prev_close = close
-
-            if not true_ranges:
-                return 0.0
-
-            return float(sum(true_ranges) / len(true_ranges))
-
-        except Exception as e:
-            self.logger.error(f"[TPSLEngine] _compute_atr_from_candles failed: {e}")
-            return 0.0
+        """Compute ATR from candlestick data — delegates to
+        math_utils.compute_atr_from_candles (see that function's docstring)."""
+        return math_utils.compute_atr_from_candles(candles, lookback)
 
     def _estimate_volatility_pressure(self, symbol: str) -> float:
         """

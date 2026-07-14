@@ -91,6 +91,7 @@ NATIVE_CTX_KEYS: tuple[str, ...] = (
     "trade_journal",  # L0 (NativeTradeJournal; observability — crash-safe audit trail)
     "prometheus_exporter",  # L7 (NativePrometheusExporter; observability — Grafana metrics)
     "fill_tracker",  # L3 (NativeFillTracker; detects fills and updates positions)
+    "daily_target_monitor",  # L0 (NativeDailyTargetMonitor; remediation item #18, 2026-07-14)
     "_native_orchestrator",  # L8 handle
     "_native_mode",  # marker flag
 )
@@ -149,6 +150,7 @@ class NativeComponents:
     ml_forecaster: Any | None = None  # MLForecaster | None (legacy agent, L3)
     symbol_screener: Any | None = None  # SymbolScreener | None (legacy agent, L3)
     symbol_rotator: Any | None = None  # SymbolRotator | None
+    daily_target_monitor: Any | None = None  # NativeDailyTargetMonitor | None (L0, remediation #18)
 
 
 def build_native_app_ctx(
@@ -251,6 +253,8 @@ def build_native_app_ctx(
         app_ctx["fill_tracker"] = components.fill_tracker
     if components.signal_manager_bridge is not None:
         app_ctx["signal_manager_bridge"] = components.signal_manager_bridge
+    if components.daily_target_monitor is not None:
+        app_ctx["daily_target_monitor"] = components.daily_target_monitor
 
     return app_ctx, orch
 

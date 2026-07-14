@@ -17,6 +17,7 @@ from typing import Any, Optional
 import pytest
 
 from core_engine.decision_engine import DecisionEngine
+from core_engine.implementations import DecisionEngineImpl
 
 # Import implementations
 # Import all 5 engines
@@ -26,6 +27,77 @@ from core_engine.safe_execution_engine import SafeExecutionEngine
 from core_engine.situation_engine import SituationEngine
 
 logger = logging.getLogger(__name__)
+
+
+class TestEvaluateSignalFailsClosed:
+    """A missing arbitration_engine must block the trade, not default-pass it."""
+
+    @pytest.mark.asyncio
+    async def test_missing_arbitration_engine_fails_closed(self) -> None:
+        app_ctx: dict[str, Any] = {}  # no "arbitration_engine" key at all
+        result = await DecisionEngineImpl.evaluate_signal(app_ctx, "BTCUSDT", "BUY", 0.9)
+        assert result["passed"] is False
+        assert "arbitration_engine_unavailable" in result["blocking_gates"]
+
+    @pytest.mark.asyncio
+    async def test_none_arbitration_engine_fails_closed(self) -> None:
+        app_ctx: dict[str, Any] = {"arbitration_engine": None}
+        result = await DecisionEngineImpl.evaluate_signal(app_ctx, "ETHUSDT", "BUY", 0.9)
+        assert result["passed"] is False
+
+
+class TestEvaluateSignalRecordsToDailyTargetMonitor:
+    """Remediation item #18: evaluate_signal() must record to
+    daily_target_monitor (read-only bookkeeping) without it affecting the
+    decision itself in any way."""
+
+    @pytest.mark.asyncio
+    async def test_records_signal_and_decision_on_pass(self) -> None:
+        from core_engine.native.daily_target_monitor import NativeDailyTargetMonitor
+
+        class _AllowEngine:
+            async def evaluate(self, symbol, signal_type, edge_score):
+                return {"passed": True, "gates_status": {}, "blocking_gates": [], "reason": ""}
+
+        mon = NativeDailyTargetMonitor()
+        app_ctx: dict[str, Any] = {"arbitration_engine": _AllowEngine(), "daily_target_monitor": mon}
+        result = await DecisionEngineImpl.evaluate_signal(app_ctx, "BTCUSDT", "BUY", 0.9)
+
+        assert result["passed"] is True
+        assert mon.state.signals_qualified == 1
+        assert mon.state.signals_risk_approved == 1
+        assert mon.state.signals_rejected == 0
+
+    @pytest.mark.asyncio
+    async def test_records_rejection_reason_on_block(self) -> None:
+        from core_engine.native.daily_target_monitor import NativeDailyTargetMonitor
+
+        class _BlockEngine:
+            async def evaluate(self, symbol, signal_type, edge_score):
+                return {
+                    "passed": False, "gates_status": {}, "reason": "confidence too low",
+                    "blocking_gates": ["gate_2_confidence"],
+                }
+
+        mon = NativeDailyTargetMonitor()
+        app_ctx: dict[str, Any] = {"arbitration_engine": _BlockEngine(), "daily_target_monitor": mon}
+        result = await DecisionEngineImpl.evaluate_signal(app_ctx, "BTCUSDT", "BUY", 0.9)
+
+        assert result["passed"] is False
+        assert mon.state.signals_rejected == 1
+        assert mon.state.rejection_reasons == {"gate_2_confidence": 1}
+
+    @pytest.mark.asyncio
+    async def test_missing_monitor_does_not_break_evaluate_signal(self) -> None:
+        """No daily_target_monitor in app_ctx (e.g. --no-native mode) must not
+        raise -- this bookkeeping hook must degrade gracefully."""
+        class _AllowEngine:
+            async def evaluate(self, symbol, signal_type, edge_score):
+                return {"passed": True, "gates_status": {}, "blocking_gates": [], "reason": ""}
+
+        app_ctx: dict[str, Any] = {"arbitration_engine": _AllowEngine()}
+        result = await DecisionEngineImpl.evaluate_signal(app_ctx, "BTCUSDT", "BUY", 0.9)
+        assert result["passed"] is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════

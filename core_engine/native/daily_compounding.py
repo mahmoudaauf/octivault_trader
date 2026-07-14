@@ -41,11 +41,29 @@ class DailyCompoundingPolicy:
         *,
         has_open_positions: bool,
         now: Optional[datetime] = None,
+        protection_floor_usdt: float = 0.0,
     ) -> float:
-        """Return the NAV that position sizing is allowed to use."""
+        """Return the NAV that position sizing is allowed to use.
+
+        ``protection_floor_usdt`` is NAVProtectionEngine's drawdown-tiered floor
+        (shared_state.nav_protection_state["protection_floor_usdt"]) — the
+        codebase's only "protected profit reserve" concept. When positive, the
+        result is additionally capped at ``current_nav - protection_floor_usdt``
+        (floored at 0), so sizing never implies risking capital NAV protection
+        has already flagged as locked/reserved. This is the connection
+        remediation item #17 asked for: the floor now actually constrains
+        position sizing instead of only being computed and logged.
+        """
         current_nav = max(0.0, float(current_nav_usdt or 0.0))
+        floor = max(0.0, float(protection_floor_usdt or 0.0))
+
+        def _apply_floor(nav: float) -> float:
+            if floor <= 0:
+                return nav
+            return max(0.0, min(nav, current_nav - floor))
+
         if not self.enabled or current_nav <= 0:
-            return current_nav
+            return _apply_floor(current_nav)
 
         instant = now or datetime.now(timezone.utc)
         if instant.tzinfo is None:
@@ -59,7 +77,7 @@ class DailyCompoundingPolicy:
                 pending_rollover=False,
             )
             self._persist()
-            return current_nav
+            return _apply_floor(current_nav)
 
         if today > self.state.sizing_date:
             if has_open_positions:
@@ -88,7 +106,7 @@ class DailyCompoundingPolicy:
 
         # Never wait until tomorrow to react to a loss. Positive intraday/unrealized
         # NAV is capped at the last committed daily base.
-        return min(current_nav, self.state.sizing_nav_usdt)
+        return _apply_floor(min(current_nav, self.state.sizing_nav_usdt))
 
     def snapshot(self) -> dict[str, object]:
         return asdict(self.state)

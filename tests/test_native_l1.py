@@ -135,6 +135,107 @@ class TestNativeExchangeClient:
         with pytest.raises(ValueError):
             await c.place_order("BTCUSDT", "BUY", 0.001, order_type="LIMIT")
 
+    def _paper_client(self) -> NativeExchangeClient:
+        retry = NativeRetryManager(max_attempts=1, base_delay_sec=0.0, jitter=False)
+        return NativeExchangeClient("paper_key", "paper_secret", retry=retry)
+
+    @pytest.mark.asyncio
+    async def test_place_order_paper_mode_never_calls_request(self) -> None:
+        c = self._paper_client()
+        c._request = AsyncMock(side_effect=AssertionError("paper mode must not call _request"))  # type: ignore[assignment]
+        c.get_prices = AsyncMock(return_value={"BTCUSDT": 50000.0})  # type: ignore[assignment]
+        out = await c.place_order("BTCUSDT", "BUY", 0.001, order_type="MARKET")
+        assert out["status"] == "FILLED"
+        assert out["symbol"] == "BTCUSDT"
+        assert float(out["price"]) == 50000.0
+        assert float(out["executedQty"]) == 0.001
+        assert out["fills"][0]["price"] == out["price"]
+        c._request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_place_order_paper_mode_no_api_secret_also_gated(self) -> None:
+        retry = NativeRetryManager(max_attempts=1, base_delay_sec=0.0, jitter=False)
+        c = NativeExchangeClient("anything", "", retry=retry)
+        c._request = AsyncMock(side_effect=AssertionError("must not call _request"))  # type: ignore[assignment]
+        c.get_prices = AsyncMock(return_value={"ETHUSDT": 3000.0})  # type: ignore[assignment]
+        out = await c.place_order("ETHUSDT", "SELL", 1.0, order_type="MARKET")
+        assert out["status"] == "FILLED"
+        c._request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_order_paper_mode_returns_real_placed_fill_not_data_less_stub(self) -> None:
+        """Regression: get_order() after a paper place_order() must return the
+        REAL fill (price/qty/status), not a generic zero-value stub — a
+        data-less stub previously corrupted executor.py's maker-first-buy
+        refresh_status() poll, silently zeroing out entry price/qty/fees."""
+        c = self._paper_client()
+        c._request = AsyncMock(side_effect=AssertionError("paper mode must not call _request"))  # type: ignore[assignment]
+        c.get_prices = AsyncMock(return_value={"BTCUSDT": 100.0})  # type: ignore[assignment]
+        placed = await c.place_order("BTCUSDT", "BUY", 5.0, order_type="LIMIT", price=99.99)
+
+        fetched_by_id = await c.get_order("BTCUSDT", order_id=placed["orderId"])
+        assert fetched_by_id["price"] == placed["price"]
+        assert fetched_by_id["origQty"] == placed["origQty"]
+        assert fetched_by_id["status"] == "FILLED"
+
+        fetched_by_coid = await c.get_order("BTCUSDT", client_order_id=placed["clientOrderId"])
+        assert fetched_by_coid["price"] == placed["price"]
+
+    @pytest.mark.asyncio
+    async def test_get_order_paper_mode_unknown_order_reports_not_filled(self) -> None:
+        """An order id never placed this process must NOT be claimed FILLED —
+        that false-positive is exactly what caused the original bug."""
+        c = self._paper_client()
+        out = await c.get_order("BTCUSDT", order_id=999999999)
+        assert out["status"] != "FILLED"
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_paper_mode_returns_real_placed_order_as_canceled(self) -> None:
+        c = self._paper_client()
+        c.get_prices = AsyncMock(return_value={"BTCUSDT": 100.0})  # type: ignore[assignment]
+        placed = await c.place_order("BTCUSDT", "BUY", 5.0, order_type="LIMIT", price=99.99)
+        out = await c.cancel_order("BTCUSDT", order_id=placed["orderId"])
+        assert out["status"] == "CANCELED"
+        assert out["price"] == placed["price"]  # real data preserved, not wiped
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_paper_mode_never_calls_request(self) -> None:
+        c = self._paper_client()
+        c._request = AsyncMock(side_effect=AssertionError("paper mode must not call _request"))  # type: ignore[assignment]
+        out = await c.cancel_order("BTCUSDT", order_id=7)
+        assert out["status"] == "CANCELED"
+        c._request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_order_paper_mode_never_calls_request(self) -> None:
+        c = self._paper_client()
+        c._request = AsyncMock(side_effect=AssertionError("paper mode must not call _request"))  # type: ignore[assignment]
+        # order_id=7 was never placed via place_order() this process, so the
+        # paper ledger has no record of it — status must NOT be reported as
+        # FILLED (see test_get_order_paper_mode_unknown_order_reports_not_filled
+        # for why: a false FILLED here previously corrupted maker-first-buy's
+        # fill-price extraction with zero-value data).
+        out = await c.get_order("BTCUSDT", order_id=7)
+        assert out["status"] != "FILLED"
+        c._request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_my_trades_paper_mode_returns_empty_never_calls_request(self) -> None:
+        c = self._paper_client()
+        c._request = AsyncMock(side_effect=AssertionError("paper mode must not call _request"))  # type: ignore[assignment]
+        out = await c.get_my_trades("BTCUSDT")
+        assert out == []
+        c._request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_place_order_live_mode_still_calls_request(self) -> None:
+        # Regression guard: real KEY/SECRET must still hit _request as before.
+        c = self._client()
+        c._request = AsyncMock(return_value={"orderId": 1, "status": "FILLED"})  # type: ignore[assignment]
+        out = await c.place_order("BTCUSDT", "BUY", 0.001, order_type="MARKET")
+        assert out["orderId"] == 1
+        c._request.assert_called_once()
+
     @pytest.mark.asyncio
     async def test_place_order_invalid_side(self) -> None:
         c = self._client()

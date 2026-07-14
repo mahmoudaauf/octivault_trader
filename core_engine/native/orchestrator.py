@@ -260,6 +260,18 @@ class NativeOrchestrator:
         Run trading cycles until duration exhausted or max_cycles reached.
 
         Returns all metrics collected.
+
+        .. important::
+            NOT called by production ``main.py`` (confirmed by
+            docs/audit/current_state_assessment.md, 2026-07-14 audit;
+            remediation_plan.md item #20). ``main.py`` drives its own
+            ``trading_cycle()`` via ``CadenceScheduler`` directly and never
+            invokes this method or ``run_cycle()`` below in the supervised
+            live/paper-trade/dry-run process. This method (and the
+            ``NativeDecisionEngine.decide()`` path it exercises via
+            ``run_cycle()``) is test-only / alternate-path infrastructure —
+            has real test coverage, is not dead code to delete, but changes
+            here do not affect live trading behavior.
         """
         await self.start()
         metrics: list[CycleMetrics] = []

@@ -704,9 +704,13 @@ class DecisionEngineImpl:
         }
 
         if not arbitration_engine:
-            logger.warning("⚠️ arbitration_engine not available; defaulting to pass=True for MVP")
-            result["passed"] = True
-            result["reason"] = "Arbitration engine unavailable; MVP default-pass"
+            logger.critical(
+                "🚫 arbitration_engine not available; failing closed (blocking trade) — "
+                "a missing arbitration engine is a startup/wiring bug, not a reason to trade unguarded"
+            )
+            result["passed"] = False
+            result["reason"] = "Arbitration engine unavailable; fail-closed (blocked)"
+            result["blocking_gates"] = ["arbitration_engine_unavailable"]
             return result
 
         try:
@@ -716,6 +720,20 @@ class DecisionEngineImpl:
         except Exception as e:
             logger.error(f"❌ Error evaluating signal: {e}")
             result["reason"] = str(e)
+
+        # Daily target monitor (remediation item #18): read-only bookkeeping,
+        # never a decision input. Reaching this point means the signal already
+        # passed upstream qualification (PERSIST_GATE/ConfFloor in the legacy
+        # signal bridge) — every evaluate_signal() call is one qualified signal.
+        _dtm = app_ctx.get("daily_target_monitor")
+        if _dtm is not None:
+            try:
+                _blocking = result.get("blocking_gates") or []
+                _reason = str(_blocking[0]) if _blocking else str(result.get("reason") or "")
+                _dtm.record_signal(symbol, qualified=True)
+                _dtm.record_decision(symbol, allowed=bool(result.get("passed")), blocked_reason=_reason)
+            except Exception as _dtm_err:
+                logger.debug("daily_target_monitor record failed for %s: %s", symbol, _dtm_err)
 
         return result
 

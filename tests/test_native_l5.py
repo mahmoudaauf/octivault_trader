@@ -6,6 +6,7 @@ Mocks NativeOrderExecution. Tests dedup, error classification, per-symbol sequen
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from core_engine.native import (
     NativeSharedState,
 )
 from core_engine.native.decisions import Action, Decision
+from core_engine.native.executor import commission_quote_from_fills, compute_net_trade_pnl
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -75,6 +77,58 @@ class _MD:
 
     def get_price(self, _symbol: str) -> float:
         return 100.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# compute_net_trade_pnl / commission_quote_from_fills (Priority 2 item #4)
+# ─────────────────────────────────────────────────────────────────────
+class TestCanonicalNetPnl:
+    def test_net_pnl_subtracts_both_fees(self) -> None:
+        net = compute_net_trade_pnl(
+            entry_price=100.0, exit_price=110.0, qty=1.0,
+            entry_commission_quote=0.1, exit_commission_quote=0.11,
+        )
+        # gross = 10.0, minus 0.21 in fees
+        assert net == pytest.approx(9.79)
+
+    def test_net_pnl_negative_commission_ignored(self) -> None:
+        # Defensive: a negative fee value must never inflate profit.
+        net = compute_net_trade_pnl(
+            entry_price=100.0, exit_price=110.0, qty=1.0,
+            entry_commission_quote=-5.0, exit_commission_quote=0.0,
+        )
+        assert net == pytest.approx(10.0)
+
+    def test_commission_quote_from_fills_quote_asset_passthrough(self) -> None:
+        fills = [{"price": "100.0", "qty": "1.0", "commission": "0.1", "commissionAsset": "USDT"}]
+        assert commission_quote_from_fills(fills, symbol="BTCUSDT") == pytest.approx(0.1)
+
+    def test_commission_quote_from_fills_base_asset_converted(self) -> None:
+        fills = [{"price": "100.0", "qty": "1.0", "commission": "0.001", "commissionAsset": "BTC"}]
+        # 0.001 BTC * 100.0 price = 0.1 USDT
+        assert commission_quote_from_fills(fills, symbol="BTCUSDT") == pytest.approx(0.1)
+
+    def test_commission_quote_from_fills_unconvertible_asset_contributes_zero(self) -> None:
+        fills = [{"price": "100.0", "qty": "1.0", "commission": "1.0", "commissionAsset": "BNB"}]
+        assert commission_quote_from_fills(fills, symbol="BTCUSDT", price_cache={}) == 0.0
+
+    def test_commission_quote_from_fills_bnb_converted_via_price_cache(self) -> None:
+        fills = [{"price": "100.0", "qty": "1.0", "commission": "1.0", "commissionAsset": "BNB"}]
+        out = commission_quote_from_fills(
+            fills, symbol="BTCUSDT", price_cache={"BNBUSDT": 600.0}
+        )
+        assert out == pytest.approx(600.0)
+
+    def test_commission_quote_from_fills_multiple_fills_summed(self) -> None:
+        fills = [
+            {"price": "100.0", "qty": "0.5", "commission": "0.05", "commissionAsset": "USDT"},
+            {"price": "101.0", "qty": "0.5", "commission": "0.05", "commissionAsset": "USDT"},
+        ]
+        assert commission_quote_from_fills(fills, symbol="BTCUSDT") == pytest.approx(0.1)
+
+    def test_commission_quote_from_fills_empty_or_none(self) -> None:
+        assert commission_quote_from_fills(None, symbol="BTCUSDT") == 0.0
+        assert commission_quote_from_fills([], symbol="BTCUSDT") == 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -339,3 +393,75 @@ class TestNativeExecutor:
         assert validator.allocated_balance == 100.0
         assert validator.recent_entries(1)[0].status == "committed"
         assert state.reserved_quote_total("USDT") == 100.0
+
+    @pytest.mark.asyncio
+    async def test_close_position_records_net_of_fee_realized_pnl(self) -> None:
+        """BUY then CLOSE must persist metrics['realized_pnl'] net of both
+        entry and exit commission, not the gross-only figure that used to
+        only appear in a log line (Priority 2 item #4)."""
+        stub = _StubOrderExecution()
+        stub.next_buy_result.update({
+            "quantity": 1.0, "executed_qty": 1.0, "avg_price": 100.0, "price": 100.0,
+            "fills": [{"price": "100.0", "qty": "1.0", "commission": "0.1", "commissionAsset": "USDT"}],
+        })
+        stub.next_sell_result.update({
+            "quantity": 1.0, "executed_qty": 1.0, "avg_price": 110.0, "price": 110.0,
+            "fills": [{"price": "110.0", "qty": "1.0", "commission": "0.11", "commissionAsset": "USDT"}],
+        })
+        state = NativeSharedState()
+
+        class _MD:
+            def get_price(self, _symbol: str) -> float:
+                return 110.0
+
+        executor = NativeExecutor(stub, market_data=_MD(), shared_state=state)  # type: ignore[arg-type]
+
+        buy_result = (await executor.execute([Decision("BTCUSDT", Action.OPEN, 100.0, "test", 0.7)]))[0]
+        assert buy_result.status == ExecutionStatus.SUCCESS
+        assert executor._entry_commission_quote["BTCUSDT"] == pytest.approx(0.1)
+
+        await asyncio.sleep(0.15)  # clear the per-symbol sequential-execution lock (0.1s)
+        sell_result = (await executor.execute([Decision("BTCUSDT", Action.CLOSE, 1.0, "test", 0.7)]))[0]
+        assert sell_result.status == ExecutionStatus.SUCCESS
+
+        # gross = (110-100)*1.0 = 10.0; net = 10.0 - 0.1 - 0.11 = 9.79
+        assert state.metrics["realized_pnl"] == pytest.approx(9.79)
+        assert state.metrics["trades_in_window"] == 1
+        # Entry fee must be cleared after being consumed, not double-counted on a future close.
+        assert "BTCUSDT" not in executor._entry_commission_quote
+
+    @pytest.mark.asyncio
+    async def test_daily_target_monitor_records_order_fill_and_trade_closed(self) -> None:
+        """Remediation item #18: BUY submission/fill and the final net-of-fee
+        close must all reach an injected daily_target_monitor."""
+        from core_engine.native.daily_target_monitor import NativeDailyTargetMonitor
+
+        stub = _StubOrderExecution()
+        stub.next_buy_result.update({
+            "quantity": 1.0, "executed_qty": 1.0, "avg_price": 100.0, "price": 100.0,
+            "fills": [{"price": "100.0", "qty": "1.0", "commission": "0.0", "commissionAsset": "USDT"}],
+        })
+        stub.next_sell_result.update({
+            "quantity": 1.0, "executed_qty": 1.0, "avg_price": 110.0, "price": 110.0,
+            "fills": [{"price": "110.0", "qty": "1.0", "commission": "0.0", "commissionAsset": "USDT"}],
+        })
+        state = NativeSharedState()
+        monitor = NativeDailyTargetMonitor()
+
+        executor = NativeExecutor(
+            stub, market_data=_MD(), shared_state=state, daily_target_monitor=monitor,
+        )  # type: ignore[arg-type]
+
+        buy_result = (await executor.execute([Decision("BTCUSDT", Action.OPEN, 100.0, "test", 0.7)]))[0]
+        assert buy_result.status == ExecutionStatus.SUCCESS
+        assert monitor.state.orders_submitted == 1
+        assert monitor.state.entries_filled == 1
+
+        await asyncio.sleep(0.15)
+        sell_result = (await executor.execute([Decision("BTCUSDT", Action.CLOSE, 1.0, "test", 0.7)]))[0]
+        assert sell_result.status == ExecutionStatus.SUCCESS
+
+        assert monitor.state.trades_closed == 1
+        assert monitor.state.net_profitable_trades == 1
+        assert monitor.state.compoundable_trades == 1
+        assert monitor.state.net_pnl_usdt == pytest.approx(10.0)

@@ -50,6 +50,7 @@ from .bounded_cache import NativeBoundedCache
 from .capital_allocator import NativeCapitalAllocator
 from .decisions import NativeDecisionEngine
 from .exchange_client import NativeExchangeClient
+from .daily_target_monitor import NativeDailyTargetMonitor
 from .executor import NativeExecutor
 from .fill_tracker import NativeFillTracker
 from .health_monitor import NativeHealthMonitor
@@ -137,6 +138,9 @@ class BootstrapConfig:
     default_planned_quote: float = 12.0  # Fixed quote per trade for small accounts (like legacy system). Autonomously scales with equity growth.
     daily_compounding_enabled: bool = True
     daily_compounding_state_path: str = "logs/daily_compounding_state.json"
+    daily_target_trades: int = 5
+    daily_target_state_path: str = "logs/daily_target_state.json"
+    daily_target_history_path: str = "logs/daily_target_history.jsonl"
     quote_reserve_ratio: float = 0.10
     quote_min_reserve_usdt: float = 0.0
     max_total_exposure_pct: float = 60.0
@@ -245,6 +249,13 @@ class BootstrapConfig:
             daily_compounding_enabled=_bool(e.get("DAILY_COMPOUNDING_ENABLED"), default=True),
             daily_compounding_state_path=(
                 e.get("DAILY_COMPOUNDING_STATE_PATH") or "logs/daily_compounding_state.json"
+            ).strip(),
+            daily_target_trades=_int(e.get("DAILY_TARGET_TRADES"), 5),
+            daily_target_state_path=(
+                e.get("DAILY_TARGET_STATE_PATH") or "logs/daily_target_state.json"
+            ).strip(),
+            daily_target_history_path=(
+                e.get("DAILY_TARGET_HISTORY_PATH") or "logs/daily_target_history.jsonl"
             ).strip(),
             quote_reserve_ratio=_float(e.get("QUOTE_RESERVE_RATIO"), 0.10),
             quote_min_reserve_usdt=_float(e.get("QUOTE_MIN_RESERVE_USDT"), 0.0),
@@ -744,6 +755,15 @@ async def build_components(
     # Trade journal — created early so executor can write fills immediately
     trade_journal = NativeTradeJournal(log_dir=cfg.trade_journal_dir)
 
+    # L0 Daily target monitor (remediation item #18) — created early so executor
+    # can record each closed trade's net-of-fee outcome immediately. Read-only
+    # with respect to gates: no method on this class can influence a decision.
+    daily_target_monitor = NativeDailyTargetMonitor(
+        target_trades=cfg.daily_target_trades,
+        state_path=cfg.daily_target_state_path,
+        history_path=cfg.daily_target_history_path,
+    )
+
     # L5
     executor = NativeExecutor(
         order_execution,
@@ -752,6 +772,7 @@ async def build_components(
         shared_state=shared_state,
         balance_validator=NativeBalanceValidator(),
         trade_journal=trade_journal,
+        daily_target_monitor=daily_target_monitor,
     )
     # tp_sl_engine injected below after it is created (line ~843)
 
@@ -992,6 +1013,7 @@ async def build_components(
         fill_tracker=fill_tracker,
         position_hydration_engine=position_hydration_engine,
         startup_state_machine=startup_state_machine,
+        daily_target_monitor=daily_target_monitor,
         adaptive_capital_engine=ace,
         polling_coordinator=polling_coordinator,
         objective_feedback_controller=ofc,

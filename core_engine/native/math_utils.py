@@ -14,7 +14,11 @@ designed for portfolio performance analysis.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def sharpe_ratio(
@@ -218,6 +222,122 @@ def volatility(returns: np.ndarray, periods_per_year: int = 252) -> float:
     return float(np.std(returns) * np.sqrt(periods_per_year))
 
 
+def compute_atr_from_candles(candles: list, lookback: int = 14) -> float:
+    """Compute ATR (average true range, absolute price units) from candlestick data.
+
+    Handles both formats:
+      - Dict:  {"high": h, "low": l, "close": c}  (WebSocket live candles)
+      - List:  [ts, open, high, low, close, ...]    (legacy kline format)
+
+    ATR = SMA(TR) where TR = max(H-L, abs(H-PC), abs(L-PC))
+
+    Shared by NativeTPSLEngine (TP/SL sizing) and NativeCapitalAllocator
+    (position-sizing volatility input) — moved here rather than duplicated
+    since ATR computation is real, non-trivial logic worth keeping in sync.
+    """
+    try:
+        if len(candles) < 2:
+            return 0.0
+
+        true_ranges = []
+        prev_close = None
+
+        for candle in candles[-lookback:]:
+            if isinstance(candle, dict):
+                high = float(candle.get("high") or candle.get("h") or 0.0)
+                low = float(candle.get("low") or candle.get("l") or 0.0)
+                close = float(candle.get("close") or candle.get("c") or 0.0)
+            elif isinstance(candle, (list, tuple)) and len(candle) >= 5:
+                high = float(candle[2] or 0.0)
+                low = float(candle[3] or 0.0)
+                close = float(candle[4] or 0.0)
+            else:
+                continue
+
+            if high <= 0 or low <= 0 or close <= 0:
+                continue
+
+            if prev_close is None:
+                prev_close = close
+                continue
+
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            true_ranges.append(tr)
+            prev_close = close
+
+        if not true_ranges:
+            return 0.0
+
+        return float(sum(true_ranges) / len(true_ranges))
+
+    except Exception as e:
+        logger.error("compute_atr_from_candles failed: %s", e)
+        return 0.0
+
+
+def compute_atr(shared_state: Any, symbol: str, lookback: int = 14) -> float:
+    """Compute ATR(lookback) (absolute price units) for ``symbol`` from shared_state.
+
+    Strategy:
+      1. Try live candles from WebSocket: market_data[(symbol, tf)] (tuple key, dict format)
+      2. Try cached ATR scalar: market_data[symbol]["atr"] (legacy format)
+      3. Try klines attribute: klines[symbol]["1m"] (legacy format)
+      4. Fallback to 0.8% of last price
+    """
+    try:
+        market_data = getattr(shared_state, "market_data", {}) or {}
+
+        for tf in ("1m", "5m", "15m"):
+            candles = market_data.get((symbol, tf))
+            if isinstance(candles, list) and len(candles) >= max(lookback, 3):
+                atr = compute_atr_from_candles(candles, min(lookback, len(candles)))
+                if atr > 0:
+                    return atr
+
+        sym_md = market_data.get(symbol)
+        if isinstance(sym_md, dict):
+            cached_atr = float(sym_md.get("atr") or 0.0)
+            if cached_atr > 0:
+                return cached_atr
+
+        klines = getattr(shared_state, "klines", {}) or {}
+        if symbol in klines:
+            candles = klines.get(symbol, {}).get("1m", [])
+            if isinstance(candles, list) and len(candles) >= 3:
+                atr = compute_atr_from_candles(candles, min(lookback, len(candles)))
+                if atr > 0:
+                    return atr
+
+        prices = getattr(shared_state, "prices", {}) or {}
+        if symbol in prices:
+            last_price = float(prices[symbol] or 0.0)
+            if last_price > 0:
+                return last_price * 0.008
+
+        logger.warning("compute_atr: %s no data for ATR, returning 0", symbol)
+        return 0.0
+
+    except Exception as e:
+        logger.error("compute_atr failed for %s: %s", symbol, e)
+        return 0.0
+
+
+def compute_atr_pct(shared_state: Any, symbol: str, lookback: int = 14) -> float:
+    """ATR normalized to a fraction of the current price (e.g. 0.008 = 0.8%).
+
+    Returns 0.0 if no ATR or no current price is available — callers should
+    apply their own floor (e.g. MIN_ATR_PCT) rather than treat 0.0 as "flat."
+    """
+    atr = compute_atr(shared_state, symbol, lookback)
+    if atr <= 0:
+        return 0.0
+    prices = getattr(shared_state, "prices", {}) or {}
+    price = float(prices.get(symbol, 0.0) or 0.0)
+    if price <= 0:
+        return 0.0
+    return atr / price
+
+
 __all__ = [
     "sharpe_ratio",
     "sortino_ratio",
@@ -227,4 +347,7 @@ __all__ = [
     "win_rate",
     "profit_factor",
     "volatility",
+    "compute_atr_from_candles",
+    "compute_atr",
+    "compute_atr_pct",
 ]

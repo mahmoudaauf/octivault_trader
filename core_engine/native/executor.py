@@ -32,6 +32,65 @@ from .balance_validator import NativeBalanceValidator
 logger = logging.getLogger(__name__)
 
 
+def commission_quote_from_fills(
+    fills: Any, *, symbol: str, fallback_price: float = 0.0, price_cache: Optional[dict[str, float]] = None,
+) -> float:
+    """Sum a Binance order response's ``fills[].commission`` in quote-currency terms.
+
+    ``fills`` entries carry ``commission``/``commissionAsset`` independently
+    per fill (Binance can split one order across multiple price levels, each
+    with its own commission entry) — quote-asset commissions pass through
+    as-is, base-asset commissions convert via the fill's own price, and any
+    other asset (e.g. BNB fee discount) converts via ``price_cache`` if a
+    ``<asset><quote>`` rate is available, else contributes 0 rather than guess.
+    """
+    if not isinstance(fills, list) or not fills:
+        return 0.0
+    symbol_u = symbol.upper()
+    quote_asset = "USDT" if symbol_u.endswith("USDT") else ""
+    base_asset = symbol_u[: -len(quote_asset)] if quote_asset else ""
+    price_cache = price_cache or {}
+    total = 0.0
+    for f in fills:
+        try:
+            commission = max(0.0, float(f.get("commission") or 0.0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if commission <= 0:
+            continue
+        fee_asset = str(f.get("commissionAsset") or "").upper()
+        if fee_asset == quote_asset:
+            total += commission
+        elif fee_asset == base_asset:
+            fill_price = float(f.get("price") or fallback_price or 0.0)
+            total += commission * fill_price
+        else:
+            conversion = float(price_cache.get(f"{fee_asset}{quote_asset}", 0.0) or 0.0)
+            if conversion > 0:
+                total += commission * conversion
+    return total
+
+
+def compute_net_trade_pnl(
+    *,
+    entry_price: float,
+    exit_price: float,
+    qty: float,
+    entry_commission_quote: float = 0.0,
+    exit_commission_quote: float = 0.0,
+) -> float:
+    """Canonical net-of-fee realized P&L for one closed trade cycle.
+
+    ``entry_price``/``exit_price`` are actual fill prices (not pre-trade
+    reference prices), so adverse slippage is already reflected in the gross
+    term — this is deliberately the ONE place in the codebase that defines
+    "net realized profit" so a "net-profitable trade" claim doesn't require
+    manual reconciliation against Binance's own trade history.
+    """
+    gross_pnl = (exit_price - entry_price) * qty
+    return gross_pnl - max(0.0, entry_commission_quote) - max(0.0, exit_commission_quote)
+
+
 class ExecutionStatus(Enum):
     """Outcome of a single execution attempt."""
 
@@ -76,6 +135,7 @@ class NativeExecutor:
         balance_validator: Optional[NativeBalanceValidator] = None,
         trade_journal: Optional[Any] = None,
         tp_sl_engine: Optional[Any] = None,
+        daily_target_monitor: Optional[Any] = None,
     ) -> None:
         self._order_exec = order_execution
         self._market_data = market_data  # for price lookups when decision.quantity is in USD
@@ -84,8 +144,10 @@ class NativeExecutor:
         self._balance_validator = balance_validator
         self._trade_journal = trade_journal
         self._tp_sl_engine = tp_sl_engine
+        self._daily_target_monitor = daily_target_monitor
         self._executed_ids: set[str] = set()  # dedup tracking
         self._symbol_locks: dict[str, float] = {}  # symbol → last execution ts
+        self._entry_commission_quote: dict[str, float] = {}  # symbol → accumulated entry-side fee (quote)
         self._symbol_filters_cache: dict[str, dict[str, Any]] = {}  # symbol → filters
         # Reject a BUY when the cached price is older than this (seconds). A stale
         # price corrupts both order sizing and the SL anchor → instant phantom stop-outs.
@@ -446,8 +508,19 @@ class NativeExecutor:
             getattr(order_result, "executed_qty", None) or order_result.quantity
         )
 
+        if self._daily_target_monitor is not None:
+            try:
+                self._daily_target_monitor.record_order_submitted(decision.symbol)
+            except Exception:
+                pass
+
         if order_result.success:
             result.status = ExecutionStatus.SUCCESS
+            if self._daily_target_monitor is not None:
+                try:
+                    self._daily_target_monitor.record_entry_filled(decision.symbol)
+                except Exception:
+                    pass
             if self._balance_validator is not None:
                 self._balance_validator.commit_allocation(
                     amount=float(decision.quantity or 0.0),
@@ -493,6 +566,18 @@ class NativeExecutor:
                 logger.info(
                     "[Executor] %s partial/adjusted fill: requested %.6f, executed %.6f",
                     decision.symbol, qty_to_place, filled_qty,
+                )
+            # Track entry-side commission so _close_position can compute a true
+            # net-of-fee realized P&L instead of a gross-only, never-persisted number.
+            entry_fee_quote = commission_quote_from_fills(
+                order_result.raw.get("fills") if order_result.raw else None,
+                symbol=decision.symbol,
+                fallback_price=fill_price,
+                price_cache=getattr(self._shared_state, "price_cache", None),
+            )
+            if entry_fee_quote > 0:
+                self._entry_commission_quote[decision.symbol] = (
+                    self._entry_commission_quote.get(decision.symbol, 0.0) + entry_fee_quote
                 )
             # Register position immediately — fill_tracker is None in polling mode,
             # so executor is the only place that can write this synchronously.
@@ -673,13 +758,47 @@ class NativeExecutor:
                         _qty = float(qty_to_sell or 0.0)
                         _gross_pnl = (fill_price - _entry_px) * _qty
                         _pnl_pct = (fill_price / _entry_px - 1.0) * 100.0
-                        _outcome = "WIN" if _gross_pnl > 0 else ("LOSS" if _gross_pnl < 0 else "FLAT")
+                        _entry_fee = self._entry_commission_quote.pop(decision.symbol, 0.0)
+                        _exit_fee = commission_quote_from_fills(
+                            result.raw.get("fills") if result.raw else None,
+                            symbol=decision.symbol,
+                            fallback_price=fill_price,
+                            price_cache=getattr(self._shared_state, "price_cache", None),
+                        )
+                        _net_pnl = compute_net_trade_pnl(
+                            entry_price=_entry_px, exit_price=fill_price, qty=_qty,
+                            entry_commission_quote=_entry_fee, exit_commission_quote=_exit_fee,
+                        )
+                        _outcome = "WIN" if _net_pnl > 0 else ("LOSS" if _net_pnl < 0 else "FLAT")
                         logger.info(
                             "[Executor] TRADE_CLOSED %s %s entry=%.8f exit=%.8f qty=%.8f "
-                            "gross_pnl=%.4f USDT pnl_pct=%.3f%% reason=%s",
+                            "gross_pnl=%.4f net_pnl=%.4f USDT pnl_pct=%.3f%% "
+                            "entry_fee=%.6f exit_fee=%.6f reason=%s",
                             decision.symbol, _outcome, _entry_px, fill_price, _qty,
-                            _gross_pnl, _pnl_pct, getattr(decision, "reason", ""),
+                            _gross_pnl, _net_pnl, _pnl_pct, _entry_fee, _exit_fee,
+                            getattr(decision, "reason", ""),
                         )
+                        metrics = getattr(self._shared_state, "metrics", None)
+                        if isinstance(metrics, dict):
+                            metrics["realized_pnl"] = metrics.get("realized_pnl", 0.0) + _net_pnl
+                            metrics["trades_in_window"] = metrics.get("trades_in_window", 0) + 1
+                            metrics["last_update_ts"] = time.time()
+                            prev_wr = metrics.get("win_rate_window", 0.5)
+                            metrics["win_rate_window"] = prev_wr * 0.9 + (1.0 if _net_pnl > 0 else 0.0) * 0.1
+                        if self._daily_target_monitor is not None:
+                            try:
+                                self._daily_target_monitor.record_trade_closed(
+                                    decision.symbol,
+                                    gross_pnl=_gross_pnl,
+                                    net_pnl=_net_pnl,
+                                    fees=_entry_fee + _exit_fee,
+                                    compoundable=_net_pnl > 0,
+                                )
+                            except Exception as _dtm_err:
+                                logger.debug(
+                                    "[Executor] daily_target_monitor record failed for %s: %s",
+                                    decision.symbol, _dtm_err,
+                                )
                     else:
                         logger.info(
                             "[Executor] SELL %s filled — position cleared from state "
@@ -850,7 +969,7 @@ class NativeExecutor:
                         qty,
                     )
                 logger.debug(
-                    "rounded qty {:.8f} → {:.8f} (step_size {:.8f})", qty, corrected_qty, step_size
+                    "rounded qty %.8f → %.8f (step_size %.8f)", qty, corrected_qty, step_size
                 )
 
         return True, "", corrected_qty

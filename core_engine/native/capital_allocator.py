@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from . import math_utils
 from .capital_policy import compute_spendable_quote
 from .daily_compounding import DailyCompoundingPolicy
 
@@ -148,9 +149,11 @@ class NativeCapitalAllocator:
             if not live_nav or live_nav <= 0:
                 logger.debug("NAV %s too low to allocate", live_nav)
                 return 0.0
+            _nav_prot_state = (getattr(self._ss, "nav_protection_state", {}) or {}) if self._ss else {}
             nav = self._daily_compounding.sizing_nav(
                 float(live_nav),
                 has_open_positions=self._has_open_positions(),
+                protection_floor_usdt=float(_nav_prot_state.get("protection_floor_usdt", 0.0) or 0.0),
             )
             if nav < float(live_nav):
                 logger.info(
@@ -393,12 +396,17 @@ class NativeCapitalAllocator:
         return False
 
     def _compute_volatility_pct(self, symbol: str) -> float:
-        """Compute volatility percentage for symbol.
+        """Compute volatility percentage for symbol from real ATR/candle data.
 
-        Placeholder: returns 0.008 (0.8% — mid-range volatility)
-        until NativeMarketData provides rolling volatility estimates."""
-        # TODO: Implement rolling volatility from klines
-        return 0.008
+        Delegates to math_utils.compute_atr_pct — the same ATR computation
+        NativeTPSLEngine uses for TP/SL sizing, moved to math_utils.py so both
+        callers share one implementation. Falls back to 0.008 (0.8% —
+        mid-range volatility) only when no candle/price data is available at
+        all (cold start), matching this method's prior always-0.008 behavior
+        for that specific case rather than silently sizing off a 0.0 input.
+        """
+        pct = math_utils.compute_atr_pct(self._ss, symbol) if self._ss else 0.0
+        return pct if pct > 0 else 0.008
 
     def _round_quantity_for_exchange_sync(
         self, symbol: str, quantity: float, price: float
