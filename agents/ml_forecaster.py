@@ -453,6 +453,48 @@ class MLForecaster:
         self._retrain_min_val_acc = float(
             self._cfg("ML_RETRAIN_MIN_VAL_ACC", os.getenv("ML_RETRAIN_MIN_VAL_ACC", 0.52)) or 0.52
         )
+        # 2026-07-14: economic retrain-deployment gate. _passes_retrain_quality_guard
+        # above only checks classification accuracy improving over the prior model --
+        # it has no concept of profitability, so a model could be redeployed every
+        # cycle on a metric that says nothing about post-cost expectancy (exactly the
+        # failure mode the ML-forecaster no-edge finding describes). retrain_weekly.py
+        # already implements a stronger, PnL-based gate on a genuine forward holdout,
+        # but its cron scheduling is unconfirmed -- this makes the same gate authoritative
+        # in-process, so live automatic retraining is never blind to profitability
+        # regardless of whether that separate script ever runs. Same threshold defaults
+        # as retrain_weekly.py (not reinvented) for consistency.
+        self._retrain_holdout_frac = float(
+            self._cfg("ML_RETRAIN_HOLDOUT_FRAC", os.getenv("ML_RETRAIN_HOLDOUT_FRAC", 0.15)) or 0.15
+        )
+        self._retrain_eval_prob_threshold = float(
+            self._cfg(
+                "ML_RETRAIN_EVAL_PROBABILITY_THRESHOLD",
+                os.getenv("ML_RETRAIN_EVAL_PROBABILITY_THRESHOLD", 0.55),
+            )
+            or 0.55
+        )
+        self._retrain_eval_round_trip_cost_pct = float(
+            self._cfg(
+                "ML_RETRAIN_EVAL_ROUND_TRIP_COST_PCT",
+                os.getenv("ML_RETRAIN_EVAL_ROUND_TRIP_COST_PCT", 0.0030),
+            )
+            or 0.0030
+        )
+        self._retrain_min_signals = int(
+            self._cfg("ML_RETRAIN_MIN_SIGNALS", os.getenv("ML_RETRAIN_MIN_SIGNALS", 20)) or 20
+        )
+        self._retrain_min_expectancy_pct = float(
+            self._cfg(
+                "ML_RETRAIN_MIN_EXPECTANCY_PCT", os.getenv("ML_RETRAIN_MIN_EXPECTANCY_PCT", 0.0)
+            )
+            or 0.0
+        )
+        self._retrain_min_profit_factor = float(
+            self._cfg(
+                "ML_RETRAIN_MIN_PROFIT_FACTOR", os.getenv("ML_RETRAIN_MIN_PROFIT_FACTOR", 1.20)
+            )
+            or 1.20
+        )
         self._full_train_on_startup = self._cfg_bool("ML_FULL_TRAIN_ON_STARTUP", True)
         self._full_train_force_first_boot = self._cfg_bool("ML_FULL_TRAIN_FORCE_FIRST_BOOT", False)
         self._full_train_target_rows = int(
@@ -494,6 +536,15 @@ class MLForecaster:
         self._retrain_default_epochs = max(3, min(5, int(self._retrain_default_epochs)))
         self._retrain_cpu_epoch_cap = max(3, int(self._retrain_cpu_epoch_cap))
         self._retrain_min_val_acc = max(0.52, min(0.99, float(self._retrain_min_val_acc)))
+        self._retrain_holdout_frac = max(0.05, min(0.40, float(self._retrain_holdout_frac)))
+        self._retrain_eval_prob_threshold = max(
+            0.5, min(0.99, float(self._retrain_eval_prob_threshold))
+        )
+        self._retrain_eval_round_trip_cost_pct = max(
+            0.0, float(self._retrain_eval_round_trip_cost_pct)
+        )
+        self._retrain_min_signals = max(1, int(self._retrain_min_signals))
+        self._retrain_min_profit_factor = max(0.0, float(self._retrain_min_profit_factor))
         self._full_train_min_rows = max(int(self._full_train_min_rows), 3000)
         self._full_train_target_rows = max(
             int(self._full_train_target_rows), int(self._full_train_min_rows)
@@ -1151,16 +1202,53 @@ class MLForecaster:
 
         return list(collected[-cap:]) if collected else []
 
-    def _build_train_df_from_ohlcv(self, ohlcv: list[Any], row_cap: int) -> Optional[pd.DataFrame]:
+    def _split_train_holdout_df(
+        self, ohlcv: list[Any], row_cap: int
+    ) -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """Build the full feature frame from ``ohlcv``, then split it into a
+        row_cap-capped training portion and a completely untouched holdout
+        tail (the most recent rows), carved out BEFORE anything is passed to
+        ``ModelTrainer.train_model``.
+
+        This must be a fresh external split, not a reconstruction of
+        ``train_model``'s own internal ~10% validation split: that internal
+        split's exact row boundary is never returned (only a sample count),
+        depends on ``input_lookback``/``max_rows`` cropping/window-count math
+        that's easy to get subtly wrong, and reusing it would risk evaluating
+        on rows whose windows the model's gradient updates already saw.
+        Mirrors retrain_weekly.py's ``val_df = df.iloc[-val_rows:]`` /
+        ``train_df = df.iloc[:-val_rows].tail(MAX_TRAINING_ROWS)`` pattern.
+
+        Returns ``(train_df, holdout_df)``; either may be ``None`` if there
+        isn't enough data to build a feature frame at all, or ``holdout_df``
+        may be an empty/too-small frame if there isn't enough data to carve a
+        meaningful holdout -- callers must treat that as a failed economic
+        gate (no holdout evidence => no deploy), not as "skip the gate."
+        """
         feature_df = self._build_edge_feature_frame(ohlcv)
         if feature_df is None or feature_df.empty:
-            return None
+            return None, None
         train_cols = self._training_feature_columns()
-        train_df = feature_df[train_cols].copy()
+        full_df = feature_df[train_cols].copy()
+        n = len(full_df)
+        holdout_rows = max(1, int(round(n * float(self._retrain_holdout_frac))))
+        holdout_rows = min(holdout_rows, max(0, n - 1))
+        if holdout_rows <= 0:
+            # Not enough rows to carve any holdout at all -- return no holdout
+            # rather than silently training on the full frame; the economic
+            # guard will reject a missing holdout, matching the fail-closed
+            # intent (no proof of profitability => no deploy).
+            cap = max(1, int(row_cap))
+            train_df = full_df.tail(cap).copy().reset_index(drop=True)
+            return train_df, None
+        train_portion = full_df.iloc[: n - holdout_rows]
+        holdout_df = full_df.iloc[n - holdout_rows :].copy().reset_index(drop=True)
         cap = max(1, int(row_cap))
-        if len(train_df) > cap:
-            train_df = train_df.tail(cap).copy().reset_index(drop=True)
-        return train_df
+        if len(train_portion) > cap:
+            train_portion = train_portion.tail(cap).copy().reset_index(drop=True)
+        else:
+            train_portion = train_portion.copy().reset_index(drop=True)
+        return train_portion, holdout_df
 
     def _load_model_metadata(self, model_path: str) -> dict[str, Any]:
         try:
@@ -1225,6 +1313,52 @@ class MLForecaster:
         if val_acc <= baseline:
             return False, f"no_improvement:{val_acc:.4f}<={baseline:.4f}"
         return True, "quality_ok"
+
+    def _passes_retrain_economic_guard(
+        self, holdout_result: Optional[dict[str, Any]]
+    ) -> tuple[bool, str]:
+        """Second, independent gate a retrain candidate must ALSO clear
+        (alongside ``_passes_retrain_quality_guard``) before deployment: a
+        net-of-fee economic bar on ``holdout_result``, the output of
+        ``ModelTrainer.evaluate_holdout()`` run against a genuinely untouched
+        holdout slice (see ``_split_train_holdout_df``).
+
+        Mirrors retrain_weekly.py's ``_accept`` gate exactly, including its
+        threshold defaults -- that gate was already vetted for this exact
+        purpose, but isn't confirmed to be the one actually protecting the
+        live, continuously-retraining model (its cron scheduling is
+        unconfirmed). Making the same standard authoritative in-process means
+        automatic retraining is never blind to profitability regardless of
+        whether that separate script ever runs.
+        """
+        if not isinstance(holdout_result, dict):
+            return False, "missing_holdout_result"
+        if not bool(holdout_result.get("ok")):
+            return False, f"holdout_not_ok:{holdout_result.get('reason', 'unknown')}"
+        try:
+            signals = int(holdout_result.get("signals") or 0)
+            expectancy_pct = float(holdout_result.get("expectancy_pct") or 0.0)
+            profit_factor = float(holdout_result.get("profit_factor") or 0.0)
+        except Exception:
+            return False, "invalid_holdout_metrics"
+        if signals < int(self._retrain_min_signals):
+            return (
+                False,
+                f"insufficient_holdout_signals:{signals}<{int(self._retrain_min_signals)}",
+            )
+        if expectancy_pct <= float(self._retrain_min_expectancy_pct):
+            return (
+                False,
+                f"non_positive_expectancy:{expectancy_pct:.4f}<="
+                f"{float(self._retrain_min_expectancy_pct):.4f}",
+            )
+        if profit_factor < float(self._retrain_min_profit_factor):
+            return (
+                False,
+                f"profit_factor_below_guard:{profit_factor:.3f}<"
+                f"{float(self._retrain_min_profit_factor):.3f}",
+            )
+        return True, "economic_ok"
 
     def _refresh_model_cache_for_path(self, model_path: str) -> bool:
         self.model_cache.pop(model_path, None)
@@ -1357,7 +1491,7 @@ class MLForecaster:
                         )
                         return
 
-                    train_df = self._build_train_df_from_ohlcv(
+                    train_df, holdout_df = self._split_train_holdout_df(
                         ohlcv, int(self._full_train_max_rows)
                     )
                     if train_df is None or train_df.empty or len(train_df) < (int(lookback) + 50):
@@ -1420,6 +1554,29 @@ class MLForecaster:
                             sym,
                             reason_text,
                             guard_reason,
+                        )
+                        return
+
+                    if holdout_df is not None and not holdout_df.empty:
+                        holdout_result = trainer.evaluate_holdout(
+                            holdout_df,
+                            probability_threshold=self._retrain_eval_prob_threshold,
+                            round_trip_cost_pct=self._retrain_eval_round_trip_cost_pct,
+                        )
+                    else:
+                        holdout_result = {"ok": False, "reason": "no_holdout_data"}
+                    econ_ok, econ_reason = self._passes_retrain_economic_guard(holdout_result)
+                    if not econ_ok:
+                        self.logger.warning(
+                            "[%s] full training candidate rejected for %s (%s): economic_guard:%s "
+                            "(signals=%s expectancy=%s pf=%s)",
+                            self.name,
+                            sym,
+                            reason_text,
+                            econ_reason,
+                            holdout_result.get("signals"),
+                            holdout_result.get("expectancy_pct"),
+                            holdout_result.get("profit_factor"),
                         )
                         return
 
@@ -1654,7 +1811,7 @@ class MLForecaster:
                                     int(min_rows_required),
                                 )
                                 continue
-                            train_df = self._build_train_df_from_ohlcv(
+                            train_df, holdout_df = self._split_train_holdout_df(
                                 ohlcv, int(self._full_train_max_rows)
                             )
                             tier_epochs = int(full_epochs)
@@ -1671,7 +1828,7 @@ class MLForecaster:
                                     tier,
                                 )
                                 continue
-                            train_df = self._build_train_df_from_ohlcv(
+                            train_df, holdout_df = self._split_train_holdout_df(
                                 ohlcv, int(self._retrain_max_rows)
                             )
                             tier_epochs = int(adaptive_epochs)
@@ -1754,6 +1911,31 @@ class MLForecaster:
                                 guard_reason,
                                 str(result.get("val_accuracy")),
                                 float(self._retrain_min_val_acc),
+                            )
+                            continue
+
+                        if holdout_df is not None and not holdout_df.empty:
+                            holdout_result = trainer.evaluate_holdout(
+                                holdout_df,
+                                probability_threshold=self._retrain_eval_prob_threshold,
+                                round_trip_cost_pct=self._retrain_eval_round_trip_cost_pct,
+                            )
+                        else:
+                            holdout_result = {"ok": False, "reason": "no_holdout_data"}
+                        econ_ok, econ_reason = self._passes_retrain_economic_guard(holdout_result)
+                        if not econ_ok:
+                            summary["guard_rejected"] += 1
+                            summary["skipped"] += 1
+                            self.logger.warning(
+                                "[%s:Retrain] Retrain finish symbol=%s tier=%s status=discarded "
+                                "reason=economic_guard:%s signals=%s expectancy=%s pf=%s",
+                                self.name,
+                                sym,
+                                tier,
+                                econ_reason,
+                                holdout_result.get("signals"),
+                                holdout_result.get("expectancy_pct"),
+                                holdout_result.get("profit_factor"),
                             )
                             continue
 
