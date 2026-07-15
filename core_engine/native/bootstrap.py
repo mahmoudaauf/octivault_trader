@@ -1013,6 +1013,7 @@ async def build_components(
         signal_fusion=signal_fusion,
         mode_manager=mode_manager,
         ml_forecaster=ml_forecaster,  # gap8: drift-retrain callback
+        exchange_client=exchange_client,  # gate_12: REST book-ticker fallback
     )
     market_regime_detector = NativeMarketRegimeDetector(
         market_data=market_data,

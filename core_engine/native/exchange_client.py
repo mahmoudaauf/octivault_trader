@@ -66,6 +66,7 @@ class NativeExchangeClient:
     EP_TIME = "/api/v3/time"
     EP_EXCHANGE_INFO = "/api/v3/exchangeInfo"
     EP_TICKER_PRICE = "/api/v3/ticker/price"
+    EP_BOOK_TICKER = "/api/v3/ticker/bookTicker"
     EP_KLINES = "/api/v3/klines"
 
     # Signed endpoints (HMAC required)
@@ -296,6 +297,8 @@ class NativeExchangeClient:
             return 2
         if endpoint == self.EP_TICKER_PRICE:
             return 1 if params and params.get("symbol") else 2
+        if endpoint == self.EP_BOOK_TICKER:
+            return 1 if params and params.get("symbol") else 2
         if endpoint == self.EP_ORDER:
             return 4
         if endpoint == self.EP_TIME:
@@ -342,6 +345,26 @@ class NativeExchangeClient:
             except (KeyError, TypeError, ValueError):
                 continue
         return out
+
+    async def get_book_ticker(self, symbol: str) -> Optional[dict[str, float]]:
+        """Best bid/ask for a single symbol, straight from Binance -- a REST
+        fallback for when the live WS book-ticker cache (shared_state.order_book)
+        has no data for this symbol yet (e.g. a just-rotated-in thin name outside
+        the WS's capped subscription set). Returns None on any failure so callers
+        can decide their own fail-open/fail-closed policy rather than this
+        client silently picking one."""
+        try:
+            data = await self._request(
+                "GET", self.EP_BOOK_TICKER, params={"symbol": symbol}
+            )
+            return {
+                "bid": float(data["bidPrice"]),
+                "bid_qty": float(data["bidQty"]),
+                "ask": float(data["askPrice"]),
+                "ask_qty": float(data["askQty"]),
+            }
+        except Exception:
+            return None
 
     async def get_klines(
         self, symbol: str, interval: str = "1m", limit: int = 100

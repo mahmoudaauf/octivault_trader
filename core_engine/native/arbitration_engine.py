@@ -37,12 +37,14 @@ class NativeArbitrationEngine:
         signal_fusion: Any | None = None,
         mode_manager: Any | None = None,
         ml_forecaster: Any | None = None,  # gap8: drift-retrain callback
+        exchange_client: Any | None = None,  # gate_12: REST book-ticker fallback
     ) -> None:
         self._shared_state = shared_state
         self._decision_engine = decision_engine
         self._signal_fusion = signal_fusion
         self._mode_manager = mode_manager
         self._ml_forecaster = ml_forecaster  # gap8
+        self._exchange_client = exchange_client
         self._regime_gate = NativeRegimeGate(shared_state=shared_state)
         self._last_buy_ts: dict[str, float] = {}  # symbol → epoch of last BUY
         self._loss_streak: dict[str, int] = {}  # symbol → consecutive loss count
@@ -66,6 +68,22 @@ class NativeArbitrationEngine:
         self._downtrend_ma_bars = max(2, int(os.getenv("DOWNTREND_MA_BARS", "50") or 50))
         self._downtrend_margin = float(os.getenv("DOWNTREND_MARGIN", "0.005") or 0.005)
         self._downtrend_slope_lag = max(1, int(os.getenv("DOWNTREND_SLOPE_LAG", "5") or 5))
+        # gate_12: real-time spread check. gate_3/regime_gate.py already has a spread
+        # cap, but it silently no-ops (fail-open) when the WS book cache has no data
+        # for the symbol (get_book_age() == inf) -- exactly the case that let a
+        # 0.53%-spread symbol (BBUSDT, 2026-07-15) through with no live coverage.
+        # This gate fails CLOSED on missing/stale book data instead, with a REST
+        # bookTicker fallback so a symbol merely outside the WS's capped tracked
+        # set isn't blocked by default -- it gets one real check before a verdict.
+        self._spread_gate_enabled = str(
+            os.getenv("SPREAD_GATE_ENABLED", "true")
+        ).lower() in ("1", "true", "yes", "on")
+        self._spread_gate_max_pct = float(
+            os.getenv("SPREAD_GATE_MAX_PCT", os.getenv("ORDERBOOK_SPREAD_MAX_PCT", "0.005")) or 0.005
+        )
+        self._spread_gate_max_book_age_s = float(
+            os.getenv("SPREAD_GATE_MAX_BOOK_AGE_S", os.getenv("ORDERBOOK_MAX_AGE_S", "10.0")) or 10.0
+        )
         self._load_streak_state()
 
     def record_trade_outcome(self, symbol: str, pnl: float) -> None:
@@ -195,6 +213,10 @@ class NativeArbitrationEngine:
             gates_status["gate_11_symbol_downtrend"] = self.gate_11_symbol_downtrend(symbol)
             if not gates_status["gate_11_symbol_downtrend"]:
                 blocking_gates.append("gate_11_symbol_downtrend")
+
+            gates_status["gate_12_spread_check"] = await self.gate_12_spread_check(symbol)
+            if not gates_status["gate_12_spread_check"]:
+                blocking_gates.append("gate_12_spread_check")
 
         passed = all(gates_status.values())
         if signal_type == "SELL":
@@ -715,6 +737,58 @@ class NativeArbitrationEngine:
             return True
         except Exception:
             return True  # fail-open
+
+    async def gate_12_spread_check(self, symbol: str) -> bool:
+        """Block a BUY when the real bid/ask spread is too wide -- FAIL CLOSED
+        on missing/stale book data, unlike gate_3/regime_gate.py's spread check
+        which silently no-ops (and effectively passes) when the WS book cache
+        has nothing for this symbol. That gap let a 0.53%-spread symbol
+        (BBUSDT) through on 2026-07-15: it wasn't in the WS's capped tracked
+        set, so get_book_age() was inf, and the always-0.0 fallback spread
+        trivially cleared gate_3's threshold.
+
+        Order of checks:
+          1. Live WS book cache, if fresh enough -- zero-cost, the common case.
+          2. REST bookTicker fallback, if the cache is missing/stale -- one
+             real check before a verdict, so a thin-but-actually-fine symbol
+             merely outside the WS's tracked set isn't blocked by default.
+          3. If neither is available, fail CLOSED (block) -- "we don't know
+             the spread" must not mean "assume it's fine" for a real order.
+        """
+        if not self._spread_gate_enabled:
+            return True
+        try:
+            ss = self._shared_state
+            spread_pct: float | None = None
+            if ss is not None and hasattr(ss, "get_book_age"):
+                age = float(ss.get_book_age(symbol))
+                if age <= self._spread_gate_max_book_age_s:
+                    spread_pct = float(ss.get_spread_pct(symbol))
+
+            if spread_pct is None and self._exchange_client is not None:
+                book = await self._exchange_client.get_book_ticker(symbol)
+                if book and book.get("bid", 0) > 0 and book.get("ask", 0) > 0:
+                    mid = (book["bid"] + book["ask"]) / 2.0
+                    spread_pct = (book["ask"] - book["bid"]) / mid if mid > 0 else None
+
+            if spread_pct is None:
+                _log.info(
+                    "[gate_12] %s BLOCK buy: no live or REST book data available "
+                    "(fail-closed on unknown spread)",
+                    symbol,
+                )
+                return False
+
+            if spread_pct > self._spread_gate_max_pct:
+                _log.info(
+                    "[gate_12] %s BLOCK buy: spread %.4f%% > max %.4f%%",
+                    symbol, spread_pct * 100.0, self._spread_gate_max_pct * 100.0,
+                )
+                return False
+            return True
+        except Exception:
+            _log.exception("[gate_12] spread check errored for %s -- fail-closed", symbol)
+            return False  # fail-CLOSED, deliberately unlike gate_11's fail-open
 
     def _confidence_floor(self, mode_name: str) -> float:
         # Get base floor — from mode_manager if available, else from decision engine

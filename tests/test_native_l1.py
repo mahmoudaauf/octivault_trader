@@ -106,6 +106,34 @@ class TestNativeExchangeClient:
         assert prices == {"BTCUSDT": 50000.0}
 
     @pytest.mark.asyncio
+    async def test_get_book_ticker_parses_bid_ask(self) -> None:
+        c = self._client()
+        c._request = AsyncMock(  # type: ignore[assignment]
+            return_value={
+                "symbol": "BTCUSDT",
+                "bidPrice": "49999.5", "bidQty": "1.2",
+                "askPrice": "50000.5", "askQty": "0.8",
+            }
+        )
+        book = await c.get_book_ticker("BTCUSDT")
+        assert book == {"bid": 49999.5, "bid_qty": 1.2, "ask": 50000.5, "ask_qty": 0.8}
+        c._request.assert_awaited_once_with(
+            "GET", c.EP_BOOK_TICKER, params={"symbol": "BTCUSDT"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_book_ticker_returns_none_on_request_failure(self) -> None:
+        c = self._client()
+        c._request = AsyncMock(side_effect=ExchangeClientError("boom"))  # type: ignore[assignment]
+        assert await c.get_book_ticker("BTCUSDT") is None
+
+    @pytest.mark.asyncio
+    async def test_get_book_ticker_returns_none_on_malformed_response(self) -> None:
+        c = self._client()
+        c._request = AsyncMock(return_value={"symbol": "BTCUSDT"})  # type: ignore[assignment]
+        assert await c.get_book_ticker("BTCUSDT") is None
+
+    @pytest.mark.asyncio
     async def test_place_order_market_params(self) -> None:
         c = self._client()
         captured: dict[str, Any] = {}
