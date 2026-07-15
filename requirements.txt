@@ -16,6 +16,11 @@ pandas==2.3.3
 numpy==1.26.4
 
 # =========================================
+# Text Sentiment (deterministic, no LLM calls)
+# =========================================
+vaderSentiment==3.3.2
+
+# =========================================
 # ML / Model Training (required for live retraining)
 # =========================================
 scikit-learn==1.5.2
