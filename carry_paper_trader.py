@@ -29,6 +29,10 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 STATE = "logs/carry_state.json"
 LEDGER = "logs/carry_ledger.jsonl"
 
@@ -277,9 +281,6 @@ def _report():
 
 async def run():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from dotenv import load_dotenv
-
-    load_dotenv()
     from binance import AsyncClient
 
     # Testnet validation: point the live order path at Binance FUTURES testnet (fake
