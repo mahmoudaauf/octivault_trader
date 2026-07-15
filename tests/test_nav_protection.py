@@ -175,6 +175,88 @@ def test_unknown_flat_healthy_nav_stays_normal() -> None:
     assert protection.suggested_confidence_floor_delta == 0.0
 
 
+def test_healthy_flat_account_at_peak_does_not_lock_95pct_floor() -> None:
+    """2026-07-15 regression: a flat (no open positions), no-drawdown account
+    sitting at its own all-time peak previously had protection_floor_usdt
+    unconditionally ratcheted to 95% of peak on every NORMAL cycle -- leaving
+    only ~5% of NAV "spendable" for new positions, far below Binance's minimum
+    order size. Reproduces the exact live scenario: peak=$57.87, nav=$57.85,
+    zero positions -- confirmed live to previously produce floor=$54.97
+    (only $2.87 available), blocking an otherwise-valid BUY."""
+    state = NativeSharedState()
+    state.recovery_state["recovery_mode_active"] = False
+    state.session_anchor_nav = 57.8669344981718
+    state.peak_nav_usdt = 57.8669344981718
+    state.metrics["peak_nav"] = 57.8669344981718
+    state.nav_usdt = 57.8669344981718
+    state.positions = {}
+    state.free_balance_usdt = 57.84562786
+    state.update_nav(57.84562786)
+    state.last_nav_attribution = {
+        "realized_pnl_total_usdt": 0.0,
+        "unrealized_pnl_total_usdt": 0.0,
+        "free_usdt": 57.84562786,
+    }
+
+    _, protection = evaluate_nav_protection(state)
+
+    assert protection.protection_mode == "NORMAL"
+    assert protection.protection_floor_usdt < 1.0, (
+        f"floor=${protection.protection_floor_usdt:.2f} -- a healthy flat account "
+        "at its own peak must not have ~95% of NAV walled off from new position sizing"
+    )
+
+
+def test_defensive_drawdown_still_applies_minimum_floor_ratio() -> None:
+    """Protective behavior must be preserved: a REAL drawdown into DEFENSIVE
+    mode still ratchets the floor to peak * minimum_protection_floor_ratio."""
+    state = NativeSharedState()
+    state.recovery_state["recovery_mode_active"] = False
+    state.session_anchor_nav = 98.0
+    state.peak_nav_usdt = 100.0
+    state.protection_floor_usdt = 0.0
+    state.nav_usdt = 98.0
+    state.update_nav(96.0)
+    state.last_nav_attribution = {
+        "realized_pnl_total_usdt": 0.0,
+        "unrealized_pnl_total_usdt": 2.0,
+        "free_usdt": 30.0,
+    }
+    state.metrics["unrealized_pnl"] = 0.0
+
+    _, protection = evaluate_nav_protection(state)
+
+    assert protection.protection_mode == "DEFENSIVE"
+    # Effective peak is capped to session_anchor_nav (98.0), not the raw
+    # peak_nav_usdt (100.0) -- see the "cap peak to session_anchor" guard.
+    assert protection.protection_floor_usdt == pytest.approx(98.0 * 0.95, rel=1e-6)
+
+
+def test_freeze_buy_still_applies_minimum_floor_ratio() -> None:
+    """Protective behavior must be preserved: FREEZE_BUY still ratchets the
+    floor to peak * minimum_protection_floor_ratio."""
+    state = NativeSharedState()
+    state.recovery_state["recovery_mode_active"] = False
+    state.session_anchor_nav = 97.0
+    state.peak_nav_usdt = 100.0
+    state.protection_floor_usdt = 0.0
+    state.nav_usdt = 97.0
+    state.update_nav(93.0)
+    state.metrics["unrealized_pnl"] = -4.0
+    state.last_nav_attribution = {
+        "realized_pnl_total_usdt": 0.0,
+        "unrealized_pnl_total_usdt": 0.0,
+        "free_usdt": 93.0,
+    }
+
+    _, protection = evaluate_nav_protection(state)
+
+    assert protection.protection_mode == "FREEZE_BUY"
+    # Effective peak is capped to session_anchor_nav (97.0), not the raw
+    # peak_nav_usdt (100.0) -- see the "cap peak to session_anchor" guard.
+    assert protection.protection_floor_usdt == pytest.approx(97.0 * 0.95, rel=1e-6)
+
+
 def test_concentration_gain_blocks_adding_more_to_same_symbol() -> None:
     state = NativeSharedState()
     state.recovery_state["recovery_mode_active"] = False

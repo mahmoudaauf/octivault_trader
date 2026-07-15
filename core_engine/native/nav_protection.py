@@ -345,7 +345,20 @@ class NAVProtectionEngine:
         free_usdt = float(getattr(shared_state, "free_balance_usdt", 0.0) or 0.0)
         free_ratio = (free_usdt / current_nav) if current_nav > 0 else 0.0
 
-        new_floor = max(prev_floor, peak_nav * self.minimum_protection_floor_ratio)
+        # 2026-07-15 fix: this used to unconditionally ratchet to peak*ratio (95%)
+        # on EVERY cycle regardless of mode -- so a perfectly healthy, flat/cash
+        # account sitting at its own all-time peak (the normal state for a small
+        # account that has never drawn down) had ~95% of NAV permanently walled
+        # off from new position sizing via daily_compounding.sizing_nav()'s
+        # protection_floor_usdt connection, leaving ~5% of peak "spendable" --
+        # far below Binance's minimum order size for any realistic small NAV.
+        # Confirmed live: peak=$57.87, ratio=0.95 -> floor=$54.97 -> only $2.87
+        # "available", blocking a signal that had already passed confidence and
+        # regime gates. The floor should only ratchet up within an ACTUAL
+        # protective trigger below (real drawdown or a realized-profit lock),
+        # matching every other branch's own bespoke floor logic -- not in the
+        # default/NORMAL, no-event case.
+        new_floor = prev_floor
 
         recovery_state = getattr(shared_state, "recovery_state", {}) or {}
         if recovery_state.get("recovery_mode_active", False):
@@ -364,6 +377,7 @@ class NAVProtectionEngine:
             allow_buy = False
             size_multiplier = 0.0
             confidence_delta = 0.20
+            new_floor = max(new_floor, peak_nav * self.minimum_protection_floor_ratio)
             actions.append("RECOVERY_ONLY")
             reason = "nav_drawdown_recovery_threshold"
         elif drawdown >= self.drawdown_freeze_buy_pct:
@@ -372,6 +386,7 @@ class NAVProtectionEngine:
             size_multiplier = 0.0
             confidence_delta = 0.15
             allow_tp_sl_adjustment = True
+            new_floor = max(new_floor, peak_nav * self.minimum_protection_floor_ratio)
             actions.extend(["FREEZE_NEW_BUYS", "TIGHTEN_TP_SL"])
             reason = "nav_drawdown_freeze_buy_threshold"
         elif drawdown >= self.drawdown_defensive_pct:
@@ -379,6 +394,7 @@ class NAVProtectionEngine:
             size_multiplier = 0.50
             confidence_delta = 0.10
             allow_tp_sl_adjustment = True
+            new_floor = max(new_floor, peak_nav * self.minimum_protection_floor_ratio)
             actions.extend(["REDUCE_BUY_SIZE", "TIGHTEN_TP_SL"])
             reason = "nav_drawdown_defensive_threshold"
         elif attribution.attribution_type == "REALIZED_PROFIT" and floating_gain_pct >= self.profit_lock_trigger_pct:
