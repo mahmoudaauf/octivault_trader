@@ -53,6 +53,10 @@ from .error_types import (
 
 # ── L1 ───────────────────────────────────────────────────────────────
 from .exchange_client import ExchangeClientError, NativeExchangeClient
+from .futures_exchange_client import (
+    FuturesExchangeClientError,
+    NativeFuturesExchangeClient,
+)
 
 # ── L5 ───────────────────────────────────────────────────────────────
 from .executor import ExecutionResult, ExecutionStatus, NativeExecutor
@@ -124,6 +128,8 @@ __all__ = [
     # L1
     "NativeExchangeClient",
     "ExchangeClientError",
+    "NativeFuturesExchangeClient",
+    "FuturesExchangeClientError",
     "NativeBalanceSync",
     "NativeBalanceValidator",
     "AllocationStatus",
