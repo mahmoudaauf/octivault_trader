@@ -16,7 +16,9 @@ Usage:
   python3 carry_paper_trader.py            # run the paper trader (daemon)
   python3 carry_paper_trader.py report     # print the live edge verdict and exit
 Env: CARRY_ENTRY_BPS(6) CARRY_EXIT_BPS(1) CARRY_FEE_RT_PCT(0.24)
-     CARRY_MIN_VOL_USD(50e6) CARRY_MAX_HOLD_H(360) CARRY_POLL_MIN(30) CARRY_NOTIONAL(1000)
+     CARRY_MIN_VOL_USD(50e6) CARRY_MAX_HOLD_H(360) CARRY_POLL_MIN(30)
+     CARRY_NOTIONAL (explicit override, $/leg -- if unset, sizing is NAV-aware:
+     see CARRY_NAV_FRACTION/CARRY_MIN_NOTIONAL/CARRY_MAX_NOTIONAL below)
 """
 from __future__ import annotations
 
@@ -36,7 +38,16 @@ FEE_RT = float(os.getenv("CARRY_FEE_RT_PCT", "0.24")) / 100.0
 MIN_VOL = float(os.getenv("CARRY_MIN_VOL_USD", "50000000"))
 MAX_HOLD_H = float(os.getenv("CARRY_MAX_HOLD_H", "360"))      # 15 days
 POLL_MIN = float(os.getenv("CARRY_POLL_MIN", "30"))
-NOTIONAL = float(os.getenv("CARRY_NOTIONAL", "1000"))         # $ per leg
+# NOTIONAL ($/leg): a flat, NAV-independent constant was unrealistic for a real
+# account (e.g. $1000/leg on a $58 account is ~17x the whole account). If
+# CARRY_NOTIONAL is explicitly set, that override wins as-is (unchanged
+# behavior). Otherwise sizing is NAV-aware -- see _resolve_notional() -- based
+# on the account's real free USDT balance, fetched once at daemon startup.
+_NOTIONAL_OVERRIDE = os.getenv("CARRY_NOTIONAL")
+NOTIONAL = float(_NOTIONAL_OVERRIDE) if _NOTIONAL_OVERRIDE else 1000.0  # $ per leg (placeholder until resolved)
+CARRY_NAV_FRACTION = float(os.getenv("CARRY_NAV_FRACTION", "0.02"))  # 2% of free USDT per leg
+CARRY_MIN_NOTIONAL = float(os.getenv("CARRY_MIN_NOTIONAL", "10"))    # exchange-realistic floor
+CARRY_MAX_NOTIONAL = float(os.getenv("CARRY_MAX_NOTIONAL", "1000"))  # upper cap (old default's value)
 MIN_TRADES = 30
 
 # ── Execution mode + safety ────────────────────────────────────────────────────
@@ -176,6 +187,26 @@ def _log_trade(rec: dict):
         f.write(json.dumps(rec) + "\n")
 
 
+async def _resolve_notional(client) -> tuple[float, str]:
+    """Resolve $/leg sizing. Explicit CARRY_NOTIONAL always wins (unchanged
+    behavior). Otherwise, size off the account's real free USDT balance --
+    this is a paper daemon so no capital actually moves, but the forward-proof
+    run should reflect what a real deployment would look like at THIS
+    account's actual size, not an arbitrary flat dollar figure. Falls back to
+    CARRY_MAX_NOTIONAL (the old flat default) if the balance fetch fails, so a
+    transient API error can never silently zero out sizing."""
+    if _NOTIONAL_OVERRIDE:
+        return float(_NOTIONAL_OVERRIDE), "explicit CARRY_NOTIONAL override"
+    try:
+        bal = await client.get_asset_balance(asset="USDT")
+        free_usdt = float((bal or {}).get("free", 0.0) or 0.0)
+    except Exception as e:
+        print(f"[carry] ⚠️  free-USDT fetch failed ({str(e)[:60]}) — using flat ${CARRY_MAX_NOTIONAL:.0f}/leg fallback")
+        return CARRY_MAX_NOTIONAL, "fallback (balance fetch failed)"
+    notional = max(CARRY_MIN_NOTIONAL, min(free_usdt * CARRY_NAV_FRACTION, CARRY_MAX_NOTIONAL))
+    return notional, f"NAV-aware ({CARRY_NAV_FRACTION*100:.1f}% of ${free_usdt:.2f} free USDT)"
+
+
 async def build_universe(client) -> set[str]:
     """USDT perps that ALSO have spot (hedgeable) AND >= MIN_VOL/24h (tradeable)."""
     info = await client.futures_exchange_info()
@@ -269,6 +300,7 @@ async def run():
         client = await AsyncClient.create(
             os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x"
         )
+    global NOTIONAL
     state = _load(STATE, {"open": {}})
     armed = MODE == "live" and os.path.exists(LIVE_ARM_FILE)
     banner = {"paper": "📝 PAPER (no orders)", "dryrun": "🧪 DRY-RUN (logs orders, sends none)",
@@ -278,8 +310,9 @@ async def run():
           f"max_total=${MAX_TOTAL_USD:.0f} leverage={LEVERAGE}x")
     print(f"[carry] guards — auto_halt_drawdown={MAX_DD_PCT}% liq_buffer={LIQ_BUFFER_PCT}% "
           f"kill_file={KILL_FILE}")
+    NOTIONAL, _notional_reason = await _resolve_notional(client)
     print(f"[carry] params — entry|f|>={ENTRY*100:.3f}% exit<{EXIT*100:.3f}% "
-          f"fee={FEE_RT*100:.2f}% notional=${NOTIONAL:.0f}/leg poll={POLL_MIN}m")
+          f"fee={FEE_RT*100:.2f}% notional=${NOTIONAL:.2f}/leg ({_notional_reason}) poll={POLL_MIN}m")
     if MODE == "live" and not armed:
         print(f"[carry] ⚠️  MODE=live but '{LIVE_ARM_FILE}' absent — will NOT send orders.")
     try:
