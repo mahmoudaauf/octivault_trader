@@ -48,8 +48,13 @@ from .balance_sync import NativeBalanceSync
 from .balance_validator import NativeBalanceValidator
 from .bounded_cache import NativeBoundedCache
 from .capital_allocator import NativeCapitalAllocator
+from .carry.executor import CarryLegExecutor
+from .carry.gates import CarryGateEngine
+from .carry.poller import CarryPollingLoop
+from .carry.state import CarrySharedState
 from .decisions import NativeDecisionEngine
 from .exchange_client import NativeExchangeClient
+from .futures_exchange_client import NativeFuturesExchangeClient
 from .daily_target_monitor import NativeDailyTargetMonitor
 from .executor import NativeExecutor
 from .fill_tracker import NativeFillTracker
@@ -178,6 +183,35 @@ class BootstrapConfig:
     adaptive_risk_fraction_min: float = 0.05
     adaptive_risk_fraction_max: float = 0.35
 
+    # --- funding-rate carry strategy (opt-in, default OFF; see the
+    # funding-carry engineering-study plan). Construction only -- build_components()
+    # never calls start() on anything (see its own docstring), so even with
+    # this enabled the carry poller does not run unless a caller explicitly
+    # starts it. Strategy-parameter env vars (CARRY_ENTRY_BPS etc.) are
+    # deliberately the SAME names carry_paper_trader.py already uses, since
+    # they're genuinely the same strategy parameters and should stay in
+    # sync. State/ledger/kill-file PATHS default to distinct native_carry_*
+    # paths so this never collides with the still-independently-running
+    # standalone paper daemon. ---
+    carry_native_enabled: bool = False
+    carry_universe: list[str] = field(default_factory=list)  # empty = auto-discover, matching carry_paper_trader.py's build_universe()
+    carry_entry_bps: float = 6.0
+    carry_exit_bps: float = 1.0
+    carry_positive_only: bool = True
+    carry_max_positions: int = 5
+    carry_max_total_usd: float = 5000.0
+    carry_max_hold_h: float = 360.0
+    carry_max_drawdown_pct: float = 5.0
+    carry_liq_buffer_pct: float = 15.0
+    carry_leverage: int = 2
+    carry_funding_poll_interval_sec: float = 1800.0
+    carry_liq_check_interval_sec: float = 300.0
+    carry_state_path: str = "logs/native_carry_state.json"
+    carry_ledger_path: str = "logs/native_carry_ledger.jsonl"
+    carry_kill_file: str = "logs/native_carry.stop"
+    carry_futures_testnet_api_key: str = ""
+    carry_futures_testnet_api_secret: str = ""
+
     # ------------------------------------------------------------------
     # Loaders
     # ------------------------------------------------------------------
@@ -289,6 +323,26 @@ class BootstrapConfig:
             ofc_heartbeat_sec=_float(e.get("OFC_HEARTBEAT_SEC"), 900.0),
             adaptive_risk_fraction_min=_float(e.get("ADAPTIVE_RISK_FRACTION_MIN"), 0.05),
             adaptive_risk_fraction_max=_float(e.get("ADAPTIVE_RISK_FRACTION_MAX"), 0.35),
+            carry_native_enabled=_bool(e.get("CARRY_NATIVE_ENABLED"), default=False),
+            carry_universe=(
+                [s.strip().upper() for s in (e.get("CARRY_UNIVERSE") or "").split(",") if s.strip()]
+            ),
+            carry_entry_bps=_float(e.get("CARRY_ENTRY_BPS"), 6.0),
+            carry_exit_bps=_float(e.get("CARRY_EXIT_BPS"), 1.0),
+            carry_positive_only=_bool(e.get("CARRY_POSITIVE_ONLY"), default=True),
+            carry_max_positions=_int(e.get("CARRY_MAX_POSITIONS"), 5),
+            carry_max_total_usd=_float(e.get("CARRY_MAX_TOTAL_USD"), 5000.0),
+            carry_max_hold_h=_float(e.get("CARRY_MAX_HOLD_H"), 360.0),
+            carry_max_drawdown_pct=_float(e.get("CARRY_MAX_DD_PCT"), 5.0),
+            carry_liq_buffer_pct=_float(e.get("CARRY_LIQ_BUFFER_PCT"), 15.0),
+            carry_leverage=_int(e.get("CARRY_LEVERAGE"), 2),
+            carry_funding_poll_interval_sec=_float(e.get("CARRY_NATIVE_FUNDING_POLL_INTERVAL_SEC"), 1800.0),
+            carry_liq_check_interval_sec=_float(e.get("CARRY_NATIVE_LIQ_CHECK_INTERVAL_SEC"), 300.0),
+            carry_state_path=(e.get("CARRY_NATIVE_STATE_PATH") or "logs/native_carry_state.json"),
+            carry_ledger_path=(e.get("CARRY_NATIVE_LEDGER_PATH") or "logs/native_carry_ledger.jsonl"),
+            carry_kill_file=(e.get("CARRY_NATIVE_KILL_FILE") or "logs/native_carry.stop"),
+            carry_futures_testnet_api_key=(e.get("BINANCE_FUTURES_TESTNET_KEY") or "").strip(),
+            carry_futures_testnet_api_secret=(e.get("BINANCE_FUTURES_TESTNET_SECRET") or "").strip(),
         )
 
 
@@ -309,6 +363,33 @@ def _default_exchange_factory(cfg: BootstrapConfig) -> NativeExchangeClient:
         testnet=cfg.testnet,
         request_timeout_sec=cfg.request_timeout_sec,
         signed_request_cooldown_sec=0.0,  # Disable local cooldown; rely on Binance 429 throttling only
+    )
+
+
+FuturesExchangeClientFactory = Callable[[BootstrapConfig], NativeFuturesExchangeClient]
+"""Optional injection seam for tests; defaults to real ``NativeFuturesExchangeClient``.
+Mirrors ExchangeClientFactory's pattern."""
+
+
+def _default_futures_exchange_factory(cfg: BootstrapConfig) -> NativeFuturesExchangeClient:
+    # Binance spot and futures testnets are SEPARATE systems with separate
+    # credentials (confirmed empirically during this strategy's earlier
+    # testnet validation work) -- do not reuse cfg.api_key/api_secret for
+    # futures testnet, even though _default_exchange_factory reuses the same
+    # creds for spot testnet vs live.
+    if cfg.paper_mode:
+        api_key, api_secret = "paper_key", "paper_secret"
+    elif cfg.testnet:
+        api_key = cfg.carry_futures_testnet_api_key
+        api_secret = cfg.carry_futures_testnet_api_secret
+    else:
+        api_key, api_secret = cfg.api_key, cfg.api_secret
+    return NativeFuturesExchangeClient(
+        api_key=api_key,
+        api_secret=api_secret,
+        testnet=cfg.testnet,
+        request_timeout_sec=cfg.request_timeout_sec,
+        signed_request_cooldown_sec=0.0,
     )
 
 
@@ -450,6 +531,7 @@ async def build_components(
     cfg: BootstrapConfig,
     *,
     exchange_client_factory: ExchangeClientFactory | None = None,
+    futures_exchange_client_factory: FuturesExchangeClientFactory | None = None,
 ) -> NativeComponents:
     """
     Build all L0-L6 native components from ``cfg``.
@@ -494,6 +576,72 @@ async def build_components(
             reason=str(getattr(shared_state, "exchange_throttle_reason", "") or ""),
         )
     order_execution = NativeOrderExecution(exchange_client)
+
+    # Funding-rate carry strategy (opt-in, default OFF) -- see the
+    # funding-carry engineering-study plan. Construction only: this function
+    # never calls start() on anything (see its own docstring), so even with
+    # carry_native_enabled=True the poller does not run unless a caller
+    # explicitly starts it -- no live behavior changes from this block
+    # existing until that separate, later step is taken.
+    futures_exchange_client = None
+    carry_state = None
+    carry_gates = None
+    carry_executor = None
+    carry_poller = None
+    if cfg.carry_native_enabled:
+        futures_factory = futures_exchange_client_factory or _default_futures_exchange_factory
+        futures_exchange_client = futures_factory(cfg)
+        carry_state = CarrySharedState(
+            state_path=cfg.carry_state_path,
+            ledger_path=cfg.carry_ledger_path,
+        )
+        carry_gates = CarryGateEngine(
+            carry_state=carry_state,
+            shared_state=shared_state,
+            entry_bps=cfg.carry_entry_bps,
+            exit_bps=cfg.carry_exit_bps,
+            positive_only=cfg.carry_positive_only,
+            max_positions=cfg.carry_max_positions,
+            max_total_usd=cfg.carry_max_total_usd,
+            max_hold_h=cfg.carry_max_hold_h,
+            max_drawdown_pct=cfg.carry_max_drawdown_pct,
+            liq_buffer_pct=cfg.carry_liq_buffer_pct,
+            kill_file=cfg.carry_kill_file,
+        )
+        carry_executor = CarryLegExecutor(
+            futures_client=futures_exchange_client,
+            spot_client=exchange_client,
+            carry_state=carry_state,
+            leverage=cfg.carry_leverage,
+            mismatch_kill_file=cfg.carry_kill_file,
+        )
+
+        async def _resolve_carry_notional_usd() -> float:
+            """NAV-aware sizing (2% of free spot USDT, floored/capped),
+            mirroring carry_paper_trader.py's own _resolve_notional() --
+            keeps the native wiring's sizing consistent with the paper
+            daemon's already-validated approach rather than a fresh
+            flat-dollar guess."""
+            bal = await exchange_client.get_balance()
+            free_usdt = float((bal or {}).get("USDT", 0.0) or 0.0)
+            return max(10.0, min(free_usdt * 0.02, cfg.carry_max_total_usd))
+
+        carry_poller = CarryPollingLoop(
+            futures_client=futures_exchange_client,
+            carry_state=carry_state,
+            carry_gates=carry_gates,
+            carry_executor=carry_executor,
+            universe=set(cfg.carry_universe) or None,
+            resolve_notional_usd=_resolve_carry_notional_usd,
+            default_notional_usd=10.0,
+            funding_poll_interval_sec=cfg.carry_funding_poll_interval_sec,
+            liq_check_interval_sec=cfg.carry_liq_check_interval_sec,
+        )
+        logger.info(
+            "✅ Carry native components constructed (NOT started) -- %d universe symbols%s",
+            len(cfg.carry_universe),
+            " (auto-discover pending)" if not cfg.carry_universe else "",
+        )
 
     # L1: Polling coordinator (legacy-style staggered polling with active-trades gate)
     # Replaces aggressive REST polling (2s market data, 5s balance, 5s fills)
@@ -1024,6 +1172,11 @@ async def build_components(
         ml_forecaster=ml_forecaster,
         symbol_screener=symbol_screener,
         symbol_rotator=symbol_rotator,
+        futures_exchange_client=futures_exchange_client,
+        carry_state=carry_state,
+        carry_gates=carry_gates,
+        carry_executor=carry_executor,
+        carry_poller=carry_poller,
     )
 
 
@@ -1073,6 +1226,15 @@ async def shutdown_components(components: NativeComponents) -> None:
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("native shutdown: ml_forecaster.stop() raised: %r", e)
 
+    # carry poller (safe no-op if it was never started -- CarryPollingLoop.stop()
+    # only cancels tasks that are not None)
+    carry_poller = components.carry_poller
+    if carry_poller is not None:
+        try:
+            await carry_poller.stop()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("native shutdown: carry_poller.stop() raised: %r", e)
+
     # close exchange HTTP session if reachable
     client = components.exchange_client or getattr(components.balance_sync, "_client", None)
     if client is not None and hasattr(client, "close"):
@@ -1080,6 +1242,14 @@ async def shutdown_components(components: NativeComponents) -> None:
             await client.close()
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("native shutdown: exchange_client.close() raised: %r", e)
+
+    # close futures exchange HTTP session if constructed
+    futures_client = components.futures_exchange_client
+    if futures_client is not None and hasattr(futures_client, "close"):
+        try:
+            await futures_client.close()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("native shutdown: futures_exchange_client.close() raised: %r", e)
 
 
 # ----------------------------------------------------------------------

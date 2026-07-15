@@ -35,6 +35,37 @@ from .state import CarrySharedState
 logger = logging.getLogger(__name__)
 
 
+async def discover_carry_universe(
+    futures_client: Any, spot_client: Any, *, min_vol_usd: float = 50_000_000.0
+) -> set[str]:
+    """USDT perps that ALSO have a spot market (delta-neutral actually
+    possible) AND clear a liquidity floor. Mirrors carry_paper_trader.py's
+    build_universe() exactly (same three-endpoint approach), just against
+    the native futures/spot clients instead of a single shared
+    python-binance AsyncClient."""
+    try:
+        info = await futures_client.futures_exchange_info()
+        perps = {
+            s["symbol"] for s in info.get("symbols", [])
+            if s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL"
+            and s.get("status") == "TRADING"
+        }
+        spot_info = await spot_client.get_exchange_info()
+        spot_symbols = {s["symbol"] for s in spot_info.get("symbols", []) if s.get("status") == "TRADING"}
+        tickers = await futures_client.futures_ticker()
+        vol_by_symbol = {
+            t.get("symbol"): float(t.get("quoteVolume", 0.0) or 0.0)
+            for t in (tickers if isinstance(tickers, list) else [])
+        }
+        return {
+            s for s in perps
+            if s in spot_symbols and vol_by_symbol.get(s, 0.0) >= min_vol_usd
+        }
+    except Exception as e:
+        logger.warning("[carry-poller] universe discovery failed: %s", str(e)[:150])
+        return set()
+
+
 class CarryPollingLoop:
     def __init__(
         self,

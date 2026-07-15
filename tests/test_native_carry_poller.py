@@ -16,6 +16,7 @@ import pytest
 
 from core_engine.native.carry.executor import LegExecutionResult
 from core_engine.native.carry.gates import CarryGateEngine
+from core_engine.native.carry.poller import discover_carry_universe
 from core_engine.native.carry.poller import CarryPollingLoop
 from core_engine.native.carry.state import CarrySharedState, HedgePosition
 
@@ -278,3 +279,41 @@ class TestLifecycle:
 
         assert p._funding_task is None
         assert p._liq_task is None
+
+
+class TestDiscoverCarryUniverse:
+    @pytest.mark.asyncio
+    async def test_filters_to_spot_hedgeable_liquid_perps(self) -> None:
+        futures = AsyncMock()
+        futures.futures_exchange_info.return_value = {
+            "symbols": [
+                {"symbol": "BTCUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+                {"symbol": "ETHUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+                {"symbol": "NOSPOTUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+                {"symbol": "DELISTEDUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "BREAK"},
+            ]
+        }
+        futures.futures_ticker.return_value = [
+            {"symbol": "BTCUSDT", "quoteVolume": "100000000"},
+            {"symbol": "ETHUSDT", "quoteVolume": "1000"},  # below liquidity floor
+            {"symbol": "NOSPOTUSDT", "quoteVolume": "100000000"},
+        ]
+        spot = AsyncMock()
+        spot.get_exchange_info.return_value = {
+            "symbols": [
+                {"symbol": "BTCUSDT", "status": "TRADING"},
+                {"symbol": "ETHUSDT", "status": "TRADING"},
+            ]
+        }
+
+        universe = await discover_carry_universe(futures, spot, min_vol_usd=50_000_000.0)
+        assert universe == {"BTCUSDT"}
+
+    @pytest.mark.asyncio
+    async def test_failure_returns_empty_set_not_raises(self) -> None:
+        futures = AsyncMock()
+        futures.futures_exchange_info.side_effect = RuntimeError("network down")
+        spot = AsyncMock()
+
+        universe = await discover_carry_universe(futures, spot)
+        assert universe == set()

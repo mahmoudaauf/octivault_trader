@@ -554,3 +554,159 @@ def test_from_env_telemetry_export_defaults():
     cfg = BootstrapConfig.from_env({"BINANCE_API_KEY": "k", "BINANCE_API_SECRET": "s"})
     assert cfg.telemetry_export_path == ""
     assert cfg.telemetry_export_interval_sec == 10.0
+
+
+# ---------------------------------------------------------------------
+# Funding-carry native wiring (Phase 7 of the engineering-study plan) --
+# opt-in, default OFF. These tests exist to lock in the one property that
+# matters most: with the default config (matching the live bot's actual
+# .env, which does not set CARRY_NATIVE_ENABLED), nothing carry-related is
+# constructed and nothing about existing behavior changes.
+# ---------------------------------------------------------------------
+def test_bootstrap_config_carry_disabled_by_default():
+    cfg = BootstrapConfig(api_key="k", api_secret="s")
+    assert cfg.carry_native_enabled is False
+
+
+def test_from_env_carry_disabled_when_unset():
+    cfg = BootstrapConfig.from_env({"BINANCE_API_KEY": "k", "BINANCE_API_SECRET": "s"})
+    assert cfg.carry_native_enabled is False
+
+
+def test_from_env_parses_carry_settings(monkeypatch):
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setenv("CARRY_NATIVE_ENABLED", "true")
+    monkeypatch.setenv("CARRY_UNIVERSE", "btcusdt, ethusdt")
+    monkeypatch.setenv("CARRY_ENTRY_BPS", "8")
+    monkeypatch.setenv("CARRY_MAX_POSITIONS", "3")
+    cfg = BootstrapConfig.from_env()
+    assert cfg.carry_native_enabled is True
+    assert cfg.carry_universe == ["BTCUSDT", "ETHUSDT"]
+    assert cfg.carry_entry_bps == 8.0
+    assert cfg.carry_max_positions == 3
+
+
+@pytest.mark.asyncio
+async def test_build_components_carry_disabled_leaves_all_carry_fields_none():
+    cfg = _min_cfg()  # carry_native_enabled not overridden -> default False
+    components = await build_components(cfg, exchange_client_factory=_stub_factory)
+    assert components.futures_exchange_client is None
+    assert components.carry_state is None
+    assert components.carry_gates is None
+    assert components.carry_executor is None
+    assert components.carry_poller is None
+
+
+@pytest.mark.asyncio
+async def test_build_components_carry_disabled_app_ctx_has_no_carry_keys():
+    cfg = _min_cfg()
+    components = await build_components(cfg, exchange_client_factory=_stub_factory)
+    app_ctx, _ = build_native_app_ctx(components)
+    assert "carry_poller" not in app_ctx
+    assert "carry_state" not in app_ctx
+
+
+@pytest.mark.asyncio
+async def test_build_components_carry_enabled_constructs_all_components(tmp_path):
+    def _stub_futures_factory(_cfg):
+        return _StubExchangeClient()
+
+    cfg = _min_cfg(
+        carry_native_enabled=True,
+        carry_state_path=str(tmp_path / "carry_state.json"),
+        carry_ledger_path=str(tmp_path / "carry_ledger.jsonl"),
+        carry_kill_file=str(tmp_path / "carry.stop"),
+    )
+    components = await build_components(
+        cfg,
+        exchange_client_factory=_stub_factory,
+        futures_exchange_client_factory=_stub_futures_factory,
+    )
+    assert components.futures_exchange_client is not None
+    assert components.carry_state is not None
+    assert components.carry_gates is not None
+    assert components.carry_executor is not None
+    assert components.carry_poller is not None
+
+
+@pytest.mark.asyncio
+async def test_build_components_carry_enabled_never_auto_starts_poller(tmp_path):
+    def _stub_futures_factory(_cfg):
+        return _StubExchangeClient()
+
+    cfg = _min_cfg(
+        carry_native_enabled=True,
+        carry_state_path=str(tmp_path / "carry_state.json"),
+        carry_ledger_path=str(tmp_path / "carry_ledger.jsonl"),
+        carry_kill_file=str(tmp_path / "carry.stop"),
+    )
+    components = await build_components(
+        cfg,
+        exchange_client_factory=_stub_factory,
+        futures_exchange_client_factory=_stub_futures_factory,
+    )
+    # build_components() never calls start() on anything (see its own
+    # docstring) -- carry must be no exception, even when enabled.
+    assert components.carry_poller._running is False
+    assert components.carry_poller._funding_task is None
+    assert components.carry_poller._liq_task is None
+
+
+@pytest.mark.asyncio
+async def test_build_components_carry_enabled_app_ctx_exposes_carry_keys(tmp_path):
+    def _stub_futures_factory(_cfg):
+        return _StubExchangeClient()
+
+    cfg = _min_cfg(
+        carry_native_enabled=True,
+        carry_state_path=str(tmp_path / "carry_state.json"),
+        carry_ledger_path=str(tmp_path / "carry_ledger.jsonl"),
+        carry_kill_file=str(tmp_path / "carry.stop"),
+    )
+    components = await build_components(
+        cfg,
+        exchange_client_factory=_stub_factory,
+        futures_exchange_client_factory=_stub_futures_factory,
+    )
+    app_ctx, _ = build_native_app_ctx(components)
+    assert app_ctx["carry_poller"] is components.carry_poller
+    assert app_ctx["carry_state"] is components.carry_state
+    assert app_ctx["carry_gates"] is components.carry_gates
+    assert app_ctx["carry_executor"] is components.carry_executor
+    assert app_ctx["futures_exchange_client"] is components.futures_exchange_client
+
+
+@pytest.mark.asyncio
+async def test_shutdown_components_stops_carry_poller_if_present(tmp_path):
+    def _stub_futures_factory(_cfg):
+        return _StubExchangeClient()
+
+    cfg = _min_cfg(
+        carry_native_enabled=True,
+        carry_state_path=str(tmp_path / "carry_state.json"),
+        carry_ledger_path=str(tmp_path / "carry_ledger.jsonl"),
+        carry_kill_file=str(tmp_path / "carry.stop"),
+    )
+    components = await build_components(
+        cfg,
+        exchange_client_factory=_stub_factory,
+        futures_exchange_client_factory=_stub_futures_factory,
+    )
+    await components.carry_poller.start()
+    assert components.carry_poller._running is True
+
+    await shutdown_components(components)
+    assert components.carry_poller._running is False
+    # Idempotent -- calling shutdown again (e.g. double-stop) must not raise.
+    await shutdown_components(components)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_components_safe_when_carry_disabled():
+    """The most important regression guard: shutdown must not assume
+    components.carry_poller exists in a truthy sense -- disabled-by-default
+    is the live bot's actual current configuration."""
+    cfg = _min_cfg()
+    components = await build_components(cfg, exchange_client_factory=_stub_factory)
+    await shutdown_components(components)  # must not raise

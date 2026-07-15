@@ -152,6 +152,19 @@ class NativeComponents:
     symbol_rotator: Any | None = None  # SymbolRotator | None
     daily_target_monitor: Any | None = None  # NativeDailyTargetMonitor | None (L0, remediation #18)
 
+    # --- funding-rate carry strategy (opt-in, default OFF -- see the
+    # funding-carry engineering-study plan). None unless
+    # BootstrapConfig.carry_native_enabled=True. Deliberately NOT threaded
+    # into NativeOrchestrator's constructor -- the carry poller manages its
+    # own independent asyncio loop rather than participating in the
+    # per-cycle trading loop, matching its "parallel, additive system"
+    # design (see core_engine/native/carry/ subpackage docstring). ---
+    futures_exchange_client: Any | None = None  # NativeFuturesExchangeClient | None
+    carry_state: Any | None = None  # CarrySharedState | None
+    carry_gates: Any | None = None  # CarryGateEngine | None
+    carry_executor: Any | None = None  # CarryLegExecutor | None
+    carry_poller: Any | None = None  # CarryPollingLoop | None
+
 
 def build_native_app_ctx(
     components: NativeComponents,
@@ -255,6 +268,12 @@ def build_native_app_ctx(
         app_ctx["signal_manager_bridge"] = components.signal_manager_bridge
     if components.daily_target_monitor is not None:
         app_ctx["daily_target_monitor"] = components.daily_target_monitor
+    if components.carry_poller is not None:
+        app_ctx["carry_poller"] = components.carry_poller
+        app_ctx["carry_state"] = components.carry_state
+        app_ctx["carry_gates"] = components.carry_gates
+        app_ctx["carry_executor"] = components.carry_executor
+        app_ctx["futures_exchange_client"] = components.futures_exchange_client
 
     return app_ctx, orch
 
