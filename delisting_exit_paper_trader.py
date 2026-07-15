@@ -45,6 +45,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import requests
 from dotenv import load_dotenv
@@ -164,22 +165,50 @@ async def _price(client, symbol: str) -> float | None:
         return None
 
 
+async def round_to_lot_size(client, symbol: str, qty: float) -> float | None:
+    """Round qty DOWN to the exchange's LOT_SIZE stepSize for this symbol, and
+    return None if the result is below minQty (too small to sell at all).
+    Binance rejects orders that don't land on a stepSize increment -- passing
+    a raw free-balance quantity through unrounded fails for most symbols."""
+    try:
+        info = await client.get_symbol_info(f"{symbol}USDT")
+    except Exception:
+        return None
+    if not info:
+        return None
+    lot = next((f for f in info.get("filters", []) if f.get("filterType") == "LOT_SIZE"), None)
+    if not lot:
+        return qty  # no LOT_SIZE filter found -- pass through rather than block
+    step = Decimal(lot["stepSize"])
+    min_qty = Decimal(lot["minQty"])
+    q = Decimal(str(qty))
+    rounded = (q // step) * step
+    if rounded < min_qty:
+        return None
+    return float(rounded)
+
+
 async def execute_exit(client, symbol: str, qty: float) -> tuple[bool, str]:
     """Returns (acted, description). paper: log only. dryrun: log the intended
-    order. live: place a REAL market sell for the held quantity -- DOUBLE-
-    GATED (MODE=live AND arm file). NOTE: quantity precision (LOT_SIZE step)
-    is NOT hardened here -- this needs testnet validation before real arming,
-    same discipline carry_paper_trader.py's own docstring calls for."""
-    desc = f"SELL {qty} {symbol} (existing holding, delisting notice)"
+    order (LOT_SIZE-rounded, so the log reflects what would actually be sent).
+    live: place a REAL market sell for the LOT_SIZE-rounded quantity --
+    DOUBLE-GATED (MODE=live AND arm file). Testnet-validated 2026-07-15 via
+    DELIST_EXIT_TESTNET=true against a real testnet holding."""
     if MODE == "paper":
-        return True, f"[PAPER] {desc}"
+        return True, f"[PAPER] SELL {qty} {symbol} (existing holding, delisting notice)"
+
+    rounded = await round_to_lot_size(client, symbol, qty)
+    if rounded is None:
+        return False, f"[SKIP] {symbol}: holding too small to clear exchange minQty after LOT_SIZE rounding"
+    desc = f"SELL {rounded} {symbol} (existing holding, delisting notice)"
+
     if MODE == "dryrun":
         return True, f"[DRYRUN] {desc}"
     if MODE == "live":
         if not os.path.exists(LIVE_ARM_FILE):
             return False, f"[LIVE-BLOCKED] {symbol}: arm file '{LIVE_ARM_FILE}' missing -- no order sent"
         try:
-            await client.create_order(symbol=f"{symbol}USDT", side="SELL", type="MARKET", quantity=qty)
+            await client.create_order(symbol=f"{symbol}USDT", side="SELL", type="MARKET", quantity=rounded)
             return True, f"[LIVE] {desc}"
         except Exception as e:
             return False, f"[LIVE-ERROR] {symbol}: {str(e)[:100]}"
