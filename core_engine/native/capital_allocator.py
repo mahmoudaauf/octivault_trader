@@ -59,6 +59,7 @@ class NativeCapitalAllocator:
         quote_min_reserve_usdt: float = 0.0,
         daily_compounding_enabled: bool = True,
         daily_compounding_state_path: str | None = None,
+        perf_tracker: Any | None = None,
     ) -> None:
         """
         Initialize adaptive capital allocator.
@@ -71,6 +72,11 @@ class NativeCapitalAllocator:
             shared_state: NativeSharedState for feedback loop data (optional)
             exchange_client: NativeExchangeClient for symbol filters (optional)
             default_planned_quote: Fixed USDT quote for small accounts (<$100); scales to %-based when account grows
+            perf_tracker: SymbolPerformanceTracker (shared with arbitration_engine/
+                SymbolRotator) -- its win-rate-derived size multiplier scales a
+                proven symbol's position up (to 1.25x on a >=80% win-rate streak)
+                or down, instead of every buy sizing identically regardless of
+                that symbol's real track record.
         """
         self._pm = portfolio_manager
         self._md = market_data
@@ -78,6 +84,7 @@ class NativeCapitalAllocator:
         self._ace = adaptive_engine
         self._ss = shared_state
         self._exchange_client = exchange_client
+        self._perf_tracker = perf_tracker
         self._default_planned_quote = max(1.0, float(default_planned_quote))
         self._quote_reserve_ratio = max(0.0, float(quote_reserve_ratio))
         self._quote_min_reserve_usdt = max(0.0, float(quote_min_reserve_usdt))
@@ -229,6 +236,23 @@ class NativeCapitalAllocator:
                     "📊 OFC SIZE_MULTIPLIER active: %.2f (from runtime_overrides)", size_mult
                 )
 
+            # Per-symbol win-rate-derived multiplier (0.0-1.25x) -- scales a proven
+            # symbol's size up (to 1.25x on a >=80% win-rate streak) or down, instead
+            # of every buy sizing identically regardless of that symbol's real track
+            # record. Combined with the global OFC multiplier above, not instead of it.
+            symbol_mult = 1.0
+            if self._perf_tracker is not None:
+                try:
+                    symbol_mult = float(self._perf_tracker.get_size_multiplier(symbol))
+                except Exception:
+                    symbol_mult = 1.0
+            if symbol_mult != 1.0:
+                logger.info(
+                    "📈 %s symbol size multiplier: %.2f (from win-rate track record)",
+                    symbol, symbol_mult,
+                )
+            combined_mult = size_mult * symbol_mult
+
             # Hybrid allocation: NAV-percentage for all accounts, floored by min_notional
             # At $58 NAV: 15% = $8.70; floor ensures we always clear Binance minimum.
             # Auto-compounds: as NAV grows, position size grows proportionally.
@@ -236,7 +260,7 @@ class NativeCapitalAllocator:
                 sym_filters = self._symbol_filters_cache.get(symbol, {})
                 min_notional = float(sym_filters.get("min_notional", 10.0))
                 # 15% of NAV, floored at min_notional + 20% safety buffer, capped at 20% of NAV
-                nav_pct_usdt = nav * 0.15 * size_mult
+                nav_pct_usdt = nav * 0.15 * combined_mult
                 # Fear-time half-size: in fear (F&G ≤ 25) without confirmed BTC reversal,
                 # halve position size. Reversal is market-wide so this gates globally.
                 fear_factor = 1.0
@@ -285,7 +309,7 @@ class NativeCapitalAllocator:
                             target_throughput_per_hour=10.0,
                             trade_history=trade_history,
                         )
-                        risk_fraction = decision.risk_fraction * size_mult
+                        risk_fraction = decision.risk_fraction * combined_mult
                         allocation_usdt = min(nav * risk_fraction, spendable_capital)
                         alloc_reason = f"ACE-adaptive (risk={decision.risk_fraction:.3f})"
 
@@ -293,17 +317,17 @@ class NativeCapitalAllocator:
                             "ACE allocation for %s: risk=%.3f mult=%.2f reason=%s",
                             symbol,
                             decision.risk_fraction,
-                            size_mult,
+                            combined_mult,
                             " | ".join(decision.reasons[:2]),
                         )
                     except Exception as e:
                         logger.warning("ACE evaluation failed; falling back to flat: %s", e)
-                        risk_fraction = (self._allocation_pct / 100.0) * size_mult
+                        risk_fraction = (self._allocation_pct / 100.0) * combined_mult
                         allocation_usdt = min(nav * risk_fraction, spendable_capital)
                         alloc_reason = "flat-pct (%.1f%%)" % self._allocation_pct
                 else:
-                    # Flat percentage allocation with OFC multiplier
-                    risk_fraction = (self._allocation_pct / 100.0) * size_mult
+                    # Flat percentage allocation with OFC + symbol-performance multiplier
+                    risk_fraction = (self._allocation_pct / 100.0) * combined_mult
                     allocation_usdt = min(nav * risk_fraction, spendable_capital)
                     alloc_reason = "flat-pct (%.1f%%)" % self._allocation_pct
 
@@ -337,8 +361,10 @@ class NativeCapitalAllocator:
                 quantity = self._round_quantity_for_exchange_sync(symbol, quantity, price)
 
             logger.info(
-                "[allocator] %s: nav=%.2f mult=%.3f spendable=%.2f usdt=%.2f price=%.4f qty=%.8f (%s)",
-                symbol, nav, size_mult, spendable_capital, allocation_usdt, price, quantity, alloc_reason,
+                "[allocator] %s: nav=%.2f mult=%.3f (ofc=%.2f x symbol=%.2f) spendable=%.2f "
+                "usdt=%.2f price=%.4f qty=%.8f (%s)",
+                symbol, nav, combined_mult, size_mult, symbol_mult,
+                spendable_capital, allocation_usdt, price, quantity, alloc_reason,
             )
 
             # The executor expects a BUY decision.quantity to be a USD quote intent

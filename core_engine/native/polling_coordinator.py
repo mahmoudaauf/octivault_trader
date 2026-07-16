@@ -677,14 +677,43 @@ class NativePollingCoordinator:
                     self._fills_processed.add(int(t.get("id") or 0))
                 continue
 
-            # Compute weighted average fill price from ALL buy trades for this symbol
+            current_qty = float(
+                pos.get("qty", 0.0) if isinstance(pos, dict)
+                else getattr(pos, "qty", 0.0)
+            )
+            if current_qty <= 0:
+                continue
+
             all_buys = [t for t in trades if self._is_buy_trade(t)]
             if not all_buys:
                 continue
 
-            total_qty = sum(float(t.get("qty") or 0) for t in all_buys)
-            total_cost = sum(float(t.get("qty") or 0) * float(t.get("price") or 0) for t in all_buys)
-            avg_fill_price = total_cost / total_qty if total_qty > 0 else 0.0
+            # Reconstruct the cost basis of ONLY the fills that make up what's actually
+            # still held -- NOT a naive average across every buy fill in the last-20-
+            # trades window. A symbol traded multiple times in one day (confirmed
+            # real corruption 2026-07-16: API3 traded 5x in a day, DASH/AIXBT/BB
+            # similarly) has its last-20-trades window span 2-3 already-closed round
+            # trips, and averaging across all of them pollutes entry_price with stale
+            # prices from unrelated, already-sold positions. The units held right now
+            # were the most recently bought, so walk backward from the newest fill and
+            # accumulate quantity only until it covers what's currently held (a
+            # FIFO/LIFO cost-basis reconstruction, not a blind average).
+            all_buys_sorted = sorted(all_buys, key=lambda t: int(t.get("time") or 0), reverse=True)
+            matched_qty = 0.0
+            total_cost = 0.0
+            needed = current_qty * 1.001  # tiny slack for float/fee rounding
+            for t in all_buys_sorted:
+                if matched_qty >= needed:
+                    break
+                qty = float(t.get("qty") or 0)
+                price = float(t.get("price") or 0)
+                if qty <= 0 or price <= 0:
+                    continue
+                take = min(qty, needed - matched_qty)
+                matched_qty += take
+                total_cost += take * price
+
+            avg_fill_price = total_cost / matched_qty if matched_qty > 0 else 0.0
 
             if avg_fill_price <= 0:
                 continue
@@ -695,10 +724,6 @@ class NativePollingCoordinator:
             )
 
             if needs_update:
-                current_qty = float(
-                    pos.get("qty", 0.0) if isinstance(pos, dict)
-                    else getattr(pos, "qty", 0.0)
-                )
                 current_mark = float(
                     pos.get("mark_price", avg_fill_price) if isinstance(pos, dict)
                     else getattr(pos, "mark_price", avg_fill_price)
@@ -711,8 +736,9 @@ class NativePollingCoordinator:
                         current=current_mark,
                     )
                     self.logger.info(
-                        "[PollingCoordinator:FILLS] %s entry reconciled: %.6f → %.6f (Binance avg fill, %d trades)",
-                        sym, current_entry, avg_fill_price, len(all_buys),
+                        "[PollingCoordinator:FILLS] %s entry reconciled: %.6f → %.6f "
+                        "(qty-matched avg over most-recent fills, %.6f/%.6f qty matched)",
+                        sym, current_entry, avg_fill_price, matched_qty, current_qty,
                     )
 
             # Mark all fetched trades as processed

@@ -974,6 +974,21 @@ class DecisionEngineImpl:
                 logger.warning(f"⚠️ Could not get position details: {e}")
                 return None
 
+        # Prefer tp_sl_engine's armed entry price over the position manager's, same
+        # reasoning as tp_sl_engine.check_triggers()/recalculate_aged_positions(): the
+        # position's entry_price can be inflated by polling_coordinator's fill-
+        # reconciliation averaging together fills from a previous, already-closed round
+        # trip on the same symbol. arm_position() always stores the actual fill price
+        # for the CURRENT position, so it is the authoritative source here too.
+        tp_sl_engine = app_ctx.get("tp_sl_engine")
+        if tp_sl_engine is not None and hasattr(tp_sl_engine, "get_entry_price"):
+            try:
+                armed_fill_price = float(tp_sl_engine.get_entry_price(symbol) or 0.0)
+                if armed_fill_price > 0:
+                    entry_price = armed_fill_price
+            except Exception:
+                pass
+
         if quantity <= 0 or entry_price <= 0 or current_price <= 0:
             logger.debug(
                 f"⚠️ Invalid position for {symbol}: qty={quantity}, entry={entry_price}, current={current_price}"

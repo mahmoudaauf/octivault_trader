@@ -442,6 +442,15 @@ class NativeTPSLEngine:
                 return None
 
             entry_price = self._pos_field(position, "entry_price", "avg_price")
+            # Prefer the entry_price registered by arm_position() over the position object,
+            # same reasoning as recalculate_aged_positions(): the position's entry_price can
+            # be inflated by polling_coordinator's fill-reconciliation averaging together
+            # fills from a previous, already-closed round trip on the same symbol.
+            # arm_position() always stores the actual fill price for the CURRENT position,
+            # so it is the authoritative source here too.
+            armed_fill_price = float(self._entry_prices.get(symbol, 0.0) or 0.0)
+            if armed_fill_price > 0 and symbol in self._armed_symbols:
+                entry_price = armed_fill_price
             if entry_price <= 0:
                 return None
 

@@ -79,6 +79,7 @@ from .signal_fusion import NativeSignalFusion
 from .signal_manager_bridge import SignalManagerBridge
 from .signals import NativeSignalEngine
 from .startup_state_machine import NativeStartupStateMachine
+from .symbol_performance_tracker import SymbolPerformanceTracker
 from .telemetry_export import NativeTelemetryExporter
 from .tp_sl_engine import NativeTPSLEngine
 from .trade_journal import NativeTradeJournal
@@ -714,6 +715,13 @@ async def build_components(
         logger.error("No symbols configured and discovery disabled; nothing to trade")
         symbols = []
 
+    # Shared SymbolPerformanceTracker -- one instance across SymbolRotator (win-rate
+    # scoring), NativeArbitrationEngine (gate_7/gate_8, record_trade_outcome), and
+    # NativeCapitalAllocator (win-rate size multiplier), so all three see the SAME
+    # trade-outcome history instead of each tracking (or, previously, not tracking)
+    # independently.
+    shared_perf_tracker = SymbolPerformanceTracker()
+
     # Symbol Rotator: scores all trained models by regime/momentum/win_rate every 2h
     symbol_rotator = None
     try:
@@ -723,7 +731,7 @@ async def build_components(
             shared_state=shared_state,
             regime_detector=None,  # wired below after market_regime_detector is built
             market_data=None,  # wired below after market_data is built
-            perf_tracker=None,
+            perf_tracker=shared_perf_tracker,
             fallback_symbols=symbols or [],
         )
         logger.info("✅ SymbolRotator instantiated (TOP_N=%d, interval=2h)", 8)
@@ -996,6 +1004,7 @@ async def build_components(
         quote_min_reserve_usdt=cfg.quote_min_reserve_usdt,
         daily_compounding_enabled=cfg.daily_compounding_enabled,
         daily_compounding_state_path=cfg.daily_compounding_state_path,
+        perf_tracker=shared_perf_tracker,
     )
     # Inject pre-fetched filters so allocator can use real step-sizes immediately
     capital_allocator._symbol_filters_cache = symbol_filters
@@ -1014,6 +1023,7 @@ async def build_components(
         mode_manager=mode_manager,
         ml_forecaster=ml_forecaster,  # gap8: drift-retrain callback
         exchange_client=exchange_client,  # gate_12: REST book-ticker fallback
+        perf_tracker=shared_perf_tracker,
     )
     market_regime_detector = NativeMarketRegimeDetector(
         market_data=market_data,

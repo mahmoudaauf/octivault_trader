@@ -146,6 +146,18 @@ class _PositionManager:
         return self._position
 
 
+class _TpSlEngine:
+    """Minimal stub exposing only what make_sell_decision() consults: the
+    armed entry-price registry that should override a stale/corrupted
+    position.entry_price (see get_entry_price() on the real engine)."""
+
+    def __init__(self, entry_prices: dict[str, float] | None = None) -> None:
+        self._entry_prices = entry_prices or {}
+
+    def get_entry_price(self, symbol: str) -> float:
+        return float(self._entry_prices.get(symbol, 0.0) or 0.0)
+
+
 def _make_position(*, qty: float = 1.0, entry: float = 100.0, mark: float = 110.0) -> Any:
     return SimpleNamespace(qty=qty, entry_price=entry, mark_price=mark)
 
@@ -164,6 +176,7 @@ def _make_app_ctx(
     regime_health: str = "OK",
     allocator_quote: float = 50.0,
     position_for_symbol: Any | None = None,
+    tp_sl_engine: Any | None = None,
 ) -> dict[str, Any]:
     locked_capital = float(locked if locked is not None else max(nav - free, 0.0))
     shared_state = _SharedState(
@@ -189,6 +202,7 @@ def _make_app_ctx(
         "execution_manager": _ExecutionManager(),
         "bounded_cache": {},
         "position_manager": _PositionManager(position_for_symbol),
+        "tp_sl_engine": tp_sl_engine,
     }
 
 
@@ -293,6 +307,29 @@ async def test_decision_engine_make_sell_decision_supports_dict_backed_positions
     assert decision is not None
     assert decision.action == "SELL"
     assert decision.quantity == 0.75
+
+
+@pytest.mark.asyncio
+async def test_decision_engine_make_sell_decision_prefers_armed_entry_price() -> None:
+    """Live incident 2026-07-16: polling_coordinator's fill-reconciliation averaged
+    together fills from a previous, already-closed round trip on the same symbol,
+    inflating position.entry_price far from the real fill price. Relative to a
+    corrupted entry (150) a mark of 101 looks like a ~33% loss and would be
+    blocked by the ordinary (non-forced) profit-after-fees gate; relative to the
+    REAL armed entry (100) the same mark is a genuine, sellable +1% gain. Confirms
+    make_sell_decision() prefers tp_sl_engine.get_entry_price() over the
+    position's own (corruptible) entry_price field.
+    """
+    position = _make_position(qty=1.0, entry=150.0, mark=101.0)  # corrupted entry
+    tp_sl_engine = _TpSlEngine({"BTCUSDT": 100.0})  # real armed entry
+    engine = DecisionEngine(_make_app_ctx(position_for_symbol=position, tp_sl_engine=tp_sl_engine))
+    decision = await engine.make_sell_decision("BTCUSDT", 0.9, "signal")
+    assert decision is not None, (
+        "expected a real SELL decision using the armed entry price (100 -> 101 is "
+        "a genuine gain); got None, suggesting the corrupted entry_price (150) was "
+        "used instead, which would look like a ~33% loss and get blocked"
+    )
+    assert decision.action == "SELL"
 
 
 @pytest.mark.asyncio

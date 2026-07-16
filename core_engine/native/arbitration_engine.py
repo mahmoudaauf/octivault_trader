@@ -38,6 +38,7 @@ class NativeArbitrationEngine:
         mode_manager: Any | None = None,
         ml_forecaster: Any | None = None,  # gap8: drift-retrain callback
         exchange_client: Any | None = None,  # gate_12: REST book-ticker fallback
+        perf_tracker: Any | None = None,  # shared with SymbolRotator/capital_allocator
     ) -> None:
         self._shared_state = shared_state
         self._decision_engine = decision_engine
@@ -53,7 +54,10 @@ class NativeArbitrationEngine:
         self._global_buy_history: list[float] = []  # epoch of every BUY (pruned to 1h)
         self._global_sl_history: list[float] = []  # epoch of every SL exit (pruned to 1h)
         self._arb_state_path = os.path.join("logs", "arb_state.json")
-        self._perf_tracker = SymbolPerformanceTracker()
+        # Shared with SymbolRotator (its win-rate scoring factor) and capital_allocator
+        # (its size-multiplier sizing) so all three see the SAME trade-outcome history,
+        # instead of each independently tracking (or, previously, not tracking at all).
+        self._perf_tracker = perf_tracker or SymbolPerformanceTracker()
         # gate_10: regimes in which adding to an underwater position is forbidden.
         _raw_regimes = os.getenv("NO_AVGDOWN_REGIMES", "DOWNTREND")
         self._no_avgdown_regimes = {r.strip().upper() for r in _raw_regimes.split(",") if r.strip()}

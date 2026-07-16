@@ -258,3 +258,51 @@ async def test_fetch_and_reconcile_fills_commission_in_base_asset_converted() ->
     # commission_quote = 0.001 BTC * 110.0 price = 0.11 USDT
     # realized_pnl = (110 - 100) * 1.0 - 0.11 = 9.89
     assert state.metrics["realized_pnl"] == pytest.approx(9.89)
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_reconcile_fills_does_not_average_across_closed_round_trips() -> None:
+    """Live incident 2026-07-16: a symbol traded multiple times in one day (API3
+    5x, DASH/AIXBT/BB similarly) has its last-20-trades window span 2-3 already-
+    closed round trips. The OLD code averaged ALL buy fills in that window
+    regardless of which round trip they belonged to, corrupting entry_price with
+    stale prices (confirmed real cases: DASH 34.78 -> 36.93, AIXBT 0.01933 ->
+    0.03116). The fix reconstructs cost basis from only the most-recent fills
+    that cover what's actually still held (FIFO/LIFO from the newest fill
+    backward), not a blind average across the whole window.
+
+    Trade history here: an OLD buy+sell (a fully-closed previous round trip at
+    price 100) followed by a NEW buy at price 200 for the position currently
+    held (qty=1.0). The naive old average would be (100+200)/2=150 -- wildly
+    wrong. The fix should land close to 200, the real current entry.
+    """
+    state = NativeSharedState()
+    state.positions["BTCUSDT"] = Position(symbol="BTCUSDT", qty=1.0, entry_price=0.0, mark_price=200.0)
+    exchange = _StubExchange(
+        balances={"USDT": 100.0},
+        trades={
+            "BTCUSDT": [
+                # Old, already-closed round trip (should NOT contribute to the
+                # current position's reconciled entry price).
+                {"id": 10, "isBuyer": True, "qty": "1.0", "price": "100.0", "time": 1_000},
+                {"id": 11, "isBuyer": False, "qty": "1.0", "price": "105.0", "time": 2_000},
+                # The current, still-open position's real buy.
+                {"id": 12, "isBuyer": True, "qty": "1.0", "price": "200.0", "time": 3_000},
+            ],
+        },
+    )
+    pc = NativePollingCoordinator(
+        shared_state=state,
+        exchange_client=exchange,
+        config=NativePollingConfig(enable_active_trades_gate=False),
+    )
+
+    await pc._fetch_and_reconcile_fills()
+
+    reconciled_entry = state.positions["BTCUSDT"].entry_price
+    assert reconciled_entry > 199.0, (
+        f"expected entry price close to the real current fill (200), got "
+        f"{reconciled_entry} -- looks like the old buggy average across both "
+        f"round trips ((100+200)/2=150) is still happening"
+    )
+    assert reconciled_entry <= 200.0

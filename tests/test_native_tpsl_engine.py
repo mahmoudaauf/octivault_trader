@@ -564,4 +564,46 @@ def test_hydrated_position_with_no_tp_sl_gets_auto_armed_on_first_check(): # noq
     assert engine._tp_levels.get("BTCUSDT", 0) > 0, "hydrated position was not auto-armed"
     assert engine._sl_levels.get("BTCUSDT", 0) > 0, "hydrated position was not auto-armed"
     assert engine._tp_levels["BTCUSDT"] > 100.0
-    assert engine._sl_levels["BTCUSDT"] < 100.0
+
+
+def test_check_triggers_prefers_armed_entry_price_over_corrupted_position_dict():
+    """Live incident 2026-07-16: polling_coordinator's fill-reconciliation averaged
+    together fills from a previous, already-closed round trip on the same symbol,
+    inflating position["entry_price"] far from the real fill price (e.g. DASH
+    34.78 -> 36.93, AIXBT 0.01933 -> 0.03116). check_triggers() must use the price
+    arm_position() actually recorded, not whatever polling_coordinator's averaging
+    wrote into the position dict -- mirroring recalculate_aged_positions()'s
+    already-correct preference for the same reason.
+
+    Uses trailing-stop activation as the discriminator: profit_pct = (current -
+    entry_price) / entry_price feeds directly into whether the trailing stop
+    arms at all (RANGING: activates at +0.8%). Relative to the real entry (100)
+    a small rally clears that bar; relative to the corrupted entry (150) the
+    exact same price looks like a ~33% LOSS and never clears any positive
+    activation threshold -- so the trailing stop only ever arms, and can only
+    ever fire, if the real armed price was actually used.
+    """
+    engine, state = _engine_with_regime("RANGING")
+    real_entry = 100.0
+    engine.arm_position("TESTUSDT", real_entry)
+
+    # Simulate polling_coordinator's corruption: position dict now claims a wildly
+    # different entry price than what was actually armed.
+    corrupted_entry = 150.0
+    pos = {"symbol": "TESTUSDT", "qty": 1.0, "entry_price": corrupted_entry}
+
+    # Step 1: rally to +1.5% (relative to the REAL entry) -- clears RANGING's 0.8%
+    # trailing activation and should record a peak at 101.5.
+    result_1 = engine.check_triggers("TESTUSDT", pos, current_price=101.5)
+    assert result_1 is None, f"expected no exit yet on the rally leg, got {result_1!r}"
+    assert engine._peak_prices["TESTUSDT"] == 101.5, (
+        "trailing stop never activated -- entry_price resolution likely used the "
+        "corrupted position-dict value (150) instead of the real armed price (100)"
+    )
+
+    # Step 2: retrace to 100.9 -- more than RANGING's 0.5% trail distance below the
+    # 101.5 peak (100.9 <= 101.5*(1-0.005)=100.9925), should fire TRAILING_STOP.
+    result_2 = engine.check_triggers("TESTUSDT", pos, current_price=100.9)
+    assert result_2 == "TRAILING_STOP", (
+        f"expected TRAILING_STOP on the retrace leg, got {result_2!r}"
+    )

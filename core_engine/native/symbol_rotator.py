@@ -165,9 +165,12 @@ def _get_win_rate(symbol: str, perf_tracker: Any) -> float:
     if perf_tracker is None:
         return 0.5
     try:
-        info = perf_tracker.symbol_info(symbol)
-        if info and info.get("win_rate") is not None:
-            return float(info["win_rate"])
+        # quality_score() IS the rolling win-rate (0.5 neutral until enough closed
+        # trades exist) -- SymbolPerformanceTracker has no separate symbol_info()
+        # method; a previous version of this function called one that never
+        # existed, silently defaulting to neutral for every symbol via the bare
+        # except below regardless of any real trade history.
+        return float(perf_tracker.quality_score(symbol))
     except Exception:
         pass
     return 0.5
