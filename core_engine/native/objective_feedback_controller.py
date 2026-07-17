@@ -53,6 +53,20 @@ DEFAULTS = {
     "OBJ_KP_SIZE": 4.0,
     "OBJ_KP_THRU": 50.0,
     "OBJ_KP_DD_PENALTY": 200.0,  # heavy penalty if dd_error > 0
+    # ── Pace-chasing (OPT-IN, all default OFF) ─────────────────────────────
+    # These re-enable the pace_error -> knob path that step() otherwise zeroes.
+    # Read the long block comment in step()'s "PI update" section before
+    # enabling any of them: a pace controller has NO FIXED POINT on a
+    # negative-expectancy trade generator (being behind target is *caused by*
+    # losing; sizing up enlarges the loss; the error never closes), so these
+    # will ramp to their clamp and pin there. That is expected behavior, not a
+    # bug. They exist because the operator asked for them with that arithmetic
+    # in hand. Containment is the pre-existing knob_ranges clamps:
+    # size_multiplier <= OBJ_SIZE_MULT_MAX (1.50) and confidence_floor >=
+    # OBJ_CONF_FLOOR_MIN (0.65).
+    "OBJ_PACE_SIZE_ENABLED": False,  # allow d_size > 0 when behind target
+    "OBJ_PACE_GATE_ENABLED": False,  # allow d_conf < 0 (loosen floor) when behind
+    "OBJ_PACE_THRU_ENABLED": False,  # un-hardwire d_thru
     # Telemetry freshness
     "OBJ_TELEMETRY_MAX_AGE_S": 1800,  # 2 × heartbeat
     # Kill-switch auto-resume: minimum time the halt must hold once drawdown
@@ -76,6 +90,24 @@ def _cfg(config: Any, key: str) -> float:
         except ValueError:
             pass
     return DEFAULTS[key]
+
+
+def _cfg_bool(config: Any, key: str) -> bool:
+    """Boolean config: attr, then env, then DEFAULTS.
+
+    Booleans need their own reader — _cfg() coerces through float(), so an env
+    value of "true"/"yes"/"on" raises ValueError and silently falls back to the
+    default, which for an opt-in safety flag is a trap (you'd set it and it
+    wouldn't take). Accepts the same tokens as the rest of the codebase.
+    """
+    if config is not None and hasattr(config, key):
+        v = getattr(config, key)
+        if v is not None:
+            return bool(v)
+    env = os.getenv(key)
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return bool(DEFAULTS[key])
 
 
 # ------------------------------------------------------------------ #
@@ -166,6 +198,22 @@ class ObjectiveFeedbackController:
             "Kp_thru": _cfg(config, "OBJ_KP_THRU"),
             "Kp_dd": _cfg(config, "OBJ_KP_DD_PENALTY"),
         }
+
+        # Opt-in pace-chasing. All default False -> step()'s control law is
+        # byte-for-byte its previous behavior unless deliberately enabled.
+        self.pace_size_enabled = _cfg_bool(config, "OBJ_PACE_SIZE_ENABLED")
+        self.pace_gate_enabled = _cfg_bool(config, "OBJ_PACE_GATE_ENABLED")
+        self.pace_thru_enabled = _cfg_bool(config, "OBJ_PACE_THRU_ENABLED")
+        if self.pace_size_enabled or self.pace_gate_enabled or self.pace_thru_enabled:
+            self.logger.warning(
+                "[OFC] PACE-CHASING ENABLED (size=%s gate=%s thru=%s). This re-enables "
+                "a control path that was deliberately removed. It cannot converge on a "
+                "negative-expectancy generator and will ramp to its clamp (size<=%.2f, "
+                "conf_floor>=%.2f) and pin there. Intended and operator-authorised.",
+                self.pace_size_enabled, self.pace_gate_enabled, self.pace_thru_enabled,
+                self.knob_ranges["size_multiplier"][1],
+                self.knob_ranges["confidence_floor"][0],
+            )
 
         self.state = ControllerState()
         self.state.last_knobs = {
@@ -288,9 +336,13 @@ class ObjectiveFeedbackController:
         halted = bool(getattr(self.ss, "trading_halted", False)) if self.ss is not None else False
 
         # ---- 3. PI update --------------------------------------------
-        # Frequency is an evaluation target, never an entry quota.  Zero trades can
-        # legitimately mean that no setup cleared the quality gates, so idle periods
-        # must not lower confidence, increase size, or shorten cooldowns.
+        # BASE LAW (always active, unchanged): de-risk only.
+        #
+        # Original rationale, preserved verbatim because it is still correct and
+        # still governs the default configuration:
+        #   "Frequency is an evaluation target, never an entry quota.  Zero trades can
+        #   legitimately mean that no setup cleared the quality gates, so idle periods
+        #   must not lower confidence, increase size, or shorten cooldowns."
         no_trades_idle = tel.trades_in_window == 0 and dd_error == 0.0
         if no_trades_idle:
             self.logger.debug("[OFC] idle (0 trades, no DD) — holding quality/risk knobs")
@@ -310,6 +362,48 @@ class ObjectiveFeedbackController:
             # The controller can de-risk, but never sizes up to chase a target.
             d_size = -self.gains["Kp_dd"] * (dd_error * 0.01)
             d_thru = 0.0
+
+        # ---- 3b. PACE-CHASING (opt-in; all flags default False) -------
+        # Re-enables the pace_error -> knob path that the base law above zeroes.
+        # This deliberately overrides the removal quoted above; the operator
+        # asked for it with the following arithmetic explicitly in hand:
+        #
+        #   A pace controller has NO FIXED POINT on a negative-expectancy trade
+        #   generator. Being behind target is *caused by* the -EV strategy
+        #   losing. Sizing up a losing bet enlarges the loss, so the error never
+        #   closes, so the controller pushes harder — until it pins at its
+        #   clamp. Measured: the ML forecaster is -0.27%/trade over 3,140
+        #   backtested samples; at 2x size that is -0.54%/trade. +2%/day is
+        #   unreachable from a negative edge at ANY size.
+        #
+        # Containment is the pre-existing knob_ranges clamps applied in step 4
+        # (size_multiplier <= 1.50, confidence_floor >= 0.65 — the latter
+        # documented as the empirical breakeven; below it win-rate ~30%).
+        # Deliberately PURE PROPORTIONAL: integral_pace stays pinned at 0.0, so
+        # there is no accumulator to wind up. The per-step deltas are small and
+        # accumulate through last_knobs, which the clamps bound.
+        pace_applied = {}
+        behind = pace_error < 0.0
+        if behind and dd_error <= 0.0:
+            # dd_error > 0 means the de-risk term is active. Never let pace
+            # fight it: de-risking always wins, regardless of pace flags.
+            if self.pace_size_enabled:
+                _d = -self.gains["Kp_size"] * pace_error * 0.01  # pace_error<0 -> positive
+                d_size += _d
+                pace_applied["size"] = _d
+            if self.pace_gate_enabled:
+                _d = self.gains["Kp_conf"] * pace_error * 0.01  # pace_error<0 -> negative
+                d_conf += _d
+                pace_applied["conf"] = _d
+            if self.pace_thru_enabled:
+                _d = -self.gains["Kp_thru"] * pace_error * 0.01
+                d_thru += _d
+                pace_applied["thru"] = _d
+        if pace_applied:
+            self.logger.info(
+                "[OFC:PACE] behind by %.4f%%/h — applying %s (idle=%s). Base knobs: %s",
+                -pace_error, pace_applied, no_trades_idle, self.state.last_knobs,
+            )
 
         # ---- 4. Apply (clamped) --------------------------------------
         new_knobs = dict(self.state.last_knobs)
@@ -347,6 +441,10 @@ class ObjectiveFeedbackController:
             "knobs_after": new_knobs,
             "halted": halted,
             "integral_pace": self.state.integral_pace,
+            # Empty dict whenever pace-chasing is off (the default) or the
+            # system is on/ahead of pace — so any non-empty value in the
+            # telemetry record is a real, auditable pace intervention.
+            "pace_applied": pace_applied,
         }
         self.state.last_knobs = new_knobs
         self.state.last_action_ts = now
