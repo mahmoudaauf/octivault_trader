@@ -68,8 +68,18 @@ from utils.logging_setup import setup_logging
 
 # ────────────────────────────────────────────────────────────────────────
 # Logging  — RotatingFileHandler (50 MB × 3) + console WARNING+
+#
+# setup_logging() attaches real handlers to the ROOT logger, so it must run
+# only when this module is actually executed as the live app (see the
+# __main__ block below) — never as a side effect of import. Importing
+# main.py (e.g. `from main import _is_real_execution_result` in tests) used
+# to trigger this at collection time, wiring every test process's root
+# logger to logs/run_latest.log and interleaving test log lines into the
+# live production log. `log` itself is just a named logger handle here —
+# safe to bind at import time either way, since it does nothing until
+# handlers exist on root.
 # ────────────────────────────────────────────────────────────────────────
-log = setup_logging()
+log = logging.getLogger("octivault.main")
 
 load_dotenv()
 
@@ -842,4 +852,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Attach the real file/console handlers to the root logger HERE, not at
+    # import time — see the comment at the top of this file next to `log =`.
+    setup_logging()
     main()

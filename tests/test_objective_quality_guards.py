@@ -16,10 +16,22 @@ class _SharedState:
         self.positions = {}
 
 
+# These tests predate opt-in pace-chasing and assert default (off) behavior.
+# Passing no `config` falls through to the real OS environment (_cfg_bool's
+# config->env->default order), which now has all three OBJ_PACE_*_ENABLED
+# permanently true in production .env (see memory: ofc-pace-chasing-enabled).
+# Force them off explicitly so these tests stay hermetic regardless of
+# ambient .env state / whatever else got imported earlier in the session.
+_NO_PACE = SimpleNamespace(
+    OBJ_PACE_SIZE_ENABLED=False, OBJ_PACE_GATE_ENABLED=False, OBJ_PACE_THRU_ENABLED=False,
+)
+
+
 @pytest.mark.asyncio
 async def test_controller_does_not_chase_pace_with_lower_quality_or_more_size(tmp_path) -> None:
     shared_state = _SharedState()
     controller = ObjectiveFeedbackController(
+        config=_NO_PACE,
         shared_state=shared_state,
         artefact_path=str(tmp_path / "ofc.json"),
     )
@@ -50,6 +62,7 @@ async def test_controller_does_not_chase_pace_with_lower_quality_or_more_size(tm
 @pytest.mark.asyncio
 async def test_controller_holds_quality_knobs_when_no_trade_qualifies(tmp_path) -> None:
     controller = ObjectiveFeedbackController(
+        config=_NO_PACE,
         shared_state=_SharedState(),
         artefact_path=str(tmp_path / "ofc.json"),
     )

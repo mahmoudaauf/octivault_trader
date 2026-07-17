@@ -32,7 +32,20 @@ class _SharedState:
 
 
 def _controller(tmp_path, **flags) -> ObjectiveFeedbackController:
-    cfg = SimpleNamespace(**flags) if flags else None
+    """Explicit flags always win over the real OS environment (never fall
+    through to `os.environ`, per _cfg_bool()'s config->env->default order) so
+    these tests stay hermetic regardless of ambient .env state. Necessary
+    because .env now has all three OBJ_PACE_*_ENABLED permanently true for
+    production (see memory: ofc-pace-chasing-enabled) — a bare `config=None`
+    default here would silently pick that up whenever something upstream in
+    the same pytest session imports main.py (which calls load_dotenv())."""
+    base = {
+        "OBJ_PACE_SIZE_ENABLED": False,
+        "OBJ_PACE_GATE_ENABLED": False,
+        "OBJ_PACE_THRU_ENABLED": False,
+    }
+    base.update(flags)
+    cfg = SimpleNamespace(**base)
     c = ObjectiveFeedbackController(
         config=cfg,
         shared_state=_SharedState(),
