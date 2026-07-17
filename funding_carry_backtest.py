@@ -41,6 +41,27 @@ RT_COST = float(os.getenv("CARRY_ROUND_TRIP_PCT", "0.24")) / 100.0  # all-in 4-f
 MAX_WINDOWS = int(os.getenv("CARRY_MAX_WINDOWS", "45"))        # ~15 days max hold
 MIN_TRADES = 30
 
+# ── Model-fidelity flags — BOTH default OFF ────────────────────────────────────
+# Default-off keeps the default path byte-for-byte identical to the methodology
+# that produced this project's recorded headline (361 spot-hedgeable perps, 944
+# trades, +0.9434%/trade, 60% win, at FUNDING_ENTRY_BPS=6). Turning either flag
+# ON makes the sim MORE faithful to what carry_paper_trader.py can actually do
+# live — and both corrections are expected to reduce the headline number.
+#
+# CARRY_SIM_POSITIVE_ONLY: enter only on POSITIVE funding, matching the live
+#   daemon's POSITIVE_ONLY=true v1 restriction (short perp + long spot; negative
+#   funding would need spot-margin shorting, which v1 does not implement). The
+#   default abs(fr) >= ENTRY counts negative-funding entries the daemon
+#   STRUCTURALLY CANNOT EXECUTE, so the default headline is not a valid
+#   predictor of live positive-only performance.
+SIM_POSITIVE_ONLY = os.getenv("CARRY_SIM_POSITIVE_ONLY", "false").lower() in ("1", "true", "yes")
+# CARRY_SIM_SIGNED_COLLECT: collect DIRECTION-ADJUSTED funding per window rather
+#   than abs(). A real position commits to a direction at entry: a short perp
+#   receives funding while fr > 0 but PAYS when fr flips negative mid-hold.
+#   abs() models "always receive, whatever the sign" — optimistic. Signed
+#   collection prices a mid-hold sign flip as the real cost it is.
+SIM_SIGNED_COLLECT = os.getenv("CARRY_SIM_SIGNED_COLLECT", "false").lower() in ("1", "true", "yes")
+
 
 async def fetch_funding(client, symbol: str) -> list[tuple[int, float]]:
     """Historical funding: list of (fundingTime_ms, fundingRate). ~1000 windows ≈ 333d."""
@@ -54,16 +75,40 @@ async def fetch_funding(client, symbol: str) -> list[tuple[int, float]]:
     return out
 
 
-def simulate(funding: list[tuple[int, float]]) -> list[float]:
-    """Walk funding windows; return list of net %-returns per completed carry trade."""
+def simulate(
+    funding: list[tuple[int, float]],
+    *,
+    positive_only: bool | None = None,
+    signed_collect: bool | None = None,
+    exit_on_flip: bool = False,
+    entry: float | None = None,
+) -> list[float]:
+    """Walk funding windows; return list of net %-returns per completed carry trade.
+
+    Behavior defaults to the SIM_POSITIVE_ONLY / SIM_SIGNED_COLLECT / ENTRY
+    module globals (both flags default OFF -> identical to the original
+    validated methodology). See their definitions above for why each default is
+    optimistic relative to live. The keyword args exist so a caller
+    (carry_frontier_sweep.py) can vary the model in-process across many configs
+    without re-importing or re-fetching funding data.
+    """
+    positive_only = SIM_POSITIVE_ONLY if positive_only is None else positive_only
+    signed_collect = SIM_SIGNED_COLLECT if signed_collect is None else signed_collect
+    entry = ENTRY if entry is None else entry
+
     trades = []
     i, n = 0, len(funding)
     while i < n:
         _, fr = funding[i]
-        if abs(fr) < ENTRY:
+        entered = (fr >= entry) if positive_only else (abs(fr) >= entry)
+        if not entered:
             i += 1
             continue
-        # Enter; collect |funding| each window until it normalises or max hold.
+        # A real position commits to a direction at entry: +1 = short perp
+        # (receives funding while fr > 0), -1 = long perp (receives while
+        # fr < 0). Under SIM_SIGNED_COLLECT the per-window income is
+        # direction * frj, so a mid-hold sign flip correctly becomes a cost.
+        direction = 1.0 if fr > 0 else -1.0
         collected = 0.0
         held = 0
         j = i
@@ -71,7 +116,14 @@ def simulate(funding: list[tuple[int, float]]) -> list[float]:
             _, frj = funding[j]
             if held > 0 and abs(frj) < EXIT:
                 break
-            collected += abs(frj)
+            # exit_on_flip models a PROPOSED daemon fix, not current behavior.
+            # carry_paper_trader.py exits only on `abs(fr) < EXIT`, so when
+            # funding flips against the committed direction the position stays
+            # open and BLEEDS until the rate decays back toward zero. Exiting the
+            # moment funding turns against us stops that bleed.
+            if held > 0 and exit_on_flip and (direction * frj) <= 0:
+                break
+            collected += (direction * frj) if signed_collect else abs(frj)
             held += 1
             j += 1
         net = collected - RT_COST
@@ -128,8 +180,17 @@ async def main() -> None:
 
     print(f"Funding-carry backtest — entry>={ENTRY*100:.3f}%/8h  exit<{EXIT*100:.3f}%  "
           f"cost={RT_COST*100:.2f}%  max_hold={MAX_WINDOWS}w (~{MAX_WINDOWS/3:.0f}d)")
+    # Make the methodology self-documenting in the output. The prior headline
+    # number was recorded in prose without its flags, which made it
+    # unverifiable after the fact -- don't repeat that.
+    _model = (
+        f"positive_only={SIM_POSITIVE_ONLY} signed_collect={SIM_SIGNED_COLLECT}"
+    )
+    print(f"Model fidelity — {_model}"
+          f"{'  [DEFAULT: matches the original validated methodology]' if not (SIM_POSITIVE_ONLY or SIM_SIGNED_COLLECT) else '  [live-faithful corrections ON]'}")
     all_trades: list[float] = []
     per_sym = {}
+    per_sym_span_days: dict[str, float] = {}
     try:
         for sym in universe:
             fund = await fetch_funding(client, sym)
@@ -137,6 +198,10 @@ async def main() -> None:
                 continue
             t = simulate(fund)
             per_sym[sym] = t
+            # Measure each symbol's REAL history span from its own timestamps
+            # rather than assuming a fixed window (see the annualisation note
+            # below for why the old fixed 333d assumption was wrong).
+            per_sym_span_days[sym] = (fund[-1][0] - fund[0][0]) / 86_400_000.0
             all_trades.extend(t)
     finally:
         await client.close_connection()
@@ -150,14 +215,25 @@ async def main() -> None:
     total = sum(all_trades)
     avg = total / n
     wr = len(wins) / n
-    # Rough annualisation: avg hold ~ (collected windows); approximate by trades/yr.
-    # Each symbol has ~1000 windows = ~333 days of history.
-    days_hist = 1000 / 3.0
+    # Annualisation, measured — NOT assumed.
+    # This previously hardcoded `days_hist = 1000 / 3.0` (=333d) on the premise
+    # that limit=1000 returns 1000 funding windows. It does not: Binance's
+    # /fapi/v1/fundingRate caps at 500 rows, so a full-history symbol spans only
+    # ~166d, and newer listings far less (e.g. HOMEUSDT ≈ 38d). Every
+    # trades/yr and %/yr figure this script printed under that assumption was
+    # therefore ~2x too low. Use each symbol's real measured span instead.
+    _spans = [d for s, d in per_sym_span_days.items() if per_sym.get(s) and d > 0]
+    days_hist = (sum(_spans) / len(_spans)) if _spans else 0.0  # mean real span
     syms = len([s for s, t in per_sym.items() if t])
-    trades_per_yr = (n / syms) / (days_hist / 365.0) if syms else 0
+    # Per-symbol trade rate summed over symbols, each against its OWN span.
+    trades_per_yr = (
+        sum(len(t) / per_sym_span_days[s] for s, t in per_sym.items()
+            if t and per_sym_span_days.get(s, 0) > 0) / syms * 365.0
+    ) if syms else 0
 
     print("\n" + "=" * 64)
-    print(f"FUNDING CARRY BACKTEST — {n} trades across {syms} perps (~{days_hist:.0f}d each)")
+    print(f"FUNDING CARRY BACKTEST — {n} trades across {syms} perps "
+          f"(~{days_hist:.0f}d avg real span each)")
     print("=" * 64)
     print(f"  Net total:          {total:+.2f}%   (sum of all trades' net carry)")
     print(f"  Avg net/trade:      {avg:+.4f}%   ← the number that matters")

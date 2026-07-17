@@ -143,7 +143,11 @@ def test_strategy_vs_wiring_split() -> None:
 
 def test_utc_day_rollover_resets_counters_and_archives(tmp_path) -> None:
     history = tmp_path / "history.jsonl"
-    mon = NativeDailyTargetMonitor(history_path=str(history))
+    # Seed the monitor's own day boundary to day 14 rather than the wall clock.
+    # Without this the constructor starts on the real "today" and the first
+    # day-14 event looks like a rollover, archiving a spurious empty row --
+    # which is why this test passed only on the day it was written.
+    mon = NativeDailyTargetMonitor(history_path=str(history), now=_utc(day=14))
     mon.record_trade_closed("A", gross_pnl=1.0, net_pnl=1.0, now=_utc(day=14))
     assert mon.state.trades_closed == 1
 
@@ -164,17 +168,52 @@ def test_utc_day_rollover_resets_counters_and_archives(tmp_path) -> None:
 
 def test_state_survives_restart_same_day(tmp_path) -> None:
     state_path = tmp_path / "daily_target_state.json"
-    first = NativeDailyTargetMonitor(state_path=str(state_path))
-    first.record_trade_closed("A", gross_pnl=1.0, net_pnl=1.0, now=_utc())
+    first = NativeDailyTargetMonitor(state_path=str(state_path), now=_utc(day=14))
+    first.record_trade_closed("A", gross_pnl=1.0, net_pnl=1.0, now=_utc(day=14))
 
-    restored = NativeDailyTargetMonitor(state_path=str(state_path))
-    # Note: restored instance uses "now" (real time) internally for its own
-    # _today() default, but since _load() only restores same-day state, this
-    # test's assertion depends on being run same real-world day as saved --
-    # so we assert directly on the loaded state's counters via its date match.
-    if restored.state.date == first.state.date:
-        assert restored.state.trades_closed == 1
-        assert restored.state.net_pnl_usdt == 1.0
+    # Restart on the SAME day -> state must be restored. Pinning `now` makes
+    # this deterministic; it previously guarded the assertions behind an
+    # `if restored.state.date == first.state.date` check that silently skipped
+    # the whole test on any day other than the one it was written.
+    restored = NativeDailyTargetMonitor(state_path=str(state_path), now=_utc(day=14))
+    assert restored.state.date == first.state.date
+    assert restored.state.trades_closed == 1
+    assert restored.state.net_pnl_usdt == 1.0
+
+
+def test_restart_across_midnight_archives_prior_day_instead_of_dropping(tmp_path) -> None:
+    """Regression: a restart crossing UTC midnight used to silently DROP the
+    prior day. _load() only restored state when date == today and discarded it
+    otherwise, never archiving -- so daily_target_history.jsonl was complete
+    only because the live process happened to survive midnight."""
+    state_path = tmp_path / "daily_target_state.json"
+    history = tmp_path / "history.jsonl"
+
+    day14 = NativeDailyTargetMonitor(
+        state_path=str(state_path), history_path=str(history), now=_utc(day=14)
+    )
+    day14.record_trade_closed("A", gross_pnl=1.0, net_pnl=1.0, now=_utc(day=14))
+    assert not history.exists()  # nothing archived yet -- day still open
+
+    # Process restarts the NEXT day (the state file still holds day 14).
+    day15 = NativeDailyTargetMonitor(
+        state_path=str(state_path), history_path=str(history), now=_utc(day=15)
+    )
+    assert day15.state.date == "2026-07-15"
+    assert day15.state.trades_closed == 0  # fresh day, not carried over
+
+    import json
+    lines = history.read_text().strip().splitlines()
+    assert len(lines) == 1, "prior day must be archived exactly once, not dropped"
+    archived = json.loads(lines[0])
+    assert archived["date"] == "2026-07-14"
+    assert archived["trades_closed"] == 1
+
+    # Restarting AGAIN the same day must not double-archive day 14.
+    NativeDailyTargetMonitor(
+        state_path=str(state_path), history_path=str(history), now=_utc(day=15)
+    )
+    assert len(history.read_text().strip().splitlines()) == 1
 
 
 def test_stale_prior_day_state_not_restored(tmp_path) -> None:

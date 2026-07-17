@@ -132,7 +132,15 @@ async def execute_legs(client, symbol: str, funding: float, action: str) -> bool
     v1 skips negative funding in dryrun/live (needs spot-margin shorting).
     """
     if action == "open" and POSITIVE_ONLY and funding <= 0:
-        return False  # skip — negative-funding carry needs margin shorting (v1: off)
+        # Skip — negative-funding carry needs spot-margin shorting (v1: off).
+        # This used to return silently, which was actively misleading: the
+        # cycle log prints max_funding as an ABSOLUTE value, so a -0.13%
+        # funding spike displayed as a tradeable-looking "0.130%" while being
+        # discarded here without a trace. 24% of live-armed polls crossed the
+        # entry threshold this way and every one was silently dropped. Say so.
+        print(f"  [SKIP] {symbol}: funding {funding*100:+.4f}% is NEGATIVE — "
+              f"positive-only v1 cannot trade it (needs spot-margin shorting)")
+        return False
 
     if MODE == "paper":
         return True
@@ -359,8 +367,18 @@ async def run():
                     opened += 1
             _save(STATE, state)
             ts = datetime.now(timezone.utc).strftime("%H:%M")
+            # Report the best ACTUALLY-TRADEABLE funding, not just the absolute
+            # max. Printing only abs(max) conflates "great opportunity" with
+            # "structurally untradeable": under POSITIVE_ONLY a -0.13% spike
+            # rendered as "0.130%" and looked like a near-miss, when in fact it
+            # could never be traded. Show both so the two are never confused.
+            _vals = list(funding.values()) or [0.0]
+            _abs_max = max(abs(v) for v in _vals)
+            _tradeable = [v for v in _vals if v > 0] if POSITIVE_ONLY else [abs(v) for v in _vals]
+            _best_tradeable = max(_tradeable) if _tradeable else 0.0
             print(f"[carry {ts}] open={len(state['open'])} opened={opened} closed={closed} "
-                  f"| max_funding={max([abs(v) for v in funding.values()] or [0])*100:.3f}%")
+                  f"| best_tradeable={_best_tradeable*100:.3f}% "
+                  f"(abs_max={_abs_max*100:.3f}%, entry>={ENTRY*100:.3f}%)")
             await asyncio.sleep(POLL_MIN * 60)
     finally:
         await client.close_connection()

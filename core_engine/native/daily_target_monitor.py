@@ -94,12 +94,19 @@ class NativeDailyTargetMonitor:
         target_trades: int = 5,
         state_path: Optional[str] = None,
         history_path: Optional[str] = None,
+        now: Optional[datetime] = None,
     ) -> None:
+        """``now`` seeds the initial day boundary. It exists because seeding the
+        constructor from the wall clock while every ``record_*`` call takes an
+        explicit ``now`` makes the class untestable with fixed dates: a monitor
+        built "today" but fed day-14 events would spuriously roll over and
+        archive an empty real-today row on its first call.
+        """
         self.target_trades = max(1, int(target_trades))
         self.state_path = Path(state_path) if state_path else None
         self.history_path = Path(history_path) if history_path else None
-        self.state = DailyTargetState(date=self._today(), target_trades=self.target_trades)
-        self._load()
+        self.state = DailyTargetState(date=self._today(now), target_trades=self.target_trades)
+        self._load(now=now)
 
     # ── Day boundary ────────────────────────────────────────────────────
     @staticmethod
@@ -111,7 +118,11 @@ class NativeDailyTargetMonitor:
 
     def _maybe_rollover(self, now: Optional[datetime] = None) -> None:
         today = self._today(now)
-        if self.state.date and self.state.date != today:
+        # Roll FORWARD only (`>`, not `!=`), matching daily_compounding.py's
+        # `today > self.state.sizing_date`. `!=` also fired on a backwards date
+        # (clock correction, or a fixed-date test), which would archive a
+        # partial day and reset — losing real data for no benefit.
+        if self.state.date and today > self.state.date:
             self._archive_day(self.state)
             self.state = DailyTargetState(date=today, target_trades=self.target_trades)
             self._persist()
@@ -270,18 +281,56 @@ class NativeDailyTargetMonitor:
         return out
 
     # ── Persistence (same pattern as daily_compounding.py) ──────────────
-    def _load(self) -> None:
+    def _already_archived(self, date: str) -> bool:
+        """True if ``date`` already has a row in the history file.
+
+        Guards against double-archiving if the process restarts more than once
+        before ``_persist()`` overwrites the stale state file.
+        """
+        if not date or self.history_path is None or not self.history_path.exists():
+            return False
+        try:
+            with open(self.history_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        if str(json.loads(line).get("date", "")) == date:
+                            return True
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            return False
+        return False
+
+    def _load(self, now: Optional[datetime] = None) -> None:
         if self.state_path is None or not self.state_path.exists():
             return
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
             date = str(payload.get("date", "") or "")
-            if date == self._today():
+            known_fields = {f for f in DailyTargetState.__dataclass_fields__}
+            filtered = {k: v for k, v in payload.items() if k in known_fields}
+            if date == self._today(now):
                 # Only restore same-day state — a stale prior day's counters
                 # should never silently carry into a new day's progress.
-                known_fields = {f for f in DailyTargetState.__dataclass_fields__}
-                filtered = {k: v for k, v in payload.items() if k in known_fields}
                 self.state = DailyTargetState(**filtered)
+            elif date:
+                # A PRIOR day's state. This branch used to just DROP it, so any
+                # restart across the UTC midnight boundary permanently lost that
+                # day from the history file — daily_target_history.jsonl was only
+                # complete because the process happened to stay alive overnight.
+                # Archive it before moving on (idempotently, in case of repeated
+                # restarts), then persist today's fresh state over the stale file.
+                prior = DailyTargetState(**filtered)
+                if not self._already_archived(prior.date):
+                    self._archive_day(prior)
+                    logger.info(
+                        "[DailyTargetMonitor] archived prior day %s recovered from state "
+                        "file on startup (restart crossed UTC midnight)", prior.date,
+                    )
+                self._persist()
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as e:
             logger.warning("[DailyTargetMonitor] invalid state file ignored: %s (%s)", self.state_path, e)
 
