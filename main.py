@@ -848,7 +848,18 @@ def main() -> None:
         rc = 130
     finally:
         _release_pid_lock()
-    sys.exit(rc)
+    # MLForecaster background training (agents/ml_forecaster.py) runs on the
+    # asyncio loop's default ThreadPoolExecutor, whose worker threads are
+    # non-daemon. If a training run is in flight at shutdown, stop() cancels
+    # the asyncio wrapper task but the underlying Keras .fit() call keeps
+    # running in its OS thread — sys.exit()'s normal interpreter teardown
+    # then hangs in atexit's _python_exit() waiting to join that thread
+    # (observed: 3+ minutes, until supervisor.sh's watchdog force-killed it).
+    # All of this process's own graceful shutdown (engine teardown, native
+    # bootstrap, logging) has already completed above by this point — only
+    # the interpreter's own atexit thread-join is being skipped here.
+    log.info("Exiting (rc=%d)", rc)
+    os._exit(rc)
 
 
 if __name__ == "__main__":
