@@ -25,6 +25,16 @@ the exact panic this strategy trades is the single biggest risk the backtest
 could not model; this daemon measures it in real time instead of assuming it
 away.
 
+UPDATE 2026-07-20 — a second, bigger real-world gap found and fixed: every
+symbol this daemon had ever "opened" (both closed trades, all open positions)
+had ZERO real supply in Binance's cross-margin lending pool when checked live
+via get_max_margin_loan(). isBorrowable=True is a static asset property, not
+a live inventory check — the pool empties out exactly where this strategy's
+edge concentrates (illiquid coins everyone else also wants to short during a
+panic). Entries now check real live borrow supply before "opening" a paper
+position (_borrow_supply_available()), so the forward record only counts
+trades that were genuinely executable at that moment.
+
 Mechanics (mirrors carry_paper_trader.py's structure, opposite direction):
   funding very negative -> shorts pay longs -> be LONG perp (receive funding)
   hedge by SHORTING spot -> borrow the asset, sell it, repay + buy back to close
@@ -218,6 +228,37 @@ async def _hourly_borrow_rate(client, asset: str) -> float:
     return rate
 
 
+_supply_cache: dict[str, tuple[bool, float]] = {}  # asset -> (has_supply, checked_ts)
+_SUPPLY_CACHE_TTL_S = 300.0  # supply can empty out fast during a panic; check often
+
+
+async def _borrow_supply_available(client, asset: str, needed_qty: float) -> bool:
+    """Real, live check: is there actually enough of `asset` left in
+    Binance's cross-margin lending pool to borrow `needed_qty` right now?
+
+    Found empirically (2026-07-20): every symbol this daemon has ever
+    "opened" a paper position in had ZERO available supply when checked live
+    — isBorrowable=True is a static asset property, not a live inventory
+    check. The lending pool empties out exactly where this strategy's edge
+    concentrates (illiquid coins everyone else also wants to short during a
+    panic), so a paper record that assumes infinite supply silently overstates
+    how often this strategy is actually executable. This check makes the
+    forward record honest: an entry only "opens" here if it could have
+    genuinely been borrowed at that moment."""
+    now = time.time()
+    cached = _supply_cache.get(asset)
+    if cached and (now - cached[1]) < _SUPPLY_CACHE_TTL_S:
+        return cached[0]
+    has_supply = False
+    try:
+        maxb = await client.get_max_margin_loan(asset=asset)
+        has_supply = float(maxb.get("amount", 0.0) or 0.0) >= needed_qty
+    except Exception:
+        has_supply = False  # not borrowable / not on margin / pool empty -> can't trade it
+    _supply_cache[asset] = (has_supply, now)
+    return has_supply
+
+
 def _report():
     trades = []
     for line in open(LEDGER) if os.path.exists(LEDGER) else []:
@@ -317,6 +358,16 @@ async def run():
                         break
                     if (len(state["open"]) + 1) * NOTIONAL > MAX_TOTAL_USD:
                         break
+                    asset = sym[:-4]
+                    try:
+                        mark = await client.futures_mark_price(symbol=sym)
+                        qty_needed = NOTIONAL / float(mark["markPrice"])
+                    except Exception:
+                        continue  # can't size it -> can't check supply -> skip
+                    if not await _borrow_supply_available(client, asset, qty_needed):
+                        print(f"  [SKIP-NO-SUPPLY] {sym}: funding {fr*100:+.3f}% qualifies but "
+                              f"the {asset} lending pool has no supply to borrow right now")
+                        continue
                     state["open"][sym] = {
                         "entry_ts": now, "entry_funding": fr,
                         "last_check_ts": now, "accrued_borrow_pct": 0.0,
