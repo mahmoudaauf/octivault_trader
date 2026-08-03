@@ -35,7 +35,7 @@ def _load(tmp_path, **env):
         "HYBRID_KILL_FILE": str(tmp_path / "kill"),
         "HYBRID_CORE_FRACTION": "0.80",
         "HYBRID_SATELLITE_FLOOR_USD": "5.0",
-        "HYBRID_SWEEP_THRESHOLD_USD": "2.0",
+        "HYBRID_SWEEP_THRESHOLD_USD": "0.5",
     }
     base.update({k: str(v) for k, v in env.items()})
     for k, v in base.items():
@@ -84,10 +84,32 @@ async def test_win_sweep_never_redeems_and_only_flows_to_core(tmp_path):
     c = _mock_client()
     state = {"position": None, "satellite_cash": 15.0, "satellite_target": 7.52}
     new_cash = await h._win_sweep(c, state, 15.0)
-    # excess (15 - 7.52 - 2.0 = 5.48) swept to core; NEVER redeemed
+    # excess (15 - 7.52 - 0.5 = 6.98) swept to core; NEVER redeemed
     c.redeem_simple_earn_flexible_product.assert_not_called()
     assert new_cash < 15.0
-    assert state["satellite_cash"] == pytest.approx(7.52 + 2.0, abs=0.01)
+    assert state["satellite_cash"] == pytest.approx(7.52 + 0.5, abs=0.01)
+
+
+async def test_live_close_sells_min_of_recorded_and_actual_balance(tmp_path):
+    """If the buy fee was taken in the base asset, the real balance is below the
+    recorded (bought) qty. Selling the recorded amount would fail 'insufficient
+    balance' — the close must sell min(recorded, actual), rounded down."""
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    c = _mock_client(price=100.0, step="0.001")
+
+    def _bal(asset=None):
+        return {"free": "0.055"} if asset == "BTC" else {"free": "0.40"}
+    c.get_asset_balance = AsyncMock(side_effect=_bal)  # actual BTC 0.055 < recorded 0.06
+
+    state = {"satellite_cash": 0.4, "position": {
+        "symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
+        "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live"}}
+    await h._close_position(c, state, "take-profit")
+    c.order_market_sell.assert_called_once()
+    _, kwargs = c.order_market_sell.call_args
+    assert float(kwargs["quantity"]) == pytest.approx(0.055, abs=0.0005)  # not 0.06
+    assert state["position"] is None
 
 
 async def test_close_position_never_redeems(tmp_path):
@@ -123,6 +145,22 @@ async def test_live_setup_redeems_once_correct_amount(tmp_path):
     # second call must NOT redeem again (the wall: setup is one-time)
     c.redeem_simple_earn_flexible_product.reset_mock()
     await h._setup_allocation(c, state)
+    c.redeem_simple_earn_flexible_product.assert_not_called()
+
+
+async def test_satellite_target_stable_across_restart(tmp_path):
+    """satellite_target must be set ONCE and never recomputed. A restart while a
+    position is open (its value held as the coin, not in spot/earn) would
+    otherwise shrink `total` and the target, corrupting the win-sweep baseline
+    (observed live: it dropped $7.52 -> $6.10)."""
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    h._EARN_PRODUCT_ID = "USDT001"
+    # mid-position restart: spot+earn ($30.48) understates the real account
+    c = _mock_client(spot_free="0.40", earn="30.08")
+    state = {"position": {"symbol": "BTCUSDT"}, "setup_done": True, "satellite_target": 7.52}
+    await h._setup_allocation(c, state)
+    assert state["satellite_target"] == 7.52          # NOT recomputed to ~6.10
     c.redeem_simple_earn_flexible_product.assert_not_called()
 
 

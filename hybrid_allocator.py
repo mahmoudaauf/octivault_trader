@@ -54,7 +54,12 @@ LEDGER = os.getenv("HYBRID_LEDGER_FILE", "logs/hybrid_ledger.jsonl")
 
 # ── Allocation ───────────────────────────────────────────────────────────────
 CORE_FRACTION = float(os.getenv("HYBRID_CORE_FRACTION", "0.80"))   # 80% safe
-SWEEP_THRESHOLD_USD = float(os.getenv("HYBRID_SWEEP_THRESHOLD_USD", "2.0"))
+# Buffer above target before a win is banked to the core. Kept SMALL relative to
+# the tiny satellite base ($0.50, not $2) so ordinary gains actually get swept —
+# a $2 buffer on a ~$7.50 sleeve would need a ~33% run before banking anything,
+# defeating the ratchet. With the $0.50 min-sweep guard in _win_sweep this means
+# a win is banked once the sleeve clears ~$1 over target.
+SWEEP_THRESHOLD_USD = float(os.getenv("HYBRID_SWEEP_THRESHOLD_USD", "0.5"))
 SATELLITE_FLOOR_USD = float(os.getenv("HYBRID_SATELLITE_FLOOR_USD", "5.0"))
 TRADE_FRACTION = float(os.getenv("HYBRID_TRADE_FRACTION", "0.95"))  # of sat cash
 
@@ -228,8 +233,14 @@ async def _setup_allocation(client, state):
     spot = await _spot_free_usdt(client)
     earn = await _earn_usdt(client)
     total = spot + earn
-    sat_target = total * (1.0 - CORE_FRACTION)
-    state["satellite_target"] = round(sat_target, 2)
+    # Set the satellite target ONCE at first setup and PERSIST it — never
+    # recompute on restart. While a position is open its value is held as the
+    # traded coin (not in spot or earn), so `total` understates the account and
+    # a recompute would shrink the target, making the win-sweep bank the
+    # satellite's own returning capital as if it were a gain.
+    if "satellite_target" not in state:
+        state["satellite_target"] = round(total * (1.0 - CORE_FRACTION), 2)
+    sat_target = state["satellite_target"]
 
     if not _is_live():
         # Paper: seed a simulated satellite balance; move no real money.
@@ -331,7 +342,21 @@ async def _close_position(client, state, reason: str):
     if _is_live():
         try:
             step, _ = await _symbol_filters(client, symbol)
-            sell_qty = _round_step(qty, step)
+            # Sell the LESSER of the recorded (bought) qty and the ACTUAL free
+            # balance, rounded down. If Binance took the buy fee in the base
+            # asset, the real balance is a hair below the recorded qty, and
+            # selling the recorded amount would fail "insufficient balance".
+            asset = symbol[:-4]
+            try:
+                bal = await client.get_asset_balance(asset=asset)
+                actual = float((bal or {}).get("free", 0.0) or 0.0)
+            except Exception:
+                actual = qty
+            sell_qty = _round_step(min(qty, actual), step)
+            if sell_qty <= 0:
+                print(f"  [SAT-CLOSE] {symbol} nothing sellable (balance {actual}) — treating as closed")
+                state["position"] = None
+                return True
             o = await client.order_market_sell(symbol=symbol, quantity=sell_qty)
             fills = o.get("fills", [])
             if fills:
