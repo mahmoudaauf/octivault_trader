@@ -64,11 +64,20 @@ SATELLITE_FLOOR_USD = float(os.getenv("HYBRID_SATELLITE_FLOOR_USD", "5.0"))
 TRADE_FRACTION = float(os.getenv("HYBRID_TRADE_FRACTION", "0.95"))  # of sat cash
 
 # ── Satellite trading ────────────────────────────────────────────────────────
-_DEFAULT_WATCH = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,ADAUSDT,SUIUSDT"
+# Watchlist tuned 2026-08-16 from the first 9 live trades: the only take-profit
+# WINS came from volatile mid-caps (LINK) actually REACHING the +4% target,
+# while mega-caps (BTC/ETH/BNB) chopped sideways and bled fees on flat
+# time-stops. A fixed +4% TP needs coins that can move 4% in the hold window,
+# so drop the mega-caps and use liquid, structurally-volatile mid-caps. (All
+# verified liquid enough for a ~$7 trade.)
+_DEFAULT_WATCH = "SOLUSDT,AVAXUSDT,LINKUSDT,DOGEUSDT,ADAUSDT,SUIUSDT,APTUSDT,ARBUSDT,INJUSDT,NEARUSDT"
 WATCHLIST = [s.strip().upper() for s in os.getenv("HYBRID_WATCHLIST", _DEFAULT_WATCH).split(",") if s.strip()]
 INTERVAL = os.getenv("HYBRID_INTERVAL", "1h")
 BREAKOUT_LOOKBACK = int(os.getenv("HYBRID_BREAKOUT_LOOKBACK", "20"))
-VOLUME_MULT = float(os.getenv("HYBRID_VOLUME_MULT", "1.5"))
+# Raised 1.5 -> 2.0 (2026-08-16): require a genuine volume SURGE, not a marginal
+# breakout, so the sleeve takes fewer/stronger entries and pays fewer ~0.2%
+# fee-drag losses on weak breakouts that just time out near flat.
+VOLUME_MULT = float(os.getenv("HYBRID_VOLUME_MULT", "2.0"))
 TP_PCT = float(os.getenv("HYBRID_TP_PCT", "4.0"))   # take-profit %
 SL_PCT = float(os.getenv("HYBRID_SL_PCT", "2.0"))   # stop-loss %
 MAX_HOLD_H = float(os.getenv("HYBRID_MAX_HOLD_H", "48"))
