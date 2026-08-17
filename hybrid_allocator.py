@@ -373,13 +373,18 @@ async def _place_protective_oco(client, symbol, qty, tp_price, sl_price):
     stop_limit = _round_price(sl_price * (1 - STOP_LIMIT_OFFSET_PCT / 100.0), tick)
     if q <= 0:
         return None
+    def _fmt(p):
+        return f"{p:.8f}".rstrip("0").rstrip(".")
     try:
+        # Binance's current OCO API uses the above/below-order form (the old
+        # price/stopPrice/stopLimitPrice form is rejected with -1102). For a SELL
+        # OCO: ABOVE = take-profit (LIMIT_MAKER, price > last), BELOW = stop-loss
+        # (STOP_LOSS_LIMIT, stopPrice < last).
         o = await _retry(
             client.create_oco_order, symbol=symbol, side="SELL", quantity=q,
-            price=f"{tp:.8f}".rstrip("0").rstrip("."),
-            stopPrice=f"{stop_trig:.8f}".rstrip("0").rstrip("."),
-            stopLimitPrice=f"{stop_limit:.8f}".rstrip("0").rstrip("."),
-            stopLimitTimeInForce="GTC")
+            aboveType="LIMIT_MAKER", abovePrice=_fmt(tp),
+            belowType="STOP_LOSS_LIMIT", belowStopPrice=_fmt(stop_trig),
+            belowPrice=_fmt(stop_limit), belowTimeInForce="GTC")
         oid = o.get("orderListId")
         print(f"  [OCO] {symbol} protective stop+target resting on exchange (id={oid}) "
               f"tp={tp} stop={stop_trig}")
