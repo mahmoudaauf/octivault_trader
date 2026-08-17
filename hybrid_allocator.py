@@ -11,21 +11,32 @@ A barbell / core-satellite structure, operator-chosen with full disclosure:
 
 The satellite has NO EDGE. It is negative expected value. Its entry rule is a
 Donchian breakout — one of the rules this very project already FALSIFIED
-(volatility_breakout_backtest.py: 5,552 signals, negative net at every horizon,
-35-42% win). It is used precisely BECAUSE any rule here loses on average, and
-breakout is simple and transparent. On a ~$7.50 sleeve with a $5 min-notional
-and ~0.2% round-trip fees, the most likely outcome is a slow bleed toward the
-$5 floor, then idle. Do not expect profit.
+(volatility_breakout_backtest.py). It is used precisely BECAUSE any rule here
+loses on average, and breakout is simple and transparent. Do not expect profit.
 
 THE POINT OF THIS FILE IS THE GUARDRAILS, NOT THE TRADING:
   1. THE WALL — the satellite can lose its whole allocation but can NEVER pull
      from the core. `redeem_simple_earn_flexible_product` is called ONLY in the
-     one-time live setup, NEVER in the trading loop. Money only ever flows
+     one-time live setup, NEVER in the trading loop. Money only flows
      satellite -> core (win-sweep), never core -> satellite.
-  2. WIN-SWEEP — satellite gains above target are swept back into the safe core,
-     so a lucky run is banked instead of compounding into a bigger bet.
-  3. FLOOR — below $5 the satellite stops (can't meet min-notional anyway).
+  2. WIN-SWEEP — satellite gains above target are swept back into the safe core.
+  3. FLOOR — below the floor the satellite stops (can't meet min-notional).
   4. Double-gated live (MODE=live AND arm file), kill-switch, drawdown-halt.
+
+Production hardening (2026-08-17, gap audit G1-G8):
+  G1 EXCHANGE-SIDE STOP — on every live open an OCO (take-profit + stop-loss)
+     rests on Binance, so the stop is enforced even if this process is dead or
+     the machine is asleep. The poll loop is only a backup + the time-stop.
+  G2 RESTART RECONCILIATION — on live startup, verify the tracked position
+     against real balances; adopt/alert on stray holdings; protect an
+     unprotected adopted position.
+  G3 SINGLE-INSTANCE LOCK — an flock pidfile prevents two daemons trading one
+     account.
+  G5 API RETRY — order/price calls retry with backoff; a filled-but-errored buy
+     is reconciled instead of leaving an untracked position.
+  G6 paper cash now applies fees (was inconsistent with the ledger).
+  G7 drawdown-halt counts LIVE trades only (paper history no longer trips live).
+  G8 live sizing is capped to the satellite budget, not all spot USDT.
 
 Modes (HYBRID_MODE, default paper):
   paper  — simulate the satellite against a NOTIONAL balance; move NO real money.
@@ -54,32 +65,21 @@ LEDGER = os.getenv("HYBRID_LEDGER_FILE", "logs/hybrid_ledger.jsonl")
 
 # ── Allocation ───────────────────────────────────────────────────────────────
 CORE_FRACTION = float(os.getenv("HYBRID_CORE_FRACTION", "0.80"))   # 80% safe
-# Buffer above target before a win is banked to the core. Kept SMALL relative to
-# the tiny satellite base ($0.50, not $2) so ordinary gains actually get swept —
-# a $2 buffer on a ~$7.50 sleeve would need a ~33% run before banking anything,
-# defeating the ratchet. With the $0.50 min-sweep guard in _win_sweep this means
-# a win is banked once the sleeve clears ~$1 over target.
 SWEEP_THRESHOLD_USD = float(os.getenv("HYBRID_SWEEP_THRESHOLD_USD", "0.5"))
 SATELLITE_FLOOR_USD = float(os.getenv("HYBRID_SATELLITE_FLOOR_USD", "5.0"))
-TRADE_FRACTION = float(os.getenv("HYBRID_TRADE_FRACTION", "0.95"))  # of sat cash
+TRADE_FRACTION = float(os.getenv("HYBRID_TRADE_FRACTION", "0.95"))  # of sat budget
 
 # ── Satellite trading ────────────────────────────────────────────────────────
-# Watchlist tuned 2026-08-16 from the first 9 live trades: the only take-profit
-# WINS came from volatile mid-caps (LINK) actually REACHING the +4% target,
-# while mega-caps (BTC/ETH/BNB) chopped sideways and bled fees on flat
-# time-stops. A fixed +4% TP needs coins that can move 4% in the hold window,
-# so drop the mega-caps and use liquid, structurally-volatile mid-caps. (All
-# verified liquid enough for a ~$7 trade.)
 _DEFAULT_WATCH = "SOLUSDT,AVAXUSDT,LINKUSDT,DOGEUSDT,ADAUSDT,SUIUSDT,APTUSDT,ARBUSDT,INJUSDT,NEARUSDT"
 WATCHLIST = [s.strip().upper() for s in os.getenv("HYBRID_WATCHLIST", _DEFAULT_WATCH).split(",") if s.strip()]
 INTERVAL = os.getenv("HYBRID_INTERVAL", "1h")
 BREAKOUT_LOOKBACK = int(os.getenv("HYBRID_BREAKOUT_LOOKBACK", "20"))
-# Raised 1.5 -> 2.0 (2026-08-16): require a genuine volume SURGE, not a marginal
-# breakout, so the sleeve takes fewer/stronger entries and pays fewer ~0.2%
-# fee-drag losses on weak breakouts that just time out near flat.
 VOLUME_MULT = float(os.getenv("HYBRID_VOLUME_MULT", "2.0"))
 TP_PCT = float(os.getenv("HYBRID_TP_PCT", "4.0"))   # take-profit %
 SL_PCT = float(os.getenv("HYBRID_SL_PCT", "2.0"))   # stop-loss %
+# OCO stop-limit sits this % below the stop TRIGGER, so a triggered stop still
+# fills through a fast move instead of resting as an unfilled limit.
+STOP_LIMIT_OFFSET_PCT = float(os.getenv("HYBRID_STOP_LIMIT_OFFSET_PCT", "0.8"))
 MAX_HOLD_H = float(os.getenv("HYBRID_MAX_HOLD_H", "48"))
 FEE_RT_PCT = float(os.getenv("HYBRID_FEE_RT_PCT", "0.2"))  # round-trip spot taker
 COOLDOWN_H = float(os.getenv("HYBRID_COOLDOWN_H", "1"))
@@ -87,14 +87,18 @@ POLL_MIN = float(os.getenv("HYBRID_POLL_MIN", "15"))
 
 _INTERVAL_HOURS = {"5m": 5 / 60, "15m": 0.25, "30m": 0.5, "1h": 1.0, "2h": 2.0, "4h": 4.0, "1d": 24.0}
 
-# ── Execution mode + safety (double-gated live, cloned from carry daemon) ─────
+# ── Execution mode + safety ──────────────────────────────────────────────────
 MODE = os.getenv("HYBRID_MODE", "paper").lower()
 LIVE_ARM_FILE = os.getenv("HYBRID_LIVE_ARM_FILE", "logs/hybrid_live_armed")
 KILL_FILE = os.getenv("HYBRID_KILL_FILE", "logs/hybrid.stop")
-MAX_DD_PCT = float(os.getenv("HYBRID_MAX_DD_PCT", "100.0"))  # sat may fully bleed by design; floor stops it
+PIDFILE = os.getenv("HYBRID_PIDFILE", "logs/hybrid.pid")          # G3
+MAX_DD_PCT = float(os.getenv("HYBRID_MAX_DD_PCT", "100.0"))
+API_RETRIES = int(os.getenv("HYBRID_API_RETRIES", "3"))          # G5
+API_RETRY_DELAY_S = float(os.getenv("HYBRID_API_RETRY_DELAY_S", "2.0"))
 
 _EARN_PRODUCT_ID = None  # resolved once at startup (USDT flexible, e.g. "USDT001")
-_filters_cache: dict[str, tuple] = {}  # symbol -> (qty_step, min_notional)
+_filters_cache: dict[str, tuple] = {}  # symbol -> (qty_step, min_notional, tick)
+_lock_handle = None      # keep the flock fd alive for the process lifetime
 
 
 def _is_live() -> bool:
@@ -105,20 +109,50 @@ def _killed() -> bool:
     return os.path.exists(KILL_FILE)
 
 
-def _current_drawdown_pct() -> float:
-    """Peak-to-current drawdown over the satellite ledger's summed net_pct."""
+# ── G3: single-instance lock ─────────────────────────────────────────────────
+def _acquire_lock() -> bool:
+    """Exclusive flock on a pidfile. Prevents two daemons trading one account
+    (double orders, racing sweeps, state clobbering). Returns False if held."""
+    global _lock_handle
+    import fcntl
+    os.makedirs(os.path.dirname(PIDFILE) or ".", exist_ok=True)
+    fh = open(PIDFILE, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False
+    fh.seek(0)
+    fh.write(str(os.getpid()))
+    fh.truncate()
+    fh.flush()
+    _lock_handle = fh  # held until process exit
+    return True
+
+
+def _current_drawdown_pct(live_only: bool = True) -> float:
+    """Peak-to-current drawdown over summed net_pct. G7: by default counts only
+    LIVE trades, so a long PAPER loss history can't trip the live drawdown-halt
+    the instant you arm live."""
     if not os.path.exists(LEDGER):
         return 0.0
     cum = peak = 0.0
-    for line in open(LEDGER):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            cum += float(json.loads(line).get("net_pct", 0.0))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-        peak = max(peak, cum)
+    with open(LEDGER) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if live_only and rec.get("mode") != "live":
+                continue
+            try:
+                cum += float(rec.get("net_pct", 0.0))
+            except (TypeError, ValueError):
+                continue
+            peak = max(peak, cum)
     return max(0.0, peak - cum)
 
 
@@ -149,18 +183,42 @@ def _round_step(qty: float, step: float) -> float:
     return (int(qty / step)) * step
 
 
-async def _symbol_filters(client, symbol: str) -> tuple[float, float]:
-    """(qty_step, min_notional) for a SPOT symbol. Cached; filters are static."""
+def _round_price(price: float, tick: float) -> float:
+    if tick <= 0:
+        return price
+    return round(int(price / tick) * tick, 8)
+
+
+# ── G5: retry wrapper for flaky API calls ────────────────────────────────────
+async def _retry(fn, *args, **kwargs):
+    """Await fn(*args, **kwargs) with bounded retry/backoff. Re-raises the last
+    error so callers still see a genuine failure."""
+    last = None
+    for attempt in range(API_RETRIES):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            if attempt < API_RETRIES - 1:
+                await asyncio.sleep(API_RETRY_DELAY_S * (attempt + 1))
+    raise last
+
+
+async def _symbol_filters(client, symbol: str) -> tuple[float, float, float]:
+    """(qty_step, min_notional, price_tick) for a SPOT symbol. Cached."""
     if symbol in _filters_cache:
         return _filters_cache[symbol]
     sinfo = await client.get_exchange_info()
     ssym = next(x for x in sinfo["symbols"] if x["symbol"] == symbol)
     step = next(float(f["stepSize"]) for f in ssym["filters"] if f["filterType"] == "LOT_SIZE")
+    tick = 0.0
     min_notional = 5.0
     for f in ssym["filters"]:
+        if f["filterType"] == "PRICE_FILTER":
+            tick = float(f["tickSize"])
         if f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL"):
             min_notional = float(f.get("minNotional", f.get("notional", 5.0)))
-    _filters_cache[symbol] = (step, min_notional)
+    _filters_cache[symbol] = (step, min_notional, tick)
     return _filters_cache[symbol]
 
 
@@ -194,7 +252,16 @@ async def _spot_free_usdt(client) -> float:
         return 0.0
 
 
-# ── Breakout signal (adapted from volatility_breakout_backtest.find_signals) ──
+async def _asset_qty(client, asset: str) -> float:
+    """Free + locked balance of a base asset (locked because an OCO holds it)."""
+    try:
+        bal = await client.get_asset_balance(asset=asset)
+        return float((bal or {}).get("free", 0.0) or 0.0) + float((bal or {}).get("locked", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+# ── Breakout signal ──────────────────────────────────────────────────────────
 async def _fetch_klines(client, symbol: str):
     try:
         lookback_days = max(2, int((BREAKOUT_LOOKBACK + 4) * _INTERVAL_HOURS[INTERVAL] / 24) + 1)
@@ -222,55 +289,49 @@ def _is_breakout(klines) -> bool:
 
 
 async def _price(client, symbol: str) -> float:
-    t = await client.get_symbol_ticker(symbol=symbol)
+    t = await _retry(client.get_symbol_ticker, symbol=symbol)
     return float(t["price"])
 
 
-# ── Satellite cash / value ───────────────────────────────────────────────────
+# ── Satellite budget ─────────────────────────────────────────────────────────
 async def _satellite_cash(client, state) -> float:
-    """Uninvested satellite USDT. Live: real spot free. Paper: simulated cash."""
+    """Investable satellite USDT. G8: live is capped to the satellite target
+    (never sizes off unrelated USDT parked in spot). Paper: simulated cash."""
     if _is_live():
-        return await _spot_free_usdt(client)
+        spot = await _spot_free_usdt(client)
+        target = float(state.get("satellite_target", 0.0)) or spot
+        return min(spot, target)
     return float(state.get("satellite_cash", 0.0))
 
 
 # ── Core allocation: one-time setup + win-sweep (the WALL lives here) ─────────
 async def _setup_allocation(client, state):
-    """Establish the 80/20 split. In LIVE this redeems earn->spot ONCE to fund
-    the satellite. This is the ONLY place redeem is ever called — the trading
-    loop never redeems, so satellite losses can never touch the core."""
+    """Establish the 80/20 split. In LIVE this redeems earn->spot ONCE. This is
+    the ONLY place redeem is called — the loop never redeems, so satellite
+    losses can never touch the core."""
     spot = await _spot_free_usdt(client)
     earn = await _earn_usdt(client)
     total = spot + earn
-    # Set the satellite target ONCE at first setup and PERSIST it — never
-    # recompute on restart. While a position is open its value is held as the
-    # traded coin (not in spot or earn), so `total` understates the account and
-    # a recompute would shrink the target, making the win-sweep bank the
-    # satellite's own returning capital as if it were a gain.
     if "satellite_target" not in state:
         state["satellite_target"] = round(total * (1.0 - CORE_FRACTION), 2)
     sat_target = state["satellite_target"]
 
     if not _is_live():
-        # Paper: seed a simulated satellite balance; move no real money.
         if "satellite_cash" not in state:
             state["satellite_cash"] = round(sat_target, 2)
-        print(f"[hybrid] paper split — total=${total:.2f} core(80%)=${total*CORE_FRACTION:.2f} "
-              f"satellite(20%)=${state['satellite_cash']:.2f} (simulated, no real money moved)")
+        print(f"[hybrid] paper split — total=${total:.2f} core={total*CORE_FRACTION:.2f} "
+              f"satellite=${state['satellite_cash']:.2f} (simulated, no real money moved)")
         return
 
-    # Live: fund the satellite to its target from earn, ONE TIME only.
     if state.get("setup_done"):
-        print(f"[hybrid] live split already established — satellite_target=${sat_target:.2f}, "
-              f"spot=${spot:.2f}")
+        print(f"[hybrid] live split already established — satellite_target=${sat_target:.2f}, spot=${spot:.2f}")
         return
     deficit = sat_target - spot
     if deficit > 0.01 and _EARN_PRODUCT_ID:
         try:
             await client.redeem_simple_earn_flexible_product(
                 productId=_EARN_PRODUCT_ID, amount=str(round(deficit, 2)))
-            print(f"[hybrid] live setup — redeemed ${deficit:.2f} earn->spot to fund satellite; "
-                  f"core stays ~${total*CORE_FRACTION:.2f}")
+            print(f"[hybrid] live setup — redeemed ${deficit:.2f} earn->spot; core stays ~${total*CORE_FRACTION:.2f}")
         except Exception as e:
             print(f"[hybrid] live setup redeem failed: {str(e)[:90]} — satellite underfunded, continuing")
     state["setup_done"] = True
@@ -283,7 +344,7 @@ async def _win_sweep(client, state, sat_cash: float):
     if target <= 0:
         return sat_cash
     excess = sat_cash - target - SWEEP_THRESHOLD_USD
-    if excess < 0.5:  # not enough to bother
+    if excess < 0.5:
         return sat_cash
     if _is_live():
         if _EARN_PRODUCT_ID:
@@ -300,9 +361,48 @@ async def _win_sweep(client, state, sat_cash: float):
     return sat_cash - excess
 
 
+# ── G1: exchange-side protective OCO (take-profit + stop-loss) ────────────────
+async def _place_protective_oco(client, symbol, qty, tp_price, sl_price):
+    """Rest an OCO SELL on Binance so the stop/target is enforced even if this
+    process dies or the machine sleeps. Returns orderListId, or None on failure
+    (the software poll loop then remains the only stop — logged loudly)."""
+    step, _mn, tick = await _symbol_filters(client, symbol)
+    q = _round_step(qty, step)
+    tp = _round_price(tp_price, tick)
+    stop_trig = _round_price(sl_price, tick)
+    stop_limit = _round_price(sl_price * (1 - STOP_LIMIT_OFFSET_PCT / 100.0), tick)
+    if q <= 0:
+        return None
+    try:
+        o = await _retry(
+            client.create_oco_order, symbol=symbol, side="SELL", quantity=q,
+            price=f"{tp:.8f}".rstrip("0").rstrip("."),
+            stopPrice=f"{stop_trig:.8f}".rstrip("0").rstrip("."),
+            stopLimitPrice=f"{stop_limit:.8f}".rstrip("0").rstrip("."),
+            stopLimitTimeInForce="GTC")
+        oid = o.get("orderListId")
+        print(f"  [OCO] {symbol} protective stop+target resting on exchange (id={oid}) "
+              f"tp={tp} stop={stop_trig}")
+        return oid
+    except Exception as e:
+        print(f"  ⚠️  [OCO-FAIL] {symbol}: {str(e)[:120]} — SOFTWARE STOP ONLY until next open")
+        return None
+
+
+async def _cancel_oco(client, symbol, oco_id):
+    if oco_id is None:
+        return
+    try:
+        await _retry(client.cancel_order, symbol=symbol, orderListId=oco_id)
+    except Exception as e:
+        # Already filled/cancelled is fine; anything else is logged, not fatal.
+        if "-2011" not in str(e) and "Unknown order" not in str(e):
+            print(f"  [OCO-CANCEL] {symbol} id={oco_id}: {str(e)[:80]}")
+
+
 # ── Satellite trade execution ────────────────────────────────────────────────
 async def _open_position(client, state, symbol: str, sat_cash: float):
-    step, min_notional = await _symbol_filters(client, symbol)
+    step, min_notional, _tick = await _symbol_filters(client, symbol)
     price = await _price(client, symbol)
     notional = min(sat_cash * TRADE_FRACTION, sat_cash - 0.05)
     if notional < max(min_notional, SATELLITE_FLOOR_USD):
@@ -313,13 +413,14 @@ async def _open_position(client, state, symbol: str, sat_cash: float):
 
     if MODE == "dryrun":
         print(f"  [DRYRUN] would BUY {qty} {symbol} @ ~{price:.6f} (~${qty*price:.2f}) "
-              f"tp=+{TP_PCT}% sl=-{SL_PCT}% — sending nothing")
+              f"tp=+{TP_PCT}% sl=-{SL_PCT}% + resting OCO — sending nothing")
         return False
 
     fill_price = price
+    oco_id = None
     if _is_live():
         try:
-            o = await client.order_market_buy(symbol=symbol, quantity=qty)
+            o = await _retry(client.order_market_buy, symbol=symbol, quantity=qty)
             fills = o.get("fills", [])
             if fills:
                 spent = sum(float(f["price"]) * float(f["qty"]) for f in fills)
@@ -327,15 +428,28 @@ async def _open_position(client, state, symbol: str, sat_cash: float):
                 fill_price = spent / got if got else price
                 qty = got
         except Exception as e:
-            print(f"  [SAT-OPEN-ERROR] {symbol}: {str(e)[:100]}")
-            return False
+            # G5: a buy can fill AND raise (timeout after match). Reconcile the
+            # real balance before assuming no fill, so we never leave an
+            # untracked, unstopped position.
+            print(f"  [SAT-OPEN-ERROR] {symbol}: {str(e)[:90]} — checking for a stray fill")
+            held = await _asset_qty(client, symbol[:-4])
+            if held * price >= max(min_notional, 5.0):
+                qty = _round_step(held, step)
+                print(f"  [SAT-OPEN-RECOVER] {symbol}: buy DID fill ({held}) — adopting + protecting")
+            else:
+                return False
+        # G1: rest the protective OCO on the exchange (uses actual held qty).
+        held = await _asset_qty(client, symbol[:-4])
+        tp_price = fill_price * (1 + TP_PCT / 100.0)
+        sl_price = fill_price * (1 - SL_PCT / 100.0)
+        oco_id = await _place_protective_oco(client, symbol, min(qty, held), tp_price, sl_price)
     else:
-        state["satellite_cash"] = round(sat_cash - qty * fill_price, 2)
+        state["satellite_cash"] = round(sat_cash - qty * fill_price * (1 + FEE_RT_PCT / 200.0), 2)
 
     state["position"] = {
         "symbol": symbol, "entry_ts": time.time(), "entry_price": fill_price,
         "qty": qty, "tp_price": fill_price * (1 + TP_PCT / 100.0),
-        "sl_price": fill_price * (1 - SL_PCT / 100.0), "mode": MODE,
+        "sl_price": fill_price * (1 - SL_PCT / 100.0), "mode": MODE, "oco_id": oco_id,
     }
     state["last_entry_ts"] = time.time()
     print(f"  [SAT-OPEN] {symbol} {qty} @ {fill_price:.6f} (~${qty*fill_price:.2f}) "
@@ -343,64 +457,131 @@ async def _open_position(client, state, symbol: str, sat_cash: float):
     return True
 
 
-async def _close_position(client, state, reason: str):
-    pos = state["position"]
-    symbol, qty, entry = pos["symbol"], pos["qty"], pos["entry_price"]
-    price = await _price(client, symbol)
-    exit_price = price
-    if _is_live():
-        try:
-            step, _ = await _symbol_filters(client, symbol)
-            # Sell the LESSER of the recorded (bought) qty and the ACTUAL free
-            # balance, rounded down. If Binance took the buy fee in the base
-            # asset, the real balance is a hair below the recorded qty, and
-            # selling the recorded amount would fail "insufficient balance".
-            asset = symbol[:-4]
-            try:
-                bal = await client.get_asset_balance(asset=asset)
-                actual = float((bal or {}).get("free", 0.0) or 0.0)
-            except Exception:
-                actual = qty
-            sell_qty = _round_step(min(qty, actual), step)
-            if sell_qty <= 0:
-                print(f"  [SAT-CLOSE] {symbol} nothing sellable (balance {actual}) — treating as closed")
-                state["position"] = None
-                return True
-            o = await client.order_market_sell(symbol=symbol, quantity=sell_qty)
-            fills = o.get("fills", [])
-            if fills:
-                got = sum(float(f["price"]) * float(f["qty"]) for f in fills)
-                sold = sum(float(f["qty"]) for f in fills)
-                exit_price = got / sold if sold else price
-        except Exception as e:
-            print(f"  [SAT-CLOSE-ERROR] {symbol}: {str(e)[:100]} — keeping tracked, will retry")
-            return False
-    else:
-        state["satellite_cash"] = round(float(state.get("satellite_cash", 0.0)) + qty * exit_price, 2)
-
+def _book_close(state, symbol, entry, exit_price, reason, qty):
+    """Write the ledger record and clear the position (shared by all close paths)."""
     gross_pct = (exit_price - entry) / entry * 100.0
     net_pct = gross_pct - FEE_RT_PCT
-    held_h = (time.time() - pos["entry_ts"]) / 3600.0
+    pos = state.get("position") or {}
+    held_h = (time.time() - pos.get("entry_ts", time.time())) / 3600.0
     _log_trade({
         "ts": datetime.now(timezone.utc).isoformat(), "symbol": symbol,
         "held_h": round(held_h, 2), "entry_price": entry, "exit_price": round(exit_price, 8),
         "qty": qty, "gross_pct": round(gross_pct, 4), "net_pct": round(net_pct, 4),
         "reason": reason, "mode": pos.get("mode", MODE),
     })
-    print(f"  [SAT-CLOSE] {symbol} @ {exit_price:.6f} net={net_pct:+.2f}% ({reason}) [{MODE}]")
+    print(f"  [SAT-CLOSE] {symbol} @ {exit_price:.6f} net={net_pct:+.2f}% ({reason}) [{pos.get('mode', MODE)}]")
     state["position"] = None
+
+
+async def _detect_exchange_close(client, state) -> bool:
+    """G1: if the resting OCO already executed (stop or target hit) — possibly
+    while this process was asleep or between polls — the coin balance is gone.
+    Detect it and book the trade at the OCO price, so the exchange stop and our
+    records stay consistent. Returns True if it closed the position."""
+    pos = state.get("position")
+    if not pos or pos.get("mode") != "live":
+        return False
+    symbol = pos["symbol"]
+    held = await _asset_qty(client, symbol[:-4])
+    # Position still meaningfully held → OCO hasn't fired.
+    if held >= pos["qty"] * 0.5:
+        return False
+    # Coin is gone → the OCO closed it. Label by which side the price is at.
+    price = await _price(client, symbol)
+    if price >= pos["tp_price"] * 0.999:
+        exit_price, reason = pos["tp_price"], "take-profit-oco"
+    else:
+        exit_price, reason = pos["sl_price"], "stop-loss-oco"
+    print(f"  [OCO-FILLED] {symbol} closed on exchange (held={held}) → booking {reason}")
+    _book_close(state, symbol, pos["entry_price"], exit_price, reason, pos["qty"])
     return True
+
+
+async def _close_position(client, state, reason: str):
+    """Software-initiated close (time-stop / kill-switch / paper). Cancels the
+    resting OCO first so the market sell isn't blocked by the locked balance."""
+    pos = state["position"]
+    symbol, qty, entry = pos["symbol"], pos["qty"], pos["entry_price"]
+    exit_price = await _price(client, symbol)
+    if _is_live():
+        try:
+            await _cancel_oco(client, symbol, pos.get("oco_id"))
+            step, _mn, _tick = await _symbol_filters(client, symbol)
+            asset = symbol[:-4]
+            actual = await _asset_qty(client, asset)
+            sell_qty = _round_step(min(qty, actual), step)
+            if sell_qty <= 0:
+                print(f"  [SAT-CLOSE] {symbol} nothing sellable (bal {actual}) — treating as closed")
+                state["position"] = None
+                return True
+            o = await _retry(client.order_market_sell, symbol=symbol, quantity=sell_qty)
+            fills = o.get("fills", [])
+            if fills:
+                got = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+                sold = sum(float(f["qty"]) for f in fills)
+                exit_price = got / sold if sold else exit_price
+        except Exception as e:
+            print(f"  [SAT-CLOSE-ERROR] {symbol}: {str(e)[:100]} — keeping tracked, will retry")
+            return False
+    else:
+        state["satellite_cash"] = round(
+            float(state.get("satellite_cash", 0.0)) + qty * exit_price * (1 - FEE_RT_PCT / 200.0), 2)
+    _book_close(state, symbol, entry, exit_price, reason, qty)
+    return True
+
+
+# ── G2: restart / crash reconciliation ───────────────────────────────────────
+async def _reconcile(client, state):
+    """On live startup, make the tracked state agree with the exchange:
+      • tracked position but the coin is GONE → it closed while we were down; book it.
+      • tracked position still held but NO resting OCO → protect it now.
+      • state is FLAT but a stray coin balance ≥ min-notional exists → adopt +
+        protect it (a buy whose state-save crashed) instead of leaving it
+        unmanaged and unstopped.
+    """
+    if not _is_live():
+        return
+    pos = state.get("position")
+    if pos and pos.get("mode") == "live":
+        symbol = pos["symbol"]
+        held = await _asset_qty(client, symbol[:-4])
+        if held < pos["qty"] * 0.5:
+            print(f"[hybrid] reconcile — tracked {symbol} no longer held; booking its exchange close")
+            await _detect_exchange_close(client, state)
+        elif not pos.get("oco_id"):
+            print(f"[hybrid] reconcile — tracked {symbol} has NO resting stop; placing one now")
+            pos["oco_id"] = await _place_protective_oco(
+                client, symbol, min(pos["qty"], held), pos["tp_price"], pos["sl_price"])
+        return
+    # Flat: look for a stray holding to adopt.
+    for symbol in WATCHLIST:
+        try:
+            held = await _asset_qty(client, symbol[:-4])
+            price = await _price(client, symbol)
+            if held * price >= max(SATELLITE_FLOOR_USD, 5.0):
+                print(f"[hybrid] reconcile — stray {symbol} holding ${held*price:.2f} found; adopting + protecting")
+                tp, sl = price * (1 + TP_PCT / 100.0), price * (1 - SL_PCT / 100.0)
+                oco = await _place_protective_oco(client, symbol, held, tp, sl)
+                state["position"] = {
+                    "symbol": symbol, "entry_ts": time.time(), "entry_price": price,
+                    "qty": held, "tp_price": tp, "sl_price": sl, "mode": "live", "oco_id": oco,
+                }
+                return
+        except Exception:
+            continue
 
 
 def _report():
     trades = []
-    for line in (open(LEDGER) if os.path.exists(LEDGER) else []):
-        line = line.strip()
-        if line:
-            try:
-                trades.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
+    if os.path.exists(LEDGER):
+        with open(LEDGER) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        trades.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
     if not trades:
         print("No closed satellite trades yet.")
         return
@@ -411,7 +592,7 @@ def _report():
     print(f"HYBRID SATELLITE — TRACK RECORD ({n} closed trades)")
     print("=" * 66)
     print(f"  Avg net/trade: {sum(nets)/n:+.3f}%   win-rate: {wins/n*100:.0f}%   cum: {sum(nets):+.2f}%")
-    print("  NOTE: satellite is negative-EV by construction — this is capped 'action',")
+    print("  NOTE: satellite is negative-EV by construction — capped 'action',")
     print("        not a growth engine. The core (80% in yield) is where growth lives.")
     print("=" * 66)
 
@@ -420,13 +601,17 @@ async def run():
     global _EARN_PRODUCT_ID
     from binance import AsyncClient
 
+    if not _acquire_lock():                                   # G3
+        print(f"[hybrid] another instance holds {PIDFILE} — refusing to start (single-instance lock)")
+        return
+
     client = await AsyncClient.create(
         os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x")
     state = _load(STATE, {"position": None})
     armed = _is_live()
     banner = {"paper": "📝 PAPER (no real money)",
               "dryrun": "🧪 DRY-RUN (logs orders, sends none)",
-              "live": ("🔴 LIVE-ARMED (real spot orders)" if armed
+              "live": ("🔴 LIVE-ARMED (real spot orders + exchange stops)" if armed
                        else "🔴 live (BLOCKED — arm file missing, no orders)")}
     print(f"[hybrid] start — MODE={MODE} → {banner.get(MODE, MODE)}")
     print(f"[hybrid] barbell — core={CORE_FRACTION*100:.0f}% (yield, untouchable) "
@@ -436,49 +621,55 @@ async def run():
     try:
         _EARN_PRODUCT_ID = await _resolve_product_id(client)
         await _setup_allocation(client, state)
+        await _reconcile(client, state)                       # G2
         _save(STATE, state)
 
         while True:
             now = time.time()
 
-            # ── Manage an open satellite position (TP / SL / time-stop) ──
+            # ── Manage an open position ──
             if state.get("position"):
-                pos = state["position"]
                 try:
-                    price = await _price(client, pos["symbol"])
-                    held_h = (now - pos["entry_ts"]) / 3600.0
-                    reason = None
-                    if price >= pos["tp_price"]:
-                        reason = "take-profit"
-                    elif price <= pos["sl_price"]:
-                        reason = "stop-loss"
-                    elif held_h >= MAX_HOLD_H:
-                        reason = "time-stop"
-                    elif _killed():
-                        reason = "kill-switch"
-                    if reason:
-                        await _close_position(client, state, reason)
-                        _save(STATE, state)
+                    # G1: did the exchange OCO already close it (asleep/between polls)?
+                    if not await _detect_exchange_close(client, state):
+                        pos = state["position"]
+                        price = await _price(client, pos["symbol"])
+                        held_h = (now - pos["entry_ts"]) / 3600.0
+                        reason = None
+                        # Software TP/SL remain as a BACKUP to the exchange OCO
+                        # (and are the only stop in paper mode).
+                        if price >= pos["tp_price"]:
+                            reason = "take-profit"
+                        elif price <= pos["sl_price"]:
+                            reason = "stop-loss"
+                        elif held_h >= MAX_HOLD_H:
+                            reason = "time-stop"
+                        elif _killed():
+                            reason = "kill-switch"
+                        if reason:
+                            await _close_position(client, state, reason)
+                    _save(STATE, state)
                 except Exception as e:
                     print(f"  [SAT-MANAGE-ERROR] {str(e)[:90]}")
 
-            # ── Drawdown auto-halt (backstop; floor is the primary stop) ──
-            dd = _current_drawdown_pct()
+            # ── Drawdown auto-halt (G7: live trades only) ──
+            dd = _current_drawdown_pct(live_only=True)
             if dd >= MAX_DD_PCT and not _killed():
                 open(KILL_FILE, "w").close()
                 print(f"[hybrid] 🛑 DRAWDOWN HALT {dd:.1f}% >= {MAX_DD_PCT}% — kill-switch engaged")
 
             sat_cash = await _satellite_cash(client, state)
 
-            # ── Win-sweep: bank satellite gains into the core (only when flat) ──
+            # ── Win-sweep (only when flat) ──
             if not state.get("position"):
                 sat_cash = await _win_sweep(client, state, sat_cash)
                 _save(STATE, state)
 
-            # ── Entry: one position at a time, breakout, floor + cooldown gated ──
+            # ── Entry ──
             opened = False
+            floor = max(SATELLITE_FLOOR_USD, 5.0)
             if (not state.get("position") and not _killed()
-                    and sat_cash >= max(SATELLITE_FLOOR_USD, 5.0)
+                    and sat_cash >= floor / TRADE_FRACTION   # G-low: no dead-zone busy-loop
                     and (now - float(state.get("last_entry_ts", 0))) >= COOLDOWN_H * 3600):
                 if MODE == "live" and not _is_live():
                     print("  [LIVE-BLOCKED] arm file missing — no order")
@@ -493,9 +684,9 @@ async def run():
                                     break
                         except Exception as e:
                             print(f"  [SCAN-ERROR] {symbol}: {str(e)[:70]}")
-            elif sat_cash < max(SATELLITE_FLOOR_USD, 5.0) and not state.get("position"):
-                print(f"  [SATELLITE-FLOOR] cash ${sat_cash:.2f} < ${max(SATELLITE_FLOOR_USD,5.0):.2f} "
-                      f"— sleeve idle (never topped up from core)")
+            elif sat_cash < floor and not state.get("position"):
+                print(f"  [SATELLITE-FLOOR] cash ${sat_cash:.2f} < ${floor:.2f} — sleeve idle "
+                      f"(never topped up from core)")
 
             ts = datetime.now(timezone.utc).strftime("%H:%M")
             held = "flat" if not state.get("position") else state["position"]["symbol"]

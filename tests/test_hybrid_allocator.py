@@ -58,11 +58,14 @@ def _mock_client(*, spot_free="0.01", earn="37.59", price=100.0,
         "symbol": "BTCUSDT",
         "filters": [
             {"filterType": "LOT_SIZE", "stepSize": step, "minQty": "0.00001"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
             {"filterType": "NOTIONAL", "minNotional": min_notional},
         ],
     }]}
     c.order_market_buy.return_value = {"fills": [{"price": str(price), "qty": "0.06"}]}
     c.order_market_sell.return_value = {"fills": [{"price": str(price), "qty": "0.06"}]}
+    c.create_oco_order.return_value = {"orderListId": 123}
+    c.cancel_order.return_value = {}
     return c
 
 
@@ -272,3 +275,147 @@ async def test_close_logs_trade_with_net_pct(tmp_path):
     assert len(lines) == 1
     assert lines[0]["net_pct"] == pytest.approx(4.0 - 0.2, abs=0.01)  # +4% gross - fees
     assert lines[0]["reason"] == "take-profit"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HARDENING (gap audit G1-G8, 2026-08-17)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# G3 — single-instance lock
+def test_single_instance_lock(tmp_path):
+    import fcntl
+    h = _load(tmp_path, HYBRID_PIDFILE=str(tmp_path / "h.pid"))
+    assert h._acquire_lock() is True
+    fh = open(tmp_path / "h.pid")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        second_got_it = True
+    except OSError:
+        second_got_it = False
+    finally:
+        fh.close()
+    assert second_got_it is False  # lock held → a second instance is blocked
+
+
+# G8 — live sizing capped to the satellite budget, not all spot USDT
+async def test_live_satellite_cash_capped_to_target(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    c = _mock_client(spot_free="50.0")  # lots of unrelated USDT parked in spot
+    state = {"satellite_target": 7.52}
+    assert await h._satellite_cash(c, state) == pytest.approx(7.52)  # NOT $50
+
+
+# G7 — drawdown-halt counts LIVE trades only
+async def test_drawdown_halt_ignores_paper_trades(tmp_path):
+    import json
+    h = _load(tmp_path)
+    with open(h.LEDGER, "w") as f:
+        f.write(json.dumps({"net_pct": -50.0, "mode": "paper"}) + "\n")
+        f.write(json.dumps({"net_pct": -2.0, "mode": "live"}) + "\n")
+    assert h._current_drawdown_pct(live_only=True) == pytest.approx(2.0)   # only the live loss
+    assert h._current_drawdown_pct(live_only=False) == pytest.approx(52.0)  # both
+
+
+# G6 — paper round-trip now loses fees (was inconsistent with the ledger before)
+async def test_paper_round_trip_loses_fees(tmp_path):
+    h = _load(tmp_path, HYBRID_MODE="paper", HYBRID_FEE_RT_PCT="0.2")
+    c = _mock_client(price=100.0)
+    state = {"position": None, "satellite_cash": 7.5}
+    await h._open_position(c, state, "BTCUSDT", 7.5)
+    await h._close_position(c, state, "time-stop")  # exit at same price
+    assert state["satellite_cash"] < 7.5   # fee was deducted (used to be exactly 7.5)
+    assert state["satellite_cash"] > 7.4   # but only a small fee
+
+
+# G1 — live open places a protective OCO on the exchange
+async def test_live_open_places_protective_oco(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    c = _mock_client(price=100.0)
+    c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
+        {"free": "0.06", "locked": "0"} if asset == "BTC" else {"free": "7.5", "locked": "0"}))
+    state = {"position": None, "satellite_target": 7.52}
+    assert await h._open_position(c, state, "BTCUSDT", 7.5) is True
+    c.order_market_buy.assert_called_once()
+    c.create_oco_order.assert_called_once()       # exchange-side stop+target placed
+    assert state["position"]["oco_id"] == 123
+
+
+# G1 — software close cancels the resting OCO before the market sell
+async def test_live_close_cancels_oco(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    c = _mock_client(price=100.0)
+    c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
+        {"free": "0.06", "locked": "0"} if asset == "BTC" else {"free": "0.4", "locked": "0"}))
+    state = {"position": {"symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
+             "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}}
+    await h._close_position(c, state, "time-stop")
+    c.cancel_order.assert_called_once()           # OCO cancelled first
+    c.order_market_sell.assert_called_once()
+    assert state["position"] is None
+
+
+# G1 — exchange OCO fired while we were away → detected and booked
+async def test_detect_exchange_close_books_when_balance_gone(tmp_path):
+    import json
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    c = _mock_client(price=104.5)  # at/above TP → labelled take-profit
+    c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
+        {"free": "0.0", "locked": "0"} if asset == "BTC" else {"free": "0.4", "locked": "0"}))
+    state = {"position": {"symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
+             "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}}
+    assert await h._detect_exchange_close(c, state) is True
+    assert state["position"] is None
+    rec = json.loads(open(h.LEDGER).read().strip())
+    assert rec["reason"] == "take-profit-oco"
+
+
+# G2 — reconcile protects a tracked position that has no resting stop
+async def test_reconcile_protects_position_without_oco(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    c = _mock_client(price=100.0)
+    c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
+        {"free": "0.06", "locked": "0"} if asset == "BTC" else {"free": "0.4", "locked": "0"}))
+    state = {"position": {"symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
+             "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": None}}
+    await h._reconcile(c, state)
+    c.create_oco_order.assert_called_once()
+    assert state["position"]["oco_id"] == 123
+
+
+# G2 — reconcile adopts + protects a stray coin holding when state says flat
+async def test_reconcile_adopts_stray_holding(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live", HYBRID_WATCHLIST="BTCUSDT")
+    c = _mock_client(price=100.0)
+    c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
+        {"free": "0.06", "locked": "0"} if asset == "BTC" else {"free": "0.4", "locked": "0"}))
+    state = {"position": None, "satellite_target": 7.52}
+    await h._reconcile(c, state)
+    assert state["position"] is not None and state["position"]["symbol"] == "BTCUSDT"
+    c.create_oco_order.assert_called_once()
+
+
+# G5 — retry succeeds after transient failures, and re-raises after max
+async def test_retry_succeeds_after_transient_failures(tmp_path):
+    h = _load(tmp_path, HYBRID_API_RETRIES="3", HYBRID_API_RETRY_DELAY_S="0")
+    calls = {"n": 0}
+    async def flaky(**k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise Exception("transient")
+        return {"ok": True}
+    assert await h._retry(flaky, x=1) == {"ok": True}
+    assert calls["n"] == 3
+
+
+async def test_retry_reraises_after_max(tmp_path):
+    h = _load(tmp_path, HYBRID_API_RETRIES="2", HYBRID_API_RETRY_DELAY_S="0")
+    async def always_fail(**k):
+        raise ValueError("nope")
+    with pytest.raises(ValueError):
+        await h._retry(always_fail)
