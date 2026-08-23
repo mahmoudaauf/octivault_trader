@@ -352,9 +352,29 @@ async def test_live_close_cancels_oco(tmp_path):
     state = {"position": {"symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
              "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}}
     await h._close_position(c, state, "time-stop")
-    c.cancel_order.assert_called_once()           # OCO cancelled first
+    # Must cancel the LIST (DELETE /api/v3/orderList). cancel_order (DELETE
+    # /api/v3/order) rejects orderListId and never cancels an OCO, which would
+    # leave the qty locked and make the market sell fail with -2010.
+    c.v3_delete_order_list.assert_called_once()
+    assert c.cancel_order.call_count == 0
     c.order_market_sell.assert_called_once()
     assert state["position"] is None
+
+
+# The time-stop must NOT drop a position whose qty is still locked by an OCO we
+# failed to cancel — that would orphan a real holding the daemon stops managing.
+async def test_live_close_blocked_when_qty_still_locked(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    c = _mock_client(price=100.0)
+    c.v3_delete_order_list = AsyncMock(side_effect=Exception("APIError(code=-1102)"))
+    c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
+        {"free": "0.0", "locked": "0.06"} if asset == "BTC" else {"free": "0.4", "locked": "0"}))
+    state = {"position": {"symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
+             "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}}
+    assert await h._close_position(c, state, "time-stop") is False
+    c.order_market_sell.assert_not_called()       # would have failed with -2010
+    assert state["position"] is not None          # still tracked, retried next poll
 
 
 # G1 — exchange OCO fired while we were away → detected and booked
@@ -390,7 +410,10 @@ async def test_reconcile_protects_position_without_oco(tmp_path):
 # G2 — reconcile adopts + protects a stray coin holding when state says flat
 async def test_reconcile_adopts_stray_holding(tmp_path):
     open(tmp_path / "armed", "w").close()
-    h = _load(tmp_path, HYBRID_MODE="live", HYBRID_WATCHLIST="BTCUSDT")
+    # PROTECTED_ASSETS cleared: this test is about adoption working at all, and
+    # BTC is the only symbol the mock exchange-info defines filters for.
+    h = _load(tmp_path, HYBRID_MODE="live", HYBRID_WATCHLIST="BTCUSDT",
+              HYBRID_PROTECTED_ASSETS="")
     c = _mock_client(price=100.0)
     c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
         {"free": "0.06", "locked": "0"} if asset == "BTC" else {"free": "0.4", "locked": "0"}))
@@ -419,3 +442,22 @@ async def test_retry_reraises_after_max(tmp_path):
         raise ValueError("nope")
     with pytest.raises(ValueError):
         await h._retry(always_fail)
+
+
+# A long-term hold living in the same spot wallet must never be adopted or
+# traded by the satellite, even if someone adds it to the watchlist.
+async def test_protected_asset_excluded_from_watchlist_and_adoption(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live",
+              HYBRID_WATCHLIST="BTCUSDT,SOLUSDT", HYBRID_PROTECTED_ASSETS="BTC")
+    assert "BTCUSDT" not in h.WATCHLIST          # filtered out of entry scanning
+    assert "SOLUSDT" in h.WATCHLIST
+
+    # Flat state + a big BTC balance => must NOT be adopted as a position.
+    c = _mock_client(price=100.0)
+    c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
+        {"free": "1.0", "locked": "0"} if asset == "BTC" else {"free": "0.0", "locked": "0"}))
+    state = {"position": None}
+    await h._reconcile(c, state)
+    assert state["position"] is None
+    c.create_oco_order.assert_not_called()

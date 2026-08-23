@@ -71,7 +71,13 @@ TRADE_FRACTION = float(os.getenv("HYBRID_TRADE_FRACTION", "0.95"))  # of sat bud
 
 # ── Satellite trading ────────────────────────────────────────────────────────
 _DEFAULT_WATCH = "SOLUSDT,AVAXUSDT,LINKUSDT,DOGEUSDT,ADAUSDT,SUIUSDT,APTUSDT,ARBUSDT,INJUSDT,NEARUSDT"
+# Assets the satellite must NEVER touch — long-term buy-and-hold buckets that
+# live in the same spot wallet. Without this, `_reconcile`'s stray-holding
+# adoption would grab the BTC hold and put a -2% stop on a position meant to be
+# held for years. Filtered out of the watchlist, so it guards entry AND adoption.
+PROTECTED_ASSETS = {s.strip().upper() for s in os.getenv("HYBRID_PROTECTED_ASSETS", "BTC").split(",") if s.strip()}
 WATCHLIST = [s.strip().upper() for s in os.getenv("HYBRID_WATCHLIST", _DEFAULT_WATCH).split(",") if s.strip()]
+WATCHLIST = [s for s in WATCHLIST if s[:-4] not in PROTECTED_ASSETS]
 INTERVAL = os.getenv("HYBRID_INTERVAL", "1h")
 BREAKOUT_LOOKBACK = int(os.getenv("HYBRID_BREAKOUT_LOOKBACK", "20"))
 VOLUME_MULT = float(os.getenv("HYBRID_VOLUME_MULT", "2.0"))
@@ -261,6 +267,16 @@ async def _asset_qty(client, asset: str) -> float:
         return 0.0
 
 
+async def _asset_free(client, asset: str) -> float:
+    """FREE balance only — what can actually be sold right now. A resting OCO
+    locks its quantity, so free < total until that OCO is cancelled or fills."""
+    try:
+        bal = await client.get_asset_balance(asset=asset)
+        return float((bal or {}).get("free", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
 # ── Breakout signal ──────────────────────────────────────────────────────────
 async def _fetch_klines(client, symbol: str):
     try:
@@ -394,15 +410,30 @@ async def _place_protective_oco(client, symbol, qty, tp_price, sl_price):
         return None
 
 
-async def _cancel_oco(client, symbol, oco_id):
+async def _cancel_oco(client, symbol, oco_id) -> bool:
+    """Cancel a resting OCO. Returns True if the list is gone (cancelled now, or
+    already filled/cancelled), False if it may STILL be resting — in which case
+    the base asset is still locked and a market sell would fail.
+
+    Must hit DELETE /api/v3/orderList (`v3_delete_order_list`), NOT
+    DELETE /api/v3/order (`cancel_order`) — the latter cancels a single order by
+    orderId and rejects `orderListId`, so it never cancelled the OCO at all.
+    """
     if oco_id is None:
-        return
+        return True
+    canceller = getattr(client, "v3_delete_order_list", None)
+    if canceller is None:  # very old python-binance — no spot order-list cancel
+        print(f"  ⚠️  [OCO-CANCEL] {symbol}: client lacks v3_delete_order_list — cannot cancel list {oco_id}")
+        return False
     try:
-        await _retry(client.cancel_order, symbol=symbol, orderListId=oco_id)
+        await _retry(canceller, symbol=symbol, orderListId=oco_id)
+        return True
     except Exception as e:
-        # Already filled/cancelled is fine; anything else is logged, not fatal.
-        if "-2011" not in str(e) and "Unknown order" not in str(e):
-            print(f"  [OCO-CANCEL] {symbol} id={oco_id}: {str(e)[:80]}")
+        # Already filled/cancelled → the list is gone, which is what we wanted.
+        if "-2011" in str(e) or "Unknown order" in str(e) or "-2013" in str(e):
+            return True
+        print(f"  ⚠️  [OCO-CANCEL] {symbol} id={oco_id}: {str(e)[:80]} — qty may still be LOCKED")
+        return False
 
 
 # ── Satellite trade execution ────────────────────────────────────────────────
@@ -510,15 +541,26 @@ async def _close_position(client, state, reason: str):
     exit_price = await _price(client, symbol)
     if _is_live():
         try:
-            await _cancel_oco(client, symbol, pos.get("oco_id"))
+            cancelled = await _cancel_oco(client, symbol, pos.get("oco_id"))
             step, _mn, _tick = await _symbol_filters(client, symbol)
             asset = symbol[:-4]
-            actual = await _asset_qty(client, asset)
-            sell_qty = _round_step(min(qty, actual), step)
-            if sell_qty <= 0:
-                print(f"  [SAT-CLOSE] {symbol} nothing sellable (bal {actual}) — treating as closed")
+            total = await _asset_qty(client, asset)      # free + locked
+            free = await _asset_free(client, asset)      # what can actually be sold
+            if total <= 0:
+                # Coin genuinely gone — the OCO already closed it on the exchange.
+                print(f"  [SAT-CLOSE] {symbol} nothing held — already closed on exchange")
                 state["position"] = None
                 return True
+            if free <= 0:
+                # Held but fully LOCKED — an OCO is still resting. Dropping the
+                # position here would orphan a real holding, so keep tracking it.
+                print(f"  [SAT-CLOSE-BLOCKED] {symbol} {total} held but LOCKED by OCO "
+                      f"{pos.get('oco_id')} (cancel_ok={cancelled}) — keeping tracked, retrying next poll")
+                return False
+            sell_qty = _round_step(min(qty, free), step)
+            if sell_qty <= 0:
+                print(f"  [SAT-CLOSE] {symbol} free {free} below lot step {step} — keeping tracked")
+                return False
             o = await _retry(client.order_market_sell, symbol=symbol, quantity=sell_qty)
             fills = o.get("fills", [])
             if fills:
