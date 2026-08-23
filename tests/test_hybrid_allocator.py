@@ -382,15 +382,19 @@ async def test_detect_exchange_close_books_when_balance_gone(tmp_path):
     import json
     open(tmp_path / "armed", "w").close()
     h = _load(tmp_path, HYBRID_MODE="live")
+    entry_ts = time.time() - 3600
     c = _mock_client(price=104.5)  # at/above TP → labelled take-profit
     c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
         {"free": "0.0", "locked": "0"} if asset == "BTC" else {"free": "0.4", "locked": "0"}))
-    state = {"position": {"symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
+    c.get_my_trades = AsyncMock(return_value=[
+        {"isBuyer": False, "qty": "0.06", "price": "104.0", "time": int((entry_ts + 60) * 1000)}])
+    state = {"position": {"symbol": "BTCUSDT", "entry_ts": entry_ts, "entry_price": 100.0,
              "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}}
     assert await h._detect_exchange_close(c, state) is True
     assert state["position"] is None
     rec = json.loads(open(h.LEDGER).read().strip())
     assert rec["reason"] == "take-profit-oco"
+    assert rec["exit_price"] == pytest.approx(104.0)
 
 
 # G2 — reconcile protects a tracked position that has no resting stop
@@ -461,3 +465,72 @@ async def test_protected_asset_excluded_from_watchlist_and_adoption(tmp_path):
     await h._reconcile(c, state)
     assert state["position"] is None
     c.create_oco_order.assert_not_called()
+
+
+# An OCO that fired must be booked at its REAL fill price, not the intended
+# trigger. A STOP_LOSS_LIMIT fills below its trigger, and labelling by the
+# (stale) current price could book a rebounded stop-out as a take-profit.
+async def test_exchange_close_books_real_fill_not_intended_price(tmp_path):
+    import json
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    entry_ts = time.time() - 3600
+    # Price has REBOUNDED above TP by poll time — the old code would have called
+    # this a +4% take-profit. The fills say it was a stop-out at 97.2.
+    c = _mock_client(price=105.0)
+    c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
+        {"free": "0.0", "locked": "0"} if asset == "BTC" else {"free": "0.4", "locked": "0"}))
+    c.get_my_trades = AsyncMock(return_value=[
+        {"isBuyer": True,  "qty": "0.06", "price": "100.0", "time": int(entry_ts * 1000)},
+        {"isBuyer": False, "qty": "0.06", "price": "97.2",  "time": int((entry_ts + 60) * 1000)},
+    ])
+    state = {"position": {"symbol": "BTCUSDT", "entry_ts": entry_ts, "entry_price": 100.0,
+             "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}}
+    assert await h._detect_exchange_close(c, state) is True
+    rec = json.loads(open(h.LEDGER).read().strip())
+    assert rec["reason"] == "stop-loss-oco"           # not take-profit
+    assert rec["exit_price"] == pytest.approx(97.2)   # real fill, not sl_price 98.0
+    assert rec["net_pct"] < 0
+
+
+# Pre-entry sells must not pollute the exit VWAP.
+async def test_exit_vwap_ignores_trades_before_entry(tmp_path):
+    h = _load(tmp_path, HYBRID_MODE="live")
+    entry_ts = time.time() - 3600
+    c = _mock_client()
+    c.get_my_trades = AsyncMock(return_value=[
+        {"isBuyer": False, "qty": "1.0", "price": "500.0", "time": int((entry_ts - 9999) * 1000)},
+        {"isBuyer": False, "qty": "0.06", "price": "97.2", "time": int((entry_ts + 60) * 1000)},
+    ])
+    assert await h._actual_exit_vwap(c, "BTCUSDT", entry_ts) == pytest.approx(97.2)
+
+
+# No usable history => return None so the caller falls back instead of booking 0.
+async def test_exit_vwap_returns_none_without_history(tmp_path):
+    h = _load(tmp_path, HYBRID_MODE="live")
+    c = _mock_client()
+    c.get_my_trades = AsyncMock(side_effect=Exception("api down"))
+    assert await h._actual_exit_vwap(c, "BTCUSDT", time.time()) is None
+
+
+# If the OCO fires between the pre-check and the market sell, the trade must
+# still reach the ledger — dropping it silently loses a real round trip (the
+# failure mode that lost the Aug-17 NEAR close).
+async def test_close_race_with_oco_still_books_the_trade(tmp_path):
+    import json
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live")
+    entry_ts = time.time() - 3600
+    c = _mock_client(price=98.0)
+    c.get_asset_balance = AsyncMock(side_effect=lambda asset=None: (
+        {"free": "0.0", "locked": "0"} if asset == "BTC" else {"free": "0.4", "locked": "0"}))
+    c.get_my_trades = AsyncMock(return_value=[
+        {"isBuyer": False, "qty": "0.06", "price": "97.2", "time": int((entry_ts + 60) * 1000)}])
+    state = {"position": {"symbol": "BTCUSDT", "entry_ts": entry_ts, "entry_price": 100.0,
+             "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}}
+    assert await h._close_position(c, state, "time-stop") is True
+    c.order_market_sell.assert_not_called()          # nothing left to sell
+    assert state["position"] is None
+    rec = json.loads(open(h.LEDGER).read().strip())  # but it IS in the ledger
+    assert rec["reason"] == "stop-loss-oco"
+    assert rec["exit_price"] == pytest.approx(97.2)

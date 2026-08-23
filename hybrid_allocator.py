@@ -509,6 +509,25 @@ def _book_close(state, symbol, entry, exit_price, reason, qty):
     state["position"] = None
 
 
+async def _actual_exit_vwap(client, symbol: str, entry_ts: float):
+    """Volume-weighted price of the SELL fills that closed this position, read
+    from real trade history. Returns None if history is unavailable, so callers
+    can fall back rather than book a fabricated price."""
+    try:
+        trades = await _retry(client.get_my_trades, symbol=symbol, limit=50)
+        since_ms = int(entry_ts * 1000)
+        sells = [t for t in (trades or [])
+                 if not t.get("isBuyer") and int(t.get("time", 0) or 0) >= since_ms]
+        total_qty = sum(float(t["qty"]) for t in sells)
+        if total_qty <= 0:
+            return None
+        return sum(float(t["price"]) * float(t["qty"]) for t in sells) / total_qty
+    except Exception as e:
+        # Any shape surprise from the API must fall back, never crash the poll.
+        print(f"  [EXIT-FILL] {symbol}: trade history unusable ({str(e)[:60]})")
+        return None
+
+
 async def _detect_exchange_close(client, state) -> bool:
     """G1: if the resting OCO already executed (stop or target hit) — possibly
     while this process was asleep or between polls — the coin balance is gone.
@@ -522,13 +541,23 @@ async def _detect_exchange_close(client, state) -> bool:
     # Position still meaningfully held → OCO hasn't fired.
     if held >= pos["qty"] * 0.5:
         return False
-    # Coin is gone → the OCO closed it. Label by which side the price is at.
-    price = await _price(client, symbol)
-    if price >= pos["tp_price"] * 0.999:
-        exit_price, reason = pos["tp_price"], "take-profit-oco"
+    # Coin is gone → the OCO closed it. Book the REAL fill, not the intended
+    # trigger price: a STOP_LOSS_LIMIT fills near sl*(1-STOP_LIMIT_OFFSET_PCT),
+    # not at sl, and labelling by the *current* price (up to POLL_MIN stale)
+    # could book a rebounded stop-out as a take-profit.
+    actual = await _actual_exit_vwap(client, symbol, pos["entry_ts"])
+    if actual is not None:
+        exit_price = actual
+        reason = "take-profit-oco" if actual >= pos["entry_price"] else "stop-loss-oco"
     else:
-        exit_price, reason = pos["sl_price"], "stop-loss-oco"
-    print(f"  [OCO-FILLED] {symbol} closed on exchange (held={held}) → booking {reason}")
+        # Trade history unavailable — fall back to the intended prices, but mark
+        # the record as an estimate so the ledger never claims false precision.
+        price = await _price(client, symbol)
+        if price >= pos["tp_price"] * 0.999:
+            exit_price, reason = pos["tp_price"], "take-profit-oco-est"
+        else:
+            exit_price, reason = pos["sl_price"], "stop-loss-oco-est"
+    print(f"  [OCO-FILLED] {symbol} closed on exchange (held={held}) → booking {reason} @ {exit_price:.6f}")
     _book_close(state, symbol, pos["entry_price"], exit_price, reason, pos["qty"])
     return True
 
@@ -547,9 +576,16 @@ async def _close_position(client, state, reason: str):
             total = await _asset_qty(client, asset)      # free + locked
             free = await _asset_free(client, asset)      # what can actually be sold
             if total <= 0:
-                # Coin genuinely gone — the OCO already closed it on the exchange.
-                print(f"  [SAT-CLOSE] {symbol} nothing held — already closed on exchange")
-                state["position"] = None
+                # Coin vanished between the pre-check and here — the OCO fired in
+                # that window. BOOK it at the real fill; silently dropping the
+                # position would lose the trade from the ledger entirely.
+                actual = await _actual_exit_vwap(client, symbol, pos["entry_ts"])
+                if actual is not None:
+                    exit_price = actual
+                    reason = "take-profit-oco" if actual >= entry else "stop-loss-oco"
+                print(f"  [SAT-CLOSE] {symbol} nothing held — OCO closed it mid-close; "
+                      f"booking {reason} @ {exit_price:.6f}")
+                _book_close(state, symbol, entry, exit_price, reason, qty)
                 return True
             if free <= 0:
                 # Held but fully LOCKED — an OCO is still resting. Dropping the
