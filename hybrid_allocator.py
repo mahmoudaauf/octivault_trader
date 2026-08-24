@@ -250,31 +250,86 @@ async def _earn_usdt(client) -> float:
         return 0.0
 
 
-async def _spot_free_usdt(client) -> float:
+async def _resync_clock(client) -> bool:
+    """Re-derive the client's Binance timestamp offset.
+
+    python-binance computes `timestamp_offset` ONCE inside AsyncClient.create()
+    and never refreshes it. Local clock drift — which macOS accrues freely across
+    sleep/wake — eventually pushes every SIGNED request's timestamp outside
+    recvWindow, so they all fail -1021 permanently while UNSIGNED calls (klines,
+    tickers) keep working. Observed live 2026-08-23: after ~1h the daemon read
+    its balance as $0.00 and idled the sleeve for 12h with $9.62 sitting in spot.
+    """
     try:
-        bal = await client.get_asset_balance(asset="USDT")
-        return float((bal or {}).get("free", 0.0) or 0.0)
-    except Exception:
-        return 0.0
+        res = await client.get_server_time()
+        before = client.timestamp_offset
+        client.timestamp_offset = res["serverTime"] - int(time.time() * 1000)
+        if abs(client.timestamp_offset - before) > 500:
+            print(f"  [CLOCK-RESYNC] timestamp offset {before}ms → {client.timestamp_offset}ms")
+        return True
+    except Exception as e:
+        print(f"  [CLOCK-RESYNC] failed: {str(e)[:80]}")
+        return False
 
 
-async def _asset_qty(client, asset: str) -> float:
-    """Free + locked balance of a base asset (locked because an OCO holds it)."""
+async def _read_balance(client, asset: str):
+    """Raw balance dict for an asset, or None if it could NOT be read.
+
+    None means UNKNOWN and must never be coerced to zero. Swallowing read errors
+    into 0.0 caused two real failures: (1) the sleeve sat idle for 12h believing
+    it had $0.00 while $9.62 was in spot; (2) far worse, `_detect_exchange_close`
+    reads this to decide whether the coin is gone — a failed read looked like
+    "OCO fired", which would book a FABRICATED close and abandon a live position.
+    """
     try:
-        bal = await client.get_asset_balance(asset=asset)
-        return float((bal or {}).get("free", 0.0) or 0.0) + float((bal or {}).get("locked", 0.0) or 0.0)
-    except Exception:
-        return 0.0
+        bal = await _retry(client.get_asset_balance, asset=asset)
+    except Exception as e:
+        # A signature/timestamp rejection is self-healable — resync and retry
+        # once before giving up, so drift costs one read instead of a whole day.
+        if "-1021" in str(e) or "-1022" in str(e) or "recvWindow" in str(e):
+            print(f"  [BAL-READ-FAIL] {asset}: {str(e)[:70]} — resyncing clock")
+            if await _resync_clock(client):
+                try:
+                    bal = await _retry(client.get_asset_balance, asset=asset)
+                    print(f"  [BAL-READ-OK] {asset}: recovered after clock resync")
+                    return bal if isinstance(bal, dict) and "free" in bal else None
+                except Exception as e2:
+                    e = e2
+        print(f"  [BAL-READ-FAIL] {asset}: {str(e)[:90]} — UNKNOWN (not zero)")
+        return None
+    if not isinstance(bal, dict) or "free" not in bal:
+        print(f"  [BAL-READ-FAIL] {asset}: unexpected response {str(bal)[:60]} — UNKNOWN (not zero)")
+        return None
+    return bal
 
 
-async def _asset_free(client, asset: str) -> float:
-    """FREE balance only — what can actually be sold right now. A resting OCO
-    locks its quantity, so free < total until that OCO is cancelled or fills."""
+async def _spot_free_usdt(client):
+    """Free spot USDT, or None if unreadable."""
+    return await _asset_free(client, "USDT")
+
+
+async def _asset_qty(client, asset: str):
+    """Free + locked balance (locked because an OCO holds it), or None if unreadable."""
+    bal = await _read_balance(client, asset)
+    if bal is None:
+        return None
     try:
-        bal = await client.get_asset_balance(asset=asset)
-        return float((bal or {}).get("free", 0.0) or 0.0)
-    except Exception:
-        return 0.0
+        return float(bal.get("free") or 0.0) + float(bal.get("locked") or 0.0)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _asset_free(client, asset: str):
+    """FREE balance only — what can actually be sold right now — or None if
+    unreadable. A resting OCO locks its quantity, so free < total until that OCO
+    is cancelled or fills."""
+    bal = await _read_balance(client, asset)
+    if bal is None:
+        return None
+    try:
+        return float(bal.get("free") or 0.0)
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Breakout signal ──────────────────────────────────────────────────────────
@@ -315,6 +370,8 @@ async def _satellite_cash(client, state) -> float:
     (never sizes off unrelated USDT parked in spot). Paper: simulated cash."""
     if _is_live():
         spot = await _spot_free_usdt(client)
+        if spot is None:
+            return None                      # UNKNOWN — caller must skip, not trade
         target = float(state.get("satellite_target", 0.0)) or spot
         return min(spot, target)
     return float(state.get("satellite_cash", 0.0))
@@ -327,6 +384,11 @@ async def _setup_allocation(client, state):
     losses can never touch the core."""
     spot = await _spot_free_usdt(client)
     earn = await _earn_usdt(client)
+    if spot is None:
+        # The one-time split (and its redeem) must never be sized off a failed
+        # read; retry on the next start rather than move the wrong amount.
+        print("[hybrid] setup deferred — spot balance unreadable this cycle")
+        return
     total = spot + earn
     if "satellite_target" not in state:
         state["satellite_target"] = round(total * (1.0 - CORE_FRACTION), 2)
@@ -469,6 +531,10 @@ async def _open_position(client, state, symbol: str, sat_cash: float):
             # untracked, unstopped position.
             print(f"  [SAT-OPEN-ERROR] {symbol}: {str(e)[:90]} — checking for a stray fill")
             held = await _asset_qty(client, symbol[:-4])
+            if held is None:
+                print(f"  [SAT-OPEN-ERROR] {symbol}: balance unreadable — cannot confirm fill; "
+                      f"NOT tracking. Reconcile will adopt it on the next start if it filled.")
+                return False
             if held * price >= max(min_notional, 5.0):
                 qty = _round_step(held, step)
                 print(f"  [SAT-OPEN-RECOVER] {symbol}: buy DID fill ({held}) — adopting + protecting")
@@ -476,6 +542,8 @@ async def _open_position(client, state, symbol: str, sat_cash: float):
                 return False
         # G1: rest the protective OCO on the exchange (uses actual held qty).
         held = await _asset_qty(client, symbol[:-4])
+        if held is None:
+            held = qty          # unreadable → protect the qty we believe we bought
         tp_price = fill_price * (1 + TP_PCT / 100.0)
         sl_price = fill_price * (1 - SL_PCT / 100.0)
         oco_id = await _place_protective_oco(client, symbol, min(qty, held), tp_price, sl_price)
@@ -538,6 +606,11 @@ async def _detect_exchange_close(client, state) -> bool:
         return False
     symbol = pos["symbol"]
     held = await _asset_qty(client, symbol[:-4])
+    if held is None:
+        # Balance UNKNOWN. Never infer "the OCO fired" from a failed read — that
+        # would book a fabricated close and abandon a live position.
+        print(f"  [OCO-CHECK] {symbol}: balance unreadable — assuming still held, retrying next poll")
+        return False
     # Position still meaningfully held → OCO hasn't fired.
     if held >= pos["qty"] * 0.5:
         return False
@@ -575,6 +648,9 @@ async def _close_position(client, state, reason: str):
             asset = symbol[:-4]
             total = await _asset_qty(client, asset)      # free + locked
             free = await _asset_free(client, asset)      # what can actually be sold
+            if total is None or free is None:
+                print(f"  [SAT-CLOSE-BLOCKED] {symbol}: balance unreadable — keeping tracked, retrying next poll")
+                return False
             if total <= 0:
                 # Coin vanished between the pre-check and here — the OCO fired in
                 # that window. BOOK it at the real fill; silently dropping the
@@ -628,6 +704,9 @@ async def _reconcile(client, state):
     if pos and pos.get("mode") == "live":
         symbol = pos["symbol"]
         held = await _asset_qty(client, symbol[:-4])
+        if held is None:
+            print(f"[hybrid] reconcile — {symbol} balance unreadable; leaving tracked state untouched")
+            return
         if held < pos["qty"] * 0.5:
             print(f"[hybrid] reconcile — tracked {symbol} no longer held; booking its exchange close")
             await _detect_exchange_close(client, state)
@@ -641,6 +720,8 @@ async def _reconcile(client, state):
         try:
             held = await _asset_qty(client, symbol[:-4])
             price = await _price(client, symbol)
+            if held is None:
+                continue
             if held * price >= max(SATELLITE_FLOOR_USD, 5.0):
                 print(f"[hybrid] reconcile — stray {symbol} holding ${held*price:.2f} found; adopting + protecting")
                 tp, sl = price * (1 + TP_PCT / 100.0), price * (1 - SL_PCT / 100.0)
@@ -709,6 +790,10 @@ async def run():
 
         while True:
             now = time.time()
+            # Keep the signing clock aligned BEFORE any signed call this cycle.
+            # Cheap (one unsigned request) and prevents drift from silently
+            # disabling every signed request until a restart.
+            await _resync_clock(client)
 
             # ── Manage an open position ──
             if state.get("position"):
@@ -742,6 +827,13 @@ async def run():
                 print(f"[hybrid] 🛑 DRAWDOWN HALT {dd:.1f}% >= {MAX_DD_PCT}% — kill-switch engaged")
 
             sat_cash = await _satellite_cash(client, state)
+            if sat_cash is None:
+                # Balance unreadable — do NOT report $0.00 and do NOT trade off a
+                # guess. Skip the cycle; the next poll re-reads.
+                print(f"[hybrid {datetime.now().strftime('%H:%M')}] mode={MODE} "
+                      f"sat_cash=UNKNOWN (balance read failed) — skipping this cycle")
+                await asyncio.sleep(POLL_MIN * 60)
+                continue
 
             # ── Win-sweep (only when flat) ──
             if not state.get("position"):

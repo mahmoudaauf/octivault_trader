@@ -534,3 +534,107 @@ async def test_close_race_with_oco_still_books_the_trade(tmp_path):
     rec = json.loads(open(h.LEDGER).read().strip())  # but it IS in the ledger
     assert rec["reason"] == "stop-loss-oco"
     assert rec["exit_price"] == pytest.approx(97.2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A failed balance read is UNKNOWN, never zero. Conflating them idled the live
+# sleeve for 12h on a false $0.00, and in the position path would have booked a
+# fabricated close and abandoned a real holding.
+# ─────────────────────────────────────────────────────────────────────────────
+def _bal_fails(c):
+    c.get_asset_balance = AsyncMock(side_effect=Exception("APIError(code=-1021) timestamp"))
+    return c
+
+
+async def test_balance_read_failure_is_none_not_zero(tmp_path):
+    h = _load(tmp_path, HYBRID_API_RETRIES="1", HYBRID_API_RETRY_DELAY_S="0")
+    c = _bal_fails(_mock_client())
+    assert await h._asset_qty(c, "BTC") is None
+    assert await h._asset_free(c, "BTC") is None
+    assert await h._spot_free_usdt(c) is None
+
+
+async def test_unknown_balance_never_books_a_fabricated_close(tmp_path):
+    """The severe case: a failed read looked like 'coin gone' => book the close
+    and drop a live position that still holds real money."""
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live", HYBRID_API_RETRIES="1", HYBRID_API_RETRY_DELAY_S="0")
+    c = _bal_fails(_mock_client(price=100.0))
+    pos = {"symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
+           "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}
+    state = {"position": dict(pos)}
+    assert await h._detect_exchange_close(c, state) is False
+    assert state["position"] is not None            # still tracked
+    assert not os.path.exists(h.LEDGER)             # nothing fabricated
+
+
+async def test_unknown_balance_blocks_close_instead_of_selling(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live", HYBRID_API_RETRIES="1", HYBRID_API_RETRY_DELAY_S="0")
+    c = _bal_fails(_mock_client(price=100.0))
+    state = {"position": {"symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
+             "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}}
+    assert await h._close_position(c, state, "time-stop") is False
+    c.order_market_sell.assert_not_called()
+    assert state["position"] is not None
+
+
+async def test_unknown_balance_defers_setup_instead_of_redeeming(tmp_path):
+    """The one-time earn->spot redeem must never be sized off a failed read."""
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live", HYBRID_API_RETRIES="1", HYBRID_API_RETRY_DELAY_S="0")
+    h._EARN_PRODUCT_ID = "USDT001"
+    c = _bal_fails(_mock_client())
+    state = {"position": None}
+    await h._setup_allocation(c, state)
+    c.redeem_simple_earn_flexible_product.assert_not_called()
+    assert state.get("setup_done") is not True      # retried on the next start
+
+
+async def test_unknown_balance_leaves_reconcile_untouched(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _load(tmp_path, HYBRID_MODE="live", HYBRID_API_RETRIES="1", HYBRID_API_RETRY_DELAY_S="0")
+    c = _bal_fails(_mock_client(price=100.0))
+    state = {"position": {"symbol": "BTCUSDT", "entry_ts": time.time() - 3600, "entry_price": 100.0,
+             "qty": 0.06, "tp_price": 104.0, "sl_price": 98.0, "mode": "live", "oco_id": 123}}
+    await h._reconcile(c, state)
+    assert state["position"] is not None
+    c.create_oco_order.assert_not_called()
+
+
+# Clock drift silently disabled every SIGNED request for 12h (unsigned calls
+# kept working, so the daemon looked healthy while reporting $0.00 cash).
+async def test_resync_clock_updates_offset(tmp_path):
+    h = _load(tmp_path)
+    c = _mock_client()
+    c.timestamp_offset = 0
+    c.get_server_time = AsyncMock(return_value={"serverTime": int(time.time() * 1000) + 30_000})
+    assert await h._resync_clock(c) is True
+    assert c.timestamp_offset > 25_000        # picked up the ~30s skew
+
+
+async def test_balance_read_recovers_after_clock_resync(tmp_path):
+    """A -1021 must trigger a resync and a retry, not a day of false zeros."""
+    h = _load(tmp_path, HYBRID_API_RETRIES="1", HYBRID_API_RETRY_DELAY_S="0")
+    c = _mock_client()
+    c.timestamp_offset = 0
+    c.get_server_time = AsyncMock(return_value={"serverTime": int(time.time() * 1000) + 30_000})
+    calls = {"n": 0}
+
+    async def _bal(asset=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise Exception("APIError(code=-1021): Timestamp for this request is outside of the recvWindow.")
+        return {"free": "9.62", "locked": "0"}
+    c.get_asset_balance = AsyncMock(side_effect=_bal)
+
+    assert await h._asset_free(c, "USDT") == pytest.approx(9.62)
+    assert c.timestamp_offset > 25_000        # resynced as part of recovery
+
+
+async def test_resync_failure_is_not_fatal(tmp_path):
+    h = _load(tmp_path)
+    c = _mock_client()
+    c.timestamp_offset = 0
+    c.get_server_time = AsyncMock(side_effect=Exception("network down"))
+    assert await h._resync_clock(c) is False   # logged, never raises
