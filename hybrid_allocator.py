@@ -830,7 +830,7 @@ async def run():
             if sat_cash is None:
                 # Balance unreadable — do NOT report $0.00 and do NOT trade off a
                 # guess. Skip the cycle; the next poll re-reads.
-                print(f"[hybrid {datetime.now().strftime('%H:%M')}] mode={MODE} "
+                print(f"[hybrid {datetime.now(timezone.utc).strftime('%H:%M')}] mode={MODE} "
                       f"sat_cash=UNKNOWN (balance read failed) — skipping this cycle")
                 await asyncio.sleep(POLL_MIN * 60)
                 continue
