@@ -638,3 +638,23 @@ async def test_resync_failure_is_not_fatal(tmp_path):
     c.timestamp_offset = 0
     c.get_server_time = AsyncMock(side_effect=Exception("network down"))
     assert await h._resync_clock(c) is False   # logged, never raises
+
+
+# A DNS outage at startup must NOT kill the daemon: AsyncClient.create() pings
+# Binance, so it raises, and the process exited(1) in a real crash-loop on
+# 2026-08-25. With a position open that leaves nothing applying the time-stop.
+async def test_client_create_waits_out_an_outage(tmp_path):
+    h = _load(tmp_path)
+    calls = {"n": 0}
+
+    class _Cls:
+        @staticmethod
+        async def create(*a, **k):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise Exception("Cannot connect to host api.binance.com:443 [Could not contact DNS servers]")
+            return "CLIENT"
+
+    # max_delay_s tiny so the backoff doesn't slow the suite
+    assert await h._create_client_with_retry(_Cls, max_delay_s=0.001) == "CLIENT"
+    assert calls["n"] == 3          # retried through the outage instead of dying

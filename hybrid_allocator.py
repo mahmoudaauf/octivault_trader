@@ -250,6 +250,34 @@ async def _earn_usdt(client) -> float:
         return 0.0
 
 
+async def _create_client_with_retry(async_client_cls, max_delay_s: float = 300.0):
+    """Build the Binance client, WAITING OUT a network outage instead of dying.
+
+    AsyncClient.create() pings Binance, so it raises on a DNS/connectivity
+    failure and the daemon exits(1) at startup. This machine drops DNS
+    regularly, which produced a real crash-loop on 2026-08-25 (four exits in
+    ~75min). Crashing is worse than waiting: with a position open, nothing
+    applies the time-stop until the process is back (the exchange OCO still
+    holds, which is exactly why G1 exists — but that's the last line, not the
+    only one). Retries log every attempt so the supervisor's stall watchdog
+    still sees a live process.
+    """
+    delay, attempt = min(15.0, max_delay_s), 0
+    while True:
+        attempt += 1
+        try:
+            client = await async_client_cls.create(
+                os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x")
+            if attempt > 1:
+                print(f"[hybrid] client connected after {attempt} attempts")
+            return client
+        except Exception as e:
+            print(f"[hybrid] client create failed (attempt {attempt}): {str(e)[:80]} "
+                  f"— retrying in {delay:.0f}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay_s)
+
+
 async def _resync_clock(client) -> bool:
     """Re-derive the client's Binance timestamp offset.
 
@@ -769,8 +797,7 @@ async def run():
         print(f"[hybrid] another instance holds {PIDFILE} — refusing to start (single-instance lock)")
         return
 
-    client = await AsyncClient.create(
-        os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x")
+    client = await _create_client_with_retry(AsyncClient)
     state = _load(STATE, {"position": None})
     armed = _is_live()
     banner = {"paper": "📝 PAPER (no real money)",
