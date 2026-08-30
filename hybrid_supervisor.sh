@@ -14,7 +14,10 @@ LOG="logs/hybrid.log"
 SUP="logs/hybrid_supervisor.log"
 STOP="logs/hybrid_supervisor.stop"
 STALL_MIN="${HYBRID_STALL_MIN:-25}"      # kill a daemon that hasn't logged this long (poll=15m)
-ALERT_CMD="${HYBRID_ALERT_CMD:-}"         # optional shell command run on crash/hang
+# Defaults to ./hybrid_alert.sh when present. This script is bash and never
+# sources .env, so HYBRID_ALERT_CMD set there would never arrive — which is
+# why every crash alert went nowhere until 2026-08-30.
+ALERT_CMD="${HYBRID_ALERT_CMD:-$([ -x ./hybrid_alert.sh ] && echo ./hybrid_alert.sh)}"
 
 log(){ echo "$(date '+%Y-%m-%d %H:%M:%S') [HYBRID-SUP] $*" | tee -a "$SUP"; }
 alert(){ log "🚨 ALERT: $*"; [ -n "$ALERT_CMD" ] && ( eval "$ALERT_CMD" "\"$*\"" >/dev/null 2>&1 & ); }

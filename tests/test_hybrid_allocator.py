@@ -658,3 +658,60 @@ async def test_client_create_waits_out_an_outage(tmp_path):
     # max_delay_s tiny so the backoff doesn't slow the suite
     assert await h._create_client_with_retry(_Cls, max_delay_s=0.001) == "CLIENT"
     assert calls["n"] == 3          # retried through the outage instead of dying
+
+
+# Every observed outage was resolver-level (aiodns "Could not contact DNS
+# servers"), so the client must not use aiohttp's default AsyncResolver.
+async def test_dns_session_params_use_os_resolver_and_cache(tmp_path):
+    import aiohttp
+    h = _load(tmp_path)
+    p = h._dns_session_params()          # needs a running loop; this test is async
+    conn = p["connector"]
+    try:
+        assert isinstance(conn._resolver, aiohttp.ThreadedResolver)   # not aiodns
+        assert conn.use_dns_cache is True                              # rides out blips
+        assert conn._cached_hosts._ttl == 300
+    finally:
+        await conn.close()
+
+
+def test_dns_session_params_degrade_safely_without_a_loop():
+    """Called outside an event loop it must fall back to defaults, never raise —
+    startup must not hinge on the DNS hardening being constructible."""
+    import hybrid_allocator as h
+    assert h._dns_session_params() == {}
+
+
+async def test_client_create_passes_dns_params(tmp_path):
+    h = _load(tmp_path)
+    seen = {}
+
+    class _Cls:
+        @staticmethod
+        async def create(*a, **k):
+            seen.update(k)
+            return "CLIENT"
+
+    assert await h._create_client_with_retry(_Cls, max_delay_s=0.001) == "CLIENT"
+    assert "connector" in seen["session_params"]
+
+
+async def test_each_retry_gets_a_fresh_connector(tmp_path):
+    """AsyncClient.create() closes the session (and its connector) when the ping
+    fails, so reusing one across retries would raise on the second attempt."""
+    h = _load(tmp_path)
+    connectors = []
+
+    class _Cls:
+        n = 0
+        @classmethod
+        async def create(cls, *a, **k):
+            connectors.append(k["session_params"]["connector"])
+            cls.n += 1
+            if cls.n < 2:
+                raise Exception("Could not contact DNS servers")
+            return "CLIENT"
+
+    assert await h._create_client_with_retry(_Cls, max_delay_s=0.001) == "CLIENT"
+    assert len(connectors) == 2
+    assert connectors[0] is not connectors[1]

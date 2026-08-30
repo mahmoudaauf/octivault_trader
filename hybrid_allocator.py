@@ -250,6 +250,30 @@ async def _earn_usdt(client) -> float:
         return 0.0
 
 
+def _dns_session_params() -> dict:
+    """aiohttp session params that survive this machine's DNS flakiness.
+
+    Every outage here has been resolver-level, not connectivity:
+    `aiodns.error.DNSError: (11, 'Could not contact DNS servers')` — three times
+    in six days, once for ~45 minutes. aiohttp defaults to AsyncResolver
+    (aiodns/c-ares), which takes its nameserver list at construction and copes
+    badly with a laptop switching networks or waking from sleep.
+
+    ThreadedResolver defers to the OS resolver instead, which tracks those
+    changes and keeps its own cache; ttl_dns_cache then rides out brief resolver
+    failures without a lookup at all. Returns a FRESH connector per call —
+    AsyncClient.create() closes the session (and connector) when its ping fails,
+    so a retry must not reuse it.
+    """
+    try:
+        import aiohttp
+        return {"connector": aiohttp.TCPConnector(
+            resolver=aiohttp.ThreadedResolver(), ttl_dns_cache=300, limit=20)}
+    except Exception as e:                      # never block startup on this
+        print(f"[hybrid] DNS hardening unavailable ({str(e)[:60]}) — using aiohttp defaults")
+        return {}
+
+
 async def _create_client_with_retry(async_client_cls, max_delay_s: float = 300.0):
     """Build the Binance client, WAITING OUT a network outage instead of dying.
 
@@ -267,7 +291,8 @@ async def _create_client_with_retry(async_client_cls, max_delay_s: float = 300.0
         attempt += 1
         try:
             client = await async_client_cls.create(
-                os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x")
+                os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x",
+                session_params=_dns_session_params())
             if attempt > 1:
                 print(f"[hybrid] client connected after {attempt} attempts")
             return client
