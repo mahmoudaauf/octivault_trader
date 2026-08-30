@@ -1138,8 +1138,15 @@ async def run_allocate():
                 continue
             try:
                 contributed = await _detect_contributions(client, state)
-                swept = await _sweep_idle_to_earn(client, state)
+                # Measure BEFORE sweeping. A spot->earn subscription debits spot
+                # immediately but the earn position updates with a lag, so a
+                # snapshot taken straight after a sweep undercounts NAV by the
+                # in-flight amount. Anchoring the baseline on that would have
+                # manufactured ~$9.60 of phantom "growth" on the next cycle.
+                # Moving money between your own wallets never changes NAV, so
+                # measuring first is both correct and always consistent.
                 snap = await _nav_snapshot(client)
+                swept = await _sweep_idle_to_earn(client, state)
                 if snap is None:
                     print(f"[alloc {datetime.now(timezone.utc):%H:%M}] NAV unreadable "
                           f"— skipping this cycle (not recording a false zero)")

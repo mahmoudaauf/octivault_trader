@@ -824,3 +824,35 @@ def test_record_nav_creates_its_directory(tmp_path):
     row = h._record_nav({"cumulative_contributions": 0.0}, snap, 0.0, 0.0)
     assert row["nav"] == 10.0
     assert os.path.exists(h.NAV_FILE)
+
+
+async def test_nav_is_measured_before_sweeping(tmp_path):
+    """A spot->earn subscription debits spot instantly but credits earn with a
+    lag. Snapshotting after the sweep undercounts NAV by the in-flight amount,
+    and anchoring the baseline on that manufactures phantom growth next cycle."""
+    open(tmp_path / "armed", "w").close()
+    h = _alloc(tmp_path)
+    h._EARN_PRODUCT_ID = "USDT001"
+    order = []
+
+    async def _bal(asset=None):
+        if asset == "USDT":
+            order.append("read")
+            return {"free": "9.74", "locked": "0"}
+        return {"free": "0", "locked": "0"}
+
+    c = _mock_client()
+    c.get_asset_balance = AsyncMock(side_effect=_bal)
+    c.get_simple_earn_flexible_product_position = AsyncMock(
+        return_value={"rows": [{"asset": "USDT", "totalAmount": "38.52"}]})
+
+    async def _sub(**k):
+        order.append("sweep")
+        return {}
+    c.subscribe_simple_earn_flexible_product = AsyncMock(side_effect=_sub)
+
+    snap = await h._nav_snapshot(c)
+    await h._sweep_idle_to_earn(c, {"position": None})
+    # NAV counts the cash while it is still in spot: 9.74 + 38.52
+    assert snap["nav"] == pytest.approx(48.26, abs=0.01)
+    assert order.index("read") < order.index("sweep")   # measured, then moved
