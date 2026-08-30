@@ -43,9 +43,19 @@ Modes (HYBRID_MODE, default paper):
   dryrun — log the exact real orders it would place; send nothing.
   live   — real spot orders; DOUBLE-GATED on MODE=live AND logs/hybrid_live_armed.
 
+Objectives (HYBRID_OBJECTIVE, default satellite):
+  satellite — the negative-EV breakout trader described above.
+  allocate  — deploy/compound/account ONLY: sweep idle spot USDT into flexible
+              earn, detect external contributions from deposit history, and
+              record an honest NAV curve that keeps deposits separate from
+              returns. Places no speculative trades and never calls redeem, so
+              the wall is absolute rather than merely enforced. Positive-EV: it
+              captures yield on cash that would otherwise sit at 0%.
+
 Usage:
-  python3 hybrid_allocator.py          # run the daemon (mode from env)
-  python3 hybrid_allocator.py report    # print the satellite track record
+  python3 hybrid_allocator.py          # run the daemon (mode + objective from env)
+  python3 hybrid_allocator.py report   # satellite track record
+  python3 hybrid_allocator.py nav      # NAV curve: contributions vs returns
 """
 from __future__ import annotations
 
@@ -99,6 +109,25 @@ LIVE_ARM_FILE = os.getenv("HYBRID_LIVE_ARM_FILE", "logs/hybrid_live_armed")
 KILL_FILE = os.getenv("HYBRID_KILL_FILE", "logs/hybrid.stop")
 PIDFILE = os.getenv("HYBRID_PIDFILE", "logs/hybrid.pid")          # G3
 MAX_DD_PCT = float(os.getenv("HYBRID_MAX_DD_PCT", "100.0"))
+
+# ── Objective: what job this daemon is doing ─────────────────────────────────
+# "satellite" — the original negative-EV breakout trader (capped, disclosed).
+# "allocate"  — deploy/compound/account only: sweep idle USDT into earn, detect
+#               external contributions, and record an honest NAV curve. Places
+#               NO speculative trades and NEVER redeems from earn, so it is
+#               strictly positive-EV (it captures yield that would otherwise sit
+#               idle) and scales linearly with capital.
+OBJECTIVE = os.getenv("HYBRID_OBJECTIVE", "satellite").lower()
+NAV_FILE = os.getenv("HYBRID_NAV_FILE", "logs/nav_history.jsonl")
+# Cash left in spot rather than swept — covers fees/min-notional friction.
+IDLE_BUFFER_USD = float(os.getenv("HYBRID_IDLE_BUFFER_USD", "0.10"))
+# Minimum sweep worth doing (Binance flexible min purchase is 0.01 USDT).
+MIN_SWEEP_USD = float(os.getenv("HYBRID_MIN_SWEEP_USD", "0.05"))
+# Fraction of a detected contribution to route into BTC. Default 0: a bot must
+# not take a directional position unless the operator explicitly asks.
+CONTRIB_BTC_PCT = float(os.getenv("HYBRID_CONTRIB_BTC_PCT", "0.0"))
+NAV_ASSETS = [a.strip().upper() for a in
+              os.getenv("HYBRID_NAV_ASSETS", "BTC,BNB,AVAX,SOL,LINK,INJ,NEAR,ADA,SUI,APT,ARB,DOGE").split(",") if a.strip()]
 API_RETRIES = int(os.getenv("HYBRID_API_RETRIES", "3"))          # G5
 API_RETRY_DELAY_S = float(os.getenv("HYBRID_API_RETRY_DELAY_S", "2.0"))
 
@@ -924,8 +953,217 @@ async def run():
         await client.close_connection()
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# OBJECTIVE "allocate" — deploy, compound, and account honestly.
+#
+# No speculation. Money flows spot -> earn ONLY; `redeem_simple_earn_flexible_
+# product` is never called here at all, so the wall is absolute rather than
+# merely enforced. Positive-EV by construction: it captures yield on cash that
+# would otherwise sit at 0%, and scales linearly with capital.
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _nav_snapshot(client) -> dict:
+    """Total account value, broken down. Returns None on an unreadable balance
+    so a failed read is never recorded as a NAV crash in the equity curve."""
+    spot = await _asset_free(client, "USDT")
+    if spot is None:
+        return None
+    earn = await _earn_usdt(client)
+    holdings, hold_usd = {}, 0.0
+    for asset in NAV_ASSETS:
+        qty = await _asset_qty(client, asset)
+        if not qty:
+            continue
+        try:
+            px = await _price(client, f"{asset}USDT")
+        except Exception:
+            continue
+        holdings[asset] = {"qty": qty, "price": px, "usd": round(qty * px, 4)}
+        hold_usd += qty * px
+    return {"spot_usdt": round(spot, 4), "earn_usdt": round(earn, 4),
+            "holdings_usd": round(hold_usd, 4), "holdings": holdings,
+            "nav": round(spot + earn + hold_usd, 4)}
+
+
+async def _detect_contributions(client, state) -> float:
+    """New EXTERNAL money since last check, in USD.
+
+    Uses deposit history, NOT a NAV jump — internal moves between your own
+    wallets look identical to a deposit in NAV terms and would be counted as
+    contributions. (This account round-tripped $20 spot->futures->spot in
+    July/August; inferring from NAV would have booked $20 of phantom deposits.)
+    Returns the new total and records the ids so a deposit is counted once.
+    """
+    seen = set(state.setdefault("seen_deposits", []))
+    total = 0.0
+    try:
+        deposits = await _retry(client.get_deposit_history)
+    except Exception as e:
+        print(f"  [CONTRIB] deposit history unavailable ({str(e)[:60]})")
+        return 0.0
+    for d in (deposits or []):
+        if int(d.get("status", -1)) != 1:            # 1 = completed
+            continue
+        key = f"{d.get('txId')}:{d.get('coin')}:{d.get('amount')}"
+        if key in seen:
+            continue
+        amount, coin = float(d.get("amount", 0) or 0), (d.get("coin") or "").upper()
+        usd = amount
+        if coin not in ("USDT", "USDC", "BUSD", "FDUSD"):
+            try:
+                usd = amount * await _price(client, f"{coin}USDT")
+            except Exception:
+                print(f"  [CONTRIB] can't price {coin}; recording qty only")
+                usd = 0.0
+        seen.add(key)
+        total += usd
+        print(f"  [CONTRIB] +{amount} {coin} (~${usd:.2f}) detected")
+    state["seen_deposits"] = sorted(seen)
+    if total:
+        state["cumulative_contributions"] = round(
+            float(state.get("cumulative_contributions", 0.0)) + total, 4)
+    return total
+
+
+async def _sweep_idle_to_earn(client, state) -> float:
+    """Move idle spot USDT into flexible earn. The ONLY money movement this
+    objective makes, and it is one-directional by design.
+
+    Runs only when flat: an open satellite position needs its cash buffer, and
+    sweeping it would strand the position. Leaves IDLE_BUFFER_USD behind for
+    fee/min-notional friction.
+    """
+    if state.get("position"):
+        return 0.0
+    spot = await _asset_free(client, "USDT")
+    if spot is None:
+        return 0.0
+    amount = spot - IDLE_BUFFER_USD
+    if amount < MIN_SWEEP_USD or not _EARN_PRODUCT_ID:
+        return 0.0
+    if not _is_live():
+        print(f"  [SWEEP-{MODE.upper()}] would move ${amount:.2f} idle spot -> earn (nothing sent)")
+        return 0.0
+    try:
+        await _retry(client.subscribe_simple_earn_flexible_product,
+                     productId=_EARN_PRODUCT_ID, amount=str(round(amount, 2)))
+        print(f"  [SWEEP] 🟢 ${amount:.2f} idle spot -> earn (now compounding)")
+        return amount
+    except Exception as e:
+        print(f"  [SWEEP-FAIL] ${amount:.2f}: {str(e)[:80]}")
+        return 0.0
+
+
+def _record_nav(state, snap: dict, contributed: float, swept: float):
+    """Append one row to the equity curve, separating CONTRIBUTIONS from RETURNS.
+
+    Without this split a deposit looks exactly like profit: balance goes up and
+    the system appears to be working. `growth` below is the only number that
+    reflects what the account actually earned.
+    """
+    contrib = float(state.get("cumulative_contributions", 0.0))
+    baseline = state.get("nav_baseline")
+    if baseline is None:                     # first ever snapshot anchors the curve
+        baseline = snap["nav"] - contrib
+        state["nav_baseline"] = round(baseline, 4)
+    row = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "nav": snap["nav"], "spot_usdt": snap["spot_usdt"], "earn_usdt": snap["earn_usdt"],
+        "holdings_usd": snap["holdings_usd"], "holdings": snap["holdings"],
+        "cumulative_contributions": round(contrib, 4),
+        "contributed_this_cycle": round(contributed, 4),
+        "swept_to_earn": round(swept, 4),
+        # growth = what the account earned, with deposits removed
+        "growth": round(snap["nav"] - contrib - float(state["nav_baseline"]), 4),
+    }
+    os.makedirs(os.path.dirname(NAV_FILE) or ".", exist_ok=True)
+    with open(NAV_FILE, "a") as f:
+        f.write(json.dumps(row) + "\n")
+    return row
+
+
+def _nav_report():
+    """Print the equity curve with contributions and returns kept apart."""
+    if not os.path.exists(NAV_FILE):
+        print("No NAV history yet.")
+        return
+    rows = []
+    with open(NAV_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    if not rows:
+        print("No NAV history yet.")
+        return
+    first, last = rows[0], rows[-1]
+    print("=" * 68)
+    print("NAV HISTORY — contributions and returns kept separate")
+    print("=" * 68)
+    print(f"  snapshots        : {len(rows)}  ({first['ts'][:16]} -> {last['ts'][:16]})")
+    print(f"  NAV now          : ${last['nav']:.2f}   (was ${first['nav']:.2f})")
+    print(f"  contributions    : ${last['cumulative_contributions']:.2f}  (deposits — NOT profit)")
+    print(f"  GROWTH (earned)  : ${last['growth']:+.2f}   <- the only honest number")
+    print(f"  breakdown        : earn ${last['earn_usdt']:.2f} | spot ${last['spot_usdt']:.2f} "
+          f"| holdings ${last['holdings_usd']:.2f}")
+    swept = sum(r.get("swept_to_earn", 0.0) for r in rows)
+    print(f"  swept to earn    : ${swept:.2f} total (cash rescued from 0% idle)")
+    print("=" * 68)
+
+
+async def run_allocate():
+    """The 'allocate' objective loop: sweep, detect contributions, record NAV."""
+    global _EARN_PRODUCT_ID
+    from binance import AsyncClient
+
+    if not _acquire_lock():
+        print(f"[hybrid] another instance holds {PIDFILE} — refusing to start")
+        return
+    client = await _create_client_with_retry(AsyncClient)
+    state = _load(STATE, {"position": None})
+    print(f"[alloc] start — OBJECTIVE=allocate MODE={MODE} "
+          f"{'🟢 LIVE (real earn subscriptions)' if _is_live() else '📝 simulated (no money moves)'}")
+    print("[alloc] job — deploy idle cash into yield, detect contributions, record honest NAV")
+    print("[alloc] NO speculative trades. Money flows spot -> earn ONLY; redeem is never called.")
+    try:
+        _EARN_PRODUCT_ID = await _resolve_product_id(client)
+        while True:
+            await _resync_clock(client)
+            if _killed():
+                print("[alloc] kill-switch present — idling (no money moves)")
+                await asyncio.sleep(POLL_MIN * 60)
+                continue
+            try:
+                contributed = await _detect_contributions(client, state)
+                swept = await _sweep_idle_to_earn(client, state)
+                snap = await _nav_snapshot(client)
+                if snap is None:
+                    print(f"[alloc {datetime.now(timezone.utc):%H:%M}] NAV unreadable "
+                          f"— skipping this cycle (not recording a false zero)")
+                else:
+                    row = _record_nav(state, snap, contributed, swept)
+                    print(f"[alloc {datetime.now(timezone.utc):%H:%M}] nav=${snap['nav']:.2f} "
+                          f"earn=${snap['earn_usdt']:.2f} spot=${snap['spot_usdt']:.2f} "
+                          f"hold=${snap['holdings_usd']:.2f} contrib=${row['cumulative_contributions']:.2f} "
+                          f"growth=${row['growth']:+.2f}")
+                _save(STATE, state)
+            except Exception as e:
+                print(f"  [ALLOC-ERROR] {str(e)[:100]}")
+            await asyncio.sleep(POLL_MIN * 60)
+    finally:
+        await client.close_connection()
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "report":
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    if arg == "report":
         _report()
+    elif arg == "nav":
+        _nav_report()
+    elif OBJECTIVE == "allocate":
+        asyncio.run(run_allocate())
     else:
         asyncio.run(run())

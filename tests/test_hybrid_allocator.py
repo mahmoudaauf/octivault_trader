@@ -715,3 +715,112 @@ async def test_each_retry_gets_a_fresh_connector(tmp_path):
     assert await h._create_client_with_retry(_Cls, max_delay_s=0.001) == "CLIENT"
     assert len(connectors) == 2
     assert connectors[0] is not connectors[1]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OBJECTIVE "allocate" — deploy / compound / account. No speculation.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _alloc(tmp_path, **env):
+    base = {"HYBRID_OBJECTIVE": "allocate", "HYBRID_MODE": "live",
+            "HYBRID_NAV_FILE": str(tmp_path / "nav.jsonl"),
+            "HYBRID_API_RETRIES": "1", "HYBRID_API_RETRY_DELAY_S": "0"}
+    base.update(env)
+    return _load(tmp_path, **base)
+
+
+# THE WALL is absolute here: redeem must not even be reachable.
+async def test_allocate_sweep_never_redeems(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _alloc(tmp_path)
+    h._EARN_PRODUCT_ID = "USDT001"
+    c = _mock_client()
+    c.get_asset_balance = AsyncMock(return_value={"free": "20.00", "locked": "0"})
+    swept = await h._sweep_idle_to_earn(c, {"position": None})
+    c.redeem_simple_earn_flexible_product.assert_not_called()
+    c.subscribe_simple_earn_flexible_product.assert_called_once()
+    assert swept == pytest.approx(20.00 - h.IDLE_BUFFER_USD, abs=0.01)
+
+
+# Sweeping while a position is open would strand its cash buffer.
+async def test_allocate_does_not_sweep_with_open_position(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _alloc(tmp_path)
+    h._EARN_PRODUCT_ID = "USDT001"
+    c = _mock_client()
+    c.get_asset_balance = AsyncMock(return_value={"free": "20.00", "locked": "0"})
+    assert await h._sweep_idle_to_earn(c, {"position": {"symbol": "AVAXUSDT"}}) == 0.0
+    c.subscribe_simple_earn_flexible_product.assert_not_called()
+
+
+async def test_allocate_sweep_moves_no_money_when_not_live(tmp_path):
+    h = _alloc(tmp_path, HYBRID_MODE="paper")     # no arm file either
+    h._EARN_PRODUCT_ID = "USDT001"
+    c = _mock_client()
+    c.get_asset_balance = AsyncMock(return_value={"free": "20.00", "locked": "0"})
+    assert await h._sweep_idle_to_earn(c, {"position": None}) == 0.0
+    c.subscribe_simple_earn_flexible_product.assert_not_called()
+
+
+# The trap this account actually contains: $20 round-tripped spot->futures->spot.
+# Internal moves must NEVER be booked as external contributions.
+async def test_contributions_come_from_deposit_history_not_nav_jumps(tmp_path):
+    h = _alloc(tmp_path)
+    c = _mock_client()
+    c.get_deposit_history = AsyncMock(return_value=[
+        {"txId": "abc", "coin": "USDT", "amount": "100.0", "status": 1},
+        {"txId": "pending", "coin": "USDT", "amount": "999.0", "status": 0},  # not completed
+    ])
+    state = {}
+    assert await h._detect_contributions(c, state) == pytest.approx(100.0)
+    assert state["cumulative_contributions"] == pytest.approx(100.0)
+    # idempotent: the same deposit must not be counted twice on the next poll
+    assert await h._detect_contributions(c, state) == 0.0
+    assert state["cumulative_contributions"] == pytest.approx(100.0)
+
+
+async def test_contribution_failure_is_not_counted(tmp_path):
+    h = _alloc(tmp_path)
+    c = _mock_client()
+    c.get_deposit_history = AsyncMock(side_effect=Exception("api down"))
+    state = {}
+    assert await h._detect_contributions(c, state) == 0.0
+    assert "cumulative_contributions" not in state
+
+
+# The whole point of #4: a deposit must never read as profit.
+def test_nav_growth_excludes_contributions(tmp_path):
+    h = _alloc(tmp_path)
+    state = {"cumulative_contributions": 0.0}
+    snap1 = {"nav": 60.0, "spot_usdt": 1.0, "earn_usdt": 40.0, "holdings_usd": 19.0, "holdings": {}}
+    r1 = h._record_nav(state, snap1, 0.0, 0.0)
+    assert r1["growth"] == pytest.approx(0.0)          # baseline anchors at zero
+
+    # deposit $100 -> NAV 160, but NOTHING was earned
+    state["cumulative_contributions"] = 100.0
+    snap2 = {"nav": 160.0, "spot_usdt": 101.0, "earn_usdt": 40.0, "holdings_usd": 19.0, "holdings": {}}
+    r2 = h._record_nav(state, snap2, 100.0, 0.0)
+    assert r2["growth"] == pytest.approx(0.0)          # <- deposit is NOT profit
+    assert r2["cumulative_contributions"] == pytest.approx(100.0)
+
+    # now genuinely earn $2.50 on top
+    snap3 = {"nav": 162.5, "spot_usdt": 101.0, "earn_usdt": 42.5, "holdings_usd": 19.0, "holdings": {}}
+    r3 = h._record_nav(state, snap3, 0.0, 0.0)
+    assert r3["growth"] == pytest.approx(2.5)          # only the earned part
+
+
+async def test_nav_snapshot_returns_none_on_unreadable_balance(tmp_path):
+    """A failed read must not be recorded as a NAV crash in the equity curve."""
+    h = _alloc(tmp_path)
+    c = _mock_client()
+    c.get_asset_balance = AsyncMock(side_effect=Exception("DNS"))
+    assert await h._nav_snapshot(c) is None
+
+
+def test_record_nav_creates_its_directory(tmp_path):
+    """A custom NAV_FILE path in a non-existent dir must not crash the loop."""
+    h = _alloc(tmp_path, HYBRID_NAV_FILE=str(tmp_path / "deep" / "nested" / "nav.jsonl"))
+    snap = {"nav": 10.0, "spot_usdt": 1.0, "earn_usdt": 9.0, "holdings_usd": 0.0, "holdings": {}}
+    row = h._record_nav({"cumulative_contributions": 0.0}, snap, 0.0, 0.0)
+    assert row["nav"] == 10.0
+    assert os.path.exists(h.NAV_FILE)
