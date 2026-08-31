@@ -21,6 +21,11 @@ ALERT_CMD="${HYBRID_ALERT_CMD:-$([ -x ./hybrid_alert.sh ] && echo ./hybrid_alert
 
 log(){ echo "$(date '+%Y-%m-%d %H:%M:%S') [HYBRID-SUP] $*" | tee -a "$SUP"; }
 alert(){ log "🚨 ALERT: $*"; [ -n "$ALERT_CMD" ] && ( eval "$ALERT_CMD" "\"$*\"" >/dev/null 2>&1 & ); }
+# Synchronous variant for the EXIT path. alert() backgrounds the command so a
+# crash-restart is never blocked, but on exit the shell dies immediately and
+# takes the background job with it — so the alert for a silently-killed
+# supervisor was itself silently lost. Verified 2026-08-31.
+alert_sync(){ log "🚨 ALERT: $*"; [ -n "$ALERT_CMD" ] && eval "$ALERT_CMD" "\"$*\"" >/dev/null 2>&1; }
 log_mtime(){ stat -f %m "$LOG" 2>/dev/null || stat -c %Y "$LOG" 2>/dev/null || echo 0; }
 
 log "supervisor started (pid $$) stall_watchdog=${STALL_MIN}m"
@@ -39,7 +44,7 @@ on_signal(){
     log "signal — stop flag present, exiting for good"; exit 0
   fi
   log "signal — exiting (no stop flag; supervisor should be restarted)"
-  alert "supervisor killed by signal with no stop flag — account is unmanaged"
+  alert_sync "supervisor killed by signal with no stop flag — account is unmanaged"
   exit 75
 }
 trap on_signal INT TERM

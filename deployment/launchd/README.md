@@ -1,51 +1,52 @@
-# launchd agents — BLOCKED while the project lives under ~/Desktop
+# launchd agents — INSTALLED and verified
 
-These agents keep `hybrid_supervisor.sh` / `delisting_exit_supervisor.sh` alive
-across sleep, logout and reboot. They are **not installed**, because they cannot
-work from the project's current location.
+Keeps `hybrid_supervisor.sh`, `delisting_exit_supervisor.sh` and
+`spread_mm_supervisor.sh` alive across sleep, logout and reboot.
 
-## Why
-
-macOS TCC treats `~/Desktop` as a privacy-protected location. launchd agents (and
-cron) run without Full Disk Access, so they cannot even read a script there:
-
-    /bin/bash: .../hybrid_supervisor.sh: Operation not permitted
-    shell-init: error retrieving current directory: getcwd: cannot access parent
-                directories: Operation not permitted
-
-Verified 2026-08-31 — both agents exited 126 immediately. The same wall has been
-silently killing this project's **cron jobs since mid-July**: `retrain_weekly.py`
-(weekly) last wrote 2026-07-14 and `carry_paper_trader.py report` (daily) last
-wrote 2026-07-15. Neither has run since, with no error surfaced anywhere.
-
-## To enable
-
-Move the project out of a protected location (`~/Desktop`, `~/Documents`,
-`~/Downloads`) — e.g. to `~/Projects/octivault_trader` — then:
-
-    # fix the paths inside the plists to the new location first
-    cp deployment/launchd/*.plist ~/Library/LaunchAgents/
-    launchctl load ~/Library/LaunchAgents/com.octivault.hybrid.plist
-    launchctl load ~/Library/LaunchAgents/com.octivault.delisting.plist
     launchctl list | grep octivault      # status 0 = healthy
 
-Granting Full Disk Access to `/bin/bash` would also work but is a far broader
-security change; moving the project is the better trade.
+## History: why the project moved
 
-## Design note
+These could not work from the old location. macOS TCC protects `~/Desktop`, and
+launchd (like cron) has no Full Disk Access there, so it could not even read the
+scripts:
 
-`KeepAlive` is `{SuccessfulExit: false}` — restart only on a NON-zero exit. This
-relies on the supervisor's exit codes: **0** when the operator's stop flag is
-present (stay down), **75** when killed with no stop flag (come back). The
-supervisor also no longer clears the stop flag at startup, so an auto-restarter
-cannot defeat the off switch.
+    /bin/bash: .../hybrid_supervisor.sh: Operation not permitted
 
-## Until then
+Agents exited 126 immediately. The same wall had been silently killing the
+project's **cron jobs since mid-July 2026** — `retrain_weekly.py` last wrote
+2026-07-14, `carry_paper_trader.py report` last wrote 2026-07-15, ~59 missed runs
+with no error surfaced anywhere.
 
-Supervision is manual:
+Resolved 2026-08-31 by moving the repo to `~/Projects/octivault_trader`, which is
+not TCC-protected. All three agents now report status 0.
 
-    nohup ./hybrid_supervisor.sh > logs/hybrid_sup_nohup.out 2>&1 &
-    nohup ./delisting_exit_supervisor.sh > logs/delisting_exit_sup_nohup.out 2>&1 &
+## Design
 
-which does NOT survive logout or a signal to the supervisor — the gap that left
-the account unmanaged for ~8.7h on 2026-08-31.
+`KeepAlive = {SuccessfulExit: false}` — restart only on a NON-zero exit. This
+depends on the supervisors' exit codes:
+
+| situation | exit | launchd |
+|---|---|---|
+| operator set the stop flag | 0 | leaves it down |
+| killed by signal, no stop flag | 75 | restarts it |
+
+The supervisors also no longer clear the stop flag at startup — otherwise an
+auto-restarter would wipe the operator's off switch on every relaunch.
+
+## Verified end-to-end (2026-08-31)
+
+- **Resurrection**: killed the supervisor with no stop flag → exit 75, alert
+  written to `logs/hybrid_alerts.log` + macOS notification, launchd relaunched it
+  within ~5s and the daemon came back with it.
+- **Off switch**: with the stop flag present → exit 0, stayed down past the
+  throttle interval, flag not wiped. The operator still wins.
+
+## Managing them
+
+    launchctl unload ~/Library/LaunchAgents/com.octivault.<name>.plist   # disable
+    launchctl load   ~/Library/LaunchAgents/com.octivault.<name>.plist   # enable
+    touch logs/<name>_supervisor.stop                                    # stop, stays stopped
+
+Plists here are the source of truth; copy to `~/Library/LaunchAgents/` after
+editing. They embed absolute paths — regenerate them if the repo moves again.

@@ -4,15 +4,15 @@
 <dict>
   <key>Label</key><string>com.octivault.delisting</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>/Users/mauf/Desktop/Projects/Octi AI Trading Bot/octivault_trader/delisting_exit_supervisor.sh</string></array>
-  <key>WorkingDirectory</key><string>/Users/mauf/Desktop/Projects/Octi AI Trading Bot/octivault_trader</string>
-  <!-- Restart only on a NON-zero exit. The supervisor exits 0 when the
-       operator's stop flag is present, so the off switch still works; it
-       exits 75 when killed with no stop flag, which is what we want back. -->
+  <array><string>/bin/bash</string><string>/Users/mauf/Projects/octivault_trader/delisting_exit_supervisor.sh</string></array>
+  <key>WorkingDirectory</key><string>/Users/mauf/Projects/octivault_trader</string>
+  <!-- Restart only on a NON-zero exit. The supervisors exit 0 when the
+       operator's stop flag is present, so the off switch still works; they
+       exit 75 when killed with no stop flag, which is what we want back. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>RunAtLoad</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
-  <key>StandardOutPath</key><string>/Users/mauf/Desktop/Projects/Octi AI Trading Bot/octivault_trader/logs/launchd_delisting.out</string>
-  <key>StandardErrorPath</key><string>/Users/mauf/Desktop/Projects/Octi AI Trading Bot/octivault_trader/logs/launchd_delisting.err</string>
+  <key>StandardOutPath</key><string>/Users/mauf/Projects/octivault_trader/logs/launchd_delisting.out</string>
+  <key>StandardErrorPath</key><string>/Users/mauf/Projects/octivault_trader/logs/launchd_delisting.err</string>
 </dict>
 </plist>
