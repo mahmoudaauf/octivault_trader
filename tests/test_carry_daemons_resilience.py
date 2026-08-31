@@ -63,3 +63,28 @@ def test_resync_happens_before_the_cycle_body(name):
     s = _src(name)
     i = s.index("while True:")
     assert "resync_clock" in s[i:i + 400], "resync must be the first thing each cycle"
+
+
+def test_resilience_helpers_are_not_duplicated():
+    """Two copies of a fix is how one of them silently rots. Every daemon must
+    delegate to exchange_resilience rather than carry its own copy."""
+    import glob
+    owners = []
+    for path in glob.glob(os.path.join(ROOT, "*.py")):
+        name = os.path.basename(path)
+        if name == "exchange_resilience.py":
+            continue
+        src = open(path).read()
+        # a real definition, not an import alias or a wrapper that delegates
+        if "def dns_session_params" in src or "def resync_clock(" in src:
+            owners.append(name)
+        if "aiohttp.ThreadedResolver()" in src:
+            owners.append(name)
+    assert not owners, f"resilience logic duplicated in: {sorted(set(owners))}"
+
+
+def test_every_daemon_uses_the_shared_resilience_module():
+    for name in DAEMONS + ["hybrid_allocator.py", "delisting_exit_paper_trader.py",
+                           "spread_mm_paper.py"]:
+        s = _src(name)
+        assert "exchange_resilience" in s, f"{name} does not use exchange_resilience"

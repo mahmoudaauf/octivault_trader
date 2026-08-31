@@ -287,79 +287,32 @@ async def _earn_usdt(client):
         return None
 
 
+# ── Resilience: shared with the other daemons ────────────────────────────────
+# These three lived here first and were duplicated into exchange_resilience.py
+# for the carry/delisting/market-maker daemons. Two copies of a fix is how one
+# of them silently rots, so this file now delegates. Thin wrappers keep the
+# existing private names and call signatures.
+from exchange_resilience import (                       # noqa: E402
+    create_client_with_retry as _shared_create_client,
+    dns_session_params as _shared_dns_params,
+    resync_clock as _shared_resync,
+)
+
+
 def _dns_session_params() -> dict:
-    """aiohttp session params that survive this machine's DNS flakiness.
-
-    Every outage here has been resolver-level, not connectivity:
-    `aiodns.error.DNSError: (11, 'Could not contact DNS servers')` — three times
-    in six days, once for ~45 minutes. aiohttp defaults to AsyncResolver
-    (aiodns/c-ares), which takes its nameserver list at construction and copes
-    badly with a laptop switching networks or waking from sleep.
-
-    ThreadedResolver defers to the OS resolver instead, which tracks those
-    changes and keeps its own cache; ttl_dns_cache then rides out brief resolver
-    failures without a lookup at all. Returns a FRESH connector per call —
-    AsyncClient.create() closes the session (and connector) when its ping fails,
-    so a retry must not reuse it.
-    """
-    try:
-        import aiohttp
-        return {"connector": aiohttp.TCPConnector(
-            resolver=aiohttp.ThreadedResolver(), ttl_dns_cache=300, limit=20)}
-    except Exception as e:                      # never block startup on this
-        print(f"[hybrid] DNS hardening unavailable ({str(e)[:60]}) — using aiohttp defaults")
-        return {}
-
-
-async def _create_client_with_retry(async_client_cls, max_delay_s: float = 300.0):
-    """Build the Binance client, WAITING OUT a network outage instead of dying.
-
-    AsyncClient.create() pings Binance, so it raises on a DNS/connectivity
-    failure and the daemon exits(1) at startup. This machine drops DNS
-    regularly, which produced a real crash-loop on 2026-08-25 (four exits in
-    ~75min). Crashing is worse than waiting: with a position open, nothing
-    applies the time-stop until the process is back (the exchange OCO still
-    holds, which is exactly why G1 exists — but that's the last line, not the
-    only one). Retries log every attempt so the supervisor's stall watchdog
-    still sees a live process.
-    """
-    delay, attempt = min(15.0, max_delay_s), 0
-    while True:
-        attempt += 1
-        try:
-            client = await async_client_cls.create(
-                os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x",
-                session_params=_dns_session_params())
-            if attempt > 1:
-                print(f"[hybrid] client connected after {attempt} attempts")
-            return client
-        except Exception as e:
-            print(f"[hybrid] client create failed (attempt {attempt}): {str(e)[:80]} "
-                  f"— retrying in {delay:.0f}s")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, max_delay_s)
+    """OS DNS resolver + cache; see exchange_resilience.dns_session_params."""
+    return _shared_dns_params()
 
 
 async def _resync_clock(client) -> bool:
-    """Re-derive the client's Binance timestamp offset.
+    """Re-derive the Binance timestamp offset; see exchange_resilience."""
+    return await _shared_resync(client, "hybrid")
 
-    python-binance computes `timestamp_offset` ONCE inside AsyncClient.create()
-    and never refreshes it. Local clock drift — which macOS accrues freely across
-    sleep/wake — eventually pushes every SIGNED request's timestamp outside
-    recvWindow, so they all fail -1021 permanently while UNSIGNED calls (klines,
-    tickers) keep working. Observed live 2026-08-23: after ~1h the daemon read
-    its balance as $0.00 and idled the sleeve for 12h with $9.62 sitting in spot.
-    """
-    try:
-        res = await client.get_server_time()
-        before = client.timestamp_offset
-        client.timestamp_offset = res["serverTime"] - int(time.time() * 1000)
-        if abs(client.timestamp_offset - before) > 500:
-            print(f"  [CLOCK-RESYNC] timestamp offset {before}ms → {client.timestamp_offset}ms")
-        return True
-    except Exception as e:
-        print(f"  [CLOCK-RESYNC] failed: {str(e)[:80]}")
-        return False
+
+async def _create_client_with_retry(async_client_cls, max_delay_s: float = 300.0):
+    """Build the client, waiting out an outage; see exchange_resilience."""
+    return await _shared_create_client(async_client_cls, label="hybrid",
+                                       max_delay_s=max_delay_s)
 
 
 async def _read_balance(client, asset: str):
