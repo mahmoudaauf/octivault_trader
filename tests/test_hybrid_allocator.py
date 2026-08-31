@@ -856,3 +856,33 @@ async def test_nav_is_measured_before_sweeping(tmp_path):
     # NAV counts the cash while it is still in spot: 9.74 + 38.52
     assert snap["nav"] == pytest.approx(48.26, abs=0.01)
     assert order.index("read") < order.index("sweep")   # measured, then moved
+
+
+async def test_earn_read_failure_is_unknown_not_zero(tmp_path):
+    """Earn is the bulk of NAV. A 0.0 fallback would record a ~$48 collapse in
+    the equity curve and, on a first snapshot, anchor the baseline to it."""
+    h = _alloc(tmp_path)
+    c = _mock_client()
+    c.get_simple_earn_flexible_product_position = AsyncMock(side_effect=Exception("api down"))
+    assert await h._earn_usdt(c) is None
+
+
+async def test_nav_snapshot_none_when_earn_unreadable(tmp_path):
+    h = _alloc(tmp_path)
+    c = _mock_client()
+    c.get_asset_balance = AsyncMock(return_value={"free": "5.0", "locked": "0"})
+    c.get_simple_earn_flexible_product_position = AsyncMock(side_effect=Exception("api down"))
+    assert await h._nav_snapshot(c) is None
+
+
+async def test_setup_defers_when_earn_unreadable(tmp_path):
+    open(tmp_path / "armed", "w").close()
+    h = _alloc(tmp_path)
+    h._EARN_PRODUCT_ID = "USDT001"
+    c = _mock_client()
+    c.get_asset_balance = AsyncMock(return_value={"free": "5.0", "locked": "0"})
+    c.get_simple_earn_flexible_product_position = AsyncMock(side_effect=Exception("api down"))
+    state = {"position": None}
+    await h._setup_allocation(c, state)
+    c.redeem_simple_earn_flexible_product.assert_not_called()
+    assert state.get("setup_done") is not True

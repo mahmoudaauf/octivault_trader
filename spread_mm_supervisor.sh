@@ -9,8 +9,19 @@ LOG="logs/spread_mm.log"
 SUP="logs/spread_mm_supervisor.log"
 STOP="logs/spread_mm_supervisor.stop"
 log(){ echo "$(date '+%Y-%m-%d %H:%M:%S') [MM-SUP] $*" | tee -a "$SUP"; }
+# Wired by ./hybrid_alert.sh being present + executable — this is bash and
+# never sources .env, which is why HYBRID_ALERT_CMD there reached nothing.
+ALERT_CMD="${ALERT_CMD:-$([ -x ./hybrid_alert.sh ] && echo ./hybrid_alert.sh)}"
+alert(){ log "🚨 ALERT: $*"; [ -n "$ALERT_CMD" ] && ( eval "$ALERT_CMD" "\"$*\"" >/dev/null 2>&1 & ); }
 log "supervisor started (pid $$)"
-trap 'log "signal — exiting"; exit 0' INT TERM
+on_signal(){
+  if [ -f "$STOP" ]; then log "signal — stop flag present, exiting for good"; exit 0; fi
+  log "signal — exiting (no stop flag; paper market-maker should be restarted)"
+  alert "paper market-maker supervisor killed by signal with no stop flag — not running"
+  exit 75
+}
+trap on_signal INT TERM
+
 while true; do
   [ -f "$STOP" ] && { log "stop flag present — exiting"; exit 0; }
   sz=$(du -m "$LOG" 2>/dev/null | cut -f1); [ "${sz:-0}" -ge 50 ] && : > "$LOG"

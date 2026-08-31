@@ -147,7 +147,10 @@ def _current_drawdown_pct() -> float:
         if not line:
             continue
         try:
-            cum += float(json.loads(line).get("net_pct", 0.0))
+            _r = json.loads(line)
+            if _r.get("net_pct") is None:
+                continue                      # unknown funding is never a 0
+            cum += float(_r["net_pct"])
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
         peak = max(peak, cum)
@@ -182,8 +185,11 @@ async def _resolve_notional(client) -> tuple[float, str]:
         bal = await client.get_asset_balance(asset="USDT")
         free_usdt = float((bal or {}).get("free", 0.0) or 0.0)
     except Exception as e:
-        print(f"[neg-carry] free-USDT fetch failed ({str(e)[:60]}) — using flat ${MAX_NOTIONAL:.0f}/leg")
-        return MAX_NOTIONAL, "fallback (balance fetch failed)"
+        # Never fall back to MAX_NOTIONAL: that sizes at maximum exactly when
+        # the account is unreadable, and this runs once at startup so one
+        # transient failure locks it in for the whole process.
+        print(f"[neg-carry] free-USDT fetch failed ({str(e)[:60]}) — sizing UNKNOWN, refusing to guess")
+        return None, "balance unreadable"
     notional = max(MIN_NOTIONAL, min(free_usdt * NAV_FRACTION, MAX_NOTIONAL))
     return notional, f"NAV-aware ({NAV_FRACTION*100:.1f}% of ${free_usdt:.2f} free USDT)"
 
@@ -238,7 +244,7 @@ async def signed_settled_funding_long(client, symbol: str, since_ms: int) -> flo
         rows = await client.futures_funding_rate(symbol=symbol, startTime=since_ms, limit=1000)
         return sum(-float(r["fundingRate"]) for r in rows)
     except Exception:
-        return 0.0
+        return None      # UNKNOWN — never 0.0, which books a fabricated number
 
 
 async def _hourly_borrow_rate(client, asset: str) -> float:
@@ -442,7 +448,7 @@ def _report():
     if not trades:
         print("No closed negative-funding carry trades yet.")
         return
-    nets = [t["net_pct"] for t in trades]
+    nets = [t["net_pct"] for t in trades if t.get("net_pct") is not None]
     n = len(nets)
     wins = sum(1 for x in nets if x > 0)
     avg = sum(nets) / n
@@ -466,9 +472,9 @@ async def run():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from binance import AsyncClient
 
-    client = await AsyncClient.create(
-        os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x"
-    )
+    from exchange_resilience import create_client_with_retry, resync_clock
+
+    client = await create_client_with_retry(AsyncClient, label="neg-carry")
     global NOTIONAL
     state = _load(STATE, {"open": {}})
     armed = MODE == "live" and os.path.exists(LIVE_ARM_FILE)
@@ -480,7 +486,17 @@ async def run():
     print(f"[neg-carry] safety — max_pos={MAX_POS} max_total=${MAX_TOTAL_USD:.0f} "
           f"auto_halt_drawdown={MAX_DD_PCT}% kill_file={KILL_FILE} "
           f"liq_margin_floor={LIQ_MARGIN_LEVEL_MIN} liq_perp_buf={LIQ_PERP_BUFFER_PCT}%")
-    NOTIONAL, _notional_reason = await _resolve_notional(client)
+    NOTIONAL = None
+    for _attempt in range(5):
+        NOTIONAL, _notional_reason = await _resolve_notional(client)
+        if NOTIONAL is not None:
+            break
+        print(f"[neg-carry] sizing unreadable (attempt {_attempt + 1}/5) — retrying in 10s")
+        await asyncio.sleep(10)
+    if NOTIONAL is None:
+        print("[neg-carry] ABORT — refusing to run on an unreadable balance rather "
+              "than defaulting to maximum notional")
+        return
     print(f"[neg-carry] params — entry<=-{ENTRY*100:.3f}% exit<{EXIT*100:.3f}% "
           f"fee={FEE_RT*100:.2f}% notional=${NOTIONAL:.2f}/leg ({_notional_reason}) "
           f"leverage={LEVERAGE}x poll={POLL_MIN}m borrow_rate_ttl={_BORROW_RATE_TTL_S/60:.0f}m")
@@ -507,6 +523,9 @@ async def run():
         print(f"[neg-carry] universe: {len(universe)} liquid, spot-hedgeable, "
               f"margin-BORROWABLE perps")
         while True:
+            # Keep the signing clock aligned before any SIGNED call; drift
+            # silently disables them all while unsigned calls keep working.
+            await resync_clock(client, "neg-carry")
             now = time.time()
             funding = await current_funding(client, universe)
             opened = closed = 0
@@ -542,15 +561,26 @@ async def run():
                             continue
                     signed_funding = await signed_settled_funding_long(
                         client, sym, int(pos["entry_ts"] * 1000))
-                    net = (signed_funding - pos["accrued_borrow_pct"] - FEE_RT) * 100.0
-                    _log_trade({
+                    # signed_funding=0.0 on a failed read booked a fabricated
+                    # net (= -borrow -fee) into the ledger and the verdict.
+                    rec = {
                         "ts": datetime.now(timezone.utc).isoformat(), "symbol": sym,
                         "held_h": round(held_h, 1),
-                        "signed_funding_pct": round(signed_funding * 100, 4),
                         "borrow_cost_pct": round(pos["accrued_borrow_pct"] * 100, 4),
-                        "net_pct": round(net, 4), "entry_funding": pos["entry_funding"],
+                        "entry_funding": pos["entry_funding"],
                         "exit_funding": fr, "mode": pos_mode,
-                    })
+                    }
+                    if signed_funding is None:
+                        rec.update({"signed_funding_pct": None, "net_pct": None,
+                                    "funding_unknown": True})
+                        print(f"  [NEG-CARRY] {sym} closed, funding UNREADABLE — booked "
+                              f"unknown, excluded from stats")
+                    else:
+                        rec.update({
+                            "signed_funding_pct": round(signed_funding * 100, 4),
+                            "net_pct": round((signed_funding - pos["accrued_borrow_pct"]
+                                              - FEE_RT) * 100.0, 4)})
+                    _log_trade(rec)
                     del state["open"][sym]
                     closed += 1
 

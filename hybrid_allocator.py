@@ -270,13 +270,21 @@ async def _resolve_product_id(client) -> str | None:
     return None
 
 
-async def _earn_usdt(client) -> float:
+async def _earn_usdt(client):
+    """Total USDT in flexible earn, or None if it could NOT be read.
+
+    Never 0.0 on failure: this is the largest component of NAV, so a failed read
+    would record a ~$48 NAV collapse in the equity curve and — on a first
+    snapshot — anchor the baseline to it, manufacturing enormous phantom growth
+    afterwards. Same failure this file already hit with sweep timing.
+    """
     try:
-        pos = await client.get_simple_earn_flexible_product_position(asset="USDT")
+        pos = await _retry(client.get_simple_earn_flexible_product_position, asset="USDT")
         rows = pos.get("rows", []) if isinstance(pos, dict) else pos
         return sum(float(p.get("totalAmount", 0.0) or 0.0) for p in rows)
-    except Exception:
-        return 0.0
+    except Exception as e:
+        print(f"  [EARN-READ-FAIL] {str(e)[:80]} — UNKNOWN (not zero)")
+        return None
 
 
 def _dns_session_params() -> dict:
@@ -466,10 +474,10 @@ async def _setup_allocation(client, state):
     losses can never touch the core."""
     spot = await _spot_free_usdt(client)
     earn = await _earn_usdt(client)
-    if spot is None:
+    if spot is None or earn is None:
         # The one-time split (and its redeem) must never be sized off a failed
         # read; retry on the next start rather than move the wrong amount.
-        print("[hybrid] setup deferred — spot balance unreadable this cycle")
+        print("[hybrid] setup deferred — balance unreadable this cycle")
         return
     total = spot + earn
     if "satellite_target" not in state:
@@ -969,6 +977,8 @@ async def _nav_snapshot(client) -> dict:
     if spot is None:
         return None
     earn = await _earn_usdt(client)
+    if earn is None:
+        return None          # earn is the bulk of NAV; never record it as 0
     holdings, hold_usd = {}, 0.0
     for asset in NAV_ASSETS:
         qty = await _asset_qty(client, asset)

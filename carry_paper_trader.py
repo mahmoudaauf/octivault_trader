@@ -87,7 +87,10 @@ def _current_drawdown_pct() -> float:
         if not line:
             continue
         try:
-            cum += float(json.loads(line).get("net_pct", 0.0))
+            _r = json.loads(line)
+            if _r.get("net_pct") is None:
+                continue                      # unknown funding is never a 0
+            cum += float(_r["net_pct"])
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
         peak = max(peak, cum)
@@ -213,8 +216,13 @@ async def _resolve_notional(client) -> tuple[float, str]:
         bal = await client.get_asset_balance(asset="USDT")
         free_usdt = float((bal or {}).get("free", 0.0) or 0.0)
     except Exception as e:
-        print(f"[carry] ⚠️  free-USDT fetch failed ({str(e)[:60]}) — using flat ${CARRY_MAX_NOTIONAL:.0f}/leg fallback")
-        return CARRY_MAX_NOTIONAL, "fallback (balance fetch failed)"
+        # Was: fall back to CARRY_MAX_NOTIONAL "so a transient API error can
+        # never silently zero out sizing". That avoids one wrong answer by
+        # taking the opposite extreme — sizing at MAXIMUM exactly when the
+        # account is unreadable — and since this runs once at startup, a single
+        # transient failure locked max sizing in for the whole process.
+        print(f"[carry] ⚠️  free-USDT fetch failed ({str(e)[:60]}) — sizing UNKNOWN, refusing to guess")
+        return None, "balance unreadable"
     notional = max(CARRY_MIN_NOTIONAL, min(free_usdt * CARRY_NAV_FRACTION, CARRY_MAX_NOTIONAL))
     return notional, f"NAV-aware ({CARRY_NAV_FRACTION*100:.1f}% of ${free_usdt:.2f} free USDT)"
 
@@ -254,7 +262,7 @@ async def settled_funding(client, symbol: str, since_ms: int) -> float:
         rows = await client.futures_funding_rate(symbol=symbol, startTime=since_ms, limit=1000)
         return sum(abs(float(r["fundingRate"])) for r in rows)
     except Exception:
-        return 0.0
+        return None      # UNKNOWN — never 0.0, which books a fabricated loss
 
 
 def _report():
@@ -269,7 +277,7 @@ def _report():
     if not trades:
         print("No closed carry trades yet.")
         return
-    nets = [t["net_pct"] for t in trades]
+    nets = [t["net_pct"] for t in trades if t.get("net_pct") is not None]
     n = len(nets)
     wins = sum(1 for x in nets if x > 0)
     avg = sum(nets) / n
@@ -291,6 +299,8 @@ async def run():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from binance import AsyncClient
 
+    from exchange_resilience import create_client_with_retry, resync_clock
+
     # Testnet validation: point the live order path at Binance FUTURES testnet (fake
     # money, real order mechanics) to prove execution before any real capital. Needs
     # separate testnet keys (create at testnet.binancefuture.com). NOTE: Binance spot &
@@ -304,11 +314,10 @@ async def run():
             print("[carry] ⚠️  CARRY_TESTNET=true but CARRY_TESTNET_KEY/SECRET not set — "
                   "create keys at testnet.binancefuture.com. Aborting.")
             return
-        client = await AsyncClient.create(key, sec, testnet=True)
+        client = await create_client_with_retry(AsyncClient, key, sec,
+                                               testnet=True, label="carry")
     else:
-        client = await AsyncClient.create(
-            os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x"
-        )
+        client = await create_client_with_retry(AsyncClient, label="carry")
     global NOTIONAL
     state = _load(STATE, {"open": {}})
     armed = MODE == "live" and os.path.exists(LIVE_ARM_FILE)
@@ -319,7 +328,17 @@ async def run():
           f"max_total=${MAX_TOTAL_USD:.0f} leverage={LEVERAGE}x")
     print(f"[carry] guards — auto_halt_drawdown={MAX_DD_PCT}% liq_buffer={LIQ_BUFFER_PCT}% "
           f"kill_file={KILL_FILE}")
-    NOTIONAL, _notional_reason = await _resolve_notional(client)
+    NOTIONAL = None
+    for _attempt in range(5):
+        NOTIONAL, _notional_reason = await _resolve_notional(client)
+        if NOTIONAL is not None:
+            break
+        print(f"[carry] sizing unreadable (attempt {_attempt + 1}/5) — retrying in 10s")
+        await asyncio.sleep(10)
+    if NOTIONAL is None:
+        print("[carry] ABORT — refusing to run on an unreadable balance rather "
+              "than defaulting to maximum notional")
+        return
     print(f"[carry] params — entry|f|>={ENTRY*100:.3f}% exit<{EXIT*100:.3f}% "
           f"fee={FEE_RT*100:.2f}% notional=${NOTIONAL:.2f}/leg ({_notional_reason}) poll={POLL_MIN}m")
     if MODE == "live" and not armed:
@@ -328,6 +347,9 @@ async def run():
         universe = await build_universe(client)
         print(f"[carry] universe: {len(universe)} liquid spot-hedgeable perps")
         while True:
+            # Keep the signing clock aligned before any SIGNED call; drift
+            # silently disables them all while unsigned calls keep working.
+            await resync_clock(client, "carry")
             now = time.time()
             funding = await current_funding(client, universe)
             opened = closed = 0
@@ -338,12 +360,22 @@ async def run():
                 if abs(fr) < EXIT or held_h >= MAX_HOLD_H or _killed():
                     await execute_legs(client, sym, pos.get("entry_funding", fr), "close")
                     accrued = await settled_funding(client, sym, int(pos["entry_ts"] * 1000))
-                    net = (accrued - FEE_RT) * 100.0
-                    _log_trade({
+                    # accrued=0.0 on a failed read booked net=-FEE_RT: a
+                    # FABRICATED LOSS written to the ledger and averaged into
+                    # the verdict. Mark it unknown and exclude it instead.
+                    rec = {
                         "ts": datetime.now(timezone.utc).isoformat(), "symbol": sym,
-                        "held_h": round(held_h, 1), "accrued_funding_pct": round(accrued * 100, 4),
-                        "net_pct": round(net, 4), "exit_funding": fr, "mode": MODE,
-                    })
+                        "held_h": round(held_h, 1), "exit_funding": fr, "mode": MODE,
+                    }
+                    if accrued is None:
+                        rec.update({"accrued_funding_pct": None, "net_pct": None,
+                                    "funding_unknown": True})
+                        print(f"  [CARRY] {sym} closed, funding UNREADABLE — booked unknown, "
+                              f"excluded from stats")
+                    else:
+                        rec.update({"accrued_funding_pct": round(accrued * 100, 4),
+                                    "net_pct": round((accrued - FEE_RT) * 100.0, 4)})
+                    _log_trade(rec)
                     del state["open"][sym]
                     closed += 1
             # Safety: drawdown auto-halt + liquidation-buffer guard.
