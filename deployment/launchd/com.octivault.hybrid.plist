@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.octivault.hybrid</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>/Users/mauf/Desktop/Projects/Octi AI Trading Bot/octivault_trader/hybrid_supervisor.sh</string></array>
+  <key>WorkingDirectory</key><string>/Users/mauf/Desktop/Projects/Octi AI Trading Bot/octivault_trader</string>
+  <!-- Restart only on a NON-zero exit. The supervisor exits 0 when the
+       operator's stop flag is present, so the off switch still works; it
+       exits 75 when killed with no stop flag, which is what we want back. -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/Users/mauf/Desktop/Projects/Octi AI Trading Bot/octivault_trader/logs/launchd_hybrid.out</string>
+  <key>StandardErrorPath</key><string>/Users/mauf/Desktop/Projects/Octi AI Trading Bot/octivault_trader/logs/launchd_hybrid.err</string>
+</dict>
+</plist>
