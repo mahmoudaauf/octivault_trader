@@ -138,13 +138,22 @@ def fetch_recent_delisting_articles(page_size: int = 50) -> list[dict]:
         return []
 
 
-async def get_real_holdings(client) -> dict[str, float]:
-    """{asset: free_qty} for non-stable, non-dust holdings in the real spot account."""
+async def get_real_holdings(client):
+    """{asset: free_qty} for non-stable, non-dust holdings, or None if the
+    account could NOT be read.
+
+    None means UNKNOWN and must never be treated as "holds nothing". get_account
+    is a SIGNED call, so it fails on clock drift while the UNSIGNED article feed
+    keeps working — and the caller marks articles as seen BEFORE checking
+    holdings. Returning {} therefore consumed every delisting notice during a
+    blind window and never re-examined it, permanently missing the exit this
+    strategy exists to make.
+    """
     try:
         acct = await client.get_account()
     except Exception as e:
-        print(f"[delist-exit] account fetch failed: {str(e)[:100]}")
-        return {}
+        print(f"[delist-exit] account fetch failed: {str(e)[:100]} — holdings UNKNOWN (not empty)")
+        return None
     out = {}
     for b in acct.get("balances", []):
         asset = b.get("asset", "")
@@ -266,17 +275,17 @@ def _report():
 async def run():
     from binance import AsyncClient
 
+    from exchange_resilience import create_client_with_retry, resync_clock
+
     testnet = os.getenv("DELIST_EXIT_TESTNET", "false").lower() in ("1", "true", "yes")
     if testnet:
-        client = await AsyncClient.create(
+        client = await create_client_with_retry(
+            AsyncClient,
             os.getenv("BINANCE_TESTNET_API_KEY") or "x",
             os.getenv("BINANCE_TESTNET_API_SECRET_HMAC") or "x",
-            testnet=True,
-        )
+            testnet=True, label="delist-exit")
     else:
-        client = await AsyncClient.create(
-            os.getenv("BINANCE_API_KEY") or "x", os.getenv("BINANCE_API_SECRET") or "x"
-        )
+        client = await create_client_with_retry(AsyncClient, label="delist-exit")
 
     state = _load(STATE, {"pending": {}, "seen_articles": []})
     seen = set(state.get("seen_articles", []))
@@ -292,10 +301,22 @@ async def run():
     try:
         while True:
             now_ms = int(time.time() * 1000)
+            # Keep the signing clock aligned BEFORE any signed call. Without
+            # this, drift silently disables get_account while the unsigned
+            # article feed keeps working -- the blindness described above.
+            await resync_clock(client, "delist-exit")
 
             if not _killed():
                 holdings = await get_real_holdings(client)
-                articles = fetch_recent_delisting_articles()
+                if holdings is None:
+                    # Blind: do NOT fetch or consume articles. Marking them seen
+                    # while we cannot check holdings would discard the notice
+                    # permanently -- articles are only ever examined once.
+                    print("[delist-exit] holdings unreadable — skipping the article scan "
+                          "this cycle (notices stay unseen so they are re-checked)")
+                    articles = []
+                else:
+                    articles = fetch_recent_delisting_articles()
                 for art in articles:
                     aid = art.get("id")
                     if aid is None or aid in seen:
