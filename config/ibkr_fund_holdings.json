@@ -1,0 +1,30 @@
+{
+  "_comment": "Look-through holdings for the exposure command. MAINTAINED BY HAND — this file is never fetched automatically, so `exposure` reports its coverage_pct honestly rather than pretending a partial file is complete. Update from each issuer's daily holdings file (search '<TICKER> holdings' on the issuer site, e.g. invesco.com for QQQM, vaneck.com for SMH, ssga.com for XLE/XLU, ishares.com for VTI... actually VTI/VXUS are Vanguard: investor.vanguard.com). Re-pull every few months; weights drift with the index.",
+  "_last_updated": "2026-09-04",
+  "QQQM": {"source": "invesco.com (mirrors QQQ holdings)", "holdings": {
+    "NVIDIA": 9.5, "MICROSOFT": 8.8, "APPLE": 7.6, "AMAZON": 5.6, "BROADCOM": 5.0,
+    "META PLATFORMS": 3.8, "ALPHABET (GOOGL)": 3.0, "ALPHABET (GOOG)": 2.9, "TESLA": 2.7, "COSTCO": 2.2
+  }},
+  "SMH": {"source": "vaneck.com", "holdings": {
+    "NVIDIA": 19.5, "TSMC": 12.0, "BROADCOM": 8.0, "ASML": 4.5, "AMD": 4.2,
+    "TEXAS INSTRUMENTS": 4.0, "QUALCOMM": 3.8, "APPLIED MATERIALS": 3.6, "LAM RESEARCH": 3.2, "KLA CORP": 3.0
+  }},
+  "XLE": {"source": "ssga.com", "holdings": {
+    "EXXON MOBIL": 22.0, "CHEVRON": 15.0, "CONOCOPHILLIPS": 8.0, "SCHLUMBERGER": 5.5,
+    "EOG RESOURCES": 4.5, "WILLIAMS COS": 4.0, "MARATHON PETROLEUM": 3.5
+  }},
+  "XLU": {"source": "ssga.com", "holdings": {
+    "NEXTERA ENERGY": 11.0, "SOUTHERN CO": 7.5, "DUKE ENERGY": 7.0, "CONSTELLATION ENERGY": 6.5,
+    "AMERICAN ELECTRIC POWER": 4.5, "SEMPRA": 4.0, "EXELON": 3.8
+  }},
+  "URA": {"source": "vaneck.com", "holdings": {
+    "CAMECO": 22.0, "NEXGEN ENERGY": 8.0, "SPROTT PHYSICAL URANIUM": 6.0, "KAZATOMPROM": 5.5
+  }},
+  "VTI": {"source": "investor.vanguard.com", "holdings": {
+    "NVIDIA": 6.5, "MICROSOFT": 6.0, "APPLE": 5.5, "AMAZON": 3.7, "META PLATFORMS": 2.6,
+    "BROADCOM": 2.2, "ALPHABET (GOOGL)": 2.0, "ALPHABET (GOOG)": 1.7, "TESLA": 1.6
+  }},
+  "VXUS": {"source": "investor.vanguard.com", "holdings": {
+    "TSMC": 2.3, "SAMSUNG ELECTRONICS": 1.2, "TENCENT": 1.0, "ASML": 0.9, "NESTLE": 0.7
+  }}
+}

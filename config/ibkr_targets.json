@@ -1,0 +1,28 @@
+{
+  "_comment": "Target weights for the IBKR thematic book. Edited by the OPERATOR, never by the daemon. Weights must sum to 1.0 across all funds. Reviewed on a schedule (see review_months), not when the news is loud.",
+  "_as_of": "2026-09-04",
+  "account_currency": "USD",
+  "monthly_deposit": 600.0,
+  "cash_cap_usd": 300.0,
+  "drift_band_pct": 5.0,
+  "min_order_usd": 1.0,
+  "review_months": 12,
+  "themes": {
+    "ai_tech": {
+      "label": "AI & large-cap tech",
+      "funds": {"QQQM": 0.35}
+    },
+    "semiconductors": {
+      "label": "Semiconductors / AI compute",
+      "funds": {"SMH": 0.20}
+    },
+    "energy": {
+      "label": "AI power, grid, nuclear & oil",
+      "funds": {"XLU": 0.10, "URA": 0.05, "XLE": 0.05}
+    },
+    "ballast": {
+      "label": "Diversification (non-US + US total market)",
+      "funds": {"VXUS": 0.15, "VTI": 0.10}
+    }
+  }
+}
