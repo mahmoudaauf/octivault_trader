@@ -591,6 +591,113 @@ async def _rotate_stablecoin(client, state, source: str, target: str,
         _save(STATE, state)
 
 
+# ── Launchpool: free tokens for stablecoins already sitting in Simple Earn ────
+# Backtested 2026-09-04 (launchpool_backtest.py): selling the reward on listing
+# day annualised POSITIVE IN EVERY CASE — FDUSD median 21.1%, BNB 17.5%, USDC
+# 7.7% while a pool is live. Holding the reward instead lost a median 12% in
+# week one. So the machine (a) parks in whichever stablecoin a live pool pays
+# best, and (b) sells rewards on day one and sweeps the proceeds into earn.
+_LP_CACHE: dict = {"ts": 0.0, "data": None}
+LP_HIST_APR = {                       # per-pool annualised median, sell day 1
+    "FDUSD": float(os.getenv("HYBRID_LP_APR_FDUSD", "0.211")),
+    "USDC": float(os.getenv("HYBRID_LP_APR_USDC", "0.077")),
+    "BNB": float(os.getenv("HYBRID_LP_APR_BNB", "0.175")),
+}
+
+
+async def _launchpool_projects(client) -> dict | None:
+    """Live Launchpool listing, cached for 5 minutes. None if unreadable."""
+    if time.time() - _LP_CACHE["ts"] < 300 and _LP_CACHE["data"] is not None:
+        return _LP_CACHE["data"]
+    try:
+        data = await _retry(client._request_margin_api, "get",
+                            "launchpool/project/list", True, data={})
+        _LP_CACHE.update(ts=time.time(), data=data)
+        return data
+    except Exception as e:
+        print(f"  [LAUNCHPOOL-READ-FAIL] {str(e)[:70]}")
+        return _LP_CACHE["data"]
+
+
+async def _launchpool_boost(client) -> dict[str, float]:
+    """{stablecoin: extra annualised yield} from pools live RIGHT NOW.
+
+    Zero when no pool is tracking, which is most of the time (~35% utilisation
+    historically, and decaying). Uses the API's own annualRate when it is
+    populated for a live pool, else the backtested per-pool median. A pool that
+    is merely "coming" is excluded: rotating early parks capital in FDUSD at
+    0.51% for nothing.
+    """
+    data = await _launchpool_projects(client)
+    if not data:
+        return {}
+    boost: dict[str, float] = {}
+    for pr in data.get("tracking") or []:
+        for pool in pr.get("projects") or []:
+            asset = str(pool.get("asset", "")).upper()
+            if asset not in STABLE_ASSETS:
+                continue
+            try:
+                api_rate = float(pool.get("annualRate") or 0)
+            except (TypeError, ValueError):
+                api_rate = 0.0
+            rate = api_rate if api_rate > 0 else LP_HIST_APR.get(asset, 0.0)
+            boost[asset] = boost.get(asset, 0.0) + rate
+            print(f"  [LAUNCHPOOL] {pr.get('rebateCoin')} live — {asset} pool "
+                  f"~{rate*100:.1f}% annualised while it runs")
+    return boost
+
+
+async def _sell_launchpool_rewards(client, state) -> float:
+    """Sell reward tokens that landed in spot from a Launchpool, on listing day.
+
+    Gated exactly like rotation (it is a SELL), and restricted to assets that
+    the Launchpool listing itself names as a reward coin — never a protected
+    hold, never a stablecoin, never anything on the NAV watchlist. The
+    backtest is unambiguous that holding the reward loses; proceeds are left in
+    spot USDT, and the next sweep compounds them into earn.
+    """
+    data = await _launchpool_projects(client)
+    if not data:
+        return 0.0
+    recent = [pr for pr in (data.get("completed", {}).get("list") or [])
+              if time.time() * 1000 - float(pr.get("mineEndTime") or 0) < 14 * 86_400_000]
+    coins = {str(pr.get("rebateCoin", "")).upper()
+             for pr in (data.get("tracking") or []) + recent
+             if pr.get("coinTradeTime") and float(pr["coinTradeTime"]) * 1000 <= time.time() * 1000}
+    coins -= set(STABLE_ASSETS) | PROTECTED_ASSETS | set(NAV_ASSETS) | {""}
+    sold = 0.0
+    for coin in sorted(coins):
+        free = await _asset_free(client, coin)
+        if not free:
+            continue
+        symbol = f"{coin}USDT"
+        try:
+            step, min_notional, _ = await _symbol_filters(client, symbol)
+            px = await _price(client, symbol)
+        except Exception:
+            continue
+        qty = _round_step(free, step)
+        if qty <= 0 or qty * px < min_notional:
+            print(f"  [LP-REWARD] {free:.6f} {coin} (~${free*px:.2f}) below min notional — holding until it is not")
+            continue
+        if not _rotate_armed():
+            print(f"  [LP-REWARD] {qty} {coin} (~${qty*px:.2f}) sellable; rotation DISARMED so not sold")
+            continue
+        if not _is_live():
+            print(f"  [LP-REWARD-DRYRUN] would order_market_sell(symbol={symbol!r}, quantity={qty})")
+            continue
+        try:
+            await _retry(client.order_market_sell, symbol=symbol, quantity=qty)
+            sold += qty * px
+            _log_trade({"ts": datetime.now(timezone.utc).isoformat(), "kind": "launchpool_reward_sell",
+                        "asset": coin, "qty": qty, "usd": round(qty * px, 4), "mode": MODE})
+            print(f"  [LP-REWARD] 🟢 sold {qty} {coin} ≈ ${qty*px:.2f} — swept to earn next cycle")
+        except Exception as e:
+            print(f"  [LP-REWARD-FAIL] {coin}: {str(e)[:80]}")
+    return sold
+
+
 async def _scan_stablecoins(client, held_asset: str, amount: float) -> dict | None:
     """Compare effective tier-aware rates across stablecoins for OUR balance.
 
@@ -607,14 +714,19 @@ async def _scan_stablecoins(client, held_asset: str, amount: float) -> dict | No
         return None
     best = None
     table = []
+    # A live Launchpool changes the answer: FDUSD's 0.51% base is the wrong
+    # home except during a pool, when its median 21% annualised makes it the
+    # right one. The boost is zero whenever nothing is tracking.
+    boost = await _launchpool_boost(client)
     for asset in STABLE_ASSETS:
         products = await _earn_products(client, asset, amount)
         if not products:
             continue
         p = products[0]
-        table.append((p["apr"], asset))
-        if best is None or p["apr"] > best["apr"]:
-            best = {"asset": asset, "apr": p["apr"], "productId": p["productId"]}
+        apr = p["apr"] + boost.get(asset, 0.0)
+        table.append((apr, asset))
+        if best is None or apr > best["apr"]:
+            best = {"asset": asset, "apr": apr, "productId": p["productId"]}
     if not best:
         return None
     current = next((apr for apr, a in table if a == held_asset.upper()), None)
@@ -1646,6 +1758,10 @@ async def _allocate_cycle(client, state):
                 await _rotate_stablecoin(client, state, held_asset,
                                          best["asset"], held,
                                          best["apr"] - cur_apr)
+        # Launchpool rewards land in spot hourly while a pool runs. Sell on
+        # listing day (holding lost a median 12% in week one), leave the USDT
+        # in spot, and the sweep above compounds it into earn next cycle.
+        await _sell_launchpool_rewards(client, state)
     if swept_assets:
         print("  [SWEEP] non-USDT subscribed: "
               + ", ".join(f"{q:.8f} {a}" for a, q in swept_assets.items()))
