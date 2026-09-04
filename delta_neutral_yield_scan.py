@@ -210,8 +210,93 @@ def report() -> None:
     print("  funding-farming on majors also looked fine before it returned -2%/yr.")
 
 
+async def funding_history(assets: list[str], days: int = 90) -> dict:
+    """Real funding distribution per asset, annualised.
+
+    THE SNAPSHOT LIES, and this is the function that proves it. On 2026-09-04
+    MOVE's live funding read +11.73%/yr while its 90-day MEAN was -21.0%; ONT
+    read +5.47% against a mean of -24.3%. Ranking on the current rate picks
+    assets that are about to pay you and ignores that they have been charging
+    you for months.
+
+    Reports mean AND worst AND percent-positive because the distribution is the
+    whole story: medians here are almost uniformly +5.5% (the funding floor)
+    while means are deeply negative, i.e. long runs of small credits wiped out
+    by rare 8h charges as extreme as -1833% annualised. A strategy sized on the
+    median and paid out of the mean is picking up pennies in front of a
+    steamroller.
+    """
+    import time as _t
+    from binance import AsyncClient
+    from exchange_resilience import create_client_with_retry
+    client = await create_client_with_retry(AsyncClient)
+    out = {}
+    try:
+        start = int(_t.time() * 1000) - days * 24 * 3600 * 1000
+        for asset in assets:
+            sym = f"{asset}USDT"
+            rows, cur = [], start
+            try:
+                while True:
+                    r = await client.futures_funding_rate(symbol=sym, startTime=cur, limit=1000)
+                    if not r:
+                        break
+                    rows += r
+                    if len(r) < 1000:
+                        break
+                    cur = r[-1]["fundingTime"] + 1
+            except Exception:
+                continue
+            if not rows:
+                continue
+            ann = [float(x["fundingRate"]) * 3 * 365 for x in rows]
+            out[asset] = {
+                "n": len(ann),
+                "mean": round(statistics.mean(ann), 6),
+                "median": round(statistics.median(ann), 6),
+                "worst": round(min(ann), 6),
+                "pct_positive": round(100.0 * sum(1 for a in ann if a > 0) / len(ann), 1),
+            }
+    finally:
+        await client.close_connection()
+    return out
+
+
+async def backtest(top: int = 25, days: int = 90) -> None:
+    """Re-rank the live scan on HISTORICAL funding instead of the snapshot."""
+    rec = await scan()
+    assets = [r["asset"] for r in rec["rows"][:top]]
+    hist = await funding_history(assets, days)
+    aprs = {r["asset"]: r["staking_apr"] for r in rec["rows"]}
+    print("=" * 78)
+    print(f"BACKTEST — staking APR (today) + funding MEAN over {days}d, not the snapshot")
+    print("=" * 78)
+    print(f"  {'asset':<11}{'staking':>9}{'fund mean':>11}{'worst8h':>11}{'%pos':>6}"
+          f"{'net/cap':>9}  verdict")
+    scored = []
+    for a in assets:
+        h = hist.get(a)
+        if not h:
+            continue
+        gross = aprs[a] + h["mean"]
+        net = gross * DEPLOYED_FRACTION - COST_PCT / 100.0
+        scored.append((net, a, h, gross))
+    for net, a, h, gross in sorted(scored, reverse=True):
+        # Positive on the MEAN and rarely negative is the only survivable shape.
+        verdict = ("survives" if net > 0 and h["pct_positive"] >= 80
+                   else "fat tail" if net > 0
+                   else "DEAD on history")
+        print(f"  {a:<11}{aprs[a]*100:>8.2f}%{h['mean']*100:>10.1f}%{h['worst']*100:>10.1f}%"
+              f"{h['pct_positive']:>5.0f}%{net*100:>8.1f}%  {verdict}")
+    print("\n  'survives' still is not proof: staking APRs are promotional and can")
+    print("  collapse, and 90d of funding does not contain every regime.")
+
+
 if __name__ == "__main__":
-    if (sys.argv[1:] or [""])[0] == "report":
+    arg = (sys.argv[1:] or [""])[0]
+    if arg == "report":
         report()
+    elif arg == "backtest":
+        asyncio.run(backtest())
     else:
         _print_scan(asyncio.run(scan()))
