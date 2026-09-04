@@ -1609,6 +1609,17 @@ async def _sweep_assets_to_earn(client, state) -> dict:
     return swept
 
 
+def _stable_breakdown(snap: dict) -> str:
+    """'(48USDC+0USDT)' — which stablecoins the core sits in, for the log line.
+
+    Empty string when the snapshot predates the stables field, so old rows and
+    new rows print through the same code path.
+    """
+    stables = snap.get("stables") or {}
+    parts = [f"{q['earn']:.0f}{a}" for a, q in stables.items() if q.get("earn", 0) >= 1]
+    return f"({'+'.join(parts)})" if parts else ""
+
+
 def _record_nav(state, snap: dict, contributed: float, swept: float):
     """Append one row to the equity curve, separating CONTRIBUTIONS from RETURNS.
 
@@ -1624,6 +1635,13 @@ def _record_nav(state, snap: dict, contributed: float, swept: float):
     row = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "nav": snap["nav"], "spot_usdt": snap["spot_usdt"], "earn_usdt": snap["earn_usdt"],
+        # Where the core actually sits. After the first rotation earn_usdt reads
+        # 0.00 while $48 sits in USDC — a curve that only carried the USDT
+        # column would look like the core vanished on the day the machine did
+        # its job. The USDT-only fields stay for continuity; these are the truth.
+        "spot_stable_usd": snap.get("spot_stable_usd", snap["spot_usdt"]),
+        "earn_stable_usd": snap.get("earn_stable_usd", snap["earn_usdt"]),
+        "stables": snap.get("stables", {}),
         "holdings_usd": snap["holdings_usd"], "holdings": snap["holdings"],
         "cumulative_contributions": round(contrib, 4),
         "contributed_this_cycle": round(contributed, 4),
@@ -1771,7 +1789,8 @@ async def _allocate_cycle(client, state):
     else:
         row = _record_nav(state, snap, contributed, swept)
         print(f"[alloc {datetime.now(timezone.utc):%H:%M}] nav=${snap['nav']:.2f} "
-              f"earn=${snap['earn_usdt']:.2f} spot=${snap['spot_usdt']:.2f} "
+              f"earn=${snap.get('earn_stable_usd', snap['earn_usdt']):.2f}{_stable_breakdown(snap)} "
+              f"spot=${snap.get('spot_stable_usd', snap['spot_usdt']):.2f} "
               f"hold=${snap['holdings_usd']:.2f} contrib=${row['cumulative_contributions']:.2f} "
               f"growth=${row['growth']:+.2f}")
     _save(STATE, state)
