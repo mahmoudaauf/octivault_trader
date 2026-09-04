@@ -45,12 +45,17 @@ Modes (HYBRID_MODE, default paper):
 
 Objectives (HYBRID_OBJECTIVE, default satellite):
   satellite — the negative-EV breakout trader described above.
-  allocate  — deploy/compound/account ONLY: sweep idle spot USDT into flexible
-              earn, detect external contributions from deposit history, and
-              record an honest NAV curve that keeps deposits separate from
-              returns. Places no speculative trades and never calls redeem, so
-              the wall is absolute rather than merely enforced. Positive-EV: it
-              captures yield on cash that would otherwise sit at 0%.
+  allocate  — deploy/compound/account ONLY. Places no speculative trades and
+              never calls redeem, so the wall is absolute rather than merely
+              enforced. Positive-EV: it captures yield on capital that would
+              otherwise sit at 0%. It does four things, all autonomous:
+                • sweeps idle spot USDT into flexible earn
+                • sweeps idle NON-USDT holdings (BTC) into their own flexible
+                  products — added 2026-09-04; the BTC hold earned 0% until then
+                • picks the BEST-APR product each cycle rather than whichever
+                  one Binance listed first, and logs the rates it saw
+                • detects external contributions from deposit history and
+                  records an honest NAV curve keeping deposits out of returns
 
 Usage:
   python3 hybrid_allocator.py          # run the daemon (mode + objective from env)
@@ -126,6 +131,22 @@ MIN_SWEEP_USD = float(os.getenv("HYBRID_MIN_SWEEP_USD", "0.05"))
 # Fraction of a detected contribution to route into BTC. Default 0: a bot must
 # not take a directional position unless the operator explicitly asks.
 CONTRIB_BTC_PCT = float(os.getenv("HYBRID_CONTRIB_BTC_PCT", "0.0"))
+# ── Autonomous yield (2026-09-04) ────────────────────────────────────────────
+# Assets auto-subscribed to flexible earn. USDT was the only one for months,
+# which left the BTC hold sitting at 0% indefinitely. Subscribing an asset does
+# NOT change NAV (see _nav_snapshot: earn quantities are counted alongside spot),
+# and flexible earn redeems on demand, so this is yield with no lock-up.
+EARN_ASSETS = [a.strip().upper() for a in
+               os.getenv("HYBRID_EARN_ASSETS", "USDT,BTC").split(",") if a.strip()]
+# Log every available flexible rate each cycle. Read-only; it is how a better
+# promotional rate becomes visible instead of being silently missed.
+RATE_SCAN = os.getenv("HYBRID_RATE_SCAN", "1") not in ("0", "false", "False")
+# DELIBERATELY NOT IMPLEMENTED: migrating the existing core between earn
+# products. It would require REDEEM, which the allocate objective never calls —
+# that absence is the wall, not a policy that could be flipped by a flag. New
+# money already routes to the best-APR product every cycle, so the rate is
+# captured over time without ever unwinding a position. A knob here that did
+# nothing would be worse than no knob at all.
 NAV_ASSETS = [a.strip().upper() for a in
               os.getenv("HYBRID_NAV_ASSETS", "BTC,BNB,AVAX,SOL,LINK,INJ,NEAR,ADA,SUI,APT,ARB,DOGE").split(",") if a.strip()]
 API_RETRIES = int(os.getenv("HYBRID_API_RETRIES", "3"))          # G5
@@ -258,16 +279,76 @@ async def _symbol_filters(client, symbol: str) -> tuple[float, float, float]:
 
 
 # ── Earn (core) helpers — READ + one-directional writes ──────────────────────
-async def _resolve_product_id(client) -> str | None:
+async def _earn_products(client, asset: str) -> list[dict]:
+    """All subscribable flexible products for an asset, best APR first.
+
+    Returns [] rather than raising: a product-list outage must degrade to "keep
+    using the product we already resolved", never to a crash in the daemon loop.
+    """
     try:
-        lst = await client.get_simple_earn_flexible_product_list(asset="USDT")
-        rows = lst.get("rows", []) if isinstance(lst, dict) else lst
-        for p in rows:
-            if str(p.get("asset")) == "USDT":
-                return p.get("productId")
+        lst = await _retry(client.get_simple_earn_flexible_product_list, asset=asset)
+        rows = lst.get("rows", []) if isinstance(lst, dict) else (lst or [])
     except Exception as e:
-        print(f"[hybrid] earn product lookup failed: {str(e)[:70]}")
-    return None
+        print(f"  [EARN-PRODUCTS-FAIL] {asset}: {str(e)[:70]}")
+        return []
+    out = []
+    for p in rows:
+        if str(p.get("asset", "")).upper() != asset.upper():
+            continue
+        if p.get("canPurchase") is False or str(p.get("status", "PURCHASING")).upper() == "END":
+            continue
+        try:
+            apr = float(p.get("latestAnnualPercentageRate", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            apr = 0.0
+        out.append({"productId": p.get("productId"), "asset": asset.upper(), "apr": apr,
+                    "min": float(p.get("minPurchaseAmount", 0.0) or 0.0)})
+    return sorted(out, key=lambda r: -r["apr"])
+
+
+async def _resolve_product_id(client, asset: str = "USDT") -> str | None:
+    """Best-APR flexible product id for an asset.
+
+    Was "first product returned", which quietly pinned the core to whatever
+    Binance happened to list first and ignored better promotional terms. Picking
+    by rate is the whole point of the scan and costs nothing.
+    """
+    products = await _earn_products(client, asset)
+    if not products:
+        return None
+    best = products[0]
+    if RATE_SCAN and len(products) > 1:
+        others = ", ".join(f"{p['apr']*100:.2f}%" for p in products[1:4])
+        print(f"  [RATE-SCAN] {asset}: using {best['apr']*100:.2f}% APR "
+              f"(product {best['productId']}); also offered {others}")
+    elif RATE_SCAN:
+        print(f"  [RATE-SCAN] {asset}: {best['apr']*100:.2f}% APR (only product)")
+    return best["productId"]
+
+
+async def _earn_positions(client) -> dict | None:
+    """{ASSET: quantity} across ALL flexible earn positions, or None if unread.
+
+    Reads every asset, not just USDT, because the sweep now subscribes BTC too.
+    A subscribed asset LEAVES the spot balance, so if NAV counted only spot the
+    machine would book a ~$12 collapse the moment it did its job correctly.
+    """
+    try:
+        pos = await _retry(client.get_simple_earn_flexible_product_position)
+        rows = pos.get("rows", []) if isinstance(pos, dict) else (pos or [])
+    except Exception as e:
+        print(f"  [EARN-READ-FAIL] {str(e)[:80]} — UNKNOWN (not zero)")
+        return None
+    out: dict[str, float] = {}
+    for p in rows:
+        asset = str(p.get("asset", "")).upper()
+        if not asset:
+            continue
+        try:
+            out[asset] = out.get(asset, 0.0) + float(p.get("totalAmount", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 async def _earn_usdt(client):
@@ -278,13 +359,10 @@ async def _earn_usdt(client):
     snapshot — anchor the baseline to it, manufacturing enormous phantom growth
     afterwards. Same failure this file already hit with sweep timing.
     """
-    try:
-        pos = await _retry(client.get_simple_earn_flexible_product_position, asset="USDT")
-        rows = pos.get("rows", []) if isinstance(pos, dict) else pos
-        return sum(float(p.get("totalAmount", 0.0) or 0.0) for p in rows)
-    except Exception as e:
-        print(f"  [EARN-READ-FAIL] {str(e)[:80]} — UNKNOWN (not zero)")
+    positions = await _earn_positions(client)
+    if positions is None:
         return None
+    return positions.get("USDT", 0.0)
 
 
 # ── Resilience: shared with the other daemons ────────────────────────────────
@@ -929,19 +1007,28 @@ async def _nav_snapshot(client) -> dict:
     spot = await _asset_free(client, "USDT")
     if spot is None:
         return None
-    earn = await _earn_usdt(client)
-    if earn is None:
+    earn_positions = await _earn_positions(client)
+    if earn_positions is None:
         return None          # earn is the bulk of NAV; never record it as 0
+    earn = earn_positions.get("USDT", 0.0)
     holdings, hold_usd = {}, 0.0
     for asset in NAV_ASSETS:
-        qty = await _asset_qty(client, asset)
+        spot_qty = await _asset_qty(client, asset)
+        earn_qty = earn_positions.get(asset, 0.0)
+        # An asset subscribed to earn LEAVES the spot balance but is still ours.
+        # Counting spot alone would book a NAV collapse the moment the sweep
+        # succeeded — the machine punishing itself for doing its job.
+        if spot_qty is None and not earn_qty:
+            continue                       # unreadable and not in earn: skip
+        qty = (spot_qty or 0.0) + earn_qty
         if not qty:
             continue
         try:
             px = await _price(client, f"{asset}USDT")
         except Exception:
             continue
-        holdings[asset] = {"qty": qty, "price": px, "usd": round(qty * px, 4)}
+        holdings[asset] = {"qty": qty, "price": px, "usd": round(qty * px, 4),
+                           "in_earn": round(earn_qty, 8)}
         hold_usd += qty * px
     return {"spot_usdt": round(spot, 4), "earn_usdt": round(earn, 4),
             "holdings_usd": round(hold_usd, 4), "holdings": holdings,
@@ -1015,6 +1102,57 @@ async def _sweep_idle_to_earn(client, state) -> float:
     except Exception as e:
         print(f"  [SWEEP-FAIL] ${amount:.2f}: {str(e)[:80]}")
         return 0.0
+
+
+async def _sweep_assets_to_earn(client, state) -> dict:
+    """Subscribe idle NON-USDT holdings (BTC by default) to flexible earn.
+
+    The USDT sweep has run for months while the BTC hold sat at 0% — the single
+    largest avoidable gap in the account. Flexible earn redeems on demand, so
+    this adds yield without a lock-up and without a directional decision: it
+    changes the rate on an asset you already hold, nothing else.
+
+    Skips PROTECTED_ASSETS only if a satellite position is open; a resting OCO
+    holds its quantity as `locked`, and `_asset_free` already excludes that, so
+    a protected position can never be swept out from under its own stop.
+    """
+    swept: dict[str, float] = {}
+    if state.get("position"):
+        return swept                       # satellite open: leave balances alone
+    for asset in EARN_ASSETS:
+        if asset == "USDT":
+            continue                       # handled by _sweep_idle_to_earn
+        free = await _asset_free(client, asset)
+        if not free:
+            continue
+        products = await _earn_products(client, asset)
+        if not products:
+            continue
+        best = products[0]
+        if best["min"] and free < best["min"]:
+            # Logged, not silent: "nothing happened" and "nothing COULD happen"
+            # look identical in a quiet log, and the operator needs to know the
+            # holding is stranded below the minimum rather than assume it earns.
+            print(f"  [SWEEP-SKIP] {asset}: hold {free:.8f} < product minimum "
+                  f"{best['min']:.8f} — stays at 0% (rate offered: "
+                  f"{best['apr']*100:.2f}% APR)")
+            continue
+        if best["apr"] <= 0.0005:
+            print(f"  [SWEEP-SKIP] {asset}: best rate {best['apr']*100:.2f}% APR "
+                  f"is not worth the subscription — leaving it liquid")
+            continue
+        if not _is_live():
+            print(f"  [SWEEP-{MODE.upper()}] would subscribe {free:.8f} {asset} "
+                  f"-> earn @ {best['apr']*100:.2f}% APR (nothing sent)")
+            continue
+        try:
+            await _retry(client.subscribe_simple_earn_flexible_product,
+                         productId=best["productId"], amount=str(free))
+            print(f"  [SWEEP] 🟢 {free:.8f} {asset} -> earn @ {best['apr']*100:.2f}% APR")
+            swept[asset] = free
+        except Exception as e:
+            print(f"  [SWEEP-FAIL] {asset} {free:.8f}: {str(e)[:80]}")
+    return swept
 
 
 def _record_nav(state, snap: dict, contributed: float, swept: float):
@@ -1110,6 +1248,14 @@ async def run_allocate():
                 # measuring first is both correct and always consistent.
                 snap = await _nav_snapshot(client)
                 swept = await _sweep_idle_to_earn(client, state)
+                # Non-USDT holdings (BTC) into their own flexible products. Same
+                # measure-before-sweep ordering as above, and for the same
+                # reason: a subscription debits the balance immediately while
+                # the earn position lags, so snapshotting after would undercount.
+                swept_assets = await _sweep_assets_to_earn(client, state)
+                if swept_assets:
+                    print(f"  [SWEEP] non-USDT subscribed: "
+                          + ", ".join(f"{q:.8f} {a}" for a, q in swept_assets.items()))
                 if snap is None:
                     print(f"[alloc {datetime.now(timezone.utc):%H:%M}] NAV unreadable "
                           f"— skipping this cycle (not recording a false zero)")
