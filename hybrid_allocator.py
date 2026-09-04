@@ -147,6 +147,15 @@ EARN_ASSETS = [a.strip().upper() for a in
 # Log every available flexible rate each cycle. Read-only; it is how a better
 # promotional rate becomes visible instead of being silently missed.
 RATE_SCAN = os.getenv("HYBRID_RATE_SCAN", "1") not in ("0", "false", "False")
+# Stablecoins compared each cycle for the best EFFECTIVE (tier-aware) rate.
+# Binance prices these very differently and the gap is not visible in the
+# headline numbers: on 2026-09-04, USDC paid 5.00% on the first 300 while USDT
+# paid 4.00% on the first 500 — a 25% better rate for the same dollar of
+# stablecoin risk. Capital parked in the wrong one is a pure, silent loss.
+STABLE_ASSETS = [a.strip().upper() for a in
+                 os.getenv("HYBRID_STABLE_ASSETS", "USDT,USDC,FDUSD,TUSD,DAI").split(",") if a.strip()]
+# How much better a rival must be before it is worth reporting, in APR points.
+STABLE_EDGE_MIN = float(os.getenv("HYBRID_STABLE_EDGE_MIN", "0.0025"))  # 0.25pp
 # DELIBERATELY NOT IMPLEMENTED: migrating the existing core between earn
 # products. It would require REDEEM, which the allocate objective never calls —
 # that absence is the wall, not a policy that could be flipped by a flag. New
@@ -388,6 +397,46 @@ async def _resolve_product_id(client, asset: str = "USDT",
         print(f"  [RATE-SCAN] {asset}: using {best['apr']*100:.2f}% APR "
               f"(product {best['productId']}){others}{tier_note}")
     return best["productId"]
+
+
+async def _scan_stablecoins(client, held_asset: str, amount: float) -> dict | None:
+    """Compare effective tier-aware rates across stablecoins for OUR balance.
+
+    Read-only: it reports, it never moves anything. Rotating stablecoins needs a
+    redeem plus a conversion, which the allocate objective deliberately does not
+    do — so this surfaces the opportunity and leaves the decision to the
+    operator rather than silently taking a position in a different issuer.
+
+    Comparing at OUR amount matters: these products are tiered, so the ranking
+    genuinely changes with balance. USDC's 5% only applies to the first 300;
+    above that USDT's deeper 500-wide tier can win.
+    """
+    if amount <= 0:
+        return None
+    best = None
+    table = []
+    for asset in STABLE_ASSETS:
+        products = await _earn_products(client, asset, amount)
+        if not products:
+            continue
+        p = products[0]
+        table.append((p["apr"], asset))
+        if best is None or p["apr"] > best["apr"]:
+            best = {"asset": asset, "apr": p["apr"], "productId": p["productId"]}
+    if not best:
+        return None
+    current = next((apr for apr, a in table if a == held_asset.upper()), None)
+    if RATE_SCAN:
+        print("  [STABLE-SCAN] "
+              + ", ".join(f"{a} {apr*100:.2f}%" for apr, a in sorted(table, reverse=True)))
+    if (current is not None and best["asset"] != held_asset.upper()
+            and best["apr"] - current >= STABLE_EDGE_MIN):
+        gain = amount * (best["apr"] - current)
+        print(f"  [STABLE-BETTER] {best['asset']} pays {best['apr']*100:.2f}% vs "
+              f"{held_asset} {current*100:.2f}% on ${amount:,.2f} "
+              f"— +${gain:,.2f}/yr if converted. Not done automatically: "
+              f"rotating needs a redeem + conversion this objective never performs.")
+    return best
 
 
 async def _earn_positions(client) -> dict | None:
@@ -1348,6 +1397,8 @@ async def _allocate_cycle(client, state):
     # subscription debits the balance immediately while the earn position lags,
     # so snapshotting after would undercount.
     swept_assets = await _sweep_assets_to_earn(client, state)
+    if snap is not None:
+        await _scan_stablecoins(client, "USDT", snap.get("earn_usdt", 0.0))
     if swept_assets:
         print("  [SWEEP] non-USDT subscribed: "
               + ", ".join(f"{q:.8f} {a}" for a, q in swept_assets.items()))
