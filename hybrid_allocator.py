@@ -45,9 +45,8 @@ Modes (HYBRID_MODE, default paper):
 
 Objectives (HYBRID_OBJECTIVE, default satellite):
   satellite — the negative-EV breakout trader described above.
-  allocate  — deploy/compound/account ONLY. Places no speculative trades and
-              never calls redeem, so the wall is absolute rather than merely
-              enforced. Positive-EV: it captures yield on capital that would
+  allocate  — deploy/compound/account ONLY. Places no speculative trades.
+              Positive-EV: it captures yield on capital that would
               otherwise sit at 0%. It does four things, all autonomous:
                 • sweeps idle spot USDT into flexible earn
                 • sweeps idle NON-USDT holdings (BTC) into their own flexible
@@ -56,6 +55,28 @@ Objectives (HYBRID_OBJECTIVE, default satellite):
                   one Binance listed first, and logs the rates it saw
                 • detects external contributions from deposit history and
                   records an honest NAV curve keeping deposits out of returns
+
+              THE ROTATION EXCEPTION (2026-09-04). This objective used to call
+              redeem NOWHERE, and that absence was the wall. It now has exactly
+              one redeem: `_rotate_stablecoin`, which moves the core between
+              STABLECOIN earn products when one pays materially better (USDC
+              paid 5.00% against USDT's 4.00% on the day it was written). The
+              wall is therefore no longer "redeem is impossible" but a set of
+              conditions, which is a weaker guarantee and is stated plainly
+              rather than glossed:
+                - disarmed by default; needs MODE=live AND a SEPARATE arm file
+                  (HYBRID_ROTATE_ARM_FILE) that this code never creates
+                - destination restricted to STABLE_ASSETS, so the worst case is
+                  holding a different dollar-pegged token, never a directional
+                  position and never a transfer that could fund the satellite
+                - refuses while a satellite position is open
+                - needs a bigger edge to act than to report, plus a cooldown,
+                  so a flickering rate cannot make it churn
+                - measures its own conversion cost from the live book and fee
+                  schedule each time, and aborts if the round trip is too dear
+                - not atomic, deliberately: if the redeem lands and the
+                  conversion does not, the cash sits in spot and the next
+                  cycle's sweep returns it to earn
 
 Usage:
   python3 hybrid_allocator.py          # run the daemon (mode + objective from env)
@@ -156,6 +177,22 @@ STABLE_ASSETS = [a.strip().upper() for a in
                  os.getenv("HYBRID_STABLE_ASSETS", "USDT,USDC,FDUSD,TUSD,DAI").split(",") if a.strip()]
 # How much better a rival must be before it is worth reporting, in APR points.
 STABLE_EDGE_MIN = float(os.getenv("HYBRID_STABLE_EDGE_MIN", "0.0025"))  # 0.25pp
+# ── Stablecoin rotation (2026-09-04) ─────────────────────────────────────────
+# Moves the CORE between stablecoin earn products to sit in the best effective
+# rate. This is the one place the allocate objective calls REDEEM, so it is
+# gated like live trading: MODE=live AND a separate arm file that this code
+# never creates. See THE ROTATION EXCEPTION in the module docstring.
+ROTATE_ARM_FILE = os.getenv("HYBRID_ROTATE_ARM_FILE", "logs/hybrid_rotate_armed")
+# Act on a bigger edge than we merely report on: acting costs two API round
+# trips and a market order, and a rate that flickers around the reporting
+# threshold must not make the machine churn.
+ROTATE_MIN_EDGE = float(os.getenv("HYBRID_ROTATE_MIN_EDGE", "0.005"))    # 0.5pp
+ROTATE_MIN_USD = float(os.getenv("HYBRID_ROTATE_MIN_USD", "20"))
+ROTATE_COOLDOWN_H = float(os.getenv("HYBRID_ROTATE_COOLDOWN_H", "24"))
+# Abort if the round trip is dearer than this. Measured from the live book each
+# time, never assumed: USDCUSDT is zero-fee with a ~0.001% spread today, but a
+# rotation must not silently proceed on a stale assumption about its own cost.
+ROTATE_MAX_COST_PCT = float(os.getenv("HYBRID_ROTATE_MAX_COST_PCT", "0.05"))
 # DELIBERATELY NOT IMPLEMENTED: migrating the existing core between earn
 # products. It would require REDEEM, which the allocate objective never calls —
 # that absence is the wall, not a policy that could be flipped by a flag. New
@@ -174,6 +211,16 @@ _lock_handle = None      # keep the flock fd alive for the process lifetime
 
 def _is_live() -> bool:
     return MODE == "live" and os.path.exists(LIVE_ARM_FILE)
+
+
+def _rotate_armed() -> bool:
+    """Stablecoin rotation is armed independently of the satellite trader.
+
+    Someone arming the negative-EV breakout trader is making a completely
+    different decision from someone allowing the core to move between stablecoin
+    issuers. One arm file for both would silently couple them.
+    """
+    return MODE == "live" and os.path.exists(ROTATE_ARM_FILE)
 
 
 def _killed() -> bool:
@@ -399,6 +446,131 @@ async def _resolve_product_id(client, asset: str = "USDT",
     return best["productId"]
 
 
+async def _conversion_cost_pct(client, source: str, target: str):
+    """Measured round-trip cost of converting source->target, or None.
+
+    Returns (symbol, side, cost_pct). Cost is read from the live book and the
+    live fee schedule every time. A rotation that assumed its own cost would
+    keep trading after Binance ended the zero-fee promotion that justified it.
+    """
+    for symbol, side in ((f"{target}{source}", "BUY"), (f"{source}{target}", "SELL")):
+        try:
+            t = await _retry(client.get_orderbook_ticker, symbol=symbol)
+            bid, ask = float(t["bidPrice"]), float(t["askPrice"])
+            if bid <= 0 or ask <= 0:
+                continue
+            spread_pct = 100.0 * (ask - bid) / ((ask + bid) / 2)
+        except Exception:
+            continue
+        fee_pct = 0.1                       # standard taker until told otherwise
+        try:
+            fees = await _retry(client.get_trade_fee, symbol=symbol)
+            row = (fees or [{}])[0] if isinstance(fees, list) else {}
+            fee_pct = float(row.get("takerCommission", 0.001)) * 100.0
+        except Exception:
+            pass
+        # Cross the spread once now; assume we cross it again to come back.
+        return symbol, side, spread_pct + fee_pct
+    return None
+
+
+async def _rotate_stablecoin(client, state, source: str, target: str,
+                             amount: float, edge: float) -> bool:
+    """Move the core from one stablecoin earn product to a better-paying one.
+
+    THE ONLY REDEEM IN THIS OBJECTIVE. Every gate below must pass, and the
+    destination is restricted to STABLE_ASSETS, so the worst case is holding a
+    different dollar-pegged token — never a directional position, and never a
+    transfer that could fund the satellite.
+
+    Failure is designed to be self-healing rather than atomic: if the redeem
+    lands but the conversion does not, the money sits in spot and the very next
+    cycle sweeps it straight back into earn. `rotation_in_flight` records the
+    attempt first, so an interrupted rotation is visible rather than silent.
+    """
+    if not _rotate_armed():
+        return False
+    if state.get("position"):
+        return False                        # satellite open: do not touch balances
+    if amount < ROTATE_MIN_USD or edge < ROTATE_MIN_EDGE:
+        return False
+    last = float(state.get("last_rotation_ts", 0.0) or 0.0)
+    if last and (time.time() - last) < ROTATE_COOLDOWN_H * 3600:
+        return False
+
+    cost = await _conversion_cost_pct(client, source, target)
+    if cost is None:
+        print(f"  [ROTATE-ABORT] no tradable pair between {source} and {target}")
+        return False
+    symbol, side, cost_pct = cost
+    if cost_pct > ROTATE_MAX_COST_PCT:
+        print(f"  [ROTATE-ABORT] {symbol} round trip costs {cost_pct:.4f}% "
+              f"(cap {ROTATE_MAX_COST_PCT}%) — not worth {edge*100:.2f}pp of rate")
+        return False
+    payback_d = 365.0 * (cost_pct / 100.0) / edge if edge > 0 else 9e9
+    print(f"  [ROTATE] {source}->{target} ${amount:,.2f}: +{edge*100:.2f}pp "
+          f"(+${amount*edge:,.2f}/yr), cost {cost_pct:.4f}% via {symbol} {side}, "
+          f"pays back in {payback_d:.1f}d")
+
+    src_product = await _resolve_product_id(client, source, amount)
+    if not src_product:
+        print(f"  [ROTATE-ABORT] cannot resolve {source} earn product")
+        return False
+
+    state["rotation_in_flight"] = {"ts": time.time(), "from": source,
+                                   "to": target, "amount": amount}
+    _save(STATE, state)
+    try:
+        await _retry(client.redeem_simple_earn_flexible_product,
+                     productId=src_product, amount=str(round(amount, 8)))
+        # Redemption credits spot asynchronously; poll rather than assume.
+        got = 0.0
+        for _ in range(10):
+            await asyncio.sleep(3)
+            got = await _asset_free(client, source) or 0.0
+            if got >= amount * 0.99:
+                break
+        if got < min(amount * 0.99, ROTATE_MIN_USD):
+            print(f"  [ROTATE-HALT] redeemed but only ${got:,.2f} {source} visible "
+                  f"in spot — stopping; the sweep returns it to earn next cycle")
+            return False
+
+        spend = min(got, amount)
+        if side == "BUY":
+            # quoteOrderQty spends an exact amount of the QUOTE asset, which
+            # sidesteps lot-step rounding on the base entirely.
+            await _retry(client.order_market_buy, symbol=symbol,
+                         quoteOrderQty=str(round(spend, 2)))
+        else:
+            step, _minn, _tick = await _symbol_filters(client, symbol)
+            qty = _round_step(spend, step)
+            if qty <= 0:
+                print(f"  [ROTATE-HALT] {spend} {source} rounds to zero at step {step}")
+                return False
+            await _retry(client.order_market_sell, symbol=symbol, quantity=qty)
+
+        tgt_free = await _asset_free(client, target) or 0.0
+        tgt_product = await _resolve_product_id(client, target, tgt_free)
+        if tgt_product and tgt_free > 0:
+            await _retry(client.subscribe_simple_earn_flexible_product,
+                         productId=tgt_product, amount=str(round(tgt_free, 8)))
+        print(f"  [ROTATE] ✅ {source}->{target} complete: {tgt_free:,.4f} {target} "
+              f"subscribed at the better rate")
+        state["last_rotation_ts"] = time.time()
+        _log_trade({"ts": datetime.now(timezone.utc).isoformat(),
+                    "kind": "stable_rotation", "from": source, "to": target,
+                    "amount": amount, "edge_apr": edge, "cost_pct": cost_pct,
+                    "symbol": symbol, "mode": MODE})
+        return True
+    except Exception as e:
+        print(f"  [ROTATE-FAIL] {source}->{target}: {str(e)[:110]} — "
+              f"any redeemed cash is re-swept into earn next cycle")
+        return False
+    finally:
+        state.pop("rotation_in_flight", None)
+        _save(STATE, state)
+
+
 async def _scan_stablecoins(client, held_asset: str, amount: float) -> dict | None:
     """Compare effective tier-aware rates across stablecoins for OUR balance.
 
@@ -432,10 +604,13 @@ async def _scan_stablecoins(client, held_asset: str, amount: float) -> dict | No
     if (current is not None and best["asset"] != held_asset.upper()
             and best["apr"] - current >= STABLE_EDGE_MIN):
         gain = amount * (best["apr"] - current)
+        state_note = ("rotation ARMED — will act if it clears the edge, size and "
+                      "cooldown gates" if _rotate_armed() else
+                      f"rotation DISARMED — create {ROTATE_ARM_FILE} (and run "
+                      f"MODE=live) to let the machine act on this")
         print(f"  [STABLE-BETTER] {best['asset']} pays {best['apr']*100:.2f}% vs "
               f"{held_asset} {current*100:.2f}% on ${amount:,.2f} "
-              f"— +${gain:,.2f}/yr if converted. Not done automatically: "
-              f"rotating needs a redeem + conversion this objective never performs.")
+              f"— +${gain:,.2f}/yr if converted. {state_note}.")
     return best
 
 
@@ -1108,10 +1283,16 @@ async def run():
 # ═════════════════════════════════════════════════════════════════════════════
 # OBJECTIVE "allocate" — deploy, compound, and account honestly.
 #
-# No speculation. Money flows spot -> earn ONLY; `redeem_simple_earn_flexible_
-# product` is never called here at all, so the wall is absolute rather than
-# merely enforced. Positive-EV by construction: it captures yield on cash that
+# No speculation. Positive-EV by construction: it captures yield on cash that
 # would otherwise sit at 0%, and scales linearly with capital.
+#
+# Money flows spot -> earn, with ONE exception added 2026-09-04:
+# `_rotate_stablecoin` redeems in order to move the core between STABLECOIN
+# earn products when one pays materially better. It is disarmed by default and
+# gated on MODE=live plus its own arm file. See THE ROTATION EXCEPTION in the
+# module docstring for the full condition list — the wall is now a set of
+# conditions rather than an impossibility, and that is worth knowing before
+# trusting this loop with more capital.
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def _nav_snapshot(client) -> dict:
@@ -1232,7 +1413,10 @@ async def _sweep_assets_to_earn(client, state) -> dict:
     swept: dict[str, float] = {}
     if state.get("position"):
         return swept                       # satellite open: leave balances alone
-    for asset in EARN_ASSETS:
+    # STABLE_ASSETS are included so a rotation interrupted between its
+    # conversion and its subscription cannot strand cash at 0%: whatever
+    # stablecoin is sitting loose in spot gets subscribed on the next cycle.
+    for asset in dict.fromkeys(EARN_ASSETS + STABLE_ASSETS):
         if asset == "USDT":
             continue                       # handled by _sweep_idle_to_earn
         free = await _asset_free(client, asset)
@@ -1341,7 +1525,8 @@ async def run_allocate():
     print(f"[alloc] start — OBJECTIVE=allocate MODE={MODE} "
           f"{'🟢 LIVE (real earn subscriptions)' if _is_live() else '📝 simulated (no money moves)'}")
     print("[alloc] job — deploy idle cash into yield, detect contributions, record honest NAV")
-    print("[alloc] NO speculative trades. Money flows spot -> earn ONLY; redeem is never called.")
+    print("[alloc] NO speculative trades. Money flows spot -> earn; the only redeem is "
+          f"stablecoin rotation, which is {'🟢 ARMED' if _rotate_armed() else 'DISARMED'}.")
     try:
         # Resolve against the real USDT balance so tiered rates are compared on
         # what we actually hold, not on a headline for a hypothetical size.
@@ -1398,7 +1583,16 @@ async def _allocate_cycle(client, state):
     # so snapshotting after would undercount.
     swept_assets = await _sweep_assets_to_earn(client, state)
     if snap is not None:
-        await _scan_stablecoins(client, "USDT", snap.get("earn_usdt", 0.0))
+        best = await _scan_stablecoins(client, "USDT", snap.get("earn_usdt", 0.0))
+        # Rotation is disarmed by default and returns False immediately unless
+        # MODE=live AND the arm file exists, so this is a no-op for anyone who
+        # has not explicitly opted in.
+        if best and best["asset"] != "USDT":
+            held = snap.get("earn_usdt", 0.0)
+            products = await _earn_products(client, "USDT", held)
+            cur_apr = products[0]["apr"] if products else 0.0
+            await _rotate_stablecoin(client, state, "USDT", best["asset"],
+                                     held, best["apr"] - cur_apr)
     if swept_assets:
         print("  [SWEEP] non-USDT subscribed: "
               + ", ".join(f"{q:.8f} {a}" for a, q in swept_assets.items()))
