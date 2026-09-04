@@ -220,7 +220,7 @@ def _rotate_armed() -> bool:
     different decision from someone allowing the core to move between stablecoin
     issuers. One arm file for both would silently couple them.
     """
-    return MODE == "live" and os.path.exists(ROTATE_ARM_FILE)
+    return MODE in ("live", "dryrun") and os.path.exists(ROTATE_ARM_FILE)
 
 
 def _killed() -> bool:
@@ -515,6 +515,26 @@ async def _rotate_stablecoin(client, state, source: str, target: str,
     src_product = await _resolve_product_id(client, source, amount)
     if not src_product:
         print(f"  [ROTATE-ABORT] cannot resolve {source} earn product")
+        return False
+
+    if not _is_live():
+        # DRYRUN. Money movement must be provable before it is performed: this
+        # prints the exact three calls, with the exact arguments, that the live
+        # path would send. Without it the first execution of this sequence would
+        # be against real capital, which is not an acceptable first test.
+        print(f"  [ROTATE-DRYRUN] would send, in order:")
+        print(f"    1. redeem_simple_earn_flexible_product("
+              f"productId={src_product!r}, amount={str(round(amount, 8))!r})")
+        if side == "BUY":
+            print(f"    2. order_market_buy(symbol={symbol!r}, "
+                  f"quoteOrderQty={str(round(amount, 2))!r})")
+        else:
+            step, _mn, _tk = await _symbol_filters(client, symbol)
+            print(f"    2. order_market_sell(symbol={symbol!r}, "
+                  f"quantity={_round_step(amount, step)})")
+        print(f"    3. subscribe_simple_earn_flexible_product(productId=<best "
+              f"{target} product>, amount=<{target} received>)")
+        print(f"  [ROTATE-DRYRUN] nothing sent (MODE={MODE})")
         return False
 
     state["rotation_in_flight"] = {"ts": time.time(), "from": source,
@@ -1305,6 +1325,26 @@ async def _nav_snapshot(client) -> dict:
     if earn_positions is None:
         return None          # earn is the bulk of NAV; never record it as 0
     earn = earn_positions.get("USDT", 0.0)
+
+    # EVERY stablecoin counts, in spot AND in earn — not just USDT.
+    # `_rotate_stablecoin` can move the entire core into USDC, and a NAV that
+    # only knew about USDT would have booked that as a total loss of the core
+    # the instant the rotation succeeded. This is the same failure the earn-
+    # aware fix closed for BTC; it had to be closed for the rotation target too.
+    # Stablecoins are valued 1:1 with USD. That is an approximation (USDC traded
+    # 0.99995 when this was written) and it is taken deliberately: pricing each
+    # one costs an API call per cycle to move the NAV by under a cent, and a
+    # failed price lookup would be a worse outcome than the rounding.
+    stables, spot_stable, earn_stable = {}, 0.0, 0.0
+    for asset in STABLE_ASSETS:
+        s_qty = (await _asset_free(client, asset)) or 0.0 if asset != "USDT" else spot
+        e_qty = earn_positions.get(asset, 0.0)
+        if not s_qty and not e_qty:
+            continue
+        stables[asset] = {"spot": round(s_qty, 8), "earn": round(e_qty, 8)}
+        spot_stable += s_qty
+        earn_stable += e_qty
+
     holdings, hold_usd = {}, 0.0
     for asset in NAV_ASSETS:
         spot_qty = await _asset_qty(client, asset)
@@ -1324,9 +1364,14 @@ async def _nav_snapshot(client) -> dict:
         holdings[asset] = {"qty": qty, "price": px, "usd": round(qty * px, 4),
                            "in_earn": round(earn_qty, 8)}
         hold_usd += qty * px
+    # spot_usdt / earn_usdt stay USDT-only so the existing equity curve keeps
+    # meaning what it always meant; the *_stable_usd fields are what NAV uses.
     return {"spot_usdt": round(spot, 4), "earn_usdt": round(earn, 4),
+            "spot_stable_usd": round(spot_stable, 4),
+            "earn_stable_usd": round(earn_stable, 4),
+            "stables": stables,
             "holdings_usd": round(hold_usd, 4), "holdings": holdings,
-            "nav": round(spot + earn + hold_usd, 4)}
+            "nav": round(spot_stable + earn_stable + hold_usd, 4)}
 
 
 async def _detect_contributions(client, state) -> float:
@@ -1583,16 +1628,24 @@ async def _allocate_cycle(client, state):
     # so snapshotting after would undercount.
     swept_assets = await _sweep_assets_to_earn(client, state)
     if snap is not None:
-        best = await _scan_stablecoins(client, "USDT", snap.get("earn_usdt", 0.0))
-        # Rotation is disarmed by default and returns False immediately unless
-        # MODE=live AND the arm file exists, so this is a no-op for anyone who
-        # has not explicitly opted in.
-        if best and best["asset"] != "USDT":
-            held = snap.get("earn_usdt", 0.0)
-            products = await _earn_products(client, "USDT", held)
-            cur_apr = products[0]["apr"] if products else 0.0
-            await _rotate_stablecoin(client, state, "USDT", best["asset"],
-                                     held, best["apr"] - cur_apr)
+        # Which stablecoin the core ACTUALLY sits in — not hardcoded USDT.
+        # After a rotation the core is USDC, and asking "should USDT move?"
+        # would read a zero balance and conclude there was nothing to do,
+        # silently stranding the core wherever the last rotation left it.
+        in_earn = {a: v["earn"] for a, v in (snap.get("stables") or {}).items()
+                   if v["earn"] > 0}
+        if in_earn:
+            held_asset = max(in_earn, key=in_earn.get)
+            held = in_earn[held_asset]
+            best = await _scan_stablecoins(client, held_asset, held)
+            # Rotation is disarmed by default and returns False immediately
+            # unless armed, so this is a no-op for anyone who has not opted in.
+            if best and best["asset"] != held_asset:
+                products = await _earn_products(client, held_asset, held)
+                cur_apr = products[0]["apr"] if products else 0.0
+                await _rotate_stablecoin(client, state, held_asset,
+                                         best["asset"], held,
+                                         best["apr"] - cur_apr)
     if swept_assets:
         print("  [SWEEP] non-USDT subscribed: "
               + ", ".join(f"{q:.8f} {a}" for a, q in swept_assets.items()))
