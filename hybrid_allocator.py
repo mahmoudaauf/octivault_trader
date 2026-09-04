@@ -67,6 +67,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -284,8 +285,57 @@ async def _symbol_filters(client, symbol: str) -> tuple[float, float, float]:
 
 
 # ── Earn (core) helpers — READ + one-directional writes ──────────────────────
-async def _earn_products(client, asset: str) -> list[dict]:
-    """All subscribable flexible products for an asset, best APR first.
+def _parse_tiers(row: dict) -> list[tuple[float, float, float]]:
+    """Binance's balance-tier rates as sorted [(lo, hi, apr)].
+
+    The payload keys look like "0-500USDT" / "500-1000USDT". A tier that cannot
+    be parsed is dropped rather than guessed at: a wrong bound silently
+    misprices every rate comparison that follows.
+    """
+    tiers = []
+    for k, v in (row.get("tierAnnualPercentageRate") or {}).items():
+        m = re.match(r"^\s*([\d.]+)\s*-\s*([\d.]+)", str(k))
+        if not m:
+            continue
+        try:
+            tiers.append((float(m.group(1)), float(m.group(2)), float(v)))
+        except (TypeError, ValueError):
+            continue
+    return sorted(tiers)
+
+
+def _effective_apr(base_apr: float, tiers: list, amount: float) -> float:
+    """Blended APR actually earned on `amount`, applying balance tiers.
+
+    THIS IS NOT THE HEADLINE RATE. Binance pays a bonus rate on a first slice of
+    the balance and the base rate above it: USDT flexible advertises
+    latestAnnualPercentageRate ~2.94% while paying 4.00% on the first 500 USDT.
+    Ranking products by the headline field therefore both understates what a
+    small balance earns and can pick the WRONG product — one with a better
+    headline but no bonus tier. For a sub-500 USDT account the tier IS the rate.
+
+    Falls back to the base rate when there are no tiers or the amount is unknown.
+    """
+    if amount <= 0 or not tiers:
+        return base_apr
+    weighted = covered = 0.0
+    for lo, hi, apr in tiers:
+        if amount <= lo:
+            break
+        portion = min(amount, hi) - lo
+        if portion > 0:
+            weighted += portion * apr
+            covered += portion
+    if covered < amount:                      # remainder earns the base rate
+        weighted += (amount - covered) * base_apr
+    return weighted / amount if amount else base_apr
+
+
+async def _earn_products(client, asset: str, amount: float = 0.0) -> list[dict]:
+    """Subscribable flexible products for an asset, best EFFECTIVE APR first.
+
+    `amount` is the balance the rate would be earned on, so tiered products are
+    ranked by what they would actually pay us rather than by their headline.
 
     Returns [] rather than raising: a product-list outage must degrade to "keep
     using the product we already resolved", never to a crash in the daemon loop.
@@ -303,31 +353,40 @@ async def _earn_products(client, asset: str) -> list[dict]:
         if p.get("canPurchase") is False or str(p.get("status", "PURCHASING")).upper() == "END":
             continue
         try:
-            apr = float(p.get("latestAnnualPercentageRate", 0.0) or 0.0)
+            base = float(p.get("latestAnnualPercentageRate", 0.0) or 0.0)
         except (TypeError, ValueError):
-            apr = 0.0
-        out.append({"productId": p.get("productId"), "asset": asset.upper(), "apr": apr,
+            base = 0.0
+        tiers = _parse_tiers(p)
+        out.append({"productId": p.get("productId"), "asset": asset.upper(),
+                    "apr": _effective_apr(base, tiers, amount),
+                    "base_apr": base, "tiers": tiers,
                     "min": float(p.get("minPurchaseAmount", 0.0) or 0.0)})
     return sorted(out, key=lambda r: -r["apr"])
 
 
-async def _resolve_product_id(client, asset: str = "USDT") -> str | None:
-    """Best-APR flexible product id for an asset.
+async def _resolve_product_id(client, asset: str = "USDT",
+                             amount: float = 0.0) -> str | None:
+    """Best-EFFECTIVE-APR flexible product id for an asset.
 
     Was "first product returned", which quietly pinned the core to whatever
-    Binance happened to list first and ignored better promotional terms. Picking
-    by rate is the whole point of the scan and costs nothing.
+    Binance happened to list first and ignored better promotional terms. Then it
+    ranked on the headline rate, which understates a small balance: the tier
+    bonus is the real rate below 500 USDT. Ranking on the effective rate for the
+    amount we actually hold is the only comparison that means anything.
     """
-    products = await _earn_products(client, asset)
+    products = await _earn_products(client, asset, amount)
     if not products:
         return None
     best = products[0]
-    if RATE_SCAN and len(products) > 1:
-        others = ", ".join(f"{p['apr']*100:.2f}%" for p in products[1:4])
+    if RATE_SCAN:
+        tier_note = ""
+        if best["tiers"] and abs(best["apr"] - best["base_apr"]) > 1e-9:
+            tier_note = (f" [tier bonus: headline is {best['base_apr']*100:.2f}%, "
+                         f"you earn {best['apr']*100:.2f}% on ${amount:,.2f}]")
+        others = (" ; also offered "
+                  + ", ".join(f"{p['apr']*100:.2f}%" for p in products[1:4])) if len(products) > 1 else " (only product)"
         print(f"  [RATE-SCAN] {asset}: using {best['apr']*100:.2f}% APR "
-              f"(product {best['productId']}); also offered {others}")
-    elif RATE_SCAN:
-        print(f"  [RATE-SCAN] {asset}: {best['apr']*100:.2f}% APR (only product)")
+              f"(product {best['productId']}){others}{tier_note}")
     return best["productId"]
 
 
@@ -1130,7 +1189,7 @@ async def _sweep_assets_to_earn(client, state) -> dict:
         free = await _asset_free(client, asset)
         if not free:
             continue
-        products = await _earn_products(client, asset)
+        products = await _earn_products(client, asset, free)
         if not products:
             continue
         best = products[0]
@@ -1235,7 +1294,10 @@ async def run_allocate():
     print("[alloc] job — deploy idle cash into yield, detect contributions, record honest NAV")
     print("[alloc] NO speculative trades. Money flows spot -> earn ONLY; redeem is never called.")
     try:
-        _EARN_PRODUCT_ID = await _resolve_product_id(client)
+        # Resolve against the real USDT balance so tiered rates are compared on
+        # what we actually hold, not on a headline for a hypothetical size.
+        _held = await _earn_usdt(client)
+        _EARN_PRODUCT_ID = await _resolve_product_id(client, "USDT", _held or 0.0)
         while True:
             if _killed():
                 print("[alloc] kill-switch present — idling (no money moves)")
