@@ -105,6 +105,11 @@ MAX_HOLD_H = float(os.getenv("HYBRID_MAX_HOLD_H", "48"))
 FEE_RT_PCT = float(os.getenv("HYBRID_FEE_RT_PCT", "0.2"))  # round-trip spot taker
 COOLDOWN_H = float(os.getenv("HYBRID_COOLDOWN_H", "1"))
 POLL_MIN = float(os.getenv("HYBRID_POLL_MIN", "15"))
+# Hard ceiling on ONE allocate cycle. A healthy cycle is a few seconds; this is
+# not a performance tuning knob but a hang-breaker. Deliberately well under the
+# supervisor's 25m stall watchdog so the daemon recovers itself in-process and
+# the watchdog stays a last resort. See the BOUNDED CYCLE note in run_allocate.
+CYCLE_TIMEOUT_S = float(os.getenv("HYBRID_CYCLE_TIMEOUT_S", "300"))
 
 _INTERVAL_HOURS = {"5m": 5 / 60, "15m": 0.25, "30m": 0.5, "1h": 1.0, "2h": 2.0, "4h": 4.0, "1d": 24.0}
 
@@ -1232,45 +1237,68 @@ async def run_allocate():
     try:
         _EARN_PRODUCT_ID = await _resolve_product_id(client)
         while True:
-            await _resync_clock(client)
             if _killed():
                 print("[alloc] kill-switch present — idling (no money moves)")
                 await asyncio.sleep(POLL_MIN * 60)
                 continue
             try:
-                contributed = await _detect_contributions(client, state)
-                # Measure BEFORE sweeping. A spot->earn subscription debits spot
-                # immediately but the earn position updates with a lag, so a
-                # snapshot taken straight after a sweep undercounts NAV by the
-                # in-flight amount. Anchoring the baseline on that would have
-                # manufactured ~$9.60 of phantom "growth" on the next cycle.
-                # Moving money between your own wallets never changes NAV, so
-                # measuring first is both correct and always consistent.
-                snap = await _nav_snapshot(client)
-                swept = await _sweep_idle_to_earn(client, state)
-                # Non-USDT holdings (BTC) into their own flexible products. Same
-                # measure-before-sweep ordering as above, and for the same
-                # reason: a subscription debits the balance immediately while
-                # the earn position lags, so snapshotting after would undercount.
-                swept_assets = await _sweep_assets_to_earn(client, state)
-                if swept_assets:
-                    print(f"  [SWEEP] non-USDT subscribed: "
-                          + ", ".join(f"{q:.8f} {a}" for a, q in swept_assets.items()))
-                if snap is None:
-                    print(f"[alloc {datetime.now(timezone.utc):%H:%M}] NAV unreadable "
-                          f"— skipping this cycle (not recording a false zero)")
-                else:
-                    row = _record_nav(state, snap, contributed, swept)
-                    print(f"[alloc {datetime.now(timezone.utc):%H:%M}] nav=${snap['nav']:.2f} "
-                          f"earn=${snap['earn_usdt']:.2f} spot=${snap['spot_usdt']:.2f} "
-                          f"hold=${snap['holdings_usd']:.2f} contrib=${row['cumulative_contributions']:.2f} "
-                          f"growth=${row['growth']:+.2f}")
-                _save(STATE, state)
+                # BOUNDED CYCLE. Nothing in here had a timeout, so a single
+                # stuck HTTP call hung the whole daemon until the supervisor's
+                # 25-minute stall watchdog killed it — five times between
+                # 2026-08-25 and 2026-09-04. aiohttp's own default only bounds
+                # ONE request (300s), and a cycle makes a dozen of them behind a
+                # 3x retry wrapper, so the ceiling was effectively unbounded.
+                # Abandoning a slow cycle is always safe here: every value is
+                # re-read from the exchange next cycle, nothing is carried over,
+                # and the sweep re-derives free balance from scratch. This makes
+                # the watchdog a true last resort instead of the primary
+                # recovery path — the daemon now heals itself in-process.
+                await asyncio.wait_for(_allocate_cycle(client, state),
+                                       timeout=CYCLE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                print(f"  [ALLOC-TIMEOUT] cycle exceeded {CYCLE_TIMEOUT_S:.0f}s — "
+                      f"abandoned; retrying next cycle (no state written)")
             except Exception as e:
                 print(f"  [ALLOC-ERROR] {str(e)[:100]}")
             await asyncio.sleep(POLL_MIN * 60)
     finally:
         await client.close_connection()
+
+
+async def _allocate_cycle(client, state):
+    """One allocate cycle. Extracted so the caller can bound it with wait_for.
+
+    Every step re-reads from the exchange, so abandoning this mid-flight loses
+    nothing: the next cycle starts from the exchange's truth, not from memory.
+    """
+    await _resync_clock(client)
+    contributed = await _detect_contributions(client, state)
+    # Measure BEFORE sweeping. A spot->earn subscription debits spot immediately
+    # but the earn position updates with a lag, so a snapshot taken straight
+    # after a sweep undercounts NAV by the in-flight amount. Anchoring the
+    # baseline on that would have manufactured ~$9.60 of phantom "growth" on the
+    # next cycle. Moving money between your own wallets never changes NAV, so
+    # measuring first is both correct and always consistent.
+    snap = await _nav_snapshot(client)
+    swept = await _sweep_idle_to_earn(client, state)
+    # Non-USDT holdings (BTC) into their own flexible products. Same
+    # measure-before-sweep ordering as above, and for the same reason: a
+    # subscription debits the balance immediately while the earn position lags,
+    # so snapshotting after would undercount.
+    swept_assets = await _sweep_assets_to_earn(client, state)
+    if swept_assets:
+        print("  [SWEEP] non-USDT subscribed: "
+              + ", ".join(f"{q:.8f} {a}" for a, q in swept_assets.items()))
+    if snap is None:
+        print(f"[alloc {datetime.now(timezone.utc):%H:%M}] NAV unreadable "
+              f"— skipping this cycle (not recording a false zero)")
+    else:
+        row = _record_nav(state, snap, contributed, swept)
+        print(f"[alloc {datetime.now(timezone.utc):%H:%M}] nav=${snap['nav']:.2f} "
+              f"earn=${snap['earn_usdt']:.2f} spot=${snap['spot_usdt']:.2f} "
+              f"hold=${snap['holdings_usd']:.2f} contrib=${row['cumulative_contributions']:.2f} "
+              f"growth=${row['growth']:+.2f}")
+    _save(STATE, state)
 
 
 if __name__ == "__main__":
