@@ -112,7 +112,10 @@ _DEFAULT_WATCH = "SOLUSDT,AVAXUSDT,LINKUSDT,DOGEUSDT,ADAUSDT,SUIUSDT,APTUSDT,ARB
 # live in the same spot wallet. Without this, `_reconcile`'s stray-holding
 # adoption would grab the BTC hold and put a -2% stop on a position meant to be
 # held for years. Filtered out of the watchlist, so it guards entry AND adoption.
-PROTECTED_ASSETS = {s.strip().upper() for s in os.getenv("HYBRID_PROTECTED_ASSETS", "BTC").split(",") if s.strip()}
+# PAXG added 2026-09-05: the gold position is a deliberate long-term hold, and
+# without this the satellite's stray-holding adoption would treat it as an
+# untracked position and put a -2% stop on money meant to be held for years.
+PROTECTED_ASSETS = {s.strip().upper() for s in os.getenv("HYBRID_PROTECTED_ASSETS", "BTC,PAXG").split(",") if s.strip()}
 WATCHLIST = [s.strip().upper() for s in os.getenv("HYBRID_WATCHLIST", _DEFAULT_WATCH).split(",") if s.strip()]
 WATCHLIST = [s for s in WATCHLIST if s[:-4] not in PROTECTED_ASSETS]
 INTERVAL = os.getenv("HYBRID_INTERVAL", "1h")
@@ -200,7 +203,14 @@ ROTATE_MAX_COST_PCT = float(os.getenv("HYBRID_ROTATE_MAX_COST_PCT", "0.05"))
 # captured over time without ever unwinding a position. A knob here that did
 # nothing would be worse than no knob at all.
 NAV_ASSETS = [a.strip().upper() for a in
-              os.getenv("HYBRID_NAV_ASSETS", "BTC,BNB,AVAX,SOL,LINK,INJ,NEAR,ADA,SUI,APT,ARB,DOGE").split(",") if a.strip()]
+              os.getenv("HYBRID_NAV_ASSETS",
+                        # PAXG first: from 2026-09-05 part of the capital is held
+                        # as allocated physical gold for growth, alongside the
+                        # stablecoin yield core. It is a long-term hold and must
+                        # be counted in NAV or the split would read as a loss —
+                        # the same failure already fixed for earn and for the
+                        # wallet transfer.
+                        "PAXG,BTC,BNB,AVAX,SOL,LINK,INJ,NEAR,ADA,SUI,APT,ARB,DOGE").split(",") if a.strip()]
 API_RETRIES = int(os.getenv("HYBRID_API_RETRIES", "3"))          # G5
 API_RETRY_DELAY_S = float(os.getenv("HYBRID_API_RETRY_DELAY_S", "2.0"))
 
