@@ -82,9 +82,13 @@ def _req(base: str, path: str, method: str = "GET", params: dict | None = None,
         q += "&signature=" + hmac.new(SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
     url = f"{base}{path}" + (f"?{q}" if method == "GET" else "")
     data = q.encode() if method != "GET" else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"X-MBX-APIKEY": KEY,
-                                          "Content-Type": "application/x-www-form-urlencoded"})
+    # Content-Type must be omitted on GET: the options API rejects the request
+    # outright if it is present ("Content type in request header should not be
+    # set for GET method"), unlike the spot API which ignores it.
+    headers = {"X-MBX-APIKEY": KEY}
+    if method != "GET":
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             body = r.read().decode()
@@ -103,19 +107,34 @@ def _book(rec: dict) -> None:
         f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "kind": "option_bet", **rec}) + "\n")
 
 
-def main(execute: bool) -> int:
+def main(execute: bool, fund_only: bool = False) -> int:
     print("=" * 70)
-    print("RING-FENCED CALL BET — " + ("EXECUTING" if execute else "DRY RUN (nothing sent)"))
+    mode = "FUND-ONLY" if fund_only else "RING-FENCED CALL BET"
+    print(f"{mode} — " + ("EXECUTING" if execute else "DRY RUN (nothing sent)"))
     print("=" * 70)
 
     # Gate 1: the key must be allowed to trade options. Checked, not assumed.
+    #
+    # FUND-ONLY exists because this account can trade options on the WEB but not
+    # over the API: neither API key offers an "Enable European Options"
+    # checkbox, so Binance gates options API access separately and no setting on
+    # our side opens it. In that mode we sell the BTC and move exactly the
+    # proceeds into the Options wallet, and the operator clicks Buy by hand.
+    # That is a STRONGER ring-fence than the software one: the Options wallet
+    # then physically cannot hold more than the BTC money, so no mistyped
+    # amount can reach the earn core sitting in a different wallet.
     perms = _req(SPOT, "/sapi/v1/account/apiRestrictions", signed=True)
     if not perms.get("enableVanillaOptions"):
-        print("  ❌ enableVanillaOptions is FALSE on this API key.")
-        print("     Activate Options in the Binance app, then edit the key and tick")
-        print("     'Enable European Options'. This script cannot do that for you.")
-        return 2
-    print("  ✅ key permits options trading")
+        if not fund_only:
+            print("  ❌ enableVanillaOptions is FALSE on this API key.")
+            print("     Activate Options in the Binance app, then edit the key and tick")
+            print("     'Enable European Options'. This script cannot do that for you.")
+            print("     If that checkbox does not exist, re-run with --fund-only.")
+            return 2
+        print("  ⓘ  options API trading unavailable on this key — funding only,")
+        print("     the buy is placed by hand on the web ticket.")
+    else:
+        print("  ✅ key permits options trading")
 
     # What we are selling: the idle BTC hold, and only its FREE balance.
     bal = _req(SPOT, "/api/v3/account", signed=True)
@@ -154,12 +173,23 @@ def main(execute: bool) -> int:
     print(f"  1. sold {qty} BTC -> ${got:.2f} USDT")
     _book({"step": "sell_btc", "qty": qty, "usdt": got})
 
-    # 2. Move exactly the premium to the options wallet.
-    amt = f"{min(cost * 1.02, got):.2f}"           # 2% headroom for fee, capped
+    # 2. Move the BTC proceeds to the options wallet.
+    #    In fund-only mode we move ALL of them, so the wallet balance itself is
+    #    the spend limit for the manual buy. In API mode, only the premium.
+    amt = f"{got - 0.01:.2f}" if fund_only else f"{min(cost * 1.02, got):.2f}"
     _req(SPOT, "/sapi/v1/asset/transfer", "POST", signed=True,
          params={"type": "MAIN_OPTION", "asset": "USDT", "amount": amt})
     print(f"  2. transferred ${amt} USDT spot -> options wallet")
-    _book({"step": "transfer", "usdt": float(amt)})
+    _book({"step": "transfer", "usdt": float(amt), "fund_only": fund_only})
+
+    if fund_only:
+        print(f"\n  ✅ Options wallet funded with ${amt}. The core is untouched and in")
+        print("     a different wallet, so this is now a hard spending limit.")
+        print("\n  YOUR CLICK, on the ticket you already have open:")
+        print(f"     expiry 2026-11-27   strike 105,000   CALLS   Buy")
+        print(f"     price  {ask:.0f}   amount 0.01 Cont   -> costs ≈ ${cost:.2f}")
+        print("     Do NOT raise the amount above 0.01; the rest is fee headroom.")
+        return 0
 
     # 3. Limit buy at the ask.
     order = _req(EAPI, "/eapi/v1/order", "POST", signed=True,
@@ -174,7 +204,7 @@ def main(execute: bool) -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main(execute="--yes" in sys.argv))
+        sys.exit(main(execute="--yes" in sys.argv, fund_only="--fund-only" in sys.argv))
     except RuntimeError as e:
         print(f"  ❌ {e}")
         sys.exit(1)
