@@ -1427,6 +1427,46 @@ async def run():
 # trusting this loop with more capital.
 # ═════════════════════════════════════════════════════════════════════════════
 
+async def _other_wallets_usd(client) -> float:
+    """BTC-denominated balance of wallets this objective does NOT manage,
+    converted to USD. Zero on failure — never None, since a failed read here
+    must not block a NAV snapshot the way an unreadable core would.
+
+    Added 2026-09-05 after a real false alarm: $11.98 was parked in the OPTIONS
+    wallet for ~20 minutes, and because NAV only summed spot + earn it recorded
+    a $11.71 "loss" and an 80% NAV collapse across two cycles. Nothing had been
+    lost. Money in transit between wallets is still the account's money, and an
+    equity curve that says otherwise will eventually panic somebody.
+
+    `/sapi/v1/asset/wallet/balance` reports every wallet (Spot, Cross Margin,
+    Futures, Earn, Options, Funding) in BTC. Spot and Earn are EXCLUDED here
+    because _nav_snapshot already counts them precisely, per-asset; double
+    counting them would be worse than the gap this closes.
+    """
+    try:
+        rows = await _retry(client._request_margin_api, "get", "asset/wallet/balance", True, data={})
+    except Exception as e:
+        print(f"  [WALLETS-READ-FAIL] {str(e)[:70]} — treating other wallets as 0")
+        return 0.0
+    counted_elsewhere = {"spot", "earn"}
+    btc = 0.0
+    for r in rows or []:
+        name = str(r.get("walletName", "")).strip().lower()
+        if name in counted_elsewhere:
+            continue
+        try:
+            btc += float(r.get("balance", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    if btc <= 0:
+        return 0.0
+    try:
+        px = await _price(client, "BTCUSDT")
+    except Exception:
+        return 0.0
+    return btc * px
+
+
 async def _nav_snapshot(client) -> dict:
     """Total account value, broken down. Returns None on an unreadable balance
     so a failed read is never recorded as a NAV crash in the equity curve."""
@@ -1478,12 +1518,14 @@ async def _nav_snapshot(client) -> dict:
         hold_usd += qty * px
     # spot_usdt / earn_usdt stay USDT-only so the existing equity curve keeps
     # meaning what it always meant; the *_stable_usd fields are what NAV uses.
+    other = await _other_wallets_usd(client)
     return {"spot_usdt": round(spot, 4), "earn_usdt": round(earn, 4),
             "spot_stable_usd": round(spot_stable, 4),
             "earn_stable_usd": round(earn_stable, 4),
             "stables": stables,
+            "other_wallets_usd": round(other, 4),
             "holdings_usd": round(hold_usd, 4), "holdings": holdings,
-            "nav": round(spot_stable + earn_stable + hold_usd, 4)}
+            "nav": round(spot_stable + earn_stable + hold_usd + other, 4)}
 
 
 async def _detect_contributions(client, state) -> float:
@@ -1642,6 +1684,9 @@ def _record_nav(state, snap: dict, contributed: float, swept: float):
         "spot_stable_usd": snap.get("spot_stable_usd", snap["spot_usdt"]),
         "earn_stable_usd": snap.get("earn_stable_usd", snap["earn_usdt"]),
         "stables": snap.get("stables", {}),
+        # Money parked in a wallet this objective does not manage is still
+        # yours; recording it keeps a transfer from reading as a loss.
+        "other_wallets_usd": snap.get("other_wallets_usd", 0.0),
         "holdings_usd": snap["holdings_usd"], "holdings": snap["holdings"],
         "cumulative_contributions": round(contrib, 4),
         "contributed_this_cycle": round(contributed, 4),
