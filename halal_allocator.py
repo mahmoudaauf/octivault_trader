@@ -223,7 +223,108 @@ async def execute(client, plan: dict, cfg: dict) -> float:
     return spent
 
 
+_LP_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+async def _launchpool(client) -> dict | None:
+    """Live Launchpool listing, cached 5 minutes. None if unreadable."""
+    if time.time() - _LP_CACHE["ts"] < 300 and _LP_CACHE["data"] is not None:
+        return _LP_CACHE["data"]
+    try:
+        d = await _retry(client._request_margin_api, "get",
+                         "launchpool/project/list", True, data={})
+        _LP_CACHE.update(ts=time.time(), data=d)
+        return d
+    except Exception as e:
+        _log(f"  [LAUNCHPOOL-READ-FAIL] {str(e)[:60]}")
+        return _LP_CACHE["data"]
+
+
+async def _launchpool_alert(client, state: dict) -> None:
+    """Alert when a pool opens. It CANNOT be staked automatically.
+
+    Binance exposes the pool listing but no subscribe/stake endpoint (probed
+    2026-09-05: launchpool/subscribe and launchpool/stake both 404). The only
+    autonomous route is holding the qualifying asset in Simple Earn, which
+    auto-enrols — and that is the interest arrangement this file exists to
+    avoid. So the machine watches and tells you; you stake by hand.
+
+    Alerts once per project, tracked in state, because a pool runs for days and
+    an alert repeated every cycle is an alert nobody reads.
+    """
+    d = await _launchpool(client)
+    if not d:
+        return
+    seen = set(state.setdefault("lp_alerted", []))
+    for pr in (d.get("tracking") or []):
+        coin = str(pr.get("rebateCoin", "")).upper()
+        if not coin or coin in seen:
+            continue
+        pools = ", ".join(f"{p.get('asset')}" for p in (pr.get("projects") or []))
+        _log(f"  🔔 LAUNCHPOOL OPEN: {coin} — stake {pools} on the Binance "
+             f"Launchpool page to farm it. Cannot be automated (no stake API).")
+        _log(f"     Rewards are sold automatically once {coin} starts trading.")
+        seen.add(coin)
+        _book({"kind": "launchpool_alert", "coin": coin, "pools": pools})
+    state["lp_alerted"] = sorted(seen)
+
+
+async def _sell_rewards(client, cfg: dict, state: dict) -> float:
+    """Sell Launchpool reward tokens once they trade. THIS part is automatable.
+
+    Backtest (launchpool_backtest.py): holding the reward lost a median 12-13%
+    in week one, up in only 2 of 12 projects. So selling on listing day is the
+    edge, and the proceeds are recycled into the basket by the normal buy path.
+
+    Restricted to coins the Launchpool listing itself names, and never an asset
+    in the target basket, so it can never sell your gold or bitcoin.
+    """
+    d = await _launchpool(client)
+    if not d:
+        return 0.0
+    now_ms = time.time() * 1000
+    recent = [p for p in (d.get("completed", {}).get("list") or [])
+              if now_ms - float(p.get("mineEndTime") or 0) < 14 * 86_400_000]
+    coins = {str(p.get("rebateCoin", "")).upper()
+             for p in (d.get("tracking") or []) + recent
+             if p.get("coinTradeTime") and float(p["coinTradeTime"]) * 1000 <= now_ms}
+    coins -= set(cfg["_w"]) | {QUOTE, ""}
+    sold = 0.0
+    for coin in sorted(coins):
+        try:
+            bal = await _retry(client.get_asset_balance, asset=coin)
+            free = float((bal or {}).get("free") or 0)
+        except Exception:
+            continue
+        if not free:
+            continue
+        symbol = f"{coin}{QUOTE}"
+        try:
+            step, min_notional = await _filters(client, symbol)
+            px = float((await _retry(client.get_symbol_ticker, symbol=symbol))["price"])
+        except Exception:
+            continue
+        qty = (int(free / step)) * step if step > 0 else free
+        if qty <= 0 or qty * px < min_notional:
+            continue
+        if not _live():
+            _log(f"  [{MODE.upper()}] would SELL {qty} {coin} (~${qty*px:.2f}) reward")
+            continue
+        try:
+            await _retry(client.order_market_sell, symbol=symbol, quantity=qty)
+            sold += qty * px
+            _log(f"  [REWARD-SELL] 🟢 sold {qty} {coin} ≈ ${qty*px:.2f} -> recycled into basket")
+            _book({"kind": "reward_sell", "asset": coin, "qty": qty, "usd": round(qty*px, 4)})
+        except Exception as e:
+            _log(f"  [REWARD-SELL-FAIL] {coin}: {str(e)[:70]}")
+    return sold
+
+
 async def _cycle(client, cfg: dict, state: dict) -> None:
+    # Sell rewards BEFORE planning, so their proceeds are counted as deployable
+    # cash in this same cycle rather than idling until the next one.
+    await _sell_rewards(client, cfg, state)
+    await _launchpool_alert(client, state)
     snap = await snapshot(client, cfg)
     if snap is None:
         return

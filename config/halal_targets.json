@@ -1,9 +1,8 @@
 {
-  "_comment": "Ownership-only targets for halal_allocator.py. Weights must sum to 1.0. GOLD-LED on purpose: allocated physical gold (PAXG) is the least contested store of value in Islamic finance, while BTC/ETH permissibility is genuinely debated among scholars. To hold only the uncontested asset, set PAXG to 1.0 and the others to 0.",
+  "_comment": "Ownership-only targets for halal_allocator.py. Weights must sum to 1.0. GOLD-LED: PAXG is one troy oz of allocated physical gold at Paxos — the least contested store of value in Islamic finance, and far less volatile than crypto. BTC is included for growth; most contemporary scholars treat it as an asset rather than a debt instrument, though it is debated. ETH deliberately omitted: at this account size three assets is over-diversification and ETH adds little BTC does not. Set PAXG to 1.0 to hold only the uncontested asset.",
   "_as_of": "2026-09-05",
   "weights": {
-    "PAXG": 0.60,
-    "BTC": 0.25,
-    "ETH": 0.15
+    "PAXG": 0.70,
+    "BTC": 0.30
   }
 }
