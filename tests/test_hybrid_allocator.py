@@ -886,3 +886,70 @@ async def test_setup_defers_when_earn_unreadable(tmp_path):
     await h._setup_allocation(c, state)
     c.redeem_simple_earn_flexible_product.assert_not_called()
     assert state.get("setup_done") is not True
+
+
+# --- effective APR: the tier is a BONUS ON TOP OF the base, not a replacement --
+#
+# Verified against this account's own reward history on 2026-09-06: Binance pays
+# two streams into a flexible position, rewardsRecord type=REALTIME at the base
+# rate and type=BONUS at the tier rate, and both are credited. On $48.20 of USDT
+# they annualised to ~2.78% and 4.00% against an advertised base of 2.78% and
+# tier of 4.00%. Treating the tier as a replacement understated every tiered
+# product and moved the USDT/USDC crossover from ~$322 to ~$800.
+
+def test_tier_is_added_to_base_not_substituted(tmp_path):
+    h = _alloc(tmp_path)
+    # Wholly inside the tier: you earn base + tier on every dollar.
+    assert h._effective_apr(0.0278, [(0.0, 500.0, 0.04)], 100.0) == pytest.approx(0.0678)
+
+
+def test_effective_apr_blends_across_the_tier_boundary(tmp_path):
+    h = _alloc(tmp_path)
+    # $600 of USDT: first 500 at 2.78+4.00, last 100 at the base alone.
+    expected = (500 * 0.0678 + 100 * 0.0278) / 600
+    assert h._effective_apr(0.0278, [(0.0, 500.0, 0.04)], 600.0) == pytest.approx(expected)
+
+
+def test_usdc_usdt_crossover_sits_at_the_tier_width(tmp_path):
+    """USDC's 5% tier is only 300 wide; USDT's 4% tier is 500 wide. Below the
+    crossover USDC wins on rate, above it USDT wins on depth."""
+    h = _alloc(tmp_path)
+    usdc, usdt = [(0.0, 300.0, 0.05)], [(0.0, 500.0, 0.04)]
+    assert h._effective_apr(0.0212, usdc, 100.0) > h._effective_apr(0.0278, usdt, 100.0)
+    assert h._effective_apr(0.0212, usdc, 500.0) < h._effective_apr(0.0278, usdt, 500.0)
+
+
+def test_no_tiers_falls_back_to_base(tmp_path):
+    h = _alloc(tmp_path)
+    assert h._effective_apr(0.0212, [], 100.0) == pytest.approx(0.0212)
+
+
+# --- trusting the advertised rate only as far as the payments justify ---------
+
+def test_advertised_rate_is_used_without_contrary_evidence(tmp_path):
+    h = _alloc(tmp_path)
+    assert h._trusted_apr({}, "USDC", 0.0712) == pytest.approx(0.0712)
+
+
+def test_one_bad_day_does_not_override_the_advertised_rate(tmp_path):
+    """Rewards credit once a day and can land late. A single low reading must
+    not trigger a rotation, which costs a conversion each way."""
+    h = _alloc(tmp_path)
+    state = {"yield_observations": {"USDC": {"2026-09-05": 0.0212}}}
+    assert h._trusted_apr(state, "USDC", 0.0712) == pytest.approx(0.0712)
+
+
+def test_sustained_shortfall_reranks_at_the_observed_rate(tmp_path):
+    """The real USDC case: rotated in on an advertised 5.00% tier that then paid
+    zero bonus. After SHORTFALL_DAYS the ranking must use what actually arrived."""
+    h = _alloc(tmp_path)
+    state = {"yield_observations": {"USDC": {
+        "2026-09-04": 0.0212, "2026-09-05": 0.0207, "2026-09-06": 0.0212}}}
+    assert h._trusted_apr(state, "USDC", 0.0712) == pytest.approx(0.0212)
+
+
+def test_days_at_the_advertised_rate_do_not_count_as_shortfall(tmp_path):
+    h = _alloc(tmp_path)
+    state = {"yield_observations": {"USDT": {
+        "2026-09-04": 0.0678, "2026-09-05": 0.0212, "2026-09-06": 0.0689}}}
+    assert h._trusted_apr(state, "USDT", 0.0678) == pytest.approx(0.0678)

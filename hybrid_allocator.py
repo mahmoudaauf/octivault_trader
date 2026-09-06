@@ -351,6 +351,35 @@ async def _symbol_filters(client, symbol: str) -> tuple[float, float, float]:
 
 
 # ── Earn (core) helpers — READ + one-directional writes ──────────────────────
+SHORTFALL_DAYS = int(os.getenv("YIELD_SHORTFALL_DAYS", "3"))
+
+
+def _trusted_apr(state, asset: str, advertised: float) -> float:
+    """The advertised rate, unless we have watched it fail to arrive.
+
+    An advertised APR is a claim; the reward history is the evidence. When an
+    asset has paid under 60% of its advertised rate on SHORTFALL_DAYS separate
+    days, the ranking switches to the median of what it actually paid. Without
+    this the machine can see that it is being underpaid, print about it every
+    fifteen minutes, and still keep ranking the product on the number that is
+    not true — which is what happened with USDC: rotated in on an advertised
+    5.00% tier that then never paid a single bonus, and no part of the loop
+    could act on the discrepancy.
+
+    Requiring several DAYS (see _audit_yield) is what stops this from chasing a
+    late reward credit into a round trip of conversion fees.
+    """
+    days_seen = (state.get("yield_observations") or {}).get(asset.upper()) or {}
+    bad = sorted(v for v in days_seen.values() if v < advertised * 0.60)
+    if len(bad) < SHORTFALL_DAYS:
+        return advertised
+    median = bad[len(bad) // 2]
+    print(f"  [YIELD-DISTRUST] {asset}: advertised {advertised*100:.2f}% but paid "
+          f"under 60% of it on {len(bad)} days — ranking it at the observed "
+          f"{median*100:.2f}% instead.")
+    return median
+
+
 def _parse_tiers(row: dict) -> list[tuple[float, float, float]]:
     """Binance's balance-tier rates as sorted [(lo, hi, apr)].
 
@@ -373,12 +402,21 @@ def _parse_tiers(row: dict) -> list[tuple[float, float, float]]:
 def _effective_apr(base_apr: float, tiers: list, amount: float) -> float:
     """Blended APR actually earned on `amount`, applying balance tiers.
 
-    THIS IS NOT THE HEADLINE RATE. Binance pays a bonus rate on a first slice of
-    the balance and the base rate above it: USDT flexible advertises
-    latestAnnualPercentageRate ~2.94% while paying 4.00% on the first 500 USDT.
-    Ranking products by the headline field therefore both understates what a
-    small balance earns and can pick the WRONG product — one with a better
-    headline but no bonus tier. For a sub-500 USDT account the tier IS the rate.
+    THIS IS NOT THE HEADLINE RATE, AND THE TIER IS NOT THE RATE EITHER. The tier
+    is a BONUS PAID ON TOP OF the base rate on a first slice of the balance.
+    Verified against our own payment history on 2026-09-06: Binance pays two
+    separate streams into flexible positions, and we receive both.
+
+        rewardsRecord type=REALTIME  ->  the base rate (latestAnnualPercentageRate)
+        rewardsRecord type=BONUS     ->  the tier rate, on the tiered slice only
+
+    On $48.20 of USDT over 2026-09-01..03 those annualised to 2.75-2.89% and
+    4.00% respectively, against an advertised base of 2.78% and tier of 4.00%.
+    So the real rate on the first 500 USDT is base + tier = 6.78%, not 4.00%.
+
+    Treating the tier as a REPLACEMENT understated every tiered product and moved
+    the USDT/USDC crossover from ~$322 to ~$800, i.e. it would have kept the
+    balance in the wrong stablecoin over a $478-wide band of account sizes.
 
     Falls back to the base rate when there are no tiers or the amount is unknown.
     """
@@ -390,7 +428,8 @@ def _effective_apr(base_apr: float, tiers: list, amount: float) -> float:
             break
         portion = min(amount, hi) - lo
         if portion > 0:
-            weighted += portion * apr
+            # base + tier: the tiered slice earns BOTH streams, not just the tier.
+            weighted += portion * (base_apr + apr)
             covered += portion
     if covered < amount:                      # remainder earns the base rate
         weighted += (amount - covered) * base_apr
@@ -708,7 +747,7 @@ async def _sell_launchpool_rewards(client, state) -> float:
     return sold
 
 
-async def _scan_stablecoins(client, held_asset: str, amount: float) -> dict | None:
+async def _scan_stablecoins(client, state, held_asset: str, amount: float) -> dict | None:
     """Compare effective tier-aware rates across stablecoins for OUR balance.
 
     Read-only: it reports, it never moves anything. Rotating stablecoins needs a
@@ -733,7 +772,7 @@ async def _scan_stablecoins(client, held_asset: str, amount: float) -> dict | No
         if not products:
             continue
         p = products[0]
-        apr = p["apr"] + boost.get(asset, 0.0)
+        apr = _trusted_apr(state, asset, p["apr"]) + boost.get(asset, 0.0)
         table.append((apr, asset))
         if best is None or apr > best["apr"]:
             best = {"asset": asset, "apr": apr, "productId": p["productId"]}
@@ -754,6 +793,115 @@ async def _scan_stablecoins(client, held_asset: str, amount: float) -> dict | No
               f"{held_asset} {current*100:.2f}% on ${amount:,.2f} "
               f"— +${gain:,.2f}/yr if converted. {state_note}.")
     return best
+
+
+async def _realized_apr(client, holdings: dict, days: int = 3) -> dict:
+    """What each earn asset was ACTUALLY paid, annualised, from reward history.
+
+    WHY THIS EXISTS
+    ---------------
+    Every rate this daemon acts on is a rate Binance ADVERTISES. Nothing verified
+    that the money arrived. On 2026-09-06 a check found the account had rotated
+    $48 into USDC on the strength of a 5.00% tier and then received, over the two
+    following days, zero BONUS payments — only the 2.12% base stream. The
+    advertised rate and the paid rate had come apart, and no part of the machine
+    could see it.
+
+    So: sum the reward rows actually credited over the last `days`, divide by the
+    balance they were credited on, annualise. That is the number that matters.
+    A shortfall does not move money on its own — it prints, loudly, because the
+    honest response to "we are not being paid what we were promised" is to look,
+    not to reflexively rotate into the next advertised number and repeat.
+
+    Returns {ASSET: realized_apr}. Assets with no history are omitted rather than
+    reported as 0%: unpaid and unknown are different claims.
+
+    KNOWN LIMIT, stated because it will otherwise be rediscovered as a bug: the
+    divisor is the CURRENT balance, while the rewards were earned on whatever the
+    balance was at the time. An asset topped up mid-window reads HIGH (USDT read
+    11.99% against a true ~6.8% the first time this ran, because $12 arrived on
+    the last day of a window whose earlier rewards were earned on $0.21); one
+    partly redeemed reads LOW. The window is therefore measured from the asset's
+    FIRST reward row rather than a flat `days`, which removes the largest error —
+    a position younger than the window looking starved. The residual bias is
+    toward over-reporting after a top-up, i.e. toward silence, so this can miss a
+    shortfall but should not invent one. Treat a flag as "go look", not as proof.
+    """
+    since = int((time.time() - days * 86400) * 1000)
+    paid: dict[str, float] = {}
+    first_seen: dict[str, float] = {}
+    for kind in ("REALTIME", "BONUS"):
+        try:
+            resp = await _retry(client._request_margin_api, "get",
+                                "simple-earn/flexible/history/rewardsRecord", True,
+                                data={"type": kind, "size": 100})
+        except Exception as e:
+            print(f"  [YIELD-AUDIT-FAIL] {kind}: {str(e)[:70]} — skipping audit")
+            return {}
+        for r in (resp or {}).get("rows", []):
+            try:
+                if int(r.get("time", 0)) < since:
+                    continue
+                asset = str(r.get("asset", "")).upper()
+                ts = float(r.get("time", 0))
+                paid[asset] = paid.get(asset, 0.0) + float(r.get("rewards", 0) or 0)
+                first_seen[asset] = min(first_seen.get(asset, ts), ts)
+            except (TypeError, ValueError):
+                continue
+    out = {}
+    now_ms = time.time() * 1000
+    for asset, credited in paid.items():
+        bal = float(holdings.get(asset, 0.0) or 0.0)
+        # Annualise over the observed span, not the nominal window: a position
+        # two days old would otherwise be divided by three days and look
+        # starved by a third purely because it is new.
+        span = max((now_ms - first_seen.get(asset, now_ms)) / 86_400_000, 0.5)
+        if bal > 0:
+            out[asset] = credited / bal * 365.0 / span
+    return out
+
+
+async def _audit_yield(client, state, holdings: dict, assumed: dict) -> None:
+    """Print realized vs assumed APR, and flag a persistent shortfall.
+
+    `assumed` is {ASSET: apr} as the rate scan believes it. The gap between the
+    two columns is the only place a broken tier promotion, a silently expired
+    bonus, or a product that quietly stopped paying can show up.
+    """
+    real = await _realized_apr(client, holdings)
+    if not real:
+        return
+    parts, shortfall = [], []
+    for asset in sorted(real, key=lambda a: -real[a]):
+        want = assumed.get(asset)
+        if want:
+            parts.append(f"{asset} {real[asset]*100:.2f}% (told {want*100:.2f}%)")
+            # 60%: wide enough to absorb a partial first day and reward-timing
+            # jitter, tight enough that a missing bonus stream cannot hide.
+            if real[asset] < want * 0.60:
+                shortfall.append((asset, real[asset], want))
+        else:
+            parts.append(f"{asset} {real[asset]*100:.2f}%")
+    print("  [YIELD-AUDIT] paid over last 3d: " + ", ".join(parts))
+
+    # Record the verdict per CALENDAR DAY, not per cycle. The daemon runs ~96
+    # cycles a day; counting cycles would reach any threshold within an hour and
+    # turn a single bad reading into a rotation. Rewards are credited once a day,
+    # so a day is the smallest unit that carries new information.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    obs = state.setdefault("yield_observations", {})
+    for asset in real:
+        if assumed.get(asset):
+            obs.setdefault(asset, {})[today] = round(real[asset], 6)
+    # Keep a fortnight; enough to see a promotion end, small enough to stay tidy.
+    for asset, days_seen in obs.items():
+        for d in sorted(days_seen)[:-14]:
+            days_seen.pop(d, None)
+
+    for asset, got, want in shortfall:
+        print(f"  [YIELD-SHORTFALL] {asset} is paying {got*100:.2f}%/yr but was "
+              f"ranked at {want*100:.2f}%/yr. The advertised tier bonus is NOT "
+              f"arriving. Do not trust this product's headline until it does.")
 
 
 async def _earn_positions(client) -> dict | None:
@@ -1822,7 +1970,17 @@ async def _allocate_cycle(client, state):
         if in_earn:
             held_asset = max(in_earn, key=in_earn.get)
             held = in_earn[held_asset]
-            best = await _scan_stablecoins(client, held_asset, held)
+            # Audit BEFORE the scan, not after: the audit is what tells the
+            # scan which advertised rates have actually been honoured, and a
+            # verdict recorded after the ranking is a verdict a cycle too late.
+            assumed = {}
+            for a, v in (snap.get("stables") or {}).items():
+                if v["earn"] > 0:
+                    prods = await _earn_products(client, a, v["earn"])
+                    if prods:
+                        assumed[a] = prods[0]["apr"]
+            await _audit_yield(client, state, in_earn, assumed)
+            best = await _scan_stablecoins(client, state, held_asset, held)
             # Rotation is disarmed by default and returns False immediately
             # unless armed, so this is a no-op for anyone who has not opted in.
             if best and best["asset"] != held_asset:
