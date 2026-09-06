@@ -953,3 +953,61 @@ def test_days_at_the_advertised_rate_do_not_count_as_shortfall(tmp_path):
     state = {"yield_observations": {"USDT": {
         "2026-09-04": 0.0678, "2026-09-05": 0.0212, "2026-09-06": 0.0689}}}
     assert h._trusted_apr(state, "USDT", 0.0678) == pytest.approx(0.0678)
+
+
+# --- the daily reading sawtooths; store and judge on its peak ----------------
+#
+# Rewards are credited discretely once a day while the annualising span grows
+# continuously, so a correct reading peaks just after a credit and decays until
+# the next. Measured 2026-09-06: healthy USDC read 5.83% at 04:00 UTC and would
+# have read 3.91% at 23:50 against a 4.25% floor. Storing the LAST reading of
+# the day would have booked a shortfall against a product paying its advertised
+# rate exactly, and three of those would have rotated $48 out of it.
+
+async def test_day_observation_keeps_the_best_reading_not_the_latest(tmp_path, monkeypatch):
+    h = _alloc(tmp_path)
+    state, seq = {}, iter([0.0583, 0.0470, 0.0391])
+
+    async def fake_realized(client, holdings, days=3):
+        return {"USDC": next(seq)}
+    monkeypatch.setattr(h, "_realized_apr", fake_realized)
+
+    for _ in range(3):
+        await h._audit_yield(None, state, {"USDC": 48.0}, {"USDC": 0.0709})
+
+    day = next(iter(state["yield_observations"]["USDC"].values()))
+    assert day == pytest.approx(0.0583)
+
+
+async def test_decaying_reading_does_not_book_a_false_shortfall(tmp_path, monkeypatch, capsys):
+    """The 3.91% late-evening reading is below the 4.25% floor, but the day
+    peaked at 5.83% — a healthy product must not be flagged."""
+    h = _alloc(tmp_path)
+    state, seq = {}, iter([0.0583, 0.0391])
+
+    async def fake_realized(client, holdings, days=3):
+        return {"USDC": next(seq)}
+    monkeypatch.setattr(h, "_realized_apr", fake_realized)
+
+    for _ in range(2):
+        await h._audit_yield(None, state, {"USDC": 48.0}, {"USDC": 0.0709})
+
+    assert "YIELD-SHORTFALL" not in capsys.readouterr().out
+    assert h._trusted_apr(state, "USDC", 0.0709) == pytest.approx(0.0709)
+
+
+async def test_a_genuinely_unpaid_tier_is_still_flagged(tmp_path, monkeypatch, capsys):
+    """The real USDC case before its bonus arrived: base only, every reading of
+    the day well under the floor. Keeping the maximum must not mask that."""
+    h = _alloc(tmp_path)
+    state, seq = {}, iter([0.0237, 0.0212])
+
+    async def fake_realized(client, holdings, days=3):
+        return {"USDC": next(seq)}
+    monkeypatch.setattr(h, "_realized_apr", fake_realized)
+
+    for _ in range(2):
+        await h._audit_yield(None, state, {"USDC": 48.0}, {"USDC": 0.0712})
+
+    assert "YIELD-SHORTFALL" in capsys.readouterr().out
+    assert state["yield_observations"]["USDC"] != {}

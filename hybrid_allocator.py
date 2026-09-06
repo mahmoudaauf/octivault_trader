@@ -871,32 +871,47 @@ async def _audit_yield(client, state, holdings: dict, assumed: dict) -> None:
     real = await _realized_apr(client, holdings)
     if not real:
         return
-    parts, shortfall = [], []
-    for asset in sorted(real, key=lambda a: -real[a]):
-        want = assumed.get(asset)
-        if want:
-            parts.append(f"{asset} {real[asset]*100:.2f}% (told {want*100:.2f}%)")
-            # 60%: wide enough to absorb a partial first day and reward-timing
-            # jitter, tight enough that a missing bonus stream cannot hide.
-            if real[asset] < want * 0.60:
-                shortfall.append((asset, real[asset], want))
-        else:
-            parts.append(f"{asset} {real[asset]*100:.2f}%")
-    print("  [YIELD-AUDIT] paid over last 3d: " + ", ".join(parts))
 
     # Record the verdict per CALENDAR DAY, not per cycle. The daemon runs ~96
     # cycles a day; counting cycles would reach any threshold within an hour and
     # turn a single bad reading into a rotation. Rewards are credited once a day,
     # so a day is the smallest unit that carries new information.
+    #
+    # Keep the day's BEST reading, not its latest. Rewards arrive discretely once
+    # a day while the annualising span grows continuously, so a correct reading
+    # sawtooths: it peaks just after a credit lands and decays until the next one.
+    # Measured on 2026-09-06, healthy USDC read 5.83% at 04:00 UTC and would have
+    # read 3.91% at 23:50 against a 4.25% floor — so storing the last reading of
+    # the day would have recorded a shortfall for a product paying its advertised
+    # rate exactly, and three such days would have rotated $48 out of it. The
+    # maximum is the sample taken closest after a credit, i.e. the least biased.
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     obs = state.setdefault("yield_observations", {})
     for asset in real:
         if assumed.get(asset):
-            obs.setdefault(asset, {})[today] = round(real[asset], 6)
+            day = obs.setdefault(asset, {})
+            day[today] = round(max(real[asset], day.get(today, 0.0)), 6)
     # Keep a fortnight; enough to see a promotion end, small enough to stay tidy.
     for asset, days_seen in obs.items():
         for d in sorted(days_seen)[:-14]:
             days_seen.pop(d, None)
+
+    parts, shortfall = [], []
+    for asset in sorted(real, key=lambda a: -real[a]):
+        want = assumed.get(asset)
+        if want:
+            # Judge on the day's best reading, for the same reason it is the one
+            # stored: the instantaneous value is depressed by time since credit.
+            best = obs.get(asset, {}).get(today, real[asset])
+            parts.append(f"{asset} {real[asset]*100:.2f}% (day best {best*100:.2f}%, "
+                         f"told {want*100:.2f}%)")
+            # 60%: wide enough to absorb a partial first day and reward-timing
+            # jitter, tight enough that a missing bonus stream cannot hide.
+            if best < want * 0.60:
+                shortfall.append((asset, best, want))
+        else:
+            parts.append(f"{asset} {real[asset]*100:.2f}%")
+    print("  [YIELD-AUDIT] paid over last 3d: " + ", ".join(parts))
 
     for asset, got, want in shortfall:
         print(f"  [YIELD-SHORTFALL] {asset} is paying {got*100:.2f}%/yr but was "
