@@ -25,7 +25,7 @@
     "invested_capital_usdt": 0.020343508438600003,
     "nav_usdt": 57.8659713684386,
     "session_anchor_nav": 0.0,
-    "ts": 1783980993.8032918
+    "ts": 1788198855.759684
   },
   "metrics": {
     "ai_office_pause_buys": false,
@@ -49,6 +49,8 @@
     "portfolio_value": 200.72269299400025,
     "positions_count": 5,
     "realized_pnl": 0.0,
+    "realized_pnl_today": 0.0,
+    "realized_pnl_today_date": "",
     "rotator_buy_ts": {
       "HBARUSDT": 1781896897.3109398
     },
@@ -68,6 +70,7 @@
     "taker_fills": 0,
     "tpsl_tighten_factor": 0.8,
     "trades_in_window": 0,
+    "trades_since_ofc_check": 0,
     "trend_regime": "DOWNTREND",
     "unrealized_pnl": -408727.46314844664,
     "win_rate_window": 0.5
@@ -546,5 +549,5 @@
     "recovery_mode_active": false
   },
   "session_anchor_nav": 0.0,
-  "ts": 1783980993.8032918
+  "ts": 1788198855.759684
 }
