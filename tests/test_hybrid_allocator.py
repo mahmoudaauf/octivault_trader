@@ -1154,3 +1154,128 @@ async def test_realized_apr_still_reports_a_real_balance(tmp_path):
     real = await h._realized_apr(c, {"USDC": 48.0})
     # one day of the base stream on $48: 0.0094/48*365 over a 1-day span
     assert real["USDC"] == pytest.approx(0.0094 / 48.0 * 365 / 1.0, rel=0.05)
+
+
+# --- tier filling: capacity, not a limit (2026-09-08) ------------------------
+#
+# Bonus tiers are capped per coin, so holding one coin is optimal only while the
+# balance fits inside that coin's cap. Past it the marginal dollar falls to the
+# base rate (USD1: 1.54%) while a rival's bonus tier sits empty. The board these
+# tests use is the live one from 2026-09-08.
+
+BOARD = [{"asset": "USD1", "base_apr": 0.0154, "tiers": [(0.0, 1500.0, 0.07)]},
+         {"asset": "USDC", "base_apr": 0.0234, "tiers": [(0.0, 300.0, 0.05)]},
+         {"asset": "USDT", "base_apr": 0.0283, "tiers": [(0.0, 800.0, 0.04)]},
+         {"asset": "FDUSD", "base_apr": 0.0050, "tiers": []}]
+
+
+def test_plan_is_single_best_coin_while_inside_its_cap(tmp_path):
+    """At present size the tier planner must reproduce single-coin rotation
+    exactly — that is what makes it safe to let it subsume that path."""
+    h = _load(tmp_path)
+    for total in (10.0, 60.2, 500.0, 1500.0):
+        plan, apr = h._tier_fill_plan(BOARD, total)
+        assert plan == {"USD1": total}
+        assert apr == pytest.approx(0.0854)
+
+
+def test_plan_spreads_once_the_best_cap_is_exceeded(tmp_path):
+    h = _load(tmp_path)
+    plan, apr = h._tier_fill_plan(BOARD, 2000.0)
+    assert plan == {"USD1": 1500.0, "USDC": 300.0, "USDT": 200.0}
+    assert apr == pytest.approx(0.0819, abs=1e-4)
+    assert sum(plan.values()) == pytest.approx(2000.0)
+
+
+def test_plan_fills_every_tier_at_capacity_then_spills_to_best_base(tmp_path):
+    h = _load(tmp_path)
+    plan, _ = h._tier_fill_plan(BOARD, 2600.0)
+    assert plan == {"USD1": 1500.0, "USDT": 800.0, "USDC": 300.0}
+    # Past capacity the remainder goes to the highest BASE rate (USDT 2.83%),
+    # not to the coin with the best headline.
+    spill, _ = h._tier_fill_plan(BOARD, 5000.0)
+    assert spill["USDT"] == pytest.approx(800.0 + 2400.0)
+
+
+def test_plan_beats_every_random_alternative(tmp_path):
+    """Greedy-by-marginal-rate is optimal for concave payoffs; verify rather
+    than assert it, so a future edit that breaks optimality is caught."""
+    import random
+    h = _load(tmp_path)
+    rng = random.Random(20260908)
+    for total in (750.0, 2000.0, 3500.0):
+        plan, _ = h._tier_fill_plan(BOARD, total)
+        best = h._alloc_yield(BOARD, plan)
+        for _ in range(400):
+            w = [rng.random() for _ in BOARD]
+            s = sum(w) or 1.0
+            rival = {p["asset"]: total * x / s for p, x in zip(BOARD, w)}
+            assert h._alloc_yield(BOARD, rival) <= best + 1e-9
+
+
+def test_plan_handles_no_products_and_no_money(tmp_path):
+    h = _load(tmp_path)
+    assert h._tier_fill_plan([], 100.0) == ({}, 0.0)
+    assert h._tier_fill_plan(BOARD, 0.0) == ({}, 0.0)
+
+
+def test_move_is_one_leg_in_the_right_direction(tmp_path):
+    h = _load(tmp_path)
+    holdings = {"USDT": 1000.0, "USDC": 1000.0}
+    plan, _ = h._tier_fill_plan(BOARD, 2000.0)
+    src, dst, amt, edge = h._tier_fill_move(BOARD, holdings, plan)
+    assert dst == "USD1"                       # the empty 8.54% tier
+    assert src in ("USDT", "USDC") and amt > 0
+    assert edge > 0
+    # One leg only: it never returns the whole rebalance at once.
+    assert amt <= max(holdings.values())
+
+
+def test_move_declines_when_already_optimal(tmp_path):
+    h = _load(tmp_path)
+    plan, _ = h._tier_fill_plan(BOARD, 60.2)
+    assert h._tier_fill_move(BOARD, {"USD1": 60.2}, plan) is None
+
+
+def test_move_declines_below_the_exchange_minimum(tmp_path):
+    """$3 of drift is not worth a conversion; TIER_FILL_MIN_USD is the floor."""
+    h = _load(tmp_path)
+    plan, _ = h._tier_fill_plan(BOARD, 60.0)
+    assert h._tier_fill_move(BOARD, {"USD1": 57.0, "USDT": 3.0}, plan) is None
+
+
+def test_move_consolidates_todays_actual_holdings(tmp_path):
+    """The real position on 2026-09-08: $48 USD1 + $12.20 USDT. All of it fits
+    inside USD1's cap, so the USDT is earning 6.83% where 8.54% is available."""
+    h = _load(tmp_path)
+    holdings = {"USD1": 48.0, "USDT": 12.20}
+    plan, _ = h._tier_fill_plan(BOARD, 60.20)
+    src, dst, amt, edge = h._tier_fill_move(BOARD, holdings, plan)
+    assert (src, dst) == ("USDT", "USD1")
+    assert amt == pytest.approx(12.20)
+    assert amt * edge == pytest.approx(0.209, abs=0.01)     # +$0.21/yr
+
+
+async def test_rotation_refuses_a_move_that_takes_too_long_to_repay(tmp_path, monkeypatch, capsys):
+    arm = tmp_path / "rotate_armed"; arm.touch()
+    h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
+    c = _mock_client()
+    async def pricey(client, s, t): return ("USD1USDT", "BUY", 0.05)   # 0.05% cost
+    monkeypatch.setattr(h, "_conversion_cost_pct", pricey)
+    # 0.6pp edge clears ROTATE_MIN_EDGE but repays 0.05% only after ~30 days.
+    ok = await h._rotate_stablecoin(c, {"position": None}, "USDT", "USD1", 50.0, 0.006,
+                                    min_usd=5.0, max_payback_d=10.0)
+    assert ok is False and "ROTATE-ABORT" in capsys.readouterr().out
+    c.redeem_simple_earn_flexible_product.assert_not_called()
+
+
+async def test_tier_fill_is_a_noop_when_the_split_is_already_optimal(tmp_path, capsys):
+    h = _load(tmp_path)
+    c = _mock_client()
+    c.get_simple_earn_flexible_product_list = AsyncMock(side_effect=_products({
+        "USD1": (0.0154, 0.07, 1500), "USDC": (0.0234, 0.05, 300),
+        "USDT": (0.0283, 0.04, 800)}))
+    assert await h._tier_fill(c, {}, {"USD1": 60.2}) is False
+    out = capsys.readouterr().out
+    assert "TIER-FILL]" in out and "TIER-FILL-MOVE" not in out
+    c.redeem_simple_earn_flexible_product.assert_not_called()

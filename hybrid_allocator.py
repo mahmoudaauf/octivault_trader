@@ -236,6 +236,22 @@ ROTATE_COOLDOWN_H = float(os.getenv("HYBRID_ROTATE_COOLDOWN_H", "24"))
 # time, never assumed: USDCUSDT is zero-fee with a ~0.001% spread today, but a
 # rotation must not silently proceed on a stale assumption about its own cost.
 ROTATE_MAX_COST_PCT = float(os.getenv("HYBRID_ROTATE_MAX_COST_PCT", "0.05"))
+# ── Tier filling (2026-09-08) ────────────────────────────────────────────────
+# Bonus tiers are CAPPED PER COIN, which is usually read as a limit and is
+# actually a capacity: USD1 pays 8.54% on the first 1,500, USDT 6.83% on 800,
+# USDC 7.34% on 300. Holding one coin is optimal only while the balance fits
+# inside that coin's cap. Above it the marginal dollar drops to the base rate
+# (USD1: 1.54%) while a rival's bonus tier sits empty — so a single-coin
+# allocator silently wastes ~5pp on every dollar past the cap.
+#
+# A tier-fill move is judged on PAYBACK, not on a flat dollar minimum. The
+# rotation minimum of $20 exists to stop uneconomic churn, but the honest test
+# is whether the conversion cost is repaid: moving $12.20 from USDT to USD1
+# costs $0.0012 at 0.01% and gains $0.21/yr, i.e. it pays for itself in two
+# days. A flat minimum would refuse that and leave the money at the worse rate
+# permanently.
+TIER_FILL_MIN_USD = float(os.getenv("HYBRID_TIER_FILL_MIN_USD", "5.0"))   # exchange min notional
+TIER_FILL_MAX_PAYBACK_D = float(os.getenv("HYBRID_TIER_FILL_MAX_PAYBACK_D", "30"))
 # DELIBERATELY NOT IMPLEMENTED: migrating the existing core between earn
 # products. It would require REDEEM, which the allocate objective never calls —
 # that absence is the wall, not a policy that could be flipped by a flag. New
@@ -564,7 +580,9 @@ async def _conversion_cost_pct(client, source: str, target: str):
 
 
 async def _rotate_stablecoin(client, state, source: str, target: str,
-                             amount: float, edge: float) -> bool:
+                             amount: float, edge: float,
+                             min_usd: float | None = None,
+                             max_payback_d: float | None = None) -> bool:
     """Move the core from one stablecoin earn product to a better-paying one.
 
     THE ONLY REDEEM IN THIS OBJECTIVE. Every gate below must pass, and the
@@ -581,7 +599,7 @@ async def _rotate_stablecoin(client, state, source: str, target: str,
         return False
     if state.get("position"):
         return False                        # satellite open: do not touch balances
-    if amount < ROTATE_MIN_USD or edge < ROTATE_MIN_EDGE:
+    if amount < (ROTATE_MIN_USD if min_usd is None else min_usd) or edge < ROTATE_MIN_EDGE:
         return False
     last = float(state.get("last_rotation_ts", 0.0) or 0.0)
     if last and (time.time() - last) < ROTATE_COOLDOWN_H * 3600:
@@ -603,6 +621,10 @@ async def _rotate_stablecoin(client, state, source: str, target: str,
               f"(cap {ROTATE_MAX_COST_PCT}%) — not worth {edge*100:.2f}pp of rate")
         return False
     payback_d = 365.0 * (cost_pct / 100.0) / edge if edge > 0 else 9e9
+    if max_payback_d is not None and payback_d > max_payback_d:
+        print(f"  [ROTATE-ABORT] {source}->{target} repays its {cost_pct:.4f}% cost "
+              f"in {payback_d:.0f}d (cap {max_payback_d:.0f}d) — not worth the churn")
+        return False
     print(f"  [ROTATE] {source}->{target} ${amount:,.2f}: +{edge*100:.2f}pp "
           f"(+${amount*edge:,.2f}/yr), cost {cost_pct:.4f}% via {symbol} {side}, "
           f"pays back in {payback_d:.1f}d")
@@ -989,6 +1011,143 @@ async def _audit_yield(client, state, holdings: dict, assumed: dict) -> None:
         print(f"  [YIELD-SHORTFALL] {asset} is paying {got*100:.2f}%/yr but was "
               f"ranked at {want*100:.2f}%/yr. The advertised tier bonus is NOT "
               f"arriving. Do not trust this product's headline until it does.")
+
+
+def _tier_fill_plan(products: list[dict], total: float) -> tuple[dict, float]:
+    """Best split of `total` across approved earn products, and its blended APR.
+
+    Each product is a staircase: the first `cap` earns base+tier, everything
+    above earns base alone. That makes each coin's yield CONCAVE in the amount
+    placed — the marginal rate only ever steps down — and for a sum of concave
+    functions, filling greedily by marginal rate is provably optimal. So the
+    plan is just: cut every product into slices, sort all slices by what they
+    pay, and pour the money in from the top.
+
+    Worked example at the 2026-09-08 board (USD1 1.54+7.00 to 1,500; USDC
+    2.34+5.00 to 300; USDT 2.83+4.00 to 800):
+
+        $60      -> all USD1                          8.54% blended
+        $2,000   -> 1,500 USD1 + 300 USDC + 200 USDT  8.04% blended
+        $2,600   -> every tier full, nothing wasted   7.90% blended
+        $5,000   -> caps full, 2,400 at USDT's 2.83%  5.46% blended
+
+    Note what the last row means: past ~$2,600 this account's marginal dollar
+    earns ~2.8%, and the right home for money above that line is not here.
+
+    Returns ({asset: amount}, blended_apr). An empty product list yields ({}, 0).
+    """
+    if total <= 0 or not products:
+        return {}, 0.0
+    # (rate, capacity, asset) for every distinct marginal rate on offer.
+    slices: list[tuple[float, float, str]] = []
+    for p in products:
+        base = float(p.get("base_apr", 0.0) or 0.0)
+        for lo, hi, apr in sorted(p.get("tiers") or []):
+            width = hi - lo
+            if width > 0:
+                slices.append((base + apr, width, p["asset"]))
+        # Above every tier the product still accepts money at its base rate.
+        slices.append((base, float("inf"), p["asset"]))
+    slices.sort(key=lambda s: -s[0])
+
+    alloc: dict[str, float] = {}
+    left, weighted = total, 0.0
+    for rate, cap, asset in slices:
+        if left <= 1e-9:
+            break
+        take = min(left, cap)
+        if take <= 0:
+            continue
+        alloc[asset] = alloc.get(asset, 0.0) + take
+        weighted += take * rate
+        left -= take
+    return {a: round(v, 8) for a, v in alloc.items() if v > 0}, weighted / total
+
+
+def _alloc_yield(products: list[dict], alloc: dict) -> float:
+    """Annual dollars an allocation earns, using the same tier maths as ranking."""
+    by = {p["asset"]: p for p in products}
+    out = 0.0
+    for asset, amt in alloc.items():
+        p = by.get(asset)
+        if p and amt > 0:
+            out += amt * _effective_apr(float(p.get("base_apr", 0.0) or 0.0),
+                                        p.get("tiers") or [], amt)
+    return out
+
+
+def _tier_fill_move(products: list[dict], holdings: dict, plan: dict) -> tuple | None:
+    """The single best leg toward `plan`, as (source, target, amount, edge_apr).
+
+    ONE leg per cycle, executed through the existing rotation primitive, rather
+    than a bespoke multi-leg transaction. Rebalancing three coins atomically
+    means three redeems and three conversions that must either all land or all
+    unwind; a single leg is the path already proven in production, is idempotent
+    (the next cycle re-reads balances and re-plans from whatever actually
+    happened), and converges in a few cycles. A partly-completed convergence is
+    never wrong — it is simply less optimal, and the next cycle continues it.
+
+    `edge_apr` is the yield improvement per dollar moved, which is the unit the
+    rotation cost gates are denominated in.
+    """
+    drift = {a: holdings.get(a, 0.0) - plan.get(a, 0.0)
+             for a in set(holdings) | set(plan)}
+    over = sorted(((v, a) for a, v in drift.items() if v > 0), reverse=True)
+    under = sorted(((-v, a) for a, v in drift.items() if v < 0), reverse=True)
+    if not over or not under:
+        return None
+    amount = round(min(over[0][0], under[0][0]), 8)
+    if amount < TIER_FILL_MIN_USD:
+        return None
+    source, target = over[0][1], under[0][1]
+    after = dict(holdings)
+    after[source] = after.get(source, 0.0) - amount
+    after[target] = after.get(target, 0.0) + amount
+    gain = _alloc_yield(products, after) - _alloc_yield(products, holdings)
+    if gain <= 0:
+        return None
+    return source, target, amount, gain / amount
+
+
+async def _tier_fill(client, state, holdings: dict) -> bool:
+    """Report the optimal tier split, and take one step toward it.
+
+    Read-only when the current split is already optimal, which it is for any
+    balance that fits inside the best coin's cap — so this is a no-op at
+    present size and becomes load-bearing exactly when capital arrives.
+    """
+    total = sum(v for v in holdings.values() if v > 0)
+    if total <= 0:
+        return False
+    products = []
+    for asset in ROTATE_DESTINATIONS:
+        got = await _earn_products(client, asset, total)
+        if got:
+            products.append(got[0])
+    if not products:
+        return False
+
+    plan, blended = _tier_fill_plan(products, total)
+    now_apr = _alloc_yield(products, holdings) / total
+    capacity = sum(hi - lo for p in products for lo, hi, _ in (p.get("tiers") or [])
+                   if hi != float("inf"))
+    print(f"  [TIER-FILL] ${total:,.2f} across {len(products)} approved products: "
+          f"now {now_apr*100:.2f}% -> best {blended*100:.2f}% "
+          f"({', '.join(f'{a} ${v:,.0f}' for a, v in sorted(plan.items(), key=lambda kv: -kv[1]))})"
+          f"   bonus-tier capacity ${capacity:,.0f}")
+
+    move = _tier_fill_move(products, holdings, plan)
+    if not move:
+        return False
+    source, target, amount, edge = move
+    gain_yr = amount * edge
+    print(f"  [TIER-FILL-MOVE] {source} -> {target} ${amount:,.2f}: "
+          f"+{edge*100:.2f}pp on the moved dollars (+${gain_yr:,.2f}/yr)")
+    # Payback rather than a flat floor: see TIER_FILL_MIN_USD. The rotation's
+    # own cost cap, cooldown, arm file and destination allowlist all still apply.
+    return await _rotate_stablecoin(client, state, source, target, amount, edge,
+                                    min_usd=TIER_FILL_MIN_USD,
+                                    max_payback_d=TIER_FILL_MAX_PAYBACK_D)
 
 
 async def _earn_positions(client) -> dict | None:
@@ -2105,15 +2264,17 @@ async def _allocate_cycle(client, state):
                     if prods:
                         assumed[a] = prods[0]["apr"]
             await _audit_yield(client, state, in_earn, assumed)
-            best = await _scan_stablecoins(client, state, held_asset, held)
+            # Kept for its reporting: the full board, the unapproved leader,
+            # and the single-best-coin comparison are all worth logging even
+            # when the tier planner is the thing that decides.
+            await _scan_stablecoins(client, state, held_asset, held)
+            # Tier filling SUBSUMES single-coin rotation: while the balance fits
+            # inside the best coin's cap the optimal plan IS "all of it in that
+            # coin", so this produces exactly the old behaviour at present size
+            # and starts spreading across coins only once a cap is exceeded.
             # Rotation is disarmed by default and returns False immediately
             # unless armed, so this is a no-op for anyone who has not opted in.
-            if best and best["asset"] != held_asset:
-                products = await _earn_products(client, held_asset, held)
-                cur_apr = products[0]["apr"] if products else 0.0
-                await _rotate_stablecoin(client, state, held_asset,
-                                         best["asset"], held,
-                                         best["apr"] - cur_apr)
+            await _tier_fill(client, state, in_earn)
         # Launchpool rewards land in spot hourly while a pool runs. Sell on
         # listing day (holding lost a median 12% in week one), leave the USDT
         # in spot, and the sweep above compounds it into earn next cycle.
