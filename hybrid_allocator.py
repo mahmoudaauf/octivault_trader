@@ -188,9 +188,13 @@ RATE_SCAN = os.getenv("HYBRID_RATE_SCAN", "1") not in ("0", "false", "False")
 #   USDe        — synthetic dollar backed by a basis trade (short perps under
 #                 the hood); the operator excluded shorting, and it can depeg.
 #   FRAX        — algorithmic history.
+#   PYUSD       — not a Binance spot asset: no earn product, no pair, and the
+#                 balance read returns None, which logged a spurious
+#                 BAL-READ-FAIL twice a cycle. Harmless (an unreadable asset with
+#                 nothing in earn is skipped, not fatal) but noise is a cost.
 STABLE_ASSETS = [a.strip().upper() for a in
                  os.getenv("HYBRID_STABLE_ASSETS",
-                           "USDC,USDT,USD1,U,FDUSD,TUSD,USDP,XUSD,RLUSD,DAI,PYUSD").split(",") if a.strip()]
+                           "USDC,USDT,USD1,U,FDUSD,TUSD,USDP,XUSD,RLUSD,DAI").split(",") if a.strip()]
 # WHAT THE MACHINE MAY HOLD. Scanning an asset and moving $48 into it are
 # different decisions, and until 2026-09-08 they were the same list. This is
 # the allowlist rotation is permitted to move INTO. Criteria: deep Binance
