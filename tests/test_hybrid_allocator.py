@@ -1039,3 +1039,81 @@ async def test_a_genuinely_unpaid_tier_is_still_flagged(tmp_path, monkeypatch, c
 
     assert "YIELD-SHORTFALL" in capsys.readouterr().out
     assert state["yield_observations"]["USDC"] != {}
+
+
+# --- scan everything, hold only what passed diligence (2026-09-08) ------------
+#
+# A review found U (8.71%) and USD1 (8.54%) paying more than the USDC (7.34%)
+# we held, both outside a hardcoded five-asset scan. Widening the scan is free.
+# Rotating INTO an asset is a different decision: U carries a persistent 0.06%
+# discount, $17.5M/day liquidity, reserves partly made of other stablecoins and
+# no independent attestation — so it is scanned and never held, while USD1
+# (BitGo custody, AICPA attestations, $184M/day) is approved.
+
+def _products(rates):
+    """Mock get_simple_earn_flexible_product_list keyed by asset: {asset: (base, tier, cap)}."""
+    async def fn(asset=None, **_):
+        if asset not in rates:
+            return {"rows": []}
+        base, tier, cap = rates[asset]
+        return {"rows": [{"asset": asset, "productId": f"{asset}001", "canPurchase": True,
+                          "status": "PURCHASING", "latestAnnualPercentageRate": str(base),
+                          "tierAnnualPercentageRate": ({f"0-{cap}{asset}": str(tier)} if tier else {})}]}
+    return fn
+
+
+def test_scan_universe_covers_every_usd_stablecoin_and_excludes_fx_and_synthetic(tmp_path):
+    h = _load(tmp_path)
+    for a in ("USDC", "USDT", "USD1", "U", "FDUSD", "XUSD", "USDP"):
+        assert a in h.STABLE_ASSETS
+    for a in ("EURI", "AEUR", "USDE", "FRAX"):
+        assert a not in h.STABLE_ASSETS
+
+
+def test_rotation_allowlist_approves_usd1_and_excludes_u(tmp_path):
+    h = _load(tmp_path)
+    assert "USD1" in h.ROTATE_DESTINATIONS
+    assert "U" not in h.ROTATE_DESTINATIONS
+    assert set(h.ROTATE_DESTINATIONS) <= set(h.STABLE_ASSETS)   # can only hold what we scan
+
+
+async def test_scan_returns_best_approved_not_raw_leader(tmp_path, monkeypatch, capsys):
+    """U tops the board but is unapproved; the scan must hand rotation USD1,
+    not U, or the legitimate rotation is blocked by a coin we never buy."""
+    h = _load(tmp_path)
+    c = _mock_client()
+    c.get_simple_earn_flexible_product_list = AsyncMock(side_effect=_products({
+        "U": (0.0071, 0.08, 5000), "USD1": (0.0154, 0.07, 1500),
+        "USDC": (0.0234, 0.05, 300), "USDT": (0.0283, 0.04, 800)}))
+    async def no_pool(client): return {}
+    monkeypatch.setattr(h, "_launchpool_boost", no_pool)
+    best = await h._scan_stablecoins(c, {}, "USDC", 48.0)
+    out = capsys.readouterr().out
+    assert best["asset"] == "USD1"
+    assert "STABLE-UNAPPROVED" in out and "U pays 8.71%" in out
+    assert "STABLE-BETTER" in out and "USD1" in out
+
+
+async def test_rotate_refuses_unapproved_destination_before_any_network_call(tmp_path, capsys):
+    # Rotation has its own arm file and needs MODE live/dryrun; the satellite's
+    # arm file does not arm it (deliberately — see _rotate_armed). dryrun is
+    # enough here: the allowlist gate fires before the live/dryrun branch.
+    arm = tmp_path / "rotate_armed"; arm.touch()
+    h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
+    c = _mock_client()
+    ok = await h._rotate_stablecoin(c, {"position": None}, "USDC", "U", 48.0, 0.0137)
+    assert ok is False
+    assert "ROTATE-SKIP" in capsys.readouterr().out
+    c.redeem_simple_earn_flexible_product.assert_not_called()
+    c.get_orderbook_ticker.assert_not_called()          # refused before pricing the pair
+
+
+async def test_rotate_lets_approved_destination_through_to_cost_check(tmp_path, monkeypatch, capsys):
+    arm = tmp_path / "rotate_armed"; arm.touch()
+    h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
+    c = _mock_client()
+    async def no_pair(client, s, t): return None
+    monkeypatch.setattr(h, "_conversion_cost_pct", no_pair)
+    ok = await h._rotate_stablecoin(c, {"position": None}, "USDC", "USD1", 48.0, 0.012)
+    out = capsys.readouterr().out
+    assert ok is False and "ROTATE-SKIP" not in out and "ROTATE-ABORT" in out

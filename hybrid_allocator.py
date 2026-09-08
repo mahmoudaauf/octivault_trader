@@ -176,8 +176,44 @@ RATE_SCAN = os.getenv("HYBRID_RATE_SCAN", "1") not in ("0", "false", "False")
 # headline numbers: on 2026-09-04, USDC paid 5.00% on the first 300 while USDT
 # paid 4.00% on the first 500 — a 25% better rate for the same dollar of
 # stablecoin risk. Capital parked in the wrong one is a pure, silent loss.
+# WHAT THE SCAN LOOKS AT. Widened 2026-09-08 after a review found the two
+# best-paying stablecoins on the exchange sitting outside a hardcoded list of
+# five (one of which, DAI, has no earn product at all): U at 8.71% and USD1 at
+# 8.54% against the 7.34% USDC we held. Binance rotates bonus tiers across
+# stablecoins on a monthly cadence (USDT, FDUSD, XUSD, USD1, U and USDC have all
+# carried one in 2026), so the list must cover every USD-pegged coin with a
+# flexible product or the machine is blind to the next promotion by
+# construction. Looking is free. Excluded on purpose:
+#   EURI, AEUR  — EUR-pegged; rotating in takes FX exposure, not a rate.
+#   USDe        — synthetic dollar backed by a basis trade (short perps under
+#                 the hood); the operator excluded shorting, and it can depeg.
+#   FRAX        — algorithmic history.
 STABLE_ASSETS = [a.strip().upper() for a in
-                 os.getenv("HYBRID_STABLE_ASSETS", "USDT,USDC,FDUSD,TUSD,DAI").split(",") if a.strip()]
+                 os.getenv("HYBRID_STABLE_ASSETS",
+                           "USDC,USDT,USD1,U,FDUSD,TUSD,USDP,XUSD,RLUSD,DAI,PYUSD").split(",") if a.strip()]
+# WHAT THE MACHINE MAY HOLD. Scanning an asset and moving $48 into it are
+# different decisions, and until 2026-09-08 they were the same list. This is
+# the allowlist rotation is permitted to move INTO. Criteria: deep Binance
+# liquidity (>= ~$100M/day), independently attested fiat / T-bill reserves (not
+# reserves made of other stablecoins), and no persistent trading discount.
+#   USDC, USDT  — obvious.
+#   USD1        — World Liberty Financial. BitGo Trust custodian; 100% US cash
+#                 and government MMFs (BlackRock among managers); monthly AICPA
+#                 attestations; Chainlink proof-of-reserves; $4.3B supply;
+#                 $184M/day on Binance; pegged 0.99977–1.00009 over 24h.
+#   FDUSD       — trades at a ~0.13% discount on $15M/day and would not qualify
+#                 on its own, but it is the Launchpool asset and pool yields
+#                 (median 21%/yr while live) dwarf the discount. Kept for that.
+#   U (excluded)— United Stables. 8.71% is the best rate on the board and it is
+#                 deliberately NOT here: persistent 0.06% discount (never touched
+#                 par in 24h), $17.5M/day, reserves "fiat AND high-quality
+#                 stablecoins" (second-order risk), self-published PoR with no
+#                 independent attestation found, and Binance's own announcement
+#                 disclaims that U is "not a direct acronym of the US dollar".
+#                 The extra 1.37pp over USDC is $0.66/yr on $48. It does not buy
+#                 that tail. Visible in the scan, never held.
+ROTATE_DESTINATIONS = [a.strip().upper() for a in
+                       os.getenv("HYBRID_ROTATE_DESTINATIONS", "USDC,USDT,USD1,FDUSD").split(",") if a.strip()]
 # How much better a rival must be before it is worth reporting, in APR points.
 STABLE_EDGE_MIN = float(os.getenv("HYBRID_STABLE_EDGE_MIN", "0.0025"))  # 0.25pp
 # ── Stablecoin rotation (2026-09-04) ─────────────────────────────────────────
@@ -528,8 +564,8 @@ async def _rotate_stablecoin(client, state, source: str, target: str,
     """Move the core from one stablecoin earn product to a better-paying one.
 
     THE ONLY REDEEM IN THIS OBJECTIVE. Every gate below must pass, and the
-    destination is restricted to STABLE_ASSETS, so the worst case is holding a
-    different dollar-pegged token — never a directional position, and never a
+    destination is restricted to ROTATE_DESTINATIONS (an allowlist narrower than
+    the STABLE_ASSETS scan), so the worst case is holding a vetted dollar-pegged token — never a directional position, and never a
     transfer that could fund the satellite.
 
     Failure is designed to be self-healing rather than atomic: if the redeem
@@ -545,6 +581,12 @@ async def _rotate_stablecoin(client, state, source: str, target: str,
         return False
     last = float(state.get("last_rotation_ts", 0.0) or 0.0)
     if last and (time.time() - last) < ROTATE_COOLDOWN_H * 3600:
+        return False
+    # The scan already prefers approved destinations; this is the hard stop in
+    # case anything else ever calls in here with a coin we scan but do not hold.
+    if target.upper() not in ROTATE_DESTINATIONS:
+        print(f"  [ROTATE-SKIP] {target} is not an approved destination "
+              f"(HYBRID_ROTATE_DESTINATIONS={','.join(ROTATE_DESTINATIONS)}) — visible, not held")
         return False
 
     cost = await _conversion_cost_pct(client, source, target)
@@ -762,6 +804,7 @@ async def _scan_stablecoins(client, state, held_asset: str, amount: float) -> di
     if amount <= 0:
         return None
     best = None
+    best_dest = None
     table = []
     # A live Launchpool changes the answer: FDUSD's 0.51% base is the wrong
     # home except during a pool, when its median 21% annualised makes it the
@@ -776,7 +819,21 @@ async def _scan_stablecoins(client, state, held_asset: str, amount: float) -> di
         table.append((apr, asset))
         if best is None or apr > best["apr"]:
             best = {"asset": asset, "apr": apr, "productId": p["productId"]}
+        # Track the best APPROVED destination separately. If the raw leader is
+        # something we scan but may not hold, returning it would hand rotation a
+        # target it must refuse — and the legitimate second-best would never be
+        # tried. The machine would sit in USDC at 7.34% while USD1 at 8.54% was
+        # approved and waiting, blocked by a coin it was never going to buy.
+        if asset in ROTATE_DESTINATIONS and (best_dest is None or apr > best_dest["apr"]):
+            best_dest = {"asset": asset, "apr": apr, "productId": p["productId"]}
     if not best:
+        return None
+    if best_dest is not None and best["asset"] != best_dest["asset"]:
+        print(f"  [STABLE-UNAPPROVED] {best['asset']} pays {best['apr']*100:.2f}% — best on "
+              f"the board but not in HYBRID_ROTATE_DESTINATIONS; visible, not held. "
+              f"Best approved: {best_dest['asset']} {best_dest['apr']*100:.2f}%")
+    best = best_dest
+    if best is None:
         return None
     current = next((apr for apr, a in table if a == held_asset.upper()), None)
     if RATE_SCAN:
