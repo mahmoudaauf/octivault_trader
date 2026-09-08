@@ -1117,3 +1117,30 @@ async def test_rotate_lets_approved_destination_through_to_cost_check(tmp_path, 
     ok = await h._rotate_stablecoin(c, {"position": None}, "USDC", "USD1", 48.0, 0.012)
     out = capsys.readouterr().out
     assert ok is False and "ROTATE-SKIP" not in out and "ROTATE-ABORT" in out
+
+
+# --- a rate needs a balance to be a rate OF ----------------------------------
+
+async def test_realized_apr_omits_fully_redeemed_dust_balance(tmp_path):
+    """First cycle after USDC->USD1: USDC kept three days of credited rewards but
+    its balance was ~1e-8, and rewards/dust printed 172,850,627%/yr. Undefined
+    must be reported as absent, not as infinite."""
+    h = _load(tmp_path)
+    c = _mock_client()
+    now_ms = int(time.time() * 1000)
+    c._request_margin_api = AsyncMock(return_value={"rows": [
+        {"asset": "USDC", "rewards": "0.02", "time": now_ms - 86_400_000},
+        {"asset": "USD1", "rewards": "0.01", "time": now_ms - 3_600_000}]})
+    real = await h._realized_apr(c, {"USDC": 1e-8, "USD1": 48.0})
+    assert "USDC" not in real                      # dust: omitted, not infinite
+    assert "USD1" in real and 0 < real["USD1"] < 1  # a sane fraction, not a percent
+
+
+async def test_realized_apr_still_reports_a_real_balance(tmp_path):
+    h = _load(tmp_path)
+    c = _mock_client()
+    now_ms = int(time.time() * 1000)
+    c._request_margin_api = AsyncMock(return_value={"rows": [
+        {"asset": "USDC", "rewards": "0.0094", "time": now_ms - 86_400_000}]})
+    real = await h._realized_apr(c, {"USDC": 48.0})
+    assert real["USDC"] == pytest.approx(0.0094 / 48.0 * 365 / 1.0, rel=0.05)

@@ -856,6 +856,10 @@ async def _scan_stablecoins(client, state, held_asset: str, amount: float) -> di
     return best
 
 
+# Smallest balance the yield audit will compute a rate on. See _realized_apr.
+AUDIT_MIN_BALANCE_USD = float(os.getenv("HYBRID_AUDIT_MIN_BALANCE_USD", "1.0"))
+
+
 async def _realized_apr(client, holdings: dict, days: int = 3) -> dict:
     """What each earn asset was ACTUALLY paid, annualised, from reward history.
 
@@ -882,7 +886,9 @@ async def _realized_apr(client, holdings: dict, days: int = 3) -> dict:
     balance was at the time. An asset topped up mid-window reads HIGH (USDT read
     11.99% against a true ~6.8% the first time this ran, because $12 arrived on
     the last day of a window whose earlier rewards were earned on $0.21); one
-    partly redeemed reads LOW. The window is therefore measured from the asset's
+    partly redeemed reads LOW, and one FULLY redeemed to a dust residual reads as
+    an absurdity (172,850,627% on the first cycle after a rotation) — so balances
+    under AUDIT_MIN_BALANCE_USD are omitted outright. The window is measured from the asset's
     FIRST reward row rather than a flat `days`, which removes the largest error —
     a position younger than the window looking starved. The residual bias is
     toward over-reporting after a top-up, i.e. toward silence, so this can miss a
@@ -917,7 +923,12 @@ async def _realized_apr(client, holdings: dict, days: int = 3) -> dict:
         # two days old would otherwise be divided by three days and look
         # starved by a third purely because it is new.
         span = max((now_ms - first_seen.get(asset, now_ms)) / 86_400_000, 0.5)
-        if bal > 0:
+        # A rate needs a balance to be a rate OF. After a rotation the source
+        # coin keeps its window of credited rewards but its balance drops to a
+        # dust residual, and rewards / dust is not "very high yield" — it is
+        # undefined. 2026-09-08, first cycle after USDC->USD1: USDC printed
+        # 172,850,627%/yr. Below a dollar, omit: unknown, not infinite.
+        if bal >= AUDIT_MIN_BALANCE_USD:
             out[asset] = credited / bal * 365.0 / span
     return out
 
