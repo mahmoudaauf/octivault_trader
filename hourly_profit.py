@@ -3,8 +3,20 @@
 
 THE GOAL
 --------
-Profit that compounds every hour, tracked hourly, with an explicit dollar
-target per hour (HOURLY_TARGET_USD, default $1.00).
+Profit that compounds every hour, tracked hourly, against a target the world
+can actually pay.
+
+The default target is exactly that: NAV x MAX_RATE_APR / 8760 -- what this
+balance earns per hour at the best verified rate available to the account
+(7.24% on 2026-09-08: USDC flexible 2.24% base + 5.00% tier, confirmed against
+real reward credits). On $60.65 that is $0.000501/hour. Progress toward it is
+therefore a measure of MACHINE EFFICIENCY: ~100% means the account is being
+paid what it was promised; a persistent shortfall means a rate has stopped
+being honoured; more than 100% means Launchpool or a bonus landed. That is a
+target the tracker can actually be judged against, unlike the $1.00/hour it
+originally shipped with, which read 0.05% forever and measured nothing.
+
+Set HOURLY_TARGET_USD or --target to override with an explicit number.
 
 WHAT SETTING THIS GOAL DOES AND DOES NOT DO
 -------------------------------------------
@@ -54,10 +66,10 @@ replace. Treat the hourly column as a progress log, not as an accounting
 statement.
 
 Usage:
-  python3 hourly_profit.py                # last 24 complete hours
+  python3 hourly_profit.py                # last 24h vs what the world pays
   python3 hourly_profit.py --hours 72
-  python3 hourly_profit.py --target 0.01  # a target that is actually in reach
-Env: HOURLY_TARGET_USD
+  python3 hourly_profit.py --target 0.001 # next capital rung ($121) as the goal
+Env: HOURLY_TARGET_USD  MAX_RATE_APR
 """
 from __future__ import annotations
 
@@ -68,7 +80,14 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 
 NAV_FILE = os.getenv("HYBRID_NAV_FILE", "logs/nav_history.jsonl")
-TARGET = float(os.getenv("HOURLY_TARGET_USD", "1.00"))
+# The rate the world pays on this balance. 7.24% = USDC flexible base 2.24% +
+# 5.00% tier, the maximum available to this account, verified against BONUS and
+# REALTIME reward credits 2026-09-06..08. If the tier changes, the rate scan in
+# hybrid_allocator.py logs the live figure -- update this to match.
+MAX_RATE_APR = float(os.getenv("MAX_RATE_APR", "0.0724"))
+# Explicit override; when unset the target is computed from NAV at runtime.
+_TARGET_ENV = os.getenv("HOURLY_TARGET_USD")
+TARGET = float(_TARGET_ENV) if _TARGET_ENV else None
 
 
 def _rows(path: str) -> list[dict]:
@@ -144,7 +163,8 @@ def _hourly(rows: list[dict]) -> "OrderedDict[str, dict]":
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=int, default=24)
-    ap.add_argument("--target", type=float, default=TARGET)
+    ap.add_argument("--target", type=float, default=TARGET,
+                    help="explicit $/hour; default = NAV x MAX_RATE_APR / 8760")
     a = ap.parse_args()
 
     rows = _rows(NAV_FILE)
@@ -157,8 +177,15 @@ def main() -> int:
         return 1
 
     shown = list(hours.items())[-a.hours:]
+    nav_now = shown[-1][1]["nav"]
+    if a.target is not None:
+        target, basis = a.target, "explicit"
+    else:
+        target = nav_now * MAX_RATE_APR / 8760.0
+        basis = f"what the world pays: ${nav_now:.2f} x {MAX_RATE_APR*100:.2f}% / 8760"
     print("=" * 68)
-    print(f"HOURLY COMPOUNDING PROFIT — goal ${a.target:.4f}/hour")
+    print(f"HOURLY COMPOUNDING PROFIT — goal ${target:.6f}/hour")
+    print(f"  ({basis})")
     print("=" * 68)
     print(f"  {'hour (UTC)':<16}{'yield':>11}{'mark':>11}{'total':>11}{'NAV':>10}")
     for k, v in shown:
@@ -178,14 +205,15 @@ def main() -> int:
     if avg > 0:
         pct = avg / nav * 100.0
         print(f"  implied compounding   : {pct:.6f}%/hour  = {((1+avg/nav)**8760-1)*100:.2f}%/yr")
-    print(f"  progress to goal      : {avg/a.target*100:.4f}% of ${a.target:.4f}/hour")
+    print(f"  progress to goal      : {avg/target*100:.1f}% of ${target:.6f}/hour"
+          + ("   <- machine efficiency vs the verified rate" if a.target is None else ""))
     # State the floor next to the number, so no one reads one hour as fact.
     quantum = 0.0001
     print(f"  measurement floor     : NAV rounds to ${quantum:.4f}, "
           f"{quantum/max(avg,1e-9)*100:.0f}% of an hour's yield — "
           f"single hours are noise")
-    gap = a.target / avg if avg > 0 else float("inf")
-    if gap != float("inf"):
+    if a.target is not None and avg > 0:
+        gap = a.target / avg
         print(f"  gap                   : {gap:,.0f}x")
         # The rate is already maxed, so the only free variable is the balance.
         print(f"  balance that would pay ${a.target:.4f}/hr at this rate: "
