@@ -25,7 +25,7 @@
     "invested_capital_usdt": 0.020343508438600003,
     "nav_usdt": 57.8659713684386,
     "session_anchor_nav": 0.0,
-    "ts": 1788198855.759684
+    "ts": 1788845589.494189
   },
   "metrics": {
     "ai_office_pause_buys": false,
@@ -549,5 +549,5 @@
     "recovery_mode_active": false
   },
   "session_anchor_nav": 0.0,
-  "ts": 1788198855.759684
+  "ts": 1788845589.494189
 }
