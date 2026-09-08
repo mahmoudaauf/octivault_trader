@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from capital_paper import cycle
+from profit_readiness import OPERATOR_TARGET_HOURLY_USD
 
 
 def main():
@@ -34,7 +35,8 @@ def main():
         refreshed = 0.0
         if cache.exists():
             refreshed = datetime.fromisoformat(json.loads(cache.read_text())["fetched_at"]).timestamp()
-        command = [sys.executable, str(root / "profit_readiness.py")]
+        command = [sys.executable, str(root / "profit_readiness.py"),
+                   "--target-hourly", f"{OPERATOR_TARGET_HOURLY_USD:.6f}"]
         if time.time() - refreshed >= 3600:
             command.append("--refresh-exchange")
         return subprocess.run(command, cwd=root, timeout=240).returncode

@@ -9,6 +9,7 @@ a promise of returns or an automatic authorization to use real capital.
 from __future__ import annotations
 
 import argparse
+import os
 import asyncio
 import json
 import math
@@ -18,6 +19,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from exchange_trade_audit import atomic_json, fifo_audit, reconcile_strategy, refresh_cache
+
+# THE OPERATOR'S GOAL (set 2026-09-08): $4.39 per WEEK from $60.65, i.e. the
+# account's whole annual yield, weekly. In per-hour terms, which is what every
+# report and gate here is denominated in:
+#
+#     $4.39 / 168 h  =  $0.026131 / hour  =  376%/yr  =  1.034%/day
+#
+# For scale: the best verified rate this account can get is 7.24%/yr, so this
+# asks 52x that; the best sustained record in fund history (Renaissance
+# Medallion, ~66%/yr) is 5.7x short of it. The world can pay $228/yr — nobody
+# offers it. This constant exists so the system is measured against the goal
+# the operator actually set, and says plainly, every cycle, how far off it is.
+# Override with PROFIT_TARGET_HOURLY_USD.
+OPERATOR_TARGET_HOURLY_USD = float(os.getenv("PROFIT_TARGET_HOURLY_USD", str(4.39 / 168.0)))
 
 
 def timestamp(value: str) -> datetime:
@@ -165,7 +180,8 @@ def render(report: dict) -> str:
               if failed else "Screening gates passed; no live trading is enabled and future returns are not guaranteed.")
     lines = ["# Profit readiness", "", f"Generated: {report['generated_at']}", "",
              f"**Status: {status}**", "",
-             f"Capital assumption: ${report['capital_usdt']:.2f}; target: ${report['target_usdt_per_hour']:.2f}/hour.",
+             f"Capital assumption: ${report['capital_usdt']:.2f}; target: ${report['target_usdt_per_hour']:.6f}/hour "
+             f"(= ${report['target_usdt_per_hour']*168:.2f}/week).",
              f"Required net return: {report['required_hourly_return_pct']:.4f}% per hour.", "",
              f"P&L basis: {report['pnl_basis']}.", "",
              "| Historical live strategy metric | Result |", "|---|---:|",
@@ -211,7 +227,8 @@ def main() -> int:
     p.add_argument("--ledger", type=Path, default=Path("logs/hybrid_ledger.jsonl"))
     p.add_argument("--nav", type=Path, default=Path("logs/nav_history.jsonl"))
     p.add_argument("--capital", type=positive_number, default=60.65)
-    p.add_argument("--target-hourly", type=positive_number, default=1.0)
+    p.add_argument("--target-hourly", type=positive_number, default=OPERATOR_TARGET_HOURLY_USD,
+                   help="net USDT per hour the operator is aiming for (default: $4.39/week)")
     p.add_argument("--start", type=timestamp, default=timestamp("2026-08-01T00:00:00+00:00"))
     p.add_argument("--end", type=timestamp)
     p.add_argument("--refresh-exchange", action="store_true")
