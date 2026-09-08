@@ -1230,9 +1230,13 @@ async def _open_position(client, state, symbol: str, sat_cash: float):
 
     fill_price = price
     oco_id = None
+    entry_order_id = None
+    entry_fills = []
     if _is_live():
         try:
             o = await _retry(client.order_market_buy, symbol=symbol, quantity=qty)
+            entry_order_id = o.get("orderId")
+            entry_fills = o.get("fills", [])
             fills = o.get("fills", [])
             if fills:
                 spent = sum(float(f["price"]) * float(f["qty"]) for f in fills)
@@ -1268,6 +1272,7 @@ async def _open_position(client, state, symbol: str, sat_cash: float):
         "symbol": symbol, "entry_ts": time.time(), "entry_price": fill_price,
         "qty": qty, "tp_price": fill_price * (1 + TP_PCT / 100.0),
         "sl_price": fill_price * (1 - SL_PCT / 100.0), "mode": MODE, "oco_id": oco_id,
+        "entry_order_id": entry_order_id, "entry_fills": entry_fills,
     }
     state["last_entry_ts"] = time.time()
     print(f"  [SAT-OPEN] {symbol} {qty} @ {fill_price:.6f} (~${qty*fill_price:.2f}) "
@@ -1277,21 +1282,33 @@ async def _open_position(client, state, symbol: str, sat_cash: float):
 
 def _book_close(state, symbol, entry, exit_price, reason, qty):
     """Write the ledger record and clear the position (shared by all close paths)."""
-    gross_pct = (exit_price - entry) / entry * 100.0
-    net_pct = gross_pct - FEE_RT_PCT
     pos = state.get("position") or {}
+    executed = sum(float(f.get("qty", 0)) for f in pos.get("exit_fills", []))
+    if executed > 0:
+        qty = executed
+    gross_pct = (exit_price - entry) / entry * 100.0
+    # Fees apply to the executed notional on each side, not twice to entry.
+    # This remains an ESTIMATE until reconciled to exchange commissions.
+    estimated_fees = qty * (entry + exit_price) * FEE_RT_PCT / 200.0
+    estimated_net = qty * (exit_price - entry) - estimated_fees
+    net_pct = estimated_net / (entry * qty) * 100.0
     held_h = (time.time() - pos.get("entry_ts", time.time())) / 3600.0
     _log_trade({
         "ts": datetime.now(timezone.utc).isoformat(), "symbol": symbol,
         "held_h": round(held_h, 2), "entry_price": entry, "exit_price": round(exit_price, 8),
         "qty": qty, "gross_pct": round(gross_pct, 4), "net_pct": round(net_pct, 4),
+        "net_pnl_usdt": estimated_net, "estimated_fees_usdt": estimated_fees,
+        "pnl_source": "estimated_round_trip_fees", "costs_reconciled": False,
+        "entry_ts": pos.get("entry_ts"), "entry_order_id": pos.get("entry_order_id"),
+        "exit_order_id": pos.get("exit_order_id"), "oco_id": pos.get("oco_id"),
+        "entry_fills": pos.get("entry_fills", []), "exit_fills": pos.get("exit_fills", []),
         "reason": reason, "mode": pos.get("mode", MODE),
     })
     print(f"  [SAT-CLOSE] {symbol} @ {exit_price:.6f} net={net_pct:+.2f}% ({reason}) [{pos.get('mode', MODE)}]")
     state["position"] = None
 
 
-async def _actual_exit_vwap(client, symbol: str, entry_ts: float):
+async def _actual_exit_vwap(client, symbol: str, entry_ts: float, evidence=None):
     """Volume-weighted price of the SELL fills that closed this position, read
     from real trade history. Returns None if history is unavailable, so callers
     can fall back rather than book a fabricated price."""
@@ -1303,6 +1320,11 @@ async def _actual_exit_vwap(client, symbol: str, entry_ts: float):
         total_qty = sum(float(t["qty"]) for t in sells)
         if total_qty <= 0:
             return None
+        if evidence is not None:
+            order_ids = {t.get("orderId") for t in sells}
+            if len(order_ids) == 1 and None not in order_ids:
+                evidence["exit_order_id"] = next(iter(order_ids))
+                evidence["exit_fills"] = sells
         return sum(float(t["price"]) * float(t["qty"]) for t in sells) / total_qty
     except Exception as e:
         # Any shape surprise from the API must fall back, never crash the poll.
@@ -1332,7 +1354,7 @@ async def _detect_exchange_close(client, state) -> bool:
     # trigger price: a STOP_LOSS_LIMIT fills near sl*(1-STOP_LIMIT_OFFSET_PCT),
     # not at sl, and labelling by the *current* price (up to POLL_MIN stale)
     # could book a rebounded stop-out as a take-profit.
-    actual = await _actual_exit_vwap(client, symbol, pos["entry_ts"])
+    actual = await _actual_exit_vwap(client, symbol, pos["entry_ts"], evidence=pos)
     if actual is not None:
         exit_price = actual
         reason = "take-profit-oco" if actual >= pos["entry_price"] else "stop-loss-oco"
@@ -1369,7 +1391,7 @@ async def _close_position(client, state, reason: str):
                 # Coin vanished between the pre-check and here — the OCO fired in
                 # that window. BOOK it at the real fill; silently dropping the
                 # position would lose the trade from the ledger entirely.
-                actual = await _actual_exit_vwap(client, symbol, pos["entry_ts"])
+                actual = await _actual_exit_vwap(client, symbol, pos["entry_ts"], evidence=pos)
                 if actual is not None:
                     exit_price = actual
                     reason = "take-profit-oco" if actual >= entry else "stop-loss-oco"
@@ -1388,6 +1410,8 @@ async def _close_position(client, state, reason: str):
                 print(f"  [SAT-CLOSE] {symbol} free {free} below lot step {step} — keeping tracked")
                 return False
             o = await _retry(client.order_market_sell, symbol=symbol, quantity=sell_qty)
+            pos["exit_order_id"] = o.get("orderId")
+            pos["exit_fills"] = o.get("fills", [])
             fills = o.get("fills", [])
             if fills:
                 got = sum(float(f["price"]) * float(f["qty"]) for f in fills)
@@ -1457,7 +1481,10 @@ def _report():
                 line = line.strip()
                 if line:
                     try:
-                        trades.append(json.loads(line))
+                        row = json.loads(line)
+                        if (isinstance(row, dict) and row.get("mode") == "live"
+                                and row.get("net_pct") is not None and not row.get("kind")):
+                            trades.append(row)
                     except json.JSONDecodeError:
                         pass
     if not trades:
@@ -1469,9 +1496,20 @@ def _report():
     print("=" * 66)
     print(f"HYBRID SATELLITE — TRACK RECORD ({n} closed trades)")
     print("=" * 66)
-    print(f"  Avg net/trade: {sum(nets)/n:+.3f}%   win-rate: {wins/n*100:.0f}%   cum: {sum(nets):+.2f}%")
-    print("  NOTE: satellite is negative-EV by construction — capped 'action',")
-    print("        not a growth engine. The core (80% in yield) is where growth lives.")
+    dollars = [float(t.get("net_pnl_usdt", t["entry_price"] * t["qty"] * t["net_pct"] / 100))
+               for t in trades]
+    print(f"  Avg estimated net/trade: {sum(nets)/n:+.3f}%   win-rate: {wins/n*100:.0f}%")
+    print(f"  Estimated total net: ${sum(dollars):+.6f} (not an account return percentage)")
+    print("  Fees are estimates; paper trades and non-trading cash movements are excluded.")
+    # Restored 2026-09-08. This caveat was dropped when the report gained a
+    # dollar P&L line, which left a positive-looking headline with nothing to
+    # read it against. On a sample this small a positive average is noise, and
+    # the strategy is negative-EV BY DESIGN — omitting that is how a capped
+    # "action" budget gets mistaken for a growth engine.
+    print("  NOTE: the satellite is negative-EV by construction — a capped 'action'")
+    print("        budget, NOT a growth engine, and this sample is far too small")
+    print("        for its average to mean anything. Growth lives in the yield core.")
+    print("  Run profit_readiness.py --refresh-exchange for fill audit and hourly evidence.")
     print("=" * 66)
 
 

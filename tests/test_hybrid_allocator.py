@@ -26,6 +26,34 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+def test_report_excludes_transfers_and_paper_and_uses_dollar_pnl(tmp_path, capsys):
+    import json
+    h = _load(tmp_path)
+    row = {"symbol": "BTCUSDT", "mode": "live", "entry_price": 100, "qty": .1, "net_pct": 1}
+    records = [row, {**row, "mode": "paper", "net_pct": 1000},
+               {"kind": "stable_rotation", "mode": "live"}, {"kind": "option_bet"}]
+    (tmp_path / "ledger.jsonl").write_text("\n".join(json.dumps(r) for r in records))
+    h._report()
+    out = capsys.readouterr().out
+    assert "1 closed trades" in out
+    assert "$+0.100000" in out
+
+
+def test_book_close_preserves_execution_evidence_and_actual_sold_quantity(tmp_path):
+    import json
+    h = _load(tmp_path)
+    state = {"position": {"entry_ts": time.time() - 100, "mode": "live", "entry_order_id": 1,
+                           "exit_order_id": 2, "entry_fills": [{"qty": "1", "commission": ".001"}],
+                           "exit_fills": [{"qty": ".9", "commission": ".001"}]}}
+    h._book_close(state, "BTCUSDT", 100, 110, "test", 1)
+    row = json.loads((tmp_path / "ledger.jsonl").read_text())
+    assert row["qty"] == .9
+    assert row["entry_order_id"] == 1 and row["exit_order_id"] == 2
+    assert row["estimated_fees_usdt"] == pytest.approx(.189)
+    assert row["net_pnl_usdt"] == pytest.approx(8.811)
+    assert row["costs_reconciled"] is False
+
+
 def _load(tmp_path, **env):
     base = {
         "HYBRID_MODE": "paper",
