@@ -410,6 +410,72 @@ async def _symbol_filters(client, symbol: str) -> tuple[float, float, float]:
 SHORTFALL_DAYS = int(os.getenv("YIELD_SHORTFALL_DAYS", "3"))
 
 
+# A product must have had at least this many observed days before "no bonus has
+# ever arrived" counts as evidence rather than as a position that is simply new.
+# Two days guarantees at least one COMPLETE bonus window has passed, since the
+# bonus pays ~03:00-05:00 UTC one day in arrears and a mid-day subscription
+# misses its first window (verified on USDC, 2026-09-04..06).
+BONUS_GRACE_DAYS = int(os.getenv("HYBRID_BONUS_GRACE_DAYS", "2"))
+
+
+async def _bonus_paid(client) -> dict:
+    """{ASSET: cumulative bonus rewards} from the live earn positions.
+
+    Read separately from _earn_positions because this answers a different and
+    much sharper question than "what rate did we measure". A measured rate is
+    noisy: it moves with elapsed time, balance changes and credit timing. This
+    is binary — either the tier stream has ever paid this position or it has
+    not, and Binance reports it directly.
+    """
+    try:
+        pos = await _retry(client.get_simple_earn_flexible_product_position)
+        rows = pos.get("rows", []) if isinstance(pos, dict) else (pos or [])
+    except Exception as e:
+        print(f"  [BONUS-READ-FAIL] {str(e)[:70]} — treating bonus history as UNKNOWN")
+        return {}
+    out = {}
+    for p in rows:
+        asset = str(p.get("asset", "")).upper()
+        if not asset:
+            continue
+        try:
+            out[asset] = out.get(asset, 0.0) + float(p.get("cumulativeBonusRewards", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _tier_never_paid(state, asset: str, tiers: list, bonus_paid: dict) -> bool:
+    """Has an advertised tier produced ZERO bonus across a complete window?
+
+    This is a stronger and faster signal than a low measured rate, and having
+    only the latter cost real money. USD1 was subscribed 2026-09-08 18:46 UTC
+    advertising 7.00pp on the first 1,500. Two bonus windows then passed with
+    cumulativeBonusRewards at exactly 0 while the base stream paid to the
+    decimal (1.54% measured against 1.54% advertised). The measured-rate gate
+    needed three days to react, and in the meantime the planner — reading the
+    advertised 8.54% — consolidated MORE money into it.
+
+    "Underpaying" and "this stream does not exist for us" are different claims.
+    The first deserves patience, because a late credit looks identical. The
+    second deserves none once a window has closed: the money is sitting at a
+    base rate while a rival's working tier is available, and every hour of
+    waiting is a certain loss against an uncertain hope.
+
+    Requires an advertised tier (nothing to be absent otherwise), an unambiguous
+    zero, and BONUS_GRACE_DAYS of observation so a one-day-old position is never
+    condemned for a window it has not reached yet.
+    """
+    if not tiers or not any(apr > 0 for _lo, _hi, apr in tiers):
+        return False
+    if asset.upper() not in bonus_paid:          # unreadable: never assume absence
+        return False
+    if bonus_paid.get(asset.upper(), 0.0) > 0:
+        return False
+    observed = len((state.get("yield_observations") or {}).get(asset.upper()) or {})
+    return observed >= BONUS_GRACE_DAYS
+
+
 def _shortfall_days(state, asset: str, advertised: float) -> list[float]:
     """Recorded days on which `asset` paid under 60% of its advertised rate.
 
@@ -425,7 +491,7 @@ def _shortfall_days(state, asset: str, advertised: float) -> list[float]:
     return sorted(v for v in days.values() if v < advertised * 0.60)
 
 
-def _distrusted_products(state, products: list[dict]) -> list[dict]:
+def _distrusted_products(state, products: list[dict], bonus_paid: dict | None = None) -> list[dict]:
     """Products re-rated at what they have actually been observed to pay.
 
     THIS IS THE LINK BETWEEN THE AUDIT AND THE MONEY, and its absence was a real
@@ -443,11 +509,21 @@ def _distrusted_products(state, products: list[dict]) -> list[dict]:
     """
     out = []
     for p in products:
-        advertised = _effective_apr(float(p.get("base_apr", 0.0) or 0.0),
-                                    p.get("tiers") or [], 1.0)
+        base = float(p.get("base_apr", 0.0) or 0.0)
+        tiers = p.get("tiers") or []
+        advertised = _effective_apr(base, tiers, 1.0)
+        # Strongest signal first: an advertised tier that has paid nothing
+        # through a complete window is absent, not merely disappointing. Rate
+        # the product at its BASE — which is what it demonstrably pays — rather
+        # than at a noisy measured average.
+        if _tier_never_paid(state, p["asset"], tiers, bonus_paid or {}):
+            out.append({**p, "base_apr": base, "tiers": [], "distrusted": True,
+                        "reason": "tier has never paid"})
+            continue
         trusted = _trusted_apr(state, p["asset"], advertised)
         if trusted < advertised:
-            out.append({**p, "base_apr": trusted, "tiers": [], "distrusted": True})
+            out.append({**p, "base_apr": trusted, "tiers": [], "distrusted": True,
+                        "reason": "measured below advertised"})
         else:
             out.append(p)
     return out
@@ -1154,10 +1230,11 @@ def _tier_fill_move(products: list[dict], holdings: dict, plan: dict,
             advertised = _effective_apr(float(tp.get("base_apr", 0.0) or 0.0),
                                         tp.get("tiers") or [], 1.0)
             bad = _shortfall_days(state, target, advertised)
-            if bad:
-                print(f"  [TIER-FILL-BLOCK] not adding ${amount:,.2f} to {target}: "
-                      f"it has underpaid on {len(bad)} recorded day(s) "
-                      f"(worst {min(bad)*100:.2f}% vs {advertised*100:.2f}% advertised). "
+            if tp.get("distrusted") or bad:
+                why = (tp.get("reason") if tp.get("distrusted") else
+                       f"underpaid on {len(bad)} recorded day(s), worst "
+                       f"{min(bad)*100:.2f}% vs {advertised*100:.2f}% advertised")
+                print(f"  [TIER-FILL-BLOCK] not adding ${amount:,.2f} to {target}: {why}. "
                       f"Adding to a suspect product needs zero doubt, not 3 days of it.")
                 return None
     after = dict(holdings)
@@ -1189,11 +1266,12 @@ async def _tier_fill(client, state, holdings: dict) -> bool:
     # Plan on what these products have been OBSERVED to pay, not what they
     # advertise. Without this the planner acts on a rate the audit has already
     # contradicted — see _distrusted_products.
-    products = _distrusted_products(state, raw)
+    bonus_paid = await _bonus_paid(client)
+    products = _distrusted_products(state, raw, bonus_paid)
     for p in products:
         if p.get("distrusted"):
-            print(f"  [TIER-FILL-DISTRUST] {p['asset']} re-rated to its observed "
-                  f"{p['base_apr']*100:.2f}% (tier treated as absent) for planning")
+            print(f"  [TIER-FILL-DISTRUST] {p['asset']} re-rated to {p['base_apr']*100:.2f}% "
+                  f"({p.get('reason','distrusted')}; tier treated as absent) for planning")
 
     plan, blended = _tier_fill_plan(products, total)
     now_apr = _alloc_yield(products, holdings) / total

@@ -1351,3 +1351,69 @@ def test_shortfall_days_counts_only_days_under_the_floor(tmp_path):
     assert h._shortfall_days(state, "X", 0.0200) == [0.0067]
     assert h._shortfall_days(state, "X", 0.0100) == []        # floor 0.6%: all clear
     assert h._shortfall_days({}, "X", 0.0854) == []
+
+
+# --- "never paid" is a different claim from "underpaying" (2026-09-10) --------
+#
+# USD1 advertised 7.00pp on the first 1,500 and paid ZERO bonus across two
+# complete windows while its base stream paid to the decimal. The measured-rate
+# gate needed three days to react, and the planner kept acting on the advertised
+# rate in the meantime. An absent stream deserves no patience: the money sits at
+# a base rate while a working rival tier is available.
+
+def test_never_paid_tier_is_detected_once_a_window_has_closed(tmp_path):
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USD1": {"2026-09-09": 0.0067, "2026-09-10": 0.0145}}}
+    assert h._tier_never_paid(state, "USD1", [(0.0, 1500.0, 0.07)], {"USD1": 0.0}) is True
+
+
+def test_a_brand_new_position_is_not_condemned_before_its_first_window(tmp_path):
+    """One observed day means the first bonus window may not have arrived — the
+    exact artifact that made me call USDC's tier dead prematurely."""
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USD1": {"2026-09-09": 0.0067}}}
+    assert h._tier_never_paid(state, "USD1", [(0.0, 1500.0, 0.07)], {"USD1": 0.0}) is False
+
+
+def test_a_tier_that_has_paid_anything_is_not_absent(tmp_path):
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USDC": {"a": 0.02, "b": 0.02, "c": 0.02}}}
+    assert h._tier_never_paid(state, "USDC", [(0.0, 300.0, 0.05)], {"USDC": 0.0197}) is False
+
+
+def test_unreadable_bonus_history_never_implies_absence(tmp_path):
+    """A failed read must not condemn a product — unknown is not zero."""
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USD1": {"a": 0.0067, "b": 0.0145}}}
+    assert h._tier_never_paid(state, "USD1", [(0.0, 1500.0, 0.07)], {}) is False
+
+
+def test_product_with_no_advertised_tier_cannot_have_an_absent_one(tmp_path):
+    h = _load(tmp_path)
+    state = {"yield_observations": {"FDUSD": {"a": 0.001, "b": 0.001}}}
+    assert h._tier_never_paid(state, "FDUSD", [], {"FDUSD": 0.0}) is False
+
+
+def test_never_paid_tier_rates_the_product_at_its_base_and_moves_the_money(tmp_path):
+    """The whole point: USD1 re-rated to its 1.54% base, so USDT's working
+    6.83% tier wins and the planner rotates out without waiting a third day."""
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USD1": {"2026-09-09": 0.0067, "2026-09-10": 0.0145}}}
+    products = h._distrusted_products(state, USD1_BOARD, {"USD1": 0.0, "USDT": 0.118})
+    by = {p["asset"]: p for p in products}
+    assert by["USD1"]["tiers"] == [] and by["USD1"]["base_apr"] == pytest.approx(0.0154)
+    assert by["USD1"]["reason"] == "tier has never paid"
+    assert "distrusted" not in by["USDT"]
+    plan, apr = h._tier_fill_plan(products, 60.25)
+    assert plan == {"USDT": 60.25} and apr == pytest.approx(0.0683)
+    src, dst, amt, _ = h._tier_fill_move(products, {"USD1": 60.25}, plan, state=state)
+    assert (src, dst) == ("USD1", "USDT") and amt == pytest.approx(60.25)
+
+
+def test_entry_block_also_fires_on_a_never_paid_tier(tmp_path, capsys):
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USD1": {"2026-09-09": 0.0067, "2026-09-10": 0.0145}}}
+    products = h._distrusted_products(state, USD1_BOARD, {"USD1": 0.0, "USDT": 0.118})
+    # Pretend the plan still wanted USD1; the block must refuse regardless.
+    assert h._tier_fill_move(products, {"USDT": 60.0}, {"USD1": 60.0}, state=state) is None
+    assert "tier has never paid" in capsys.readouterr().out
