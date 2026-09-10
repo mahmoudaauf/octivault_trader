@@ -1417,3 +1417,29 @@ def test_entry_block_also_fires_on_a_never_paid_tier(tmp_path, capsys):
     # Pretend the plan still wanted USD1; the block must refuse regardless.
     assert h._tier_fill_move(products, {"USDT": 60.0}, {"USD1": 60.0}, state=state) is None
     assert "tier has never paid" in capsys.readouterr().out
+
+
+# --- a corrective move is not churn (2026-09-10) -----------------------------
+
+async def test_cooldown_blocks_an_ordinary_rotation(tmp_path, monkeypatch):
+    arm = tmp_path / "rotate_armed"; arm.touch()
+    h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
+    c = _mock_client()
+    state = {"position": None, "last_rotation_ts": time.time() - 3600}   # 1h ago
+    assert await h._rotate_stablecoin(c, state, "USDT", "USDC", 50.0, 0.02) is False
+    c.redeem_simple_earn_flexible_product.assert_not_called()
+
+
+async def test_cooldown_is_bypassed_when_escaping_a_tier_that_never_paid(tmp_path, monkeypatch, capsys):
+    """Binary, sticky signal -> no oscillation to prevent, so waiting only pays
+    the bad rate for another day."""
+    arm = tmp_path / "rotate_armed"; arm.touch()
+    h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
+    c = _mock_client()
+    async def cheap(client, s, t): return ("USD1USDC", "SELL", 0.01)
+    monkeypatch.setattr(h, "_conversion_cost_pct", cheap)
+    state = {"position": None, "last_rotation_ts": time.time() - 3600}
+    await h._rotate_stablecoin(c, state, "USD1", "USDC", 60.0, 0.057,
+                               min_usd=5.0, ignore_cooldown=True)
+    out = capsys.readouterr().out
+    assert "cooldown bypassed" in out and "never paid" in out

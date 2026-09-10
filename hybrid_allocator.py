@@ -701,7 +701,8 @@ async def _conversion_cost_pct(client, source: str, target: str):
 async def _rotate_stablecoin(client, state, source: str, target: str,
                              amount: float, edge: float,
                              min_usd: float | None = None,
-                             max_payback_d: float | None = None) -> bool:
+                             max_payback_d: float | None = None,
+                             ignore_cooldown: bool = False) -> bool:
     """Move the core from one stablecoin earn product to a better-paying one.
 
     THE ONLY REDEEM IN THIS OBJECTIVE. Every gate below must pass, and the
@@ -722,7 +723,16 @@ async def _rotate_stablecoin(client, state, source: str, target: str,
         return False
     last = float(state.get("last_rotation_ts", 0.0) or 0.0)
     if last and (time.time() - last) < ROTATE_COOLDOWN_H * 3600:
-        return False
+        # The cooldown exists to stop CHURN — oscillating between products on
+        # noisy rate readings. Escaping a product whose tier has provably never
+        # paid is not churn: the signal is binary (cumulativeBonusRewards == 0),
+        # it cannot flip back without a real payment arriving, so there is no
+        # oscillation to prevent. Holding a corrective move behind a 24h timer
+        # just pays the bad rate for another day.
+        if not ignore_cooldown:
+            return False
+        print(f"  [ROTATE] cooldown bypassed: leaving {source}, whose advertised "
+              f"tier has never paid — this cannot oscillate back")
     # The scan already prefers approved destinations; this is the hard stop in
     # case anything else ever calls in here with a coin we scan but do not hold.
     if target.upper() not in ROTATE_DESTINATIONS:
@@ -1286,6 +1296,9 @@ async def _tier_fill(client, state, holdings: dict) -> bool:
     if not move:
         return False
     source, target, amount, edge = move
+    # Narrowly scoped: only when we are LEAVING a product whose tier never paid.
+    by = {p["asset"]: p for p in products}
+    escaping = by.get(source, {}).get("reason") == "tier has never paid"
     gain_yr = amount * edge
     print(f"  [TIER-FILL-MOVE] {source} -> {target} ${amount:,.2f}: "
           f"+{edge*100:.2f}pp on the moved dollars (+${gain_yr:,.2f}/yr)")
@@ -1293,7 +1306,8 @@ async def _tier_fill(client, state, holdings: dict) -> bool:
     # own cost cap, cooldown, arm file and destination allowlist all still apply.
     return await _rotate_stablecoin(client, state, source, target, amount, edge,
                                     min_usd=TIER_FILL_MIN_USD,
-                                    max_payback_d=TIER_FILL_MAX_PAYBACK_D)
+                                    max_payback_d=TIER_FILL_MAX_PAYBACK_D,
+                                    ignore_cooldown=escaping)
 
 
 async def _earn_positions(client) -> dict | None:
