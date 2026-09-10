@@ -20,19 +20,29 @@ from pathlib import Path
 
 from exchange_trade_audit import atomic_json, fifo_audit, reconcile_strategy, refresh_cache
 
-# THE OPERATOR'S GOAL (set 2026-09-08): $4.39 per WEEK from $60.65, i.e. the
-# account's whole annual yield, weekly. In per-hour terms, which is what every
-# report and gate here is denominated in:
+# THE OPERATOR'S GOAL, restated 2026-09-10: $1.00 NET PER HOUR.
 #
-#     $4.39 / 168 h  =  $0.026131 / hour  =  376%/yr  =  1.034%/day
+#     $1.00/hour = $8,760/year = $168/week
 #
-# For scale: the best verified rate this account can get is 7.24%/yr, so this
-# asks 52x that; the best sustained record in fund history (Renaissance
-# Medallion, ~66%/yr) is 5.7x short of it. The world can pay $228/yr — nobody
-# offers it. This constant exists so the system is measured against the goal
-# the operator actually set, and says plainly, every cycle, how far off it is.
+# Measured against the account as it stands ($60.69), that is a 14,444% annual
+# return, and no mechanism produces it — the best verified rate available here
+# is 8.53%, and Renaissance Medallion's ~66%/yr (the best sustained record in
+# the history of finance) applied to this balance earns $0.77/WEEK, still 6x
+# short of even a $4.39/week target. So as a RETURN ON THIS CAPITAL the goal is
+# unreachable, and this constant exists to say so with a number every cycle
+# rather than to imply progress.
+#
+# It is NOT unreachable as an income. $1/hour is reachable two ways, and the
+# report now prices both instead of only the first:
+#
+#   1. CAPITAL at the achievable rate:  $8,760 / 0.0853 = ~$102,700 in earn.
+#   2. CAPITAL-INDEPENDENT revenue: income that does not scale with what we
+#      hold — referral/affiliate commission, licensing the allocator, bounties.
+#      These pay the same on a $60 account as on a $0 one, which is the only
+#      honest way to "unbind the goal from capital".
+#
 # Override with PROFIT_TARGET_HOURLY_USD.
-OPERATOR_TARGET_HOURLY_USD = float(os.getenv("PROFIT_TARGET_HOURLY_USD", str(4.39 / 168.0)))
+OPERATOR_TARGET_HOURLY_USD = float(os.getenv("PROFIT_TARGET_HOURLY_USD", "1.00"))
 
 
 def timestamp(value: str) -> datetime:
