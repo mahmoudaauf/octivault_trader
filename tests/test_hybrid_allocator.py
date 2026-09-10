@@ -1279,3 +1279,75 @@ async def test_tier_fill_is_a_noop_when_the_split_is_already_optimal(tmp_path, c
     out = capsys.readouterr().out
     assert "TIER-FILL]" in out and "TIER-FILL-MOVE" not in out
     c.redeem_simple_earn_flexible_product.assert_not_called()
+
+
+# --- the audit must be connected to the money (2026-09-10) --------------------
+#
+# Real failure. When the tier planner replaced single-coin rotation on 09-08,
+# _trusted_apr was left applied only inside _scan_stablecoins, whose return
+# value the planner does not use. So the audit printed [YIELD-SHORTFALL] for
+# USD1 every cycle while the planner, reading the advertised 8.52%,
+# consolidated a further $12.20 into it. Two bugs: distrust was disconnected
+# from the mover, and nothing stopped ADDING to a flagged product.
+
+USD1_BOARD = [{"asset": "USD1", "base_apr": 0.0154, "tiers": [(0.0, 1500.0, 0.07)]},
+              {"asset": "USDT", "base_apr": 0.0283, "tiers": [(0.0, 800.0, 0.04)]}]
+
+
+def test_distrusted_product_loses_its_tier_not_just_a_little_rate(tmp_path):
+    """A bonus that is not arriving means NO TIER, which is what the reward
+    history showed: USD1 paying 1.45% against a 1.54% advertised base."""
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USD1": {
+        "2026-09-09": 0.0067, "2026-09-10": 0.0145, "2026-09-11": 0.0150}}}
+    out = {p["asset"]: p for p in h._distrusted_products(state, USD1_BOARD)}
+    assert out["USD1"]["tiers"] == [] and out["USD1"]["distrusted"] is True
+    assert out["USD1"]["base_apr"] == pytest.approx(0.0145)   # median observed
+    assert out["USDT"]["tiers"] == [(0.0, 800.0, 0.04)]        # untouched
+    assert "distrusted" not in out["USDT"]
+
+
+def test_plan_abandons_a_distrusted_coin_for_the_honest_second_best(tmp_path):
+    """The self-correction that was severed: once USD1 is distrusted the plan
+    must prefer USDT, which is what finally moves the money back."""
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USD1": {
+        "2026-09-09": 0.0067, "2026-09-10": 0.0145, "2026-09-11": 0.0150}}}
+    products = h._distrusted_products(state, USD1_BOARD)
+    plan, apr = h._tier_fill_plan(products, 60.25)
+    assert plan == {"USDT": 60.25}
+    assert apr == pytest.approx(0.0683)
+    src, dst, amt, edge = h._tier_fill_move(products, {"USD1": 60.25}, plan, state=state)
+    assert (src, dst) == ("USD1", "USDT") and amt == pytest.approx(60.25) and edge > 0
+
+
+def test_one_day_of_doubt_blocks_adding_even_though_three_are_needed_to_exit(tmp_path, capsys):
+    """The exact 09-09 move: $12.20 USDT -> USD1 one day after USD1's bonus was
+    first flagged. Exiting needs SHORTFALL_DAYS; entering must need none."""
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USD1": {"2026-09-09": 0.0067}}}
+    # One day only: not enough to re-rate the product...
+    assert h._trusted_apr(state, "USD1", 0.0854) == pytest.approx(0.0854)
+    # ...but enough to refuse adding to it.
+    plan, _ = h._tier_fill_plan(USD1_BOARD, 60.20)
+    assert plan == {"USD1": 60.20}
+    holdings = {"USD1": 48.0, "USDT": 12.20}
+    assert h._tier_fill_move(USD1_BOARD, holdings, plan, state=state) is None
+    assert "TIER-FILL-BLOCK" in capsys.readouterr().out
+
+
+def test_adding_is_allowed_when_there_is_no_doubt_at_all(tmp_path):
+    h = _load(tmp_path)
+    plan, _ = h._tier_fill_plan(USD1_BOARD, 60.20)
+    move = h._tier_fill_move(USD1_BOARD, {"USD1": 48.0, "USDT": 12.20}, plan, state={})
+    assert move is not None and move[1] == "USD1"
+
+
+def test_shortfall_days_counts_only_days_under_the_floor(tmp_path):
+    h = _load(tmp_path)
+    state = {"yield_observations": {"X": {"a": 0.0145, "b": 0.0854, "c": 0.0067}}}
+    assert h._shortfall_days(state, "X", 0.0854) == [0.0067, 0.0145]
+    # Against a 2% advertised rate the floor is 1.2%: 1.45% clears it, 0.67% does not.
+    assert h._shortfall_days(state, "X", 0.0200) == [0.0067]
+    assert h._shortfall_days(state, "X", 0.0100) == []        # floor 0.6%: all clear
+    assert h._shortfall_days({}, "X", 0.0854) == []

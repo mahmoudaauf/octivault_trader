@@ -410,6 +410,49 @@ async def _symbol_filters(client, symbol: str) -> tuple[float, float, float]:
 SHORTFALL_DAYS = int(os.getenv("YIELD_SHORTFALL_DAYS", "3"))
 
 
+def _shortfall_days(state, asset: str, advertised: float) -> list[float]:
+    """Recorded days on which `asset` paid under 60% of its advertised rate.
+
+    Separate from _trusted_apr because ENTERING and EXITING deserve different
+    standards of proof, and conflating them cost real money on 2026-09-09.
+    Exiting a position on one low reading risks churning out of a good product
+    over a late reward credit, so it requires SHORTFALL_DAYS of evidence.
+    ADDING to a position has no such excuse: the downside is unbounded and
+    compounding, the upside of piling in one day sooner is a rounding error, so
+    a single day of doubt is enough to refuse.
+    """
+    days = (state.get("yield_observations") or {}).get(asset.upper()) or {}
+    return sorted(v for v in days.values() if v < advertised * 0.60)
+
+
+def _distrusted_products(state, products: list[dict]) -> list[dict]:
+    """Products re-rated at what they have actually been observed to pay.
+
+    THIS IS THE LINK BETWEEN THE AUDIT AND THE MONEY, and its absence was a real
+    failure. When the tier planner replaced single-coin rotation on 2026-09-08,
+    _trusted_apr was left applied only inside _scan_stablecoins — whose return
+    value the planner does not use. The audit therefore printed
+    [YIELD-SHORTFALL] for USD1 every cycle while the planner, reading the
+    advertised 8.52%, consolidated a further $12.20 into it. The machine was
+    simultaneously saying "this rate is not arriving" and acting on that rate.
+
+    A product whose bonus is not arriving is not a product paying slightly less;
+    it is a product with NO TIER. So the distrusted view drops the tiers outright
+    and sets the base to the observed rate, which is exactly what the reward
+    history shows: USD1 paying 1.45% against 1.54% advertised base, tier absent.
+    """
+    out = []
+    for p in products:
+        advertised = _effective_apr(float(p.get("base_apr", 0.0) or 0.0),
+                                    p.get("tiers") or [], 1.0)
+        trusted = _trusted_apr(state, p["asset"], advertised)
+        if trusted < advertised:
+            out.append({**p, "base_apr": trusted, "tiers": [], "distrusted": True})
+        else:
+            out.append(p)
+    return out
+
+
 def _trusted_apr(state, asset: str, advertised: float) -> float:
     """The advertised rate, unless we have watched it fail to arrive.
 
@@ -1076,7 +1119,8 @@ def _alloc_yield(products: list[dict], alloc: dict) -> float:
     return out
 
 
-def _tier_fill_move(products: list[dict], holdings: dict, plan: dict) -> tuple | None:
+def _tier_fill_move(products: list[dict], holdings: dict, plan: dict,
+                    state: dict | None = None) -> tuple | None:
     """The single best leg toward `plan`, as (source, target, amount, edge_apr).
 
     ONE leg per cycle, executed through the existing rotation primitive, rather
@@ -1100,6 +1144,22 @@ def _tier_fill_move(products: list[dict], holdings: dict, plan: dict) -> tuple |
     if amount < TIER_FILL_MIN_USD:
         return None
     source, target = over[0][1], under[0][1]
+    # Asymmetric by design: one day of doubt blocks ADDING, where exiting needs
+    # SHORTFALL_DAYS. On 2026-09-09 this gate's absence let $12.20 move INTO
+    # USD1 a day after its bonus was first flagged as missing.
+    if state is not None:
+        by = {p["asset"]: p for p in products}
+        tp = by.get(target)
+        if tp is not None:
+            advertised = _effective_apr(float(tp.get("base_apr", 0.0) or 0.0),
+                                        tp.get("tiers") or [], 1.0)
+            bad = _shortfall_days(state, target, advertised)
+            if bad:
+                print(f"  [TIER-FILL-BLOCK] not adding ${amount:,.2f} to {target}: "
+                      f"it has underpaid on {len(bad)} recorded day(s) "
+                      f"(worst {min(bad)*100:.2f}% vs {advertised*100:.2f}% advertised). "
+                      f"Adding to a suspect product needs zero doubt, not 3 days of it.")
+                return None
     after = dict(holdings)
     after[source] = after.get(source, 0.0) - amount
     after[target] = after.get(target, 0.0) + amount
@@ -1119,13 +1179,21 @@ async def _tier_fill(client, state, holdings: dict) -> bool:
     total = sum(v for v in holdings.values() if v > 0)
     if total <= 0:
         return False
-    products = []
+    raw = []
     for asset in ROTATE_DESTINATIONS:
         got = await _earn_products(client, asset, total)
         if got:
-            products.append(got[0])
-    if not products:
+            raw.append(got[0])
+    if not raw:
         return False
+    # Plan on what these products have been OBSERVED to pay, not what they
+    # advertise. Without this the planner acts on a rate the audit has already
+    # contradicted — see _distrusted_products.
+    products = _distrusted_products(state, raw)
+    for p in products:
+        if p.get("distrusted"):
+            print(f"  [TIER-FILL-DISTRUST] {p['asset']} re-rated to its observed "
+                  f"{p['base_apr']*100:.2f}% (tier treated as absent) for planning")
 
     plan, blended = _tier_fill_plan(products, total)
     now_apr = _alloc_yield(products, holdings) / total
@@ -1136,7 +1204,7 @@ async def _tier_fill(client, state, holdings: dict) -> bool:
           f"({', '.join(f'{a} ${v:,.0f}' for a, v in sorted(plan.items(), key=lambda kv: -kv[1]))})"
           f"   bonus-tier capacity ${capacity:,.0f}")
 
-    move = _tier_fill_move(products, holdings, plan)
+    move = _tier_fill_move(products, holdings, plan, state=state)
     if not move:
         return False
     source, target, amount, edge = move
