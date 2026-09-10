@@ -1394,29 +1394,46 @@ def test_product_with_no_advertised_tier_cannot_have_an_absent_one(tmp_path):
     assert h._tier_never_paid(state, "FDUSD", [], {"FDUSD": 0.0}) is False
 
 
-def test_never_paid_tier_rates_the_product_at_its_base_and_moves_the_money(tmp_path):
-    """The whole point: USD1 re-rated to its 1.54% base, so USDT's working
-    6.83% tier wins and the planner rotates out without waiting a third day."""
+def test_a_zero_bonus_reading_is_reported_but_NEVER_moves_money(tmp_path, capsys):
+    """The 2026-09-10 near-miss, pinned. bonusCum==0 is not a fact: Binance
+    backdates the credit and the API lags it ~2h. USD1 read 0 at 05:35 and
+    5.72% at 05:57, having been paid at 03:55. Acting on the zero would have
+    rotated $60 out of a product paying its tier in full."""
     h = _load(tmp_path)
+    # Two days observed, zero bonus visible: the old code re-rated on this.
     state = {"yield_observations": {"USD1": {"2026-09-09": 0.0067, "2026-09-10": 0.0145}}}
     products = h._distrusted_products(state, USD1_BOARD, {"USD1": 0.0, "USDT": 0.118})
     by = {p["asset"]: p for p in products}
-    assert by["USD1"]["tiers"] == [] and by["USD1"]["base_apr"] == pytest.approx(0.0154)
-    assert by["USD1"]["reason"] == "tier has never paid"
-    assert "distrusted" not in by["USDT"]
-    plan, apr = h._tier_fill_plan(products, 60.25)
-    assert plan == {"USDT": 60.25} and apr == pytest.approx(0.0683)
-    src, dst, amt, _ = h._tier_fill_move(products, {"USD1": 60.25}, plan, state=state)
-    assert (src, dst) == ("USD1", "USDT") and amt == pytest.approx(60.25)
+    # Reported...
+    assert "TIER-BONUS-UNSEEN" in capsys.readouterr().out
+    # ...but the tier is INTACT: two days is not three, so no re-rating.
+    assert by["USD1"]["tiers"] == [(0.0, 1500.0, 0.07)]
+    assert "distrusted" not in by["USD1"]
+    plan, _ = h._tier_fill_plan(products, 60.25)
+    assert plan == {"USD1": 60.25}          # money stays put
 
 
-def test_entry_block_also_fires_on_a_never_paid_tier(tmp_path, capsys):
+def test_a_late_credit_heals_the_measured_gate_by_itself(tmp_path):
+    """Why the measured-rate gate is the right decider: the credit that landed
+    lifted USD1 from 1.45% to 5.72%, clearing the 60% floor with no code change."""
     h = _load(tmp_path)
-    state = {"yield_observations": {"USD1": {"2026-09-09": 0.0067, "2026-09-10": 0.0145}}}
-    products = h._distrusted_products(state, USD1_BOARD, {"USD1": 0.0, "USDT": 0.118})
-    # Pretend the plan still wanted USD1; the block must refuse regardless.
-    assert h._tier_fill_move(products, {"USDT": 60.0}, {"USD1": 60.0}, state=state) is None
-    assert "tier has never paid" in capsys.readouterr().out
+    floor = 0.0853 * 0.60
+    assert 0.0145 < floor                       # before the credit: shortfall
+    assert 0.0572 > floor                       # after: cleared, no action taken
+    state = {"yield_observations": {"USD1": {"2026-09-09": 0.0067, "2026-09-10": 0.0572}}}
+    assert h._trusted_apr(state, "USD1", 0.0853) == pytest.approx(0.0853)
+
+
+def test_three_days_of_measured_underpayment_still_moves_the_money(tmp_path):
+    """The gate that survives: real, sustained underpayment still re-rates."""
+    h = _load(tmp_path)
+    state = {"yield_observations": {"USD1": {
+        "2026-09-09": 0.0067, "2026-09-10": 0.0145, "2026-09-11": 0.0150}}}
+    products = h._distrusted_products(state, USD1_BOARD, {"USD1": 0.0})
+    by = {p["asset"]: p for p in products}
+    assert by["USD1"]["tiers"] == [] and by["USD1"]["distrusted"] is True
+    plan, _ = h._tier_fill_plan(products, 60.25)
+    assert plan == {"USDT": 60.25}
 
 
 # --- a corrective move is not churn (2026-09-10) -----------------------------
@@ -1430,16 +1447,18 @@ async def test_cooldown_blocks_an_ordinary_rotation(tmp_path, monkeypatch):
     c.redeem_simple_earn_flexible_product.assert_not_called()
 
 
-async def test_cooldown_is_bypassed_when_escaping_a_tier_that_never_paid(tmp_path, monkeypatch, capsys):
-    """Binary, sticky signal -> no oscillation to prevent, so waiting only pays
-    the bad rate for another day."""
+async def test_cooldown_has_no_bypass_at_all(tmp_path, monkeypatch):
+    """A bypass existed for ~20 minutes on 2026-09-10 and was the difference
+    between a wrong $60 rotation and none. The cooldown is a circuit breaker
+    against this code's own conclusions, not just an anti-churn timer."""
     arm = tmp_path / "rotate_armed"; arm.touch()
     h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
     c = _mock_client()
     async def cheap(client, s, t): return ("USD1USDC", "SELL", 0.01)
     monkeypatch.setattr(h, "_conversion_cost_pct", cheap)
     state = {"position": None, "last_rotation_ts": time.time() - 3600}
-    await h._rotate_stablecoin(c, state, "USD1", "USDC", 60.0, 0.057,
-                               min_usd=5.0, ignore_cooldown=True)
-    out = capsys.readouterr().out
-    assert "cooldown bypassed" in out and "never paid" in out
+    assert await h._rotate_stablecoin(c, state, "USD1", "USDC", 60.0, 0.057,
+                                      min_usd=5.0) is False
+    c.redeem_simple_earn_flexible_product.assert_not_called()
+    import inspect
+    assert "ignore_cooldown" not in inspect.signature(h._rotate_stablecoin).parameters

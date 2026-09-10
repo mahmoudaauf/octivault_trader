@@ -446,25 +446,31 @@ async def _bonus_paid(client) -> dict:
 
 
 def _tier_never_paid(state, asset: str, tiers: list, bonus_paid: dict) -> bool:
-    """Has an advertised tier produced ZERO bonus across a complete window?
+    """REPORTING ONLY. Does an advertised tier show zero bonus so far?
 
-    This is a stronger and faster signal than a low measured rate, and having
-    only the latter cost real money. USD1 was subscribed 2026-09-08 18:46 UTC
-    advertising 7.00pp on the first 1,500. Two bonus windows then passed with
-    cumulativeBonusRewards at exactly 0 while the base stream paid to the
-    decimal (1.54% measured against 1.54% advertised). The measured-rate gate
-    needed three days to react, and in the meantime the planner — reading the
-    advertised 8.54% — consolidated MORE money into it.
+    DO NOT WIRE THIS INTO A DECISION. It was, for about twenty minutes on
+    2026-09-10, and the record of that is why this warning exists.
 
-    "Underpaying" and "this stream does not exist for us" are different claims.
-    The first deserves patience, because a late credit looks identical. The
-    second deserves none once a window has closed: the money is sitting at a
-    base rate while a rival's working tier is available, and every hour of
-    waiting is a certain loss against an uncertain hope.
+    The premise was that cumulativeBonusRewards == 0 is a binary fact and so a
+    faster, cleaner signal than a noisy measured rate. It is not a fact. Binance
+    BACKDATES the credit and the API lags it by roughly two hours:
 
-    Requires an advertised tier (nothing to be absent otherwise), an unambiguous
-    zero, and BONUS_GRACE_DAYS of observation so a one-day-old position is never
-    condemned for a window it has not reached yet.
+        03:55:37 UTC  USD1 bonus credited, 0.00920552 (= exactly 7.00%/yr on $48)
+        05:35:00 UTC  position reads bonusCum=0; history's latest row is 09-09
+        05:54:00 UTC  this check fires, planner schedules USD1 -> USDC, $60
+        05:57:00 UTC  API catches up; measured rate jumps 1.45% -> 5.72%
+
+    Only the 24h rotation cooldown prevented a $60 rotation out of a product
+    paying its tier in full, into two conversions and a worse rate.
+
+    The measured-rate gate in _trusted_apr is strictly better for deciding,
+    because it is SELF-HEALING against exactly this: a late credit lifts the
+    measured rate the moment it lands, which is what cleared USD1 instantly. A
+    zero read from a lagging endpoint heals nothing — it looks identical to a
+    dead tier for as long as the lag lasts.
+
+    So this stays as a log line worth seeing, and the money is moved only by
+    three separate days of measured underpayment.
     """
     if not tiers or not any(apr > 0 for _lo, _hi, apr in tiers):
         return False
@@ -512,14 +518,12 @@ def _distrusted_products(state, products: list[dict], bonus_paid: dict | None = 
         base = float(p.get("base_apr", 0.0) or 0.0)
         tiers = p.get("tiers") or []
         advertised = _effective_apr(base, tiers, 1.0)
-        # Strongest signal first: an advertised tier that has paid nothing
-        # through a complete window is absent, not merely disappointing. Rate
-        # the product at its BASE — which is what it demonstrably pays — rather
-        # than at a noisy measured average.
+        # A zero bonus reading is logged, never acted on: see _tier_never_paid
+        # for the two hours in which acting on it nearly cost a good position.
         if _tier_never_paid(state, p["asset"], tiers, bonus_paid or {}):
-            out.append({**p, "base_apr": base, "tiers": [], "distrusted": True,
-                        "reason": "tier has never paid"})
-            continue
+            print(f"  [TIER-BONUS-UNSEEN] {p['asset']} advertises a tier but no bonus "
+                  f"is visible yet. NOT acting on this — the credit endpoint lags "
+                  f"~2h. The measured-rate gate decides.")
         trusted = _trusted_apr(state, p["asset"], advertised)
         if trusted < advertised:
             out.append({**p, "base_apr": trusted, "tiers": [], "distrusted": True,
@@ -701,8 +705,7 @@ async def _conversion_cost_pct(client, source: str, target: str):
 async def _rotate_stablecoin(client, state, source: str, target: str,
                              amount: float, edge: float,
                              min_usd: float | None = None,
-                             max_payback_d: float | None = None,
-                             ignore_cooldown: bool = False) -> bool:
+                             max_payback_d: float | None = None) -> bool:
     """Move the core from one stablecoin earn product to a better-paying one.
 
     THE ONLY REDEEM IN THIS OBJECTIVE. Every gate below must pass, and the
@@ -723,16 +726,17 @@ async def _rotate_stablecoin(client, state, source: str, target: str,
         return False
     last = float(state.get("last_rotation_ts", 0.0) or 0.0)
     if last and (time.time() - last) < ROTATE_COOLDOWN_H * 3600:
-        # The cooldown exists to stop CHURN — oscillating between products on
-        # noisy rate readings. Escaping a product whose tier has provably never
-        # paid is not churn: the signal is binary (cumulativeBonusRewards == 0),
-        # it cannot flip back without a real payment arriving, so there is no
-        # oscillation to prevent. Holding a corrective move behind a 24h timer
-        # just pays the bad rate for another day.
-        if not ignore_cooldown:
-            return False
-        print(f"  [ROTATE] cooldown bypassed: leaving {source}, whose advertised "
-              f"tier has never paid — this cannot oscillate back")
+        # NO BYPASS. A bypass was added on 2026-09-10 for "escaping a tier that
+        # never paid" and removed the same hour, because within minutes the
+        # cooldown was the only thing that stopped a $60 rotation out of a
+        # product that was paying its tier in full. The reasoning had been that
+        # cumulativeBonusRewards == 0 is binary and cannot flip back; it flipped
+        # back two minutes later, because the API lags the credit by ~2h. The
+        # cooldown is not only an anti-churn timer — it is a circuit breaker
+        # against this code's own conclusions being wrong, and it has now earned
+        # that twice. Anything urgent enough to beat it is urgent enough for a
+        # human to look at.
+        return False
     # The scan already prefers approved destinations; this is the hard stop in
     # case anything else ever calls in here with a coin we scan but do not hold.
     if target.upper() not in ROTATE_DESTINATIONS:
@@ -1296,9 +1300,6 @@ async def _tier_fill(client, state, holdings: dict) -> bool:
     if not move:
         return False
     source, target, amount, edge = move
-    # Narrowly scoped: only when we are LEAVING a product whose tier never paid.
-    by = {p["asset"]: p for p in products}
-    escaping = by.get(source, {}).get("reason") == "tier has never paid"
     gain_yr = amount * edge
     print(f"  [TIER-FILL-MOVE] {source} -> {target} ${amount:,.2f}: "
           f"+{edge*100:.2f}pp on the moved dollars (+${gain_yr:,.2f}/yr)")
@@ -1306,8 +1307,7 @@ async def _tier_fill(client, state, holdings: dict) -> bool:
     # own cost cap, cooldown, arm file and destination allowlist all still apply.
     return await _rotate_stablecoin(client, state, source, target, amount, edge,
                                     min_usd=TIER_FILL_MIN_USD,
-                                    max_payback_d=TIER_FILL_MAX_PAYBACK_D,
-                                    ignore_cooldown=escaping)
+                                    max_payback_d=TIER_FILL_MAX_PAYBACK_D)
 
 
 async def _earn_positions(client) -> dict | None:
