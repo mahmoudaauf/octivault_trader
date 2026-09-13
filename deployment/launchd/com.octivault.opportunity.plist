@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.octivault.opportunity</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mauf/Projects/octivault_trader/venv/bin/python3</string>
+    <string>/Users/mauf/Projects/octivault_trader/opportunity_desk.py</string>
+    <string>scan</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/mauf/Projects/octivault_trader</string>
+  <!-- Hourly. Binance rotates bonus tiers on a monthly cadence, so hourly is
+       already far finer than the event rate; more often would only add API load
+       and log noise without catching anything sooner. -->
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/mauf/Projects/octivault_trader/logs/opportunity.log</string>
+  <key>StandardErrorPath</key><string>/Users/mauf/Projects/octivault_trader/logs/opportunity.err</string>
+</dict>
+</plist>
