@@ -179,3 +179,42 @@ Rate 7.24% → 8.53% · every USD stablecoin scanned, vetted allowlist for holdi
 · tier-filler live (capacity $2,600) · paid-vs-promised audit with three-day gate
 and entry block · both income axes tracked every 15 min · 1,118 tests · four
 autonomous agents · $60.69 compounding at the best rate on the exchange.
+
+---
+
+## Addendum 2026-09-13 — the last untested edge, falsified
+
+Order-book imbalance was the only lever in this project never tested against
+real out-of-sample data; the original run said so upfront, having had just
+**22.7 hours** of snapshots. Collection continued until `main.py` was retired,
+leaving **57.5 days / 155,057 snapshots / 37 symbols — 60x the data.**
+
+Re-ran it. 27,121 signal events, 70/30 chronological holdout:
+
+| horizon | out-of-sample avg net | win-rate |
+|---|---|---|
+| 1 min | −0.0984% | 11% |
+| 5 min | −0.0920% | 24% |
+| 15 min | −0.0905% | 32% |
+| 60 min | −0.1055% | 40% |
+
+**Every horizon loses almost exactly the 0.12% round-trip cost.** That is the
+signature of zero predictive power — the signal tells you nothing and you pay
+the spread.
+
+One trap worth recording: the 60-minute horizon shows **+33.29% in-sample**
+against **−0.1055% out-of-sample**. A +33% average net return over 16,997
+events is not an edge, it is a data artifact (stale or gapped snapshot prices
+around delistings and collection pauses). Anyone re-reading these logs will hit
+that number; it is not real.
+
+**The edge search is now exhaustively complete.** Every category has been
+measured with real data and falsified or found uncapturable. There is no
+untested lever remaining, which means the two levers in this plan — capital
+and referral — are not merely the best options, they are the only ones.
+
+Also done this day: the `com.octivault.halal` agent was unloaded and its plist
+retired (redundant since Simple Earn was approved; it had moved nothing).
+Launchpool capture was verified end-to-end against a simulated live pool — the
+scan correctly switches to FDUSD at 21.54% (+$7.81/yr) when one runs. No pool
+is live; 70 completed all-time.
