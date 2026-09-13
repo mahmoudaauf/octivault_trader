@@ -255,6 +255,27 @@ def risks(pos: dict) -> None:
         print(f"  {n:<34}{e:<22}{note}")
 
 
+def platform() -> None:
+    """Is the machinery actually running? Loaded is not the same as producing."""
+    _rule("PLATFORM")
+    try:
+        import platform_health as ph
+        rows = ph.check()
+    except Exception as e:
+        print(f"  {UNKNOWN} — health check unavailable: {str(e)[:70]}")
+        return
+    bad = [r for r in rows if r["state"] != "OK"]
+    ok = len(rows) - len(bad)
+    print(f"  {ok}/{len(rows)} agents loaded AND producing output within their own cadence")
+    for r in bad:
+        print(f"  ⚠ {r['label']:<32}{r['state']} — {r['why']}")
+    noisy = [r for r in rows if r["err"]]
+    for r in noisy:
+        print(f"  · {r['label']:<32}recent stderr: {r['err'][:60]}")
+    if not bad and not noisy:
+        print("  no stale agents, no recent errors")
+
+
 def desk() -> None:
     _rule("YOUR DESK  (only the principal can do these)")
     print("  1. Account → Referral — report the mode. Lite vs Pro is likely irreversible,")
@@ -290,6 +311,7 @@ def main() -> int:
     axes(pos.get("nav"), pos.get("rate"), a.goal)
     pipeline()
     risks(pos)
+    platform()
     desk()
     print("\n" + "═" * 74)
     return 0

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.octivault.health</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mauf/Projects/octivault_trader/venv/bin/python3</string>
+    <string>/Users/mauf/Projects/octivault_trader/platform_health.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/mauf/Projects/octivault_trader</string>
+  <!-- Hourly. Long enough that a single missed cycle on any watched job has
+       already resolved itself; short enough that a genuinely dead agent is
+       caught the same day rather than the same month — which is what happened
+       when three cron jobs died silently for six weeks in July 2026. -->
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/mauf/Projects/octivault_trader/logs/platform_health.log</string>
+  <key>StandardErrorPath</key><string>/Users/mauf/Projects/octivault_trader/logs/platform_health.err</string>
+</dict>
+</plist>
