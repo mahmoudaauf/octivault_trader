@@ -73,7 +73,12 @@ CAPITAL_BOUND = ("flexible", "simple earn", "locked", "staking", "savings",
 CAPITAL_FREE = ("referral", "commission", "kickback", "rebate", "affiliate",
                 "airdrop", "launchpool", "megadrop", "hodler", "distribution",
                 "token swap", "bonus voucher", "reward voucher", "campaign",
-                "promotion")
+                "promotion",
+                # Paid for doing something, not for holding something: quiz
+                # rewards, task centres, content. Added 2026-09-13 — these read
+                # as UNCLASSIFIED before, so a Learn & Earn credit would have
+                # been excluded from the capital-free axis it belongs on.
+                "learn", "quiz", "task", "rewards hub", "write2earn", "word of the day")
 
 
 def _signed(path: str, params: dict | None = None):

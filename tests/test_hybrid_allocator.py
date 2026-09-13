@@ -1462,3 +1462,107 @@ async def test_cooldown_has_no_bypass_at_all(tmp_path, monkeypatch):
     c.redeem_simple_earn_flexible_product.assert_not_called()
     import inspect
     assert "ignore_cooldown" not in inspect.signature(h._rotate_stablecoin).parameters
+
+
+# --- free tokens must become capital, not dust (2026-09-13) -------------------
+#
+# Until this change only Launchpool reward coins were converted. Binance pays
+# several programmes in kind — Learn & Earn quizzes, task campaigns, HODLer
+# airdrops, token-swap distributions — and every one of those would have landed
+# in spot and stayed there. The $0.37 of ADA/INJ/DASH/PEPE in this account is
+# exactly that: free tokens nobody ever swept.
+
+def _acct(balances):
+    return {"balances": [{"asset": a, "free": str(v), "locked": "0"} for a, v in balances.items()]}
+
+
+async def test_windfall_token_is_sold_even_though_no_launchpool_names_it(tmp_path, monkeypatch, capsys):
+    """A $3 Learn & Earn reward in SOL: not a Launchpool coin, must still convert."""
+    arm = tmp_path / "rotate_armed"; arm.touch()
+    h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
+    c = _mock_client()
+    c.get_account = AsyncMock(return_value=_acct({"SOL": 0.02, "USDT": 5.0}))
+    async def no_pools(client): return {}
+    monkeypatch.setattr(h, "_launchpool_projects", no_pools)
+    monkeypatch.setattr(h, "_asset_free", AsyncMock(return_value=0.02))
+    monkeypatch.setattr(h, "_symbol_filters", AsyncMock(return_value=(0.001, 5.0, 0.01)))
+    monkeypatch.setattr(h, "_price", AsyncMock(return_value=200.0))   # 0.02 * 200 = $4... below $5
+    await h._sell_launchpool_rewards(c, {})
+    out = capsys.readouterr().out
+    assert "SOL" in out                                   # considered, not ignored
+
+
+async def test_windfall_above_min_notional_is_sold(tmp_path, monkeypatch, capsys):
+    arm = tmp_path / "rotate_armed"; arm.touch()
+    h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
+    c = _mock_client()
+    c.get_account = AsyncMock(return_value=_acct({"SOL": 0.10}))
+    async def no_pools(client): return {}
+    monkeypatch.setattr(h, "_launchpool_projects", no_pools)
+    monkeypatch.setattr(h, "_asset_free", AsyncMock(return_value=0.10))
+    monkeypatch.setattr(h, "_symbol_filters", AsyncMock(return_value=(0.001, 5.0, 0.01)))
+    monkeypatch.setattr(h, "_price", AsyncMock(return_value=200.0))   # $20 — sellable
+    await h._sell_launchpool_rewards(c, {})
+    assert "WINDFALL-DRYRUN" in capsys.readouterr().out
+
+
+async def test_windfall_never_sells_stables_protected_holds_or_bnb(tmp_path, monkeypatch, capsys):
+    """BNB is the fee buffer; BTC/PAXG are protected holds; stables are the core.
+    NAV_ASSETS is deliberately NOT a hold-list — see the companion test."""
+    arm = tmp_path / "rotate_armed"; arm.touch()
+    h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
+    c = _mock_client()
+    c.get_account = AsyncMock(return_value=_acct(
+        {"BNB": 1.0, "BTC": 0.5, "USDT": 100.0, "USDC": 100.0, "USD1": 100.0}))
+    async def no_pools(client): return {}
+    monkeypatch.setattr(h, "_launchpool_projects", no_pools)
+    monkeypatch.setattr(h, "_symbol_filters", AsyncMock(return_value=(0.001, 5.0, 0.01)))
+    monkeypatch.setattr(h, "_price", AsyncMock(return_value=1000.0))
+    await h._sell_launchpool_rewards(c, {})
+    out = capsys.readouterr().out
+    for protected in ("BNB", "BTC", "USDT", "USDC", "USD1"):
+        assert f"{protected}USDT" not in out and f" {protected} " not in out
+
+
+async def test_windfall_selling_respects_the_arm_file(tmp_path, monkeypatch, capsys):
+    # Point at a path that does not exist. The default is logs/hybrid_rotate_armed,
+    # which is PRESENT on the live machine and would otherwise leak in and arm
+    # the test.
+    h = _load(tmp_path, HYBRID_MODE="dryrun",
+              HYBRID_ROTATE_ARM_FILE=str(tmp_path / "no_such_arm_file"))
+    c = _mock_client()
+    c.get_account = AsyncMock(return_value=_acct({"SOL": 0.10}))
+    async def no_pools(client): return {}
+    monkeypatch.setattr(h, "_launchpool_projects", no_pools)
+    monkeypatch.setattr(h, "_asset_free", AsyncMock(return_value=0.10))
+    monkeypatch.setattr(h, "_symbol_filters", AsyncMock(return_value=(0.001, 5.0, 0.01)))
+    monkeypatch.setattr(h, "_price", AsyncMock(return_value=200.0))
+    await h._sell_launchpool_rewards(c, {})
+    out = capsys.readouterr().out
+    assert "DISARMED" in out and "WINDFALL-DRYRUN" not in out
+
+
+async def test_account_read_failure_falls_back_to_launchpool_coins_only(tmp_path, monkeypatch, capsys):
+    """An unreadable balance list must not crash the cycle or sell blindly."""
+    arm = tmp_path / "rotate_armed"; arm.touch()
+    h = _load(tmp_path, HYBRID_MODE="dryrun", HYBRID_ROTATE_ARM_FILE=str(arm))
+    c = _mock_client()
+    c.get_account = AsyncMock(side_effect=Exception("api down"))
+    async def no_pools(client): return {}
+    monkeypatch.setattr(h, "_launchpool_projects", no_pools)
+    assert await h._sell_launchpool_rewards(c, {}) == 0.0
+    assert "WINDFALL-READ-FAIL" in capsys.readouterr().out
+
+
+def test_nav_watchlist_is_for_valuing_not_for_holding(tmp_path):
+    """ADA and INJ sat in spot as dust precisely because NAV_ASSETS was used as
+    a never-sell list. Being able to PRICE a coin is not a reason to KEEP it;
+    PROTECTED_ASSETS is the hold-list and it is deliberately short."""
+    # Set explicitly: _load mutates os.environ, so a value set by an earlier
+    # test leaks into this one (it read {"BTC"} rather than the default).
+    h = _load(tmp_path, HYBRID_PROTECTED_ASSETS="BTC,PAXG")
+    assert "SOL" in h.NAV_ASSETS and "ADA" in h.NAV_ASSETS and "INJ" in h.NAV_ASSETS
+    assert h.PROTECTED_ASSETS == {"BTC", "PAXG"}
+    # The watchlist is far larger than the hold-list, which is the whole point.
+    assert len(h.NAV_ASSETS) > len(h.PROTECTED_ASSETS)
+    assert not (set(h.NAV_ASSETS) - {"BTC", "PAXG", "BNB"}) & h.PROTECTED_ASSETS

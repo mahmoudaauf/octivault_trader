@@ -52,3 +52,13 @@ def test_yield_wins_when_a_label_could_read_either_way():
 def test_stablecoins_are_priced_without_a_network_call():
     for a in ("USDT", "USDC", "USD1", "FDUSD", "BFUSD"):
         assert inc._price(a) == 1.0
+
+
+@pytest.mark.parametrize("label", [
+    "Learn and Earn reward", "Learn & Earn", "Quiz reward", "Rewards Hub task",
+    "Write2Earn payout", "Word of the Day reward",
+])
+def test_paid_for_doing_not_holding_is_capital_free(label):
+    """These read as UNCLASSIFIED before 2026-09-13, so a Learn & Earn credit
+    would have been excluded from the capital-free axis it belongs on."""
+    assert inc.classify(label) == "capital_free"

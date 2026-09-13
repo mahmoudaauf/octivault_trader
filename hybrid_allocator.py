@@ -899,23 +899,57 @@ async def _launchpool_boost(client) -> dict[str, float]:
 
 
 async def _sell_launchpool_rewards(client, state) -> float:
-    """Sell reward tokens that landed in spot from a Launchpool, on listing day.
+    """Sell any windfall token sitting in spot, so free tokens become capital.
 
-    Gated exactly like rotation (it is a SELL), and restricted to assets that
-    the Launchpool listing itself names as a reward coin — never a protected
-    hold, never a stablecoin, never anything on the NAV watchlist. The
-    backtest is unambiguous that holding the reward loses; proceeds are left in
-    spot USDT, and the next sweep compounds them into earn.
+    Covers Launchpool reward coins AND anything else Binance pays in kind —
+    Learn & Earn quiz rewards, task campaigns, HODLer airdrops, token-swap
+    distributions. Until 2026-09-13 only Launchpool coins were converted, so
+    every other free token would have landed in spot and stayed there as dust.
+    That is not hypothetical: $0.37 of ADA, INJ, DASH, PEPE and friends has been
+    sitting there the whole time, and a single $3 Learn & Earn reward is more
+    than half a year of this account's entire yield.
+
+    Gated exactly like rotation (it is a SELL). Never touches a stablecoin, a
+    PROTECTED_ASSETS hold, or BNB (the fee buffer). Deliberately it DOES touch
+    assets on the NAV watchlist: that list exists to VALUE holdings, and being
+    able to price a coin is not a reason to keep it.
+    Anything below the exchange's min notional is left alone and reported —
+    selling is impossible there, which is precisely why dust accumulates.
+
+    Proceeds stay in spot USDT and the next sweep compounds them into earn.
+    Holding the reward instead is the measured-worse choice: a median 12% loss
+    in week one.
     """
+    coins: set[str] = set()
     data = await _launchpool_projects(client)
-    if not data:
-        return 0.0
-    recent = [pr for pr in (data.get("completed", {}).get("list") or [])
-              if time.time() * 1000 - float(pr.get("mineEndTime") or 0) < 14 * 86_400_000]
-    coins = {str(pr.get("rebateCoin", "")).upper()
-             for pr in (data.get("tracking") or []) + recent
-             if pr.get("coinTradeTime") and float(pr["coinTradeTime"]) * 1000 <= time.time() * 1000}
-    coins -= set(STABLE_ASSETS) | PROTECTED_ASSETS | set(NAV_ASSETS) | {""}
+    if data:
+        recent = [pr for pr in (data.get("completed", {}).get("list") or [])
+                  if time.time() * 1000 - float(pr.get("mineEndTime") or 0) < 14 * 86_400_000]
+        coins |= {str(pr.get("rebateCoin", "")).upper()
+                  for pr in (data.get("tracking") or []) + recent
+                  if pr.get("coinTradeTime") and float(pr["coinTradeTime"]) * 1000 <= time.time() * 1000}
+    # ANY windfall token, not only Launchpool reward coins. Binance pays several
+    # programmes in whatever asset they feature — Learn & Earn quizzes, task
+    # campaigns, HODLer airdrops, token-swap distributions — and until now
+    # nothing converted those. They would have landed in spot and stayed there
+    # forever as dust, which is exactly what the $0.37 of ADA/INJ/DASH/PEPE
+    # already sitting there is: free tokens nobody ever swept. The reason to
+    # sell rather than hold is unchanged and measured — holding a reward token
+    # lost a median 12% in week one — and the reason to compound is that a $3
+    # quiz reward is over half a year of this account's yield.
+    try:
+        acct = await _retry(client.get_account)
+        coins |= {str(b.get("asset", "")).upper() for b in (acct.get("balances") or [])
+                  if float(b.get("free", 0) or 0) > 0}
+    except Exception as e:
+        print(f"  [WINDFALL-READ-FAIL] {str(e)[:70]} — Launchpool coins only this cycle")
+    # PROTECTED_ASSETS is the hold-list; NAV_ASSETS is NOT and must not be used
+    # as one. NAV_ASSETS exists so holdings can be VALUED — being able to price
+    # a coin is not a reason to keep it. Conflating the two is why ADA and INJ
+    # are still sitting in spot as dust: they are on the NAV watchlist, so the
+    # old exclusion refused to convert them, forever. BNB stays excluded on its
+    # own merits as the fee-discount buffer.
+    coins -= set(STABLE_ASSETS) | PROTECTED_ASSETS | {"BNB", ""}
     sold = 0.0
     for coin in sorted(coins):
         free = await _asset_free(client, coin)
@@ -929,22 +963,22 @@ async def _sell_launchpool_rewards(client, state) -> float:
             continue
         qty = _round_step(free, step)
         if qty <= 0 or qty * px < min_notional:
-            print(f"  [LP-REWARD] {free:.6f} {coin} (~${free*px:.2f}) below min notional — holding until it is not")
+            print(f"  [WINDFALL] {free:.6f} {coin} (~${free*px:.2f}) below min notional — holding until it is not")
             continue
         if not _rotate_armed():
-            print(f"  [LP-REWARD] {qty} {coin} (~${qty*px:.2f}) sellable; rotation DISARMED so not sold")
+            print(f"  [WINDFALL] {qty} {coin} (~${qty*px:.2f}) sellable; rotation DISARMED so not sold")
             continue
         if not _is_live():
-            print(f"  [LP-REWARD-DRYRUN] would order_market_sell(symbol={symbol!r}, quantity={qty})")
+            print(f"  [WINDFALL-DRYRUN] would order_market_sell(symbol={symbol!r}, quantity={qty})")
             continue
         try:
             await _retry(client.order_market_sell, symbol=symbol, quantity=qty)
             sold += qty * px
-            _log_trade({"ts": datetime.now(timezone.utc).isoformat(), "kind": "launchpool_reward_sell",
+            _log_trade({"ts": datetime.now(timezone.utc).isoformat(), "kind": "windfall_sell",
                         "asset": coin, "qty": qty, "usd": round(qty * px, 4), "mode": MODE})
-            print(f"  [LP-REWARD] 🟢 sold {qty} {coin} ≈ ${qty*px:.2f} — swept to earn next cycle")
+            print(f"  [WINDFALL] 🟢 sold {qty} {coin} ≈ ${qty*px:.2f} — swept to earn next cycle")
         except Exception as e:
-            print(f"  [LP-REWARD-FAIL] {coin}: {str(e)[:80]}")
+            print(f"  [WINDFALL-FAIL] {coin}: {str(e)[:80]}")
     return sold
 
 
