@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.octivault.p2pspread</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mauf/Projects/octivault_trader/venv/bin/python3</string>
+    <string>/Users/mauf/Projects/octivault_trader/p2p_spread_monitor.py</string>
+    <string>sample</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/mauf/Projects/octivault_trader</string>
+  <!-- Every 15 min. The spread moves intraday with payment-rail availability,
+       so the distribution needs samples across the whole day, not the hour a
+       human happened to look. 48h gives ~192 observations. -->
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/mauf/Projects/octivault_trader/logs/p2p_spread.log</string>
+  <key>StandardErrorPath</key><string>/Users/mauf/Projects/octivault_trader/logs/p2p_spread.err</string>
+</dict>
+</plist>
