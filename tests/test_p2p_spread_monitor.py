@@ -163,3 +163,79 @@ def test_the_median_stays_comparable_when_the_book_gets_deeper(tmp_path, monkeyp
     # Median of the first 20 only — 500s on later pages must not drag it.
     assert row["buy_median"] == pytest.approx(109.5)
     assert row["n_buy"] == 100          # depth WAS fetched, for reach
+
+
+# --- the rail constraint is what makes a spread a trade (2026-09-29) ----------
+# spread_reach_pct was still not executable: it pairs the cheapest reachable BUY
+# ad with the dearest reachable SELL ad without asking whether the two settle on
+# the same payment rail. On the live book they do not — the cheap buy side is
+# Instapay, the rich sell side is VodafoneCash. Three consecutive snapshots gave
+# 0 of 749 / 755 / 654 combinations positive, best -0.411%, against a reach
+# figure of +0.757%. The apparent spread is the price of crossing rails.
+
+def test_the_executable_spread_requires_one_shared_rail(tmp_path, monkeypatch):
+    """The live shape: cheap to buy on Instapay, rich to sell on VodafoneCash,
+    and nothing joins them. Reach looks positive; executable is negative."""
+    monkeypatch.setattr(p2p, "STATE", str(tmp_path / "h.jsonl"))
+    monkeypatch.setattr(p2p, "CAPITAL_USD", 60.0)
+    monkeypatch.setattr(p2p, "_ads", lambda tt, rows=20, pages=1:
+                        [_ad(52.80, 100.0, rails=("Instapay",)),
+                         _ad(53.46, 100.0, rails=("VodafoneCash",))] if tt == "BUY"
+                        else [_ad(53.24, 100.0, rails=("VodafoneCash",))])
+    row = p2p.sample()
+    # Ignoring rails, 52.80 -> 53.24 looks like +0.833%.
+    assert row["spread_reach_pct"] == pytest.approx(0.833, abs=1e-2)
+    # Requiring a shared rail, the only pair is 53.46 -> 53.24 = -0.411%.
+    assert row["spread_exec_pct"] == pytest.approx(-0.411, abs=1e-2)
+    assert row["exec_rail"] == "VodafoneCash"
+    assert row["n_exec_positive"] == 0 and row["n_exec_combos"] == 1
+    assert row["spread_exec_pct"] < row["spread_reach_pct"]
+
+
+def test_a_genuinely_capturable_spread_is_still_reported(tmp_path, monkeypatch):
+    """The guard must not hard-code the negative answer: when a cheap buy and a
+    rich sell DO share a rail, the executable spread is positive."""
+    monkeypatch.setattr(p2p, "STATE", str(tmp_path / "h.jsonl"))
+    monkeypatch.setattr(p2p, "CAPITAL_USD", 60.0)
+    monkeypatch.setattr(p2p, "_ads", lambda tt, rows=20, pages=1:
+                        [_ad(52.80, 100.0, rails=("Instapay",))] if tt == "BUY"
+                        else [_ad(53.11, 100.0, rails=("Instapay", "telda"))])
+    row = p2p.sample()
+    assert row["spread_exec_pct"] == pytest.approx(0.587, abs=1e-2)
+    assert row["n_exec_positive"] == 1
+    assert row["exec_rail"] == "Instapay"
+
+
+def test_no_shared_rail_at_all_records_none_not_zero(tmp_path, monkeypatch):
+    """No overlapping rail means the executable spread is unknown, and unknown is
+    not 0% — a later report must not average it in as a flat outcome."""
+    monkeypatch.setattr(p2p, "STATE", str(tmp_path / "h.jsonl"))
+    monkeypatch.setattr(p2p, "CAPITAL_USD", 60.0)
+    monkeypatch.setattr(p2p, "_ads", lambda tt, rows=20, pages=1:
+                        [_ad(52.80, 100.0, rails=("Instapay",))] if tt == "BUY"
+                        else [_ad(53.40, 100.0, rails=("OrangeCash",))])
+    row = p2p.sample()
+    assert row["spread_exec_pct"] is None
+    assert row["n_exec_combos"] == 0
+    assert row["spread_reach_pct"] == pytest.approx(1.136, abs=1e-2)  # still true
+
+
+def test_frontier_refuses_to_price_a_target_off_a_negative_spread(tmp_path, monkeypatch, capsys):
+    """The failure this whole exercise is about: a headline number that prices a
+    plan. When the executable spread is negative the frontier must say so, and
+    must print n/a rather than a capital figure."""
+    monkeypatch.setattr(p2p, "STATE", str(tmp_path / "h.jsonl"))
+    rows = [{"ts": f"2026-09-2{d}T19:00:00+00:00", "buy": 52.8, "sell": 53.3,
+             "buy_min_fiat": 500.0, "sell_min_fiat": 500.0,
+             "spread_pct": 1.0, "spread_median_pct": 0.48,
+             "buy_median": 52.8, "sell_median": 53.05, "n_buy": 100, "n_sell": 100,
+             "spread_reach_pct": 0.795, "spread_exec_pct": -0.411,
+             "n_exec_combos": 654, "n_exec_positive": 0,
+             "orders30_p50": 286, "orders30_p90": 979, "maker_fee_p50": 0.0}
+            for d in range(1, 6)]
+    (tmp_path / "h.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    p2p.frontier()
+    out = capsys.readouterr().out
+    assert "NOT CAPTURABLE AS A TAKER" in out
+    assert "EXECUTABLE p50" in out and "n/a" in out
+    assert "MAKER" in out          # says what is actually left

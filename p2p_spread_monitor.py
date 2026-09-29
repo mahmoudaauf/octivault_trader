@@ -199,15 +199,49 @@ def sample() -> dict | None:
         return {m.get("tradeMethodName") or m.get("identifier")
                 for a in ads for m in (a["adv"].get("tradeMethods") or [])}
     row["rails_both"] = sorted(rails(buys) & rails(sells))
+
+    # --- the only spread that is a TRADE rather than a number -----------------
+    # Added 2026-09-29, hours after spread_reach_pct, because spread_reach_pct is
+    # still not executable: it pairs the cheapest reachable BUY ad with the
+    # dearest reachable SELL ad without asking whether the two settle on the same
+    # payment rail. They usually do not — the cheap buy side is Instapay and the
+    # rich sell side is VodafoneCash. Requiring one shared rail on both legs, two
+    # consecutive snapshots of the live book gave 0 of 749 and 0 of 755
+    # combinations positive, best -0.412%, against a reach figure of +0.757%.
+    #
+    # So this is the honest number and the earlier ones are upper bounds. It is
+    # recorded rather than concluded from: the book moved 1.25% between those two
+    # snapshots, which is exactly why this file exists.
+    def legs(ads):
+        return [(float(a["adv"]["price"]), minamt(a),
+                 rails([a])) for a in ads]
+    bl = [(px_, lo, r) for px_, lo, r in legs(buys) if lo <= fiat_cap]
+    sl = [(px_, lo, r) for px_, lo, r in legs(sells) if lo <= fiat_cap]
+    combos = [((sp - bp) / bp * 100, sorted(br & sr))
+              for bp, _bl, br in bl for sp, _sl, sr in sl if br & sr]
+    if combos:
+        best_exec = max(combos, key=lambda c: c[0])
+        row["spread_exec_pct"] = round(best_exec[0], 4)
+        row["exec_rail"] = best_exec[1][0] if best_exec[1] else None
+        row["n_exec_combos"] = len(combos)
+        row["n_exec_positive"] = sum(1 for g, _ in combos if g > 0)
+    else:
+        row["spread_exec_pct"] = None
+        row["exec_rail"] = None
+        row["n_exec_combos"] = 0
+        row["n_exec_positive"] = 0
     os.makedirs(os.path.dirname(STATE) or ".", exist_ok=True)
     with open(STATE, "a") as f:
         f.write(json.dumps(row) + "\n")
     reach = ("n/a" if row["spread_reach_pct"] is None
              else f"{row['spread_reach_pct']:+.3f}%")
+    ex = ("n/a" if row["spread_exec_pct"] is None
+          else f"{row['spread_exec_pct']:+.3f}%")
     print(f"[p2p {row['ts'][11:16]}] buy {row['buy']:.2f} sell {row['sell']:.2f} "
           f"top {row['spread_pct']:+.3f}%  median {row['spread_median_pct']:+.3f}%  "
-          f"reachable@${CAPITAL_USD:.0f} {reach} ({row['n_reach']} ads)  "
-          f"merchants {row['orders30_p50']:.0f} orders/30d")
+          f"reach {reach}  EXEC {ex} "
+          f"({row['n_exec_positive']}/{row['n_exec_combos']} pos, "
+          f"{row['exec_rail'] or '-'})")
     return row
 
 
@@ -287,6 +321,8 @@ def frontier() -> int:
     reach = [r["spread_reach_pct"] for r in rows
              if r.get("spread_reach_pct") is not None]
     meds = [r["spread_median_pct"] for r in rows]
+    ex = [r["spread_exec_pct"] for r in rows
+          if r.get("spread_exec_pct") is not None]
     orders = [r["orders30_p50"] for r in rows if r.get("orders30_p50")]
     o90 = [r["orders30_p90"] for r in rows if r.get("orders30_p90")]
     target_day = TARGET_PER_HOUR * 24
@@ -312,6 +348,14 @@ def frontier() -> int:
               f"orders/30d = {_q(orders,0.50)/60:.1f} round trips/day")
         print(f"                               p90 {_q(o90,0.50):.0f} "
               f"orders/30d = {_q(o90,0.50)/60:.1f} round trips/day")
+    if ex:
+        npos = sum(1 for r in rows if r.get("n_exec_positive"))
+        print(f"    spread EXECUTABLE (one shared rail, both legs reachable)")
+        print(f"                               p50 {_q(ex,0.50):+.3f}%   "
+              f"best {max(ex):+.3f}%   ({len(ex)} obs, {npos} with any "
+              "positive combination)")
+    else:
+        print("    spread EXECUTABLE          NOT YET RECORDED — re-run `sample`")
     fees = [r.get("maker_fee_p50", 0) for r in rows if "maker_fee_p50" in r]
     if fees:
         print(f"    advertiser fee             {_q(fees,0.50)*100:.4f}% "
@@ -320,7 +364,7 @@ def frontier() -> int:
     # The frontier itself. Rows are spreads, columns are velocities, cells are
     # the capital that reaches the target. Nothing here is a projection: both
     # axes are quantiles of what was recorded.
-    spreads = [("reachable p10", _q(reach, 0.10) if reach else None),
+    spreads = [("EXECUTABLE p50", _q(ex, 0.50) if ex else None),
                ("reachable p50", _q(reach, 0.50) if reach else None),
                ("median-of-book p50", _q(meds, 0.50))]
     vels = [("median merchant", _q(orders, 0.50) / 60 if orders else 4.8),
@@ -341,6 +385,17 @@ def frontier() -> int:
     print(f"  Binance ceiling: ${target_day * 365 / 0.086:,.0f}.")
 
     print()
+    if ex and _q(ex, 0.50) <= 0:
+        print("  ⛔ THE SPREAD IS NOT CAPTURABLE AS A TAKER.")
+        print("     Top-of-book and 'reachable' both look positive because they")
+        print("     pair a cheap Instapay buy with a rich VodafoneCash sell. Once")
+        print("     both legs must settle on ONE shared rail, every combination")
+        print("     measured so far is negative. The apparent spread is the price")
+        print("     of moving between payment rails, which is not free to you.")
+        print("     What is left is being the MAKER: post your own ad, set your")
+        print("     own rail, and be paid by takers who need it. That is a")
+        print("     different business and it is not measured here.")
+        print()
     print("  WHAT THIS DOES NOT SAY")
     print("    - A round trip is TWO manual bank transfers plus a chat. The")
     print("      median merchant's 4.8/day is ~10 transfers a day, every day.")
