@@ -992,9 +992,24 @@ def test_days_at_the_advertised_rate_do_not_count_as_shortfall(tmp_path):
 # the day would have booked a shortfall against a product paying its advertised
 # rate exactly, and three of those would have rotated $48 out of it.
 
+def _held_across_window(asset: str, bal: float, days: int = 3) -> dict:
+    """balance_history showing `asset` steady at `bal` for the whole audit window.
+
+    A reading is only evidence once a stable balance has been watched across the
+    window (see _audit_yield._mature), so any test about WHAT a reading means
+    has to say that the position was actually held. Tests about the guards
+    themselves deliberately leave this out.
+    """
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    return {asset: {(now - timedelta(days=n)).strftime("%Y-%m-%d"): bal
+                    for n in range(days)}}
+
+
 async def test_day_observation_keeps_the_best_reading_not_the_latest(tmp_path, monkeypatch):
     h = _alloc(tmp_path)
-    state, seq = {}, iter([0.0583, 0.0470, 0.0391])
+    state = {"balance_history": _held_across_window("USDC", 48.0)}
+    seq = iter([0.0583, 0.0470, 0.0391])
 
     async def fake_realized(client, holdings, days=3, spans=None):
         return {"USDC": next(seq)}
@@ -1011,7 +1026,8 @@ async def test_decaying_reading_does_not_book_a_false_shortfall(tmp_path, monkey
     """The 3.91% late-evening reading is below the 4.25% floor, but the day
     peaked at 5.83% — a healthy product must not be flagged."""
     h = _alloc(tmp_path)
-    state, seq = {}, iter([0.0583, 0.0391])
+    state = {"balance_history": _held_across_window("USDC", 48.0)}
+    seq = iter([0.0583, 0.0391])
 
     async def fake_realized(client, holdings, days=3, spans=None):
         return {"USDC": next(seq)}
@@ -1028,7 +1044,8 @@ async def test_a_genuinely_unpaid_tier_is_still_flagged(tmp_path, monkeypatch, c
     """The real USDC case before its bonus arrived: base only, every reading of
     the day well under the floor. Keeping the maximum must not mask that."""
     h = _alloc(tmp_path)
-    state, seq = {}, iter([0.0237, 0.0212])
+    state = {"balance_history": _held_across_window("USDC", 48.0)}
+    seq = iter([0.0237, 0.0212])
 
     async def fake_realized(client, holdings, days=3, spans=None):
         return {"USDC": next(seq)}
@@ -1580,7 +1597,7 @@ def test_nav_watchlist_is_for_valuing_not_for_holding(tmp_path):
 async def test_a_freshly_subscribed_day_is_not_evidence_of_underpayment(
         tmp_path, monkeypatch, capsys):
     h = _alloc(tmp_path)
-    state = {}
+    state = {"balance_history": _held_across_window("USDC", 60.0)}
 
     async def fake_realized(client, holdings, days=3, spans=None):
         if spans is not None:
@@ -1605,7 +1622,8 @@ async def test_a_matured_position_that_underpays_is_still_caught(
     h = _alloc(tmp_path)
     # Two prior days already on the books; today is the third.
     state = {"yield_observations": {"USDC": {"2026-09-20": 0.0212,
-                                             "2026-09-21": 0.0209}}}
+                                             "2026-09-21": 0.0209}},
+             "balance_history": _held_across_window("USDC", 60.0)}
 
     async def fake_realized(client, holdings, days=3, spans=None):
         if spans is not None:
@@ -1639,3 +1657,56 @@ async def test_poisoned_observations_are_discarded_once_then_kept(tmp_path, caps
     state["yield_observations"] = {"USDC": {"2026-09-30": 0.0212}}
     h._migrate_yield_observations(state)
     assert state["yield_observations"] == {"USDC": {"2026-09-30": 0.0212}}
+
+
+# --- a mid-window top-up is not underpayment (2026-09-29) --------------------
+# Second half of the same defect. USDT's first reward credit was two days old,
+# so the span guard passed it, but the balance had gone from $0.0001 to $60.32
+# on 09-28: three days of rewards earned on nothing, divided by $60.32, read
+# 1.13% against an advertised 6.72%. Three of those trips _trusted_apr and
+# rotates the whole balance out of a product that is paying fine.
+
+async def test_a_mid_window_top_up_is_not_evidence_of_underpayment(
+        tmp_path, monkeypatch, capsys):
+    h = _alloc(tmp_path)
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    yday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    d2 = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    # Held dust until yesterday, then $60.32 arrived.
+    state = {"balance_history": {"USDT": {d2: 0.0001, yday: 0.0001}}}
+
+    async def fake_realized(client, holdings, days=3, spans=None):
+        if spans is not None:
+            spans["USDT"] = 2.0          # old enough — the span guard passes it
+        return {"USDT": 0.0113}
+    monkeypatch.setattr(h, "_realized_apr", fake_realized)
+
+    await h._audit_yield(None, state, {"USDT": 60.32}, {"USDT": 0.0672})
+
+    out = capsys.readouterr().out
+    assert "NEW, not counted" in out
+    assert "YIELD-SHORTFALL" not in out
+    assert state["yield_observations"].get("USDT", {}) == {}
+    assert h._trusted_apr(state, "USDT", 0.0672) == pytest.approx(0.0672)
+
+
+async def test_the_audit_goes_quiet_for_the_window_after_a_reset(tmp_path, monkeypatch):
+    """A fresh state has no balance history, so nothing can be judged until a
+    stable balance has been watched for the whole window. Silence is the correct
+    answer to 'I have not been looking long enough', and it is what the reset
+    message promises."""
+    h = _alloc(tmp_path)
+    state = {}
+    h._migrate_yield_observations(state)
+
+    async def fake_realized(client, holdings, days=3, spans=None):
+        if spans is not None:
+            spans["USDT"] = 5.0
+        return {"USDT": 0.0001}
+    monkeypatch.setattr(h, "_realized_apr", fake_realized)
+
+    await h._audit_yield(None, state, {"USDT": 60.32}, {"USDT": 0.0672})
+    assert state["yield_observations"] == {}
+    # ...but the balance IS recorded, so the clock starts immediately.
+    assert state["balance_history"]["USDT"]

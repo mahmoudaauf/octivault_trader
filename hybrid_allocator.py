@@ -91,7 +91,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -486,7 +486,12 @@ def _tier_never_paid(state, asset: str, tiers: list, bonus_paid: dict) -> bool:
 # from the rotation artefacts that motivated it, so they are dropped wholesale
 # on first start after the fix. Three days of holding rebuilds the evidence; a
 # single poisoned day that survives can blacklist a good product for a fortnight.
-YIELD_OBS_SCHEMA = 2
+#
+# v3 (2026-09-29): the balance-stability guard landed after v2 had already
+# recorded one reading under the old rules (USDT 1.13%, the top-up artefact).
+# Bumped so that reading is discarded too — the schema is the only thing that
+# distinguishes a reading taken under the current guards from one taken before.
+YIELD_OBS_SCHEMA = 3
 
 
 def _migrate_yield_observations(state: dict) -> None:
@@ -1077,6 +1082,19 @@ async def _scan_stablecoins(client, state, held_asset: str, amount: float) -> di
 # and rotated the whole balance out of a product that was paying fine.
 AUDIT_MIN_SPAN_DAYS = float(os.getenv("HYBRID_AUDIT_MIN_SPAN_DAYS", "1.0"))
 
+# Days of reward history _realized_apr sums over. Kept next to the guards that
+# depend on it: evidence is only as good as the window it was measured across.
+AUDIT_WINDOW_DAYS = 3
+
+# A reading is also worthless when the BALANCE moved during the window, because
+# _realized_apr divides rewards earned on the OLD balance by the CURRENT one.
+# 2026-09-29: USDT went from $0.0001 to $60.32 on 09-28, so three days of
+# rewards earned on nothing were divided by $60.32 and read 1.13% against an
+# advertised 6.72% — a shortfall invented entirely by the top-up. The span guard
+# does not catch this (the first reward credit was two days old). So a product
+# is judged only once a stable balance has been watched across the whole window.
+AUDIT_BALANCE_STABLE_FRAC = 0.60
+
 # Smallest balance the yield audit will compute a rate on. See _realized_apr.
 AUDIT_MIN_BALANCE_USD = float(os.getenv("HYBRID_AUDIT_MIN_BALANCE_USD", "1.0"))
 
@@ -1169,15 +1187,48 @@ async def _audit_yield(client, state, holdings: dict, assumed: dict) -> None:
     if not real:
         return
 
-    def _mature(asset: str) -> bool:
-        """Has this asset been observed long enough for a reading to be evidence?
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        A span shorter than AUDIT_MIN_SPAN_DAYS means the reading is dominated by
-        the partial first window, not by how the product pays. Unknown spans
-        (a caller that supplied none) count as mature, so this can only ever
-        REMOVE evidence, never manufacture it.
+    # Record what each asset is holding today, so tomorrow's audit can tell a
+    # product that underpays from one that was merely funded mid-window.
+    bal_hist = state.setdefault("balance_history", {})
+    for asset in real:
+        bal_hist.setdefault(asset, {})[today] = round(
+            float(holdings.get(asset, 0.0) or 0.0), 4)
+    for asset, seen in bal_hist.items():
+        for d in sorted(seen)[:-14]:
+            seen.pop(d, None)
+
+    window = {(datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
+              for n in range(AUDIT_WINDOW_DAYS)}
+
+    def _mature(asset: str) -> bool:
+        """Is a reading for this asset good enough to be EVIDENCE of underpayment?
+
+        Two independent ways a reading can be structurally low without the
+        product being at fault, both cost real money before they were guarded:
+
+        1. The position is younger than the window — the numerator covers only
+           the hours it was subscribed while the denominator is floored at half
+           a day (USDC, 09-26..09-28, blacklisted at 0.72% against a real 7.54%).
+        2. The balance moved during the window — rewards earned on the old
+           balance are divided by the new one (USDT, 09-28, read 1.13% against
+           an advertised 6.72% after going from $0.0001 to $60.32).
+
+        So: require a span of at least AUDIT_MIN_SPAN_DAYS, AND a balance
+        recorded on every day of the window that is within
+        AUDIT_BALANCE_STABLE_FRAC of what is held now. A day with no recorded
+        balance is not evidence of stability, so it fails — which means a fresh
+        state stays silent for AUDIT_WINDOW_DAYS rather than guessing.
+
+        Both checks can only REMOVE evidence, never manufacture it.
         """
-        return spans.get(asset, float("inf")) >= AUDIT_MIN_SPAN_DAYS
+        if spans.get(asset, float("inf")) < AUDIT_MIN_SPAN_DAYS:
+            return False
+        now_bal = float(holdings.get(asset, 0.0) or 0.0)
+        seen = bal_hist.get(asset, {})
+        return all(seen.get(d, 0.0) >= now_bal * AUDIT_BALANCE_STABLE_FRAC
+                   for d in window)
 
     # Record the verdict per CALENDAR DAY, not per cycle. The daemon runs ~96
     # cycles a day; counting cycles would reach any threshold within an hour and
@@ -1192,7 +1243,6 @@ async def _audit_yield(client, state, holdings: dict, assumed: dict) -> None:
     # the day would have recorded a shortfall for a product paying its advertised
     # rate exactly, and three such days would have rotated $48 out of it. The
     # maximum is the sample taken closest after a credit, i.e. the least biased.
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     obs = state.setdefault("yield_observations", {})
     for asset in real:
         if assumed.get(asset) and _mature(asset):
