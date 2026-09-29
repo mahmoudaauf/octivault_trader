@@ -482,6 +482,26 @@ def _tier_never_paid(state, asset: str, tiers: list, bonus_paid: dict) -> bool:
     return observed >= BONUS_GRACE_DAYS
 
 
+# Observations recorded before AUDIT_MIN_SPAN_DAYS existed cannot be told apart
+# from the rotation artefacts that motivated it, so they are dropped wholesale
+# on first start after the fix. Three days of holding rebuilds the evidence; a
+# single poisoned day that survives can blacklist a good product for a fortnight.
+YIELD_OBS_SCHEMA = 2
+
+
+def _migrate_yield_observations(state: dict) -> None:
+    """Drop pre-maturity-guard readings once, then stamp the schema."""
+    if state.get("yield_obs_schema") == YIELD_OBS_SCHEMA:
+        return
+    stale = sum(len(v) for v in (state.get("yield_observations") or {}).values())
+    state["yield_observations"] = {}
+    state["yield_obs_schema"] = YIELD_OBS_SCHEMA
+    if stale:
+        print(f"  [YIELD-AUDIT-RESET] discarded {stale} reading(s) recorded before "
+              "the fresh-subscription guard existed — they cannot be trusted as "
+              "evidence. Rebuilding over the next 3 days.")
+
+
 def _shortfall_days(state, asset: str, advertised: float) -> list[float]:
     """Recorded days on which `asset` paid under 60% of its advertised rate.
 
@@ -1045,11 +1065,24 @@ async def _scan_stablecoins(client, state, held_asset: str, amount: float) -> di
     return best
 
 
+# Shortest observation window that may be used as EVIDENCE of underpayment.
+# A reading taken less than a full day after an asset's first reward credit is
+# structurally too low to judge: the numerator covers only the hours the money
+# was actually subscribed, while the denominator is floored at half a day (see
+# _realized_apr). Measured 2026-09-29: USDC, rotated through over 09-26..09-28,
+# booked three such readings (0.01%, 0.91%, 0.72%) against a real 7.54% and was
+# distrusted down to 0.72% — the machine poisoned the product it had just used.
+# USDT was two days into the same trap and would have tripped on 09-30, which
+# would have ranked the product holding 100% of the money BELOW XUSD and USD1
+# and rotated the whole balance out of a product that was paying fine.
+AUDIT_MIN_SPAN_DAYS = float(os.getenv("HYBRID_AUDIT_MIN_SPAN_DAYS", "1.0"))
+
 # Smallest balance the yield audit will compute a rate on. See _realized_apr.
 AUDIT_MIN_BALANCE_USD = float(os.getenv("HYBRID_AUDIT_MIN_BALANCE_USD", "1.0"))
 
 
-async def _realized_apr(client, holdings: dict, days: int = 3) -> dict:
+async def _realized_apr(client, holdings: dict, days: int = 3,
+                        spans: dict | None = None) -> dict:
     """What each earn asset was ACTUALLY paid, annualised, from reward history.
 
     WHY THIS EXISTS
@@ -1119,6 +1152,8 @@ async def _realized_apr(client, holdings: dict, days: int = 3) -> dict:
         # 172,850,627%/yr. Below a dollar, omit: unknown, not infinite.
         if bal >= AUDIT_MIN_BALANCE_USD:
             out[asset] = credited / bal * 365.0 / span
+            if spans is not None:
+                spans[asset] = span
     return out
 
 
@@ -1129,9 +1164,20 @@ async def _audit_yield(client, state, holdings: dict, assumed: dict) -> None:
     two columns is the only place a broken tier promotion, a silently expired
     bonus, or a product that quietly stopped paying can show up.
     """
-    real = await _realized_apr(client, holdings)
+    spans: dict[str, float] = {}
+    real = await _realized_apr(client, holdings, spans=spans)
     if not real:
         return
+
+    def _mature(asset: str) -> bool:
+        """Has this asset been observed long enough for a reading to be evidence?
+
+        A span shorter than AUDIT_MIN_SPAN_DAYS means the reading is dominated by
+        the partial first window, not by how the product pays. Unknown spans
+        (a caller that supplied none) count as mature, so this can only ever
+        REMOVE evidence, never manufacture it.
+        """
+        return spans.get(asset, float("inf")) >= AUDIT_MIN_SPAN_DAYS
 
     # Record the verdict per CALENDAR DAY, not per cycle. The daemon runs ~96
     # cycles a day; counting cycles would reach any threshold within an hour and
@@ -1149,7 +1195,7 @@ async def _audit_yield(client, state, holdings: dict, assumed: dict) -> None:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     obs = state.setdefault("yield_observations", {})
     for asset in real:
-        if assumed.get(asset):
+        if assumed.get(asset) and _mature(asset):
             day = obs.setdefault(asset, {})
             day[today] = round(max(real[asset], day.get(today, 0.0)), 6)
     # Keep a fortnight; enough to see a promotion end, small enough to stay tidy.
@@ -1164,11 +1210,12 @@ async def _audit_yield(client, state, holdings: dict, assumed: dict) -> None:
             # Judge on the day's best reading, for the same reason it is the one
             # stored: the instantaneous value is depressed by time since credit.
             best = obs.get(asset, {}).get(today, real[asset])
+            young = "" if _mature(asset) else " NEW, not counted"
             parts.append(f"{asset} {real[asset]*100:.2f}% (day best {best*100:.2f}%, "
-                         f"told {want*100:.2f}%)")
+                         f"told {want*100:.2f}%{young})")
             # 60%: wide enough to absorb a partial first day and reward-timing
             # jitter, tight enough that a missing bonus stream cannot hide.
-            if best < want * 0.60:
+            if best < want * 0.60 and _mature(asset):
                 shortfall.append((asset, best, want))
         else:
             parts.append(f"{asset} {real[asset]*100:.2f}%")
@@ -1948,6 +1995,7 @@ async def run():
 
     client = await _create_client_with_retry(AsyncClient)
     state = _load(STATE, {"position": None})
+    _migrate_yield_observations(state)
     armed = _is_live()
     banner = {"paper": "📝 PAPER (no real money)",
               "dryrun": "🧪 DRY-RUN (logs orders, sends none)",
@@ -2378,6 +2426,7 @@ async def run_allocate():
         return
     client = await _create_client_with_retry(AsyncClient)
     state = _load(STATE, {"position": None})
+    _migrate_yield_observations(state)
     print(f"[alloc] start — OBJECTIVE=allocate MODE={MODE} "
           f"{'🟢 LIVE (real earn subscriptions)' if _is_live() else '📝 simulated (no money moves)'}")
     print("[alloc] job — deploy idle cash into yield, detect contributions, record honest NAV")

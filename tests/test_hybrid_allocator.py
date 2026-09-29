@@ -996,7 +996,7 @@ async def test_day_observation_keeps_the_best_reading_not_the_latest(tmp_path, m
     h = _alloc(tmp_path)
     state, seq = {}, iter([0.0583, 0.0470, 0.0391])
 
-    async def fake_realized(client, holdings, days=3):
+    async def fake_realized(client, holdings, days=3, spans=None):
         return {"USDC": next(seq)}
     monkeypatch.setattr(h, "_realized_apr", fake_realized)
 
@@ -1013,7 +1013,7 @@ async def test_decaying_reading_does_not_book_a_false_shortfall(tmp_path, monkey
     h = _alloc(tmp_path)
     state, seq = {}, iter([0.0583, 0.0391])
 
-    async def fake_realized(client, holdings, days=3):
+    async def fake_realized(client, holdings, days=3, spans=None):
         return {"USDC": next(seq)}
     monkeypatch.setattr(h, "_realized_apr", fake_realized)
 
@@ -1030,7 +1030,7 @@ async def test_a_genuinely_unpaid_tier_is_still_flagged(tmp_path, monkeypatch, c
     h = _alloc(tmp_path)
     state, seq = {}, iter([0.0237, 0.0212])
 
-    async def fake_realized(client, holdings, days=3):
+    async def fake_realized(client, holdings, days=3, spans=None):
         return {"USDC": next(seq)}
     monkeypatch.setattr(h, "_realized_apr", fake_realized)
 
@@ -1566,3 +1566,76 @@ def test_nav_watchlist_is_for_valuing_not_for_holding(tmp_path):
     # The watchlist is far larger than the hold-list, which is the whole point.
     assert len(h.NAV_ASSETS) > len(h.PROTECTED_ASSETS)
     assert not (set(h.NAV_ASSETS) - {"BTC", "PAXG", "BNB"}) & h.PROTECTED_ASSETS
+
+
+# --- a rotation must not poison the product it rotated through (2026-09-29) ---
+# Real incident: USDC was rotated through on 09-26..09-28. Each day it was
+# freshly subscribed, so every reading was a partial first window — 0.01%, 0.91%,
+# 0.72% against an advertised 7.54%. Three such days tripped _trusted_apr and
+# USDC was re-ranked at 0.72%, i.e. blacklisted as the second-best approved
+# product on evidence produced entirely by the machine's own rotation. USDT was
+# two days into the identical trap and would have tripped the next day, which
+# would have ranked the product holding 100% of the balance below XUSD and USD1.
+
+async def test_a_freshly_subscribed_day_is_not_evidence_of_underpayment(
+        tmp_path, monkeypatch, capsys):
+    h = _alloc(tmp_path)
+    state = {}
+
+    async def fake_realized(client, holdings, days=3, spans=None):
+        if spans is not None:
+            spans["USDC"] = 0.5          # floored span: money arrived today
+        return {"USDC": 0.0072}
+    monkeypatch.setattr(h, "_realized_apr", fake_realized)
+
+    for _ in range(3):
+        await h._audit_yield(None, state, {"USDC": 60.0}, {"USDC": 0.0754})
+
+    out = capsys.readouterr().out
+    assert "NEW, not counted" in out
+    assert "YIELD-SHORTFALL" not in out
+    assert state.get("yield_observations", {}).get("USDC", {}) == {}
+    assert h._trusted_apr(state, "USDC", 0.0754) == pytest.approx(0.0754)
+
+
+async def test_a_matured_position_that_underpays_is_still_caught(
+        tmp_path, monkeypatch, capsys):
+    """The guard must only remove evidence from young positions, never mask a
+    product that has been held long enough to judge."""
+    h = _alloc(tmp_path)
+    # Two prior days already on the books; today is the third.
+    state = {"yield_observations": {"USDC": {"2026-09-20": 0.0212,
+                                             "2026-09-21": 0.0209}}}
+
+    async def fake_realized(client, holdings, days=3, spans=None):
+        if spans is not None:
+            spans["USDC"] = 3.0          # held the full window
+        return {"USDC": 0.0212}
+    monkeypatch.setattr(h, "_realized_apr", fake_realized)
+
+    await h._audit_yield(None, state, {"USDC": 60.0}, {"USDC": 0.0754})
+
+    assert "YIELD-SHORTFALL" in capsys.readouterr().out
+    assert len(state["yield_observations"]["USDC"]) == 3
+    assert h._trusted_apr(state, "USDC", 0.0754) == pytest.approx(0.0212)
+
+
+async def test_poisoned_observations_are_discarded_once_then_kept(tmp_path, capsys):
+    """The live state on 2026-09-29 held five rotation-artefact readings that the
+    maturity guard cannot retroactively identify. They must be dropped on the
+    first start after the fix — and only that once."""
+    h = _alloc(tmp_path)
+    state = {"yield_observations": {"USDC": {"2026-09-26": 6.5e-05,
+                                             "2026-09-27": 0.009075,
+                                             "2026-09-28": 0.007158},
+                                    "USDT": {"2026-09-28": 0.0003,
+                                             "2026-09-29": 0.01176}}}
+    h._migrate_yield_observations(state)
+    assert state["yield_observations"] == {}
+    assert "discarded 5 reading(s)" in capsys.readouterr().out
+    assert h._trusted_apr(state, "USDC", 0.0754) == pytest.approx(0.0754)
+
+    # Second start must not wipe evidence gathered since.
+    state["yield_observations"] = {"USDC": {"2026-09-30": 0.0212}}
+    h._migrate_yield_observations(state)
+    assert state["yield_observations"] == {"USDC": {"2026-09-30": 0.0212}}
