@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.octivault.p2pmaker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mauf/Projects/octivault_trader/venv/bin/python3</string>
+    <string>/Users/mauf/Projects/octivault_trader/p2p_maker_probe.py</string>
+    <string>sample</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/mauf/Projects/octivault_trader</string>
+  <!-- Every 3 min, NOT the 15 of the spread monitor. This measures fills, and a
+       fill is a surplus decrease between two consecutive snapshots: the longer
+       the gap, the more ads vanish and reprice in between, and a vanished ad is
+       deliberately never counted as a fill. Coarse sampling therefore throws the
+       signal away rather than merely blurring it. 3 min is two public GETs per
+       cycle, well inside the endpoint's tolerance.
+
+       StartInterval with no KeepAlive: a cycle that dies leaves no process for
+       launchd to restart, and platform_health.py derives its staleness budget
+       from this interval, so it will notice the silence. -->
+  <key>StartInterval</key><integer>180</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/mauf/Projects/octivault_trader/logs/p2p_maker.log</string>
+  <key>StandardErrorPath</key><string>/Users/mauf/Projects/octivault_trader/logs/p2p_maker.err</string>
+</dict>
+</plist>

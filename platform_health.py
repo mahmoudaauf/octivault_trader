@@ -64,6 +64,7 @@ OUTPUTS = {
     "com.octivault.profit-research": ("logs/profit_research.log", 45),
     "com.octivault.opportunity":     ("logs/opportunity.log", 180),
     "com.octivault.p2pspread":       ("logs/p2p_spread.log", 45),
+    "com.octivault.p2pmaker":        ("logs/p2p_maker.log", 12),
     "com.octivault.health":          ("logs/platform_health.log", 180),
 }
 
