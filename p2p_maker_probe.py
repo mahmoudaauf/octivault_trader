@@ -156,6 +156,10 @@ def _snapshot() -> dict | None:
                     "surplus": float(d.get("surplusAmount") or 0),
                     "min_fiat": float(d.get("minSingleTransAmount") or 0),
                     "orders": int(a["advertiser"].get("monthOrderCount") or 0),
+                    # Advertiser identity, because monthOrderCount is a property
+                    # of the ADVERTISER and not of the ad. See the attribution
+                    # cap in sample().
+                    "who": a["advertiser"].get("userNo") or "",
                 }
             except (TypeError, ValueError, KeyError):
                 continue
@@ -187,7 +191,8 @@ def sample() -> dict | None:
         print("[probe] non-positive interval — skipping diff")
         return None
 
-    filled, topped, vanished, shrunk = [], 0, 0, 0
+    filled, topped, vanished, shrunk, overclaim = [], 0, 0, 0, 0
+    candidates: list[dict] = []
     for adv_no, was in prev["ads"].items():
         nowad = now["ads"].get(adv_no)
         if nowad is None:
@@ -197,14 +202,35 @@ def sample() -> dict | None:
         d_orders = nowad["orders"] - was["orders"]
         if delta > 1e-9 and d_orders > 0:
             # Two witnesses: inventory fell AND the advertiser completed an order.
-            filled.append({"advNo": adv_no, "side": was["side"],
-                           "rank": was["rank"], "bucket": _bucket(was["rank"]),
-                           "px": was["px"], "filled_usdt": round(delta, 8),
-                           "n_orders": d_orders, "orders30": was["orders"]})
+            candidates.append({"advNo": adv_no, "side": was["side"],
+                               "rank": was["rank"], "bucket": _bucket(was["rank"]),
+                               "px": was["px"], "filled_usdt": round(delta, 8),
+                               "n_orders": d_orders, "orders30": was["orders"],
+                               "who": was.get("who", "")})
         elif delta > 1e-9:
             shrunk += 1          # edited down, not sold
         elif delta < -1e-9:
             topped += 1
+
+    # monthOrderCount belongs to the ADVERTISER, not the ad. An advertiser running
+    # two ads who sells on one and trims the other would have both witnesses fire
+    # on the trimmed ad. Measured 2026-10-01: only 4 of 116 advertisers ran more
+    # than one ad in the sampled book (8 ads, 7%, never more than 2 each), so the
+    # exposure is small -- but small is not zero, and the fix is to let an
+    # advertiser claim no more ads than orders they actually completed. Largest
+    # inventory drop wins, since a real sale is the likelier cause of the bigger
+    # move.
+    by_who: dict[str, list[dict]] = {}
+    for c in candidates:
+        by_who.setdefault(c["who"], []).append(c)
+    for who, cs in by_who.items():
+        if len(cs) == 1:
+            filled += cs
+            continue
+        cs.sort(key=lambda c: -c["filled_usdt"])
+        allowed = max(c["n_orders"] for c in cs)
+        filled += cs[:allowed]
+        overclaim += len(cs) - len(cs[:allowed])
 
     # Ads actually seen per bucket, so the per-ad rate divides by a counted
     # number instead of the guess the first version used.
@@ -216,7 +242,8 @@ def sample() -> dict | None:
     row = {"ts": now["ts"], "hours": round(dt_h, 5),
            "n_prev": len(prev["ads"]), "n_now": len(now["ads"]),
            "fills": filled, "n_topped_up": topped, "n_vanished": vanished,
-           "n_shrunk": shrunk, "ads_per_bucket": seen}
+           "n_shrunk": shrunk, "n_overclaimed": overclaim,
+           "ads_per_bucket": seen}
     os.makedirs(os.path.dirname(FILLS) or ".", exist_ok=True)
     with open(FILLS, "a") as f:
         f.write(json.dumps(row) + "\n")
@@ -224,7 +251,8 @@ def sample() -> dict | None:
     vol = sum(f["filled_usdt"] for f in filled)
     print(f"[probe {now['ts'][11:16]}] {dt_h*60:.1f}min: {len(filled)} confirmed "
           f"fills, {vol:,.1f} {ASSET}  (excluded: {shrunk} shrank without an "
-          f"order, {topped} topped up, {vanished} vanished)")
+          f"order, {topped} topped up, {vanished} vanished, "
+          f"{overclaim} over-claimed)")
     return row
 
 
@@ -272,6 +300,8 @@ def report() -> int:
     print(f"    {shrunk} ads shrank with no new order  (edited down, not sold)")
     print(f"    {vanished} ads vanished                (filled OR cancelled)")
     print(f"    {topped} ads topped up")
+    oc = sum(r.get("n_overclaimed", 0) for r in usable)
+    print(f"    {oc} ads over-claimed by a multi-ad advertiser")
     if dropped:
         print(f"    {dropped} diff(s) spanned under {MIN_DIFF_MIN:.1f} min "
               "— too short to be a rate")

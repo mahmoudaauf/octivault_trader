@@ -170,3 +170,45 @@ def test_the_per_ad_rate_divides_by_ads_actually_observed(tmp_path, monkeypatch,
     probe.report()
     out = capsys.readouterr().out
     assert "24.0 U" in out
+
+
+def test_one_advertiser_cannot_claim_more_fills_than_orders(tmp_path, monkeypatch):
+    """monthOrderCount belongs to the ADVERTISER, not the ad. An advertiser running
+    two ads who sells on one and trims the other would otherwise have both
+    witnesses fire on the trimmed ad too. They may claim no more ads than orders
+    they actually completed; the larger inventory drop is the likelier sale."""
+    _paths(tmp_path, monkeypatch)
+    a1 = _ad("x1", 52.8, 500, orders=200)
+    a2 = _ad("x2", 52.9, 500, orders=200)
+    for a in (a1, a2):
+        a["advertiser"]["userNo"] = "same_person"
+    _book(monkeypatch, [a1, a2], [_ad("s1", 53.3, 100)])
+    probe.sample()
+    # One order completed, but BOTH ads shrank: the 400 is the sale, 50 is a trim.
+    b1 = _ad("x1", 52.8, 100, orders=201)
+    b2 = _ad("x2", 52.9, 450, orders=201)
+    for a in (b1, b2):
+        a["advertiser"]["userNo"] = "same_person"
+    _book(monkeypatch, [b1, b2], [_ad("s1", 53.3, 100)])
+    row = probe.sample()
+    assert len(row["fills"]) == 1
+    assert row["fills"][0]["advNo"] == "x1"          # the bigger drop
+    assert row["fills"][0]["filled_usdt"] == pytest.approx(400.0)
+    assert row["n_overclaimed"] == 1
+
+
+def test_two_orders_let_a_multi_ad_advertiser_claim_both(tmp_path, monkeypatch):
+    """The cap must not punish an advertiser who genuinely sold on both ads."""
+    _paths(tmp_path, monkeypatch)
+    a1, a2 = _ad("y1", 52.8, 500, orders=200), _ad("y2", 52.9, 500, orders=200)
+    for a in (a1, a2):
+        a["advertiser"]["userNo"] = "busy_person"
+    _book(monkeypatch, [a1, a2], [_ad("s1", 53.3, 100)])
+    probe.sample()
+    b1, b2 = _ad("y1", 52.8, 100, orders=202), _ad("y2", 52.9, 300, orders=202)
+    for a in (b1, b2):
+        a["advertiser"]["userNo"] = "busy_person"
+    _book(monkeypatch, [b1, b2], [_ad("s1", 53.3, 100)])
+    row = probe.sample()
+    assert len(row["fills"]) == 2
+    assert row["n_overclaimed"] == 0
